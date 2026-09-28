@@ -231,7 +231,20 @@ same-pane, same-session-id relaunch instead:
    falls through to `undefined` (logged, one-time fresh-restart-at-next-poll)
    rather than a wrong-but-real guess. The discovered id is then persisted
    (`persistDiscoveredSessionId`, `.butchr-session-id.json`,
-   `workspaceSessionId`) for `resumeInPlace()` below to use later.
+   `workspaceSessionId`) for `resumeInPlace()` below to use later. A FAILED
+   discovery (epic review on PR #513, round 3) does not just skip that
+   write — it actively INVALIDATES any id already on disk from an earlier
+   launch of this same workspace (`invalidatePersistedSessionId`), and only
+   then logs the WARNING. Without this, a workspace directory that already
+   held an older persisted id AND its transcript (both stable across
+   respawns — the project folder is per-cwd, and `resumeInPlace()`'s own
+   `claudeTranscriptExists` is a bare `existsSync`) would let a later
+   model/effort change silently `--resume` a DIFFERENT, already-finished
+   conversation and report it "preserved" — the `after`/`birthtimeMs` bound
+   above only protects *discovery*; this closes the matching gap on the
+   *persisted* side, so a failed discovery here always means the next
+   `resumeInPlace()` sees no id at all (`"unresumable"`, honest fresh
+   restart) rather than a stale one.
 2. `HerdrHerd.resumeInPlace()` (src/agents/herd.ts) — reached from
    `reconcileNow`'s respawn loop (src/daemon/loop.ts) BEFORE the ordinary
    `stop()`+`spawn()` path, and only for a `resumable` staleness — first

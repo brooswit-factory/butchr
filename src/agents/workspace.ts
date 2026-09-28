@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync, renameSync, rmdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync, renameSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -1129,6 +1129,30 @@ export function discoverClaudeSessionId(dir: string, home?: string, after?: numb
 export function persistDiscoveredSessionId(dir: string, sessionId: string): void {
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify(sessionId));
+}
+
+/**
+ * FACTORY-314 (epic review on PR #513, round 3) — the OTHER half of
+ * `persistDiscoveredSessionId`'s "never a guess" contract, closing a gap a
+ * failed discovery left wide open. `.butchr-session-id.json` was previously
+ * ONLY ever written, never invalidated: `startProviders()`'s own discovery
+ * failure branch just logged a WARNING and moved on, leaving an OLDER id
+ * from a PRIOR launch of this same workspace on disk. That id's transcript
+ * is still sitting right there too (`claudeTranscriptExists` is a bare
+ * `existsSync`, and the project folder is per-cwd, stable across respawns —
+ * see `discoverClaudeSessionId`'s own doc comment for why), so a LATER
+ * model/effort change would find a persisted id that validates cleanly and
+ * `--resume` it — silently resuming a DIFFERENT, already-finished
+ * conversation and reporting it "PRESERVED". Called from that same
+ * discovery-failure branch instead of merely logging: removing the file
+ * (tolerating ENOENT — nothing to remove is not an error) makes
+ * `workspaceSessionId` fail-safe back to `undefined`, so `resumeInPlace()`'s
+ * existing `if (!sessionId) return "unresumable"` check catches it — an
+ * honest fresh restart, never a wrong-but-real resume.
+ */
+export function invalidatePersistedSessionId(dir: string): void {
+  try { rmSync(join(dir, ".butchr-session-id.json")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
 }
 
 /**

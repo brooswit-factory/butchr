@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -935,7 +935,21 @@ export class HerdrHerd implements Herd {
           await this.wait(SESSION_DISCOVERY_POLL_MS);
         }
         if (discovered) persistDiscoveredSessionId(dir, discovered);
-        else this.log?.(`WARNING: [spawn] ${spec.key} could not discover a native Claude session id after a successful launch — a later model/effort change will fall back to a fresh restart instead of resuming`);
+        else {
+          // FACTORY-314 (epic review, round 3): MUST invalidate, not just log —
+          // an earlier launch of this SAME workspace may have persisted a
+          // session id of its own, and leaving it on disk here means a LATER
+          // model/effort change would find that OLDER id, find its transcript
+          // still sitting in the same per-cwd project folder (`claudeTranscriptExists`
+          // is a bare existsSync), and `--resume` it: a silent, confidently
+          // wrong resume into a different, already-finished conversation,
+          // reported as "PRESERVED". Removing it makes `workspaceSessionId`
+          // fail safe to `undefined`, so `resumeInPlace()`'s existing
+          // `if (!sessionId) return "unresumable"` check catches this launch
+          // instead — an honest fresh restart next time, never a wrong guess.
+          invalidatePersistedSessionId(dir);
+          this.log?.(`WARNING: [spawn] ${spec.key} could not discover a native Claude session id after a successful launch — a later model/effort change will fall back to a fresh restart instead of resuming`);
+        }
       }
     } else {
       if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);

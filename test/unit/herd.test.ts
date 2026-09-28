@@ -2160,6 +2160,43 @@ describe("resumeInPlace", () => {
     });
   });
 
+  // FACTORY-73 epic review on PR #513 (round 3) — the failure shape a
+  // discovery-failure branch that only LOGGED, never invalidated, left wide
+  // open: (1) an earlier launch of this SAME workspace discovers and
+  // persists S1. (2) the workspace later gets a genuinely fresh relaunch
+  // (any reason), Claude picks a NEW id, but THIS launch's discovery finds
+  // nothing (simulated here by `fakeHerdr`'s `agent.start`, which never
+  // writes a transcript at all — the same "discovery loses the race"
+  // condition `SESSION_DISCOVERY_ATTEMPTS` bounds but does not eliminate).
+  // (3) S1's OLD id and OLD transcript are both still sitting on disk
+  // (`claudeTranscriptExists` is a bare `existsSync`, and the project
+  // folder is per-cwd, stable across respawns) — so a NAIVE "only log on
+  // failure" implementation would leave S1 persisted, `resumeInPlace()`
+  // would find it, find its transcript, and `--resume` it: silently
+  // reviving a DIFFERENT, already-finished conversation and calling it
+  // "PRESERVED". Asserts the OUTCOME (`resumeInPlace()` returns
+  // `"unresumable"`, never attempts `/exit`), not merely that some file
+  // changed.
+  test("FACTORY-314 (epic review, round 3): a failed discovery INVALIDATES an older persisted session id from a PRIOR launch of this same workspace — resumeInPlace() never resumes the stale one", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-908" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "stale-session-from-a-prior-launch", async (home) => {
+        const f = fakeHerdr([]); // agent.start here never writes a transcript — this launch's own discovery will find nothing
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn(spec);
+        expect(f.started).toHaveLength(1);
+        // The stale id must be GONE, not merely left unreplaced — a later
+        // resumeInPlace() must never find it.
+        expect(workspaceSessionId(cwd)).toBeUndefined();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("unresumable");
+        expect(f.started).toHaveLength(1); // no /exit, no second agent.start — never touched the live agent at all
+      });
+    });
+  });
+
   // FACTORY-73 (25989/25978): FACTORY-300 root-causes ManagedHerdrLifecycle.start()
   // throwing HandoffBlocked("Current worker disappeared; refusing implicit
   // replacement") when its remembered `this.active` can't be re-resolved — a

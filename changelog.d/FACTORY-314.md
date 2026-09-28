@@ -9,3 +9,4 @@ bump: minor
 ### Fixed
 
 - The stale-argv reconcile comment no longer tells an agent whose conversation was actually preserved to "re-read your ticket as if fresh".
+- A failed session-id discovery after a fresh launch now invalidates any session id already persisted from an EARLIER launch of that same workspace, instead of just logging and leaving it in place — closing a gap where a later model/effort change could have silently `--resume`d a different, already-finished conversation and reported it as preserved.

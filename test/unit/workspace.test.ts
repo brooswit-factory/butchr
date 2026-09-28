@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, m
 import { join, resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
@@ -1000,6 +1000,33 @@ describe("buildWorkspace", () => {
       try {
         persistDiscoveredSessionId(root, "abc-123");
         expect(workspaceSessionId(root)).toBe("abc-123");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    // FACTORY-314 (epic review on PR #513, round 3): the OTHER half of
+    // `persistDiscoveredSessionId`'s "never a guess" contract. A failed
+    // discovery must not leave an OLDER id from a prior launch resumable —
+    // see `HerdrHerd.startProviders`'s discovery-failure branch, which now
+    // calls this instead of only logging.
+    test("invalidatePersistedSessionId removes a persisted id — workspaceSessionId falls back to undefined", () => {
+      const root = mkdtempSync(join(tmpdir(), "bw-invalidate-"));
+      try {
+        persistDiscoveredSessionId(root, "stale-from-a-prior-launch");
+        expect(workspaceSessionId(root)).toBe("stale-from-a-prior-launch");
+        invalidatePersistedSessionId(root);
+        expect(workspaceSessionId(root)).toBeUndefined();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("invalidatePersistedSessionId on a workspace with no persisted id at all never throws (nothing to remove is not an error)", () => {
+      const root = mkdtempSync(join(tmpdir(), "bw-invalidate-noop-"));
+      try {
+        expect(() => invalidatePersistedSessionId(root)).not.toThrow();
+        expect(workspaceSessionId(root)).toBeUndefined();
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
