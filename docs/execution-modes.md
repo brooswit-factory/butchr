@@ -103,8 +103,24 @@ other and of every other field):
 
 | field | values | default | reaches argv? |
 |---|---|---|---|
-| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent (Drovr's own default, `bypassPermissions`, applies) | yes — `SpawnSpec.permissionMode` |
-| `lizardMode` | boolean | absent/`false` | no — daemon-side only |
+| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → butchr's own default applies (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, src/agents/argv.ts), for every provider including `jira-project` since FACTORY-129 | yes — `SpawnSpec.permissionMode` |
+| `lizardMode` | boolean | absent → eligible (`ruleLizardModeOf`: `rule.lizardMode !== false`); explicit `false` → never scanned | no — daemon-side only |
+
+**Rollout, and there is no global override.** `permissionMode` reaches
+launch argv, so every currently-running agent with no explicit
+`permissionMode` was respawned ONCE, fleet-wide, at the deploy that shipped
+this default (FACTORY-138) — a value change caught by the existing
+stale-argv check, not a loop; `jira-project` agents got their own separate
+one-time respawn at the later FACTORY-129 deploy that removed their
+`"auto"` override. An agent with an explicit `permissionMode`
+(`bypassPermissions` included) and a Codex/agy agent are not respawned by
+either change. `lizardMode` never reaches argv, so flipping it (or its
+default changing, as it did here) takes effect on the very next
+permission-answer tick with no respawn. There is no config file or env var
+that turns this default off fleet-wide; rolling one rule back means setting
+`permissionMode: "bypassPermissions"` explicitly on it (which respawns that
+rule's agents once) — "leave it unset" now means `acceptEdits`, not the
+pre-FACTORY-138 behaviour.
 
 **What they do.** `lizardMode: true` is the operator's own name (FACTORY-67)
 for turning on the daemon's standalone permission-answer timer
