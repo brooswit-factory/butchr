@@ -716,6 +716,59 @@ export function assertNoInheritedMcpConfig(dir: string): void {
   }
 }
 
+/**
+ * FACTORY-411/FACTORY-424 (session-field-reload-classification.md, Finding
+ * 2, point 2) — extracted out of `buildWorkspace` below so `resumeInPlace()`
+ * (src/agents/herd.ts) can regenerate JUST this file BEFORE attempting a
+ * relaunch, for the `mcpServers` channel-flag case: the relaunched process's
+ * argv is built straight from `spec` (correct immediately), but Claude reads
+ * `mcp.json`'s CONTENT fresh from disk — if this file were only rewritten
+ * AFTER a confirmed-alive relaunch (as `buildWorkspace`'s other, staleness-
+ * bookkeeping writes deliberately still are — see `resumeInPlaceExclusive`'s
+ * own doc comment on that ordering, and why it must NOT change for those
+ * other files), the relaunched process would read the STALE tool-binding set
+ * on its very first turn even though its own argv already claims the new
+ * channel. Byte-identical behavior to the equivalent block `buildWorkspace`
+ * used to inline directly — moving it doesn't change what it writes, only
+ * who else can call it and when.
+ *
+ * BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
+ * mcp.json alongside butchr's own and any externalMcpServers, `channel:
+ * true` or not — mcp.json is what gives Claude MCP TOOL access; the
+ * channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
+ * additive decision about PUSH notifications. No bindings -> byte-identical
+ * to before (Object.fromEntries([]) spreads nothing). A binding's headers
+ * are the union of its (per-RULE, env-resolved, potentially secret)
+ * `headersEnvVar` value and its (per-AGENT, always non-secret)
+ * `accountHeader` value — see `resolveMcpServerHeaders`/
+ * `resolveAccountHeader`'s own doc comments for why these are two
+ * different resolution mechanisms sharing one binding shape, not two
+ * competing ones.
+ */
+export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string): void {
+  let hasSecretHeaders = false;
+  const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
+    const envHeaders = resolveMcpServerHeaders(b);
+    if (envHeaders) hasSecretHeaders = true;
+    const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
+    const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
+    return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
+  }));
+  const mcpJsonPath = join(dir, "mcp.json");
+  writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
+  // Review finding, PR #387: a bound server's resolved header VALUE (often
+  // a bearer token) must never sit in a group/other-readable file at the
+  // default umask. `writeFileSync`'s own `mode` option only ever applies
+  // when it CREATES the file (a rebuilt workspace's mcp.json already
+  // exists), so this is an explicit chmod, not a write option, and only
+  // when this write
+  // actually carries a secret; a binding-less (or headers-less) mcp.json
+  // keeps its exact previous permissions, untouched. `accountHeader`'s own
+  // value (an account NAME, never a secret) never sets `hasSecretHeaders`
+  // by itself — only `headersEnvVar`'s resolution does.
+  if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
@@ -816,41 +869,7 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") {
-    // BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
-    // mcp.json alongside butchr's own and any externalMcpServers, `channel:
-    // true` or not — mcp.json is what gives Claude MCP TOOL access; the
-    // channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
-    // additive decision about PUSH notifications. No bindings -> byte-identical
-    // to before (Object.fromEntries([]) spreads nothing). A binding's headers
-    // are the union of its (per-RULE, env-resolved, potentially secret)
-    // `headersEnvVar` value and its (per-AGENT, always non-secret)
-    // `accountHeader` value — see `resolveMcpServerHeaders`/
-    // `resolveAccountHeader`'s own doc comments for why these are two
-    // different resolution mechanisms sharing one binding shape, not two
-    // competing ones.
-    let hasSecretHeaders = false;
-    const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const envHeaders = resolveMcpServerHeaders(b);
-      if (envHeaders) hasSecretHeaders = true;
-      const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
-      const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
-      return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
-    }));
-    const mcpJsonPath = join(dir, "mcp.json");
-    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
-    // Review finding, PR #387: a bound server's resolved header VALUE (often
-    // a bearer token) must never sit in a group/other-readable file at the
-    // default umask. `writeFileSync`'s own `mode` option only ever applies
-    // when it CREATES the file (a rebuilt workspace's mcp.json already
-    // exists), so this is an explicit chmod, not a write option, and only
-    // when this write
-    // actually carries a secret; a binding-less (or headers-less) mcp.json
-    // keeps its exact previous permissions, untouched. `accountHeader`'s own
-    // value (an account NAME, never a secret) never sets `hasSecretHeaders`
-    // by itself — only `headersEnvVar`'s resolution does.
-    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
-  }
+  if (provider === "claude") writeClaudeMcpJson(dir, spec, mcpUrl);
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
