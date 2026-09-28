@@ -8,6 +8,7 @@ import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { checkBearerOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "./bearer-origin-guard.js";
+import { resolveWebRoot, serveStaticAsset } from "./static-assets.js";
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -137,6 +138,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       });
       return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
     })
+    // FACTORY-432: the built React dashboard app (dashboard-app/,
+    // vite.config.ts), served as static files from src/web/static-assets.ts.
+    // Plumbing only — nothing above links here yet, and no page currently
+    // served by `/` or `/configurations` changes behavior because of this
+    // route existing.
+    .get("/dashboard-app", () => serveStaticAsset(resolveWebRoot(), "/"))
+    .get("/dashboard-app/*", ({ params }) => serveStaticAsset(resolveWebRoot(), "/" + (params["*"] ?? "")))
     // 503 (not just a false `ok`) when unhealthy, so a `curl -f` or any dumb
     // uptime checker goes red too — an endpoint nobody curls doesn't satisfy
     // "loud" (BUTCHR-18/BUTCHR-6).
