@@ -1075,8 +1075,12 @@ for — rebuilt every managed-sessions poll from each eligible definition's own
 manifest, never persisted or acted on stale). Since FACTORY-138, a `vendor:
 "claude"` definition that doesn't set the field at all is ELIGIBLE by default
 (the map's fill is `lizardMode ?? (vendor === "claude")`) — only an explicit
-`lizardMode: false` leaves it untouched; a `vendor: "codex"` definition stays
-not-eligible when absent, since it cannot set this field to begin with.
+`lizardMode: false` leaves it untouched; a `vendor: "codex"` definition CAN
+set the field (see "Codex support (FACTORY-108)" below), but stays
+not-eligible when absent by design, not by inability — a Codex launch only
+drops `--dangerously-bypass-approvals-and-sandbox` on an EXPLICIT `true`
+(see "Codex support" below), so defaulting it eligible would add a scan with
+no dialog it could ever find to answer.
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
 field is independent, and a definition may set it alongside any
