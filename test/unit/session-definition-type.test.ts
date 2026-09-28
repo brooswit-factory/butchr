@@ -13,6 +13,7 @@ import {
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
 import { listFilesystemResources } from "../../src/resources/filesystem.js";
+import type { SessionDefinition } from "../../src/resources/session-definition.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 
@@ -453,6 +454,61 @@ describe("createSessionDefinitionEventRules", () => {
     expect(await changed.decide(key, "someone-else", "primary")).toEqual({ deliver: false });
     expect(changed.changedRelated).toEqual([]);
     expect(await changed.decide(key, key, "related")).toEqual({ deliver: false });
+  });
+
+  // FACTORY-417: a `brief`/`workingDirectory` content move on an otherwise
+  // size/mtime-changed pair delivers WITH a `definitionField` reason naming
+  // the new value(s) — every other field edit (this test's own baseline,
+  // above) keeps delivering with no `reason` at all. Same diff/decide/notify
+  // machinery as the baseline test, so idempotence (a key only ever appears
+  // in `changedPrimary` for the ONE poll its [size, mtimeMs] pair actually
+  // moved, never again once `prev` catches up to it) is inherited, not
+  // reimplemented — this test only pins the NEW `reason`, not that property.
+  const rule = builtinManagedSessionsRule("/defs");
+  const baseDefinition: SessionDefinition = { workingDirectory: "/repo/old", brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false };
+  const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" });
+  const unitWith = (def: SessionDefinition, r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition: def } });
+
+  test("brief content move: delivers with { definitionField: { brief: <new> } }, workingDirectory absent from the reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief." }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { brief: "New brief." } } });
+  });
+
+  test("workingDirectory content move: delivers with { definitionField: { workingDirectory: <new> } }, brief absent from the reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { workingDirectory: "/repo/new" } } });
+  });
+
+  test("both brief and workingDirectory move in the same poll: both keys present in the one reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief.", workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({
+      deliver: true,
+      reason: { definitionField: { brief: "New brief.", workingDirectory: "/repo/new" } },
+    });
+  });
+
+  // No regression (this ticket's own AC3): a field OUTSIDE this ticket's
+  // scope changing (here, `vendor`) still delivers with no `reason` at all —
+  // the exact same shape the pre-existing baseline test above pins.
+  test("a non-brief/workingDirectory field move (e.g. vendor) still delivers with no reason — unchanged from before this ticket", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, role: "sentinel" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true });
   });
 });
 
