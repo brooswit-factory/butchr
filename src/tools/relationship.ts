@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
@@ -7,7 +7,7 @@ import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
 import { resolveEligibleProjects, advanceProjectWatermark } from "../resources/project.js";
-import { ruleBriefHeader, workspaceDirFor, workspaceRoot, type SpawnSpec } from "../agents/workspace.js";
+import { ruleBriefHeader, workspaceDirsForResource, agentIdOfWorkspacePath, type SpawnSpec } from "../agents/workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { ADMISSION_PREFIX, AGENT_PREFIX } from "../labels/plan.js";
 import { Refusal } from "./outcome.js";
@@ -1940,16 +1940,24 @@ export interface CorrectWorkerResult {
  * returned `message` names that gap explicitly.
  */
 function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace-on-disk" | "rewritten" | "failed"; error?: string } {
-  const providerDir = join(workspaceRoot(), "jira-work");
-  let ruleIds: string[];
-  try { ruleIds = readdirSync(providerDir); } catch { return { outcome: "no-workspace-on-disk" }; }
+  // FACTORY-118: `workspaceDirsForResource`, not a hand-rolled walk
+  // assuming a fixed leaf name — a migrated resource's leaf is now
+  // FACTORY-90's short display id rather than its raw percent-encoded
+  // resource id, though the three-deep `<root>/<provider>/<ruleId>/<leaf>`
+  // shape itself is unchanged. The helper already covers BOTH layouts, so
+  // this stays correct for a resource with some rules' workspaces migrated
+  // and others not yet.
+  let dirs: string[];
+  try { dirs = workspaceDirsForResource("jira-work", spec.key); } catch { return { outcome: "no-workspace-on-disk" }; }
   let rewrote = false;
-  for (const ruleId of ruleIds) {
-    const briefPath = join(workspaceDirFor(`jira-work:${ruleId}:${spec.key}`), "brief.md");
-    if (!decodeAgentKey(`jira-work:${ruleId}:${spec.key}`) || !existsSync(briefPath)) continue;
+  for (const dir of dirs) {
+    const id = agentIdOfWorkspacePath(dir);
+    const decoded = id ? decodeAgentKey(id) : null;
+    const briefPath = join(dir, "brief.md");
+    if (!decoded || !existsSync(briefPath)) continue;
     try {
       const [, ...rest] = readFileSync(briefPath, "utf8").split("\n");
-      writeFileSync(briefPath, [ruleBriefHeader(ruleId, spec.key, spec.summary), ...rest].join("\n"));
+      writeFileSync(briefPath, [ruleBriefHeader(decoded.ruleId, spec.key, spec.summary), ...rest].join("\n"));
       rewrote = true;
     } catch (e) {
       return { outcome: "failed", error: (e as Error).message };

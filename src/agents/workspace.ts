@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync, renameSync, rmdirSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -14,10 +14,12 @@ import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
-import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
+import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, type AgentKeyParts, type ResourceProvider } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
+import { collisionSuffix, shortDisplayId } from "../rules/display-label.js";
 import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 import { codexReasoningEffortFlag } from "../resources/power-scale.js";
+import { MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
 
 /**
  * `key` is the herd identity: a rule-engine agent key
@@ -123,7 +125,7 @@ export interface SpawnSpec {
    * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
    */
   cwd?: string;
-  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means today's behaviour exactly — no `permissionMode` is sent, same as before this ticket. */
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means `agentLaunchConfig` applies ITS OWN default (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, or `"auto"` for a `jira-project` agent) rather than sending nothing — see that function's own doc comment; FACTORY-138 changed this from "no flag sent, Drovr's own bypassPermissions fallback applies" to an explicit butchr-owned default. */
   permissionMode?: string;
   /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
   strictMcpConfig?: boolean;
@@ -235,38 +237,375 @@ export const effortFor = (issuetype: string): string =>
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
 /**
+ * FACTORY-118: the bookkeeping file a NEW-layout (short display name)
+ * workspace directory carries, recording the FULL agent key that produced
+ * it — the one thing a short, lossy display name can never itself decode
+ * back into (see `baseDisplayLabel`, src/rules/display-label.ts, which is
+ * deliberately lossy: two different keys can and do render the same short
+ * id, e.g. two `filesystem` resources named `rinth` under different
+ * parents). This is the lossless half of "short readable path, still a
+ * bijection with the agent key" — `agentIdOfWorkspacePath` reads it back;
+ * `ensureWorkspaceDir`/`buildWorkspace` are the only writers. Content is the
+ * bare JSON-encoded key string, same minimal shape as this file's siblings
+ * (`.butchr-permission-mode.json` etc, immediately below in this file).
+ */
+export const AGENT_KEY_BOOKKEEPING_FILE = ".butchr-agent-key.json";
+
+/** Reads back a directory's own bookkeeping stamp, or `null` if absent, unreadable, or not a real agent key (a corrupted/foreign file — treated exactly like "no stamp", never trusted half-way). */
+export function readBookkeptAgentKey(dir: string): string | null {
+  try {
+    const raw: unknown = JSON.parse(readFileSync(join(dir, AGENT_KEY_BOOKKEEPING_FILE), "utf8"));
+    return typeof raw === "string" && decodeAnyAgentKey(raw) ? raw : null;
+  } catch { return null; }
+}
+
+/** Stamps `dir` with `id` — see `AGENT_KEY_BOOKKEEPING_FILE`'s own doc comment. Caller's job to have created `dir` first. */
+export function writeBookkeptAgentKey(dir: string, id: string): void {
+  writeFileSync(join(dir, AGENT_KEY_BOOKKEEPING_FILE), JSON.stringify(id));
+}
+
+/**
+ * Claude Code's own project-slug algorithm (verified against
+ * `@brooswit/drovr`'s independent reimplementation and empirically against
+ * the real `claude` CLI — see docs/workspace-layout.md's "Empirical slug
+ * verification" section). Lives here, not in `workspace-migration.ts`,
+ * because `newLayoutDirFor` below needs it too (A4's slug-collision check) —
+ * `workspace-migration.ts` imports this one copy rather than keeping its own.
+ */
+export function claudeProjectSlug(cwd: string): string {
+  return resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
+}
+
+/**
+ * The pre-FACTORY-118 leaf: `encodeAgentKey`'s own per-segment
+ * `encodeURIComponent`, unchanged — every rule-engine workspace's leaf
+ * before this ticket, and the fallback FACTORY-118's own Addendum A2
+ * requires whenever a provider's short id is not a safe single path segment.
+ */
+const legacyLeaf = (resourceId: string): string => encodeURIComponent(resourceId);
+
+/**
+ * FACTORY-118 Addendum A2: a provider's short id is free text — it can be
+ * empty, `.`/`..`, contain `/` or NUL, or exceed a filesystem name-component
+ * byte limit (see `filesystemShortDisplayId`'s and `managedSessionShortDisplayId`'s
+ * own doc comments, src/rules/*-type.ts, for concrete producers of each
+ * hostile shape). This is the one gate every candidate leaf must pass before
+ * `join()` is ever called on it — a leaf this rejects would otherwise make
+ * `join()` return the rule directory itself (`.`/`..`), escape it (a
+ * candidate containing `/`), or throw at `mkdirSync` (NUL, over-length).
+ * Exported so `test/unit/workspace.test.ts` can pin EVERY hostile shape
+ * directly — not every one is reachable through a real provider's own
+ * `shortDisplayId` method with a resourceId `encodeAgentKey` would ever have
+ * accepted (a NUL or `.`/`..` short id has no known real producer), and this
+ * function's own contract does not depend on one existing.
+ * Deliberately permissive otherwise: `:`, `#`, spaces and non-ASCII are all
+ * valid single-path-segment bytes on a real filesystem, so — unlike the
+ * pre-Addendum herdr-LABEL sanitization this ticket's own leaf naming does
+ * NOT reuse — none of those are rewritten; the leaf is either the provider's
+ * real short id, verbatim, or (on failure here) `legacyLeaf` above.
+ */
+export function isValidLeaf(leaf: string): boolean {
+  if (leaf.length === 0 || leaf === "." || leaf === "..") return false;
+  if (leaf.includes("/") || leaf.includes("\0")) return false;
+  return Buffer.byteLength(leaf, "utf8") <= MAX_ENCODED_SEGMENT_BYTES;
+}
+
+/**
+ * The leaf a resource-kind key's workspace would get under this ticket's
+ * naming rule, and whether that leaf actually DIFFERS from the pre-FACTORY-118
+ * one (`legacyLeaf`). `changed: false` is what lets `newLayoutDirFor` below
+ * skip every bit of collision/sticky/slug machinery for a provider whose
+ * short id already equals its legacy encoded id (`jira-work`, `jira-idea`,
+ * `jira-project` — Addendum A1's own "NO change and NO filesystem writes"
+ * requirement for exactly these): when the leaf never moves, there is
+ * nothing to disambiguate and nothing to stamp — the pre-existing
+ * segment-decode path in `agentIdOfWorkspacePath` already recognises it.
+ */
+function candidateLeaf(decoded: AgentKeyParts): { leaf: string; changed: boolean } {
+  const legacy = legacyLeaf(decoded.resourceId);
+  const short = shortDisplayId(decoded.resourceProvider, decoded.ruleId, decoded.resourceId);
+  const leaf = isValidLeaf(short) ? short : legacy;
+  return { leaf, changed: leaf !== legacy };
+}
+
+/**
+ * Every currently-existing rule-engine workspace directory under `root`,
+ * old-layout or new-layout, whichever it actually lives at right now —
+ * `<root>/<provider>/<ruleId>/<leaf>`, three levels, read-only. Shared by
+ * `workspaceDirsForResource` (below) and `newLayoutDirFor`'s own A4
+ * slug-collision scan.
+ */
+function existingWorkspaceDirs(root: string): string[] {
+  const out: string[] = [];
+  let providers: string[];
+  try { providers = readdirSync(root); } catch { return out; }
+  for (const provider of providers) {
+    let ruleIds: string[];
+    try { ruleIds = readdirSync(join(root, provider)); } catch { continue; }
+    for (const ruleId of ruleIds) {
+      let leaves: string[];
+      try { leaves = readdirSync(join(root, provider, ruleId)); } catch { continue; }
+      for (const leaf of leaves) out.push(join(root, provider, ruleId, leaf));
+    }
+  }
+  return out;
+}
+
+/**
+ * FACTORY-118 Addendum A4: Claude Code's own slug is LOSSY (every
+ * non-alphanumeric character becomes `-`), so two different directory paths
+ * can collapse onto the same `~/.claude/projects/<slug>` — sharing a slug
+ * means two agents silently share (and overwrite) each other's memory, a new
+ * instance of this ticket's own hazard. `true` iff some OTHER
+ * already-existing workspace directory under `root` slugs identically to
+ * `candidateDir` (never compares `candidateDir` against itself — it need not
+ * exist yet, and if it already does, that is `candidateDir`'s own prior
+ * assignment, not a collision).
+ */
+function slugCollides(candidateDir: string, root: string): boolean {
+  const slug = claudeProjectSlug(candidateDir);
+  return existingWorkspaceDirs(root).some((dir) => resolve(dir) !== resolve(candidateDir) && claudeProjectSlug(dir) === slug);
+}
+
+/**
+ * The new-layout leaf `id` (a resource-kind key) would get, resolved WITHOUT
+ * regard to any old-layout directory that might still exist for it —
+ * `workspaceDirFor`'s own step 3 below, skipping step 2 (see that function's
+ * own doc comment). `migrateWorkspaceLayout` (src/agents/workspace-migration.ts)
+ * needs exactly this: the migration TARGET, by definition always the new
+ * layout's answer regardless of where the workspace currently lives.
+ *
+ * STABLE, STICKY RESOLUTION (Addendum A3): a leaf is chosen ONCE and never
+ * recomputed-and-renamed just because some OTHER resource later appears or
+ * disappears — first-come-first-served, not `resolveDisplayLabels`'s own
+ * recomputed tie-break (that is free to shift because a herdr LABEL is
+ * disposable text; a directory name is not, since Claude Code's memory slug
+ * is keyed on it). Resolution order:
+ *   1. A directory already stamped with EXACTLY this key, at either the
+ *      bare or the suffixed candidate leaf — reuse it. Stable across
+ *      restarts with no in-memory state.
+ *   2. A fresh assignment: the bare leaf, unless it is already occupied by
+ *      a DIFFERENT key (on disk, per Addendum A6's "in-workspace record is a
+ *      hint, not an authority" — occupied means SOME directory exists there,
+ *      not that its stamp names this key) or slug-collides with any other
+ *      known workspace dir (Addendum A4) — either case gets the deterministic
+ *      `<leaf>-<collisionSuffix(id)>` suffix, and FACTORY-90's own single
+ *      loud log line.
+ * Never mutates anything — a handful of reads, never a write.
+ */
+export function newLayoutDirFor(id: string, root: string = workspaceRoot()): string {
+  const decoded = decodeAnyAgentKey(id);
+  // Not a rule-engine key at all, or a query-level key (Addendum A1: query agents keep their pre-FACTORY-118 leaf unchanged) — same fixed shape either way.
+  if (!decoded || decoded.kind === "query") return join(root, ...id.split(SEGMENT_SEP));
+
+  const ruleDir = join(root, decoded.resourceProvider, decoded.ruleId);
+  const { leaf, changed } = candidateLeaf(decoded);
+  if (!changed) return join(ruleDir, leaf); // identity short id — always equals the legacy path; see candidateLeaf's own doc comment
+
+  const bareDir = join(ruleDir, leaf);
+  if (readBookkeptAgentKey(bareDir) === id) return bareDir;
+  const suffixedLeaf = `${leaf}-${collisionSuffix(id)}`;
+  const suffixedDir = join(ruleDir, suffixedLeaf);
+  if (readBookkeptAgentKey(suffixedDir) === id) return suffixedDir;
+
+  if (existsSync(bareDir) || slugCollides(bareDir, root)) {
+    console.error(`butchr: [workspace-dir] "${leaf}" (${id}) collides with an existing workspace directory or Claude Code memory slug — using "${suffixedLeaf}" instead`);
+    return suffixedDir;
+  }
+  return bareDir;
+}
+
+const SEGMENT_SEP = ":";
+
+/**
  * Where an agent's workspace lives. A rule-engine agent key — per-resource
  * (`encodeAgentKey`) or query-level (`encodeQueryAgentKey`, BUTCHR-397) —
- * maps to `<root>/<provider>/<ruleId>/<resourceId-or-"%40query">` (each
- * segment already URI-escaped by the key codec, so the key's `:`-joined
- * parts ARE the path segments). Anything else keeps the legacy `<root>/<id>`
- * layout. The two layouts cannot collide: a legacy directory is one level
- * deep, a rule-engine one is three — so a legacy workspace is never reused,
- * rewritten, or adopted by a rule agent for the same ticket. A query-level
- * workspace sits as a SIBLING of that same rule's per-resource ones, never
- * their ancestor (see `QUERY_AGENT_MARKER`'s own comment in agent-key.ts).
+ * keeps the pre-FACTORY-118 three-deep shape (`<root>/<provider>/<ruleId>/<leaf>`);
+ * only a resource-kind key's LEAF changes, from the raw percent-encoded
+ * resource id to FACTORY-90's own per-provider short display id
+ * (`shortDisplayId`, reused — never a second naming scheme, and never
+ * combined with the ruleId the way a herdr LABEL combines it, since the
+ * ruleId is already this path's own middle segment — see `newLayoutDirFor`'s
+ * own doc comment for the full resolution order). Anything else (a legacy
+ * bare id, e.g. `AGY-1`) keeps the pre-rules `<root>/<id>` layout, unchanged.
+ *
+ * RESOLUTION ORDER, each step is what makes migration and cold-start both
+ * safe:
+ *   1. `newLayoutDirFor`'s own answer, if a directory already stamped
+ *      (`AGENT_KEY_BOOKKEEPING_FILE`) with EXACTLY this key already lives
+ *      there.
+ *   2. The pre-FACTORY-118 leaf (`<root>/<provider>/<ruleId>/<legacyLeaf>`),
+ *      if it still exists on disk and carries no bookkeeping stamp for a
+ *      DIFFERENT key — this workspace has not been migrated yet, and
+ *      `workspaceDirFor` must keep pointing at where it ACTUALLY lives until
+ *      a migration pass moves it (see `migrateWorkspaceLayout` below), never
+ *      silently start looking for it somewhere nothing has moved it to.
+ *   3. A fresh assignment: `newLayoutDirFor`'s own answer. Only
+ *      `ensureWorkspaceDir` below ever turns this into a real, stamped
+ *      directory — this function itself never creates or writes anything.
  */
 export function workspaceDirFor(id: string, root: string = workspaceRoot()): string {
-  return decodeAnyAgentKey(id) ? join(root, ...id.split(":")) : join(root, id);
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return join(root, id); // legacy/bare id — unchanged
+
+  const target = newLayoutDirFor(id, root);
+  if (readBookkeptAgentKey(target) === id) return target;
+
+  const oldDir = join(root, ...id.split(SEGMENT_SEP));
+  if (existsSync(oldDir) && !readBookkeptAgentKey(oldDir)) return oldDir;
+
+  return target;
+}
+
+/**
+ * Creates (if absent) and returns the workspace directory for `id`,
+ * stamping it with `id`'s own bookkeeping file (`AGENT_KEY_BOOKKEEPING_FILE`)
+ * the FIRST time it is claimed — never re-stamped afterward, and a no-op
+ * (besides the harmless recursive `mkdir`) once already stamped. This is
+ * the ONLY function in this codebase that may bring a rule-engine
+ * workspace directory into existence; `buildWorkspace`, `resource-connections.ts`'s
+ * `prepare()`, and `HerdrHerd`'s own `lifecycle()` (src/agents/herd.ts) all
+ * go through this rather than pairing a bare `workspaceDirFor` with their
+ * own `mkdirSync` — centralizing the claim is what closes the collision
+ * race two DIFFERENT keys sharing a base label could otherwise hit: two
+ * concurrent first-time callers computing `workspaceDirFor` for two
+ * different colliding keys could, if each created its own directory
+ * independently, both see the bare name as "free" and both claim it. Since
+ * every real caller reaches this function synchronously with no `await`
+ * between its own `workspaceDirFor` recomputation and its `mkdirSync`/stamp
+ * (this function itself has no `await` either), one caller's claim always
+ * completes before another's begins — JS's single-threaded, run-to-completion
+ * semantics make this atomic in practice, with no explicit lock needed.
+ * Legacy/bare ids (unowned by any rule), query-level keys (Addendum A1:
+ * unchanged leaf), and a resource-kind key whose leaf equals its legacy one
+ * (Addendum A1: identity short ids — `jira-work`/`jira-idea`/`jira-project`)
+ * are created but NEVER stamped — for the first two there is no full agent
+ * key to lose (nothing would ever read the stamp) or no leaf change to
+ * record; for the third, stamping would be a pure, forbidden filesystem
+ * write with nothing to show for it (the pre-existing segment-decode path in
+ * `agentIdOfWorkspacePath` already recognises this exact directory).
+ */
+export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): string {
+  const decoded = decodeAnyAgentKey(id);
+  // Computed BEFORE `mkdirSync` below creates anything: `newLayoutDirFor`'s
+  // own A4 slug-collision/A3 occupied-bare-name checks read what currently
+  // EXISTS on disk, so evaluating it after this call's own `mkdirSync` would
+  // make a key see its own freshly-created (not-yet-stamped) directory as
+  // "occupied by someone else" and wrongly suffix itself — caught by
+  // `workspace.test.ts`'s own "spec.cwd does NOT redirect buildWorkspace"
+  // case before this ever shipped.
+  const target = decoded ? newLayoutDirFor(id, root) : null;
+  const dir = workspaceDirFor(id, root);
+  mkdirSync(dir, { recursive: true });
+  // FACTORY-118: stamp ONLY when `dir` is actually the NEW-layout location —
+  // never the pre-migration three-deep one `workspaceDirFor` can also
+  // return (its own step 2, for a not-yet-migrated workspace). Stamping is a
+  // new-layout-only concept (`AGENT_KEY_BOOKKEEPING_FILE`'s own doc
+  // comment); stamping an OLD-layout dir here would be actively harmful, not
+  // just useless: `workspaceDirFor`'s step 2 condition for "still at the old
+  // path" is precisely `!readBookkeptAgentKey(oldDir)`, so stamping it flips
+  // that condition on the VERY NEXT call — before any migration has
+  // actually moved anything — and `workspaceDirFor` starts reporting the
+  // (still-nonexistent) new-layout path instead, orphaning the real,
+  // unmoved content at the old path with nothing left pointing at it. Caught
+  // by `workspace-migration.test.ts`'s own partial-failure coverage before
+  // this ever shipped. AND only for a resource-kind key whose leaf actually
+  // moved (`candidateLeaf`'s own `changed` flag) — see this function's own
+  // doc comment for why an identity-short-id provider or a query-level key
+  // must see no write at all.
+  const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded).changed;
+  // Compares against `target` (computed BEFORE `mkdirSync` above) — never a
+  // fresh `newLayoutDirFor(id, root)` call here, which would see this call's
+  // own just-created, not-yet-stamped directory as "occupied by someone
+  // else" and reroute to a suffixed alternative, contradicting `dir` (this
+  // exact bug is what the comment on `target`'s own declaration above
+  // describes being caught and fixed before shipping — this line had
+  // regressed back to the recomputing form).
+  if (leafActuallyMoved && dir === target && !readBookkeptAgentKey(dir)) writeBookkeptAgentKey(dir, id);
+  return dir;
 }
 
 /**
  * The herd id owning `cwd`, inverse of `workspaceDirFor`: a canonical agent
- * key (per-resource or query-level) for a three-deep rule-engine workspace,
- * the upper-cased directory name for a legacy one-deep workspace, `null` for
- * anything else. Legacy ids are still reported so legacy agents stay visible
- * (dashboard, admission census); the rule loop's `ownsId` is what keeps it
- * from ever stopping or adopting them.
+ * key (per-resource or query-level) for a workspace at ANY layout this
+ * codebase has ever produced — the new short-name one (bookkeeping stamp
+ * read back, FACTORY-118), the pre-FACTORY-118 three-deep rule-engine one
+ * (segment decode, unchanged), or a legacy one-deep bare-id workspace
+ * (upper-cased directory name, unchanged) — `null` for anything else,
+ * INCLUDING a one-deep directory with no bookkeeping stamp that doesn't
+ * look like a legacy id either (there is no such case today: every
+ * one-deep directory this codebase creates is either legacy-bare or
+ * stamped, so this fallback only ever matters for a foreign, non-butchr
+ * directory dropped under `root` by something else — never adopted, per
+ * this ticket's own requirement). A workspace whose directory has not been
+ * migrated to the new layout is still recognised, unchanged from before
+ * this ticket, via the second (segment-decode) branch — the whole reason
+ * `workspaceDirFor` above leaves an unmigrated workspace at its OLD path
+ * rather than silently expecting it at the new one. Legacy ids are still
+ * reported so legacy agents stay visible (dashboard, admission census); the
+ * rule loop's `ownsId` is what keeps it from ever stopping or adopting
+ * them.
  */
 export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
   if (!cwd) return null;
   const rel = relative(root, cwd);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
   const segments = rel.split(sep);
-  if (segments.length === 1) return segments[0]!.toUpperCase();
+  if (segments.length === 1) {
+    const stamped = readBookkeptAgentKey(cwd);
+    return stamped ?? segments[0]!.toUpperCase();
+  }
   if (segments.length !== 3) return null;
-  const key = segments.join(":");
+  const [provider, ruleId, leaf] = segments as [string, string, string];
+  // FACTORY-118 Addendum A6: a bookkeeping stamp is a HINT, never an
+  // authority — trust it only when this directory's own location
+  // (provider/ruleId match the stamped key's, AND the leaf is one of that
+  // key's own legitimate forms: its short id, that short id's collision
+  // suffix, or its legacy encoded id) is one the real machinery would have
+  // produced for it. A copied/edited stamp that fails this check falls
+  // through to the ordinary segment-decode below — "unrecognised", never
+  // "belongs to another key", and never a duplicate spawn.
+  const stamped = readBookkeptAgentKey(join(root, provider, ruleId, leaf));
+  if (stamped) {
+    const decoded = decodeAgentKey(stamped);
+    if (decoded && decoded.resourceProvider === provider && decoded.ruleId === ruleId && legitimateLeafFor(decoded, leaf)) return stamped;
+  }
+  const key = segments.join(SEGMENT_SEP);
   return decodeAnyAgentKey(key) ? key : null;
+}
+
+/** Addendum A6's own validity check — see `agentIdOfWorkspacePath`'s doc comment for why this exists. */
+function legitimateLeafFor(decoded: AgentKeyParts, leaf: string): boolean {
+  const key = encodeAgentKey(decoded);
+  const { leaf: shortLeaf, changed } = candidateLeaf(decoded);
+  if (!changed) return leaf === shortLeaf; // identity short id — the only legitimate leaf equals the (unchanged) legacy one too
+  return leaf === shortLeaf || leaf === `${shortLeaf}-${collisionSuffix(key)}` || leaf === legacyLeaf(decoded.resourceId);
+}
+
+/**
+ * Every currently-existing workspace directory — old three-deep layout or
+ * new short-name layout, whichever this workspace actually lives at right
+ * now — whose agent key names EXACTLY this `(resourceProvider, resourceId)`
+ * pair, under ANY rule id. For a caller that must reach a resource's
+ * workspace(s) without already knowing which rule(s) matched it
+ * (`rewriteWorkspaceBriefSummary`, src/tools/relationship.ts, the reason
+ * this exists) — one resource can have a rule-engine workspace per rule
+ * that matched it, same as before this ticket; this just finds them
+ * without assuming the old fixed directory shape. Read-only; never creates
+ * or migrates anything. Order is not meaningful (a `Set`, insertion order
+ * of two independent scans).
+ */
+export function workspaceDirsForResource(resourceProvider: ResourceProvider, resourceId: string, root: string = workspaceRoot()): string[] {
+  const out = new Set<string>();
+  let ruleIds: string[];
+  try { ruleIds = readdirSync(join(root, resourceProvider)); } catch { ruleIds = []; }
+  for (const ruleId of ruleIds) {
+    let key: string;
+    try { key = encodeAgentKey({ resourceProvider, ruleId, resourceId }); } catch { continue; } // stray non-rule-shaped entry under the provider folder — not a real workspace
+    const dir = workspaceDirFor(key, root);
+    if (existsSync(dir)) out.add(dir);
+  }
+  return [...out];
 }
 
 /**
@@ -353,8 +692,17 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // comment for why butchr's bookkeeping files must never land in an
   // operator's own project directory. `spec.cwd`, when present, only ever
   // reaches the launched PROCESS's cwd (`agentLaunchConfig`, src/agents/argv.ts).
-  const dir = workspaceDirFor(spec.key);
-  if (spec.cwd !== undefined) assertNoInheritedMcpConfig(dir);
+  // FACTORY-118: the guard below must run BEFORE anything is created on disk
+  // (`assertNoInheritedMcpConfig`'s own "refuse before write" contract) — so
+  // resolve the path with a bare, non-creating `workspaceDirFor` first, and
+  // only call `ensureWorkspaceDir` (which claims + stamps the directory —
+  // see that function's own doc comment for why centralizing the claim here
+  // is what closes the two-different-colliding-keys race) once the guard has
+  // already passed. Both calls resolve to the same path: nothing on disk
+  // changes between them, since the guard is read-only.
+  const plannedDir = workspaceDirFor(spec.key);
+  if (spec.cwd !== undefined) assertNoInheritedMcpConfig(plannedDir);
+  const dir = ensureWorkspaceDir(spec.key);
   const resource = resourceOfSpec(spec);
   if (spec.externalMcpServers) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-external-mcp.json"),JSON.stringify(spec.externalMcpServers),{mode:0o600}); }
   // BUTCHR-408: `McpServerBinding` never carries a resolved header VALUE

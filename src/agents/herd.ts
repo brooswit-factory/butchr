@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -398,8 +398,20 @@ export class HerdrHerd implements Herd {
   private lifecycle(issue: string): ManagedHerdrLifecycle {
     let lifecycle = this.lifecycles.get(issue);
     if (!lifecycle) {
+      // FACTORY-118: `ensureWorkspaceDir`, not a bare `workspaceDirFor` —
+      // claims (creates + stamps) the directory synchronously, right here,
+      // the FIRST time any code path references this issue's lifecycle
+      // (cached in `this.lifecycles` from then on). That is what closes the
+      // two-different-colliding-short-names race for the spawn path
+      // specifically: `startProviders` (below) calls `this.lifecycle(spec.key)`
+      // well before its own `buildWorkspace` call, so without this, a
+      // second colliding key's spawn interleaving in between could claim
+      // the bare short name first, leaving THIS key's cached `cwd` pointing
+      // at a directory a later `workspaceDirFor` recomputation would no
+      // longer agree is free. See `ensureWorkspaceDir`'s own doc comment
+      // (src/agents/workspace.ts) for why this is race-free without a lock.
       lifecycle = new ManagedHerdrLifecycle({
-        client: this.herdr, cwd: workspaceDirFor(issue),
+        client: this.herdr, cwd: ensureWorkspaceDir(issue),
         availability: this.availability, wait: this.wait,
         startOptions: {
           readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS,

@@ -1,5 +1,14 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-145: every `answered:` journal line and audit record now carries
+> a `trigger` (`"fast"` or `"sweep"`), plus a `latencyMs` number when
+> `trigger` is `"fast"`.** See "Fast-path latency (FACTORY-145)" further down
+> for the exact field shapes and how to compute p50/p95 from the audit file.
+> `latencyMs` is a lower bound on the operator-visible wait (it excludes
+> whatever time herdr itself took to notice the pane went blocked and get a
+> frame to butchr, plus ordinary network/socket delay before receipt) and is
+> never emitted for a sweep-triggered answer, whose true wait is unknowable.
+
 > **FACTORY-98 (FACTORY-97): a lizard-eligible pane is now usually answered
 > within about a second, not up to 20s.** The daemon opens a herdr push
 > subscription (`pane.agent_status_changed`) filtered to exactly the
@@ -7,10 +16,8 @@
 > transition. The 20s scan below is unchanged and still runs as a fallback —
 > see "Event-driven: the fast path (FACTORY-98)" further down for what
 > changed, why it still needs the scan at all, and what stayed a scan-only
-> path (CPU sanity, respawn-loop safety). Text above and below that section
-> describing "the" 20s timer as the only mechanism predates this change but
-> is otherwise still accurate: the scan itself, its opt-in gate, its cadence,
-> and its audit/journal behavior are all unchanged.
+> path (CPU sanity, respawn-loop safety). The scan itself, its opt-in gate,
+> its cadence, and its audit/journal behavior are unchanged.
 
 > **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
 > with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
@@ -19,29 +26,32 @@
 > project" and was silently skipped, freezing the codey canary. No stored
 > allow rules are written any more. Every skipped pane is now logged
 > (`[permission-answer] <label> (<pane>) SKIPPED, left for a human: <reason>`),
-> once per pane+reason. Text below describing the "always allow" option
-> predates this change.
+> once per pane+reason.
 
 ## What it is
 
-DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs? })`
+DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs?, scope? })`
 in `@brooswit/drovr` (>= 0.15.0): an unattended pass that scans every Claude
 pane for a pending tool-permission dialog ("Do you want to proceed?") and
-presses the "Yes, and always allow … from this project" stored-rule option
-only when it is unambiguously that option — auditing every attempt. DROVR-41
-proved it live against a real herdr pane and recommended wiring it into
-butchr's own daemon.
+presses an option on it, only when it is unambiguously the right one —
+auditing every attempt. As wired here (FACTORY-93, drovr >= 0.15.1) it always
+calls with `scope: "once"`, pressing plain "Yes" (allow once) and never the
+"Yes, and always allow … from this project" stored-rule option; no stored
+rule is ever written. DROVR-41 proved the mechanism live against a real
+herdr pane and recommended wiring it into butchr's own daemon.
 
 That recommendation (DROVR-42) was originally scoped as a blanket sweep over
 every Claude pane. Before it merged, FACTORY-67's director narrowed the ask:
 the operator wants this as an **explicit, per-agent opt-in** — `lizardMode: true`
 on a managed-session definition (`SessionDefinition`, `src/resources/session-definition.ts`)
-— named "lizard mode" for the combination the field exists for: `permissionMode: "default"`
-(Claude's manual/ask mode, prompting before every tool call) plus this field,
-so an agent gets manual mode's own safety for every OTHER decision while
-never sitting frozen on the ONE dialog drovr already knows how to answer
-unambiguously. A definition that doesn't set the field behaves exactly as
-before — nothing here is a blanket sweep.
+— named "lizard mode". It is a SEPARATE toggle from `permissionMode`, not
+tied to any one value of it: it pairs with any `permissionMode` that still
+prompts before a tool call (manual/`"default"` included, but also, e.g.,
+`"acceptEdits"`, which auto-accepts file edits but still prompts for Bash and
+MCP tool calls), so an agent gets that mode's own safety for every prompt it
+still shows while never sitting frozen on the ONE dialog drovr already knows
+how to answer unambiguously. A definition that doesn't set the field behaves
+exactly as before — nothing here is a blanket sweep.
 
 `src/agents/permission-answer-loop.ts` is the daemon-side wiring:
 `startPermissionAnswerLoop` wraps `autoAnswerPermissions` on its own
@@ -142,7 +152,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s | only `lizardMode: true` panes | the tool-permission "always allow" dialog only, via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only `lizardMode: true` panes | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall
@@ -275,6 +285,95 @@ restart could see as stale. A `stop()`/restart of the watch simply closes
 whatever subscription is open and re-derives everything from the next
 `agent.list()` call, same as the scan-only version always did.
 
+## Fast-path latency (FACTORY-145)
+
+FACTORY-98 made a lizard-eligible pane usually get answered within about a
+second, but the `answered:` journal line only recorded that an answer
+happened, with the journal's own 1s timestamp resolution — no number a p50/p95
+could be computed from. FACTORY-145 adds one.
+
+**What's measured, and from where.** `permission-answer-watch.ts` records a
+monotonic instant (`deps.now`, default `performance.now`, never wall-clock —
+wall-clock can step backward or forward under NTP adjustment, corrupting an
+elapsed-time subtraction) the moment a pane's own `pane.agent_status_changed`
+push frame reports `blocked` (`fastPathTriggers: Map<paneId, instant>`).
+`runPermissionAnswerTick` (`permission-answer-loop.ts`) consumes that instant
+(reads it, then deletes it) for every pane it scans this tick, whether or not
+the pane ends up answered — a `skipped`/`failed` outcome must not leave a
+stale trigger instant behind for a later tick to (wrongly) measure against.
+For a pane that ends up `answered`, the elapsed time from that trigger
+instant to "this tick pressed its prompt" is `latencyMs`.
+
+**This is a lower bound on the operator-visible wait, not the whole of it.**
+The push frame's own shape (`{ pane_id, agent_status }`, no timestamp —
+checked against `@brooswit/herdr-sdk`'s own generated
+`PaneAgentStatusChangedEvent` type, which carries none) never tells butchr
+when herdr itself observed the pane go blocked, only when butchr received the
+frame reporting it. So `latencyMs` excludes whatever time herdr took to
+notice the transition and get a frame to butchr, plus ordinary network/socket
+delay ahead of receipt. Name it "latency from frame receipt", not "latency
+from the pane going blocked", if you write about it elsewhere.
+
+**Sweep-triggered answers carry no latency number at all — never a fabricated
+one.** A pane the sweep's own `agent.list()` scan discovers (no fast-path
+frame ever recorded for it — herdr's push connection was down, or the pane
+became eligible too recently to be subscribed yet, see "A newly-eligible
+pane's first tick is still scan-driven" above) may have been sitting blocked
+anywhere from 0 to one whole sweep interval before the scan happened to look.
+"Now minus when the sweep looked" is not a latency, it is an artefact that
+LOOKS like one and would silently drag a computed p95 downward. Such an
+answer's `trigger` is `"sweep"` and it carries no `latencyMs` field at all
+(never `latencyMs: null` — the field itself is entirely absent, so any reader
+that filters on the field being present rather than merely truthy still gets
+the right answer).
+
+**Field shapes**, both on the `[permission-answer] … answered: …` journal
+line (as a trailing `, fast, 247ms` or `, sweep` suffix) and on the
+`.permission-audit.jsonl` record appended right after drovr's own two
+records (`approving`/`approved`) for that pane's attempt:
+
+| field | present | type | meaning |
+| --- | --- | --- | --- |
+| `trigger` | always | `"fast" \| "sweep"` | which path caused this pane to be looked at THIS tick |
+| `latencyMs` | only when `trigger === "fast"` | number (ms, rounded, >= 0) | elapsed time from frame receipt to this tick pressing the prompt |
+
+The rest of the appended record (`ts`, `paneId`, `label`, `tool`, `request`)
+mirrors the journal line's own fields, so `jq` can filter and join on them
+without cross-referencing drovr's own `approving`/`approved` records for the
+same attempt.
+
+**Logging never risks or delays an answer.** The audit append happens AFTER
+`autoAnswerPermissions` has already returned its outcome for the pane — a
+failing `appendAudit` (disk full, permission denied) is caught and logged
+(`latency audit write failed for <pane>: <detail>`), never thrown, and never
+prevents or retries the answer itself, which has already happened by the time
+this write is attempted.
+
+### Computing p50/p95 from the audit file
+
+Every fast-path answer's own latency record is a single JSONL line with
+`trigger: "fast"` and a numeric `latencyMs` — filter on both (not just the
+field's presence) so a future record shape with `latencyMs: null` for some
+other reason can't sneak into the computation:
+
+```sh
+jq -s '
+  [ .[] | select(.trigger == "fast" and (.latencyMs | type == "number")) | .latencyMs ]
+  | sort
+  | . as $s
+  | { n: length,
+      p50: $s[(length * 0.50 | floor)],
+      p95: $s[(length * 0.95 | floor)] }
+' .permission-audit.jsonl
+```
+
+A `trigger: "sweep"` record has no `latencyMs` at all, so `.latencyMs | type
+== "number"` alone already excludes it — the explicit `trigger == "fast"`
+check is belt-and-suspenders documentation of intent, not load-bearing on its
+own, but keep both: a filter that only checks `.latencyMs` existing would
+misread a future field with a different meaning if one is ever added under
+the same name.
+
 ## The audit log
 
 `Config.permissionAuditPath` (`src/config/config.ts`): a JSONL file, default
@@ -287,26 +386,36 @@ distinct file.
 Every `approvePermission` attempt appends an `approving` record before any
 key is sent, and a second record with the outcome after — see
 `approvePermission`'s own doc comment (`@brooswit/drovr`). Every record
-carries `operator` and (on an `approved` outcome) the exact stored-rule
-`option` text that was pressed. This daemon's wiring passes
-`operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
+carries `operator` and, once a prompt's option was resolved, the exact
+`option` text that was pressed — always "Yes" (allow once) as this daemon
+calls it (`scope: "once"`), never a stored-rule option. This daemon's wiring
+passes `operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
 shared audit file, or a human comparing hosts, can tell butchr's own
 unattended pass apart from any other caller.
+
+**A third record follows drovr's own two, for every answered pane
+(FACTORY-145):** `runPermissionAnswerTick` itself appends one more JSONL line
+to the SAME `auditPath` right after drovr's `approving`/`approved` pair —
+this module owns that write, not drovr, since drovr's own `approvePermission`
+has no way to accept extra fields to fold into its own records. See "Fast-path
+latency (FACTORY-145)" above for its exact shape. A reader that assumed
+exactly two records per answered attempt (drovr's own historical contract)
+now sees three; nothing about drovr's own two records changed.
 
 ## Seeing recent auto-answers (FACTORY-67: mandatory, not optional)
 
 The daemon's own journal names WHICH AGENT and WHICH TOOL for every
 answer/failure, not just an opaque pane id: `[permission-answer] <definition
 file> (<pane id>) answered: <tool> — "<request excerpt>" (see <auditPath>
-for the exact stored-rule text)`, plus a per-tick summary line
+for the exact option text)`, plus a per-tick summary line
 (`N answered, M skipped, K failed`) whenever a tick answers or fails
 anything (an all-skipped or empty tick logs nothing, to keep the console
-quiet in normal operation). The exact "always allow" rule text pressed is
-not returned by `autoAnswerPermissions` itself — recovering it without
-re-parsing the pane's screen a second time (which this module deliberately
-never does; dialog recognition is drovr's job, not butchr's, per
-FACTORY-49/FACTORY-67) means pointing at the audit log's own `option` field
-for that literal text, which the journal line does.
+quiet in normal operation). The exact option text pressed — always "Yes"
+today — is not returned by `autoAnswerPermissions` itself — recovering it
+without re-parsing the pane's screen a second time (which this module
+deliberately never does; dialog recognition is drovr's job, not butchr's,
+per FACTORY-49/FACTORY-67) means pointing at the audit log's own `option`
+field for that literal text, which the journal line does.
 
 `tail -f <permissionAuditPath>` (or `grep`) gets the full per-attempt detail
 (promptId, scope, the exact option text, both the `approving` and `approved`/
@@ -329,3 +438,108 @@ that is a natural, separable follow-up.
   none setting `lizardMode`) and every existing rule (none setting either new
   field) load and behave unchanged. Deploys and any live cutover go through
   admin-assembly at the operator's direction.
+
+## Approval sound (FACTORY-100/FACTORY-103)
+
+An OPT-IN, OFF-by-default sound played on **this daemon's own host** every
+time this loop's `runPermissionAnswerTick` reports a pane `answered` — the
+operator's own request: a human in earshot of the host should hear each
+unattended approval as it happens, not just find it later in
+`permissionAuditPath`'s JSONL trail. Implemented in
+`src/agents/approval-sound.ts`, wired into the `onApproved` dep shared by
+`startPermissionAnswerLoop` and `startPermissionAnswerWatch`
+(`src/daemon/index.ts`), called once per answered pane regardless of which
+of the two wires it up — `onApproved` lives on `PermissionAnswerLoopDeps`,
+and `startPermissionAnswerWatch` forwards its own deps straight through to
+`runPermissionAnswerTick` (see `permission-answer-watch.ts`), so this hook
+does not care which sits on top.
+
+**Why the hook sits here, not in drovr.** The "approval" audit record itself
+(`outcome: "approved"`) is written by `@brooswit/drovr`'s
+`approvePermission` — a separate published npm package, not this repo.
+`runPermissionAnswerTick`'s own `answered` filter is the EARLIEST point in
+BUTCHR'S OWN code that knows a prompt was just approved, and it already
+flows through this exact function on every tick, whether the tick was fired
+by the sweep timer or the event-driven watch — tailing drovr's audit file as
+an event source would be strictly later, more expensive (a file watch or
+poll on top of the poll this loop already is), and has no precedent anywhere
+in this codebase. (An operator FACTORY-100 comment briefly asked whether the
+sound asset and its playback should both move into drovr; the ruling that
+followed keeps the hook here — only the SOUND ASSET itself moved into drovr,
+see "Default sound source" below.)
+
+**Config:** `Config.lizardApprovalSound?: { overridePath?: string }` — TWO
+SEPARATE env vars (`src/config/config.ts`): `BUTCHR_LIZARD_APPROVAL_SOUND`
+(any non-empty value enables the feature; absent/empty means disabled,
+today's behaviour exactly) and `BUTCHR_LIZARD_APPROVAL_SOUND_PATH` (optional,
+`~` expanded) as a local-file-path override. A path with the enable flag
+unset does NOT enable the feature — the flag is the master switch. Daemon/host
+level, not per-managed-session: the sound plays on the HOST's own speakers
+regardless of which agent's pane triggered it, so one knob is the natural
+fit — a per-definition setting would imply a per-agent sound the host cannot
+actually produce independently.
+
+**Default sound source: drovr's own bundled asset.** With the flag on and no
+override path, the source is `@brooswit/drovr`'s own bundled
+`assets/sounds/lizard-button.mp3` (FACTORY-122 ships it there) — resolved at
+runtime (`resolveDrovrBundledAsset`) by asking `import.meta.resolve` for the
+package's main entry (the only subpath its `exports` field exposes), then
+walking up the filesystem to the ancestor directory whose OWN `package.json`
+declares `name: "@brooswit/drovr"` (that package's `exports` does NOT expose
+`./package.json` or an arbitrary asset subpath as importable specifiers, so
+this walks the filesystem after resolving only the "." export rather than
+trying to `import()` either directly). The package or asset failing to
+resolve (missing, or a pin without the asset) logs ONE warning and disables
+the sound for the daemon's remaining lifetime, same as any other unresolvable
+source — see `test/unit/approval-sound.test.ts`'s REAL-PACKAGE GUARD test for
+why this is deliberately re-checked against the actually-installed package
+rather than only against fakes. **URL sources are out of scope** (cut after
+the operator's suggested `https://www.myinstants.com/...` value turned out to
+403 non-browser clients on this fleet's hosts, and a later redirect asked for
+the asset to live inside drovr rather than as a URL or a Butchr-side
+download) — this module does not build, keep, or document any download/cache
+path.
+
+**Player selection** (`chooseSoundPlayer`/`candidateSoundPlayers`): tries, in
+this fixed order, whichever of `gst-play-1.0`, `afplay`, `mpv`, `ffplay`
+(`-nodisp -autoexit -loglevel quiet`), `paplay`, `pw-play`, `aplay` is found
+on `PATH` (`Bun.which`, same detection primitive `detectTerminalPrefix`
+already uses for terminal emulators, `src/terminal/open.ts`). `aplay` (ALSA)
+cannot decode mp3, so it is restricted to `.wav` sources; every other player
+is tried against any format. `gst-play-1.0` is tried FIRST specifically
+because a live measurement on codey found `paplay`/`pw-play` both fail on mp3
+there (its libsndfile build has no mp3 support) while `gst-play-1.0` plays it
+fine — a candidate that exits non-zero or errors is treated as "try the next
+one", not success, walking the full fallback chain rather than giving up
+after the first installed candidate. The first candidate that actually
+succeeds is REMEMBERED and tried directly (skipping the PATH-lookup probe
+entirely) on every later approval; if it ever stops working, it is forgotten
+and the full fallback chain is re-probed from scratch. No usable player at
+all logs ONE warning and disables the sound for the daemon's remaining
+lifetime — it is never re-checked.
+
+**Coalescing:** `DEFAULT_COALESCE_MS` (1500ms, `createApprovalSoundNotifier`'s
+`coalesceMs` option) — a burst of approvals inside that window plays at most
+one sound (a leading-edge throttle: the first approval in a quiet period
+plays immediately; every approval before the window elapses is coalesced
+away; the next approval after the window plays again).
+
+**Journal evidence.** Every ACTUAL play logs one concise line naming the
+player, the file, and the exit status (e.g. `played <path> via "gst-play-1.0"
+(exit 0)`) — deliberately not a once-ever message like the failure warnings
+below, so admin-assembly can confirm from the journal alone that a real
+approval played the sound, every time.
+
+**Never touches the approval path.** `notifyApproved` is synchronous, never
+awaited by its caller, and wraps everything in `try`/`catch` — a throwing
+`onApproved` (or a throwing `now`/`has`/`spawn` dependency) cannot propagate
+into `runPermissionAnswerTick`, which ALSO wraps its own call to
+`deps.onApproved?.()` defensively (belt-and-suspenders). A player that fails
+to spawn (ENOENT), reports an async `"error"` event, or exits non-zero (the
+headless-host, no-audio-device case) each log at most one warning and are
+otherwise silent — this is a **deliberately different** failure mode from
+"no player found"/"source unresolvable" above: a playback-runtime failure
+does not disable the feature forever, since the underlying condition (no
+audio sink attached to a headless host) can never be distinguished here from
+a merely transient one, and the ticket's own requirement is "degrade silently
+after one warning", not "give up permanently".
