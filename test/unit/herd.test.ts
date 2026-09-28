@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -1895,6 +1895,40 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
   });
 });
 
+// FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 3): a
+// deliberate ALLOWLIST, never a blanket "any checkArgv failure is
+// resumable". Exercises the pure classifier directly — the integration path
+// (a real staleIssues()/resumeInPlace() round trip) is covered separately in
+// the "resumeInPlace" describe block below.
+describe("resumableArgvReason", () => {
+  const claudeCases: Array<[string, boolean]> = [
+    ["argv lacks --permission-mode bypassPermissions", true],
+    ["argv lacks --strict-mcp-config", true],
+    ["argv lacks --dangerously-load-development-channels server:x server:y", true],
+    // Combined — still every piece within the allowed set.
+    ["argv lacks --permission-mode bypassPermissions, --strict-mcp-config", true],
+    // A REQUIRED_CLAUDE_FLAGS member this ticket did NOT verify --resume
+    // against (the --mcp-config VALUE itself, e.g. a changed mcpUrl) —
+    // never allowed, alone or mixed with an allowed flag.
+    ["argv lacks --mcp-config http://new/mcp", false],
+    ["argv lacks --permission-mode bypassPermissions, --mcp-config http://new/mcp", false],
+    // The freeform-jira-project shape — a different AgentConfig entirely, never verified.
+    ["argv lacks --dangerously-bypass-approvals-and-sandbox", false],
+    ["argv lacks --cd /some/path", false],
+    // Not even a checkArgv-shaped reason (e.g. the Codex MCP isolation push site's own text).
+    ["Codex MCP isolation inventory missing", false],
+  ];
+  for (const [reason, expected] of claudeCases) {
+    test(`claude, "${reason}" -> ${expected}`, () => {
+      expect(resumableArgvReason(reason, "claude")).toBe(expected);
+    });
+  }
+  test("never true for a non-Claude provider, even for an otherwise-allowed reason", () => {
+    expect(resumableArgvReason("argv lacks --permission-mode bypassPermissions", "codex")).toBe(false);
+    expect(resumableArgvReason("argv lacks --strict-mcp-config", "agy")).toBe(false);
+  });
+});
+
 describe("resumeInPlace", () => {
   const instant = () => Promise.resolve();
   const CLAUDE_PROC = { pid: 1, argv: ["claude"], name: "claude" };
@@ -2269,6 +2303,127 @@ describe("resumeInPlace", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  });
+
+  // FACTORY-411/FACTORY-424 acceptance criterion 1: each candidate field
+  // preserves the session on a Claude-vendor agent when it changes ALONE,
+  // proven through the PRODUCTION spawn path — `HerdrHerd.staleIssues()`
+  // detecting the drift as `resumable`, then the REAL `resumeInPlaceExclusive`
+  // (`statefulHerdr`'s multi-step /exit-then-relaunch protocol, not an
+  // isolated `agentStartParams` builder call) actually carrying it out. Not
+  // an isolated-builder test — the exact gap this ticket's own acceptance
+  // criteria name as having shipped a defect behind a green gate once
+  // already.
+  test("FACTORY-411/FACTORY-424: a permissionMode-only drift is detected as resumable by staleIssues(), and resumeInPlace() resumes the SAME session id with the NEW --permission-mode in its relaunch argv", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-911" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, permissionMode: "bypassPermissions" as const };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // Seeds the pane's OWN reported argv as though it was launched with
+        // the OLD permission mode (the definition's own persisted intent,
+        // written below, already calls for the new one) — the exact drift
+        // shape the FACTORY-43 tests above exercise, here carried through to
+        // an actual resumeInPlace() call rather than stopping at staleIssues().
+        const oldArgv = spawnArgs({ key, issuetype: "task", summary: "", parent: null }, cwd);
+        await f.client.agent.start({ args: oldArgv });
+        f.started.length = 0; // that seeding call isn't part of what this test asserts on
+        const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+        writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("bypassPermissions"));
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).toContain("--permission-mode bypassPermissions");
+        expect(stale[0]!.resumable).toBe(true);
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]); // idle-checked, exited, never interrupted mid-turn
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).toContain("--resume");
+        expect(f.started[0]!.args).toContain("original-session");
+        expect(f.started[0]!.args).toContain("--permission-mode");
+        expect(f.started[0]!.args).toContain("bypassPermissions");
+        expect(workspaceSessionId(cwd)).toBe("original-session"); // SAME session, never rediscovered
+
+        // The very next poll must not flag it stale again (FACTORY-43 no-loop
+        // symmetry) — staleIssues() now sees the RELAUNCHED argv, which
+        // already carries --permission-mode bypassPermissions.
+        expect(await herd.staleIssues()).toEqual([]);
+      });
+    });
+  });
+
+  // Same production-path proof, for strictMcpConfig.
+  test("FACTORY-411/FACTORY-424: a strictMcpConfig-only drift is detected as resumable by staleIssues(), and resumeInPlace() resumes the SAME session id with --strict-mcp-config in its relaunch argv", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-912" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, strictMcpConfig: true };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const oldArgv = spawnArgs({ key, issuetype: "task", summary: "", parent: null }, cwd);
+        await f.client.agent.start({ args: oldArgv });
+        f.started.length = 0;
+        const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+        writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).toContain("--strict-mcp-config");
+        expect(stale[0]!.resumable).toBe(true);
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(f.started[0]!.args).toContain("--strict-mcp-config");
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+        expect(await herd.staleIssues()).toEqual([]);
+      });
+    });
+  });
+
+  // FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 2): the
+  // mcpServers channel-flag case specifically — proves mcp.json's CONTENT is
+  // already fresh once resumeInPlace() reports "resumed", not merely that
+  // its own argv is correct. Against the pre-fix ordering (buildWorkspace()
+  // only called after a confirmed-alive relaunch, and never regenerating
+  // mcp.json at all on this path) the bound server would be MISSING from
+  // mcp.json here.
+  test("FACTORY-411/FACTORY-424: an mcpServers channel-flag add is detected as resumable, and resumeInPlace() writes the new binding into mcp.json BEFORE reporting resumed", async () => {
+    await withTempWorkspaces(async () => {
+      // Managed-session shape (filesystem/managed-sessions) — staleIssues()
+      // only reads `mcpServers` back from the workspace's own persisted
+      // `.butchr-mcp-servers.json` (`workspaceMcpServers`) for THIS shape;
+      // a bare rule-engine spec instead needs a `mcpBindingsOf` callback
+      // this test doesn't wire up.
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/factory-913.json" });
+      const cwd = ensureWorkspaceDir(key);
+      const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, resource: "/etc/defs/factory-913.json", mcpServers: [binding] };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const oldArgv = spawnArgs({ key, issuetype: "managed-session", summary: "", parent: null, resource: "/etc/defs/factory-913.json" }, cwd);
+        await f.client.agent.start({ args: oldArgv });
+        f.started.length = 0;
+        const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+        writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify([binding]));
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).toContain("--dangerously-load-development-channels");
+        expect(stale[0]!.resumable).toBe(true);
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        const mcpJson = JSON.parse(readFileSync(join(cwd, "mcp.json"), "utf8"));
+        expect(mcpJson.mcpServers.chan1).toEqual({ type: "http", url: "http://example/mcp" });
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
     });
   });
 });
