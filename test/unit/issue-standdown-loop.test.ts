@@ -308,6 +308,7 @@ describe("BUTCHR-307 REVIEW FIX (PR #322 round 1): a stood-down boss must not wa
       async stop(i: string) { running.delete(i); },
       async paneFor(i: string) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
   }
 

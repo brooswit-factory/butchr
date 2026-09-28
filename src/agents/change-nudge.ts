@@ -55,7 +55,14 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // names every changed link itself; it has no single "about" clause to
   // append). Handled defensively rather than asserted unreachable, for the
   // same reason `pr` already is.
-  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
+  //
+  // FACTORY-417: `definitionField` is the same shape of "unreachable here in
+  // practice" — it renders via its own `sessionDefinitionFieldNudge` below,
+  // wired directly by src/daemon/session-definitions-loop.ts, never through
+  // `changeNudge` (only Jira-issue-shaped resources call this function).
+  // Folded into the same defensive fallback rather than given its own
+  // clause here, for the same reason `pr`/`linked` are.
+  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
   if ("status" in reason) return `changed status from "${reason.status.from}" to "${reason.status.to}"`;
@@ -126,6 +133,14 @@ export function changeNudge(issue: string, about: string, reason: NotifyReason |
 export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if (!reason) return " (reason: not determinable)";
   if ("linked" in reason) return ` (linked:${reason.linked.events.length})`;
+  // FACTORY-417: unreachable via `notifyRuleAgent` in practice (managed
+  // sessions log their own `[notify]` line in src/daemon/session-definitions-loop.ts's
+  // `deps.deliver` caller, never through this tag) — handled defensively,
+  // same precedent as every other member above.
+  if ("definitionField" in reason) {
+    const fields = Object.keys(reason.definitionField);
+    return ` (definitionField:${fields.join(",")})`;
+  }
   if ("pr" in reason) return ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})`;
   if ("appeared" in reason) return " (appeared)";
   if ("disappeared" in reason) return " (disappeared)";
@@ -220,6 +235,46 @@ export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEv
  */
 export function filesystemNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Filesystem resource ${resource} ${reasonClause(reason)} — re-read it from disk.`;
+}
+
+/**
+ * FACTORY-417 (story FACTORY-412, epic FACTORY-394): the content-push nudge
+ * for a managed-session definition's `brief`/`workingDirectory` edit —
+ * `session-definitions-loop.ts`'s `notify` callback renders THIS instead of
+ * `filesystemNudge` above whenever `decide()` (src/rules/session-definition-type.ts)
+ * detects one of those two fields moved, and falls back to `filesystemNudge`
+ * for every other definition-field edit exactly as before (see that
+ * function's own top comment).
+ *
+ * PUSHES THE NEW VALUE DIRECTLY, rather than telling the agent to re-read
+ * `brief.md`/re-`cd`, because the survey this ticket implements
+ * (`docs/session-field-reload-classification.md`, the `brief`/
+ * `workingDirectory` rows) establishes that `buildWorkspace()` — the ONLY
+ * code path that ever rewrites `brief.md` on disk — runs exclusively from
+ * the spawn/resume path (`HerdrHerd.spawnExclusive`'s `prepare()` and
+ * `resumeInPlaceExclusive`'s post-success re-persist, src/agents/herd.ts),
+ * never from an ordinary poll against an already-running, non-stale agent.
+ * A `brief`/`workingDirectory` edit on a live agent is, by this ticket's own
+ * scope, never routed through `resumeInPlace()` or a respawn — so
+ * `brief.md` on disk is NOT rewritten when this nudge fires, and "re-read
+ * your brief.md" would point the agent at STALE content with no race to
+ * even win: the file simply never changes underneath a live agent this
+ * mechanism touches. Pushing the new text directly has no such dependency
+ * on daemon-internal timing — it is exactly as reliable as `herd.nudge`
+ * delivering the message at all, the same guarantee every other
+ * `NotifyReason` nudge in this module already rests on.
+ *
+ * `changes` carries only the field(s) that actually moved this poll (see
+ * `NotifyReason`'s own `definitionField` doc comment, src/resources/types.ts)
+ * — both keys are rendered when both changed in the same poll, each its own
+ * sentence, so a reader (agent or operator) never has to guess whether an
+ * omitted field is "unchanged" or "not reported here."
+ */
+export function sessionDefinitionFieldNudge(resource: string, changes: { brief?: string; workingDirectory?: string }): string {
+  const sentences: string[] = [];
+  if (changes.brief !== undefined) sentences.push(`its brief changed — act on this new brief now:\n\n${changes.brief}`);
+  if (changes.workingDirectory !== undefined) sentences.push(`its working directory changed — operate in ${changes.workingDirectory} from now on (this does not move your process's actual shell cwd; treat it as an instruction, not a signal anything already moved)`);
+  return `[butchr] Managed-session definition ${resource} was edited: ${sentences.join(" Separately, ")}.`;
 }
 
 /**

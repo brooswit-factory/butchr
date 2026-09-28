@@ -458,6 +458,7 @@ function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -484,6 +485,7 @@ describe("reconcileNow: checkCrashLoop is called before the spawn loop, with (pl
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
     await reconcileNow(herd, new Map([["A", spec("A")]]), {
@@ -511,6 +513,7 @@ describe("reconcileNow: checkCrashLoop is called before the spawn loop, with (pl
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
     const desired = new Map([["BUTCHR-1", spec("BUTCHR-1")]]);
@@ -534,6 +537,7 @@ describe("reconcileNow: checkCrashLoop is called before the spawn loop, with (pl
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
     const desired = new Map([["BUTCHR-1", spec("BUTCHR-1")]]);

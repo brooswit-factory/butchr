@@ -109,6 +109,7 @@ export function specForGithubPr({ agentKey, rule, pr }: GithubPrMatch): SpawnSpe
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -129,6 +130,7 @@ export function specForGithubPrQuery(rule: Rule, agentKey: string): SpawnSpec {
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 

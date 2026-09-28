@@ -12,6 +12,7 @@ test("quota recovery passes through the scoped herd before fresh state is read",
     stop: async () => {},
     paneFor: async () => null,
     nudge: async () => ({ delivered: false }),
+    resumeInPlace: async () => "unresumable",
   };
   await reconcileNow(scopedHerd(herd, (id) => id === "KAN-1"), new Map([["KAN-1", { key: "KAN-1", issuetype: "task", summary: "", parent: null }]]));
   expect(calls[0]).toBe("recover:KAN-1");
@@ -26,6 +27,7 @@ test("one quota recovery failure does not prevent another workspace from spawnin
     staleIssues: async () => [],
     spawn: async (spec) => { spawned.push(spec.key); },
     stop: async () => {}, paneFor: async () => null, nudge: async () => ({ delivered: false }),
+    resumeInPlace: async () => "unresumable",
   };
   await reconcileNow(herd, new Map(["KAN-1", "KAN-2"].map((key) => [key, { key, issuetype: "task", summary: "", parent: null }])));
   expect(spawned).toEqual(["KAN-2"]);

@@ -13,6 +13,7 @@ import {
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
 import { listFilesystemResources } from "../../src/resources/filesystem.js";
+import type { SessionDefinition } from "../../src/resources/session-definition.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 
@@ -249,7 +250,7 @@ describe("specForSessionDefinition", () => {
     expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
 
-  test("DROVR-42/FACTORY-67: lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
+  test("DROVR-42/FACTORY-67: for vendor claude, lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
     const rule = builtinManagedSessionsRule("/defs");
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
@@ -259,6 +260,18 @@ describe("specForSessionDefinition", () => {
     const spec = specForSessionDefinition(match);
     expect(spec).not.toHaveProperty("lizardMode");
     expect(Object.keys(spec)).not.toContain("lizardMode");
+  });
+
+  test("FACTORY-108: for vendor codex, lizardMode IS carried into the SpawnSpec — the opposite of the claude case above — so agentLaunchConfig's Codex branch (src/agents/argv.ts) can drop --dangerously-bypass-approvals-and-sandbox; absent/false forwards nothing, same as every other vendor's absent field", () => {
+    const rule = builtinManagedSessionsRule("/defs");
+    const base = { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const match = (definition: typeof base & { lizardMode?: boolean }): SessionDefinitionMatch => ({
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
+      rule, resource: res("/defs/a.json"), definition,
+    });
+    expect(specForSessionDefinition(match({ ...base, lizardMode: true })).lizardMode).toBe(true);
+    expect(specForSessionDefinition(match(base))).not.toHaveProperty("lizardMode");
+    expect(specForSessionDefinition(match({ ...base, lizardMode: false }))).not.toHaveProperty("lizardMode");
   });
 
   test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {
@@ -377,11 +390,13 @@ describe("createManagedSessionResourceType", () => {
     expect(resolvedAgents.has(keyPower)).toBe(false);
   });
 
-  test("FACTORY-138 (DROVR-42/FACTORY-67 lineage): `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key — a vendor:claude definition defaults to ELIGIBLE (true) when absent (only explicit false opts out), a vendor:codex definition stays at false when absent since it cannot set the field at all — a frozen/removed definition's entry does not linger", async () => {
+  test("FACTORY-138/FACTORY-108/FACTORY-106 (DROVR-42/FACTORY-67 lineage): `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key — a vendor:claude definition defaults to ELIGIBLE (true) when absent (only explicit false opts out); a vendor:codex definition defaults to NOT eligible (false) when absent (the opposite default, a deliberate story decision — codex CAN set the field, unlike the claude default flip, but its own launch only drops the bypass flag on an explicit true, so default-eligible would only add a scan that can never find anything to press) — only an explicit true resolves eligible for codex, and explicit false stays not-eligible same as absent; a frozen/removed definition's entry does not linger", async () => {
     let files: Record<string, string> = {
       "/defs/a.json": JSON.stringify(goodDef({ lizardMode: false, permissionMode: "default" })),
-      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — now defaults to true
+      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — defaults to true
       "/defs/c.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: undefined })), // lizardMode absent, vendor codex — stays false
+      "/defs/d.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: true })), // lizardMode explicit true, vendor codex — eligible
+      "/defs/e.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: false })), // lizardMode explicit false, vendor codex — stays not-eligible, same outcome as absent
     };
     const { list } = fakeFiles(files);
     const rule = builtinManagedSessionsRule("/defs");
@@ -390,12 +405,16 @@ describe("createManagedSessionResourceType", () => {
     const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
     const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
     const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
+    const keyD = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/d.json" });
+    const keyE = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/e.json" });
     await type.discovery.search();
     expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.get(keyB)).toBe(true);
     expect(lizardModes.get(keyC)).toBe(false);
+    expect(lizardModes.get(keyD)).toBe(true);
+    expect(lizardModes.get(keyE)).toBe(false);
     // b.json goes frozen (still valid, but ineligible) — its entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })), "/defs/c.json": files["/defs/c.json"]! };
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })), "/defs/c.json": files["/defs/c.json"]!, "/defs/d.json": files["/defs/d.json"]!, "/defs/e.json": files["/defs/e.json"]! };
     await type.discovery.search();
     expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.has(keyB)).toBe(false);
@@ -454,6 +473,61 @@ describe("createSessionDefinitionEventRules", () => {
     expect(changed.changedRelated).toEqual([]);
     expect(await changed.decide(key, key, "related")).toEqual({ deliver: false });
   });
+
+  // FACTORY-417: a `brief`/`workingDirectory` content move on an otherwise
+  // size/mtime-changed pair delivers WITH a `definitionField` reason naming
+  // the new value(s) — every other field edit (this test's own baseline,
+  // above) keeps delivering with no `reason` at all. Same diff/decide/notify
+  // machinery as the baseline test, so idempotence (a key only ever appears
+  // in `changedPrimary` for the ONE poll its [size, mtimeMs] pair actually
+  // moved, never again once `prev` catches up to it) is inherited, not
+  // reimplemented — this test only pins the NEW `reason`, not that property.
+  const rule = builtinManagedSessionsRule("/defs");
+  const baseDefinition: SessionDefinition = { workingDirectory: "/repo/old", brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false };
+  const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" });
+  const unitWith = (def: SessionDefinition, r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition: def } });
+
+  test("brief content move: delivers with { definitionField: { brief: <new> } }, workingDirectory absent from the reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief." }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { brief: "New brief." } } });
+  });
+
+  test("workingDirectory content move: delivers with { definitionField: { workingDirectory: <new> } }, brief absent from the reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { workingDirectory: "/repo/new" } } });
+  });
+
+  test("both brief and workingDirectory move in the same poll: both keys present in the one reason", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief.", workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({
+      deliver: true,
+      reason: { definitionField: { brief: "New brief.", workingDirectory: "/repo/new" } },
+    });
+  });
+
+  // No regression (this ticket's own AC3): a field OUTSIDE this ticket's
+  // scope changing (here, `vendor`) still delivers with no `reason` at all —
+  // the exact same shape the pre-existing baseline test above pins.
+  test("a non-brief/workingDirectory field move (e.g. vendor) still delivers with no reason — unchanged from before this ticket", async () => {
+    const type = createSessionDefinitionEventRules();
+    const poll = await type.poll(
+      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, role: "sentinel" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+    );
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -472,6 +546,7 @@ function fakeHerd(initial: string[] = []): { herd: Herd; spawned: SpawnSpec[]; s
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
   return { herd, spawned, stopped, running };
 }
@@ -643,6 +718,7 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     return { herd, spawned };
   }

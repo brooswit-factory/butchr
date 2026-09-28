@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -155,9 +155,24 @@ export interface Herd {
    *   back to today's stop-then-fresh-spawn, with a comment that says
    *   plainly the resume failed and why.
    * Never throws for any of the five; only a genuine herdr/RPC failure does.
-   * Optional so no existing `Herd` fake needs updating.
+   *
+   * FACTORY-426: REQUIRED, not optional — `scopedHerd` (src/daemon/loop.ts),
+   * the one wrapper production's real reconcile call site actually goes
+   * through, explicitly delegates named `Herd` members instead of spreading
+   * (see that function's own doc comment for why). `resumeInPlace` being
+   * declared optional here is exactly what let `scopedHerd` silently omit it
+   * from that list and still compile — `herd.resumeInPlace` was `undefined`
+   * on every real poll, so the `if (info.resumable && herd.resumeInPlace)`
+   * guard below was false on every poll and control fell straight through to
+   * the old stop()+spawn() path, even though every regression test (built on
+   * a fake `Herd` object that DOES define `resumeInPlace`, calling
+   * `reconcileNow` directly rather than through `scopedHerd`) passed. Making
+   * this required means a `Herd` implementation or fake that forgets it
+   * fails to COMPILE, closing the gap TypeScript couldn't catch when it was
+   * optional. A fake that has no use for real resume behaviour can implement
+   * it as `async () => "unresumable"`.
    */
-  resumeInPlace?(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">;
+  resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">;
 }
 
 export interface ManagedHerdAgent {
@@ -704,7 +719,14 @@ export class HerdrHerd implements Herd {
       // here, never a value recomputed independently of that spawn.
       const permissionMode = workspacePermissionMode(cwd);
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // FACTORY-108: same read-the-workspace-back shape as permissionMode/
+      // strictMcpConfig above, for a Codex lizard agent's own
+      // bypassApprovalsAndSandbox-dropping launch signal (SpawnSpec.lizardMode) —
+      // without this, a lizard Codex agent's real (bypass-flag-less) argv
+      // would forever mismatch a naively-recomputed "expected" argv that
+      // still assumes the bypass flag, respawn-looping it forever.
+      const lizardMode = workspaceLizardMode(cwd);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) {
         // FACTORY-411/FACTORY-424 (classification doc, Finding 2, points 3

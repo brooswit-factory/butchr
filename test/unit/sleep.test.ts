@@ -32,6 +32,7 @@ function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -189,6 +190,7 @@ describe("the lost-wake proof (BUTCHR-66/83 criterion 4, evidence-4)", () => {
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     // The resource wakes on poll 1 and STAYS awake (its own watermark can
     // only be advanced by the agent that never got to run) — exactly the

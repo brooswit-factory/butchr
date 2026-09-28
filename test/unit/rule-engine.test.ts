@@ -43,6 +43,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -91,22 +92,29 @@ describe("rule discovery", () => {
   // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42's lizard mode):
   // permissionMode is forwarded onto the spawn spec when the rule sets it —
   // it's what actually puts a rule-launched Claude agent into
-  // permissionMode: "default" (manual/ask mode); lizardMode never reaches
-  // the spec — it stays a daemon-side-only opt-in (src/daemon/index.ts's
-  // `ruleLizardModeOf`), so there is no argv for a stale-argv check to
-  // compare, the same "no argv, no stale-argv risk" shape
-  // session-definition-type.test.ts asserts for SessionDefinition.lizardMode.
-  test("FACTORY-87: permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+  // permissionMode: "default" (manual/ask mode). FACTORY-108: lizardMode is
+  // ALSO forwarded now — a rule-launched CODEX agent has no permissionMode
+  // concept, so lizardMode is what `agentLaunchConfig`'s Codex branch
+  // (src/agents/argv.ts) reads to decide whether to drop
+  // --dangerously-bypass-approvals-and-sandbox. This is additive to, not a
+  // replacement for, lizardMode's pre-existing daemon-side-only consumer
+  // (src/daemon/index.ts's `ruleLizardModeOf`, which still gates the
+  // permission-answer timer's own eligibility independently of SpawnSpec,
+  // unaffected by this) — see `Rule.lizardMode`'s own doc comment
+  // (src/rules/rules.ts) for the full "two independent consumers" story.
+  test("FACTORY-87/FACTORY-108: permissionMode and lizardMode are both forwarded onto the spawn spec when the rule sets them; absent means neither is present", () => {
     const [lizardRule] = rules({ id: "manual", query: "q", permissionMode: "default", lizardMode: true });
     const spec = specForMatch({ agentKey: "jira-work:manual:BUTCHR-7", rule: lizardRule!, issue: issue("BUTCHR-7") });
     expect(spec.permissionMode).toBe("default");
-    expect(spec).not.toHaveProperty("lizardMode");
+    expect(spec.lizardMode).toBe(true);
     const [plainRule] = rules({ id: "plain", query: "q" });
-    expect(specForMatch({ agentKey: "jira-work:plain:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") }).permissionMode).toBeUndefined();
+    const plainSpec = specForMatch({ agentKey: "jira-work:plain:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") });
+    expect(plainSpec.permissionMode).toBeUndefined();
+    expect(plainSpec).not.toHaveProperty("lizardMode");
     // specForRuleQuery (singleton/persistent query-level agents) gets the same treatment.
     const querySpec = specForRuleQuery(lizardRule!, "jira-work:manual:%40query");
     expect(querySpec.permissionMode).toBe("default");
-    expect(querySpec).not.toHaveProperty("lizardMode");
+    expect(querySpec.lizardMode).toBe(true);
   });
 });
 

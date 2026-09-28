@@ -175,16 +175,20 @@ describe("github issue resource type", () => {
   });
 
   // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
-  // reaches the spawn spec when the rule sets it; lizardMode never does — the
-  // same "no argv, no stale-argv risk" shape session-definition-type.test.ts
-  // asserts for SessionDefinition.lizardMode.
-  test("permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is", () => {
+  // reaches the spawn spec when the rule sets it. FACTORY-108: lizardMode now
+  // does too — a rule-launched Codex agent has no permissionMode concept, so
+  // lizardMode is what agentLaunchConfig's Codex branch (src/agents/argv.ts)
+  // reads to drop --dangerously-bypass-approvals-and-sandbox; see
+  // Rule.lizardMode's own doc comment (src/rules/rules.ts) for the full story.
+  test("permissionMode and lizardMode are both forwarded onto the spawn spec when the rule sets them", () => {
     const [lizardRule] = ghRules({ id: "bugs", query: "type:Bug", permissionMode: "default", lizardMode: true });
     const m: GithubIssueMatch = { agentKey: encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/w#1" }), rule: lizardRule!, issue: gi("acme/w#1") };
     const spec = specForGithubIssue(m);
     expect(spec.permissionMode).toBe("default");
-    expect(spec).not.toHaveProperty("lizardMode");
-    expect(specForGithubIssue(match("acme/w#1")).permissionMode).toBeUndefined();
+    expect(spec.lizardMode).toBe(true);
+    const plainSpec = specForGithubIssue(match("acme/w#1"));
+    expect(plainSpec.permissionMode).toBeUndefined();
+    expect(plainSpec).not.toHaveProperty("lizardMode");
   });
 
   test("event rules: no notice on appear, disappear or updated-only; reasons for state, comment, title, other", async () => {
@@ -234,6 +238,7 @@ describe("github issue resource type", () => {
       async stop(i) { stopped.push(i); running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     let issues = [gi("acme/w#1")];
     const notified: Array<[string, NotifyReason | undefined]> = [];
