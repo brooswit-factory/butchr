@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -1157,9 +1157,9 @@ export class HerdrHerd implements Herd {
     if (preference?.model) selected.model = preference.model;
     if (preference?.effort) selected.effort = preference.effort;
     // FACTORY-312 review (26137, point 1): the argv is built from `cwd`
-    // DIRECTLY — deliberately NOT via `buildWorkspace()` here, before the
-    // relaunch is even attempted. Persisting the new model/effort BEFORE
-    // knowing the relaunch succeeded would make a FAILED resume
+    // DIRECTLY — deliberately NOT via the FULL `buildWorkspace()` here,
+    // before the relaunch is even attempted. Persisting the new model/effort
+    // BEFORE knowing the relaunch succeeded would make a FAILED resume
     // indistinguishable from a healthy one on the very next poll (the
     // persisted-vs-live comparison would already "match", so a stuck-on-old-
     // flags agent would never be flagged again). Same shared builder
@@ -1167,6 +1167,26 @@ export class HerdrHerd implements Herd {
     // `staleIssues()`'s own comparison use, so this relaunch's argv shape is
     // judged by the identical module that built it — the SAME pane_id as
     // before, never a new workspace/pane, unlike a fresh spawn.
+    //
+    // FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 2): that
+    // reasoning covers the staleness-BOOKKEEPING files (model/effort/
+    // permission-mode/strict-mcp-config, never read by Claude itself, only
+    // compared against by a LATER `staleIssues()` poll) — it does NOT cover
+    // `mcp.json`, which Claude reads as real file CONTENT on its very first
+    // post-resume turn. The relaunched process's argv (built from `spec`
+    // just below) already carries the new channel flag correctly regardless
+    // of timing, but if `mcp.json` itself is still the OLD content, the
+    // relaunch would silently start with stale tool bindings. So this one
+    // file — and only this one — is written NOW, before the relaunch
+    // attempt, via the same writer `buildWorkspace()` itself calls
+    // (`writeClaudeMcpJson`, src/agents/workspace.ts) rather than the full
+    // function: it carries no anti-regression timing concern of its own
+    // (Claude re-reads it fresh every turn regardless of what `staleIssues()`
+    // believes), so writing it early costs nothing and fixes the gap: a
+    // FAILED resume leaves it pointing at the NEW bindings, same as it would
+    // once `buildWorkspace()` runs again on this workspace's next successful
+    // spawn/resume anyway.
+    writeClaudeMcpJson(cwd, spec, this.mcpUrl);
     const params = agentStartParams(spec, cwd, pane, nameFor(issue), selected, this.mcpUrl);
     try {
       await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
