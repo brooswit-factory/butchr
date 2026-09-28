@@ -4,6 +4,7 @@ import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
 import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
+import type { CredentialDeathAlert } from "../agents/login-expired-alert.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -161,6 +162,23 @@ export interface HealthStatus {
    * report" convention `unresolvedRelationships` above already uses.
    */
   managedSessionEscalations?: ManagedSessionEscalation[];
+  /**
+   * FACTORY-363/FACTORY-397: the current host-wide "Claude Code credential
+   * appears dead" alert, if one is open — a FIFTH sibling, alongside
+   * `managedSessionEscalations` above, for the same reason: `ok` is the AND
+   * over liveness `components[]` on purpose, and a dead CREDENTIAL is not a
+   * liveness failure of THIS daemon's own poll loops (the loops themselves
+   * keep polling fine) — conflating the two would make `/health`'s 503
+   * contract fire for a condition a restart cannot fix. This is the status
+   * SURFACE a human (or an uptime checker) finds this alert on WITHOUT any
+   * agent or Claude API call in the path — see
+   * `src/agents/login-expired-alert.ts`'s own header for why that matters:
+   * this condition kills the very credential every other recovery lever in
+   * this daemon depends on. ABSENT (no key at all), never null, when no
+   * episode is open — the same "absent means nothing to report" convention
+   * `managedSessionEscalations` above already uses.
+   */
+  credentialDeathAlert?: CredentialDeathAlert;
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -222,6 +240,7 @@ export const combineHealth = (
   resourceLoops?: readonly ResourceLoopHealth[],
   unresolvedRelationships?: readonly UnresolvedRelationship[],
   managedSessionEscalations?: readonly ManagedSessionEscalation[],
+  credentialDeathAlert?: CredentialDeathAlert,
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -234,6 +253,7 @@ export const combineHealth = (
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
     ...(managedSessionEscalations && managedSessionEscalations.length ? { managedSessionEscalations: [...managedSessionEscalations] } : {}),
+    ...(credentialDeathAlert ? { credentialDeathAlert } : {}),
   };
 };
 
