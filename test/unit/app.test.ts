@@ -10,11 +10,14 @@ import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import { buildDashboardRows, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, createDashboardFeed, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
+import { buildQueryAgentInventory } from "../../src/agents/query-agent-inventory.js";
+import type { Rule } from "../../src/rules/rules.js";
+import { githubPrStaffing } from "../../src/rules/github-pr-type.js";
 
 // BUTCHR-332: a trivial, empty-sources fixture for every existing
 // DashboardResponse literal below that predates the admission view and isn't
@@ -482,6 +485,115 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
       expect(html).not.toContain("no running agent");
       expect(html).toContain("COULD NOT CHECK");
       expect(html.match(/COULD NOT CHECK/g)?.length ?? 0).toBeGreaterThanOrEqual(2); // staffing cell AND cross-link area
+    } finally {
+      app.stop();
+    }
+  });
+});
+
+// FACTORY-136: end-to-end through the REAL app/route AND a REAL
+// createDashboardFeed + createAdmissionController + buildQueryAgentInventory
+// — never a hand-built inventory literal like the block above (which only
+// pins the route's own pass-through wiring). This is the "real routes"
+// half of DoD requirement 6.
+describe("GET /configurations (FACTORY-136): the admission-source-unavailable tri-state, wired end-to-end through a real feed + admission controller", () => {
+  function ruleFixture(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
+    return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+  }
+
+  test("a never-reported admission source covering a jira-work rule serves COULD NOT CHECK (naming the source) through /configurations and /config-inventory alike, never UNSTAFFED", async () => {
+    const now = () => 0;
+    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [], sources: ["issue"], now });
+    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+    await feed.poll(async () => ({ agents: [] })); // agent.list() succeeds; the "issue" admission source never reports
+
+    const r = ruleFixture({ id: "task", resourceProvider: "jira-work" });
+    const configInventory = () =>
+      buildQueryAgentInventory({
+        rulesFile: { path: "/rules.json", rules: [r], error: null },
+        dashboard: feed.snapshot(),
+        configReasonFor: () => null,
+        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
+      });
+    const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+
+      const jsonInventory = await (await fetch(`${b}/config-inventory`)).json() as { rules: { staffed: boolean | null; reason: string | null }[] };
+      expect(jsonInventory.rules[0]!.staffed).toBeNull();
+      expect(jsonInventory.rules[0]!.reason).toContain("never-reported");
+
+      const html = await (await fetch(`${b}/configurations`)).text();
+      expect(html).toContain("task");
+      expect(html.toUpperCase()).not.toContain("UNSTAFFED");
+      expect(html).toContain("COULD NOT CHECK");
+      expect(html).toContain("never-reported");
+    } finally {
+      app.stop();
+    }
+  });
+
+  // FACTORY-340: the exact real-daemon failure the epic reviewer found on
+  // FACTORY-136 — an enabled github-pr rule when `config.github` is unset.
+  // `src/daemon/index.ts`'s own conditional `sources:` list (`githubPrs =
+  // githubPrStaffingResult.run && config.github`) then OMITS
+  // ADMISSION_SOURCE_GITHUB_PR from `sources:` entirely — the source is not
+  // merely unchecked this poll, it was never DECLARED — while an enabled
+  // github-pr rule exists. `configReasonFor` below mirrors `index.ts`'s own
+  // real callback (github-issue/github-pr/zendesk-ticket branches) exactly,
+  // including this ticket's own fix (B) to it. Revert fix (B) (the
+  // `github-pr` branch added to `configReasonFor` in `src/daemon/index.ts`)
+  // and this rule falls through to fix (A)'s admission-source-absent branch
+  // instead, which still correctly reads COULD NOT CHECK (A alone already
+  // makes the safety argument true) — so this test only catches a FULL
+  // revert of both (A) and (B), which reproduces the original bug exactly:
+  // `staffed: false, reason: "no matching resources this poll"`, i.e. a
+  // silent, wrong UNSTAFFED for a rule whose withholding cannot be ruled
+  // out. See `admissionSourceCensusFor`'s own doc comment (src/agents/
+  // query-agent-inventory.ts) and `ruleStaffingReason`'s own unit tests for
+  // fix (A) isolated from fix (B).
+  test("FACTORY-340: an enabled github-pr rule whose admission source is entirely ABSENT (config.github unset) never reads UNSTAFFED/'no matching resources' — it gets the real config reason, through /configurations and /config-inventory alike", async () => {
+    const now = () => 0;
+    // No "github-pr" in `sources` — mirrors index.ts declaring it only when
+    // `githubPrs` (itself gated on `config.github`) is truthy.
+    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [], sources: ["issue"], now });
+    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+    await feed.poll(async () => ({ agents: [] }));
+
+    const r: Rule = { id: "review-prs", resourceProvider: "github-pr", enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
+    const staffing = githubPrStaffing([r], undefined); // config.github === undefined, same as a daemon with no GITHUB_TOKEN_FILE/BUTCHR_GITHUB_ORGS
+    if (staffing.run) throw new Error("expected githubPrStaffing to read run:false with no config.github"); // sanity + narrows `staffing.reason` below
+    const githubPrStaffingResult = staffing;
+
+    const configInventory = () =>
+      buildQueryAgentInventory({
+        rulesFile: { path: "/rules.json", rules: [r], error: null },
+        dashboard: feed.snapshot(),
+        // Mirrors src/daemon/index.ts's own `configInventory: () => ...configReasonFor` callback verbatim, github-pr branch included (this ticket's fix B).
+        configReasonFor: (rule) => (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((x) => x.id === rule.id) ? githubPrStaffingResult.reason : null),
+        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
+      });
+    const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
+    app.listen(0);
+    try {
+      const b = `http://localhost:${app.server!.port}`;
+
+      const jsonInventory = await (await fetch(`${b}/config-inventory`)).json() as { rules: { staffed: boolean | null; reason: string | null }[] };
+      expect(jsonInventory.rules[0]!.staffed).toBe(false);
+      expect(jsonInventory.rules[0]!.reason).toBe(githubPrStaffingResult.reason);
+      expect(jsonInventory.rules[0]!.reason).not.toBe("no matching resources this poll");
+
+      // "UNSTAFFED: <reason>" IS the correct, pre-existing rendering for a
+      // config-reason `staffed:false` (same convention as a disabled rule's
+      // "UNSTAFFED: disabled" — see config-inventory-page.test.ts's own
+      // "UNSTAFFED: disabled" assertions) — the defect this test guards
+      // against is the WRONG reason ("no matching resources this poll"),
+      // not the word "UNSTAFFED" itself.
+      const html = await (await fetch(`${b}/configurations`)).text();
+      expect(html).toContain("review-prs");
+      expect(html).not.toContain("no matching resources this poll");
+      expect(html).toContain(githubPrStaffingResult.reason!);
     } finally {
       app.stop();
     }

@@ -21,14 +21,24 @@ import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 function rule(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
   return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
 }
-const noAdmissionView: AdmissionView = { cap: 10, residency: 0, sentinels: 0, sources: [] };
+// FACTORY-340: declare every source a rule in THIS file's fixtures is
+// covered by (jira-work -> "issue", plus github-issue/jira-idea/filesystem
+// verbatim — see `RULE_ADMISSION_SOURCE`, ../../src/agents/query-agent-
+// inventory.ts) as reported this poll, same rationale as query-agent-
+// inventory.test.ts's own `allCoveredSourcesReported` — an empty `sources`
+// now reads as "absent from the census" -> COULD NOT CHECK for every rule
+// below, which is not what these tests are about.
+const allCoveredSourcesReported: AdmissionView = {
+  cap: 10, residency: 0, sentinels: 0,
+  sources: ["issue", "github-issue", "jira-idea", "filesystem"].map((source) => ({ source, census: { checked: true, confirmedAt: new Date(0).toISOString() } })),
+};
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true };
 function checkedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
-  return { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+  return { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: allCoveredSourcesReported };
 }
 /** FACTORY-132: the agent census is unavailable — `rows`, when given, models a STALE carry-forward (a poll failed after an earlier success), never a fresh one (the response-level `checked:false` is what the render layer must key on, not `rows.length`). */
 function uncheckedDashboard(rows: DashboardResponse["rows"] = []): DashboardResponse {
-  return { checked: false, declinedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+  return { checked: false, declinedAt: new Date(0).toISOString(), rows, admission: allCoveredSourcesReported };
 }
 function agentRow(resourceKey: string): AgentDashboardRow {
   return { kind: "agent", resourceKey, tier: { kind: "project" }, agentStatus: "working", pane: "p1", timeInStatus: floor, confirmedAt: new Date(0).toISOString() };
@@ -695,5 +705,86 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
     const sessionRow = rowSlice(html, "idle.json");
     expect(sessionRow).toContain("no running agent");
     expect(sessionRow).not.toContain("COULD NOT CHECK");
+  });
+});
+
+// ---- FACTORY-136: the admission-source-unavailable tri-state renders -----
+// through a REAL createDashboardFeed + createAdmissionController, same
+// end-to-end bar as the FACTORY-132 block just above. `renderStaffed`
+// (config-inventory-page.ts) requires NO code change for this: it already
+// renders `staffed === null` as `COULD NOT CHECK: <reason>` generically, so
+// this block pins that the reused tri-state actually reaches the page this
+// way, rather than asserting it only at the `query-agent-inventory.ts` layer.
+
+function feedWithAdmission(now: () => number, sources: readonly string[], residency: () => Promise<readonly string[]> = async () => []) {
+  const admission = createAdmissionController({ cap: 1_000_000, residency, sources, now });
+  const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+  return { admission, feed };
+}
+
+describe("renderConfigInventory — the admission-source-unavailable tri-state through a REAL createDashboardFeed + createAdmissionController (FACTORY-136)", () => {
+  test("a never-reported admission source covering the rule's provider renders COULD NOT CHECK in the staffing cell, naming the source — the cross-link area (keyed on the AGENT census, not the admission census) is UNCHANGED, still 'no running agent'", async () => {
+    const { feed } = feedWithAdmission(() => 0, ["issue"]);
+    await feed.poll(async () => ({ agents: [] })); // agent.list() succeeds; the "issue" admission source never reports
+    expect(feed.snapshot().checked).toBe(true);
+
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: feed.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    expect(inventory.rules[0]!.staffed).toBeNull();
+
+    // agentCensusChecked reflects the AGENT census only (dashboard.checked),
+    // which is true here — the admission census being down is a different,
+    // narrower fact this option was never meant to carry.
+    const html = renderConfigInventory({ ok: true, inventory }, feed.snapshot().rows, opts({ agentCensusChecked: feed.snapshot().checked }));
+    const row = rowSlice(html, "task");
+    expect(row).toMatch(/<span class="staffed cnc">COULD NOT CHECK/);
+    expect(row).toContain("never-reported");
+    expect(row.toUpperCase()).not.toContain("UNSTAFFED");
+    // The cross-link area's own independent could-not-check axis is untouched
+    // by this ticket — no live agent, agent census fine, so still "no running agent".
+    expect(row).toContain("no running agent");
+  });
+
+  test("a declined admission source (residency threw) renders COULD NOT CHECK naming 'census-threw', distinct wording from the agent-census-unavailable case", async () => {
+    const now = () => 0;
+    const { admission, feed } = feedWithAdmission(now, ["issue"], async () => { throw new Error("herdr down"); });
+    await admission.admit(["I1"], [], "issue");
+    await feed.poll(async () => ({ agents: [] }));
+
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: feed.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, feed.snapshot().rows, opts({ agentCensusChecked: feed.snapshot().checked }));
+    const row = rowSlice(html, "task");
+    expect(row).toContain("COULD NOT CHECK");
+    expect(row).toContain("census-threw");
+  });
+
+  test("control: once the covering admission source reports, the page reverts to the pre-existing UNSTAFFED wording exactly", async () => {
+    const now = () => 0;
+    const { admission, feed } = feedWithAdmission(now, ["issue"]);
+    await admission.admit(["I1"], [], "issue");
+    await feed.poll(async () => ({ agents: [] }));
+
+    const r = rule({ id: "task", resourceProvider: "jira-work" });
+    const inventory = await buildQueryAgentInventory({
+      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      dashboard: feed.snapshot(),
+      configReasonFor: noConfigReason,
+      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
+    });
+    const html = renderConfigInventory({ ok: true, inventory }, feed.snapshot().rows, opts({ agentCensusChecked: feed.snapshot().checked }));
+    const row = rowSlice(html, "task");
+    expect(row).toContain("UNSTAFFED: no matching resources this poll");
+    expect(row).not.toContain("COULD NOT CHECK");
   });
 });

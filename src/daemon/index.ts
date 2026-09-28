@@ -793,6 +793,7 @@ const { app, mcp } = buildApp({
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((r) => r.id === rule.id)) return githubPrStaffingResult.reason;
         if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
         return null;
       },
