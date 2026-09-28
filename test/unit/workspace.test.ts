@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, m
 import { join, resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
@@ -863,6 +863,44 @@ describe("buildWorkspace", () => {
       expect(workspaceStrictMcpConfig(dir)).toBeUndefined();
       expect(workspacePermissionMode("/does/not/exist")).toBeUndefined();
       expect(workspaceStrictMcpConfig("/does/not/exist")).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-108: same persist-at-build/read-back shape as permissionMode/
+  // strictMcpConfig above, for Codex's own lizard-mode launch signal —
+  // without this, HerdrHerd.staleIssues() (src/agents/herd.ts) would have no
+  // way to recover it either, which would respawn-loop every lizard Codex
+  // agent forever (the exact FACTORY-43 bug, for this field).
+  test("workspaceLizardMode round-trips what buildWorkspace persisted, independent of permissionMode/strictMcpConfig", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-lizard-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, lizardMode: true }, "http://x/mcp");
+      expect(readFileSync(join(dir, ".butchr-lizard-mode.json"), "utf8")).toBe(JSON.stringify(true));
+      expect(workspaceLizardMode(dir)).toBe(true);
+      const falseDir = buildWorkspace({ key: "KAN-10", issuetype: "managed-session", summary: "s", parent: null, lizardMode: false }, "http://x/mcp");
+      expect(readFileSync(join(falseDir, ".butchr-lizard-mode.json"), "utf8")).toBe(JSON.stringify(false));
+      expect(workspaceLizardMode(falseDir)).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceLizardMode is undefined for a workspace where it was never set, never throws", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-lizard-none-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
+      expect(workspaceLizardMode(dir)).toBeUndefined();
+      expect(workspaceLizardMode("/does/not/exist")).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;

@@ -324,7 +324,10 @@ export async function searchSessionDefinitions(
  * no such field — see that field's own doc comment). `agents` names
  * exactly one preference (the definition's own vendor/tier) — `spec.agents`,
  * not `rule.agentPreferences`, is what makes this heterogeneous per file
- * despite one shared `Rule`.
+ * despite one shared `Rule`. FACTORY-108: `lizardMode` is the Codex
+ * counterpart — forwarded only for `vendor: "codex"` (never `"claude"`,
+ * which keeps lizardMode daemon-side-only — see `SpawnSpec.lizardMode`'s own
+ * doc comment).
  */
 export function specForSessionDefinition({ agentKey, resource, definition }: SessionDefinitionMatch): SpawnSpec {
   return {
@@ -338,6 +341,11 @@ export function specForSessionDefinition({ agentKey, resource, definition }: Ses
     cwd: definition.workingDirectory,
     permissionMode: definition.permissionMode,
     ...(definition.strictMcpConfig !== undefined ? { strictMcpConfig: definition.strictMcpConfig } : {}),
+    // FACTORY-108: only for vendor "codex" — a "claude" definition's
+    // lizardMode must NEVER reach SpawnSpec (see SpawnSpec.lizardMode's own
+    // doc comment and the "lizardMode is deliberately NEVER carried into the
+    // SpawnSpec" test, which is scoped to vendor "claude" specifically).
+    ...(definition.vendor === "codex" && definition.lizardMode ? { lizardMode: true } : {}),
     ...(definition.mcpServers ? { mcpServers: definition.mcpServers } : {}),
   };
 }
@@ -458,11 +466,21 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * not-eligible. This pairs with `agentLaunchConfig`'s own new
    * `acceptEdits` default (src/agents/argv.ts): an accept-edits agent with
    * no lizard coverage is exactly the DROVR-37 freeze shape, so the two
-   * ship together. A `vendor: "codex"` definition CANNOT set this field at
-   * all (rejected at manifest load) and stays at `false` even when absent —
-   * the new default deliberately does not reach it (see the fill site's own
-   * comment for why), inert until FACTORY-106/FACTORY-108. Deliberately
-   * live, not persisted-at-spawn like
+   * ship together. **A `vendor: "codex"` definition CAN set this field
+   * (FACTORY-108) — not rejected at manifest load — but its default is the
+   * OPPOSITE of Claude's**, a story decision (FACTORY-106/FACTORY-324): a
+   * `codex` definition that never sets `lizardMode` resolves not-eligible
+   * here (see the fill site's own `?? (vendor === "claude")`), same as
+   * before FACTORY-108; only an EXPLICIT `true` resolves eligible, and an
+   * explicit `false` stays not-eligible. Reason: unlike Claude, a Codex
+   * agent's launch argv (`agentLaunchConfig`'s Codex branch,
+   * src/agents/argv.ts) only drops the bypass-approvals flag on an
+   * EXPLICIT `true` (see `SessionDefinition.lizardMode`'s own doc comment,
+   * src/resources/session-definition.ts) — a Codex agent launched by
+   * default still carries the bypass flag and so never shows the dialog
+   * this map's consumer answers, making default-on here a scan that could
+   * never find anything, not real coverage. Deliberately live, not
+   * persisted-at-spawn like
    * `permissionMode`/`strictMcpConfig` (FACTORY-43) — this field never
    * reaches the launched process's argv, so there is nothing for a
    * stale-argv check to compare and no respawn-loop risk to guard against;
@@ -544,16 +562,21 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
           deps.lizardModes.clear();
           // FACTORY-138: absent now means eligible for a `vendor: "claude"`
           // definition (butchr's default is accept-edits + lizard mode
-          // together) — only an EXPLICIT `false` opts one out. A `vendor:
-          // "codex"` definition can never SET this field at all (rejected
-          // at manifest load — see `sessionDefinitionProblems`,
-          // src/resources/session-definition.ts), so it always reads
-          // `undefined` here; unlike a Rule's `lizardMode` (which has no
-          // fixed vendor and already applies uniformly for an explicit
-          // `true`), this field's hard rejection for Codex is a stronger
-          // signal that the DEFAULT must not silently reach it either —
-          // kept at its pre-FACTORY-138 `false` deliberately, inert until
-          // FACTORY-106/FACTORY-108 gives Codex its own dialog recognition.
+          // together) — only an EXPLICIT `false` opts one out. FACTORY-108/
+          // FACTORY-106/FACTORY-324 (story decision): a `vendor: "codex"`
+          // definition CAN set this field (not rejected at manifest load —
+          // see `SessionDefinition.lizardMode`'s own doc comment,
+          // src/resources/session-definition.ts), but its default stays the
+          // OPPOSITE of Claude's: absent resolves not-eligible for codex too,
+          // same as before FACTORY-108, only an EXPLICIT `true` resolves
+          // eligible. Reason: a Codex agent's own launch only drops the
+          // bypass-approvals flag on an explicit `true`
+          // (`specForSessionDefinition`, this file, below), so an
+          // absent-but-eligible Codex definition would be scanned every tick
+          // for a dialog its own bypass-mode launch can never show — a
+          // no-op that would silently claim coverage nobody canaried, not
+          // real coverage the way Claude's default-on already is (Claude's
+          // launch always shows the dialog this map's consumer answers).
           for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? (m.definition.vendor === "claude"));
         }
         return groupExecutionUnits([deps.rule], matches);
