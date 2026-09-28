@@ -194,11 +194,16 @@ describe("butchr webapp + open action", () => {
 // href string — so a wrong href (L4, R7) or a wrong clock (A2) actually
 // fails this test instead of one that only re-asserts what the route is
 // supposed to do.
+// FACTORY-408: the row's own `id` is still built from the FULL resourceKey
+// (`agentRowAnchorId`, unchanged by this ticket) even though the visible
+// `.key` label is now the bare provider-native id — so this slices on the
+// anchor id, not the (now-narrower) visible label, to keep finding the row
+// regardless of which key shape ends up in the `.key` span.
 function rowSlice(html: string, resourceKey: string): string {
-  const marker = `<span class="key">${resourceKey}</span>`;
+  const marker = `id="agent-${encodeURIComponent(resourceKey)}"`;
   const start = html.indexOf(marker);
   if (start === -1) throw new Error(`expected to find a row for resourceKey ${JSON.stringify(resourceKey)}`);
-  const nextStart = html.indexOf('<span class="key">', start + marker.length);
+  const nextStart = html.indexOf('<div class="row agent"', start + marker.length);
   return html.slice(start, nextStart === -1 ? html.length : nextStart);
 }
 
