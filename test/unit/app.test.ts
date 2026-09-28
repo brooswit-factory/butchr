@@ -212,10 +212,16 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     // render, no matter how old the row actually is).
     const pollTime = Date.now() - 65_000;
     const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
+    // FACTORY-407: `agent_key` (the full, undiscarded key) is what
+    // `buildDashboardRows` now uses for `AgentDashboardRow.resourceKey` — the
+    // real shape `ownedAgentOfCwd` (src/daemon/index.ts) produces, not a bare
+    // provider-native id.
+    const issueKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
+    const projectKey = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "task", resourceId: "BUTCHR" });
     const rows = buildDashboardRows(
       [
-        { resource_key: "BUTCHR-1", agent_status: "working", pane_id: "w1:p3" },
-        { resource_key: "BUTCHR", agent_status: "idle", pane_id: "p2" },
+        { agent_key: issueKey, agent_status: "working", pane_id: "w1:p3" },
+        { agent_key: projectKey, agent_status: "idle", pane_id: "p2" },
       ],
       { now: () => pollTime, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => pollTime) },
     );
@@ -223,8 +229,8 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     // Distinct, clearly-shaped targets so a mismatch (e.g. the project row
     // 302ing to the issue row's Jira url) is unambiguous.
     const resourceLink = async (key: string) => {
-      if (key === "BUTCHR-1") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/BUTCHR-1" };
-      if (key === "BUTCHR") return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
+      if (key === issueKey) return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/BUTCHR-1" };
+      if (key === projectKey) return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
       return { ok: false as const, error: `unexpected resource key ${key}` };
     };
     // BUTCHR-344 [correction] (V1): a REAL header — distinct from every other
@@ -250,8 +256,8 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
       expect(html).toContain("behind by 5"); // the real header's own stale currency verdict
       expect(html).not.toContain("build sha unknown");
 
-      const issueRow = rowSlice(html, "BUTCHR-1");
-      const projectRow = rowSlice(html, "BUTCHR");
+      const issueRow = rowSlice(html, issueKey);
+      const projectRow = rowSlice(html, projectKey);
 
       const terminalHrefMatch = issueRow.match(/href="([^"]+)">open terminal</);
       if (!terminalHrefMatch) throw new Error("expected a terminal link in the issue row's own HTML");
@@ -415,7 +421,7 @@ describe("GET /config-inventory (FACTORY-72): every configured rule and managed-
 describe("GET /configurations (FACTORY-81): the Configurations view, wired end-to-end", () => {
   test("serves the render of deps.configInventory()/dashboard(), and the forward/back cross-links actually round-trip through the real app", async () => {
     const liveKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
-    const rows = buildDashboardRows([{ name: "x", resource_key: liveKey, agent_status: "working", pane_id: "w1:p3" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: liveKey, agent_status: "working", pane_id: "w1:p3" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const dashboard: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };

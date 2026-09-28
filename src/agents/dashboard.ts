@@ -44,6 +44,7 @@
  * inside a module that never sees it).
  */
 import { isProjectId } from "../resources/id.js";
+import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import { StatusFloorTracker, type StatusFloor } from "./status-floor.js";
 import type { AdmissionCensus } from "./admission.js";
 
@@ -89,6 +90,20 @@ export type TierField = { kind: "project" } | { kind: "issue"; issuetype: Issuet
  */
 export interface AgentDashboardRow {
   kind: "agent";
+  /**
+   * FACTORY-407: the full `encodeAgentKey`/`encodeQueryAgentKey` value this
+   * agent was spawned under (never the bare provider-native resource id
+   * alone) — the SAME correlation identifier `query-agent-inventory.ts`'s
+   * `liveAndWithheldRuleKeys` and `config-inventory-links.ts`'s
+   * `agentRowsForRule`/`configAnchorForResourceKey`/
+   * `agentRowsForSessionDefinition` already decode/compare it as (those
+   * modules' own doc comments describe exactly this contract — this field
+   * now actually satisfies it). Carries its own `ruleId` for a `swarm`
+   * agent, so which rule owns which per-resource row is never ambiguous
+   * even when several rules match the same resource: correlation is by the
+   * agent's own key, never by re-matching the bare resource id against every
+   * rule.
+   */
   resourceKey: string;
   tier: TierField;
   /** Raw `AgentInfo.agent_status` — the SDK-pinned `"idle" | "working" | "blocked" | "done" | "unknown"` domain, served as-is rather than remapped through labels/plan.ts's `ObservedAgentLabel` (a different consumer's own vocabulary). */
@@ -111,6 +126,18 @@ export interface AgentDashboardRow {
  */
 export interface WithheldDashboardRow {
   kind: "withheld";
+  /**
+   * FACTORY-407: the admission candidate string verbatim (`bucket.withheld`,
+   * below) — this was ALREADY the full `encodeAgentKey`/`encodeQueryAgentKey`
+   * value every admission source admits under (`unitAgentKey`,
+   * `src/rules/execution.ts`, is what every `runResourceLoop` call site
+   * passes as its `desired`/`plan.spawn` candidates, and those are exactly
+   * what `admissionController.admit()` receives and records as `withheld`)
+   * — same shape as `AgentDashboardRow.resourceKey` now carries, which is
+   * what makes the `deps.agentKeys.has(...)` "agent wins" comparison below,
+   * and `query-agent-inventory.ts`'s `decodeAnyAgentKey(row.resourceKey)`
+   * correlation, actually line up for both row kinds alike.
+   */
   resourceKey: string;
   tier: TierField;
   /** Which admission-census source (e.g. the issue or project tier) produced this row — see src/agents/admission.ts's `AdmissionCensusBucket`. Lets a consumer (and a test) tie a row to the specific census that produced it, which is what makes "only the project tier's rows went could-not-check" checkable rather than merely asserted. */
@@ -216,7 +243,23 @@ export function buildAdmissionView(census: AdmissionCensus): AdmissionView {
 /** The subset of `AgentInfo` this module actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardAgent {
   name?: string | null;
+  /**
+   * The BARE provider-native resource id (e.g. a Jira issue key) — used ONLY
+   * by `src/daemon/index.ts`'s own `statusMapFromAgents` (the labels-sync
+   * status map, looked up by the bare keys a Jira search returns). NOT the
+   * correlation identifier a dashboard row's own `resourceKey` carries — see
+   * `agent_key` below for that.
+   */
   resource_key?: string | null;
+  /**
+   * FACTORY-407: the full owned agent key (`ownedAgentOfCwd`,
+   * `src/daemon/index.ts`) — `null`/absent for an unowned or legacy pane.
+   * This, not `resource_key`, is what `buildDashboardRows` uses to build
+   * `AgentDashboardRow.resourceKey`: `resource_key`'s bare form is correct
+   * for a Jira-label lookup but was never decodable by `decodeAnyAgentKey`,
+   * which is exactly the defect this field exists to stop feeding forward.
+   */
+  agent_key?: string | null;
   agent_status: string;
   pane_id: string;
 }
@@ -238,7 +281,7 @@ export function buildDashboardRows(agents: readonly DashboardAgent[], deps: Buil
 
   const resolved: { agent: DashboardAgent; resourceKey: string }[] = [];
   for (const agent of agents) {
-    const resourceKey = agent.resource_key;
+    const resourceKey = agent.agent_key;
     if (resourceKey) resolved.push({ agent, resourceKey });
   }
   // Same discipline as FrozenAsleepTracker.forgetMissing: an id absent from
@@ -257,9 +300,25 @@ export function buildDashboardRows(agents: readonly DashboardAgent[], deps: Buil
   }));
 }
 
+/**
+ * FACTORY-407: `resourceKey` is now the FULL agent/query key (see
+ * `AgentDashboardRow.resourceKey`'s own doc comment), but `isProjectId`/
+ * `issueMeta` need the bare provider-native resource id underneath it — so
+ * this decodes first. A `kind: "resource"` key yields that bare id exactly
+ * as before this ticket. A `kind: "query"` key (a `singleton`/`persistent`
+ * rule's one query-level agent) has no single resource to report a tier
+ * for — same could-not-check shape this function already produced for a
+ * query-level id pre-FACTORY-407 (decoding used to fail entirely for that
+ * case too, via a different path — see this ticket's PR description for the
+ * full history); an undecodable key (defensive only — nothing in this
+ * daemon produces one for an owned agent) falls through the same way.
+ */
 function buildTier(resourceKey: string, issueMeta: (key: string) => IssueMeta | undefined, declinedAt: string): TierField {
-  if (isProjectId(resourceKey)) return { kind: "project" };
-  const meta = issueMeta(resourceKey);
+  const decoded = decodeAnyAgentKey(resourceKey);
+  const bareId = decoded && decoded.kind === "resource" ? decoded.resourceId : null;
+  if (bareId === null) return { kind: "issue", issuetype: { checked: false, declinedAt } };
+  if (isProjectId(bareId)) return { kind: "project" };
+  const meta = issueMeta(bareId);
   return { kind: "issue", issuetype: meta ? { checked: true, value: meta.issuetype } : { checked: false, declinedAt } };
 }
 
