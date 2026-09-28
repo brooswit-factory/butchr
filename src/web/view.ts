@@ -284,11 +284,25 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       backpressureLimit: 4 * 1024 * 1024,
       closeOnBackpressureLimit: true,
       beforeHandle({ request, params, set }) {
-        const guard = checkBearerOriginForUpgrade({ authorization: request.headers.get("authorization"), origin: request.headers.get("origin") }, extensionAuth);
+        const guard = checkBearerOriginForUpgrade(
+          {
+            authorization: request.headers.get("authorization"),
+            origin: request.headers.get("origin"),
+            subprotocol: request.headers.get("sec-websocket-protocol"),
+          },
+          extensionAuth,
+        );
         if (!guard.ok) {
           set.status = guard.status;
           return guard.body;
         }
+        // FACTORY-455: echoed back ONLY when auth actually went through the
+        // subprotocol channel (`checkBearerOriginForUpgrade` sets this) —
+        // never for header auth, which offered no subprotocol to select
+        // from in the first place. See `PTY_BEARER_SUBPROTOCOL_MARKER`'s own
+        // doc comment in `./bearer-origin-guard.ts` for why this must be
+        // exactly the marker and never the token.
+        if (guard.selectedSubprotocol) set.headers["sec-websocket-protocol"] = guard.selectedSubprotocol;
         if (!deps.ptyAttach) {
           set.status = 503;
           return { error: "endpoint disabled: no token configured" };

@@ -361,4 +361,23 @@ describe("extensionAuth (FACTORY-339)", () => {
     expect(d).toContain("extensionAuth=enabled(token=***(11 chars)) origins=chrome-extension://abcdefghijklmnopabcdefghijklmnop");
     expect(d).not.toContain("supersecret");
   });
+
+  // FACTORY-455 (implementing FACTORY-454): the token must be representable
+  // as a `Sec-WebSocket-Protocol` value (RFC 6455 §4.3 / RFC 2616 HTTP token
+  // chars) since GET /agents/:agentKey/pty carries it that way for a browser
+  // caller — see `bearer-origin-guard.ts`'s `isHttpTokenChars`.
+  test("rejects a BUTCHR_EXTENSION_TOKEN containing characters invalid in a WebSocket subprotocol value, naming the offenders", () => {
+    expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: "has a space" }, noRead)).toThrow("BUTCHR_EXTENSION_TOKEN");
+    try {
+      loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: "bad,token" }, noRead);
+      throw new Error("expected loadConfig to throw");
+    } catch (e) {
+      expect((e as Error).message).toContain(",");
+    }
+  });
+  test("accepts a token made only of HTTP token characters (hex/base64url/JWT-like shapes)", () => {
+    for (const ok of ["a1b2c3d4e5f6", "aGVsbG8td29ybGQ-_", "header.payload.signature"]) {
+      expect(loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: ok }, noRead).extensionAuth.token).toBe(ok);
+    }
+  });
 });
