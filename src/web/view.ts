@@ -7,7 +7,9 @@ import type { DashboardResponse } from "../agents/dashboard.js";
 import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
-import { checkBearerOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "./bearer-origin-guard.js";
+import { checkBearerOrigin, checkBearerOriginForUpgrade, preflightBearerOrigin, type BearerOriginGuardDeps } from "./bearer-origin-guard.js";
+import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
+import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -81,6 +83,35 @@ export interface ViewDeps {
    * `undefined` token.
    */
   extensionAuth?: BearerOriginGuardDeps;
+  /**
+   * FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the
+   * `GET /agents/:agentKey/pty` WebSocket's own deps — resolving an agent
+   * key to a pane, checking that pane is still live on each poll tick, and
+   * reading/writing its text. Optional, same "absent means disabled"
+   * discipline as `resourcesForUrl` above: this route is gated by the SAME
+   * `extensionAuth` token/origin guard (see `./bearer-origin-guard.ts`'s
+   * `checkBearerOriginForUpgrade`), and an omitted `ptyAttach` makes it
+   * unreachable regardless of `extensionAuth`.
+   */
+  ptyAttach?: {
+    /** Resolves `:agentKey` against the daemon's current dashboard snapshot — no I/O, see `../terminal/pty-attach.ts`. */
+    resolve: (agentKey: string) => PtyAttachResolution;
+    /** Re-checked every poll tick against a fresh snapshot read (still no I/O) so a pane that goes away mid-session is caught promptly. */
+    isLive: (agentKey: string, pane: string) => boolean;
+    /** `herdr.pane.read`, wrapped — see `../terminal/pty-bridge.ts`'s header for why this is a poll, not a push stream. */
+    read: (pane: string) => Promise<string>;
+    /** `herdr.pane.sendText`, wrapped. */
+    send: (pane: string, text: string) => Promise<void>;
+    /** Poll interval, in ms — this daemon's own choice, not herdr's; see `docs/pty-attach.md`'s Config section. */
+    pollMs: number;
+  };
+}
+
+/** One open `/agents/:agentKey/pty` socket's server-side bookkeeping — keyed by `ElysiaWS.id`, since neither Elysia nor Bun hands the `open`/`message`/`close` callbacks a shared closure over each other by default. */
+interface PtySession {
+  pane: string;
+  timer: ReturnType<typeof setInterval>;
+  state: PtyTickState;
 }
 
 /** The live view: the page, its data (/state), the connected-agents feed (/agents), and the open action. */
@@ -90,6 +121,8 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
   // `bearer-origin-guard.ts`'s header for why an absent token must never
   // read as "no auth required".
   const extensionAuth: BearerOriginGuardDeps = deps.extensionAuth ?? { token: undefined, allowedOrigins: [] };
+  // FACTORY-453: one entry per currently-open `/agents/:agentKey/pty` socket — see `PtySession`'s own doc comment for why this exists instead of closing over per-connection state directly.
+  const ptySessions = new Map<string, PtySession>();
   return new Elysia()
     // BUTCHR-339: the dashboard page itself — a pure, synchronous render
     // (src/web/dashboard-page.ts) of the SAME snapshot `/dashboard` serves,
@@ -228,5 +261,117 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // resource" shape as any other unparseable input, never a special error.
       const url = typeof query["url"] === "string" ? query["url"] : "";
       return deps.resourcesForUrl(url);
+    })
+    // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the ONLY
+    // other guarded route in this file, and the highest-risk one — a
+    // WebSocket that gives a browser keystroke access to a live agent's
+    // terminal. See `docs/pty-attach.md` for the full contract, framing,
+    // close-reason and back-pressure policy, and — most importantly — why
+    // this route's Origin rule is STRICTER than `/resources/for-url`'s
+    // above: `checkBearerOriginForUpgrade`, not `checkBearerOrigin`, because
+    // CORS does not apply to WebSocket upgrades (see that function's own
+    // doc comment in `./bearer-origin-guard.ts`). `beforeHandle` runs before
+    // Elysia ever calls `server.upgrade()`, so a refusal here is an ordinary
+    // HTTP response (401/403/404/503) — the socket is never opened at all,
+    // never opened-then-closed.
+    .ws("/agents/:agentKey/pty", {
+      // Bun-native back-pressure policy (see `docs/pty-attach.md`'s Contract
+      // section for the justification): once a slow client's own unread
+      // buffer exceeds this bound, the connection is dropped outright
+      // rather than silently discarding pane output the client would have
+      // no way to know it missed — an honest, visible failure a client can
+      // reconnect from, not a terminal that quietly desyncs.
+      backpressureLimit: 4 * 1024 * 1024,
+      closeOnBackpressureLimit: true,
+      beforeHandle({ request, params, set }) {
+        const guard = checkBearerOriginForUpgrade({ authorization: request.headers.get("authorization"), origin: request.headers.get("origin") }, extensionAuth);
+        if (!guard.ok) {
+          set.status = guard.status;
+          return guard.body;
+        }
+        if (!deps.ptyAttach) {
+          set.status = 503;
+          return { error: "endpoint disabled: no token configured" };
+        }
+        const agentKey = decodeURIComponent(params.agentKey);
+        const resolution = deps.ptyAttach.resolve(agentKey);
+        if (!resolution.ok) {
+          set.status = 404;
+          return { error: ptyAttachRefusalMessage(resolution.refusal) };
+        }
+      },
+      open(ws) {
+        // `beforeHandle` above already refused anything that doesn't
+        // resolve — `deps.ptyAttach` and a successful `resolve` are both
+        // guaranteed here. Re-running `resolve` (a cheap, synchronous scan
+        // of the in-memory snapshot, not a second I/O call) rather than
+        // smuggling its result through Elysia's context avoids relying on
+        // exactly how far `beforeHandle`'s own derived values propagate
+        // into the `open` handler's context, which this codebase has no
+        // other `.ws()` route to already prove out.
+        const agentKey = decodeURIComponent((ws.data as { params: { agentKey: string } }).params.agentKey);
+        const ptyAttach = deps.ptyAttach!;
+        const resolution = ptyAttach.resolve(agentKey);
+        if (!resolution.ok) {
+          ws.close(4004, ptyAttachRefusalMessage(resolution.refusal));
+          return;
+        }
+        const pane = resolution.pane;
+        const session: PtySession = {
+          pane,
+          state: { lastText: "" },
+          timer: setInterval(() => {
+            void (async () => {
+              const current = ptySessions.get(ws.id);
+              if (!current) return;
+              const live = ptyAttach.isLive(agentKey, current.pane);
+              let text = "";
+              if (live) {
+                try {
+                  text = await ptyAttach.read(current.pane);
+                } catch {
+                  // A read failure on an otherwise-live-looking pane is
+                  // treated the same as the pane having gone away: this
+                  // socket's whole job is showing a live pane, and there is
+                  // no meaningful partial state to report instead.
+                  clearInterval(current.timer);
+                  ptySessions.delete(ws.id);
+                  ws.close(4000, PTY_CLOSED_REASON);
+                  return;
+                }
+              }
+              const result = ptyTick(current.state, live, text);
+              if (result.kind === "closed") {
+                clearInterval(current.timer);
+                ptySessions.delete(ws.id);
+                ws.close(4000, result.reason);
+              } else {
+                current.state = result.state;
+                if (result.kind === "output") ws.send(result.text);
+              }
+            })();
+          }, ptyAttach.pollMs),
+        };
+        ptySessions.set(ws.id, session);
+      },
+      message(ws, message) {
+        const session = ptySessions.get(ws.id);
+        if (!session || !deps.ptyAttach) return;
+        const frame = parseClientFrame(message as string | Uint8Array);
+        // Only "input" is ever acted on: a "control" (resize) frame is
+        // accepted and parsed, never rejected, but is NOT wired through —
+        // see `../terminal/pty-bridge.ts`'s header for why no herdr call
+        // exists to do that, and `docs/pty-attach.md`'s Contract section for
+        // this stated plainly rather than left to be discovered by a
+        // resize that silently does nothing. "ignored" frames (unparseable
+        // binary, or a JSON shape this daemon doesn't recognize) are
+        // likewise never fatal to the connection.
+        if (frame.kind === "input") void deps.ptyAttach.send(session.pane, frame.text);
+      },
+      close(ws) {
+        const session = ptySessions.get(ws.id);
+        if (session) clearInterval(session.timer);
+        ptySessions.delete(ws.id);
+      },
     });
 }

@@ -108,3 +108,34 @@ const EXTENSION_ORIGIN_RE = /^chrome-extension:\/\/[a-p]{32}$/;
 
 /** True only for a well-formed `chrome-extension://<id>` origin — used to validate `BUTCHR_EXTENSION_ORIGINS` entries at config-load time, before any request is ever checked against them. */
 export const isExtensionOrigin = (origin: string): boolean => EXTENSION_ORIGIN_RE.test(origin);
+
+/**
+ * FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the STRICT
+ * sibling of `checkBearerOrigin`, for a WebSocket upgrade rather than an
+ * ordinary cross-origin `fetch()`.
+ *
+ * `checkBearerOrigin` deliberately ALLOWS an absent `Origin` header, because
+ * a browser always sends `Origin` on a cross-origin fetch and CORS covers
+ * the rest — there is no way for a page other than an allowlisted extension
+ * to make that specific request succeed. A WebSocket upgrade has no such
+ * backstop: browsers do NOT apply CORS to WebSockets, so any page the user
+ * has open could attempt one, and an Origin-less request is exactly what a
+ * non-browser caller (or a browser context that simply omits the header)
+ * looks like too. Calling `checkBearerOrigin` verbatim on an upgrade path
+ * would accept that request and hand it a live terminal socket — this
+ * function exists so that mistake has no easy way to happen: an upgrade
+ * whose `Origin` is ABSENT is refused here (403) exactly like one that is
+ * PRESENT but not allowlisted, before the token is ever inspected. Do not
+ * "simplify" a WebSocket route back onto `checkBearerOrigin` — the two
+ * routes' Origin rules differ on purpose, not by oversight, precisely
+ * because one of them is CORS-covered and the other cannot be.
+ */
+export function checkBearerOriginForUpgrade(req: { authorization: string | null; origin: string | null }, deps: BearerOriginGuardDeps): GuardOutcome {
+  if (deps.token === undefined) {
+    return { ok: false, status: 503, body: { error: "endpoint disabled: no token configured" }, corsHeaders: {} };
+  }
+  if (req.origin === null) {
+    return { ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} };
+  }
+  return checkBearerOrigin(req, deps);
+}
