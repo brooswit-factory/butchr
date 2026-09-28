@@ -320,12 +320,22 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
 });
 
 describe("project-manager Claude permissions", () => {
-  // No human answers a project manager's prompts; Claude's auto mode is the
-  // counterpart of the Codex launch's on-request + auto_review policy.
-  test("a jira-project Claude agent launches in auto permission mode", () => {
+  // FACTORY-129: the jira-project-only "auto" override is gone — a
+  // jira-project Claude agent with no explicit spec.permissionMode now gets
+  // butchr's ordinary default, acceptEdits, exactly like every other rule
+  // kind (safety for the dropped "auto" behaviour comes from lizard-mode
+  // eligibility, pinned separately in test/unit/permission-answer-loop.test.ts's
+  // parameterized "jira-project" case).
+  test("a jira-project Claude agent with no explicit permissionMode gets the ordinary acceptEdits default, not a jira-project-specific override", () => {
     const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
     const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
-    expect(args[args.indexOf("--permission-mode") + 1]).toBe("auto");
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe(DEFAULT_PERMISSION_MODE);
+  });
+
+  test("a jira-project rule's own explicit permissionMode still wins (FACTORY-87 no regression)", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "bypassPermissions" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
   });
 });
 

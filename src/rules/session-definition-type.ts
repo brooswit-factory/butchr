@@ -122,8 +122,17 @@ export function managedSessionShortDisplayId(resourceId: string): string {
  * carries `linkedEventing: true` — there is no separate boolean to plumb
  * through, and every OTHER linked-eventing knob (`maxLinkedItems`,
  * `maxLinkedTurnsPerHour`, `linkedRemoteLinks`, `linkedDescriptionLinks`) is
- * left absent, the same "absent means uncapped/off" default an unconfigured
- * `jira-project` rule already has. `resourceProvider: "filesystem"` (rather
+ * left absent. BUTCHR-471: absent no longer means "uncapped" for the two
+ * cap fields — `runTick` itself (`effectiveMaxLinkedItems`/
+ * `effectiveMaxLinkedTurnsPerHour`, src/jira-watch/linked-eventing.ts) falls
+ * back to a fixed default (2 turns/hour, 25 items) whenever a rule leaves
+ * either absent, THIS rule included, precisely so a managed session cannot
+ * run uncapped either — there is still no per-definition override (a known,
+ * deliberately-deferred gap tracked in FACTORY-78/BUTCHR-471's own
+ * follow-up list), only the shared default. `linkedRemoteLinks`/
+ * `linkedDescriptionLinks` are unaffected by this ticket and still mean
+ * "off" when absent, same as an unconfigured `jira-project` rule.
+ * `resourceProvider: "filesystem"` (rather
  * than "jira-project") is deliberate: this value never names a jira-project
  * RULE — it names the managed-sessions definition file that granted the
  * opt-in — but nothing reads its `resourceProvider`/`query` fields; they

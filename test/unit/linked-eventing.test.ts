@@ -319,6 +319,88 @@ describe("BUTCHR-436: linked-change eventing", () => {
   });
 });
 
+describe("BUTCHR-472: de-dup Implements/outward pairs already covered by related:", () => {
+  test("FALSIFIER/jiraKindLinkedItems: an Implements/outward target (already routed via related:) is excluded; other issuelink types and the inward Implements direction are unaffected", () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Implements", otherEnd: "outward", key: "BUTCHR-2" }, // routed via related: — must be de-duplicated out of the linked path
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-3" }, // reverse direction (this issue hearing its own boss) — deliberately unchanged
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-4" }, // non-Implements type — unaffected
+      ] as never,
+    });
+    const items = jiraKindLinkedItems({ agentKey: "a", rule: rule(), issue: owner }, undefined);
+    expect(items.map((i) => i.target).sort()).toEqual(["BUTCHR-3", "BUTCHR-4"]);
+  });
+
+  test("FALSIFIER/runTick: a boss with an Implements/outward worker gets no linked turn for that worker even on a real change, because related: already covers it", async () => {
+    const boss = issue("BUTCHR-1", { issuelinks: [{ type: "Implements", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), boss);
+
+    await state.runTick([m], deps); // seed (nothing to seed for BUTCHR-2 — excluded from the linked path entirely)
+    expect(notified).toHaveLength(0);
+
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(0); // still nothing: this pair is de-duplicated, not just rate-capped
+  });
+
+  test("a boss's OTHER (non-Implements-outward) links still produce linked turns exactly as before, alongside a de-duplicated Implements/outward pair", async () => {
+    const boss = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Implements", otherEnd: "outward", key: "BUTCHR-2" }, // de-duplicated — related: already covers it
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-3" }, // unaffected
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }),
+      "BUTCHR-3": issue("BUTCHR-3", { status: "To Do", updated: "t1" }),
+    };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), boss);
+
+    await state.runTick([m], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    world["BUTCHR-3"] = issue("BUTCHR-3", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string }[] } };
+    expect(reason.linked.events.map((e) => e.target)).toEqual(["BUTCHR-3"]); // BUTCHR-2 never appears — de-duplicated
+  });
+
+  test("a leaf task/bug agent (a plain Implements/inward link to its own boss, nothing outward) is unaffected: its linked changes still notify exactly as before", async () => {
+    const leaf = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-BOSS" }, // this leaf's own boss — reverse direction, never in watchedKeys()
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-BOSS": issue("BUTCHR-BOSS", { status: "To Do", updated: "t1" }),
+      "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }),
+    };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), leaf);
+
+    await state.runTick([m], deps); // seed — both targets readable, nothing to report yet
+    expect(notified).toHaveLength(0);
+
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1); // leaf agents: zero overlap with related:, unaffected by this ticket
+
+    world["BUTCHR-BOSS"] = issue("BUTCHR-BOSS", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(2); // its own boss's change still reaches it too — the reverse direction stays untouched
+  });
+});
+
 describe("jiraKindLinkedItems", () => {
   test("issuelink/parent/description-jira-key are Jira-kind; confluence/github/webpage description links are excluded", () => {
     const owner: JiraIssue = issue("BUTCHR-1", {
