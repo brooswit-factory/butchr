@@ -159,6 +159,52 @@ describe("createCredentialDeathTracker (FACTORY-363/FACTORY-397)", () => {
       expect(lines.length).toBe(1); // still no second open line — the host-wide episode never actually closed
       expect(tracker.current()?.paneIds).toEqual(["p1-respawned"]);
     });
+
+    test("FACTORY-357 defect 1: a genuine recovery must still close the alert even when the LAST departure is pane-gone, not recovered", () => {
+      // Would fail before the fix: the "recovered" resolve for p1 doesn't close (p2 is
+      // still tracked), and the "pane-gone" resolve for p2 never re-checks the close
+      // condition at all — the episode was stuck open forever with paneIds: [].
+      const { deps, lines } = fakeDeps();
+      const tracker = createCredentialDeathTracker(deps);
+      tracker.onLoginExpired({ paneId: "p1", detail: "Login expired · Please run /login" });
+      tracker.onLoginExpired({ paneId: "p2", detail: "Login expired · Please run /login" });
+
+      tracker.onLoginExpiredResolved({ paneId: "p1", reason: "recovered" }); // credential demonstrably back
+      tracker.onLoginExpiredResolved({ paneId: "p2", reason: "pane-gone" }); // churns away during recovery
+
+      expect(tracker.current()).toBeUndefined(); // must close — the credential recovered
+      expect(lines.length).toBe(2);
+      expect(lines[1]).toInclude("cleared");
+    });
+
+    test("FACTORY-357 defect 2: a stray recovered for a paneId never tracked must NOT close an alert already emptied by pane-gone alone", () => {
+      // Would fail before the fix: once panes.size === 0 from the pane-gone departure,
+      // delete("never-tracked") is a no-op but size === 0 already held, so the close
+      // fired anyway — an unrelated pane's recovery silenced a live credential outage.
+      const { deps, lines } = fakeDeps();
+      const tracker = createCredentialDeathTracker(deps);
+      tracker.onLoginExpired({ paneId: "p1", detail: "Login expired · Please run /login" });
+      tracker.onLoginExpiredResolved({ paneId: "p1", reason: "pane-gone" }); // set empty, alert deliberately stays open
+
+      tracker.onLoginExpiredResolved({ paneId: "some-other-pane-id-never-tracked", reason: "recovered" });
+
+      expect(tracker.current()).toBeDefined(); // must NOT close — nothing tracked ever actually recovered
+      expect(lines.length).toBe(1); // no "cleared" line
+    });
+
+    test("an episode whose every pane departs via pane-gone ONLY (no recovered anywhere) must still refuse to close, even with an empty set — this is not 'empty set means clear'", () => {
+      const { deps, lines } = fakeDeps();
+      const tracker = createCredentialDeathTracker(deps);
+      tracker.onLoginExpired({ paneId: "p1", detail: "Login expired · Please run /login" });
+      tracker.onLoginExpired({ paneId: "p2", detail: "Login expired · Please run /login" });
+
+      tracker.onLoginExpiredResolved({ paneId: "p1", reason: "pane-gone" });
+      tracker.onLoginExpiredResolved({ paneId: "p2", reason: "pane-gone" });
+
+      expect(tracker.current()).toBeDefined(); // MUST stay open — the credential is presumed still dead
+      expect(tracker.current()?.paneIds).toEqual([]);
+      expect(lines.length).toBe(1); // no "cleared" line
+    });
   });
 
   test("a resolve for a paneId this tracker never saw is a harmless no-op", () => {
