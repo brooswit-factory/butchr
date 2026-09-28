@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -37,6 +37,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
@@ -765,7 +766,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1725,6 +1726,34 @@ const blockingEscalationTimer = setInterval(() => {
     .finally(() => { blockingEscalationPollInFlight = false; });
 }, 5_000);
 blockingEscalationTimer.unref?.();
+
+// FACTORY-363/FACTORY-397: drovr's SEPARATE login-expired watcher
+// (`createLoginExpiredWatcher`, `@brooswit/drovr` >= 0.16.3,
+// src/agents/login-expired-alert.ts) — its OWN independent poll loop, own
+// timer, own read of the fleet, deliberately NOT sharing
+// `blockingEscalationTimer` above: that timer feeds ONLY
+// `escalator.onDrovrUnknownDialog`, whose managed-session-only routing is
+// exactly the trap this condition must not inherit (a keyed pane — both real
+// incidents, FACTORY-314/w1T and FACTORY-324/w1V — resolves `managedSessionOf`
+// to null there and would be silently dropped). This tracker has no
+// managed-session concept at all: every pane drovr reports reaches the
+// host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
+// the full design and why its delivery (a journal line + a `/health` sibling
+// field, both below) survives a dead Claude credential.
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+const loginExpiredWatcher = createLoginExpiredWatcher({
+  onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
+  onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
+});
+let loginExpiredPollInFlight = false;
+const loginExpiredTimer = setInterval(() => {
+  if (loginExpiredPollInFlight) return;
+  loginExpiredPollInFlight = true;
+  loginExpiredWatcher.poll(herdr)
+    .catch((e) => console.error(`  [login-expired] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { loginExpiredPollInFlight = false; });
+}, 5_000);
+loginExpiredTimer.unref?.();
 
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by
