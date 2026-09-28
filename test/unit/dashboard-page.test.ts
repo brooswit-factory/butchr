@@ -96,6 +96,48 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
 });
 
 // ---------------------------------------------------------------------------
+// FACTORY-408: FACTORY-407 widened `AgentDashboardRow.resourceKey` to the
+// FULL agent key (needed for correlation/hrefs/anchors), which silently
+// widened the VISIBLE `.key` label too — a regression epic FACTORY-68
+// explicitly forbids ("the existing agent view and attach behaviour are
+// unchanged"). These pin the exact `.key` element content — a `toContain`
+// of the bare id is exactly the check that let the regression ship silently
+// in the first place, since the full key also contains that substring.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: the visible .key label is the bare resource id, never the full agent key (FACTORY-408)", () => {
+  test("an issue-tier row's .key label is the bare issue key exactly — not the full jira-work:<rule>:<id> agent key", () => {
+    const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "w1:p3")], {
+      now: () => 0,
+      issueMeta: () => ({ summary: "s", issuetype: "Task" }),
+      tracker: new StatusFloorTracker(() => 0),
+    });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(elementText(html, 'class="key"', "</span>")).toBe("BUTCHR-1");
+    // the full key must still be present ELSEWHERE on the row (hrefs/anchors) — this ticket narrows only the visible label
+    expect(html).toContain(encodeURIComponent(agentKeyFor("butchr-butchr-1")));
+  });
+
+  test("a project-tier row's .key label is the bare project id exactly — not the full jira-project:<rule>:<id> agent key", () => {
+    const rows = buildDashboardRows([agent("butchr-butchr", "idle", "p2")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(elementText(html, 'class="key"', "</span>")).toBe("BUTCHR");
+  });
+
+  test("a query-level agent's .key label reads '<provider>:<rule> (query)' — never its own literal full key, which has no single resource to name", () => {
+    const key = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" });
+    const rows = buildDashboardRows(
+      [{ name: "director", resource_key: "director", agent_key: key, agent_status: "idle", pane_id: "p1" }],
+      { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) },
+    );
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts());
+    expect(elementText(html, 'class="key"', "</span>")).toBe("filesystem:director (query)");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BUTCHR-342: the pane is one of the five fields BUTCHR-266 requires as
 // VISIBLE text on every agent row — not merely present somewhere in the HTML
 // (it was already present, inside the terminal link's href, which is exactly
