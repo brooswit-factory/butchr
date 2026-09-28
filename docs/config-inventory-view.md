@@ -102,7 +102,55 @@ agent row carries on `/`. All three are percent-encoded, `--`-joined tokens —
 safe as both an HTML `id` and a URL fragment, with no `:`/`/`/`#` of their
 own.
 
-## The additive change to the existing agent view (`/`)
+## FACTORY-407: `resourceKey` actually carries the correlation identifier now
+
+Every section above describes the intended contract as FACTORY-81/FACTORY-72
+originally designed it: `AgentDashboardRow.resourceKey`/`WithheldDashboardRow.resourceKey`
+is a full `encodeAgentKey`/`encodeQueryAgentKey` value, decodable via
+`decodeAnyAgentKey`. Between that design and FACTORY-407, it never actually
+was — `src/daemon/index.ts` fed `buildDashboardRows` the BARE provider-native
+resource id (`resourceOfCwd(a.cwd)`, which discards `resourceProvider`/`ruleId`
+via `resourceKeyOf`), so every real agent row's `resourceKey` was exactly the
+one shape `decodeAnyAgentKey` can never produce a match for ("a bare issue key
+contains no `:` and never decodes" — `src/rules/agent-key.ts`'s own header).
+The forward/back cross-links above, `query-agent-inventory.ts`'s own
+`live`/`withheld` correlation, and the `/resource/:key/open` route's
+provider-aware redirect (`src/daemon/index.ts`'s `resourceLink`, which already
+called `decodeAgentKey(key)` on this same value) were all written against the
+intended full-key contract and were all silently broken against a real daemon
+— a green suite coexisted with this because every existing test hand-built its
+`DashboardRow` fixtures with the correct (full) shape directly, never through
+`buildDashboardRows`'s own real input path.
+
+FACTORY-407's fix: `src/agents/dashboard.ts`'s `DashboardAgent` gained a
+SECOND field, `agent_key` — the full owned key (`ownedAgentOfCwd(cwd)` in
+`src/daemon/index.ts`, undiscarded) — alongside the pre-existing bare
+`resource_key` (which stays bare; label-sync's own status map, keyed by a Jira
+search's own issue keys, still needs exactly that). `buildDashboardRows` now
+builds `AgentDashboardRow.resourceKey` from `agent_key`, not `resource_key`,
+and decodes it internally wherever the OLD bare-id lookup (`isProjectId`/
+`issueMeta`) is still needed. The admission census's own `withheld` keys
+needed NO change at all: `admissionController.admit()`'s candidates were
+already the full `unitAgentKey` shape (`src/rules/execution.ts` — the same
+value every `runResourceLoop` desired-set entry and spawned agent id already
+uses), so `WithheldDashboardRow.resourceKey` (`bucket.withheld` verbatim,
+`updateWithheldRows`) was already correct — it was the AGENT row's own bare
+stripping that broke the `deps.agentKeys.has(...)` "agent wins" comparison
+between the two row kinds, not the withheld side. See `AgentDashboardRow`/
+`WithheldDashboardRow`'s own doc comments in `dashboard.ts` for the exact
+per-field reasoning.
+
+**Swarm ambiguity (the "several rules may match one resource" case
+`agent-key.ts`'s own header names):** resolved, not guessed. A `swarm` rule's
+per-resource agent's own key already carries the exact `ruleId` it was
+spawned under (`encodeAgentKey({resourceProvider, ruleId, resourceId})`,
+`src/rules/resource-type.ts` et al.) — correlation reads that `ruleId` directly
+off the agent's own key, never by re-matching the bare resource id against
+every enabled rule. So when two different swarm rules both match the same
+resource, each spawns its own agent under its own distinct key, and each
+row's `staffed:true` attributes to the correct rule with no ambiguity —
+proven directly in `test/unit/query-agent-inventory.test.ts`'s "two DIFFERENT
+swarm rules matching the SAME resource" case.
 
 Per this ticket's own requirement 7, the ONLY change to the pre-existing
 `renderDashboard`/`renderAgentRow` (`src/web/dashboard-page.ts`) is:
@@ -114,8 +162,10 @@ Per this ticket's own requirement 7, the ONLY change to the pre-existing
    overridable via the new, OPTIONAL `RenderDashboardOpts.configLinkHref`
    — same pure-URL-builder pattern as the pre-existing
    `terminalLinkHref`/`resourceLinkHref`). Nothing renders when the
-   resourceKey fails to decode at all (nothing in this daemon produces that
-   today).
+   resourceKey fails to decode at all — see FACTORY-407 below for why that
+   is now the genuinely-rare, defensive-only case this line always meant it
+   to be, rather than (pre-FACTORY-407) the case every real running agent's
+   row actually hit.
 3. A withheld row gets no back-link — requirement 3 speaks of the "running
    agent row" specifically, and a withheld row's own `reason` field already
    names the admission cap.

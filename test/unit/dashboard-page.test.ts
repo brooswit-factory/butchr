@@ -15,8 +15,20 @@ import {
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 
+/** FACTORY-407: the bare provider-native resource id these fixtures have always named their agents by — unchanged. */
+function resourceIdFor(name: string): string {
+  return name.replace(/^butchr[-:]/, "").toUpperCase();
+}
+
+/** FACTORY-407: the REAL, full agent-key shape a real daemon puts on `AgentDashboardRow.resourceKey` (via `ownedAgentOfCwd`, undiscarded). */
+function agentKeyFor(name: string, ruleId = "rule"): string {
+  const resourceId = resourceIdFor(name);
+  const resourceProvider = resourceId.includes("-") ? "jira-work" : "jira-project";
+  return encodeAgentKey({ resourceProvider, ruleId, resourceId });
+}
+
 function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
-  return { name, resource_key: name.replace(/^butchr[-:]/, "").toUpperCase(), agent_status: status, pane_id: pane };
+  return { name, resource_key: resourceIdFor(name), agent_key: agentKeyFor(name), agent_status: status, pane_id: pane };
 }
 
 const NO_ADMISSION = { cap: 0, residency: null, sentinels: null, sources: [] as const };
@@ -73,7 +85,7 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
     expect(html).toContain("Task");
     expect(html).toContain('class="st working"');
     expect(html).toContain(`href="/agents/pane/${encodeURIComponent("w1:p3")}/attach"`);
-    expect(html).toContain(`href="/resource/${encodeURIComponent("BUTCHR-1")}/open"`);
+    expect(html).toContain(`href="/resource/${encodeURIComponent(agentKeyFor("butchr-butchr-1"))}/open"`);
   });
 
   test("a project-tier row renders tier 'project' — no issuetype to know or decline", () => {
@@ -429,7 +441,7 @@ describe("renderDashboard: mutation 7 (page-level) — resource links always go 
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
     const calls: string[] = [];
     renderDashboard(response, opts({ resourceLinkHref: (key) => { calls.push(key); return `/marked/${key}`; } }));
-    expect(calls).toEqual(["BUTCHR-1"]);
+    expect(calls).toEqual([agentKeyFor("butchr-butchr-1")]);
   });
 
   test("a withheld row's resource link is ALSO built from resourceLinkHref(resourceKey) — withheld rows are not exempted from having a working resource link", async () => {
@@ -783,7 +795,7 @@ describe("renderDashboard: esc() actually escapes, verified with a pane containi
 describe("renderDashboard: the additive Configurations back-link on an agent row (FACTORY-81)", () => {
   test("carries an id anchor matching agentRowAnchorId, and a 'config' link to the default /configurations#<anchor> href for a rule-driven row", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
-    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
@@ -794,7 +806,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 
   test("a singleton/persistent rule's query-level agent row also gets the same rule anchor a per-resource row would", () => {
     const key = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" });
-    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
@@ -804,7 +816,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 
   test("a managed-session row's back-link points at its OWN session anchor — never the generic managed-sessions rule anchor", () => {
     const key = sessionAgentKey("/home/butchr/defs/foo.json");
-    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
@@ -815,7 +827,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 
   test("a caller-supplied configLinkHref is used instead of the default — same pattern as terminalLinkHref/resourceLinkHref", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
-    const rows = buildDashboardRows([{ name: "x", resource_key: key, agent_status: "working", pane_id: "p1" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
@@ -826,7 +838,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 
   test("a resourceKey that fails to decode entirely renders no config link at all — never a broken href", () => {
     expect(configAnchorForResourceKey("not-a-real-key")).toBeNull(); // sanity on the shared helper this row rendering relies on
-    const rows = buildDashboardRows([{ name: "x", resource_key: "not-a-real-key", agent_status: "working", pane_id: "p1" }], {
+    const rows = buildDashboardRows([{ name: "x", agent_key: "not-a-real-key", agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };

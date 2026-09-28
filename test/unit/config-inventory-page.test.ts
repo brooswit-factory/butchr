@@ -683,7 +683,7 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
     const activeDir = "/defs";
     const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
 
-    await f.poll(async () => ({ agents: [{ resource_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
+    await f.poll(async () => ({ agents: [{ agent_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
     expect(f.snapshot().checked).toBe(true);
 
     const inventory = await buildQueryAgentInventory({
