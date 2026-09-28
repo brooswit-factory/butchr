@@ -210,28 +210,57 @@ staleness is this model/effort comparison (`StaleAgent.resumable`, set only
 by the push site above and only for `provider === "claude"`) — with a
 same-pane, same-session-id relaunch instead:
 
-1. Every fresh Claude launch mints a `--session-id <uuid>` itself
-   (`crypto.randomUUID()`, `buildWorkspace()`) and persists it
-   (`.butchr-session-id.json`, `workspaceSessionId`) — Claude's own native
-   session identity, never re-derived from herdr (`agent_session` is never
-   populated for a butchr-launched pane — no code here calls
-   `pane.report_agent_session`) or from its transcript directory.
+1. `buildWorkspace()` mints/persists NO session id at all — the real
+   fresh-launch path (`ManagedHerdrLifecycle.start()`, `@brooswit/drovr`)
+   builds its own `agent.start` params via Drovr's own
+   `buildAgentStartParams()`, which has no `--session-id` concept for
+   Claude, so anything butchr passed there would never have reached the
+   real launch anyway (this was round 1's mistake, caught in review before
+   merge). Instead, the REAL id Claude actually picked is discovered AFTER
+   a confirmed-successful launch, from Claude's own transcript directory
+   for that workspace's cwd (`discoverClaudeSessionId`,
+   src/agents/workspace.ts) — a short bounded poll
+   (`SESSION_DISCOVERY_ATTEMPTS`/`SESSION_DISCOVERY_POLL_MS`, src/agents/herd.ts)
+   since the transcript file can lag the launch's own liveness
+   confirmation. Positively tied to THIS launch: `discoverClaudeSessionId`
+   takes the wall-clock instant captured just before the launch attempt
+   began and NEVER returns a transcript created before it (`birthtimeMs`,
+   deliberately immutable-once-created unlike `mtime`) — so a workspace
+   directory already holding an OLDER transcript from a prior respawn of
+   the same issue can never be silently mistaken for this launch's own; it
+   falls through to `undefined` (logged, one-time fresh-restart-at-next-poll)
+   rather than a wrong-but-real guess. The discovered id is then persisted
+   (`persistDiscoveredSessionId`, `.butchr-session-id.json`,
+   `workspaceSessionId`) for `resumeInPlace()` below to use later.
 2. `HerdrHerd.resumeInPlace()` (src/agents/herd.ts) — reached from
    `reconcileNow`'s respawn loop (src/daemon/loop.ts) BEFORE the ordinary
-   `stop()`+`spawn()` path, and only for a `resumable` staleness — waits for
-   the agent to be idle/done (NEVER interrupts a turn: `"deferred"` if it's
-   mid-turn, retried next poll, no stop, no spawn), asks it to `/exit`,
-   confirms the pane's foreground is back to a shell (`"stuck"` and left
-   alone if it never is — never relaunched onto a stuck pane, never killed),
-   then relaunches on the exact SAME pane with `--resume <persisted-id>`
-   plus the NEW model/effort plus every other flag a fresh launch carries
+   `stop()`+`spawn()` path, and only for a `resumable` staleness — first
+   re-verifies the persisted id still has a real transcript
+   (`claudeTranscriptExists`; a missing/stale id falls back to
+   `"unresumable"`, an honest "session id could not be determined" fresh
+   restart rather than ever resuming a guess), then waits for the agent to
+   be idle/done (NEVER interrupts a turn: `"deferred"` if it's mid-turn,
+   retried next poll, no stop, no spawn), asks it to `/exit`, confirms the
+   pane's foreground is back to a shell (`"stuck"` and left alone if it
+   never is — never relaunched onto a stuck pane, never killed; the same
+   `"stuck"` outcome also covers a measured live race where herdr briefly
+   still holds the OLD process's agent name even after its pane left the
+   claude foreground, surfacing as `agent_name_taken` on the relaunch
+   attempt — treated as a safe retry-next-poll, not a thrown failure), then
+   relaunches on the exact SAME pane with `--resume <persisted-id>` plus
+   the NEW model/effort plus every other flag a fresh launch carries
    (`--permission-mode`, `--mcp-config`, the development-channels flag) —
    built by the SAME `agentStartParams()`/`spawnArgs()` a fresh launch uses,
    so the FACTORY-43 launch/stale-check symmetry requirement holds by
-   construction. `buildWorkspace()` runs again as part of this, re-persisting
-   the new model/effort (the session id file is never overwritten), so the
-   very next poll's ordinary comparison above sees the new values and does
-   not flag this agent stale again.
+   construction. `buildWorkspace()` runs again as part of this, ONLY after
+   a brief post-launch liveness check confirms the relaunch actually stayed
+   alive (an unavailable model, etc., reports `"failed"` instead, leaving
+   the persisted model/effort untouched so the agent stays visibly stale
+   rather than looking falsely "already matching" next poll) — re-persisting
+   the new model/effort (session id is untouched here; a `--resume` relaunch
+   keeps the same id by definition), so the very next poll's ordinary
+   comparison above sees the new values and does not flag this agent stale
+   again.
 3. Deliberately NOT built on `ManagedHerdrLifecycle` (`@brooswit/drovr`,
    pinned 0.15.1): that class's only "continue after a change" path
    (`replacePaneId`, used by `HerdrHerd.recoverQuota()` for provider
