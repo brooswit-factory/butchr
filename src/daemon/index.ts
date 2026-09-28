@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createLoginExpiredWatcher } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -39,6 +39,7 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
@@ -775,7 +776,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1804,6 +1805,30 @@ const loginExpiredTimer = setInterval(() => {
     .finally(() => { loginExpiredPollInFlight = false; });
 }, 5_000);
 loginExpiredTimer.unref?.();
+
+// FACTORY-425 (implements FACTORY-419): host-side counting of Codex
+// unrecognised-dialog sightings per fingerprint — a FOURTH, independent poll
+// loop, own timer, own read of the fleet, same isolation reasoning as
+// `loginExpiredTimer`/`blockingEscalationTimer` above. Deliberately calls
+// ONLY `scanPendingCodexApprovals` (a pure read — never
+// `approveCodexApproval`/`autoAnswerCodexApprovals`, either of which can
+// press keys for a RECOGNISED dialog): this loop observes and counts, never
+// answers or classifies, per FACTORY-419's own scope correction. See
+// `src/agents/codex-dialog-sightings.ts`'s own header for why this counts
+// EPISODES, not polls, and for why there was no existing
+// aggregate-count-by-fingerprint surface in this repo (for either vendor) to
+// mirror.
+const codexDialogSightings = createCodexDialogSightingsTracker({ log: (line) => console.log(line), now: () => Date.now() });
+let codexDialogSightingsPollInFlight = false;
+const codexDialogSightingsTimer = setInterval(() => {
+  if (codexDialogSightingsPollInFlight) return;
+  codexDialogSightingsPollInFlight = true;
+  scanPendingCodexApprovals(herdr)
+    .then((result) => codexDialogSightings.onScan(result.unrecognised))
+    .catch((e) => console.error(`  [codex-unrecognised] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { codexDialogSightingsPollInFlight = false; });
+}, 5_000);
+codexDialogSightingsTimer.unref?.();
 
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by
