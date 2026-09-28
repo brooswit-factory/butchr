@@ -2,9 +2,30 @@ import { describe, expect, test } from "bun:test";
 import { buildDashboardRows, createDashboardFeed, initialDashboardSnapshot, type AgentDashboardRow, type DashboardAgent, type DashboardRow, type IssueMeta } from "../../src/agents/dashboard.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
+
+/** FACTORY-407: the bare provider-native resource id these fixtures have always named their agents by — unchanged. */
+function resourceIdFor(name: string): string {
+  return name.replace(/^butchr[-:]/, "").toUpperCase();
+}
+
+/**
+ * FACTORY-407: the REAL, full agent-key shape a real daemon actually puts on
+ * `AgentDashboardRow.resourceKey` (via `ownedAgentOfCwd`, undiscarded) —
+ * this module's whole reason to now import `encodeAgentKey` at all. A bare
+ * resource id with no `-<digits>` suffix (e.g. "BUTCHR") is a Jira PROJECT
+ * id, so it's routed through `jira-project` rather than `jira-work` — the
+ * one case a bare key is a valid resource id at all (`agent-key.ts`'s own
+ * header).
+ */
+function agentKeyFor(name: string, ruleId = "rule"): string {
+  const resourceId = resourceIdFor(name);
+  const resourceProvider = resourceId.includes("-") ? "jira-work" : "jira-project";
+  return encodeAgentKey({ resourceProvider, ruleId, resourceId });
+}
 
 function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
-  return { name, resource_key: name.replace(/^butchr[-:]/, "").toUpperCase(), agent_status: status, pane_id: pane };
+  return { name, resource_key: resourceIdFor(name), agent_key: agentKeyFor(name), agent_status: status, pane_id: pane };
 }
 
 /** `buildDashboardRows` only ever produces "agent" rows — this narrows for the tests below rather than repeating the same `if (kind !== "agent") throw` at every call site. */
@@ -30,7 +51,7 @@ describe("buildDashboardRows: the row shape, for both an issue-tier row and a pr
     expect(rows).toHaveLength(1);
     const row = asAgentRow(rows[0]!);
     expect(row.kind).toBe("agent");
-    expect(row.resourceKey).toBe("BUTCHR-1");
+    expect(row.resourceKey).toBe(agentKeyFor("butchr-butchr-1"));
     expect(row.tier).toEqual({ kind: "issue", issuetype: { checked: true, value: "Task" } });
     expect(row.agentStatus).toBe("working");
     expect(row.pane).toBe("pane-1");
@@ -45,7 +66,7 @@ describe("buildDashboardRows: the row shape, for both an issue-tier row and a pr
       tracker: new StatusFloorTracker(() => 0),
     });
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.resourceKey).toBe("BUTCHR");
+    expect(rows[0]!.resourceKey).toBe(agentKeyFor("butchr-butchr"));
     expect(rows[0]!.tier).toEqual({ kind: "project" });
   });
 
@@ -69,14 +90,15 @@ describe("buildDashboardRows: the row shape, for both an issue-tier row and a pr
     expect(rows).toEqual([]);
   });
 
-  test("path-derived resource identity works without a name and overrides a misleading name", () => {
-    const rows = buildDashboardRows([{ name: "butchr-wrong-1", resource_key: "KAN-42", agent_status: "working", pane_id: "p1" }], {
+  test("row identity comes from agent_key, not name — a misleading name never overrides it", () => {
+    const key = agentKeyFor("kan-42");
+    const rows = buildDashboardRows([{ name: "butchr-wrong-1", resource_key: "KAN-42", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0,
       issueMeta: () => undefined,
       tracker: new StatusFloorTracker(() => 0),
     });
     expect(rows).toHaveLength(1);
-    expect(asAgentRow(rows[0]!).resourceKey).toBe("KAN-42");
+    expect(asAgentRow(rows[0]!).resourceKey).toBe(key);
   });
 });
 
@@ -238,12 +260,16 @@ describe("createDashboardFeed + createAdmissionController: per-source withheld r
       admission: () => admission.census(),
     });
 
-    await admission.admit(["A", "B"], [], "issue"); // cap 1 — A admitted, B withheld
+    // FACTORY-407: admission candidates are the SAME full agent-key shape a
+    // real rule loop admits under (`unitAgentKey`) — the exact shape this
+    // ticket's fix makes `AgentDashboardRow.resourceKey` line up with, so
+    // "agent wins" below actually exercises the real comparison.
+    await admission.admit([agentKeyFor("butchr-a"), agentKeyFor("butchr-b")], [], "issue"); // cap 1 — A admitted, B withheld
     await feed.poll(async () => ({ agents: [agent("butchr-a")] }));
     let snap = feed.snapshot();
     if (!snap.checked) throw new Error("expected checked:true");
-    expect(snap.rows.find((r) => r.resourceKey === "A")?.kind).toBe("agent");
-    const withheldRow = snap.rows.find((r) => r.resourceKey === "B");
+    expect(snap.rows.find((r) => r.resourceKey === agentKeyFor("butchr-a"))?.kind).toBe("agent");
+    const withheldRow = snap.rows.find((r) => r.resourceKey === agentKeyFor("butchr-b"));
     if (!withheldRow || withheldRow.kind !== "withheld") throw new Error("expected a withheld row for B");
     expect(withheldRow.source).toBe("issue");
     // mutation 1's own target: not-applicable (agentFields), never could-not-check (checked/declinedAt).
@@ -255,11 +281,11 @@ describe("createDashboardFeed + createAdmissionController: per-source withheld r
     // mutation 8's own target: once admitted, the withheld row must not survive.
     depsObj.cap = 2; // free a slot
     now = 1000;
-    await admission.admit(["A", "B"], [], "issue"); // both admitted now
+    await admission.admit([agentKeyFor("butchr-a"), agentKeyFor("butchr-b")], [], "issue"); // both admitted now
     await feed.poll(async () => ({ agents: [agent("butchr-a"), agent("butchr-b")] }));
     snap = feed.snapshot();
     if (!snap.checked) throw new Error("expected checked:true");
-    expect(snap.rows.find((r) => r.resourceKey === "B")?.kind).toBe("agent");
+    expect(snap.rows.find((r) => r.resourceKey === agentKeyFor("butchr-b"))?.kind).toBe("agent");
     expect(snap.rows.some((r) => r.kind === "withheld")).toBe(false);
   });
 
@@ -280,11 +306,11 @@ describe("createDashboardFeed + createAdmissionController: per-source withheld r
       admission: () => admission.census(),
     });
 
-    await admission.admit(["A"], [], "issue"); // A withheld
+    await admission.admit([agentKeyFor("butchr-a")], [], "issue"); // A withheld
     await feed.poll(async () => ({ agents: [] }));
     let snap = feed.snapshot();
     if (!snap.checked) throw new Error("expected checked:true");
-    expect(snap.rows.find((r) => r.resourceKey === "A")?.kind).toBe("withheld");
+    expect(snap.rows.find((r) => r.resourceKey === agentKeyFor("butchr-a"))?.kind).toBe("withheld");
 
     // The issue tier's own census now fails — its bucket declines, so A's
     // stale withheld row would ordinarily carry forward untouched. But A
@@ -293,11 +319,11 @@ describe("createDashboardFeed + createAdmissionController: per-source withheld r
     // last refreshed A's own source.
     issueBroken = true;
     now = 5000;
-    await admission.admit(["A"], [], "issue"); // declines — A's carried-forward row would otherwise persist
+    await admission.admit([agentKeyFor("butchr-a")], [], "issue"); // declines — A's carried-forward row would otherwise persist
     await feed.poll(async () => ({ agents: [agent("butchr-a")] }));
     snap = feed.snapshot();
     if (!snap.checked) throw new Error("expected checked:true");
-    expect(snap.rows.find((r) => r.resourceKey === "A")?.kind).toBe("agent");
+    expect(snap.rows.find((r) => r.resourceKey === agentKeyFor("butchr-a"))?.kind).toBe("agent");
     expect(snap.rows.some((r) => r.kind === "withheld")).toBe(false);
   });
 

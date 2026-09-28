@@ -352,6 +352,26 @@ export const specForSessionDefinitionUnit = (u: ExecutionUnit<SessionDefinitionM
 /** What "changed" means for one already-matched definition, independent of appear/disappear (spawn/stop already say that — same precedent as `filesystem-type.ts`'s own PRIMARY diff): its underlying file's kind/size/mtime moved. */
 const observed = (m: SessionDefinitionMatch): string => JSON.stringify([m.resource.size, m.resource.mtimeMs]);
 
+/**
+ * FACTORY-417: the `definitionField` reason for a changed (from, to) match
+ * pair — content-diffs `brief`/`workingDirectory` specifically (the two
+ * fields the survey found are never otherwise pushed to a running agent;
+ * see `docs/session-field-reload-classification.md`'s own rows for both),
+ * never the whole definition object, so an edit to any OTHER field
+ * (`vendor`, `modelPower`, `permissionMode`, …) still returns `undefined`
+ * here and falls through to `decide`'s existing bare `{ deliver: true }` —
+ * unchanged rendering, unchanged nudge, for every field this ticket does not
+ * own. Returns `undefined` (not a reason with both keys `undefined`) when
+ * neither of the two changed, so `decide` can tell "nothing this function
+ * covers moved" from "something did" with a single truthiness check.
+ */
+function definitionFieldReason(from: SessionDefinition, to: SessionDefinition): NotifyReason | undefined {
+  const changes: { brief?: string; workingDirectory?: string } = {};
+  if (from.brief !== to.brief) changes.brief = to.brief;
+  if (from.workingDirectory !== to.workingDirectory) changes.workingDirectory = to.workingDirectory;
+  return Object.keys(changes).length > 0 ? { definitionField: changes } : undefined;
+}
+
 export function createSessionDefinitionEventRules(): EventRules<ExecutionUnit<SessionDefinitionMatch>> {
   return {
     async poll(prev: PollSnapshot<ExecutionUnit<SessionDefinitionMatch>>, next: PollSnapshot<ExecutionUnit<SessionDefinitionMatch>>): Promise<EventPoll> {
@@ -362,7 +382,9 @@ export function createSessionDefinitionEventRules(): EventRules<ExecutionUnit<Se
         async decide(key, watcher, space) {
           if (space !== "primary") return { deliver: false };
           const pair = primaryDiff.pairFor(key);
-          return watcher === key && pair ? { deliver: true } : { deliver: false };
+          if (watcher !== key || !pair) return { deliver: false };
+          const reason = definitionFieldReason(pair.from.definition, pair.to.definition);
+          return reason ? { deliver: true, reason } : { deliver: true };
         },
       };
     },

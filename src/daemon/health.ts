@@ -4,6 +4,8 @@ import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
 import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
+import type { CredentialDeathAlert } from "../agents/login-expired-alert.js";
+import type { CodexDialogSighting } from "../agents/codex-dialog-sightings.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -161,6 +163,37 @@ export interface HealthStatus {
    * report" convention `unresolvedRelationships` above already uses.
    */
   managedSessionEscalations?: ManagedSessionEscalation[];
+  /**
+   * FACTORY-363/FACTORY-397: the current host-wide "Claude Code credential
+   * appears dead" alert, if one is open — a FIFTH sibling, alongside
+   * `managedSessionEscalations` above, for the same reason: `ok` is the AND
+   * over liveness `components[]` on purpose, and a dead CREDENTIAL is not a
+   * liveness failure of THIS daemon's own poll loops (the loops themselves
+   * keep polling fine) — conflating the two would make `/health`'s 503
+   * contract fire for a condition a restart cannot fix. This is the status
+   * SURFACE a human (or an uptime checker) finds this alert on WITHOUT any
+   * agent or Claude API call in the path — see
+   * `src/agents/login-expired-alert.ts`'s own header for why that matters:
+   * this condition kills the very credential every other recovery lever in
+   * this daemon depends on. ABSENT (no key at all), never null, when no
+   * episode is open — the same "absent means nothing to report" convention
+   * `managedSessionEscalations` above already uses.
+   */
+  credentialDeathAlert?: CredentialDeathAlert;
+  /**
+   * FACTORY-425 (implements FACTORY-419): every Codex unrecognised-dialog
+   * fingerprint sighted since this daemon started tracking, with its
+   * aggregate sighting (episode) count and a representative excerpt — see
+   * `src/agents/codex-dialog-sightings.ts`'s own header for what counts as a
+   * sighting and why these counts are a LOWER BOUND, never an authoritative
+   * total. A SIXTH sibling, same "additive, never flips `ok`" reasoning
+   * `managedSessionEscalations`/`credentialDeathAlert` above already use:
+   * these are purely observational counts, not a liveness signal for this
+   * daemon's own poll loops. ABSENT (no key at all), never an empty array,
+   * when nothing has been sighted yet — the same "absent means nothing to
+   * report" convention `managedSessionEscalations` above already uses.
+   */
+  codexUnrecognisedDialogSightings?: CodexDialogSighting[];
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -222,6 +255,8 @@ export const combineHealth = (
   resourceLoops?: readonly ResourceLoopHealth[],
   unresolvedRelationships?: readonly UnresolvedRelationship[],
   managedSessionEscalations?: readonly ManagedSessionEscalation[],
+  credentialDeathAlert?: CredentialDeathAlert,
+  codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -234,6 +269,10 @@ export const combineHealth = (
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
     ...(managedSessionEscalations && managedSessionEscalations.length ? { managedSessionEscalations: [...managedSessionEscalations] } : {}),
+    ...(credentialDeathAlert ? { credentialDeathAlert } : {}),
+    ...(codexUnrecognisedDialogSightings && codexUnrecognisedDialogSightings.length
+      ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
+      : {}),
   };
 };
 

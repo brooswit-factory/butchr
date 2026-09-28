@@ -11,7 +11,7 @@ import type { Stop } from "@brooswit/sundry";
 import type { JiraIssue } from "../atlassian/types.js";
 import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import type { Herd } from "../agents/herd.js";
-import { filesystemNudge } from "../agents/change-nudge.js";
+import { filesystemNudge, sessionDefinitionFieldNudge } from "../agents/change-nudge.js";
 import { realPathExists, wireManagedSessionArchiveRelease } from "../agents/managed-session-account-release.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { LinkedEventingDeps } from "../jira-watch/linked-eventing.js";
@@ -125,7 +125,17 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ownsId: (id) => ownsManagedSessionAgent(id, rule.id),
     notify: async (agent: string, about: string, reason?: NotifyReason) => {
       const resource = resourceKeyOf(about === agent ? agent : about);
-      await deps.deliver(agent, resource, filesystemNudge(resource, reason));
+      // FACTORY-417: a `brief`/`workingDirectory` content change gets its own
+      // content-push rendering (names the new value directly) instead of the
+      // generic `filesystemNudge` fallback every other definition-field edit
+      // still gets — see `sessionDefinitionFieldNudge`'s own doc comment
+      // (src/agents/change-nudge.ts) for why this is reliable and
+      // `definitionField`'s own doc comment (src/resources/types.ts) for how
+      // `decide()` produces it.
+      const msg = reason && "definitionField" in reason
+        ? sessionDefinitionFieldNudge(resource, reason.definitionField)
+        : filesystemNudge(resource, reason);
+      await deps.deliver(agent, resource, msg);
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
     ...(account ? { account } : {}),

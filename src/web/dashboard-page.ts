@@ -38,6 +38,7 @@ import type { StatusFloor } from "../agents/status-floor.js";
 import { humanDuration } from "../agents/status-floor.js";
 import type { CurrencyReport } from "../daemon/currency.js";
 import { agentRowAnchorId, configAnchorForResourceKey } from "../agents/config-inventory-links.js";
+import { decodeAnyAgentKey } from "../rules/agent-key.js";
 
 /** The subset of `BuildReport` (src/agents/build-identity.ts) this header actually reads — kept narrow so a test fixture doesn't have to fabricate herdr's full shape. */
 export interface DashboardBuildInfo {
@@ -164,11 +165,38 @@ function renderConfigBackLink(resourceKey: string, opts: RenderDashboardOpts): s
   return `<a class="link" href="${esc(href)}">config</a>`;
 }
 
+/**
+ * FACTORY-408: the visible row label — a REGRESSION FIX, not a new
+ * decision. `AgentDashboardRow.resourceKey` (FACTORY-407) is the full
+ * `<resourceProvider>:<ruleId>:<resourceId>` key, needed for correlation,
+ * hrefs, and anchors, but this is what a person actually reads on `/` and
+ * `/dashboard` — it must decode back to the bare provider-native resource
+ * id a person saw before FACTORY-407 widened `resourceKey` (e.g. `FACTORY-68`,
+ * never `jira-work:epics:FACTORY-68`).
+ *
+ * A query-level agent (`kind: "query"`, `decodeAnyAgentKey`) has no single
+ * resource to name — its OWN full key was always a slightly odd thing to
+ * show verbatim, even before this key's format grew tied to correlation —
+ * so this renders `<resourceProvider>:<ruleId> (query)` instead: readable,
+ * and distinct from an ordinary bare resource id so a reader never mistakes
+ * one for the other.
+ *
+ * `null` (nothing this daemon produces for an owned agent today, same
+ * defensive case `buildTier` in `src/agents/dashboard.ts` guards) falls
+ * back to the raw key rather than throwing — this is a display function,
+ * never the source of a crash.
+ */
+function displayResourceKey(resourceKey: string): string {
+  const decoded = decodeAnyAgentKey(resourceKey);
+  if (decoded === null) return resourceKey;
+  return decoded.kind === "resource" ? decoded.resourceId : `${decoded.resourceProvider}:${decoded.ruleId} (query)`;
+}
+
 function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDashboardOpts): string {
   const tier = renderTier(row.tier);
   return (
     `<div class="row agent" id="${esc(agentRowAnchorId(row.resourceKey))}">` +
-    `<span class="key">${esc(row.resourceKey)}</span>` +
+    `<span class="key">${esc(displayResourceKey(row.resourceKey))}</span>` +
     `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
     `<span class="st ${safeClass(row.agentStatus)}">${esc(row.agentStatus)}</span>` +
     `<span class="pane">${esc(row.pane)}</span>` +
