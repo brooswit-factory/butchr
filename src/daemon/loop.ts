@@ -957,7 +957,17 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
   // nothing. Explicit delegation avoids this entirely, and is strictly
   // safer besides: an object literal typed `Herd` fails to COMPILE if
   // `Herd` ever gains a member, where the spread would have silently kept
-  // dropping it.
+  // dropping it — EXCEPT that this explicit list itself omitted
+  // `resumeInPlace` (and `providerOf`) for exactly as long as both stayed
+  // OPTIONAL on `Herd`, which is precisely why FACTORY-314's resume-in-place
+  // mechanism never once fired in production despite its own regression
+  // suite passing (FACTORY-426): `herd.resumeInPlace` here was silently
+  // `undefined` on every real poll, and an optional member missing from an
+  // object literal is not a compile error the way a required one is.
+  // `resumeInPlace` is now required on `Herd` for exactly this reason (see
+  // its own doc comment); `providerOf` stays optional (HerdrHerd's only
+  // caller — BUTCHR-413's Codex channel relay — does not go through
+  // `scopedHerd`) but is forwarded here too, now that it's been audited.
   return {
     ...(herd.frozen ? {frozen:(ids:readonly string[])=>herd.frozen!(ids.filter(ownsId))} : {}),
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
@@ -974,6 +984,8 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     paneFor: (issue) => herd.paneFor(issue),
     nudge: (issue, text) => herd.nudge(issue, text),
     ...(herd.recoverQuota ? { recoverQuota: (spec: SpawnSpec) => herd.recoverQuota!(spec) } : {}),
+    ...(herd.providerOf ? { providerOf: (issue: string) => herd.providerOf!(issue) } : {}),
+    resumeInPlace: (spec: SpawnSpec) => herd.resumeInPlace(spec),
   };
 }
 

@@ -312,6 +312,7 @@ describe("BUTCHR-147 §5 — the crash-loop overlap, MEASURED against the real r
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const desired = new Map([["BUTCHR-1", { key: "BUTCHR-1", issuetype: "Task", summary: "s", parent: null }]]);
     let reconcileFiredAtPoll = -1;
@@ -358,6 +359,7 @@ describe("BUTCHR-147 review fix (PR #204 round 1) — a persistently-failing her
       async stop() { throw new Error("herdr stop refused: pane busy"); },
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const desired = new Map<string, { key: string; issuetype: string; summary: string; parent: null }>();
     let firedAtPoll = -1;

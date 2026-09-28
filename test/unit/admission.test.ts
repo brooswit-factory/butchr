@@ -15,6 +15,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
@@ -595,6 +596,7 @@ describe("reconcileNow + admission (BUTCHR-284 integration)", () => {
       async stop(i) { stopped.push(i); running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const desired = new Map([["A", spec("A")], ["B", spec("B")]]);
     // cap fully consumed by A+B already — no spawn budget left at all.
@@ -656,6 +658,7 @@ describe("B4 — wait clears only on a SUCCEEDED spawn, never on admission (BUTC
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     // A residency source fully decoupled from `herd` (a pure occupant-count
     // stand-in, never claimed to be in `desired`/`running`/`stopping`) so
@@ -868,6 +871,7 @@ describe("shared cap across rule loops — in-flight reservations", () => {
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     return { herd, running, peak: () => peak, release: () => { for (const r of pending.splice(0)) r(); } };
   }
@@ -986,6 +990,7 @@ describe("shared cap across rule loops — in-flight reservations", () => {
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues(), sources: ["issue", "jira-idea"] });
     const issues = new Map([["issue-1", spec("issue-1")], ["issue-2", spec("issue-2")]]);
@@ -1053,6 +1058,7 @@ describe("shared cap across rule loops — in-flight reservations", () => {
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues() });
     const respawning = reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")]]), wired(ctrl, "issue"));
@@ -1079,6 +1085,7 @@ describe("shared cap across rule loops — in-flight reservations", () => {
       async stop(i) { running.delete(i); },
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const ctrl = createAdmissionController({ cap: 2, residency: () => herd.runningIssues() });
     await reconcileNow(scopedHerd(herd, (id) => id.startsWith("issue-")), new Map([["issue-1", spec("issue-1")]]), wired(ctrl, "issue"));
@@ -1094,6 +1101,7 @@ describe("shared cap across rule loops — in-flight reservations", () => {
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const ctrl = createAdmissionController({ cap: 3, residency: () => herd.runningIssues() });
     const desired = new Map(["issue-0", "issue-1", "issue-3"].map((k) => [k, spec(k)] as const));
