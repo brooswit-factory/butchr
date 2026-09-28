@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
-import { isExtensionOrigin } from "../web/bearer-origin-guard.js";
+import { isExtensionOrigin, isHttpTokenChars } from "../web/bearer-origin-guard.js";
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -561,6 +561,16 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   // token must disable the guarded routes, not open them (see `Config.extensionAuth`'s
   // own doc comment).
   const extensionToken = env.BUTCHR_EXTENSION_TOKEN?.trim() || undefined;
+  // FACTORY-455's charset decision (see `bearer-origin-guard.ts`'s
+  // `isHttpTokenChars` doc comment for the full reasoning): the token must
+  // already be valid `Sec-WebSocket-Protocol` value bytes, since
+  // `GET /agents/:agentKey/pty` carries it that way when `Authorization`
+  // can't be sent (a browser). Checked here, once, at startup — never
+  // silently mangled or truncated later on a request that happens to hit it.
+  if (extensionToken !== undefined && !isHttpTokenChars(extensionToken)) {
+    const offending = [...new Set([...extensionToken].filter((c) => !isHttpTokenChars(c)))];
+    throw new Error(`BUTCHR_EXTENSION_TOKEN contains characters not valid in a WebSocket subprotocol value (RFC 6455 §4.3 / RFC 2616 HTTP token chars only) — offending: ${JSON.stringify(offending.join(""))}`);
+  }
   const extensionOrigins = env.BUTCHR_EXTENSION_ORIGINS ? env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   for (const origin of extensionOrigins) {
     if (!isExtensionOrigin(origin)) throw new Error(`BUTCHR_EXTENSION_ORIGINS contains an invalid chrome-extension:// origin: ${JSON.stringify(origin)}`);

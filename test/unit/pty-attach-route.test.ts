@@ -6,6 +6,7 @@ import { listenOptions } from "../../src/daemon/listen.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { PTY_CLOSED_REASON } from "../../src/terminal/pty-bridge.js";
 import { resolvePtyPane } from "../../src/terminal/pty-attach.js";
+import { PTY_BEARER_SUBPROTOCOL_MARKER } from "../../src/web/bearer-origin-guard.js";
 
 const fakeMcp = { connections: { list: () => [] } } as unknown as McpHandle;
 const ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
@@ -68,6 +69,43 @@ describe("GET /agents/:agentKey/pty — upgrade refusals (HTTP-level, before any
   test("non-allowlisted Origin: 403", async () => {
     const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
     const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", authorization: "Bearer s3cr3t", origin: OTHER_ORIGIN } }));
+    expect(res.status).toBe(403);
+  });
+  // FACTORY-455 (implementing FACTORY-454): a browser cannot set
+  // `Authorization` on a WebSocket handshake at all, so this is the ONLY
+  // channel it has — covered at the HTTP-refusal level here, and over a
+  // real upgraded socket (including the echoed subprotocol) below.
+  test("wrong token via subprotocol (no Authorization sent): 401", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, {
+      headers: { upgrade: "websocket", origin: ORIGIN, "sec-websocket-protocol": `${PTY_BEARER_SUBPROTOCOL_MARKER}, wrong` },
+    }));
+    expect(res.status).toBe(401);
+  });
+  test("no credential at all (no Authorization, no subprotocol): 401", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", origin: ORIGIN } }));
+    expect(res.status).toBe(401);
+  });
+  test("token unset: 503 regardless of a valid subprotocol credential", async () => {
+    const app = liveView(fakeMcp, baseDeps({ ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, {
+      headers: { upgrade: "websocket", origin: ORIGIN, "sec-websocket-protocol": `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` },
+    }));
+    expect(res.status).toBe(503);
+  });
+  test("MISSING Origin: 403 even with a correct subprotocol credential", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, {
+      headers: { upgrade: "websocket", "sec-websocket-protocol": `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` },
+    }));
+    expect(res.status).toBe(403);
+  });
+  test("non-allowlisted Origin: 403 even with a correct subprotocol credential", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, {
+      headers: { upgrade: "websocket", origin: OTHER_ORIGIN, "sec-websocket-protocol": `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` },
+    }));
     expect(res.status).toBe(403);
   });
   test("malformed agent key: refused (404), auth otherwise correct", async () => {
@@ -147,6 +185,8 @@ describe("GET /agents/:agentKey/pty — a real upgraded socket", () => {
     paneText = "";
     live = true;
     const ws = await connect();
+    // Header auth offers no subprotocol at all, so the server selects none.
+    expect(ws.protocol).toBe("");
     paneText = "hello from the pane";
     const msg = await nextMessage(ws);
     expect(msg).toBe("hello from the pane");
@@ -216,6 +256,61 @@ describe("GET /agents/:agentKey/pty — a real upgraded socket", () => {
     expect(closeEvent.code).toBe(4000);
     expect(closeEvent.reason).toBe(PTY_CLOSED_REASON);
     readShouldThrow = false;
+  });
+});
+
+// FACTORY-455 (implementing FACTORY-454): the ONLY channel a real browser
+// has, since it cannot set `Authorization` on a WebSocket handshake at all.
+// A separate app/socket from the header-auth block above, same shape.
+describe("GET /agents/:agentKey/pty — a real upgraded socket, authenticated via Sec-WebSocket-Protocol", () => {
+  let paneText = "";
+  const view = baseDeps({
+    extensionAuth: AUTH,
+    ptyAttach: {
+      resolve: (agentKey) => (agentKey === AGENT_KEY ? { ok: true as const, pane: "pane-1" } : { ok: false as const, refusal: { reason: "unknown-pane" as const, agentKey } }),
+      isLive: () => true,
+      read: async () => paneText,
+      send: async () => {},
+      pollMs: 15,
+    },
+  });
+  const { app, mcp } = buildApp(view);
+  app.listen(listenOptions(0));
+  const wsUrl = `ws://localhost:${app.server!.port}/agents/${encodeURIComponent(AGENT_KEY)}/pty`;
+  afterAll(async () => {
+    await mcp.closeAll();
+    await Promise.race([app.stop(true), new Promise((r) => setTimeout(r, 200))]);
+  });
+
+  test("a correct token offered as [marker, token] over Sec-WebSocket-Protocol opens the socket, and the response selects ONLY the marker", async () => {
+    const ws = await new Promise<WebSocket>((resolve, reject) => {
+      const socket = new WebSocket(wsUrl, { headers: { origin: ORIGIN }, protocols: [PTY_BEARER_SUBPROTOCOL_MARKER, "s3cr3t"] } as never);
+      socket.addEventListener("open", () => resolve(socket), { once: true });
+      socket.addEventListener("error", reject, { once: true });
+    });
+    // The handshake response's selected subprotocol is visible to the client
+    // as `.protocol` — it must be exactly the marker, never the token and
+    // never empty (a browser would otherwise have rejected the handshake
+    // outright for selecting something it didn't offer).
+    expect(ws.protocol).toBe(PTY_BEARER_SUBPROTOCOL_MARKER);
+    expect(ws.protocol).not.toBe("s3cr3t");
+    paneText = "hello via subprotocol auth";
+    const msg = await new Promise<string>((resolve) => ws.addEventListener("message", (e) => resolve(e.data as string), { once: true }));
+    expect(msg).toBe("hello via subprotocol auth");
+    ws.close();
+    await new Promise((resolve) => ws.addEventListener("close", resolve, { once: true }));
+  });
+
+  test("a wrong token offered over Sec-WebSocket-Protocol never opens the socket", async () => {
+    await new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(wsUrl, { headers: { origin: ORIGIN }, protocols: [PTY_BEARER_SUBPROTOCOL_MARKER, "wrong"] } as never);
+      socket.addEventListener("open", () => reject(new Error("should not have opened")), { once: true });
+      // A refused upgrade surfaces to the client as an "error" event followed
+      // by "close", never "open" — this asserts the refusal, not the (never
+      // sent) HTTP status, which the earlier `app.handle(...)`-based tests
+      // already cover directly.
+      socket.addEventListener("error", () => resolve(), { once: true });
+    });
   });
 });
 
