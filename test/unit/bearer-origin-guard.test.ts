@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { checkBearerOrigin, isExtensionOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "../../src/web/bearer-origin-guard.js";
+import { checkBearerOrigin, checkBearerOriginForUpgrade, isExtensionOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "../../src/web/bearer-origin-guard.js";
 
 const ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const OTHER_ORIGIN = "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba";
@@ -44,6 +44,42 @@ describe("checkBearerOrigin", () => {
         expect(r.corsHeaders["access-control-allow-origin"]).not.toBe("*");
       }
     }
+  });
+});
+
+describe("checkBearerOriginForUpgrade", () => {
+  // FACTORY-453 acceptance criterion, stated by the ticket as its own test:
+  // an upgrade with a MISSING Origin must be rejected here even though
+  // `checkBearerOrigin` (above) ALLOWS a missing Origin for the plain HTTP
+  // sibling route — this is a distinct code path and a distinct bug class
+  // from "wrong Origin", tested separately on purpose.
+  test("a correct token with NO Origin header is REJECTED (403) — the corrected WebSocket-upgrade rule, opposite of checkBearerOrigin", () => {
+    const r = checkBearerOriginForUpgrade({ authorization: "Bearer s3cr3t", origin: null }, deps);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} });
+  });
+  test("a non-allowlisted Origin is still rejected (403), same as checkBearerOrigin", () => {
+    const r = checkBearerOriginForUpgrade({ authorization: "Bearer s3cr3t", origin: OTHER_ORIGIN }, deps);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin not allowed" }, corsHeaders: {} });
+  });
+  test("token unset disables the endpoint (503) before Origin is even inspected", () => {
+    const disabled: BearerOriginGuardDeps = { token: undefined, allowedOrigins: [ORIGIN] };
+    const r = checkBearerOriginForUpgrade({ authorization: "Bearer anything", origin: null }, disabled);
+    expect(r).toEqual({ ok: false, status: 503, body: { error: "endpoint disabled: no token configured" }, corsHeaders: {} });
+  });
+  test("missing Authorization from an allowlisted origin is still unauthorized (401)", () => {
+    const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN }, deps);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.status).toBe(401);
+  });
+  test("wrong token from an allowlisted origin is still unauthorized (401)", () => {
+    const r = checkBearerOriginForUpgrade({ authorization: "Bearer wrong", origin: ORIGIN }, deps);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.status).toBe(401);
+  });
+  test("correct token from an allowlisted origin succeeds with CORS headers for exactly that origin", () => {
+    const r = checkBearerOriginForUpgrade({ authorization: "Bearer s3cr3t", origin: ORIGIN }, deps);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.corsHeaders["access-control-allow-origin"]).toBe(ORIGIN);
   });
 });
 
