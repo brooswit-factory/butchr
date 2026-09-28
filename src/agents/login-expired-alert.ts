@@ -134,11 +134,23 @@ export interface CredentialDeathTracker {
  */
 export function createCredentialDeathTracker(deps: CredentialDeathAlertDeps): CredentialDeathTracker {
   const host = deps.host ?? hostname();
-  let episode: { since: number; detail: string; panes: Set<string> } | undefined;
+  // `hadRecovery` is the closing evidence itself: true only once some pane that was
+  // ACTUALLY a member of `panes` at the time has resolved with `reason: "recovered"`.
+  // Closing on `panes.size === 0` alone (the FACTORY-357/PR#529 defects) is wrong in
+  // both directions — it can stay stuck open forever after a genuine recovery (every
+  // OTHER pane then departs via "pane-gone", which never re-checks the empty set),
+  // and it can be tricked into closing a live alert by a stray "recovered" for a
+  // paneId this tracker never tracked (an untracked delete is a no-op, so the set
+  // was already empty from "pane-gone" departures alone — nothing recovered).
+  // `hadRecovery` fixes both: it is set ONLY when `panes.delete(paneId)` actually
+  // removed a tracked member on a "recovered" event, and closing requires both the
+  // set being empty AND this flag — so an episode that empties out via "pane-gone"
+  // alone never closes, exactly preserving that deliberate invariant.
+  let episode: { since: number; detail: string; panes: Set<string>; hadRecovery: boolean } | undefined;
 
   function onLoginExpired(escalation: { paneId: string; detail: string }): void {
     if (!episode) {
-      episode = { since: deps.now(), detail: escalation.detail, panes: new Set() };
+      episode = { since: deps.now(), detail: escalation.detail, panes: new Set(), hadRecovery: false };
       deps.log(
         `${CREDENTIAL_DEATH_MARKER} ${host}: Claude Code's own credential appears dead (pane ${escalation.paneId}: "${escalation.detail}"). ` +
           `This is a HOST-WIDE alert, not a per-ticket one — every pane on this daemon is likely affected. ` +
@@ -153,12 +165,14 @@ export function createCredentialDeathTracker(deps: CredentialDeathAlertDeps): Cr
     if (!episode) return;
     if (resolved.reason === "superseded") return; // same still-live pane, new episode follows immediately — not evidence of anything, and never removed from the set
     if (resolved.reason === "pane-gone") {
-      episode.panes.delete(resolved.paneId); // bookkeeping only — pane churn is not credential recovery, so this NEVER triggers the close check below
-      return;
+      episode.panes.delete(resolved.paneId); // bookkeeping only — pane churn is not credential recovery
+    } else {
+      // resolved.reason === "recovered": evidence the credential itself is back, but
+      // ONLY when this paneId was actually a tracked member — a stray "recovered" for
+      // an untracked paneId must contribute nothing (see `hadRecovery`'s doc above).
+      if (episode.panes.delete(resolved.paneId)) episode.hadRecovery = true;
     }
-    // resolved.reason === "recovered": the only reason that is evidence the credential itself is back.
-    episode.panes.delete(resolved.paneId);
-    if (episode.panes.size === 0) {
+    if (episode.panes.size === 0 && episode.hadRecovery) {
       const openForMs = deps.now() - episode.since;
       deps.log(`${CREDENTIAL_DEATH_MARKER} ${host}: cleared — credential recovered (reason: recovered), open for ${Math.round(openForMs / 1000)}s`);
       episode = undefined;
