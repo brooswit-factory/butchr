@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -20,6 +20,7 @@ import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, sing
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
@@ -37,6 +38,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
@@ -144,6 +146,14 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
+// Jira site as a bare, lower-cased HOST (never the full `https://` URL
+// `config.atlassian.site` is), and its Zendesk subdomain read directly from
+// `ZENDESK_SUBDOMAIN`, the SAME env var `zendesk-ticket.ts` itself reads
+// (never routed through `Config`, matching that module's own convention —
+// see this ticket's own doc for why Zendesk config isn't centralized there).
+const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -765,7 +775,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -807,6 +817,13 @@ const { app, mcp } = buildApp({
   resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
     ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
     : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  // FACTORY-339: NO I/O here, same discipline as `dashboard` above —
+  // `dashboardFeed.snapshot()` is the SAME already-polled staffed-agent
+  // registry `/dashboard` itself serves, never a second poll or a live
+  // per-request query (see `../resources/resource-lookup.ts`'s own header
+  // for why re-running each rule's query here would be wrong).
+  resourcesForUrl: async (url) => buildResourcesForUrlResponse(url, resourceLookupDeps, dashboardFeed.snapshot().rows),
+  extensionAuth: config.extensionAuth,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -1726,6 +1743,34 @@ const blockingEscalationTimer = setInterval(() => {
     .finally(() => { blockingEscalationPollInFlight = false; });
 }, 5_000);
 blockingEscalationTimer.unref?.();
+
+// FACTORY-363/FACTORY-397: drovr's SEPARATE login-expired watcher
+// (`createLoginExpiredWatcher`, `@brooswit/drovr` >= 0.16.3,
+// src/agents/login-expired-alert.ts) — its OWN independent poll loop, own
+// timer, own read of the fleet, deliberately NOT sharing
+// `blockingEscalationTimer` above: that timer feeds ONLY
+// `escalator.onDrovrUnknownDialog`, whose managed-session-only routing is
+// exactly the trap this condition must not inherit (a keyed pane — both real
+// incidents, FACTORY-314/w1T and FACTORY-324/w1V — resolves `managedSessionOf`
+// to null there and would be silently dropped). This tracker has no
+// managed-session concept at all: every pane drovr reports reaches the
+// host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
+// the full design and why its delivery (a journal line + a `/health` sibling
+// field, both below) survives a dead Claude credential.
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+const loginExpiredWatcher = createLoginExpiredWatcher({
+  onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
+  onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
+});
+let loginExpiredPollInFlight = false;
+const loginExpiredTimer = setInterval(() => {
+  if (loginExpiredPollInFlight) return;
+  loginExpiredPollInFlight = true;
+  loginExpiredWatcher.poll(herdr)
+    .catch((e) => console.error(`  [login-expired] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { loginExpiredPollInFlight = false; });
+}, 5_000);
+loginExpiredTimer.unref?.();
 
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by
