@@ -45,6 +45,7 @@ import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
+import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
@@ -825,6 +826,29 @@ const { app, mcp } = buildApp({
   // for why re-running each rule's query here would be wrong).
   resourcesForUrl: async (url) => buildResourcesForUrlResponse(url, resourceLookupDeps, dashboardFeed.snapshot().rows),
   extensionAuth: config.extensionAuth,
+  // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330):
+  // `GET /agents/:agentKey/pty`'s deps. `resolve`/`isLive` read the SAME
+  // `dashboardFeed.snapshot()` `resourcesForUrl` above already reads — no
+  // new poll, no new I/O, same discipline as every other route in this
+  // object. `read`/`send` are this daemon's own existing pane helpers
+  // (defined below, already used by the detector loops). `pollMs` (250ms)
+  // is this daemon's own choice, not herdr's — see `docs/pty-attach.md`'s
+  // Config section for why: fast enough to feel interactive for a person
+  // typing, far above herdr's own per-call cost to matter as load.
+  ptyAttach: {
+    resolve: (agentKey) => resolvePtyPane(agentKey, dashboardFeed.snapshot().rows),
+    isLive: (agentKey, pane) => isPaneStillLive(agentKey, pane, dashboardFeed.snapshot().rows),
+    // Wrapped rather than passed directly: `readPaneForPty`/`sendPane` are
+    // declared further down this file, and `buildApp(...)` runs at
+    // module-evaluation time — a direct reference here would be a TDZ
+    // error. These closures aren't evaluated until a socket actually calls
+    // them, by which point the module has finished loading. `read` is
+    // `readPaneForPty`, NOT the detectors' `readPane` — see that function's
+    // own doc comment for why (ANSI must survive for a real terminal).
+    read: (pane) => readPaneForPty(pane),
+    send: (pane, text) => sendPane(pane, text),
+    pollMs: 250,
+  },
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -870,6 +894,23 @@ if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE
 
 const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
+// FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the PTY
+// endpoint's OWN read, deliberately NOT `readPane` above. `readPane` passes
+// `strip_ansi: true`, correct for the detectors that use it (they want
+// plain text), but wrong here: FACTORY-338 puts xterm.js on the other end
+// of `/agents/:agentKey/pty`'s socket, and ANSI-stripped output has no
+// colour, no cursor positioning, no redraw — a dead scrolling text dump,
+// not a terminal (FACTORY-330's own correction on this ticket, 2026-09-28).
+// `source: "visible"` (not `readPane`'s `"detection"`) matches what this is
+// FOR — the pane's current on-screen contents, the same thing a real
+// terminal shows, not a detector's parse-friendly scrollback view. `format:
+// "ansi"` alongside `strip_ansi: false` is this daemon's reading of "don't
+// strip ANSI" as also meaning "ask for the ANSI-bearing format", not just
+// leaving the default in place — see `docs/pty-attach.md`'s Contract
+// section for this stated plainly, and `src/terminal/pty-bridge.ts`'s own
+// header for why the bridge sends each read as a full-screen redraw rather
+// than a diff once ANSI is in play.
+const readPaneForPty = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "visible", format: "ansi", strip_ansi: false })).read.text;
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
