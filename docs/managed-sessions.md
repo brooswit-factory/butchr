@@ -9,6 +9,11 @@ what lets Baker's directory-driven agents and Candlestix's managed sessions
 "run as applications of Butchr's query -> agent model" (the story's own
 goal) without either product's own supervisor.
 
+**What happens to a *running* agent when one of its own fields below
+changes** (hot-reload in place / resume with new flags / fresh process,
+session lost) is its own separate survey, not this doc:
+`docs/session-field-reload-classification.md` (FACTORY-413).
+
 ## The well-known directory
 
 `sessionDefinitionsPath()` (`src/resources/session-definition.ts`) resolves,
