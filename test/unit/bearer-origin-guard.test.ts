@@ -1,5 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { checkBearerOrigin, checkBearerOriginForUpgrade, isExtensionOrigin, preflightBearerOrigin, type BearerOriginGuardDeps } from "../../src/web/bearer-origin-guard.js";
+import {
+  checkBearerOrigin,
+  checkBearerOriginForUpgrade,
+  extractSubprotocolBearer,
+  isExtensionOrigin,
+  isHttpTokenChars,
+  preflightBearerOrigin,
+  PTY_BEARER_SUBPROTOCOL_MARKER,
+  type BearerOriginGuardDeps,
+} from "../../src/web/bearer-origin-guard.js";
 
 const ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
 const OTHER_ORIGIN = "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba";
@@ -80,6 +89,87 @@ describe("checkBearerOriginForUpgrade", () => {
     const r = checkBearerOriginForUpgrade({ authorization: "Bearer s3cr3t", origin: ORIGIN }, deps);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.corsHeaders["access-control-allow-origin"]).toBe(ORIGIN);
+  });
+
+  // FACTORY-455 (implementing FACTORY-454): the subprotocol channel is only
+  // ever consulted when `Authorization` is ABSENT — a browser has no other
+  // way to authenticate this upgrade at all, so this is its whole path.
+  describe("the Sec-WebSocket-Protocol bearer channel (FACTORY-455)", () => {
+    test("a correct token via subprotocol, with Authorization absent, succeeds and echoes back ONLY the marker", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` }, deps);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.selectedSubprotocol).toBe(PTY_BEARER_SUBPROTOCOL_MARKER);
+        expect(r.selectedSubprotocol).not.toBe("s3cr3t");
+        expect(r.corsHeaders["access-control-allow-origin"]).toBe(ORIGIN);
+      }
+    });
+    test("a wrong token via subprotocol is unauthorized (401)", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: `${PTY_BEARER_SUBPROTOCOL_MARKER}, wrong` }, deps);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.status).toBe(401);
+    });
+    test("no Authorization and no subprotocol at all is unauthorized (401), same as missing Authorization alone", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: null }, deps);
+      expect(r).toEqual({ ok: false, status: 401, body: { error: "unauthorized" }, corsHeaders: {} });
+    });
+    test("a subprotocol list naming the wrong marker is treated as no credential (401), never matched loosely", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: "not-the-marker, s3cr3t" }, deps);
+      expect(r).toEqual({ ok: false, status: 401, body: { error: "unauthorized" }, corsHeaders: {} });
+    });
+    test("a subprotocol list with only the marker and no credential is unauthorized (401)", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: PTY_BEARER_SUBPROTOCOL_MARKER }, deps);
+      expect(r).toEqual({ ok: false, status: 401, body: { error: "unauthorized" }, corsHeaders: {} });
+    });
+    test("Authorization present takes priority — a subprotocol credential is never consulted, correct or not", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: "Bearer s3cr3t", origin: ORIGIN, subprotocol: `${PTY_BEARER_SUBPROTOCOL_MARKER}, totally-wrong` }, deps);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.selectedSubprotocol).toBeUndefined();
+    });
+    test("MISSING Origin is still 403 even with a valid subprotocol token — the same corrected upgrade rule, not bypassed by this channel", () => {
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: null, subprotocol: `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` }, deps);
+      expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} });
+    });
+    test("token unset is 503 regardless of subprotocol", () => {
+      const disabled: BearerOriginGuardDeps = { token: undefined, allowedOrigins: [ORIGIN] };
+      const r = checkBearerOriginForUpgrade({ authorization: null, origin: ORIGIN, subprotocol: `${PTY_BEARER_SUBPROTOCOL_MARKER}, s3cr3t` }, disabled);
+      expect(r).toEqual({ ok: false, status: 503, body: { error: "endpoint disabled: no token configured" }, corsHeaders: {} });
+    });
+  });
+});
+
+describe("extractSubprotocolBearer", () => {
+  test("extracts the credential from a well-formed [marker, credential] list", () => {
+    expect(extractSubprotocolBearer("clevr.bearer, s3cr3t", "clevr.bearer")).toBe("s3cr3t");
+  });
+  test("tolerates the RFC 6455 comma-separated-with-optional-whitespace form exactly, nothing looser", () => {
+    expect(extractSubprotocolBearer("clevr.bearer,s3cr3t", "clevr.bearer")).toBe("s3cr3t");
+  });
+  test("returns null for a null header", () => {
+    expect(extractSubprotocolBearer(null, "clevr.bearer")).toBeNull();
+  });
+  test("returns null when the marker doesn't match", () => {
+    expect(extractSubprotocolBearer("other.marker, s3cr3t", "clevr.bearer")).toBeNull();
+  });
+  test("returns null for too few or too many entries", () => {
+    expect(extractSubprotocolBearer("clevr.bearer", "clevr.bearer")).toBeNull();
+    expect(extractSubprotocolBearer("clevr.bearer, s3cr3t, extra", "clevr.bearer")).toBeNull();
+  });
+});
+
+describe("isHttpTokenChars (FACTORY-455 charset decision for BUTCHR_EXTENSION_TOKEN)", () => {
+  test("accepts common secret shapes: hex, base64url, JWT-like dotted segments", () => {
+    expect(isHttpTokenChars("a1b2c3d4e5f6")).toBe(true);
+    expect(isHttpTokenChars("aGVsbG8td29ybGQ-_")).toBe(true);
+    expect(isHttpTokenChars("header.payload.signature")).toBe(true);
+  });
+  test("rejects whitespace, quotes, commas and other RFC 2616 separators", () => {
+    for (const bad of ["has space", "has,comma", 'has"quote', "has/slash", "has;semi", "has:colon"]) {
+      expect(isHttpTokenChars(bad)).toBe(false);
+    }
+  });
+  test("rejects the empty string", () => {
+    expect(isHttpTokenChars("")).toBe(false);
   });
 });
 

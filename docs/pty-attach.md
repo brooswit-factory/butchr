@@ -7,12 +7,17 @@ answered "which agents serve this page" (`GET /resources/for-url`, see
 `docs/resources-for-url.md`); this endpoint is the other half — letting a
 browser tab actually attach to and drive one of those agents' terminals.
 
+FACTORY-455 (implementing FACTORY-454) added a SECOND credential channel,
+`Sec-WebSocket-Protocol`, alongside `Authorization` — see "Two credential
+channels" below for why both exist and neither is redundant.
+
 ## Contract
 
 ```
 GET /agents/:agentKey/pty
 Upgrade: websocket
-Authorization: Bearer <BUTCHR_EXTENSION_TOKEN>
+Authorization: Bearer <BUTCHR_EXTENSION_TOKEN>        (non-browser callers)
+Sec-WebSocket-Protocol: clevr.bearer, <BUTCHR_EXTENSION_TOKEN>   (browser callers — see below)
 Origin: chrome-extension://<id>   (REQUIRED here — see Security below)
 ```
 
@@ -22,17 +27,91 @@ see `src/rules/agent-key.ts`). The upgrade is refused (never opened) when:
 
 | condition | result |
 |---|---|
-| `BUTCHR_EXTENSION_TOKEN` unset | `503`, endpoint disabled entirely |
-| `Origin` header ABSENT | `403` |
+| `BUTCHR_EXTENSION_TOKEN` unset | `503`, endpoint disabled entirely, regardless of which channel a credential arrives on |
+| `Origin` header ABSENT | `403`, even with an otherwise-valid credential on either channel |
 | `Origin` present but not in `BUTCHR_EXTENSION_ORIGINS` | `403` |
-| `Authorization` missing | `401` |
-| `Authorization` wrong | `401` |
+| Neither `Authorization` nor a valid `Sec-WebSocket-Protocol` credential present | `401` |
+| `Authorization` present but wrong | `401` |
+| `Authorization` absent and the `Sec-WebSocket-Protocol` credential wrong | `401` |
 | `:agentKey` does not decode as a valid agent key | `404`, `"not a valid agent key: <key>"` |
 | `:agentKey` decodes fine but names no currently-live agent row | `404`, `"no such live pane: <key> (not one of this daemon's own running agents)"` — the SAME wording `/agents/pane/:pane/attach` (`src/terminal/open.ts`'s `attachRefusalMessage`) uses for an unknown pane, deliberately reused rather than reinvented |
 
 All of the above happen in Elysia's `beforeHandle`, which runs BEFORE the
 WebSocket upgrade — a refusal is an ordinary HTTP response, and the socket
 is never opened at all.
+
+## Two credential channels, and why both exist
+
+**A browser's `WebSocket` constructor cannot set arbitrary request headers —
+it cannot send `Authorization` on the handshake at all.** This was measured,
+not assumed: Chrome's `declarativeNetRequest` `modifyHeaders` (the obvious
+workaround) was tested against a real WebSocket upgrade on Chrome for Testing
+148 and does NOT rewrite the handshake's headers, even though the identical
+rule correctly adds `Authorization` to an ordinary `fetch()` to the same
+host. So for Clevr (FACTORY-338), the header channel is simply unreachable —
+this is not a style preference, it is the only way a browser-based caller
+can authenticate this endpoint at all. **Do not delete the
+`Sec-WebSocket-Protocol` path as "redundant" with `Authorization` — for the
+one caller this whole endpoint exists to serve, it is the ONLY path.**
+
+`Authorization: Bearer <token>` keeps working completely unchanged — curl, a
+CLI, a test, anything that CAN set arbitrary headers still authenticates
+exactly as before FACTORY-455. `Sec-WebSocket-Protocol` is checked ONLY when
+`Authorization` is absent; when both are somehow present, `Authorization`
+takes priority and the subprotocol value is not even consulted. Both
+channels share the SAME `BUTCHR_EXTENSION_TOKEN`, the SAME Origin rule (see
+below — unchanged by this addition), and the SAME constant-time comparison
+(`bearer-origin-guard.ts`'s `constantTimeEqual`, invoked exactly once, via
+`checkBearerOrigin`, regardless of which channel the credential arrived on).
+
+### The exact subprotocol shape
+
+A browser client opens:
+
+```js
+new WebSocket(url, ["clevr.bearer", "<BUTCHR_EXTENSION_TOKEN>"])
+```
+
+which Chrome sends as `Sec-WebSocket-Protocol: clevr.bearer, <token>` (RFC
+6455 §4.3's comma-separated list). The server requires EXACTLY that
+two-element shape — the fixed marker `clevr.bearer`
+(`PTY_BEARER_SUBPROTOCOL_MARKER` in `src/web/bearer-origin-guard.ts`) first,
+the token second, nothing more and nothing less. Anything else (no
+subprotocol header, only the marker, the marker in the wrong position, extra
+entries) is treated exactly like a missing `Authorization` header: `401`,
+not a distinguishable error.
+
+**The server echoes back ONLY the marker, NEVER the token,** as the selected
+`Sec-WebSocket-Protocol` on a successful subprotocol-authenticated upgrade.
+This is not optional politeness — it is required for two independent
+reasons: (1) a response header containing the bearer token would defeat the
+whole "never log/echo the token" discipline this endpoint otherwise
+maintains, and (2) **a browser REJECTS a handshake whose selected
+subprotocol is not one the client itself offered** — selecting nothing, or
+selecting the token, are both wrong; only selecting the marker (which the
+client DID offer) lets the handshake complete. A header-authenticated
+connection (no subprotocol offered at all) gets no `Sec-WebSocket-Protocol`
+in the response either — there is nothing to select from.
+
+### Charset: why `BUTCHR_EXTENSION_TOKEN` itself is constrained, not encoded
+
+RFC 6455 §4.3 restricts a subprotocol value to HTTP token characters (RFC
+2616 §2.2) — no whitespace, no `"`, `,`, `/`, `:`, `;`, control characters,
+or non-ASCII. Rather than invent a second encoding (e.g. base64url) that the
+subprotocol value would need decoding out of on every request — with its own
+decode-failure mode, and a token that reaches the comparison that is never
+quite the raw `BUTCHR_EXTENSION_TOKEN` bytes — **this codebase instead
+requires `BUTCHR_EXTENSION_TOKEN` itself to already consist only of HTTP
+token characters**, checked ONCE at config load
+(`src/config/config.ts`, via `bearer-origin-guard.ts`'s `isHttpTokenChars`).
+A token that fails this check refuses the daemon at startup with the
+offending characters named — loud and immediate, never a token that appears
+to load fine and then silently fails to authenticate (or gets mangled/
+truncated) on the first subprotocol-authenticated request. Any token
+generated by a common "random hex/base64url secret" convention already
+satisfies this; a JWT-shaped token (dot-separated base64url segments) does
+too. Only a token someone deliberately puts a space, comma, or quote in
+would ever hit this refusal.
 
 Once open, the pane the socket attached to is re-checked on every poll tick
 against the SAME staffed-agent registry the initial resolve used. If it goes
@@ -133,7 +212,7 @@ instead.
 
 | env var | required | effect |
 |---|---|---|
-| `BUTCHR_EXTENSION_TOKEN` | to enable the endpoint | the SAME shared bearer token `GET /resources/for-url` uses. **UNSET means the endpoint is DISABLED (503 on every upgrade attempt), never open.** No second token, no second env var. |
+| `BUTCHR_EXTENSION_TOKEN` | to enable the endpoint | the SAME shared bearer token `GET /resources/for-url` uses — and, since FACTORY-455, the SAME token accepted on EITHER credential channel above, never a second token. **UNSET means the endpoint is DISABLED (503 on every upgrade attempt), never open.** Must consist only of HTTP token characters (see "Charset" above) — validated at config load, not silently accepted and later mangled. |
 | `BUTCHR_EXTENSION_ORIGINS` | no | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses. |
 
 Both are read once into `Config.extensionAuth` (`src/config/config.ts`) and
@@ -183,22 +262,28 @@ and a different bug class).
   poll tick.** Both read the same already-polled `dashboardFeed.snapshot()`
   every other route in `src/daemon/index.ts` reads — never a fresh provider
   call.
-- **Token/Origin gate at upgrade, never after.** A refusal is a plain HTTP
-  response; the socket is never opened and then closed.
+- **Token/Origin gate at upgrade, never after, on either credential
+  channel.** A refusal is a plain HTTP response; the socket is never opened
+  and then closed. The Origin rule (strict, `checkBearerOriginForUpgrade`)
+  is identical regardless of whether the credential arrived via
+  `Authorization` or `Sec-WebSocket-Protocol` — FACTORY-455 added the second
+  channel, not a second Origin policy.
 - **Nothing sensitive is logged.** No route or bridge code here logs token
   values, socket payloads, or keystrokes.
 
 ## Files
 
-- `src/web/bearer-origin-guard.ts` — adds `checkBearerOriginForUpgrade`, the strict Origin-required sibling of `checkBearerOrigin`.
+- `src/web/bearer-origin-guard.ts` — adds `checkBearerOriginForUpgrade`, the strict Origin-required sibling of `checkBearerOrigin`; FACTORY-455 extended it with the `Sec-WebSocket-Protocol` fallback (`extractSubprotocolBearer`, `PTY_BEARER_SUBPROTOCOL_MARKER`) and the charset check (`isHttpTokenChars`).
+- `src/config/config.ts` — FACTORY-455: validates `BUTCHR_EXTENSION_TOKEN` against `isHttpTokenChars` at load time.
 - `src/terminal/pty-attach.ts` — resolves `:agentKey` to a live pane (and re-checks liveness) over the dashboard snapshot; the refusal vocabulary, reusing `src/terminal/open.ts`'s wording for the "unknown/not-live" case.
 - `src/terminal/pty-bridge.ts` — the pure framing/tick logic: parses client frames, decides what to send and when to close, with no socket, herdr client, or timer of its own.
 - `src/web/view.ts` — the actual `.ws("/agents/:agentKey/pty", ...)` route: the `beforeHandle` auth+resolve gate, the poll-loop wiring, back-pressure config, and the message/close handlers.
 - `src/daemon/index.ts` — wires real deps: `resolvePtyPane`/`isPaneStillLive` over `dashboardFeed.snapshot()`, the new ANSI-preserving `readPaneForPty` (distinct from the detectors' ANSI-stripping `readPane`), `sendPane`, and the 250ms poll interval.
-- `test/unit/bearer-origin-guard.test.ts` — unit coverage for `checkBearerOriginForUpgrade`, including the missing-Origin case.
+- `test/unit/bearer-origin-guard.test.ts` — unit coverage for `checkBearerOriginForUpgrade`, including the missing-Origin case, plus (FACTORY-455) the `Sec-WebSocket-Protocol` channel (success + marker-only echo, wrong/missing credential, Authorization-takes-priority, Origin/token-unset unchanged), `extractSubprotocolBearer`, and `isHttpTokenChars`.
 - `test/unit/pty-attach.test.ts` — unit coverage for pane resolution/liveness/refusal wording.
 - `test/unit/pty-bridge.test.ts` — unit coverage for frame parsing and the per-tick decision, including an ANSI-sequence-survives-a-tick case.
-- `test/unit/pty-attach-route.test.ts` — end-to-end coverage over a real upgraded socket: successful attach and input/output round-trip, an ANSI escape sequence surviving the real socket byte-for-byte, a resize control frame not breaking the connection, every upgrade refusal (missing token, wrong token, token unset, missing Origin, wrong Origin, malformed key, unknown/not-live key), a `herdr.pane.read` failure, a pane disappearing between `beforeHandle` and `open`, and the pane-disappearing close reason.
+- `test/unit/pty-attach-route.test.ts` — end-to-end coverage over a real upgraded socket: successful attach and input/output round-trip, an ANSI escape sequence surviving the real socket byte-for-byte, a resize control frame not breaking the connection, every upgrade refusal (missing token, wrong token, token unset, missing Origin, wrong Origin, malformed key, unknown/not-live key), a `herdr.pane.read` failure, a pane disappearing between `beforeHandle` and `open`, the pane-disappearing close reason, and (FACTORY-455) the `Sec-WebSocket-Protocol` channel over a real socket — successful attach with the response's `.protocol` equal to the marker (never the token), a wrong subprotocol credential never opening the socket, and the HTTP-level refusals (wrong/missing subprotocol credential, token unset, missing/wrong Origin) all still applying to that channel.
+- `test/unit/config.test.ts` — (FACTORY-455) `BUTCHR_EXTENSION_TOKEN` charset validation: rejects characters invalid in a WebSocket subprotocol value, naming the offenders; accepts common secret shapes (hex, base64url, JWT-like).
 
 ## A related, inherent limitation worth documenting here
 
