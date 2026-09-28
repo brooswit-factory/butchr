@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -2186,10 +2186,22 @@ describe("resumeInPlace", () => {
   // process can still hold this pane's agent name in herdr's own
   // bookkeeping for a moment even after every check above (idle, `/exit`,
   // "back to a shell") has passed — `agent.start` itself then rejects with
-  // `agent_name_taken`. This must resolve to the SAME safe, non-destructive
-  // "stuck" outcome a pane that never left claude's foreground gets, not a
-  // raw thrown failure.
-  test("stuck (via agent_name_taken): the relaunch is rejected because the old process still holds the pane's agent name — resolves to 'stuck', never throws, never persists", async () => {
+  // `agent_name_taken`.
+  //
+  // FACTORY-426 (epic review, comment 27460): originally asserted this
+  // resolved to "stuck" — proven WRONG by a live reproduction
+  // (FACTORY-73/FACTORY-394, FACTORY-312 comment 27407): "stuck" is a bare
+  // retry, and by the time this catch fires the pane is ALREADY confirmed
+  // empty (this fake's own `sendKeys` sets `foreground = "shell"`
+  // immediately, simulating the confirmed exit), so a bare retry never
+  // clears `ManagedHerdrLifecycle`'s stale "current worker" identity —
+  // every later ordinary spawn attempt then hits `HandoffBlocked: Current
+  // worker disappeared; refusing implicit replacement`, forever. The
+  // correct outcome is "failed", which routes through `reconcileNow`'s
+  // existing stop-then-spawn fallback (see loop.test.ts's own
+  // scopedHerd-routing tests) — the SAME machinery a liveness-check failure
+  // already used safely before this ticket.
+  test("failed (via agent_name_taken on an already-confirmed-empty pane): routes to the stop-then-spawn fallback instead of a bare 'stuck' retry — never persists", async () => {
     await withTempWorkspaces(async () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-908" });
       const cwd = workspaceDirFor(key);
@@ -2198,7 +2210,53 @@ describe("resumeInPlace", () => {
         const f = statefulHerdr("w1:p1", cwd, "idle", { nameTaken: true });
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
-        expect(outcome).toBe("stuck");
+        expect(outcome).toBe("failed");
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
+    });
+  });
+
+  // FACTORY-426: the twin of the test above — required addition 1 from the
+  // epic's review. Any OTHER error from the relaunch attempt (not just
+  // `agent_name_taken`) reaches this same catch with the pane just as
+  // confirmed-empty, and used to propagate as a raw throw — `reconcileNow`
+  // then does `failures.push(...); continue;`, ALSO a bare retry that never
+  // clears `ManagedHerdrLifecycle.active`. Must resolve the same way.
+  test("failed (via a non-agent_name_taken relaunch error on an already-confirmed-empty pane): routes to the stop-then-spawn fallback instead of propagating the throw", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-909" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle");
+        f.client.agent.start = async () => { throw new Error("transport hiccup"); };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
+    });
+  });
+
+  // FACTORY-426: the narrow safety valve required addition 1 preserves —
+  // if something genuinely DOES occupy the pane again between the exit
+  // check and the relaunch attempt's own failure (not the expected case,
+  // but not provably impossible either), the original error must still
+  // surface rather than being silently downgraded to "failed".
+  test("a relaunch error with the pane unexpectedly re-occupied still throws (not silently downgraded to 'failed')", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-910" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle");
+        f.client.agent.start = async () => {
+          // Something reoccupies the pane's foreground right as the relaunch itself fails.
+          f.client.pane.processInfo = async () => ({ process_info: { pane_id: "w1:p1", foreground_processes: [CLAUDE_PROC] } });
+          throw new Error("transport hiccup");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await expect(herd.resumeInPlace(spec)).rejects.toThrow("transport hiccup");
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });
@@ -2386,6 +2444,209 @@ describe("resumeInPlace", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  });
+
+  /**
+   * FACTORY-426 (epic review, comment 27460 — "the first test proposal on
+   * this ticket that would actually have caught its own bug"): a fake at
+   * the `Herd` interface level (what every prior resumeInPlace/scopedHerd
+   * test on this ticket used) cannot exercise this bug at all — it lives
+   * inside `ManagedHerdrLifecycle`'s own private `this.active` bookkeeping,
+   * a REAL class from `@brooswit/drovr` that `HerdrHerd` constructs
+   * internally and never exposes. This fixture stubs ONLY the herdr RPC
+   * boundary (`client.agent`/`client.pane`/`client.workspace`) — the same
+   * seam `fakeHerdr` above already uses for a real fresh spawn — and adds
+   * exactly what `resumeInPlace`'s own post-`/exit` region additionally
+   * needs: `pane.processInfo` (foreground detection), `pane.sendText`/
+   * `sendKeys` (the `/exit` sequence), and `agent_status` on spawned
+   * entries (`ManagedHerdrLifecycle.resolveCurrent()`'s own idle check).
+   */
+  function fakeHerdrFullCycle(cwd: string) {
+    const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; foreground: "claude" | "shell" } = { agents: [], foreground: "shell" };
+    let paneCounter = 0;
+    const started: any[] = []; const closed: string[] = []; const sent: any[] = []; const creates: any[] = [];
+    let nameTakenNext = false;
+    const client = {
+      agent: {
+        list: async () => ({ agents: state.agents.map((a) => ({ ...a })) }),
+        start: async (p: any) => {
+          started.push(p);
+          if (nameTakenNext) { nameTakenNext = false; throw HerdrError.from("agent.start", { code: "agent_name_taken", message: "agent name already used" }); }
+          state.agents = [...state.agents.filter((a) => a.pane_id !== p.pane_id), { pane_id: p.pane_id, cwd, agent: "claude", agent_status: "idle" }];
+          state.foreground = "claude";
+        },
+      },
+      pane: {
+        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: ["claude"], name: "claude" }] : [] } }),
+        sendText: async (p: any) => { sent.push({ text: p.text }); },
+        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); state.foreground = "shell"; },
+        close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); },
+        read: async () => ({ read: { text: "" } }),
+      },
+      workspace: { create: async (p: any) => { paneCounter++; creates.push(p); return { root_pane: { pane_id: `fresh-${paneCounter}` } }; } },
+    };
+    return {
+      client: client as any, started, closed, sent, creates, state,
+      setNameTakenOnNextStart: () => { nameTakenNext = true; },
+      // Simulates herdr's OWN bookkeeping eventually forgetting a dead
+      // pane's agent-name registration (the "old process can still hold
+      // this pane's agent name... for a moment" gap `staleIssues()`'s own
+      // comment describes) — its real timing is external and unmodeled
+      // here; what this test actually validates is what happens ONCE that
+      // catch-up occurs, which is the part `ManagedHerdrLifecycle.active`'s
+      // own staleness controls.
+      forgetAllAgents: () => { state.agents = []; },
+    };
+  }
+
+  // THE regression test for FACTORY-426's floor fix. Verified (locally,
+  // before committing) to FAIL against the pre-fix `resumeInPlaceExclusive`
+  // (which returned "stuck" for `agent_name_taken` unconditionally): with
+  // "stuck", `herd.stop()` below is never reached, so `ManagedHerdrLifecycle`
+  // still holds the ORIGINAL pane as `this.active` when the final
+  // `herd.spawn()` runs, which then hits `resolveCurrent()` finding nothing
+  // (this test's own `forgetAllAgents()`) while `this.active` is still set —
+  // `ManagedHerdrLifecycle.start()`'s own precondition throws
+  // `HandoffBlocked: Current worker disappeared; refusing implicit
+  // replacement`, `spawnExclusive` catches it, logs `"waiting - handoff
+  // blocked"`, and returns — no throw, `f.started` stays at 2, no third
+  // pane is ever created. That is the exact silent permanent stall
+  // confirmed live (FACTORY-73/FACTORY-394, FACTORY-312 comment 27407).
+  test("FACTORY-426: a 'failed' outcome from a vacated-pane relaunch collision lets the NEXT ordinary spawn actually recover — real HerdrHerd + real ManagedHerdrLifecycle, stubbed only at the herdr RPC boundary", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-911" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-strand-"));
+      try {
+        const f = fakeHerdrFullCycle(cwd);
+        let sessionCounter = 0;
+        const rawStart = f.client.agent.start;
+        // Simulates Claude naming its OWN transcript file on a genuinely
+        // successful launch only — `rawStart` throws before this runs when
+        // `setNameTakenOnNextStart()` is armed, exactly like the real
+        // failure this fixture reproduces never gets a session id either.
+        f.client.agent.start = async (p: any) => {
+          await rawStart(p);
+          sessionCounter++;
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+
+        // 1) A REAL fresh spawn — establishes ManagedHerdrLifecycle's own
+        // "current worker" identity for real, not a fake's approximation of it.
+        await herd.spawn(spec);
+        expect(f.started).toHaveLength(1);
+        const originalPane = f.state.agents[0]!.pane_id;
+
+        // 2) resumeInPlace attempts a same-pane relaunch that collides with
+        // agent_name_taken — the exact live-reproduced failure.
+        f.setNameTakenOnNextStart();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed"); // not "stuck" — the floor fix in effect
+        expect(f.sent.some((s) => s.text === "/exit")).toBe(true); // confirms /exit really was sent before the collision
+
+        // 3) herdr eventually forgets the dead pane's registration (see
+        // `forgetAllAgents`'s own doc comment above for why this is the
+        // honest way to reach the state this test actually cares about).
+        f.forgetAllAgents();
+
+        // 4) reconcileNow's ACTUAL contract for a "failed" outcome —
+        // `herd.stop(issue)` THEN `herd.spawn(issue)` — mirrored directly so
+        // this test isolates exactly what the floor fix changed, without
+        // routing through reconcileNow's own unrelated admission/guard logic.
+        await herd.stop(spec.key);
+        await herd.spawn(spec);
+
+        expect(f.started).toHaveLength(3); // the third attempt actually reached agent.start — not silently blocked
+        expect(f.state.agents).toHaveLength(1);
+        expect(f.state.agents[0]!.pane_id).not.toBe(originalPane); // a genuinely NEW pane — an honest fresh restart, not a phantom reuse
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // The negative control for the test above: without the `herd.stop()` call
+  // (i.e., the OLD "stuck" behavior's actual consequence), the next spawn
+  // attempt is silently blocked — proving this fixture reproduces the real
+  // defect, not just a fixture quirk. Deliberately calls `spawnExclusive`'s
+  // production entry point (`herd.spawn`), never a lower-level drovr call.
+  test("FACTORY-426 (negative control): skipping herd.stop() before the next spawn reproduces the silent HandoffBlocked stall this ticket fixed", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-912" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-strand-control-"));
+      try {
+        const f = fakeHerdrFullCycle(cwd);
+        let sessionCounter = 0;
+        const rawStart = f.client.agent.start;
+        f.client.agent.start = async (p: any) => {
+          await rawStart(p);
+          sessionCounter++;
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn(spec);
+        f.setNameTakenOnNextStart();
+        await herd.resumeInPlace(spec);
+        f.forgetAllAgents();
+        // Deliberately no herd.stop() here — mirrors what "stuck" used to do.
+        await herd.spawn(spec);
+        // `ManagedHerdrLifecycle.start()` returns `{status:"blocked"}` rather
+        // than throwing; `spawnExclusive` logs and returns silently. The
+        // observable symptom: no third launch attempt ever reaches
+        // `agent.start`, and no new pane appears — the silent permanent
+        // stall, reproduced deliberately to prove this fixture is sensitive
+        // to the actual defect rather than trivially passing either way.
+        expect(f.started).toHaveLength(2);
+        expect(f.state.agents).toHaveLength(0);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-426 (epic-authorized observability gap): before this, no outcome
+  // of `resumeInPlace` was ever logged — a `"stuck"`/`"unresumable"`/`"failed"`
+  // result with no `onResumePreserved`/`onResumeWaiting` subscriber wired
+  // left zero trace that a resume was even attempted. Covers every outcome
+  // through the ONE wrapper (`resumeInPlace`'s own try/catch around
+  // `resumeInPlaceExclusive`), not by asserting every branch individually.
+  test("RESUME_TAG: every outcome (and a thrown error) logs exactly one line, never zero", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-913" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+
+      // "unresumable": no entry running at all — the cheapest outcome to reach.
+      const lines: string[] = [];
+      const f = statefulHerdr("w1:p1", cwd);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l));
+      const outcome = await herd.resumeInPlace(spec);
+      expect(outcome).toBe("unresumable");
+      expect(lines).toEqual([`${RESUME_TAG} ${key} unresumable`]);
+
+      // A thrown error also logs exactly one line, distinguishable from a
+      // clean outcome by its own wording, and still propagates the throw.
+      const lines2: string[] = [];
+      const f2 = statefulHerdr("w1:p1", cwd, "idle");
+      f2.client.agent.list = async () => { throw new Error("herdr hiccup"); };
+      const herd2 = new HerdrHerd(f2.client, "http://x/mcp", instant, (l) => lines2.push(l));
+      await expect(herd2.resumeInPlace(spec)).rejects.toThrow("herdr hiccup");
+      expect(lines2).toEqual([`${RESUME_TAG} ${key} threw — herdr hiccup`]);
     });
   });
 });
