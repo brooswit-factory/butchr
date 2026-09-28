@@ -76,6 +76,7 @@ function fakeHerd(): Herd & { running: Set<string>; spawnedSpecs: Map<string, Sp
     async stop(id) { running.delete(id); },
     async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -156,6 +157,7 @@ describe("BUTCHR-412/BUTCHR-464: the 3x3x2 execution x account x role matrix, th
         async stop() {},
         async paneFor() { return null; },
         async nudge() { return { delivered: true }; },
+        async resumeInPlace() { return "unresumable" as const; },
       };
       // A prior spawn already provisioned this agent's account.
       const first = await manager.ensureAccount(key, "temporary");
@@ -190,6 +192,7 @@ describe("BUTCHR-412/BUTCHR-464: the 3x3x2 execution x account x role matrix, th
       async stop(id) { running.delete(id); },
       async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     const ids = Array.from({ length: 12 }, (_, i) => `jira-work:triage:T-${i}`);
     const desired = new Map(ids.map((id) => [id, { key: id, issuetype: "task", summary: "s", parent: null }]));

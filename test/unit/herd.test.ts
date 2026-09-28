@@ -540,6 +540,7 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
       stop: async () => {},
       paneFor: async () => null,
       nudge: async () => ({ delivered: false }),
+      resumeInPlace: async () => "unresumable",
     };
     const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
     const desired = new Map([

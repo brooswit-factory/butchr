@@ -528,6 +528,7 @@ function fakeHerd(initial: string[] = []): { herd: Herd; spawned: SpawnSpec[]; s
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
   return { herd, spawned, stopped, running };
 }
@@ -699,6 +700,7 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
       async stop() {},
       async paneFor() { return null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     return { herd, spawned };
   }
