@@ -200,16 +200,18 @@ reuses:
   into the SAME `createLinkedEventingState`/`runTick` machinery
   (`src/jira-watch/linked-eventing.ts`) a `jira-project` rule's own owners
   already use — no second watcher, no separate rate cap.
-- **Uncapped by default (known gap, FACTORY-78):** these nudges reuse the
-  BUTCHR-469 rate-cap MECHANISM, but this definition has no field to
-  configure a cap VALUE, and the wiring's own fixed `Rule`-shaped gate never
-  sets one — so today, a managed session's linked-eventing nudges are
-  uncapped, the same "absent means uncapped" behaviour an unconfigured
-  `jira-project` rule owner already has, not a real per-session or
-  per-project budget. A real default (or a per-definition setting) is an
-  open operator decision, deliberately deferred rather than invented
-  unilaterally — see `docs/resource-links.md`'s own section for the full
-  reasoning and FACTORY-78 for the tracked gap.
+- **Capped by the shared default, not yet by any per-definition setting
+  (BUTCHR-471):** this definition still has no field to configure a cap
+  VALUE, and the wiring's own fixed `Rule`-shaped gate
+  (`MANAGED_SESSION_LINKED_EVENTING_RULE`) still never sets one — but absent
+  no longer means uncapped: `runTick` (`src/jira-watch/linked-eventing.ts`)
+  now falls back to a fixed default (2 turns/hour, 25 items) whenever a
+  rule leaves either cap absent, this fixed gate included, so no owner kind
+  — a managed session among them — can run uncapped. A per-definition
+  override remains a known limit, tracked as a follow-up (the residue of
+  FACTORY-78) — see `docs/resource-links.md`'s own BUTCHR-471 section for
+  the full reasoning, the evidence behind the default's numbers, and what
+  is and isn't done yet.
 
 ## Tier -> model mapping
 
@@ -1025,18 +1027,20 @@ does. A director definition wants both: `assertNoInheritedMcpConfig` closes
 the project-level gap unconditionally, `strictMcpConfig: true` closes the
 user-level one this definition explicitly asks for.
 
-## Lizard mode: manual permission mode without the freeze risk (DROVR-42/FACTORY-67)
+## Lizard mode: auto-answering the tool-permission dialog without a stored rule (DROVR-42/FACTORY-67)
 
 DROVR-37 shipped `@brooswit/drovr`'s `autoAnswerPermissions`: an unattended
-pass over Claude panes that presses the "Yes, and always allow … from this
-project" stored-rule option on an unambiguous tool-permission dialog, only
-when it is unambiguous, auditing every attempt. The operator's own name for
-running a managed session in Claude's manual/ask mode (`permissionMode:
-"default"`) with that auto-answer switched on is **"lizard mode"** — the
-point is to keep manual mode's own safety property for every tool call
-while never letting the agent sit frozen on the ONE dialog drovr already
-answers safely, which is exactly the incident (agents frozen for hours,
-herdr reporting them idle/done) this whole DROVR-37 epic exists to fix:
+pass over Claude panes that presses the plain "Yes" (allow once) option on
+an unambiguous tool-permission dialog, only when it is unambiguous, auditing
+every attempt. Since FACTORY-93, it never presses the "Yes, and always
+allow …" stored-rule option, and no rule persists past that one answer. The
+operator's own name for a managed session that opts into that auto-answer is
+**"lizard mode"** — it is a SEPARATE toggle that pairs with any
+`permissionMode` that still prompts (manual/`"default"` included, but not
+only that one), so the agent never sits frozen on the ONE dialog drovr
+already answers safely, which is exactly the incident (agents frozen for
+hours, herdr reporting them idle/done) this whole DROVR-37 epic exists to
+fix:
 
 ```json
 {
@@ -1067,11 +1071,16 @@ established the pattern for — rebuilt every managed-sessions poll from each
 eligible definition's own manifest, never persisted or acted on stale).
 
 **Nothing here requires pairing with `permissionMode: "default"`** — the
-field is independent and a definition may set it alongside any
-`permissionMode` — but manual mode is the combination it exists for; in
-`"auto"`/`"bypassPermissions"` mode the tool-permission dialog this targets
-essentially never appears, so `lizardMode` there is a harmless no-op, not an
-error.
+field is independent, and a definition may set it alongside any
+`permissionMode` that still prompts before a tool call; `permissionMode:
+"acceptEdits"` plus `lizardMode: true` and `permissionMode: "default"` plus
+`lizardMode: true` are both valid, ordinary combinations, not a headline
+plus an afterthought. `acceptEdits` auto-accepts file EDITS only — Bash and
+MCP tool prompts still appear there, and those are what lizard mode answers.
+`"bypassPermissions"` skips permission prompts by design, so `lizardMode`
+there has nothing to answer. What `"auto"` does is version-dependent and
+UNVERIFIED here — don't assume it behaves like `bypassPermissions`, and
+don't assume `lizardMode` is therefore a no-op under it.
 
 **No stale-argv risk for CLAUDE, unlike `permissionMode`/`strictMcpConfig`
 (FACTORY-43).** Those two fields DO reach the launched process's argv, which
@@ -1162,19 +1171,57 @@ from FACTORY-43) — not a gap introduced by this ticket, and not otherwise
 fixed here per this ticket's own requirement to document, not silently
 leave, whatever the existing mechanism actually does.
 
-**Why the explicit-only reading matters: FACTORY-127.** A sibling story is
-making `lizardMode` default to `true` where it is resolved for
-ELIGIBILITY — i.e. whether the daemon's answering timer scans a pane at
-all — and that default flip is promised to never reach argv, never respawn
-anything, and take effect on the daemon's very next poll (same "live,
-no-respawn" property Claude's own `lizardMode` already has). If the Codex
-LAUNCH decision above keyed off that same resolved/defaulted value instead of
-the raw explicit field, FACTORY-127's default flip would silently drop the
-bypass flag from EVERY running Codex agent at deploy — a fleet-wide sandbox
-change and respawn wave with no canary. Reading only the explicit field keeps
-Codex agents leaving bypass mode one at a time, by deliberate opt-in, after a
-canary — see this ticket's own PR/code comment on the launch-flag decision
-function (`src/agents/argv.ts`) for where this is enforced.
+**Why the explicit-only reading matters: FACTORY-127/FACTORY-138.** A sibling
+story (FACTORY-127, shipped with FACTORY-138) made `lizardMode` default to
+`true` where it is resolved for ELIGIBILITY — i.e. whether the daemon's
+answering timer scans a pane at all — for a `vendor: "claude"` definition;
+that default flip never reaches argv, never respawns anything, and takes
+effect on the daemon's very next poll (a live, no-respawn property, since
+Claude's own `lizardMode` never reaches argv at all — see above). **For
+`vendor: "codex"`, the story explicitly decided (FACTORY-106/FACTORY-324)
+NOT to extend that default-eligible flip** — a `codex` definition that never
+sets `lizardMode` stays not-eligible for scanning too (see the "Codex
+eligibility for SCANNING vs. LAUNCH — two separate defaults" note below for
+the full three-case table). If the Codex LAUNCH decision above keyed off the
+resolved/defaulted ELIGIBILITY value instead of the raw explicit field,
+either default (today's not-eligible-when-absent, or a future eligible-when-
+absent) would risk changing argv/respawn behaviour purely from an eligibility
+default flip with no canary. Reading only the explicit field keeps Codex
+agents leaving bypass mode one at a time, by deliberate opt-in, after a
+canary, independent of whatever the eligibility default happens to be — see
+this ticket's own PR/code comment on the launch-flag decision function
+(`src/agents/argv.ts`) for where this is enforced.
+
+**Codex eligibility for SCANNING vs. LAUNCH — two separate defaults
+(FACTORY-106/FACTORY-324 story decision).** These are two different
+questions with two different defaults for a `vendor: "codex"` definition,
+and conflating them is the mistake this note exists to prevent:
+
+| `lizardMode` on the definition | eligible for SCANNING (daemon answers a dialog if it appears) | LAUNCHED without the bypass flag (a dialog can appear at all) |
+| --- | --- | --- |
+| absent | **NOT eligible** (opposite of `vendor: "claude"`'s FACTORY-138 default) | bypass flag present — no dialog ever shows |
+| explicit `true` | eligible | bypass flag dropped — dialog can show, and gets answered |
+| explicit `false` | not eligible | bypass flag present — no dialog ever shows |
+
+Absent and explicit-`false` are outcome-identical for Codex today (both:
+not-eligible, bypass flag present, no dialog, nothing to answer) — the
+absent case is called out separately only because it is the one place Codex
+deliberately does NOT mirror Claude's FACTORY-138 "absent means eligible"
+default. Reason: for Claude, "eligible but nothing to press" cannot happen —
+a Claude launch always risks showing this dialog, so default-eligible is
+real coverage. For Codex, a definition's launch shows the dialog ONLY when
+the SAME field is explicitly `true`; defaulting eligibility on for Codex
+would only add a scan that can never find anything to press (a harmless
+no-op, not a bug — see the rule-side asymmetry note immediately below for
+the one place this exact shape is deliberately still allowed to occur), while
+silently implying a coverage guarantee nobody canaried. `Rule.lizardMode`
+(the rule-engine, non-managed-session path — src/rules/rules.ts) resolves
+scanning eligibility differently — `!== false`, i.e. absent IS eligible,
+regardless of vendor, unchanged by this decision — creating a deliberate,
+documented asymmetry with this table for a rule-launched (as opposed to
+managed-session) Codex agent: see `Rule.lizardMode`'s own doc comment for
+why that asymmetry was judged harmless rather than worth a matching vendor
+check.
 
 **Host config caveat.** `~/.codex/config.toml`'s own `approval_policy`/
 `sandbox_mode` settings can change which prompt shapes Codex renders,
@@ -1184,13 +1231,13 @@ epic's, not this ticket's.
 
 **Audit visibility.** Every auto-answer is recorded to a JSONL file under
 the workspace root (`Config.permissionAuditPath`, default
-`.permission-audit.jsonl`) with the exact stored-rule text pressed, and the
-daemon's own journal logs a line per answered/failed pane naming the
-DEFINITION FILE (not just an opaque pane id) and the tool — see
-`docs/permission-answer-loop.md`'s "Seeing recent auto-answers" section for
-the full detail and the reasoning for why this module never re-parses a
-pane's dialog itself to recover the exact rule text (dialog recognition
-stays drovr's job — FACTORY-49/FACTORY-67).
+`.permission-audit.jsonl`) with the exact option text pressed — always
+"Yes" (allow once) today, never a stored-rule option — and the daemon's own
+journal logs a line per answered/failed pane naming the DEFINITION FILE (not
+just an opaque pane id) and the tool — see `docs/permission-answer-loop.md`'s
+"Seeing recent auto-answers" section for the full detail and the reasoning
+for why this module never re-parses a pane's dialog itself to recover that
+text (dialog recognition stays drovr's job — FACTORY-49/FACTORY-67).
 
 **Rule-launched agents get the same mechanism too (FACTORY-87/FACTORY-76).**
 `Rule.permissionMode`/`Rule.lizardMode` (`src/rules/rules.ts`) extend this
@@ -1201,10 +1248,11 @@ and `lizardMode`" section for the rule-side field story, and
 `docs/permission-answer-loop.md` for how `ruleLizardModeOf`
 (`src/agents/permission-answer-loop.ts`) extends `eligiblePanes` to cover them.
 
-**Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
-manifest load rather than silently storing-and-dropping it — see
-"Per-vendor launch differences" immediately below for why this follows
-`strictMcpConfig`'s precedent, not `permissionMode`'s more lenient one.
+**Vendor:** `codex`, unlike `strictMcpConfig` (which it still REJECTS at
+manifest load), ACCEPTS `lizardMode` (FACTORY-108) — see the eligibility
+table above for what an absent/`true`/`false` value on a `codex` definition
+actually does, and "Per-vendor launch differences" immediately below for
+`strictMcpConfig`'s own (unchanged) rejection.
 
 ## Per-vendor launch differences
 
@@ -1238,13 +1286,19 @@ they have an MCP-isolation security property they do not — the exact
 silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
 first place. `test/unit/session-definition.test.ts` proves the rejection.
 
-`lizardMode` follows `strictMcpConfig`'s precedent, not `permissionMode`'s:
-`@brooswit/drovr`'s `classifyPermissionPrompt` recognises the Claude Code
-CLI's own tool-permission dialog shape specifically and never matches a
-Codex pane's screen, so a `vendor: "codex"` definition setting
-`lizardMode: true` would silently do nothing — the same misleading-silence
-failure mode, closed the same way (**REJECTED at manifest load**, any
-value, not merely a truthy one).
+`lizardMode` is **NOT** `strictMcpConfig`'s precedent (FACTORY-108,
+superseding an earlier draft of this doc that said otherwise): a
+`vendor: "codex"` definition CAN set `lizardMode` — it is validated and
+stored like any other field, never rejected at manifest load. An explicit
+`true` reaches `SpawnSpec.lizardMode` and, via `agentLaunchConfig`'s Codex
+branch (`src/agents/argv.ts`), drops `--dangerously-bypass-approvals-and-sandbox`
+from the launch argv so drovr's Codex approval-answering (its own
+Codex-specific dialog recognition, not `classifyPermissionPrompt`, which
+stays Claude-only) has a dialog to see and answer. See the "Codex
+eligibility for SCANNING vs. LAUNCH" table above for the full
+absent/`true`/`false` matrix, which differs from `permissionMode`'s
+Claude-only default specifically because Codex's own launch condition is
+explicit-`true`-only, not "absent means eligible".
 
 ## Not in this version
 

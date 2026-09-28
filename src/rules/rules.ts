@@ -288,9 +288,9 @@ export interface Rule {
   linkedEventing?: boolean;
   /** Poll cadence (milliseconds) for the non-Jira link pollers (Confluence/GitHub/webpage) stories 2/3 add. Reserved: typed and validated here, consulted by no code in this story. */
   linkedPollIntervalMs?: number;
-  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. */
+  /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedItems`; an explicit value here always wins over that default, in both directions. */
   maxLinkedItems?: number;
-  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. Reserved: typed and validated here, consulted by no code in this story. */
+  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (2) via `effectiveMaxLinkedTurnsPerHour`; an explicit value here always wins over that default, in both directions. */
   maxLinkedTurnsPerHour?: number;
   /**
    * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's
@@ -331,12 +331,13 @@ export interface Rule {
    * (FACTORY-43) already reads `spec.permissionMode` generically for every
    * provider, not just managed sessions, so no new wiring is needed there —
    * only threading this field into each builder's own `SpawnSpec` output.
-   * Absent means today's behaviour exactly: no flag is sent, so Drovr's own
-   * default (`bypassPermissions`, `agentLaunchConfig`, src/agents/argv.ts)
-   * applies unchanged — INCLUDING for a `jira-project` rule, whose own
+   * Absent means butchr's own default applies: `acceptEdits`
+   * (`DEFAULT_PERMISSION_MODE`, `agentLaunchConfig`, src/agents/argv.ts,
+   * since FACTORY-138 — previously Drovr's own `bypassPermissions` fallback
+   * applied instead) — INCLUDING for a `jira-project` rule, whose own
    * unconditional `permissionMode: "auto"` default there is set BEFORE
-   * `spec.permissionMode`'s spread and so is overridden by this field only
-   * when present. See `lizardMode` immediately below: the two fields are
+   * `spec.permissionMode`'s spread (but AFTER butchr's own default) and so
+   * is overridden by this field only when present. See `lizardMode` immediately below: the two fields are
    * independent (either may be set without the other), but pairing this with
    * `"default"` and `lizardMode: true` is the combination FACTORY-76 exists
    * for. See `RULE_PERMISSION_MODES`'s own doc comment for why there is no
@@ -354,29 +355,57 @@ export interface Rule {
    * exactly which option each presses and how it is logged, deliberately not
    * restated here since that is drovr's own answering policy, not this
    * field's concern (and is a moving target — FACTORY-93/FACTORY-67/
-   * FACTORY-108) — so a rule kept in `permissionMode: "default"` (Claude), or
-   * whose Codex fallback launches in manual-approval mode (FACTORY-108, see
-   * `SpawnSpec.lizardMode`), is never left frozen on that dialog for hours.
-   * Absent/false means today's behaviour exactly: this rule's panes are
-   * never scanned or touched by that timer, matching every rule that does
-   * not set this field. The timer's own eligibility gate is resolved live
-   * from the loaded `rules` list (`ruleLizardModeOf`, an exported pure
-   * function in `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts`
-   * just binds it to its own live state) regardless of vendor — that part is
-   * unchanged by FACTORY-108 and has no stale-argv concern of its own.
+   * FACTORY-108/FACTORY-138) — originally built so a rule kept in
+   * `permissionMode: "default"` was never left frozen on that dialog for
+   * hours. FACTORY-138 (operator decision, FACTORY-67 director comment
+   * 2026-09-26 22:24Z): butchr's own launch default is now `permissionMode:
+   * "acceptEdits"` + this field eligible together — an accept-edits agent
+   * still gets Bash/MCP tool-permission prompts, so it needs the same
+   * unattended-clearing this field always provided for manual mode. Absent
+   * now means ELIGIBLE FOR SCANNING (a rule that IS found and never sets this
+   * field is scanned/touched by that timer, regardless of vendor); only an
+   * EXPLICIT `false` opts a rule's panes out of scanning — that
+   * absent-vs-false distinction is unchanged, only which one means "on" has
+   * flipped. The timer's own scanning-eligibility gate is resolved live from
+   * the loaded `rules` list (`ruleLizardModeOf`, an exported pure function in
+   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
+   * it to its own live state) as `rule.lizardMode !== false`, regardless of
+   * vendor — unchanged by FACTORY-108.
    *
-   * FACTORY-108: UNLIKE `permissionMode` above, this field is ALSO forwarded
-   * onto `SpawnSpec.lizardMode` by every `specFor*` builder (the same ones
-   * `permissionMode` threads through) so a Codex-resolved launch
-   * (`agentLaunchConfig`'s Codex branch, src/agents/argv.ts) can read it and
-   * drop `--dangerously-bypass-approvals-and-sandbox` — see
-   * `SpawnSpec.lizardMode`'s own doc comment (src/agents/workspace.ts) for
-   * the full contract, including the FACTORY-43-style persist-at-spawn/
-   * read-back stale-argv pair this now rides generically (nothing
-   * rule-specific was added for it). A Claude- or Agy-resolved launch still
-   * ignores it completely (neither branch of `agentLaunchConfig` reads
-   * `spec.lizardMode`), so the paragraph above remains the whole story for
-   * those two vendors — only a Codex fallback is new territory. See
+   * FACTORY-108: UNLIKE `permissionMode` above, and unlike scanning
+   * eligibility just described, this field is ALSO forwarded onto
+   * `SpawnSpec.lizardMode` by every `specFor*` builder (the same ones
+   * `permissionMode` threads through) — but there ONLY on an EXPLICIT `true`
+   * (`rule.lizardMode ? { lizardMode: true } : {}`), never merely-absent —
+   * so a Codex-resolved launch (`agentLaunchConfig`'s Codex branch,
+   * src/agents/argv.ts) can read it and drop
+   * `--dangerously-bypass-approvals-and-sandbox` only when a rule opted in
+   * explicitly. See `SpawnSpec.lizardMode`'s own doc comment
+   * (src/agents/workspace.ts) for the full contract, including the
+   * FACTORY-43-style persist-at-spawn/read-back stale-argv pair this now
+   * rides generically (nothing rule-specific was added for it). A Claude- or
+   * Agy-resolved launch still ignores it completely (neither branch of
+   * `agentLaunchConfig` reads `spec.lizardMode`), so the scanning-eligibility
+   * paragraph above remains the whole story for those two vendors — only a
+   * Codex fallback is new territory.
+   *
+   * **Deliberate rule-side asymmetry (story decision, FACTORY-106/FACTORY-324):**
+   * a rule-launched Codex agent with `lizardMode` merely ABSENT is "eligible"
+   * for scanning per `ruleLizardModeOf` above, but is still launched WITH the
+   * bypass flag (launch keys on explicit `true` only, per the paragraph
+   * above) — so `autoAnswerCodexApprovals` scans its pane every tick and
+   * finds nothing to press, a harmless no-op, not a functional gap: an agent
+   * launched with the bypass flag never shows the approval dialog this
+   * mechanism answers in the first place. This mirrors
+   * `SessionDefinition.lizardMode`'s own resolution (absent = ineligible for
+   * a `vendor: "codex"` definition, explicit `true` = eligible AND launched
+   * without the bypass flag, explicit `false` = ineligible — see that
+   * field's own doc comment) in outcome for the codex-launch decision, but
+   * NOT in the scanning-eligibility default, which stays `!== false` here
+   * unconditionally rather than gaining a vendor check — changing that
+   * default was judged unnecessary risk (it would silently claim coverage
+   * nobody canaried) for a mismatch that costs nothing beyond one wasted
+   * scan per tick. See
    * `RULE_PERMISSION_MODES`'s own doc comment for why there is no
    * Codex-vendor validation rejection here, unlike `SessionDefinition`'s
    * `strictMcpConfig`.

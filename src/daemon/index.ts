@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -20,6 +20,7 @@ import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, sing
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
@@ -37,6 +38,7 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
@@ -145,6 +147,14 @@ try {
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 
+// FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
+// Jira site as a bare, lower-cased HOST (never the full `https://` URL
+// `config.atlassian.site` is), and its Zendesk subdomain read directly from
+// `ZENDESK_SUBDOMAIN`, the SAME env var `zendesk-ticket.ts` itself reads
+// (never routed through `Config`, matching that module's own convention —
+// see this ticket's own doc for why Zendesk config isn't centralized there).
+const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
+
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
 // an absent file means zero rules (there are no built-in defaults), announced
@@ -207,8 +217,12 @@ const managedSessionResolvedAgents = new Map<string, { model: string; effort?: A
 /**
  * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
  * `managedSessionAccountPolicies` immediately above, one field over: whether
- * an eligible managed-session definition opted into "lizard mode"
- * (`SessionDefinition.lizardMode`). Consulted below by `ruleLizardModeOf`,
+ * an eligible managed-session definition is lizard-mode eligible
+ * (`SessionDefinition.lizardMode` — since FACTORY-138, absent now resolves
+ * eligible for a `vendor: "claude"` definition; see that field's own doc
+ * comment and the fill site, `ManagedSessionResourceDeps.lizardModes`,
+ * src/rules/session-definition-type.ts, for the full default and its
+ * Codex carve-out). Consulted below by `ruleLizardModeOf`,
  * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
  * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
  * comment (src/rules/session-definition-type.ts) for why this is
@@ -761,7 +775,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -779,6 +793,7 @@ const { app, mcp } = buildApp({
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((r) => r.id === rule.id)) return githubPrStaffingResult.reason;
         if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
         return null;
       },
@@ -802,6 +817,13 @@ const { app, mcp } = buildApp({
   resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
     ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
     : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  // FACTORY-339: NO I/O here, same discipline as `dashboard` above —
+  // `dashboardFeed.snapshot()` is the SAME already-polled staffed-agent
+  // registry `/dashboard` itself serves, never a second poll or a live
+  // per-request query (see `../resources/resource-lookup.ts`'s own header
+  // for why re-running each rule's query here would be wrong).
+  resourcesForUrl: async (url) => buildResourcesForUrlResponse(url, resourceLookupDeps, dashboardFeed.snapshot().rows),
+  extensionAuth: config.extensionAuth,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -876,9 +898,14 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
  * `speakOnOwnChannel`/`ops.addComment` would otherwise post a doomed Jira
  * write against — a real escalation silently lost for exactly the
  * long-lived (persistent/singleton) agents this ticket exists to support.
- * `resourceOfCwd` itself is UNCHANGED and still used for the dashboard/
- * label-sync status map, where the bogus fallback is a harmless, never-
- * looked-up orphan entry, not a write.
+ * `resourceOfCwd` itself is UNCHANGED and still used for the label-sync
+ * status map (`statusMapFromAgents`, which needs the BARE key to match a
+ * Jira search's own issue keys). FACTORY-407: the dashboard no longer goes
+ * through `resourceOfCwd` at all — `agentStatusesFeedingDashboard` below
+ * feeds `buildDashboardRows` the FULL owned key (`ownedAgentOfCwd` itself,
+ * undiscarded) via a separate `agent_key` field, because `resourceOfCwd`'s
+ * bare fallback is exactly what made every real `AgentDashboardRow.resourceKey`
+ * undecodable — see that ticket for the full history.
  */
 const escalationTargetOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
@@ -932,7 +959,12 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
-      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })) };
+      // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
+      // own correlation identifier (`buildDashboardRows`); `resource_key`
+      // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
+      // `statusMapFromAgents` below already needs. One `ownedAgentOfCwd` call
+      // per agent either way — `resourceOfCwd` already makes its own.
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: ownedAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
@@ -1722,6 +1754,34 @@ const blockingEscalationTimer = setInterval(() => {
 }, 5_000);
 blockingEscalationTimer.unref?.();
 
+// FACTORY-363/FACTORY-397: drovr's SEPARATE login-expired watcher
+// (`createLoginExpiredWatcher`, `@brooswit/drovr` >= 0.16.3,
+// src/agents/login-expired-alert.ts) — its OWN independent poll loop, own
+// timer, own read of the fleet, deliberately NOT sharing
+// `blockingEscalationTimer` above: that timer feeds ONLY
+// `escalator.onDrovrUnknownDialog`, whose managed-session-only routing is
+// exactly the trap this condition must not inherit (a keyed pane — both real
+// incidents, FACTORY-314/w1T and FACTORY-324/w1V — resolves `managedSessionOf`
+// to null there and would be silently dropped). This tracker has no
+// managed-session concept at all: every pane drovr reports reaches the
+// host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
+// the full design and why its delivery (a journal line + a `/health` sibling
+// field, both below) survives a dead Claude credential.
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+const loginExpiredWatcher = createLoginExpiredWatcher({
+  onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
+  onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
+});
+let loginExpiredPollInFlight = false;
+const loginExpiredTimer = setInterval(() => {
+  if (loginExpiredPollInFlight) return;
+  loginExpiredPollInFlight = true;
+  loginExpiredWatcher.poll(herdr)
+    .catch((e) => console.error(`  [login-expired] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { loginExpiredPollInFlight = false; });
+}, 5_000);
+loginExpiredTimer.unref?.();
+
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by
 // FACTORY-67's director before merge; see that ticket if this looks
@@ -1739,13 +1799,18 @@ blockingEscalationTimer.unref?.();
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
 // only when its cwd resolves to SOME rule-engine agent id (managed session or
-// rule-launched alike) AND `ruleLizardModeOf` says that id's own lizard-mode
-// opt-in (`managedSessionLizardModes`'s live poll for a managed session,
-// `Rule.lizardMode` for everything else — FACTORY-87) is `true`. Everything
-// else — a legacy/bare-issue agent, a managed session or rule that never set
-// the field, a managed session not yet observed this daemon's lifetime —
-// resolves `false` and is never touched, matching `lizardMode`'s own "absent
-// means today's behaviour exactly" contract. The label itself (basename of
+// rule-launched alike) AND `ruleLizardModeOf` says that id is eligible
+// (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87). FACTORY-138 (operator
+// decision, FACTORY-67 director comment 2026-09-26 22:24Z): a managed
+// session (vendor "claude") or rule that never sets the field is now
+// eligible BY DEFAULT — only an explicit `lizardMode: false` resolves
+// `false`. A legacy/bare-issue agent, a managed session not yet observed
+// this daemon's lifetime, or a `vendor: "codex"` managed session (which
+// cannot set this field at all) still resolves `false` and is never
+// touched — see `ruleLizardModeOf`'s own doc comment
+// (src/agents/permission-answer-loop.ts) for the full breakdown of which
+// cases the new default does and does not reach. The label itself (basename of
 // the resource id, e.g. the definition file or the Jira/GitHub/filesystem
 // resource) is what lets a log line name WHICH AGENT got a prompt answered
 // (FACTORY-67's own requirement), not just an opaque pane id.

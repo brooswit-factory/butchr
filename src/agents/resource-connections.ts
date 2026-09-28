@@ -1,11 +1,11 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InboxRelay, startMcpChannelProxy, mcpServersFromMcpJson, CHANNEL_NOTIFICATION,
   inboxMessageFromNotification, type ChannelSourceOptions } from '@brooswit/drovr-events';
-import { workspaceDirFor, resourceOfSpec, type SpawnSpec } from './workspace.js';
+import { ensureWorkspaceDir, resourceOfSpec, type SpawnSpec } from './workspace.js';
 import type { Herd } from './herd.js';
 
 type Proxy = Awaited<ReturnType<typeof startMcpChannelProxy>>;
@@ -27,7 +27,21 @@ export class ResourceConnections {
     const raw=JSON.parse(await readFile(file,'utf8'));
     const definitions=mcpServersFromMcpJson(raw);
     if (!raw.mcpServers || !Object.keys(definitions).length) throw new Error(`No MCP servers in ${file}`);
-    const dir=workspaceDirFor(spec.key);await mkdir(dir,{recursive:true});
+    // FACTORY-118: `ensureWorkspaceDir`, not a bare `workspaceDirFor` + our
+    // own `mkdir` — `prepare()` runs BEFORE `HerdrHerd.spawn()`'s own
+    // `buildWorkspace()` call (see jira-project-type.ts's `deps.prepare`
+    // wiring, which augments `m.spec` ahead of the actual spawn), so this is
+    // the FIRST claim of this key's directory for a brand-new agent. A bare
+    // `workspaceDirFor` here would compute a fresh short-name directory,
+    // create it unstamped, and then `buildWorkspace()`'s own later
+    // `ensureWorkspaceDir()` call would see that name already occupied
+    // (by this very directory, just unstamped) and hand back the DIFFERENT
+    // collision-suffixed name instead — stranding the `.butchr-mcp-*.token`
+    // files this function writes below in a directory the agent's own
+    // workspace never ends up at. See `ensureWorkspaceDir`'s own doc comment
+    // (src/agents/workspace.ts) for why centralizing the claim here is what
+    // keeps every caller agreeing on one directory for one key.
+    const dir=ensureWorkspaceDir(spec.key);
     const servers:NonNullable<SpawnSpec['externalMcpServers']>=[];
     const created:string[]=[];
     try {

@@ -389,10 +389,13 @@ describe("createManagedSessionResourceType", () => {
     expect(resolvedAgents.has(keyPower)).toBe(false);
   });
 
-  test("DROVR-42/FACTORY-67: `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key, defaulting to false when absent — a frozen/removed definition's entry does not linger", async () => {
+  test("FACTORY-138/FACTORY-108/FACTORY-106 (DROVR-42/FACTORY-67 lineage): `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key — a vendor:claude definition defaults to ELIGIBLE (true) when absent (only explicit false opts out); a vendor:codex definition defaults to NOT eligible (false) when absent (the opposite default, a deliberate story decision — codex CAN set the field, unlike the claude default flip, but its own launch only drops the bypass flag on an explicit true, so default-eligible would only add a scan that can never find anything to press) — only an explicit true resolves eligible for codex, and explicit false stays not-eligible same as absent; a frozen/removed definition's entry does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: true, permissionMode: "default" })),
-      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent — defaults to false
+      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: false, permissionMode: "default" })),
+      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — defaults to true
+      "/defs/c.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: undefined })), // lizardMode absent, vendor codex — stays false
+      "/defs/d.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: true })), // lizardMode explicit true, vendor codex — eligible
+      "/defs/e.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: false })), // lizardMode explicit false, vendor codex — stays not-eligible, same outcome as absent
     };
     const { list } = fakeFiles(files);
     const rule = builtinManagedSessionsRule("/defs");
@@ -400,13 +403,19 @@ describe("createManagedSessionResourceType", () => {
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, lizardModes });
     const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
     const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
+    const keyD = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/d.json" });
+    const keyE = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/e.json" });
     await type.discovery.search();
-    expect(lizardModes.get(keyA)).toBe(true);
-    expect(lizardModes.get(keyB)).toBe(false);
+    expect(lizardModes.get(keyA)).toBe(false);
+    expect(lizardModes.get(keyB)).toBe(true);
+    expect(lizardModes.get(keyC)).toBe(false);
+    expect(lizardModes.get(keyD)).toBe(true);
+    expect(lizardModes.get(keyE)).toBe(false);
     // b.json goes frozen (still valid, but ineligible) — its entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })) };
+    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })), "/defs/c.json": files["/defs/c.json"]!, "/defs/d.json": files["/defs/d.json"]!, "/defs/e.json": files["/defs/e.json"]! };
     await type.discovery.search();
-    expect(lizardModes.get(keyA)).toBe(true);
+    expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.has(keyB)).toBe(false);
   });
 

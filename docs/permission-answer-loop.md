@@ -1,5 +1,14 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-145: every `answered:` journal line and audit record now carries
+> a `trigger` (`"fast"` or `"sweep"`), plus a `latencyMs` number when
+> `trigger` is `"fast"`.** See "Fast-path latency (FACTORY-145)" further down
+> for the exact field shapes and how to compute p50/p95 from the audit file.
+> `latencyMs` is a lower bound on the operator-visible wait (it excludes
+> whatever time herdr itself took to notice the pane went blocked and get a
+> frame to butchr, plus ordinary network/socket delay before receipt) and is
+> never emitted for a sweep-triggered answer, whose true wait is unknowable.
+
 > **FACTORY-98 (FACTORY-97): a lizard-eligible pane is now usually answered
 > within about a second, not up to 20s.** The daemon opens a herdr push
 > subscription (`pane.agent_status_changed`) filtered to exactly the
@@ -7,10 +16,8 @@
 > transition. The 20s scan below is unchanged and still runs as a fallback —
 > see "Event-driven: the fast path (FACTORY-98)" further down for what
 > changed, why it still needs the scan at all, and what stayed a scan-only
-> path (CPU sanity, respawn-loop safety). Text above and below that section
-> describing "the" 20s timer as the only mechanism predates this change but
-> is otherwise still accurate: the scan itself, its opt-in gate, its cadence,
-> and its audit/journal behavior are all unchanged.
+> path (CPU sanity, respawn-loop safety). The scan itself, its opt-in gate,
+> its cadence, and its audit/journal behavior are unchanged.
 
 > **FACTORY-93 (drovr >= 0.15.1): the loop now calls `autoAnswerPermissions`
 > with `scope: "once"` — it presses option 1 "Yes" (allow once), never the
@@ -19,29 +26,32 @@
 > project" and was silently skipped, freezing the codey canary. No stored
 > allow rules are written any more. Every skipped pane is now logged
 > (`[permission-answer] <label> (<pane>) SKIPPED, left for a human: <reason>`),
-> once per pane+reason. Text below describing the "always allow" option
-> predates this change.
+> once per pane+reason.
 
 ## What it is
 
-DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs? })`
+DROVR-37 shipped `autoAnswerPermissions(client, { auditPath, operator?, readTimeoutMs?, scope? })`
 in `@brooswit/drovr` (>= 0.15.0): an unattended pass that scans every Claude
 pane for a pending tool-permission dialog ("Do you want to proceed?") and
-presses the "Yes, and always allow … from this project" stored-rule option
-only when it is unambiguously that option — auditing every attempt. DROVR-41
-proved it live against a real herdr pane and recommended wiring it into
-butchr's own daemon.
+presses an option on it, only when it is unambiguously the right one —
+auditing every attempt. As wired here (FACTORY-93, drovr >= 0.15.1) it always
+calls with `scope: "once"`, pressing plain "Yes" (allow once) and never the
+"Yes, and always allow … from this project" stored-rule option; no stored
+rule is ever written. DROVR-41 proved the mechanism live against a real
+herdr pane and recommended wiring it into butchr's own daemon.
 
 That recommendation (DROVR-42) was originally scoped as a blanket sweep over
 every Claude pane. Before it merged, FACTORY-67's director narrowed the ask:
 the operator wants this as an **explicit, per-agent opt-in** — `lizardMode: true`
 on a managed-session definition (`SessionDefinition`, `src/resources/session-definition.ts`)
-— named "lizard mode" for the combination the field exists for: `permissionMode: "default"`
-(Claude's manual/ask mode, prompting before every tool call) plus this field,
-so an agent gets manual mode's own safety for every OTHER decision while
-never sitting frozen on the ONE dialog drovr already knows how to answer
-unambiguously. A definition that doesn't set the field behaves exactly as
-before — nothing here is a blanket sweep.
+— named "lizard mode". It is a SEPARATE toggle from `permissionMode`, not
+tied to any one value of it: it pairs with any `permissionMode` that still
+prompts before a tool call (manual/`"default"` included, but also, e.g.,
+`"acceptEdits"`, which auto-accepts file edits but still prompts for Bash and
+MCP tool calls), so an agent gets that mode's own safety for every prompt it
+still shows while never sitting frozen on the ONE dialog drovr already knows
+how to answer unambiguously. A definition that doesn't set the field behaves
+exactly as before — nothing here is a blanket sweep.
 
 `src/agents/permission-answer-loop.ts` is the daemon-side wiring:
 `startPermissionAnswerLoop` wraps `autoAnswerPermissions` on its own
@@ -149,15 +159,38 @@ recomputed "expected" argv that still assumes the bypass flag, respawn-looping
 it forever, the exact bug FACTORY-43 closed for the other two fields.
 
 **Explicit only — never a resolved/defaulted value — and why that matters.**
-A sibling story, FACTORY-127, makes `lizardMode` default to `true` where it
-is resolved for ELIGIBILITY (the `eligiblePanes` gate above), and promises
-that default flip never reaches argv or respawns anything. Reading the raw
-field, not the resolved one, at Codex launch-config time is what keeps that
-promise true here too: if the launch decision instead keyed off the
-resolved/defaulted value, FACTORY-127's rollout would silently drop the
-bypass flag from every running Codex agent at once, with no canary. The
-launch-flag decision lives in one small function in `src/agents/argv.ts`
-carrying this reasoning as its own comment.
+FACTORY-127 (shipped with FACTORY-138) made `lizardMode` default to `true`
+where it is resolved for ELIGIBILITY (the `eligiblePanes` gate above) for a
+`vendor: "claude"` managed-session definition, and promises that default
+flip never reaches argv or respawns anything. Reading the raw field, not the
+resolved one, at Codex launch-config time is what keeps a parallel promise
+true for Codex: if the launch decision instead keyed off a resolved/defaulted
+eligibility value, a default flip (present or future, for either vendor)
+could silently drop the bypass flag from every running Codex agent at once,
+with no canary. The launch-flag decision lives in one small function in
+`src/agents/argv.ts` carrying this reasoning as its own comment.
+
+**Codex's own ELIGIBILITY default stayed `false` — a deliberate, separate
+decision (FACTORY-106/FACTORY-324), not an oversight inherited from
+FACTORY-127.** FACTORY-127/FACTORY-138's default-eligible flip is scoped to
+`vendor: "claude"` only: a `vendor: "codex"` managed-session definition that
+never sets `lizardMode` resolves NOT eligible for scanning
+(`m.definition.lizardMode ?? (m.definition.vendor === "claude")`,
+`src/rules/session-definition-type.ts`) — only an explicit `true` makes it
+eligible, and that same explicit `true` is also what the paragraph above
+requires for the LAUNCH to drop the bypass flag, so eligible-for-scanning and
+capable-of-showing-a-dialog move together for Codex, by construction. Making
+Codex default-eligible too (mirroring Claude) would have decoupled them: a
+newly-eligible-by-default Codex pane would be scanned every tick for a dialog
+its still-bypassed launch can never show — a harmless no-op, but one that
+silently claims coverage nobody canaried, which is exactly the failure shape
+this whole epic exists to avoid elsewhere. See `docs/managed-sessions.md`'s
+"Codex eligibility for SCANNING vs. LAUNCH" table for the full three-case
+breakdown, including the deliberate, documented asymmetry on the
+`Rule.lizardMode` (non-managed-session) path, which resolves scanning
+eligibility as `!== false` (absent IS eligible) regardless of vendor and was
+left unchanged — see `Rule.lizardMode`'s own doc comment
+(`src/rules/rules.ts`) for why.
 
 **Fixture coupling — "no `-a`/`-s` flags" is deliberate, not an oversight.**
 drovr's Codex prompt recognition was captured against codex-cli 0.145.0
@@ -215,6 +248,25 @@ an approval dialog was not verified for this ticket (unlike Claude, where
 FACTORY-98 established it live) — until it is, treat Codex as answered by
 the 20s sweep, not the ~1s event path, even though the code path is shared.
 
+**`trigger`/`latencyMs` (FACTORY-145) are Claude-only — a Codex answer gets
+neither field.** `runPermissionAnswerTick` only consumes `fastPathTriggers`
+and computes an elapsed-ms latency for panes in the Claude-shaped `results`
+array; the Codex loop (`codexAnswered`/`codexFailed`/`codexUnrecognised`)
+never reads `fastPathTriggers` and never appends the trailing
+`.permission-audit.jsonl` latency record described above, so a Codex pane's
+own `[permission-answer] … answered (codex): …` journal line carries no
+`, fast, …ms`/`, sweep` suffix and its audit trail is exactly whatever
+`autoAnswerCodexApprovals` itself writes (`vendor: "codex"`, no `trigger` or
+`latencyMs` key). Deliberate, not an oversight: FACTORY-145 measured Claude's
+own `pane.agent_status_changed` push path (FACTORY-98) specifically; whether
+herdr's push frame is even a reliable "blocked" signal for a Codex pane is
+the open question the paragraph above already flags as unverified, so wiring
+a latency computation on top of an unverified trigger would produce a number
+that looks precise and is not. A p50/p95 computed from the audit file (see
+"Computing p50/p95 from the audit file" below) is therefore Claude-only by
+construction — every row it can select has `vendor` absent (Claude) never
+`"codex"`.
+
 `Rule.permissionMode` (FACTORY-87) is the opposite case, and needed no new
 persist/read-back logic at all: `buildWorkspace()`/`staleIssues()`'s pair
 above already reads/writes `spec.permissionMode` generically, for any spawn —
@@ -231,7 +283,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s | only `lizardMode: true` panes | the tool-permission "always allow" dialog only, via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only `lizardMode: true` panes | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall
@@ -364,6 +416,95 @@ restart could see as stale. A `stop()`/restart of the watch simply closes
 whatever subscription is open and re-derives everything from the next
 `agent.list()` call, same as the scan-only version always did.
 
+## Fast-path latency (FACTORY-145)
+
+FACTORY-98 made a lizard-eligible pane usually get answered within about a
+second, but the `answered:` journal line only recorded that an answer
+happened, with the journal's own 1s timestamp resolution — no number a p50/p95
+could be computed from. FACTORY-145 adds one.
+
+**What's measured, and from where.** `permission-answer-watch.ts` records a
+monotonic instant (`deps.now`, default `performance.now`, never wall-clock —
+wall-clock can step backward or forward under NTP adjustment, corrupting an
+elapsed-time subtraction) the moment a pane's own `pane.agent_status_changed`
+push frame reports `blocked` (`fastPathTriggers: Map<paneId, instant>`).
+`runPermissionAnswerTick` (`permission-answer-loop.ts`) consumes that instant
+(reads it, then deletes it) for every pane it scans this tick, whether or not
+the pane ends up answered — a `skipped`/`failed` outcome must not leave a
+stale trigger instant behind for a later tick to (wrongly) measure against.
+For a pane that ends up `answered`, the elapsed time from that trigger
+instant to "this tick pressed its prompt" is `latencyMs`.
+
+**This is a lower bound on the operator-visible wait, not the whole of it.**
+The push frame's own shape (`{ pane_id, agent_status }`, no timestamp —
+checked against `@brooswit/herdr-sdk`'s own generated
+`PaneAgentStatusChangedEvent` type, which carries none) never tells butchr
+when herdr itself observed the pane go blocked, only when butchr received the
+frame reporting it. So `latencyMs` excludes whatever time herdr took to
+notice the transition and get a frame to butchr, plus ordinary network/socket
+delay ahead of receipt. Name it "latency from frame receipt", not "latency
+from the pane going blocked", if you write about it elsewhere.
+
+**Sweep-triggered answers carry no latency number at all — never a fabricated
+one.** A pane the sweep's own `agent.list()` scan discovers (no fast-path
+frame ever recorded for it — herdr's push connection was down, or the pane
+became eligible too recently to be subscribed yet, see "A newly-eligible
+pane's first tick is still scan-driven" above) may have been sitting blocked
+anywhere from 0 to one whole sweep interval before the scan happened to look.
+"Now minus when the sweep looked" is not a latency, it is an artefact that
+LOOKS like one and would silently drag a computed p95 downward. Such an
+answer's `trigger` is `"sweep"` and it carries no `latencyMs` field at all
+(never `latencyMs: null` — the field itself is entirely absent, so any reader
+that filters on the field being present rather than merely truthy still gets
+the right answer).
+
+**Field shapes**, both on the `[permission-answer] … answered: …` journal
+line (as a trailing `, fast, 247ms` or `, sweep` suffix) and on the
+`.permission-audit.jsonl` record appended right after drovr's own two
+records (`approving`/`approved`) for that pane's attempt:
+
+| field | present | type | meaning |
+| --- | --- | --- | --- |
+| `trigger` | always | `"fast" \| "sweep"` | which path caused this pane to be looked at THIS tick |
+| `latencyMs` | only when `trigger === "fast"` | number (ms, rounded, >= 0) | elapsed time from frame receipt to this tick pressing the prompt |
+
+The rest of the appended record (`ts`, `paneId`, `label`, `tool`, `request`)
+mirrors the journal line's own fields, so `jq` can filter and join on them
+without cross-referencing drovr's own `approving`/`approved` records for the
+same attempt.
+
+**Logging never risks or delays an answer.** The audit append happens AFTER
+`autoAnswerPermissions` has already returned its outcome for the pane — a
+failing `appendAudit` (disk full, permission denied) is caught and logged
+(`latency audit write failed for <pane>: <detail>`), never thrown, and never
+prevents or retries the answer itself, which has already happened by the time
+this write is attempted.
+
+### Computing p50/p95 from the audit file
+
+Every fast-path answer's own latency record is a single JSONL line with
+`trigger: "fast"` and a numeric `latencyMs` — filter on both (not just the
+field's presence) so a future record shape with `latencyMs: null` for some
+other reason can't sneak into the computation:
+
+```sh
+jq -s '
+  [ .[] | select(.trigger == "fast" and (.latencyMs | type == "number")) | .latencyMs ]
+  | sort
+  | . as $s
+  | { n: length,
+      p50: $s[(length * 0.50 | floor)],
+      p95: $s[(length * 0.95 | floor)] }
+' .permission-audit.jsonl
+```
+
+A `trigger: "sweep"` record has no `latencyMs` at all, so `.latencyMs | type
+== "number"` alone already excludes it — the explicit `trigger == "fast"`
+check is belt-and-suspenders documentation of intent, not load-bearing on its
+own, but keep both: a filter that only checks `.latencyMs` existing would
+misread a future field with a different meaning if one is ever added under
+the same name.
+
 ## The audit log
 
 `Config.permissionAuditPath` (`src/config/config.ts`): a JSONL file, default
@@ -376,26 +517,36 @@ distinct file.
 Every `approvePermission` attempt appends an `approving` record before any
 key is sent, and a second record with the outcome after — see
 `approvePermission`'s own doc comment (`@brooswit/drovr`). Every record
-carries `operator` and (on an `approved` outcome) the exact stored-rule
-`option` text that was pressed. This daemon's wiring passes
-`operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
+carries `operator` and, once a prompt's option was resolved, the exact
+`option` text that was pressed — always "Yes" (allow once) as this daemon
+calls it (`scope: "once"`), never a stored-rule option. This daemon's wiring
+passes `operator: "butchr-daemon"` (drovr's own default is `"drovr-auto"`) so a
 shared audit file, or a human comparing hosts, can tell butchr's own
 unattended pass apart from any other caller.
+
+**A third record follows drovr's own two, for every answered pane
+(FACTORY-145):** `runPermissionAnswerTick` itself appends one more JSONL line
+to the SAME `auditPath` right after drovr's `approving`/`approved` pair —
+this module owns that write, not drovr, since drovr's own `approvePermission`
+has no way to accept extra fields to fold into its own records. See "Fast-path
+latency (FACTORY-145)" above for its exact shape. A reader that assumed
+exactly two records per answered attempt (drovr's own historical contract)
+now sees three; nothing about drovr's own two records changed.
 
 ## Seeing recent auto-answers (FACTORY-67: mandatory, not optional)
 
 The daemon's own journal names WHICH AGENT and WHICH TOOL for every
 answer/failure, not just an opaque pane id: `[permission-answer] <definition
 file> (<pane id>) answered: <tool> — "<request excerpt>" (see <auditPath>
-for the exact stored-rule text)`, plus a per-tick summary line
+for the exact option text)`, plus a per-tick summary line
 (`N answered, M skipped, K failed`) whenever a tick answers or fails
 anything (an all-skipped or empty tick logs nothing, to keep the console
-quiet in normal operation). The exact "always allow" rule text pressed is
-not returned by `autoAnswerPermissions` itself — recovering it without
-re-parsing the pane's screen a second time (which this module deliberately
-never does; dialog recognition is drovr's job, not butchr's, per
-FACTORY-49/FACTORY-67) means pointing at the audit log's own `option` field
-for that literal text, which the journal line does.
+quiet in normal operation). The exact option text pressed — always "Yes"
+today — is not returned by `autoAnswerPermissions` itself — recovering it
+without re-parsing the pane's screen a second time (which this module
+deliberately never does; dialog recognition is drovr's job, not butchr's,
+per FACTORY-49/FACTORY-67) means pointing at the audit log's own `option`
+field for that literal text, which the journal line does.
 
 `tail -f <permissionAuditPath>` (or `grep`) gets the full per-attempt detail
 (promptId, scope, the exact option text, both the `approving` and `approved`/

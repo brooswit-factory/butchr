@@ -1,11 +1,133 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync } from "node:fs";
+import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
+import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
+
+// FACTORY-118 review round 1: A2/A3/A4/A6 each need a test that PINS the
+// addendum's own claim directly, not just incidentally exercised as a side
+// effect of some other test's setup — reviewed-in gap, fixed here.
+describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug collisions, untrusted stamps", () => {
+  test("Addendum A2: a hostile short id falls back to the legacy encoded leaf, never an unsafe path segment", () => {
+    // Every non-empty, single-char-or-longer, slash-free, NUL-free string at
+    // or under the byte limit is valid — isValidLeaf's own permissive half.
+    expect(isValidLeaf("a")).toBe(true);
+    expect(isValidLeaf(":")).toBe(true);
+    expect(isValidLeaf("#42")).toBe(true);
+    expect(isValidLeaf("日本語")).toBe(true);
+    // Every hostile shape the addendum names, individually pinned — no real
+    // provider is known to produce a NUL or a bare "."/".." short id (their
+    // own resourceId-level validation forbids the inputs that would), but
+    // isValidLeaf's OWN contract does not depend on one existing.
+    expect(isValidLeaf("")).toBe(false);
+    expect(isValidLeaf(".")).toBe(false);
+    expect(isValidLeaf("..")).toBe(false);
+    expect(isValidLeaf("a/b")).toBe(false);
+    expect(isValidLeaf("/")).toBe(false);
+    expect(isValidLeaf("a\0b")).toBe(false);
+    expect(isValidLeaf("a".repeat(MAX_ENCODED_SEGMENT_BYTES))).toBe(true); // exactly at the limit
+    expect(isValidLeaf("a".repeat(MAX_ENCODED_SEGMENT_BYTES + 1))).toBe(false); // one byte over
+
+    // End to end, through a REAL provider that actually produces a hostile
+    // short id: filesystemShortDisplayId("/") returns "/" itself (no
+    // non-empty segments to name) — contains "/", so newLayoutDirFor must
+    // fall back to the legacy percent-encoded leaf, never join() on it raw.
+    // (The over-length case has no known real producer to reach end to end:
+    // every current provider's short id is a substring/transform of its own
+    // resourceId, which `isResourceId` already caps at the same encoded
+    // byte limit before `encodeAgentKey` ever accepts it — the direct
+    // `isValidLeaf` checks above are this shape's own real pin.)
+    const rootLeafKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/" });
+    expect(newLayoutDirFor(rootLeafKey, "/root")).toBe("/root/filesystem/repos/%2F");
+  });
+
+  test("Addendum A3: a leaf, once chosen, is STICKY — unaffected by a colliding key later appearing or disappearing, and survives a fresh process (no in-memory state)", () => {
+    const root = mkdtempSync(join(tmpdir(), "butchr-sticky-"));
+    try {
+      // Two different real paths reducing to the same "<parent>:<name>" short id — the FACTORY-90 collision example.
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/acme/rinth" });
+
+      const firstDirBeforeCollision = ensureWorkspaceDir(first, root);
+      expect(firstDirBeforeCollision.endsWith("/acme:rinth")).toBe(true); // no collision yet — bare name
+
+      const secondDir = ensureWorkspaceDir(second, root);
+      expect(secondDir).not.toBe(firstDirBeforeCollision); // suffixed, not the same directory
+      expect(secondDir.endsWith("/acme:rinth")).toBe(false);
+
+      // The FIRST key's own assignment did not move just because a collision now exists.
+      expect(newLayoutDirFor(first, root)).toBe(firstDirBeforeCollision);
+      expect(ensureWorkspaceDir(first, root)).toBe(firstDirBeforeCollision);
+
+      // Removing the second key's directory (its "disappearance") must not move the first either —
+      // sticky means "chosen once", never "recomputed against whatever currently exists".
+      rmSync(secondDir, { recursive: true, force: true });
+      expect(newLayoutDirFor(first, root)).toBe(firstDirBeforeCollision);
+
+      // "Survives a fresh process": nothing here is in-memory — a brand new
+      // resolution, from nothing but the stamp already on disk, agrees.
+      expect(readBookkeptAgentKey(firstDirBeforeCollision)).toBe(first);
+      expect(newLayoutDirFor(first, root)).toBe(firstDirBeforeCollision);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Addendum A4: two different directory names whose Claude Code memory slugs would COLLIDE are disambiguated, even though the directory names themselves don't collide", () => {
+    const root = mkdtempSync(join(tmpdir(), "butchr-slugcollide-"));
+    try {
+      // Short ids "p:a.b" and "p:a-b" — two DIFFERENT directory names (no
+      // directory-name collision between them at all) that both slug to
+      // "...-p-a-b" (every non-alphanumeric character becomes "-").
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a.b" });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a-b" });
+
+      const firstDir = ensureWorkspaceDir(first, root);
+      expect(firstDir.endsWith("/p:a.b")).toBe(true); // no directory-NAME collision — claimed bare
+
+      const secondDir = ensureWorkspaceDir(second, root);
+      // Would otherwise ALSO claim its own bare "p:a-b" (still no directory-name
+      // collision with "p:a.b") — disambiguated anyway, because its Claude Code
+      // slug collides with the first directory's.
+      expect(secondDir.endsWith("/p:a-b")).toBe(false);
+      expect(secondDir).not.toBe(firstDir);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Addendum A6: an in-directory bookkeeping stamp is a HINT, never an authority — a stamp copied into a foreign directory, or left at the wrong leaf for its own key, is never trusted", () => {
+    const root = mkdtempSync(join(tmpdir(), "butchr-untrusted-stamp-"));
+    try {
+      const realKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
+      const realDir = ensureWorkspaceDir(realKey, root);
+      expect(readBookkeptAgentKey(realDir)).toBe(realKey);
+      expect(agentIdOfWorkspacePath(realDir, root)).toBe(realKey);
+
+      // Copy the real stamp into an unrelated, foreign directory under the SAME rule.
+      const foreignDir = join(root, "filesystem", "repos", "totally-unrelated-name");
+      mkdirSync(foreignDir, { recursive: true });
+      writeBookkeptAgentKey(foreignDir, realKey);
+      // The foreign directory must NEVER resolve to the real key via its copied stamp...
+      expect(agentIdOfWorkspacePath(foreignDir, root)).not.toBe(realKey);
+      // ...and the REAL directory must keep resolving correctly — a foreign copy never hijacks it.
+      expect(agentIdOfWorkspacePath(realDir, root)).toBe(realKey);
+
+      // Delete the real stamp: the workspace degrades to unrecognised (never
+      // mis-attributed to another key, never a duplicate spawn) — segment
+      // decode also fails here since the leaf is the short id, not the
+      // legacy percent-encoded form.
+      unlinkSync(join(realDir, ".butchr-agent-key.json"));
+      expect(agentIdOfWorkspacePath(realDir, root)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {

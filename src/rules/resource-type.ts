@@ -23,7 +23,7 @@ import { jiraIssueClass } from "../resources/jira-idea.js";
 import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discovery.js";
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
-import { createLinkedEventingState, type LinkedEventingDeps, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
+import { createLinkedEventingState, effectiveMaxLinkedItems, type LinkedEventingDeps, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -594,7 +594,15 @@ export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIs
  * src/resources/linked-discovery.ts's own top comment) — that parser still
  * exists for a caller that already has that data, but wiring it here would
  * add a second Jira call this story doesn't make. `rule.maxLinkedItems`
- * (absent = uncapped) bounds what gets logged as kept vs. skipped per match.
+ * bounds what gets logged as kept vs. skipped per match — BUTCHR-471: for a
+ * rule with `linkedEventing === true`, this must agree with what `runTick`
+ * ACTUALLY watches, so an absent cap falls back to the same
+ * `effectiveMaxLinkedItems` default `runTick` itself applies, never
+ * "uncapped". For a rule that is NOT opted into `linkedEventing`, this stays
+ * exactly as it always was: `rule.maxLinkedItems` as written (absent means
+ * uncapped) — this discovery log runs unconditionally for every match, opted
+ * in or not, and a non-opted rule's log must not start showing a cap
+ * `runTick` never enforces for it.
  */
 export function logLinkedDiscovery(
   matches: readonly RuleMatch[],
@@ -608,7 +616,8 @@ export function logLinkedDiscovery(
       description: m.issue.description,
       ownKey: m.issue.key,
     });
-    const { kept, skipped } = capLinkedItems(items, m.rule.maxLinkedItems);
+    const cap = m.rule.linkedEventing === true ? effectiveMaxLinkedItems(m.rule) : m.rule.maxLinkedItems;
+    const { kept, skipped } = capLinkedItems(items, cap);
     if (!tracker.changed(m.agentKey, kept, skipped)) continue;
     for (const line of formatLinkedDiscoveryLines(m.agentKey, kept, skipped)) log?.(line);
   }

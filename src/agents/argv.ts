@@ -12,6 +12,24 @@ import {
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
 export const KICKOFF_PROMPT = "follow your CLAUDE.md";
+/**
+ * FACTORY-127/FACTORY-138 (operator decision, FACTORY-67 director comment
+ * 2026-09-26 22:24Z): butchr's own default for a Claude launch whose spec
+ * names no `permissionMode` — replacing reliance on Drovr's own
+ * `launch.permissionMode ?? "bypassPermissions"` fallback
+ * (`@brooswit/drovr`'s Claude arg builder). Exported so tests and any future
+ * doc reference exactly one value rather than a repeated literal. Applied
+ * ONLY inside `agentLaunchConfig` below — see that function's own doc
+ * comment for why nowhere else is the right place. `acceptEdits` auto-
+ * accepts file edits only; Bash/MCP tool-permission prompts still fire,
+ * which is why this default NEVER ships without `lizardMode` also
+ * defaulting to eligible (see `ruleLizardModeOf`,
+ * src/agents/permission-answer-loop.ts, and the managed-session
+ * `lizardModes` map fill, src/rules/session-definition-type.ts) — the
+ * DROVR-37 freeze incident is what an accept-edits agent with no lizard
+ * coverage looks like.
+ */
+export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;
 export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string }
 
@@ -184,7 +202,13 @@ export function agentLaunchConfig(
 
   return {
     provider: "claude",
-    ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" ? {permissionMode:"auto"}: {}),
+    // FACTORY-138: butchr's own default; an explicit spec.permissionMode
+    // further down still wins over it — see DEFAULT_PERMISSION_MODE's own
+    // doc comment for why this is the one place the default belongs.
+    // FACTORY-129: the jira-project-only "auto" override that used to sit
+    // here is gone — jira-project agents now inherit this default (and
+    // lizard-mode eligibility) exactly like every other rule kind.
+    permissionMode: DEFAULT_PERMISSION_MODE,
     name,
     paneId,
     cwd: dir,

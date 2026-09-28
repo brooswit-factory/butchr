@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnArgs, checkArgv, codexMcpServerNames, inventoryCodexMcp, type AgentProvider } from "../../src/agents/argv.js";
@@ -79,7 +79,17 @@ describe("provider selection", () => {
     expect(await herd.nudge("TEST-1", "fixture update")).toEqual({ delivered: true });
     for (let i = 0; i < 2; i++) await expect(herd.spawn(spec)).rejects.toThrow("new Codex spawns disabled");
     expect(creates).toBe(0);
-    expect(existsSync(join(root, spec.key))).toBe(false);
+    // FACTORY-118: `HerdrHerd.lifecycle()` now claims (creates) a key's
+    // workspace directory eagerly, via `ensureWorkspaceDir`, the INSTANT
+    // any spawn attempt references it — before the provider-availability
+    // check inside `.start()` gets a chance to refuse — closing a real
+    // two-different-colliding-keys race (see `lifecycle()`'s own doc
+    // comment, src/agents/herd.ts). A refused spawn can therefore leave an
+    // empty claim behind; what actually matters here is that no CONTENT
+    // (a stamp, CLAUDE.md, brief.md — anything `buildWorkspace` would have
+    // written for a real spawn) was ever written into it.
+    const dir = join(root, spec.key);
+    if (existsSync(dir)) expect(readdirSync(dir)).toEqual([]);
     expect(probes).toBe(1);
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain("restart Butchr");

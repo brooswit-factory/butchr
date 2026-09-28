@@ -122,8 +122,17 @@ export function managedSessionShortDisplayId(resourceId: string): string {
  * carries `linkedEventing: true` — there is no separate boolean to plumb
  * through, and every OTHER linked-eventing knob (`maxLinkedItems`,
  * `maxLinkedTurnsPerHour`, `linkedRemoteLinks`, `linkedDescriptionLinks`) is
- * left absent, the same "absent means uncapped/off" default an unconfigured
- * `jira-project` rule already has. `resourceProvider: "filesystem"` (rather
+ * left absent. BUTCHR-471: absent no longer means "uncapped" for the two
+ * cap fields — `runTick` itself (`effectiveMaxLinkedItems`/
+ * `effectiveMaxLinkedTurnsPerHour`, src/jira-watch/linked-eventing.ts) falls
+ * back to a fixed default (2 turns/hour, 25 items) whenever a rule leaves
+ * either absent, THIS rule included, precisely so a managed session cannot
+ * run uncapped either — there is still no per-definition override (a known,
+ * deliberately-deferred gap tracked in FACTORY-78/BUTCHR-471's own
+ * follow-up list), only the shared default. `linkedRemoteLinks`/
+ * `linkedDescriptionLinks` are unaffected by this ticket and still mean
+ * "off" when absent, same as an unconfigured `jira-project` rule.
+ * `resourceProvider: "filesystem"` (rather
  * than "jira-project") is deliberate: this value never names a jira-project
  * RULE — it names the managed-sessions definition file that granted the
  * opt-in — but nothing reads its `resourceProvider`/`query` fields; they
@@ -425,17 +434,39 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
    * definition opted into "lizard mode" (`SessionDefinition.lizardMode`).
    * The permission-answer timer (`src/agents/permission-answer-loop.ts`,
    * wired in `src/daemon/index.ts`) consults this map every tick to decide
-   * which panes it may scan/answer at all — a definition absent from this
-   * map (not yet observed this daemon's lifetime, or simply never setting
-   * the field) is never touched, matching `lizardMode`'s own "absent means
-   * today's behaviour exactly" contract. Deliberately live, not
-   * persisted-at-spawn like `permissionMode`/`strictMcpConfig` (FACTORY-43)
-   * — this field never reaches the launched process's argv, so there is
-   * nothing for a stale-argv check to compare and no respawn-loop risk to
-   * guard against; toggling it in the manifest takes effect on this loop's
-   * very next poll, live, with no agent restart. Optional; omitted, no
-   * lizard-mode information is surfaced (today's behaviour — every caller
-   * before this ticket, and any direct call that does not opt in).
+   * which panes it may scan/answer at all — a definition absent from THIS
+   * MAP (not yet observed this daemon's lifetime — before its first poll
+   * completes) is never touched, the one case this field still can't cover.
+   * FACTORY-138 (operator decision, FACTORY-67 director comment 2026-09-26
+   * 22:24Z): once observed, a `vendor: "claude"` definition that never sets
+   * `lizardMode` at all is now filled in here as ELIGIBLE (see the fill
+   * site immediately below) — only an explicit `false` resolves
+   * not-eligible. This pairs with `agentLaunchConfig`'s own new
+   * `acceptEdits` default (src/agents/argv.ts): an accept-edits agent with
+   * no lizard coverage is exactly the DROVR-37 freeze shape, so the two
+   * ship together. **A `vendor: "codex"` definition CAN set this field
+   * (FACTORY-108) — not rejected at manifest load — but its default is the
+   * OPPOSITE of Claude's**, a story decision (FACTORY-106/FACTORY-324): a
+   * `codex` definition that never sets `lizardMode` resolves not-eligible
+   * here (see the fill site's own `?? (vendor === "claude")`), same as
+   * before FACTORY-108; only an EXPLICIT `true` resolves eligible, and an
+   * explicit `false` stays not-eligible. Reason: unlike Claude, a Codex
+   * agent's launch argv (`agentLaunchConfig`'s Codex branch,
+   * src/agents/argv.ts) only drops the bypass-approvals flag on an
+   * EXPLICIT `true` (see `SessionDefinition.lizardMode`'s own doc comment,
+   * src/resources/session-definition.ts) — a Codex agent launched by
+   * default still carries the bypass flag and so never shows the dialog
+   * this map's consumer answers, making default-on here a scan that could
+   * never find anything, not real coverage. Deliberately live, not
+   * persisted-at-spawn like
+   * `permissionMode`/`strictMcpConfig` (FACTORY-43) — this field never
+   * reaches the launched process's argv, so there is nothing for a
+   * stale-argv check to compare and no respawn-loop risk to guard against;
+   * toggling it in the manifest (or its default changing, as here) takes
+   * effect on this loop's very next poll, live, with no agent restart.
+   * Optional; omitted entirely, no lizard-mode information is surfaced at
+   * all (a caller that opts out of this map completely, not a definition
+   * within it).
    */
   lizardModes?: Map<string, boolean>;
   /**
@@ -507,7 +538,24 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
         latest = matches;
         if (deps.lizardModes) {
           deps.lizardModes.clear();
-          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? false);
+          // FACTORY-138: absent now means eligible for a `vendor: "claude"`
+          // definition (butchr's default is accept-edits + lizard mode
+          // together) — only an EXPLICIT `false` opts one out. FACTORY-108/
+          // FACTORY-106/FACTORY-324 (story decision): a `vendor: "codex"`
+          // definition CAN set this field (not rejected at manifest load —
+          // see `SessionDefinition.lizardMode`'s own doc comment,
+          // src/resources/session-definition.ts), but its default stays the
+          // OPPOSITE of Claude's: absent resolves not-eligible for codex too,
+          // same as before FACTORY-108, only an EXPLICIT `true` resolves
+          // eligible. Reason: a Codex agent's own launch only drops the
+          // bypass-approvals flag on an explicit `true`
+          // (`specForSessionDefinition`, this file, below), so an
+          // absent-but-eligible Codex definition would be scanned every tick
+          // for a dialog its own bypass-mode launch can never show — a
+          // no-op that would silently claim coverage nobody canaried, not
+          // real coverage the way Claude's default-on already is (Claude's
+          // launch always shows the dialog this map's consumer answers).
+          for (const m of matches) deps.lizardModes.set(m.agentKey, m.definition.lizardMode ?? (m.definition.vendor === "claude"));
         }
         return groupExecutionUnits([deps.rule], matches);
       },
