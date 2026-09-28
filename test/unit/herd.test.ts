@@ -969,8 +969,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
       const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
@@ -995,8 +994,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       // The definition has just been edited to lizardMode: true, and the daemon persisted that at the last managed-sessions poll...
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
       // ...but the agent itself is still the one running from BEFORE the edit — still carrying the bypass flag.
@@ -1018,8 +1016,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       // No .butchr-lizard-mode.json — the definition has just been edited BACK to lizardMode: false/unset.
       // The agent itself is still the one running from BEFORE that edit — launched without the bypass flag.
       const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
@@ -1042,8 +1039,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
       const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-364", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
@@ -1063,8 +1059,7 @@ describe("staleIssues", () => {
     process.env.BUTCHR_WORKSPACES = root;
     try {
       const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const cwd = workspaceDirFor(key);
-      mkdirSync(cwd, { recursive: true });
+      const cwd = ensureWorkspaceDir(key);
       const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
