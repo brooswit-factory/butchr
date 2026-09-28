@@ -20,6 +20,7 @@ import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, sing
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
@@ -145,6 +146,14 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
+// Jira site as a bare, lower-cased HOST (never the full `https://` URL
+// `config.atlassian.site` is), and its Zendesk subdomain read directly from
+// `ZENDESK_SUBDOMAIN`, the SAME env var `zendesk-ticket.ts` itself reads
+// (never routed through `Config`, matching that module's own convention —
+// see this ticket's own doc for why Zendesk config isn't centralized there).
+const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -807,6 +816,13 @@ const { app, mcp } = buildApp({
   resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
     ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
     : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  // FACTORY-339: NO I/O here, same discipline as `dashboard` above —
+  // `dashboardFeed.snapshot()` is the SAME already-polled staffed-agent
+  // registry `/dashboard` itself serves, never a second poll or a live
+  // per-request query (see `../resources/resource-lookup.ts`'s own header
+  // for why re-running each rule's query here would be wrong).
+  resourcesForUrl: async (url) => buildResourcesForUrlResponse(url, resourceLookupDeps, dashboardFeed.snapshot().rows),
+  extensionAuth: config.extensionAuth,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
