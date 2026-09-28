@@ -2014,6 +2014,265 @@ describe("createEscalator — managed-session escalation captures the full pane 
   });
 });
 
+// FACTORY-381: the gap this ticket closes — a pane with NEITHER an issue key
+// NOR a resolved managed-session identity (the real incident: an admin
+// session whose cwd matched neither) used to leave nothing behind but one
+// journal line. Same contract as its two siblings above: optional, fails
+// open, local-disk-only, unredacted, and never posts/sends anything —
+// asserted directly in nearly every test below, not just assumed.
+describe("createEscalator — ticketless (non-managed) escalation captures the full pane text (FACTORY-381)", () => {
+  test("with no captures dep configured, behaves exactly as before: no capture, log line unchanged", async () => {
+    const h = harness();
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    const lines = h.logs.filter((l) => /no issue key — cannot escalate/.test(l));
+    expect(lines.length).toBe(2);
+    expect(lines.every((l) => !l.includes("captured to"))).toBe(true);
+    expect(h.posted).toEqual([]);
+    expect(h.sent).toEqual([]);
+  });
+
+  test("debounces exactly like the ticketed path: no capture until the SAME fingerprint clears DEBOUNCE_POLLS consecutive polls", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt); // 1st poll: still debouncing
+    expect(cap.files.size).toBe(0);
+    await h.poll("p1", null, prompt); // 2nd consecutive poll: captures
+    expect(cap.files.size).toBe(1);
+  });
+
+  test("on a fresh episode, the FULL raw pane text is written to the capture store, unredacted, headed with cwd/session, and the journal line names the path", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const SECRET_PANE = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n" + REAL;
+    h.setPaneText(SECRET_PANE);
+    const prompt = parsePrompt(REAL)!;
+    const context = { cwd: "/home/butchr/admin-nexus", sessionName: "admin-brooswit-nexus" };
+    await h.escalator.onBlocked("p1", null, prompt, 1, context);
+    await h.escalator.onBlocked("p1", null, prompt, 2, context); // clears the debounce — captures
+
+    expect(cap.files.size).toBe(1);
+    const [name, contents] = [...cap.files.entries()][0]!;
+    expect(name).toMatch(/^ticketless-blocked-p1-\d{8}T\d{6}Z\.txt$/);
+    expect(contents).toContain(SECRET_PANE); // full pane text, UNREDACTED, on local disk
+    expect(contents).toContain("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI");
+    expect(contents).toContain("# cwd: /home/butchr/admin-nexus");
+    expect(contents).toContain("# session: admin-brooswit-nexus");
+    expect(contents).toContain("# pane: p1");
+    expect(contents).toContain("# trigger: blocked");
+
+    const lines = h.logs.filter((l) => /no issue key — cannot escalate/.test(l));
+    expect(lines.length).toBe(2);
+    expect(lines[0]).not.toContain("captured to"); // 1st poll: still debouncing
+    expect(lines[1]).toContain(`captured to /fake-captures/${name}`); // 2nd poll: captured
+
+    expect(h.posted).toEqual([]); // never posted to Jira — there is no ticket
+    expect(h.sent).toEqual([]);
+  });
+
+  test("no context given at all — the header says 'unknown' rather than omitting the field", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.escalator.onBlocked("p1", null, prompt, 1);
+    await h.escalator.onBlocked("p1", null, prompt, 2);
+    expect(cap.files.size).toBe(1);
+    const [, contents] = [...cap.files.entries()][0]!;
+    expect(contents).toMatch(/# cwd: unknown/);
+    expect(contents).toMatch(/# session: unknown/);
+  });
+
+  test("the SAME fingerprint on later polls does not write a second capture", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    expect(cap.files.size).toBe(1);
+  });
+
+  test("a NEW fingerprint on the same pane captures again, after its own debounce", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt1 = parsePrompt(REAL)!;
+    const prompt2 = parsePrompt(TRUST)!;
+    await h.poll("p1", null, prompt1);
+    await h.poll("p1", null, prompt1); // captures fp1
+    h.setClock(60_000); // distinct compact-UTC timestamp so the two capture names don't collide
+    await h.poll("p1", null, prompt2);
+    await h.poll("p1", null, prompt2); // captures fp2
+    expect(cap.files.size).toBe(2);
+  });
+
+  test("clearing (pane no longer blocked) ends the episode — the SAME fingerprint reappearing later captures again", async () => {
+    const cap = fakeCaptureSink();
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    expect(cap.files.size).toBe(1);
+
+    h.notBlocked([]); // the herd no longer reports p1 blocked at all
+
+    h.setClock(60_000);
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    expect(cap.files.size).toBe(2); // a fresh episode, not silently suppressed
+  });
+
+  test("a capture failure is logged and never blocks or silences the 'cannot escalate' journal line", async () => {
+    const failingSink = {
+      write: async (): Promise<string> => { throw new Error("disk full"); },
+      list: async () => [] as string[],
+      remove: async () => {},
+    };
+    const h = harness({ captures: failingSink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt);
+    const lines = h.logs.filter((l) => /no issue key — cannot escalate/.test(l));
+    expect(lines.length).toBe(2); // still logs every poll, unchanged
+    expect(lines.every((l) => !l.includes("captured to"))).toBe(true);
+    expect(h.logs.some((l) => /ticketless capture failed/.test(l))).toBe(true);
+  });
+
+  test("evicts the oldest ticketless capture, by timestamp, once at the file cap — never touching a sibling shape", async () => {
+    const cap = fakeCaptureSink();
+    for (let i = 0; i < 50; i++) {
+      const ts = `202601${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`ticketless-blocked-pOld-${ts}.txt`, "old capture");
+    }
+    // Every sibling capture shape must survive untouched.
+    cap.files.set("KAN-1-escalation-20260101T000000Z.txt", "foreign: issue-keyed escalation");
+    cap.files.set("filesystem:managed-sessions:%2Ffoo.json-managed-escalation-pX-20260101T000000Z.txt", "foreign: managed-session escalation");
+    cap.files.set("KAN-1-unrecognised-20260101T000000Z.txt", "foreign: session-limit-watch");
+    const oldestName = "ticketless-blocked-pOld-20260101T000000Z.txt";
+    expect(cap.files.has(oldestName)).toBe(true);
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt); // captures — pushes past the cap
+    expect(cap.files.has(oldestName)).toBe(false); // evicted
+    expect(cap.files.has("KAN-1-escalation-20260101T000000Z.txt")).toBe(true);
+    expect(cap.files.has("filesystem:managed-sessions:%2Ffoo.json-managed-escalation-pX-20260101T000000Z.txt")).toBe(true);
+    expect(cap.files.has("KAN-1-unrecognised-20260101T000000Z.txt")).toBe(true);
+    expect(cap.files.size).toBe(53); // 49 kept + 1 new + 3 untouched foreign
+  });
+
+  // The disjointness control the ticket demands directly, mirroring the
+  // sibling test above each of the other three shapes already has: a check
+  // that FAILS if TICKETLESS_CAPTURE_NAME ever starts matching one of the
+  // other three shapes, so "the shapes are disjoint" is not just a claim in
+  // a comment.
+  test("never treats a sibling shape as its own — foreign captures are never evicted or counted toward the cap", async () => {
+    const cap = fakeCaptureSink();
+    const foreignEscalation = "KAN-1-escalation-20260101T000000Z.txt";
+    const foreignManaged = "filesystem:managed-sessions:%2Ffoo.json-managed-escalation-pX-20260101T000000Z.txt";
+    const foreignUnrecognised = "KAN-1-unrecognised-20260101T000000Z.txt";
+    const foreignNoResetTime = "KAN-1-no-reset-time-20260101T000000Z.txt";
+    for (const f of [foreignEscalation, foreignManaged, foreignUnrecognised, foreignNoResetTime]) cap.files.set(f, "foreign");
+    // Fill to the cap with OUR OWN recognisable captures so the next capture forces eviction.
+    for (let i = 0; i < 50; i++) {
+      const ts = `202602${String(i + 1).padStart(2, "0")}T000000Z`;
+      cap.files.set(`ticketless-blocked-pOld-${ts}.txt`, "old capture");
+    }
+    const h = harness({ captures: cap.sink });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt); // captures — pushes past the cap
+    for (const f of [foreignEscalation, foreignManaged, foreignUnrecognised, foreignNoResetTime]) {
+      expect(cap.files.has(f)).toBe(true);
+    }
+  });
+
+  // AC7: same fix, same coverage, for onNoPrompt.
+  describe("the unparseable path (onNoPrompt)", () => {
+    test("a ticketless unparseable pane produces exactly one capture with the expected name shape and header", async () => {
+      const cap = fakeCaptureSink();
+      const h = harness({ captures: cap.sink });
+      const context = { cwd: "/home/butchr/admin-nexus", sessionName: "admin-brooswit-nexus" };
+      h.escalator.onNoPrompt("p1", null, "some garbled text", 1, context);
+      await Bun.sleep(0);
+
+      expect(cap.files.size).toBe(1);
+      const [name, contents] = [...cap.files.entries()][0]!;
+      expect(name).toMatch(/^ticketless-unparseable-p1-\d{8}T\d{6}Z\.txt$/);
+      expect(contents).toContain("# trigger: unparseable");
+      expect(contents).toContain("# cwd: /home/butchr/admin-nexus");
+      expect(contents).toContain("# session: admin-brooswit-nexus");
+
+      const lines = h.logs.filter((l) => /no parseable dialog and no issue key — cannot escalate/.test(l));
+      expect(lines.length).toBe(1);
+      expect(lines[0]).toContain(`captured to /fake-captures/${name}`);
+      expect(h.posted).toEqual([]);
+      expect(h.sent).toEqual([]);
+    });
+
+    test("a pane frozen on the SAME garbled text across many polls produces exactly ONE capture", async () => {
+      const cap = fakeCaptureSink();
+      const h = harness({ captures: cap.sink });
+      for (let seq = 1; seq <= 5; seq++) {
+        h.escalator.onNoPrompt("p1", null, "same garbled text", seq);
+        await Bun.sleep(0);
+      }
+      expect(cap.files.size).toBe(1);
+    });
+
+    test("a genuinely different garbled text produces a second capture", async () => {
+      const cap = fakeCaptureSink();
+      const h = harness({ captures: cap.sink });
+      h.escalator.onNoPrompt("p1", null, "first garbled text", 1);
+      await Bun.sleep(0);
+      h.setClock(60_000); // distinct compact-UTC timestamp so the two capture names don't collide
+      h.escalator.onNoPrompt("p1", null, "second, different garbled text", 2);
+      await Bun.sleep(0);
+      expect(cap.files.size).toBe(2);
+    });
+
+    test("a sink write failure is swallowed and logged, and the loop keeps going", async () => {
+      const failingSink = {
+        write: async (): Promise<string> => { throw new Error("disk full"); },
+        list: async () => [] as string[],
+        remove: async () => {},
+      };
+      const h = harness({ captures: failingSink });
+      h.escalator.onNoPrompt("p1", null, "garbled text", 1);
+      await Bun.sleep(0);
+      expect(h.logs.some((l) => /ticketless capture failed/.test(l))).toBe(true);
+      const lines = h.logs.filter((l) => /no parseable dialog and no issue key — cannot escalate/.test(l));
+      expect(lines.length).toBe(1);
+      expect(lines[0]).not.toContain("captured to");
+
+      // The loop keeps going: a later, genuinely different text on the SAME
+      // pane still attempts (and still fails the same way), never wedged.
+      h.setClock(60_000);
+      h.escalator.onNoPrompt("p1", null, "a different garbled text", 2);
+      await Bun.sleep(0);
+      expect(h.logs.filter((l) => /ticketless capture failed/.test(l)).length).toBe(2);
+    });
+
+    test("eviction recognizes the unparseable-trigger name and does not touch a session-limit capture", async () => {
+      const cap = fakeCaptureSink();
+      const foreignSessionLimit = "KAN-1-unrecognised-20260101T000000Z.txt";
+      cap.files.set(foreignSessionLimit, "foreign");
+      for (let i = 0; i < 50; i++) {
+        const ts = `202601${String(i + 1).padStart(2, "0")}T000000Z`;
+        cap.files.set(`ticketless-unparseable-pOld-${ts}.txt`, "old capture");
+      }
+      const oldestName = "ticketless-unparseable-pOld-20260101T000000Z.txt";
+      const h = harness({ captures: cap.sink });
+      h.escalator.onNoPrompt("p1", null, "garbled text", 1);
+      await Bun.sleep(0);
+      expect(cap.files.has(oldestName)).toBe(false); // evicted
+      expect(cap.files.has(foreignSessionLimit)).toBe(true); // untouched
+    });
+  });
+});
+
 // BUTCHR-141/§2.6, acceptance criterion 6: "you are changing a branch that
 // gates two existing alarms, prove both alarms still fire." The
 // sustained-unresponsive alarm above is proven throughout this file against
