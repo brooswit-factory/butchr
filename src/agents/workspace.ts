@@ -130,6 +130,35 @@ export interface SpawnSpec {
   /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
   strictMcpConfig?: boolean;
   /**
+   * FACTORY-108: Codex's own "lizard mode" launch signal — the Codex twin of
+   * `permissionMode` above, not of `SessionDefinition.lizardMode`/`Rule.lizardMode`
+   * (which stay daemon-side-only for CLAUDE, per those fields' own doc
+   * comments). `agentLaunchConfig`'s Codex branch (src/agents/argv.ts) reads
+   * this to omit `--dangerously-bypass-approvals-and-sandbox` (Codex's manual
+   * approval mode) when true — Codex has no `permissionMode` concept, so
+   * there is nothing else on `SpawnSpec` a Codex launch could pair its own
+   * lizard mode with. Ignored entirely by the Claude and Agy branches of
+   * `agentLaunchConfig` — present or absent, neither launch's argv changes,
+   * so a `specForSessionDefinition`/rule-engine caller may set this
+   * unconditionally without knowing which vendor a launch will ultimately
+   * use (a `Rule`'s `agentPreferences` is a ranked fallback, decided at spawn
+   * time, not spec-build time — see `docs/execution-modes.md`'s "no
+   * Codex-vendor rejection" section). A `SessionDefinition`, which DOES fix
+   * its vendor at load time, only ever sets this for `vendor: "codex"` (see
+   * `specForSessionDefinition`) — never for `vendor: "claude"`, preserving
+   * that vendor's existing "lizardMode never reaches SpawnSpec" contract
+   * exactly. Same FACTORY-43 persist-at-spawn/read-back stale-argv shape as
+   * `permissionMode`/`strictMcpConfig`: `.butchr-lizard-mode.json`
+   * (`buildWorkspace`/`workspaceLizardMode` below), read back by
+   * `HerdrHerd.staleIssues()` (src/agents/herd.ts) — without this, a lizard
+   * Codex agent's real (bypass-flag-less) argv would forever mismatch a
+   * naively-recomputed "expected" argv that still assumes the bypass flag,
+   * respawn-looping it forever (the exact FACTORY-43 bug, for this field).
+   * Absent/`false` means today's behaviour exactly — no flag change, ordinary
+   * `--dangerously-bypass-approvals-and-sandbox` default.
+   */
+  lizardMode?: boolean;
+  /**
    * BUTCHR-408: additional MCP servers this agent may connect to, beyond
    * butchr's own — a managed-session definition's own `mcpServers`
    * (src/resources/session-definition.ts). `McpServerBinding` (src/rules/rules.ts)
@@ -724,6 +753,12 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // respawned every poll forever.
   if (spec.permissionMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-permission-mode.json"),JSON.stringify(spec.permissionMode)); }
   if (spec.strictMcpConfig !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-strict-mcp-config.json"),JSON.stringify(spec.strictMcpConfig)); }
+  // FACTORY-108: same "persist non-secret spawn intent, re-derive it at
+  // staleness-check time" shape as `.butchr-permission-mode.json` above, for
+  // Codex's own lizard-mode launch signal (see `SpawnSpec.lizardMode`'s own
+  // doc comment for why this one DOES need it, unlike the daemon-side-only
+  // Claude case).
+  if (spec.lizardMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-lizard-mode.json"),JSON.stringify(spec.lizardMode)); }
   // FACTORY-75: same "persist non-secret spawn intent, re-derive it at
   // staleness-check time" shape as `.butchr-permission-mode.json` above —
   // the two-axis (`modelPower`/`effort`) mechanism resolves to a concrete
@@ -1017,6 +1052,12 @@ export function workspacePermissionMode(dir: string): SpawnSpec["permissionMode"
 /** Same shape as `workspacePermissionMode` above, for `spec.strictMcpConfig` (`.butchr-strict-mcp-config.json`). */
 export function workspaceStrictMcpConfig(dir: string): SpawnSpec["strictMcpConfig"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-strict-mcp-config.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/** Same shape as `workspacePermissionMode` above, for `spec.lizardMode` (`.butchr-lizard-mode.json`) — FACTORY-108, Codex's own lizard-mode launch signal. */
+export function workspaceLizardMode(dir: string): SpawnSpec["lizardMode"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-lizard-mode.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }
 

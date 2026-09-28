@@ -204,30 +204,58 @@ export interface SessionDefinition {
    * default, since FACTORY-138); only an EXPLICIT `false` means this pane
    * is never scanned or touched by the permission-answer timer — that
    * absent-vs-false distinction is still fully preserved, only which one
-   * means "on" has flipped, for `claude`. A `vendor: "codex"` definition
-   * (the hard rejection below) stays not-eligible when absent, since it
-   * cannot set this field to begin with — see `ManagedSessionResourceDeps.lizardModes`'s
-   * own doc comment (src/rules/session-definition-type.ts) for exactly
-   * where that default is applied. Does not reach the launched process's own argv — unlike
-   * `permissionMode`/`strictMcpConfig` (see FACTORY-43), this is a
-   * DAEMON-side behaviour toggle only, read fresh from `ManagedSessionResourceDeps.lizardModes`
-   * every poll (src/rules/session-definition-type.ts) — so there is no
-   * persisted-at-spawn value for a stale-argv check to compare against, and
-   * none is needed: toggling this field (or its default changing, as here)
-   * takes effect on the very next permission-answer tick, live, with no
-   * agent respawn (see that map's own doc comment for the "no second,
+   * means "on" has flipped, for `claude`.
+   *
+   * For a `vendor: "claude"` definition, does not reach the launched
+   * process's own argv — unlike `permissionMode`/`strictMcpConfig` (see
+   * FACTORY-43), this is a DAEMON-side behaviour toggle only, read fresh from
+   * `ManagedSessionResourceDeps.lizardModes` every poll
+   * (src/rules/session-definition-type.ts) — so there is no persisted-at-spawn
+   * value for a stale-argv check to compare against, and none is needed:
+   * toggling this field (or its default changing, as with FACTORY-138) takes
+   * effect on the very next permission-answer tick, live, with no agent
+   * respawn (see that map's own doc comment for the "no second,
    * independently-recomputed expectation" FACTORY-43 lesson this design
    * sidesteps by construction, having nothing to duplicate in the first
-   * place). **Rejected at manifest load for `vendor: "codex"`** —
-   * `autoAnswerPermissions`'s own Claude-specific dialog recognition
-   * (`classifyPermissionPrompt`, `@brooswit/drovr`) never matches a Codex
-   * pane's screen, so a Codex definition setting this field at all would
-   * silently do nothing — the same misleading-silence failure mode
-   * `strictMcpConfig`'s own hard rejection for Codex exists to close, not
-   * `permissionMode`'s more lenient "stored but unforwarded" precedent;
-   * this new default is correspondingly INERT for a Codex definition, never
-   * applied to one (see the `lizardModes` fill site for how). See
-   * `docs/managed-sessions.md`'s "Lizard mode" section.
+   * place).
+   *
+   * **FACTORY-108: `vendor: "codex"` CAN set this field — not rejected at
+   * manifest load.** `@brooswit/drovr` >= 0.16.0 ships
+   * `autoAnswerCodexApprovals`, a Codex-specific twin of
+   * `autoAnswerPermissions` (FACTORY-107), which the daemon's permission-answer
+   * timer now also calls every tick (`src/agents/permission-answer-loop.ts`).
+   * A Codex definition's own default is the OPPOSITE of Claude's, though,
+   * decided by the story rather than mechanically inherited from FACTORY-138
+   * (FACTORY-106/FACTORY-324): **absent means INELIGIBLE for `vendor:
+   * "codex"`** — see `ManagedSessionResourceDeps.lizardModes`'s own fill site
+   * (`m.definition.lizardMode ?? (m.definition.vendor === "claude")`,
+   * src/rules/session-definition-type.ts) — an explicit `true` makes it
+   * ELIGIBLE, and an explicit `false` stays ineligible, same as `claude`'s
+   * own absent-vs-false handling just inverted for which default wins.
+   * Reason: default-on for Codex would change nothing about the launch
+   * itself (see the next paragraph — that stays explicit-true-only) and
+   * would only add a scan that can never find anything to press, while
+   * silently claiming a coverage guarantee nobody canaried; Claude's own
+   * FACTORY-138 default-on is safe specifically because Claude's launch
+   * already always shows the dialog this mechanism answers.
+   *
+   * Unlike the Claude case above, this field also DOES reach a Codex
+   * launch's own argv, on an EXPLICIT `true` only (never merely eligible via
+   * the default above): `specForSessionDefinition`
+   * (src/rules/session-definition-type.ts) forwards it onto
+   * `SpawnSpec.lizardMode` only for `vendor: "codex"` and only when
+   * `definition.lizardMode` is truthy, and `agentLaunchConfig`'s Codex branch
+   * (src/agents/argv.ts) reads it to decide whether to omit
+   * `--dangerously-bypass-approvals-and-sandbox` — Codex's own "manual
+   * approval mode" pairing, replacing the `permissionMode: "default"`
+   * pairing Claude uses (Codex has no `permissionMode` concept). This DOES
+   * need FACTORY-43's persist-at-spawn/read-back stale-argv pair, same shape
+   * as `permissionMode`/`strictMcpConfig` (`.butchr-lizard-mode.json`,
+   * `workspaceLizardMode`, src/agents/workspace.ts) — see
+   * `docs/permission-answer-loop.md`'s "Codex lizard mode" section for the
+   * full story. `vendor: "claude"` behaviour (above) is completely
+   * unchanged by any of this. See `docs/managed-sessions.md`'s "Lizard mode"
+   * section for the three-case table (absent/true/false) side by side.
    */
   lizardMode?: boolean;
   /** Reused verbatim from `Rule` (src/rules/rules.ts) — same type, same validation, same "independent of every other field" semantics. Stored and surfaced; execution-mode RECONCILIATION for an individual definition is not implemented by this ticket (see docs/managed-sessions.md) — the built-in query itself always runs `swarm` (one agent per eligible definition file), which is already "one agent" for every mode at the file granularity this ticket covers. */
@@ -431,10 +459,7 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
     if (typeof doc.strictMcpConfig !== "boolean") problems.push(`${at}.strictMcpConfig must be a boolean`);
     else if (doc.vendor === "codex") problems.push(`${at}.strictMcpConfig is not supported for vendor "codex" — Codex has no strict-MCP-config concept; omit this field for a Codex definition`);
   }
-  if (doc.lizardMode !== undefined) {
-    if (typeof doc.lizardMode !== "boolean") problems.push(`${at}.lizardMode must be a boolean`);
-    else if (doc.vendor === "codex") problems.push(`${at}.lizardMode is not supported for vendor "codex" — drovr's tool-permission dialog recognition is Claude-specific and never matches a Codex pane; omit this field for a Codex definition`);
-  }
+  if (doc.lizardMode !== undefined && typeof doc.lizardMode !== "boolean") problems.push(`${at}.lizardMode must be a boolean`);
   if (doc.execution !== undefined && !oneOf(EXECUTION_MODES, doc.execution)) problems.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
   if (doc.account !== undefined && !oneOf(ACCOUNT_POLICIES, doc.account)) problems.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
   if (doc.role !== undefined && !oneOf(AGENT_ROLES, doc.role)) problems.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);

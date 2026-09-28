@@ -339,6 +339,58 @@ describe("project-manager Claude permissions", () => {
   });
 });
 
+describe("FACTORY-108: codex lizard mode — manual-approval launch", () => {
+  // Today's behaviour, unchanged: absent spec.lizardMode still launches
+  // Codex with --dangerously-bypass-approvals-and-sandbox (drovr's own
+  // launch.bypassApprovalsAndSandbox===false ? [] : [flag] default).
+  test("absent lizardMode: codex still launches with --dangerously-bypass-approvals-and-sandbox, same as before this ticket", () => {
+    const args = spawnArgs(spec, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+    const launch = agentLaunchConfig(spec, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && "bypassApprovalsAndSandbox" in launch).toBe(false);
+  });
+
+  test("lizardMode: false behaves exactly like absent — still bypasses", () => {
+    const args = spawnArgs({ ...spec, lizardMode: false }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+
+  // The actual fix: lizardMode: true is Codex's own "manual approval mode"
+  // launch signal — the Codex counterpart of Claude's permissionMode:
+  // "default" — and omitting the bypass flag is what lets a pending Codex
+  // approval dialog exist at all for autoAnswerCodexApprovals to answer
+  // (src/agents/permission-answer-loop.ts).
+  test("lizardMode: true drops --dangerously-bypass-approvals-and-sandbox from a codex launch", () => {
+    const args = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    const launch = agentLaunchConfig({ ...spec, lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
+  // Ignored entirely by the other two vendors — present or absent, neither
+  // launch's argv changes (SpawnSpec.lizardMode's own doc comment).
+  test("lizardMode is ignored entirely by Claude and Agy launches", () => {
+    const claudeWith = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "claude" });
+    const claudeWithout = spawnArgs(spec, "/w/KAN-783", { provider: "claude" });
+    expect(claudeWith).toEqual(claudeWithout);
+    const agyWith = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "agy" });
+    const agyWithout = spawnArgs(spec, "/w/KAN-783", { provider: "agy" });
+    expect(agyWith).toEqual(agyWithout);
+  });
+
+  // The pre-existing unconditional jira-project case (a freeform project
+  // manager's own always-manual review mode) is independent of lizardMode —
+  // it still drops the flag on its own with lizardMode absent, and adding
+  // lizardMode: true changes nothing further (the OR short-circuits).
+  test("the jira-project unconditional bypass-drop is unaffected by lizardMode either way", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const withoutLizard = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(withoutLizard).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    const withLizard = spawnArgs({ ...pm, lizardMode: true }, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(withLizard).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+});
+
 // FACTORY-314 (PR #513 review fix): `--resume` — appended ONLY by
 // `agentStartParams()`/`spawnArgs()`, and ONLY when `agent.resumeSessionId`
 // is set (`HerdrHerd.resumeInPlace()`'s own caller). A fresh Claude launch

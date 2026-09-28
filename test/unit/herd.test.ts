@@ -963,6 +963,122 @@ describe("staleIssues", () => {
     }
   });
 
+  // FACTORY-108: same FACTORY-43 respawn-loop shape, for Codex's own
+  // lizard-mode launch signal (`SpawnSpec.lizardMode` -> drops
+  // `--dangerously-bypass-approvals-and-sandbox`). Without persisting the
+  // EXPLICIT spawn-time value and reading it back into `staleIssues()`'s own
+  // "expected" reconstruction, a lizard Codex agent's real (bypass-flag-less)
+  // argv would forever mismatch an expectation still assuming the bypass
+  // flag, and it would respawn on every poll forever.
+  test("FACTORY-108: a managed-session CODEX agent launched with lizardMode: true (persisted at build time, workspaceLizardMode) is honoured, not flagged stale for lacking the bypass flag it was deliberately launched without", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = ensureWorkspaceDir(key);
+      writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-108: toggling lizardMode on an ALREADY-RUNNING Codex agent is
+  // NOT symmetric — `checkManagedAgentArgv` only ever flags a WANTED-BUT-MISSING
+  // flag, never an unwanted-but-present one. Both directions measured
+  // directly here rather than assumed, per this ticket's own requirement to
+  // document (and prove) what toggling actually does, not leave it silent.
+  test("FACTORY-108: turning lizardMode ON while a CODEX agent is already running IN bypass mode is SILENT — not flagged stale, since the new expected argv no longer wants the bypass flag at all and checkArgv never flags an unwanted-but-present flag", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-on-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = ensureWorkspaceDir(key);
+      // The definition has just been edited to lizardMode: true, and the daemon persisted that at the last managed-sessions poll...
+      writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
+      // ...but the agent itself is still the one running from BEFORE the edit — still carrying the bypass flag.
+      const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillBypassedArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("FACTORY-108: turning lizardMode OFF while a CODEX agent is already running WITHOUT the bypass flag IS flagged stale and respawns it back to bypass mode — the opposite direction from the test above", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-off-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = ensureWorkspaceDir(key);
+      // No .butchr-lizard-mode.json — the definition has just been edited BACK to lizardMode: false/unset.
+      // The agent itself is still the one running from BEFORE that edit — launched without the bypass flag.
+      const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillLizardArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("FACTORY-108: a RULE-launched (non-managed-session) CODEX agent with lizardMode: true persisted is likewise honoured, not flagged stale for lacking the bypass flag — the persist/read-back path is not managed-session-only", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-rule-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "live-jira-work", resourceId: "BUTCHR-364" });
+      const cwd = ensureWorkspaceDir(key);
+      writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "task", summary: "", parent: null, resource: "BUTCHR-364", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("FACTORY-108: a non-lizard CODEX agent's staleness behaviour is unchanged — no .butchr-lizard-mode.json, bypass flag present, still not stale", async () => {
+    const { mkdtempSync, mkdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-absent-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const cwd = ensureWorkspaceDir(key);
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      expect(await herd.staleIssues()).toEqual([]);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   // FACTORY-138 (AC4, the respawn-loop guard): the shared builder
   // (`agentLaunchConfig`) now defaults an unset `permissionMode` to
   // `acceptEdits` — and `staleIssues()` reconstructs its own "expected" argv
