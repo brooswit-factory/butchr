@@ -928,6 +928,25 @@ export class HerdrHerd implements Herd {
       // on the FIRST check (the file is usually already there).
       if (result.account.provider === "claude") {
         const dir = workspaceDirFor(spec.key);
+        // FACTORY-418 (fixed here, inside FACTORY-411's PR — see that
+        // ticket for why it's routed through this story instead of its
+        // own): invalidate BEFORE the discovery poll starts, not only in
+        // the poll's failure branch below. An earlier launch of this SAME
+        // workspace may have persisted a session id of its own; if a
+        // daemon death or a non-ENOENT `discoverClaudeSessionId` error hits
+        // mid-poll, control never reaches the `else` branch that used to be
+        // the only place this ran, so that stale id (and its still-present
+        // transcript, since `claudeTranscriptExists` is a bare existsSync)
+        // would survive on disk. A LATER model/effort (or now
+        // permissionMode/strictMcpConfig/mcpServers-channel) change would
+        // then find it, find its transcript still sitting in the same
+        // per-cwd project folder, and `--resume` it: a silent, confidently
+        // wrong resume into a different, already-finished conversation,
+        // reported as "PRESERVED". Clearing it as soon as a fresh launch is
+        // confirmed successful — before the poll can be interrupted — means
+        // the ONLY way a stale id survives this launch is if discovery
+        // itself then succeeds and re-persists a fresh one.
+        invalidatePersistedSessionId(dir);
         let discovered: string | undefined;
         for (let attempt = 0; attempt < SESSION_DISCOVERY_ATTEMPTS; attempt++) {
           discovered = discoverClaudeSessionId(dir, preparedHome, launchStartedAt);
@@ -936,18 +955,11 @@ export class HerdrHerd implements Herd {
         }
         if (discovered) persistDiscoveredSessionId(dir, discovered);
         else {
-          // FACTORY-314 (epic review, round 3): MUST invalidate, not just log —
-          // an earlier launch of this SAME workspace may have persisted a
-          // session id of its own, and leaving it on disk here means a LATER
-          // model/effort change would find that OLDER id, find its transcript
-          // still sitting in the same per-cwd project folder (`claudeTranscriptExists`
-          // is a bare existsSync), and `--resume` it: a silent, confidently
-          // wrong resume into a different, already-finished conversation,
-          // reported as "PRESERVED". Removing it makes `workspaceSessionId`
-          // fail safe to `undefined`, so `resumeInPlace()`'s existing
-          // `if (!sessionId) return "unresumable"` check catches this launch
-          // instead — an honest fresh restart next time, never a wrong guess.
-          invalidatePersistedSessionId(dir);
+          // Already invalidated above, before the poll began. Nothing left
+          // to clear here — `workspaceSessionId` already fails safe to
+          // `undefined`, so `resumeInPlace()`'s existing `if (!sessionId)
+          // return "unresumable"` check catches this launch — an honest
+          // fresh restart next time, never a wrong guess. Logged only.
           this.log?.(`WARNING: [spawn] ${spec.key} could not discover a native Claude session id after a successful launch — a later model/effort change will fall back to a fresh restart instead of resuming`);
         }
       }
