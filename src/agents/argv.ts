@@ -31,7 +31,23 @@ export const KICKOFF_PROMPT = "follow your CLAUDE.md";
  */
 export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;
-export interface AgentConfig { provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string }
+export interface AgentConfig {
+  provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string;
+  /**
+   * FACTORY-314 (PR #513 review fix) — set ONLY by `HerdrHerd.resumeInPlace()`
+   * (src/agents/herd.ts) for a model/effort-only change on a still-alive
+   * Claude agent: the workspace's own DISCOVERED session id (its real,
+   * Claude-assigned one — `discoverClaudeSessionId`, src/agents/workspace.ts
+   * — never a butchr-minted one; a fresh launch has no `--session-id`
+   * equivalent at all, see `agentStartParams`'s own doc comment below for
+   * why), so `agentStartParams()` below emits `--resume <id>`. Absent for
+   * every other caller (an ordinary fresh spawn, and `staleIssues()`'s own
+   * expected-argv reconstruction), which is what keeps this a strict
+   * addition: nothing about today's launch or staleness comparison changes
+   * when this field is unset.
+   */
+  resumeSessionId?: string;
+}
 
 export function providerOrder(agent: AgentConfig, role: string): AgentProvider[] {
   return agent.roleProviders?.[role.toLowerCase() as "project" | "epic" | "story" | "task"] ?? agent.providers ?? [agent.provider];
@@ -227,12 +243,37 @@ export function agentLaunchConfig(
   };
 }
 
-/** Compatibility helper for argv inspection; lifecycle dispatches kickoff separately. */
+/**
+ * Compatibility helper for argv inspection; lifecycle dispatches kickoff
+ * separately.
+ *
+ * FACTORY-314 (PR #513 review fix): the ONE place `--resume` is appended.
+ * IMPORTANT ASYMMETRY, unlike every other flag this function builds: this
+ * function is NOT in the real fresh-launch path. `HerdrHerd.spawnExclusive`'s
+ * `prepare()` hands `agentLaunchConfig(...)` straight to Drovr's
+ * `ManagedHerdrLifecycle.start()`, which builds its OWN `agent.start` params
+ * via Drovr's `buildAgentStartParams` — never this function — for a fresh
+ * spawn (verified against the pinned 0.15.1 source: `buildAgentStartParams`'s
+ * Claude branch has no `--session-id`/`--resume` concept at all, so a fresh
+ * launch runs under Claude's OWN auto-generated session id, discovered
+ * AFTERWARD from its transcript directory — see `discoverClaudeSessionId`,
+ * src/agents/workspace.ts, and `HerdrHerd.startProviders`'s own doc comment
+ * — never pre-declared here). This function IS the real launch builder for
+ * exactly one caller: `HerdrHerd.resumeInPlace()`, which bypasses
+ * `ManagedHerdrLifecycle` entirely and calls this directly — so `--resume`
+ * appended HERE is real, but do not read the rest of this function's
+ * "real launch AND staleness comparison agree" property as extending to a
+ * flag that only matters for that one caller.
+ */
 export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
-  return buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
+  const params = buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
+  if (agent.provider === "claude" && agent.resumeSessionId) {
+    params.args = [...(params.args ?? []), "--resume", agent.resumeSessionId];
+  }
+  return params;
 }
 
 /**

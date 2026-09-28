@@ -175,6 +175,7 @@ describe("routing GitHub issue changes to idea agents", () => {
       async stop(i) { running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     return { herd, running };
   }

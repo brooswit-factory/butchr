@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createLoginExpiredWatcher } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -39,6 +39,7 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
@@ -56,7 +57,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment } from "../agents/respawn.js";
+import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
@@ -775,7 +776,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1448,6 +1449,29 @@ runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  // FACTORY-314: a model/effort-only change resumed the SAME session —
+  // distinct marker/wording from `onRespawn` above (never "re-read your
+  // ticket"), same query-level-agent exclusion (no single ticket to post to).
+  onResumePreserved: async (agent) => {
+    console.error(`  [reconcile] ${agent} resumed in place (session preserved)`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, resumePreservedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-314: fires once (not per-poll) after RESUME_WAITING_NOTICE_AT_POLLS
+  // consecutive deferred/stuck polls — never a trigger to force a restart,
+  // only a heads-up that a model/effort change is still waiting.
+  onResumeWaiting: async (agent, outcome, consecutivePolls) => {
+    console.error(`  [reconcile] ${agent} resume still waiting after ${consecutivePolls} polls (${outcome})`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    const why = outcome === "deferred"
+      ? "it has stayed mid-turn across every poll since"
+      : "its pane never returned to a shell prompt after being asked to exit — it may need a human to look at it";
+    await ops.addComment(issue, `[butchr:resume] A model/effort change for ${agent} is still waiting to resume (checked ${consecutivePolls} polls ago and every poll since): ${why}. Nothing was interrupted; the daemon will keep retrying rather than force a restart.`).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume-waiting notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
@@ -1781,6 +1805,30 @@ const loginExpiredTimer = setInterval(() => {
     .finally(() => { loginExpiredPollInFlight = false; });
 }, 5_000);
 loginExpiredTimer.unref?.();
+
+// FACTORY-425 (implements FACTORY-419): host-side counting of Codex
+// unrecognised-dialog sightings per fingerprint — a FOURTH, independent poll
+// loop, own timer, own read of the fleet, same isolation reasoning as
+// `loginExpiredTimer`/`blockingEscalationTimer` above. Deliberately calls
+// ONLY `scanPendingCodexApprovals` (a pure read — never
+// `approveCodexApproval`/`autoAnswerCodexApprovals`, either of which can
+// press keys for a RECOGNISED dialog): this loop observes and counts, never
+// answers or classifies, per FACTORY-419's own scope correction. See
+// `src/agents/codex-dialog-sightings.ts`'s own header for why this counts
+// EPISODES, not polls, and for why there was no existing
+// aggregate-count-by-fingerprint surface in this repo (for either vendor) to
+// mirror.
+const codexDialogSightings = createCodexDialogSightingsTracker({ log: (line) => console.log(line), now: () => Date.now() });
+let codexDialogSightingsPollInFlight = false;
+const codexDialogSightingsTimer = setInterval(() => {
+  if (codexDialogSightingsPollInFlight) return;
+  codexDialogSightingsPollInFlight = true;
+  scanPendingCodexApprovals(herdr)
+    .then((result) => codexDialogSightings.onScan(result.unrecognised))
+    .catch((e) => console.error(`  [codex-unrecognised] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { codexDialogSightingsPollInFlight = false; });
+}, 5_000);
+codexDialogSightingsTimer.unref?.();
 
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by

@@ -122,6 +122,7 @@ describe("BUTCHR-460 end to end: managed-session archive release through the rea
       async stop(id) { running.delete(id); },
       async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
   }
 
@@ -276,6 +277,7 @@ describe("BUTCHR-460 review round 1: a managed-session definition is never silen
       async stop(id) { running.delete(id); },
       async paneFor(id) { return running.has(id) ? `pane-${id}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
       spawnedSpecs,
     };
   }

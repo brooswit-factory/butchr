@@ -104,6 +104,7 @@ function fakeHerd(initial: string[] = []): Herd & { stopped: string[]; running: 
     async stop(i: string) { stopped.push(i); running.delete(i); },
     async paneFor(i: string) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 

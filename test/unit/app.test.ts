@@ -757,6 +757,7 @@ describe("/health reflects real poll-loop liveness (BUTCHR-18)", () => {
         async stop() {},
         async paneFor() { return null; },
         async nudge() { return { delivered: true }; },
+        async resumeInPlace() { return "unresumable" as const; },
       };
       let allowPoll = true;
       const stop = startLoop({
@@ -842,6 +843,7 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
         async stop() {},
         async paneFor() { return null; },
         async nudge() { return { delivered: true }; },
+        async resumeInPlace() { return "unresumable" as const; },
       };
       // "To Do" (not an ACTIVE_STATUSES member — src/reconcile/plan.ts) so
       // reconcileNow's desired set stays empty and this test only exercises
