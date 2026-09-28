@@ -43,6 +43,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 

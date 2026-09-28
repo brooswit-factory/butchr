@@ -292,6 +292,7 @@ describe("github pr resource type", () => {
       async stop(i) { stopped.push(i); running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     let prs = [gp("acme/w#1")];
     const notified: Array<[string, NotifyReason | undefined]> = [];
@@ -322,6 +323,7 @@ describe("github pr resource type", () => {
       async stop(i) { stopped.push(i); running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
     };
     let prs = [gp("acme/w#2")];
     const type = createGithubPrResourceType({ rules: prRules({ id: "prs", query: "is:open" }), search: async () => prs });

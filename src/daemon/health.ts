@@ -5,6 +5,7 @@ import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
 import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
 import type { CredentialDeathAlert } from "../agents/login-expired-alert.js";
+import type { CodexDialogSighting } from "../agents/codex-dialog-sightings.js";
 
 /**
  * Liveness for the poll loop, independent of the loop's own error seam.
@@ -179,6 +180,20 @@ export interface HealthStatus {
    * `managedSessionEscalations` above already uses.
    */
   credentialDeathAlert?: CredentialDeathAlert;
+  /**
+   * FACTORY-425 (implements FACTORY-419): every Codex unrecognised-dialog
+   * fingerprint sighted since this daemon started tracking, with its
+   * aggregate sighting (episode) count and a representative excerpt — see
+   * `src/agents/codex-dialog-sightings.ts`'s own header for what counts as a
+   * sighting and why these counts are a LOWER BOUND, never an authoritative
+   * total. A SIXTH sibling, same "additive, never flips `ok`" reasoning
+   * `managedSessionEscalations`/`credentialDeathAlert` above already use:
+   * these are purely observational counts, not a liveness signal for this
+   * daemon's own poll loops. ABSENT (no key at all), never an empty array,
+   * when nothing has been sighted yet — the same "absent means nothing to
+   * report" convention `managedSessionEscalations` above already uses.
+   */
+  codexUnrecognisedDialogSightings?: CodexDialogSighting[];
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -241,6 +256,7 @@ export const combineHealth = (
   unresolvedRelationships?: readonly UnresolvedRelationship[],
   managedSessionEscalations?: readonly ManagedSessionEscalation[],
   credentialDeathAlert?: CredentialDeathAlert,
+  codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -254,6 +270,9 @@ export const combineHealth = (
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
     ...(managedSessionEscalations && managedSessionEscalations.length ? { managedSessionEscalations: [...managedSessionEscalations] } : {}),
     ...(credentialDeathAlert ? { credentialDeathAlert } : {}),
+    ...(codexUnrecognisedDialogSightings && codexUnrecognisedDialogSightings.length
+      ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
+      : {}),
   };
 };
 
