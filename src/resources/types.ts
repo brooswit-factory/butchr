@@ -147,6 +147,24 @@ export interface Activation<T> {
  * structural: a daemon-label-only diff coinciding with this edge used to
  * wake a sleeping watcher unconditionally instead of going through the
  * `unseenFor` gate like every other comment-caused delivery does.
+ *
+ * FACTORY-417: `definitionField` is produced only by
+ * `createSessionDefinitionEventRules` (src/rules/session-definition-type.ts),
+ * never by the Jira-issue `decide()` this doc comment otherwise describes —
+ * a managed-session definition file's `brief`/`workingDirectory` content
+ * moving between two polls, content-diffed against the PREVIOUS parsed
+ * definition (not the [size, mtimeMs] pair every other definition-field
+ * change is still reported by — see that function for why only these two
+ * fields get this treatment). Carries the NEW value of whichever of the two
+ * changed (either key may be absent; never both absent — a delivery this
+ * shape only ever fires because at least one moved) so the nudge can name
+ * the content directly instead of pointing the agent at a re-read that may
+ * race a workspace rebuild the daemon does not actually perform on every
+ * poll (see `sessionDefinitionFieldNudge`'s own doc comment,
+ * src/agents/change-nudge.ts, for why a direct push was chosen over that
+ * race). Every OTHER definition-field change (`vendor`, `tier`, `modelPower`,
+ * `permissionMode`, …) still delivers with no `reason` at all, exactly as
+ * before this ticket — this member is additive, not a replacement.
  */
 export type NotifyReason =
   | { pr: { from: string | null; to: string } }
@@ -157,7 +175,8 @@ export type NotifyReason =
   | { summary: true }
   | { comment: string | null }
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
-  | { linked: { events: readonly LinkedChangeEvent[] } };
+  | { linked: { events: readonly LinkedChangeEvent[] } }
+  | { definitionField: { brief?: string; workingDirectory?: string } };
 
 /**
  * BUTCHR-436 (epic BUTCHR-421, story 2/4): one line of a coalesced
