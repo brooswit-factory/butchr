@@ -22,25 +22,39 @@
     "start": "bun run src/daemon/index.ts",
     "generate": "bun run scripts/load/generate.ts",
     "typecheck": "bun --bun x tsc -p tsconfig.json --noEmit",
+    "typecheck:web": "bun --bun x tsc -p dashboard-app/tsconfig.json --noEmit",
+    "dev:web": "bun --bun x vite",
+    "build:web": "bun --bun x vite build",
     "test": "bun test",
     "test:unit": "bun test test/unit test/load && bun run scripts/coverage/gate.ts",
     "release:check": "bun run scripts/release/check.ts",
-    "check": "bun run scripts/preflight.ts && bun run generate && bun run typecheck && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
-    "build": "bun run scripts/build/build.ts"
+    "check": "bun run scripts/preflight.ts && bun run generate && bun run typecheck && bun run typecheck:web && bun test test/unit test/load && bun run scripts/coverage/gate.ts && bun run scripts/verify-generated-is-committed.ts && bun run build",
+    "build": "bun run scripts/build/build.ts && bun run build:web"
   },
   "dependencies": {
     "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.16.4/brooswit-drovr-0.16.4.tgz",
+    "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz",
     "@brooswit/sundry": "^0.2.1",
     "@brooswit/thatch": "0.8.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "confluence.js": "^3.2.0",
     "elysia": "^1.4.29",
     "jira.js": "^6.2.0",
-    "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz"
+    "react": "19",
+    "react-aria": "^3.52.1",
+    "react-aria-components": "^1.21.1",
+    "react-dom": "19",
+    "react-hook-form": "^7.89.0",
+    "react-router": "^8.4.0",
+    "react-stately": "^3.50.0"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",
-    "typescript": "^5.6.0"
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^4",
+    "typescript": "^5.6.0",
+    "vite": "^6"
   },
   "engines": {
     "bun": ">=1.1"
