@@ -282,6 +282,44 @@ export function resumableArgvReason(reason: string, provider: ManagedAgentProvid
 }
 
 /**
+ * FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 4: "Treat
+ * Claude-only as a stated property") — `staleIssues()`'s own `checkArgv`-
+ * failure push site delegates its `resumable`/`reason` computation here,
+ * pulled out into its own named, directly testable function per PR #541
+ * review (the reason-rewrite branch had no test of its own — an allowlist
+ * unit test on `resumableArgvReason` proves WHETHER a reason is resumable,
+ * a different claim from what the respawn comment SAYS when it isn't).
+ *
+ * `provider` is the REAL, currently-observed provider (`providerOfPane`'s
+ * own result) — never guessed downstream from the reason string alone. If
+ * this SAME reason would have been resumable on a Claude agent but this
+ * agent's actual provider isn't Claude, the respawn comment states that
+ * explicitly instead of reading as a bare argv diff with no hint that the
+ * session loss is an intentional, Claude-only limitation rather than a bug.
+ *
+ * NOTE ON REACHABILITY: today, `spawnArgs`'s non-Claude branches
+ * (`src/agents/argv.ts`, the `provider === "codex"` shape) never emit
+ * `--permission-mode`/`--strict-mcp-config`/`--dangerously-load-development-channels`
+ * at all, so `expected` never calls for them on a non-Claude agent and this
+ * rewrite branch cannot currently be reached through `staleIssues()`'s own
+ * `checkArgv` comparison for those flags specifically — it exists for the
+ * day a non-Claude provider's expected argv DOES grow one of these fields
+ * (or an equivalent), so that day doesn't also require remembering to wire
+ * this message up. Tested directly (this function, not through a
+ * synthetic/unreachable `staleIssues()` fixture) for exactly this reason.
+ */
+export function staleArgvOutcome(reason: string, provider: ManagedAgentProvider): { reason: string; resumable: boolean } {
+  const resumable = resumableArgvReason(reason, provider);
+  if (!resumable && provider !== "claude" && resumableArgvReason(reason, "claude")) {
+    return {
+      resumable,
+      reason: `session lost: its definition changed ${reason.replace(/^argv lacks /, "")}, a field that CAN preserve a session on a Claude-vendor agent, but this agent's provider (${provider}) is not Claude — butchr's resume-in-place mechanism is Claude-only by construction (no verified --resume-equivalent exists for any other provider), so this is a stated limitation, not a defect`,
+    };
+  }
+  return { reason, resumable };
+}
+
+/**
  * BUTCHR-320: the single tag every spawn-attempt outcome line is emitted
  * under, whatever the outcome — success, failure, or the no-op early return
  * (see `spawn()`'s own doc comment for why all three share it). A window's
@@ -669,26 +707,11 @@ export class HerdrHerd implements Herd {
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) {
-        // FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 3):
-        // the SECOND push site that may ever set `resumable` — see
-        // `resumableArgvReason`'s own doc comment for the exact, deliberate
-        // per-reason allowlist. Every `checkArgv` failure OUTSIDE that
-        // allowlist (or on a non-Claude provider) keeps today's behavior
-        // exactly: `resumable` absent, `herd.stop()`+`herd.spawn()`.
-        const resumable = resumableArgvReason(check.reason, provider);
-        // "Treat Claude-only as a stated property" (classification doc,
-        // Finding 2, point 4): computed with the REAL provider known here
-        // (never guessed downstream from the reason string alone, which
-        // would be indistinguishable from an ordinary Claude checkArgv
-        // failure that just hasn't gone through this ticket's widening) —
-        // if this SAME reason would have been resumable on a Claude agent
-        // but this agent's actual provider is something else, the respawn
-        // comment must say so explicitly rather than reading as a bare argv
-        // diff with no hint that the session loss is an intentional
-        // limitation, not a bug.
-        const reason = !resumable && provider !== "claude" && resumableArgvReason(check.reason, "claude")
-          ? `session lost: its definition changed ${check.reason.replace(/^argv lacks /, "")}, a field that CAN preserve a session on a Claude-vendor agent, but this agent's provider (${provider}) is not Claude — butchr's resume-in-place mechanism is Claude-only by construction (no verified --resume-equivalent exists for any other provider), so this is a stated limitation, not a defect`
-          : check.reason;
+        // FACTORY-411/FACTORY-424 (classification doc, Finding 2, points 3
+        // & 4): the SECOND push site that may ever set `resumable` — see
+        // `staleArgvOutcome`'s own doc comment for the exact, deliberate
+        // per-reason allowlist and the Claude-only reason rewrite.
+        const { reason, resumable } = staleArgvOutcome(check.reason, provider);
         out.push({ issue, reason, observedArgv: proc.argv, resumable });
         continue;
       }

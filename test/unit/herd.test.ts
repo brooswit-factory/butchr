@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -1926,6 +1926,54 @@ describe("resumableArgvReason", () => {
   test("never true for a non-Claude provider, even for an otherwise-allowed reason", () => {
     expect(resumableArgvReason("argv lacks --permission-mode bypassPermissions", "codex")).toBe(false);
     expect(resumableArgvReason("argv lacks --strict-mcp-config", "agy")).toBe(false);
+  });
+});
+
+// FACTORY-411/FACTORY-424 (PR #541 review, item 4): `staleArgvOutcome` is
+// the exact function `staleIssues()`'s own checkArgv-failure push site
+// calls — see its own doc comment for why this is tested directly rather
+// than through a full `staleIssues()` fixture (today's non-Claude argv
+// shapes never actually produce one of these three flags in `expected`, so
+// a `staleIssues()`-level fixture for this specific rewrite would be
+// unreachable/synthetic; this is the real code path, exercised directly).
+describe("staleArgvOutcome", () => {
+  test("a Claude-resumable reason passes through unchanged, resumable: true", () => {
+    expect(staleArgvOutcome("argv lacks --permission-mode bypassPermissions", "claude")).toEqual({
+      reason: "argv lacks --permission-mode bypassPermissions",
+      resumable: true,
+    });
+  });
+  test("a non-candidate reason (even on Claude) passes through unchanged, resumable: false", () => {
+    expect(staleArgvOutcome("argv lacks --mcp-config http://new/mcp", "claude")).toEqual({
+      reason: "argv lacks --mcp-config http://new/mcp",
+      resumable: false,
+    });
+  });
+  test("a non-candidate reason on a non-Claude provider passes through unchanged, resumable: false — no Claude-only rewrite for a reason that was never a candidate", () => {
+    expect(staleArgvOutcome("Codex MCP isolation inventory missing", "codex")).toEqual({
+      reason: "Codex MCP isolation inventory missing",
+      resumable: false,
+    });
+  });
+  // The case PR #541's review specifically asked for: a non-Claude provider
+  // whose drift IS confined to one of the three candidate fields gets the
+  // explicit "stated limitation" rewrite, never the bare argv diff.
+  test("a Claude-candidate reason on a non-Claude provider is rewritten to state the Claude-only limitation explicitly, resumable: false", () => {
+    const { reason, resumable } = staleArgvOutcome("argv lacks --strict-mcp-config", "codex");
+    expect(resumable).toBe(false);
+    expect(reason).not.toContain("argv lacks"); // never the bare argv diff for this case
+    expect(reason).toContain("session lost");
+    expect(reason).toContain("--strict-mcp-config");
+    expect(reason).toContain("Claude-only");
+    expect(reason).toContain("codex"); // names the actual provider, not a generic "not Claude"
+  });
+  test("same rewrite for a combined candidate reason (permission-mode + development-channels) on a non-Claude provider", () => {
+    const { reason, resumable } = staleArgvOutcome("argv lacks --permission-mode bypassPermissions, --dangerously-load-development-channels server:x", "agy");
+    expect(resumable).toBe(false);
+    expect(reason).not.toContain("argv lacks");
+    expect(reason).toContain("session lost");
+    expect(reason).toContain("--permission-mode bypassPermissions");
+    expect(reason).toContain("--dangerously-load-development-channels server:x");
   });
 });
 
