@@ -41,14 +41,23 @@ export interface StaleAgent {
   /** The offending process's real argv, for the log line and Jira notice. */
   observedArgv: string[];
   /**
-   * FACTORY-314 — `true` ONLY for the narrow case this ticket adds a second
-   * respawn path for: a Claude agent whose SOLE staleness is the
-   * `resolvedAgentOf` model/effort comparison below (never a
-   * `checkArgv`/`checkManagedAgentArgv` failure, and never a non-Claude
-   * provider — see the two push sites in `staleIssues()` for exactly which
-   * one sets this). The reconcile loop (`src/daemon/loop.ts`) reads this to
-   * choose `herd.resumeInPlace()` over today's `herd.stop()`+`herd.spawn()`;
-   * every OTHER stale reason leaves this `false`/absent and keeps today's
+   * FACTORY-314, widened by FACTORY-411/FACTORY-424 — `true` for a Claude
+   * agent whose staleness is EITHER the `resolvedAgentOf` model/effort
+   * comparison below, OR a `checkArgv`/`checkManagedAgentArgv` failure whose
+   * ENTIRE reason is confined to the three fields the classification doc
+   * (`docs/session-field-reload-classification.md`) names as generalizable:
+   * `permissionMode`, `strictMcpConfig`, and the `mcpServers` `channel`-flag
+   * half — see `resumableArgvReason()`, this file, for the exact per-reason
+   * classification and why it must be a deliberate allowlist, never a
+   * blanket "any checkArgv failure is resumable". Never `true` for a
+   * non-Claude provider, or for a `checkArgv` failure that mixes an allowed
+   * flag with ANY other one (a mixed reason means at least one field outside
+   * the verified set changed too, and this ticket only verified `claude
+   * --resume` tolerating the three fields above, individually and together
+   * with model/effort — not an unbounded combination with unverified
+   * flags). The reconcile loop (`src/daemon/loop.ts`) reads this to choose
+   * `herd.resumeInPlace()` over today's `herd.stop()`+`herd.spawn()`; every
+   * OTHER stale reason leaves this `false`/absent and keeps today's
    * fresh-restart behaviour completely unchanged.
    */
   resumable?: boolean;
@@ -231,6 +240,46 @@ export const RESUME_LAUNCH_VERIFY_MS = 3_000;
  */
 export const SESSION_DISCOVERY_ATTEMPTS = 15;
 export const SESSION_DISCOVERY_POLL_MS = 1_000;
+
+/**
+ * FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 3) — the
+ * deliberate, per-reason `checkArgv`/`checkManagedAgentArgv` allowlist that
+ * decides whether a `StaleAgent` from a `checkArgv` FAILURE (as opposed to
+ * the separate `resolvedAgentOf` model/effort push site) may set
+ * `resumable: true`. `checkManagedAgentArgv` (`@brooswit/drovr`) returns
+ * ONE joined string, `"argv lacks " + missing.join(", ")` — never a
+ * structured list — so this parses that exact, verified format back apart
+ * (each piece is `"<flag>"` or `"<flag> <value...>"`) rather than
+ * re-deriving the comparison itself. Deliberately NOT exported from drovr as
+ * constants (`CLAUDE_STRICT_MCP_FLAG`/`CLAUDE_DEVELOPMENT_CHANNELS_FLAG`),
+ * so the three literal flag strings below are verified directly against the
+ * pinned `@brooswit/drovr` version's own `checkManagedAgentArgv` source
+ * (`node_modules/@brooswit/drovr/dist/index.js`) — re-verify them there if
+ * the pinned version ever changes.
+ *
+ * A DELIBERATE ALLOWLIST, never a blanket "any checkArgv failure is
+ * resumable" — the classification doc is explicit that only THESE three
+ * fields were ever verified (FACTORY-314's own Step 0 style test) to have
+ * `claude --resume` tolerate the flag changing: `permissionMode`
+ * (`--permission-mode`), `strictMcpConfig` (`--strict-mcp-config`), and the
+ * `mcpServers` `channel`-flag half (`--dangerously-load-development-channels`).
+ * Every OTHER `checkArgv` reason — a `--mcp-config` VALUE mismatch, a
+ * `--dangerously-bypass-approvals-and-sandbox`/`--cd`/`--config` mismatch (a
+ * DIFFERENT `AgentConfig`/`spec.cwd` shape this ticket never verified `--resume`
+ * against), or any future flag `checkManagedAgentArgv` ever grows — must stay
+ * `false`, including when it appears ALONGSIDE an allowed flag in the SAME
+ * `missing` list: a mixed reason means at least one unverified field changed
+ * too, which is a combination this ticket never tested.
+ */
+export function resumableArgvReason(reason: string, provider: ManagedAgentProvider): boolean {
+  if (provider !== "claude") return false;
+  const prefix = "argv lacks ";
+  if (!reason.startsWith(prefix)) return false;
+  const pieces = reason.slice(prefix.length).split(", ");
+  if (pieces.length === 0) return false;
+  const ALLOWED_FLAGS = new Set(["--permission-mode", "--strict-mcp-config", "--dangerously-load-development-channels"]);
+  return pieces.every((piece) => ALLOWED_FLAGS.has(piece.split(" ")[0] ?? ""));
+}
 
 /**
  * BUTCHR-320: the single tag every spawn-attempt outcome line is emitted
@@ -619,7 +668,30 @@ export class HerdrHerd implements Herd {
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
-      if (!check.ok) { out.push({ issue, reason: check.reason, observedArgv: proc.argv }); continue; }
+      if (!check.ok) {
+        // FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 3):
+        // the SECOND push site that may ever set `resumable` — see
+        // `resumableArgvReason`'s own doc comment for the exact, deliberate
+        // per-reason allowlist. Every `checkArgv` failure OUTSIDE that
+        // allowlist (or on a non-Claude provider) keeps today's behavior
+        // exactly: `resumable` absent, `herd.stop()`+`herd.spawn()`.
+        const resumable = resumableArgvReason(check.reason, provider);
+        // "Treat Claude-only as a stated property" (classification doc,
+        // Finding 2, point 4): computed with the REAL provider known here
+        // (never guessed downstream from the reason string alone, which
+        // would be indistinguishable from an ordinary Claude checkArgv
+        // failure that just hasn't gone through this ticket's widening) —
+        // if this SAME reason would have been resumable on a Claude agent
+        // but this agent's actual provider is something else, the respawn
+        // comment must say so explicitly rather than reading as a bare argv
+        // diff with no hint that the session loss is an intentional
+        // limitation, not a bug.
+        const reason = !resumable && provider !== "claude" && resumableArgvReason(check.reason, "claude")
+          ? `session lost: its definition changed ${check.reason.replace(/^argv lacks /, "")}, a field that CAN preserve a session on a Claude-vendor agent, but this agent's provider (${provider}) is not Claude — butchr's resume-in-place mechanism is Claude-only by construction (no verified --resume-equivalent exists for any other provider), so this is a stated limitation, not a defect`
+          : check.reason;
+        out.push({ issue, reason, observedArgv: proc.argv, resumable });
+        continue;
+      }
       // FACTORY-75: `--model`/`--effort` are deliberately excluded from
       // `checkArgv`/`checkManagedAgentArgv`'s own comparison just above
       // (this method's own top comment: "issuetype/summary/parent don't
