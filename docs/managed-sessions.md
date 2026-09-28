@@ -1248,10 +1248,11 @@ and `lizardMode`" section for the rule-side field story, and
 `docs/permission-answer-loop.md` for how `ruleLizardModeOf`
 (`src/agents/permission-answer-loop.ts`) extends `eligiblePanes` to cover them.
 
-**Vendor:** `codex`, like `strictMcpConfig`, REJECTS `lizardMode` at
-manifest load rather than silently storing-and-dropping it — see
-"Per-vendor launch differences" immediately below for why this follows
-`strictMcpConfig`'s precedent, not `permissionMode`'s more lenient one.
+**Vendor:** `codex`, unlike `strictMcpConfig` (which it still REJECTS at
+manifest load), ACCEPTS `lizardMode` (FACTORY-108) — see the eligibility
+table above for what an absent/`true`/`false` value on a `codex` definition
+actually does, and "Per-vendor launch differences" immediately below for
+`strictMcpConfig`'s own (unchanged) rejection.
 
 ## Per-vendor launch differences
 
@@ -1285,13 +1286,19 @@ they have an MCP-isolation security property they do not — the exact
 silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
 first place. `test/unit/session-definition.test.ts` proves the rejection.
 
-`lizardMode` follows `strictMcpConfig`'s precedent, not `permissionMode`'s:
-`@brooswit/drovr`'s `classifyPermissionPrompt` recognises the Claude Code
-CLI's own tool-permission dialog shape specifically and never matches a
-Codex pane's screen, so a `vendor: "codex"` definition setting
-`lizardMode: true` would silently do nothing — the same misleading-silence
-failure mode, closed the same way (**REJECTED at manifest load**, any
-value, not merely a truthy one).
+`lizardMode` is **NOT** `strictMcpConfig`'s precedent (FACTORY-108,
+superseding an earlier draft of this doc that said otherwise): a
+`vendor: "codex"` definition CAN set `lizardMode` — it is validated and
+stored like any other field, never rejected at manifest load. An explicit
+`true` reaches `SpawnSpec.lizardMode` and, via `agentLaunchConfig`'s Codex
+branch (`src/agents/argv.ts`), drops `--dangerously-bypass-approvals-and-sandbox`
+from the launch argv so drovr's Codex approval-answering (its own
+Codex-specific dialog recognition, not `classifyPermissionPrompt`, which
+stays Claude-only) has a dialog to see and answer. See the "Codex
+eligibility for SCANNING vs. LAUNCH" table above for the full
+absent/`true`/`false` matrix, which differs from `permissionMode`'s
+Claude-only default specifically because Codex's own launch condition is
+explicit-`true`-only, not "absent means eligible".
 
 ## Not in this version
 
