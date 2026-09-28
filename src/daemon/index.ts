@@ -793,6 +793,7 @@ const { app, mcp } = buildApp({
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((r) => r.id === rule.id)) return githubPrStaffingResult.reason;
         if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
         return null;
       },
@@ -897,9 +898,14 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
  * `speakOnOwnChannel`/`ops.addComment` would otherwise post a doomed Jira
  * write against — a real escalation silently lost for exactly the
  * long-lived (persistent/singleton) agents this ticket exists to support.
- * `resourceOfCwd` itself is UNCHANGED and still used for the dashboard/
- * label-sync status map, where the bogus fallback is a harmless, never-
- * looked-up orphan entry, not a write.
+ * `resourceOfCwd` itself is UNCHANGED and still used for the label-sync
+ * status map (`statusMapFromAgents`, which needs the BARE key to match a
+ * Jira search's own issue keys). FACTORY-407: the dashboard no longer goes
+ * through `resourceOfCwd` at all — `agentStatusesFeedingDashboard` below
+ * feeds `buildDashboardRows` the FULL owned key (`ownedAgentOfCwd` itself,
+ * undiscarded) via a separate `agent_key` field, because `resourceOfCwd`'s
+ * bare fallback is exactly what made every real `AgentDashboardRow.resourceKey`
+ * undecodable — see that ticket for the full history.
  */
 const escalationTargetOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
@@ -953,7 +959,12 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
-      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })) };
+      // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
+      // own correlation identifier (`buildDashboardRows`); `resource_key`
+      // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
+      // `statusMapFromAgents` below already needs. One `ownedAgentOfCwd` call
+      // per agent either way — `resourceOfCwd` already makes its own.
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: ownedAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
