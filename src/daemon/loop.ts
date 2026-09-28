@@ -44,6 +44,10 @@ export interface LoopDeps {
    * src/daemon/index.ts wires it through.
    */
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
+  onResumePreserved?: (issue: string) => void | Promise<void>;
+  /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
+  onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
   /** Reconcile daemon-owned (agent:*, pr:*) labels on this poll's `issues`. */
   syncLabels?: (issues: readonly JiraIssue[]) => Promise<ReadonlySet<string>>;
   /**
@@ -183,12 +187,61 @@ export class RespawnGuard {
   }
 }
 
+/**
+ * FACTORY-314 — tracks CONSECUTIVE `herd.resumeInPlace()` non-terminal
+ * outcomes ("deferred": the agent is mid-turn; "stuck": its pane never
+ * returned to a shell after being asked to exit) per issue, purely for an
+ * honest one-time notice, never to force a fresh restart — the operator
+ * requirement this ticket exists for is precisely that a model/effort
+ * change must NOT destroy a mid-turn conversation, so neither outcome ever
+ * falls back to `stop()`+`spawn()` (see `reconcileNow`'s own respawn loop).
+ * `count()` returning exactly `NOTICE_AT_POLLS` is the caller's cue to speak
+ * up ONCE; every later poll's `count()` keeps climbing (nothing resets it
+ * except an eventual `"resumed"`/`"unresumable"` outcome) but the caller
+ * only acts on THAT one boundary value, not "count >= threshold", so a
+ * human is told once rather than on every subsequent poll.
+ */
+export class ResumeDeferGuard {
+  private counts = new Map<string, number>();
+  /** Record a non-terminal poll for `issue`; returns the new consecutive count. */
+  count(issue: string): number {
+    const n = (this.counts.get(issue) ?? 0) + 1;
+    this.counts.set(issue, n);
+    return n;
+  }
+  /** Reset `issue`'s streak — call on any terminal outcome ("resumed" or "unresumable"). */
+  clear(issue: string): void {
+    this.counts.delete(issue);
+  }
+}
+
+/** Consecutive `"deferred"`/`"stuck"` polls before `onResumeWaiting` fires once — see `ResumeDeferGuard`'s own doc comment. */
+export const RESUME_WAITING_NOTICE_AT_POLLS = 10;
+
 export interface ReconcileOptions {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   /** Storm-guard state; see RespawnGuard. Defaults to a fresh (never-suppressing) instance. */
   guard?: RespawnGuard;
   /** Called, with the exact line to log, when the storm guard suppresses a would-be respawn. */
   onSuppressed?: (issue: string, message: string) => void;
+  /**
+   * FACTORY-314 — `herd.resumeInPlace()` succeeded: `issue`'s Claude
+   * conversation was preserved across a model/effort change on the SAME
+   * session id. The wiring (src/daemon/index.ts) posts a "session preserved"
+   * comment here — one that must NOT tell the agent to re-read its ticket as
+   * if fresh, unlike `onRespawn`'s comment.
+   */
+  onResumePreserved?: (issue: string) => void | Promise<void>;
+  /**
+   * FACTORY-314 — `herd.resumeInPlace()` has returned `"deferred"`/`"stuck"`
+   * for `issue` on `RESUME_WAITING_NOTICE_AT_POLLS` CONSECUTIVE polls (never
+   * fired again until it resolves and re-accumulates) — an honest one-time
+   * notice that a model/effort change is still waiting on the agent (mid-turn,
+   * or a pane stuck on a dialog), never a trigger to force a restart.
+   */
+  onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /** State for `onResumeWaiting`'s consecutive-poll count; see `ResumeDeferGuard`. Defaults to a fresh (per-call) instance, matching `guard`'s own default shape. */
+  resumeDeferGuard?: ResumeDeferGuard;
   /**
    * BUTCHR-66/83: resource ids currently `"asleep"` — see `planReconcile`'s
    * `atRest` param, which this is threaded straight through to. Defaults to
@@ -492,6 +545,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     }));
   }
   const guard = opts.guard ?? new RespawnGuard();
+  const resumeDeferGuard = opts.resumeDeferGuard ?? new ResumeDeferGuard();
   const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
@@ -684,6 +738,42 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   }
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
+    let reason = info.reason;
+    // FACTORY-314: a `resumable` staleness (Claude, model/effort-only) tries
+    // `herd.resumeInPlace()` FIRST, entirely OUTSIDE the RespawnGuard/stop/
+    // spawn machinery below — a "deferred"/"stuck" outcome is not a respawn
+    // ATTEMPT at all (nothing was stopped, nothing was spawned), so it must
+    // never consume a guard admission slot or trip the "respawned again
+    // within N polls" suppression warning; only "unresumable" falls through
+    // to today's stop-then-fresh-spawn path, with `reason` overridden to an
+    // honest, distinct explanation.
+    if (info.resumable && herd.resumeInPlace) {
+      const spec = desired.get(issue)!;
+      let outcome: Awaited<ReturnType<NonNullable<Herd["resumeInPlace"]>>>;
+      try {
+        outcome = await herd.resumeInPlace(spec);
+      } catch (e) {
+        failures.push({ id: issue, stage: "respawn", error: e });
+        continue;
+      }
+      if (outcome === "deferred" || outcome === "stuck") {
+        const count = resumeDeferGuard.count(issue);
+        if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
+        continue; // no stop, no spawn, no guard admission — retried next poll
+      }
+      resumeDeferGuard.clear(issue);
+      if (outcome === "resumed") {
+        if (opts.onResumePreserved) await opts.onResumePreserved(issue);
+        continue;
+      }
+      // outcome is "unresumable" or "failed": fall through to the
+      // stop-then-fresh-spawn path below, same as any other stale reason,
+      // with an honest, DISTINCT reason for each — a genuine "no id to
+      // resume with" reads differently from "we tried and it didn't stay up".
+      reason = outcome === "failed"
+        ? "session lost: resume failed (the relaunched session did not stay alive — see the pane for details)"
+        : "session lost: session id could not be determined";
+    }
     if (!guard.admit(issue, poll)) {
       const until = guard.eligibleAgainAt(issue);
       opts.onSuppressed?.(
@@ -747,7 +837,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // isolation scope is herd.spawn/stop/respawn specifically (its own
     // title) — production wiring already guarantees this callback never
     // throws (see daemon/index.ts's own `.catch` around its Jira comment).
-    if (opts.onRespawn) await opts.onRespawn(issue, info.reason, info.observedArgv);
+    if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
   }
   // BUTCHR-147: called once per poll, after every isolated spawn/stop/respawn
   // attempt above — never gates or delays anything (see ReconcileOptions.checkReconcileFailure's own doc comment).
@@ -909,6 +999,10 @@ export interface GenericLoopDeps<T> {
   ownsId: (id: string) => boolean;
   notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
+  onResumePreserved?: (issue: string) => void | Promise<void>;
+  /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
+  onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
   /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above — same placement rule as `checkParked`, no `related` needed. Optional; omitted, abandoned-worker detection simply never runs. */
@@ -982,6 +1076,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   // survives across polls without leaking between independent
   // runResourceLoop calls (e.g. separate tests).
   const respawnGuard = new RespawnGuard();
+  const resumeDeferGuard = new ResumeDeferGuard();
   // BUTCHR-57: a monotonic counter used as `watch()`'s `hash` option below,
   // forcing `onChange` (the notify stage) to run on EVERY poll rather than
   // only when the fetched Snapshot's content-hash differs from last time.
@@ -1017,7 +1112,10 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+        ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
+        ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
         guard: respawnGuard,
+        resumeDeferGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
         ...(deps.checkFrozenAsleep ? { checkFrozenAsleep: deps.checkFrozenAsleep } : {}),
         ...(deps.checkDeclaredDone ? { checkDeclaredDone: deps.checkDeclaredDone } : {}),
@@ -1188,6 +1286,8 @@ export function startLoop(deps: LoopDeps): Stop {
     ownsId: () => true,
     notify: deps.notify,
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+    ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
+    ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
     ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
     ...(deps.checkAbandoned ? { checkAbandoned: deps.checkAbandoned } : {}),

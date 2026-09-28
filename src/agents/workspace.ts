@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, renameSync, rmdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync, renameSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -1042,4 +1042,126 @@ export function workspaceModel(dir: string): string | undefined {
 export function workspaceEffort(dir: string): AgentPreference["effort"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-effort.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — this workspace's own persisted Claude
+ * session id (`.butchr-session-id.json`), DISCOVERED from Claude's own
+ * transcript directory right after a successful fresh launch
+ * (`discoverClaudeSessionId`/`persistDiscoveredSessionId` below,
+ * `HerdrHerd.startProviders`), never pre-minted by butchr itself — a fresh
+ * Claude launch runs under Claude's OWN auto-generated session id, and
+ * nothing butchr passes reaches that real launch's argv (Drovr's
+ * `ManagedHerdrLifecycle.start()` builds its own `agent.start` params via
+ * `buildAgentStartParams`, which has no `--session-id` concept at all).
+ * `undefined` for a workspace spawned by a build before this ticket, one
+ * whose discovery failed (a WARNING is logged when that happens — see
+ * `startProviders`), or a non-Claude provider — all mean "no known session
+ * id", the same fail-safe shape `workspaceModel`/`workspaceEffort` already
+ * use for their own missing file.
+ */
+export function workspaceSessionId(dir: string): string | undefined {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-session-id.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — Claude Code's own encoding of a working
+ * directory into its `~/.claude/projects/<encoded>/` transcript folder name.
+ * Matches Drovr's OWN encoding EXACTLY (`resolve(cwd).replace(/[^a-zA-Z0-9]/g,
+ * "-")`, verified against the pinned 0.15.1 source, `readClaudeTranscriptTail`/
+ * `readNativeTranscript` in `node_modules/@brooswit/drovr/dist/index.js`) —
+ * duplicated here rather than imported because Drovr does not export it,
+ * only functions that already know the session id and just need to read one
+ * specific transcript; this file needs to LIST a directory to find out what
+ * id Claude picked in the first place, which Drovr has no function for.
+ */
+function claudeProjectDir(dir: string, home: string = homedir()): string {
+  return join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix; epic review on PR #513, "trap 2") — the id
+ * of a `.jsonl` transcript under this workspace's own Claude project folder
+ * that is POSITIVELY TIED to a launch started at or after `after` (epoch
+ * ms, `Date.now()`-comparable) — never merely "the newest file present".
+ * That distinction is load-bearing, not cosmetic: a workspace directory is
+ * unique per issue (`workspaceDirFor`), but is NOT guaranteed to hold only
+ * ONE transcript ever — a prior respawn of the SAME issue leaves its OLDER
+ * transcript sitting right there. Picking "whatever's newest" with no time
+ * bound would, on a slow launch, silently resolve to that OLDER transcript
+ * instead of failing safe — a WRONG id that still validates and still
+ * resumes, restoring the agent into someone else's finished conversation
+ * with no error at all. Filtering by `created >= after` (birth time,
+ * falling back to mtime when a filesystem doesn't report birth time)
+ * closes that: nothing can be created before the launch that is about to
+ * produce it, so a transcript failing this check is BY CONSTRUCTION not
+ * this launch's, and `after` omitted means "no bound" (only used where a
+ * caller has already scoped candidates some other way — no caller in this
+ * codebase does that yet). No qualifying transcript returns `undefined`,
+ * the same fail-safe "cannot establish it — don't guess" contract
+ * `HerdrHerd.startProviders`'s own caller already treats as "session lost:
+ * id unknown" rather than resuming a best guess.
+ */
+export function discoverClaudeSessionId(dir: string, home?: string, after?: number): string | undefined {
+  const projectDir = claudeProjectDir(dir, home);
+  let entries: string[];
+  try { entries = readdirSync(projectDir); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  let newest: { id: string; created: number } | undefined;
+  for (const entry of entries) {
+    if (!entry.endsWith(".jsonl")) continue;
+    let stat: ReturnType<typeof statSync>;
+    try { stat = statSync(join(projectDir, entry)); }
+    catch { continue; } // a transcript removed between readdir and stat — not a candidate
+    // `birthtimeMs` is 0 (or absent) on a filesystem that doesn't track
+    // creation time — fall back to `mtimeMs` there rather than treating
+    // every entry as "created at epoch 0" (which `after` would then reject
+    // outright on every filesystem that lacks birth time).
+    const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+    if (after !== undefined && created < after) continue; // exists, but predates this launch — not a candidate, ever
+    if (!newest || created > newest.created) newest = { id: entry.slice(0, -".jsonl".length), created };
+  }
+  return newest?.id;
+}
+
+/** Persists a discovered (or resumed) session id — the write half of `workspaceSessionId`. */
+export function persistDiscoveredSessionId(dir: string, sessionId: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify(sessionId));
+}
+
+/**
+ * FACTORY-314 (epic review on PR #513, round 3) — the OTHER half of
+ * `persistDiscoveredSessionId`'s "never a guess" contract, closing a gap a
+ * failed discovery left wide open. `.butchr-session-id.json` was previously
+ * ONLY ever written, never invalidated: `startProviders()`'s own discovery
+ * failure branch just logged a WARNING and moved on, leaving an OLDER id
+ * from a PRIOR launch of this same workspace on disk. That id's transcript
+ * is still sitting right there too (`claudeTranscriptExists` is a bare
+ * `existsSync`, and the project folder is per-cwd, stable across respawns —
+ * see `discoverClaudeSessionId`'s own doc comment for why), so a LATER
+ * model/effort change would find a persisted id that validates cleanly and
+ * `--resume` it — silently resuming a DIFFERENT, already-finished
+ * conversation and reporting it "PRESERVED". Called from that same
+ * discovery-failure branch instead of merely logging: removing the file
+ * (tolerating ENOENT — nothing to remove is not an error) makes
+ * `workspaceSessionId` fail-safe back to `undefined`, so `resumeInPlace()`'s
+ * existing `if (!sessionId) return "unresumable"` check catches it — an
+ * honest fresh restart, never a wrong-but-real resume.
+ */
+export function invalidatePersistedSessionId(dir: string): void {
+  try { rmSync(join(dir, ".butchr-session-id.json")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — whether a transcript for `sessionId`
+ * actually exists under this workspace's Claude project folder. Consulted
+ * by `resumeInPlace()` right before attempting `--resume <id>`: a stale or
+ * corrupted persisted id must fail safe to "unresumable" (an honest fresh
+ * restart) rather than resuming a nonexistent conversation.
+ */
+export function claudeTranscriptExists(dir: string, sessionId: string, home?: string): boolean {
+  return existsSync(join(claudeProjectDir(dir, home), `${sessionId}.jsonl`));
 }
