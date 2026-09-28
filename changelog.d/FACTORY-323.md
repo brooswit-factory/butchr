@@ -1,0 +1,8 @@
+---
+bump: patch
+---
+
+### Fixed
+
+- **The Configurations view (`/configurations`, `/config-inventory`) claimed a rule was `UNSTAFFED: no matching resources this poll` — a genuine observed zero — even when the ONE admission source covering that rule's provider (e.g. Jira issues, GitHub issues, Zendesk tickets) had declined or never reported this poll, in which case a matched-but-withheld resource for that rule could not actually be ruled out (FACTORY-136).** The agent census being fine (FACTORY-132's own tri-state) is a different, broader fact from a specific rule's OWN admission source being down: the fleet-wide "admission cap: withheld" reason relies on withheld rows that are only refreshed for a source whose census reported this poll, so a rule whose covering source was unavailable had no way to know its true state. `ruleStaffingReason` now resolves each rule's own covering admission source (a verified, total, 1:1 mapping from `ResourceProvider` to admission-source name — `jira-work` → `"issue"`, every other provider identity) and, when that source's own census is unavailable AND the rule has no live or withheld row (fresh or carried forward), reports the SAME `staffed: null` tri-state FACTORY-132 introduced, naming the unavailable source and its own decline reason. No new render flag was needed: `renderStaffed` already renders any `staffed === null` as `COULD NOT CHECK: <reason>` regardless of which census produced it.
+- The existing check order is unchanged for every prior branch (disabled, provider config reason, live agent, admission-cap withheld, agent-census-unavailable) — the new check sits strictly after those, so a rule whose covering source reported this poll, or one already known live/withheld, is completely unaffected.
