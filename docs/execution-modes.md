@@ -632,3 +632,70 @@ metadata for every owned running workspace (never an unowned one, proven
 via cwd, never via herdr's own label), disambiguates the same way
 spawn-time does, is idempotent, and never lets a herdr hiccup or one
 workspace's own failure block the rest.
+
+## Workspace DIRECTORY layout: short leaves, lossless resolution, and the memory-slug migration (FACTORY-118, implementing FACTORY-91, epic FACTORY-83)
+
+The section above gives every resource agent a short herdr **label**. This
+ticket applies the SAME per-provider short id (`shortDisplayId`,
+`src/rules/display-label.ts` — reused, never a second naming scheme) to the
+on-disk workspace **directory**'s leaf, so e.g.
+`<root>/filesystem/managed-sessions/%2Fhome%2F...%2Fsession-definitions%2Fadmin-assembly.json`
+becomes `<root>/filesystem/managed-sessions/admin-assembly`. Full details,
+the empirical Claude Code slug-algorithm verification, the required Servy
+proof (with its negative control), and the operator deploy runbook all live
+in **`docs/workspace-layout.md`** — this section is the short pointer + the
+one correction to the section above that this ticket's own story made after
+the fact.
+
+**Correction to "Collisions: deterministic and loud" above:** that section
+correctly describes `collisionSuffix` as stable (a pure hash of the full
+key), but a label's BARE-vs-SUFFIXED tie-break (which member of a colliding
+group keeps the bare name) is NOT stable — `resolveDisplayLabels`'s own doc
+comment says a label "can change over time" as other colliding keys come and
+go. That is fine for a disposable herdr label. It is NOT fine for a
+directory that holds memory, transcripts and git worktrees: recomputing a
+DIRECTORY's leaf the same way would rename a workspace out from under itself
+for a reason that has nothing to do with that workspace. `newLayoutDirFor`
+(`src/agents/workspace.ts`) therefore does not reuse `resolveDisplayLabels`'s
+tie-break at all — it chooses a leaf ONCE, at first claim, sticky forever
+after via the bookkeeping stamp described in `docs/workspace-layout.md`.
+
+Three points worth knowing without opening that doc:
+
+1. **The leaf is the provider's short id alone**, never combined with the
+   rule id the way a herdr LABEL combines it (`"<shortId> · <ruleId>"`) — a
+   workspace path already carries the rule id as its own separate directory
+   segment (`<provider>/<ruleId>/<leaf>`), so appending it into the leaf too
+   would duplicate it. `jira-work`/`jira-idea`/`jira-project`'s identity
+   short ids mean those three providers see **no directory change and no
+   filesystem write at all** — only `filesystem`, `github-issue`,
+   `github-pr` and `zendesk-ticket` workspaces ever actually move.
+2. **A short id is not a lossless encoding of the resource id** (unlike the
+   pre-ticket `encodeURIComponent`-escaped leaf), so the reverse mapping
+   `agentIdOfWorkspacePath` (a pane's cwd -> its agent key — every
+   ownership/reap/residency/reconcile decision in the fleet depends on this)
+   needed a lossless mechanism that does not depend on decoding the leaf: a
+   bookkeeping stamp file written inside the directory at claim time. An
+   old-layout (still fully percent-encoded, not yet migrated) workspace
+   keeps decoding exactly as it always did — nothing about pre-ticket
+   directories changed.
+3. **Renaming an existing workspace's directory also has to move Claude
+   Code's own `~/.claude/projects/<slug-of-cwd>` memory/transcript
+   directory**, or the agent silently loses every prior conversation the
+   next time it resumes — the hazard this whole ticket exists to close.
+   `docs/workspace-layout.md` has the empirical proof this actually works
+   (and, separately, an actual failure mode this ticket found and fixed:
+   Claude Code truncates-and-hashes a slug over 200 characters in a way this
+   codebase cannot reproduce, so a migration whose NEW path would trip that
+   threshold refuses loudly rather than silently guessing wrong).
+
+`test/unit/workspace.test.ts` and `test/unit/workspace-migration.test.ts`
+carry this ticket's own test coverage (leaf validation against hostile short
+ids, sticky/collision resolution, slug-collision detection, the migration's
+idempotent/reversible/never-overwrite-non-empty properties and their edge
+cases, and `planWorkspaceMigration`'s pure decision logic for the operator
+script). `test/unit/herd.test.ts`, `test/unit/missing-rules-preflight.test.ts`
+and the other caller files listed in `docs/workspace-layout.md`'s own
+"Callers updated" section cover Addendum A5's fail-open bar: a mixed fleet
+of old-layout and new-layout agents recognised identically, stably, across
+repeated polls — the FACTORY-47/FACTORY-75 class of bug, in a new place.

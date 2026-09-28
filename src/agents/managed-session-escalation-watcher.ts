@@ -51,10 +51,17 @@ export interface ManagedSessionEscalationWatcher {
 export function createManagedSessionEscalationWatcher(
   escalator: Pick<Escalator, "onDrovrUnknownDialog" | "onDrovrDialogResolved">,
 ): ManagedSessionEscalationWatcher {
-  const watcher: BlockingEscalationWatcher = createBlockingEscalationWatcher({
-    onUnknownDialog: (escalation) => escalator.onDrovrUnknownDialog(escalation),
-    onDialogResolved: (resolved) => escalator.onDrovrDialogResolved(resolved),
-  });
+  const watcher: BlockingEscalationWatcher = createBlockingEscalationWatcher(
+    {
+      onUnknownDialog: (escalation) => escalator.onDrovrUnknownDialog(escalation),
+      onDialogResolved: (resolved) => escalator.onDrovrDialogResolved(resolved),
+    },
+    // FACTORY-326: `permissionScope` must match the scope butchr's own answering
+    // pass actually runs (`src/agents/permission-answer-loop.ts`'s `scope: "once"`,
+    // FACTORY-93) — a mismatch here would silently reintroduce FACTORY-318's bug
+    // by escalating (or failing to escalate) a `permission` dialog for the wrong scope.
+    { permissionScope: "once" },
+  );
   return {
     poll: (client, options) =>
       watcher.poll({ agent: { list: client.agent.list, read: client.agent.read, sendKeys: async () => ({ type: "ok" }) } }, options),
