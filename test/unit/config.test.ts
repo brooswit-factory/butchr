@@ -336,4 +336,33 @@ describe("loadConfig", () => {
     expect(d).toContain("temporaryAccountCapThreshold=8");
     expect(d).toContain("adminTokenFile=/etc/rc-token");
   });
+
+  // FACTORY-369: a SEPARATE identity from `rocketchat` above — same
+  // all-or-nothing shape, but its own env vars.
+  describe("managedEscalationRocketChat (FACTORY-369)", () => {
+    test("absent when any of the three required settings is missing", () => {
+      expect(loadConfig(base, noRead).managedEscalationRocketChat).toBeUndefined();
+      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x" }, noRead).managedEscalationRocketChat).toBeUndefined();
+      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1" }, noRead).managedEscalationRocketChat).toBeUndefined();
+    });
+    test("populated when all three are set; room defaults to team-admin", () => {
+      const c = loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token" }, noRead);
+      expect(c.managedEscalationRocketChat).toEqual({ url: "https://chat.x", adminUserId: "a1", adminTokenFile: "/etc/ta-token", room: "team-admin" });
+    });
+    test("BUTCHR_TEAM_ADMIN_ROOM overrides the default room", () => {
+      const c = loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token", BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead);
+      expect(c.managedEscalationRocketChat?.room).toBe("ops-alerts");
+    });
+    test("a stray BUTCHR_TEAM_ADMIN_ROOM never crashes a daemon that otherwise has no team-admin config", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead)).not.toThrow();
+      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead).managedEscalationRocketChat).toBeUndefined();
+    });
+    test("describeConfig reports it disabled or its url/admin id/room, and never reads (or could leak) the token file", () => {
+      expect(describeConfig(loadConfig(base, noRead))).toContain("managedEscalationRocketChat=disabled");
+      const d = describeConfig(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token" }, noRead));
+      expect(d).toContain("url=https://chat.x");
+      expect(d).toContain("room=team-admin");
+      expect(d).toContain("adminTokenFile=/etc/ta-token");
+    });
+  });
 });
