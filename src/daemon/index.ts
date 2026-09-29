@@ -1724,6 +1724,21 @@ startManagedSessionsLoop({
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   checkCrashLoop: managedSessionCrashLoopDetector.check,
+  // FACTORY-505: the gap FACTORY-500 found and this comment used to name —
+  // `onResumeWaiting`/`onResumePreserved` never reached `startManagedSessionsLoop`
+  // at all, so a managed session (buddy, genius) deferring a model/effort
+  // resume was silent however long it deferred, and a successful in-place
+  // resume never even logged. Same "no Jira ticket to comment on" reasoning
+  // as `managedSessionCrashLoopDetector`/`managedSessionRestoredPaneEscalationDetector`
+  // above — log only, never `ops.addComment`. See
+  // `ManagedSessionsLoopDeps.onResumeWaiting`/`.onResumePreserved`'s own doc
+  // comments (src/daemon/session-definitions-loop.ts).
+  onResumeWaiting: (agent, outcome, consecutivePolls) => {
+    console.error(`  [managed-sessions:resume-waiting] ${agent}: resume still waiting after ${consecutivePolls} polls (${outcome}) — no Jira ticket to comment on, logging instead`);
+  },
+  onResumePreserved: (agent) => {
+    console.error(`  [managed-sessions] ${agent} resumed in place (session preserved)`);
+  },
   // FACTORY-501: REQUIRED wiring — without this, a restored-pane escalation
   // would silently never fire for buddy/genius (the canary set), the exact
   // gap FACTORY-500 found in `onResumeWaiting`/`onResumePreserved` above
