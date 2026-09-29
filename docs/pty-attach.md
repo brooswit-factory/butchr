@@ -30,7 +30,7 @@ see `src/rules/agent-key.ts`). The upgrade is refused (never opened) when:
 
 | condition | result |
 |---|---|
-| `BUTCHR_EXTENSION_ORIGINS` unset/empty | `403` on every request — fail-closed, the endpoint is effectively disabled |
+| `BUTCHR_EXTENSION_ORIGINS` explicitly EMPTY | `403` on every request — fail-closed, losing even the default below, the endpoint is effectively disabled |
 | `Origin` header ABSENT | `403` — the only credential left, so an absent one has nothing to fall back to |
 | `Origin` present but not in `BUTCHR_EXTENSION_ORIGINS` | `403` |
 | `:agentKey` does not decode as a valid agent key | `404`, `"not a valid agent key: <key>"` |
@@ -139,7 +139,7 @@ instead.
 
 | env var | required | effect |
 |---|---|---|
-| `BUTCHR_EXTENSION_ORIGINS` | to enable the endpoint | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses. **UNSET/EMPTY means the endpoint is DISABLED (403 on every upgrade attempt), never open.** |
+| `BUTCHR_EXTENSION_ORIGINS` | optional | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses — see that doc's Config section for the default (Clevr's fixed id), the additive-override behavior, and the explicit-empty fail-closed case. |
 
 Read once into `Config.extensionAuth` (`src/config/config.ts`) and consumed
 here through `src/web/origin-guard.ts` — the exact same mechanism
