@@ -426,7 +426,7 @@ describe("HerdrHerd ordered provider fallback", () => {
 
     test("a Codex kickoff that lands on the usage-limit notice falls through to Claude", async () => {
       const f = fixture({ refuseCodex: true });
-      const availability = new ProviderAvailabilityRegistry();
+      const availability = new ProviderAvailabilityRegistry(() => new Date(2026, 8, 24, 12, 0).getTime());
       const herd = new HerdrHerd(f.client, url, instant, undefined, { ...config, providers: ["codex", "claude"] }, availability);
       await herd.spawn(spec);
       expect(f.starts.map(p => p.kind)).toEqual(["codex", "claude"]);
@@ -466,7 +466,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     test("nudging a Codex pane on the notice reports the refusal and never presses Enter on its menu", async () => {
       const f = fixture({ existing: [existing("codex")], text: codexNotice });
       f.client.agent.prompt = async (params: any) => { f.prompts.push(params); return { agent: f.rows()[0] }; };
-      const herd = new HerdrHerd(f.client, url, instant, undefined, config, new ProviderAvailabilityRegistry());
+      const herd = new HerdrHerd(f.client, url, instant, undefined, config, new ProviderAvailabilityRegistry(() => new Date(2026, 8, 24, 12, 0).getTime()));
       const result = await herd.nudge(spec.key, "new request");
       expect(result.delivered).toBe(true);
       // Codex accepts follow-ups in its native input path (see nudge()'s own
@@ -485,7 +485,7 @@ describe("HerdrHerd ordered provider fallback", () => {
         ["agy", codexNotice],
       ] as const) {
         const f = fixture({ existing: [existing(agent)], text });
-        const availability = new ProviderAvailabilityRegistry();
+        const availability = new ProviderAvailabilityRegistry(() => new Date(2026, 8, 24, 12, 0).getTime());
         const herd = new HerdrHerd(f.client, url, instant, undefined, config, availability, instant);
         expect(await herd.recoverQuota(spec)).toBe("not-refused");
         expect(f.creates).toEqual([]);
