@@ -45,10 +45,14 @@
  * against a fixed literal host.
  *
  * A URL is classified into AT MOST ONE provider (`jira-work` checked first,
- * then GitHub, then Zendesk) purely because a canonical URL can only ever
- * match one host in the first place — the ordering has no observable effect
- * given that constraint, but is fixed here (rather than left to iteration
- * order) so a future reader doesn't have to wonder.
+ * then `jira-project`, then GitHub, then Zendesk) purely because a canonical
+ * URL can only ever match one host in the first place — the ordering has no
+ * observable effect given that constraint, but is fixed here (rather than
+ * left to iteration order) so a future reader doesn't have to wonder. The
+ * one place `jira-work` vs. `jira-project` ordering DOES matter is
+ * `/browse/<KEY>` and any `selectedIssue`-bearing project URL, both of which
+ * `resolveJiraWorkItem` must see first — see the JIRA PROJECT URL FORMS note
+ * below.
  *
  * JIRA URL FORMS (own judgment call, not a fact asserted about any live Jira
  * instance — verify these against the real product before trusting them
@@ -59,12 +63,24 @@
  * `/jira/software/projects/<PROJ>/boards/<N>?selectedIssue=<KEY>`). All three
  * end up validated through the SAME `parseJiraWorkItemRef` call, so none of
  * them can produce a key `isIssueKey` itself would reject.
+ *
+ * JIRA PROJECT URL FORMS (FACTORY-532, implementing FACTORY-531): a project
+ * or board page — `/jira/software/c/projects/<KEY>` or
+ * `/jira/software/projects/<KEY>`, with any path segments and query string
+ * beyond that (boards, backlog, list, timeline, `?selectedIssue=`-free query
+ * strings, ...) — and the bare `/browse/<KEY>` project-home view. Checked
+ * ONLY after `resolveJiraWorkItem` has already had a chance to match: an
+ * `/issues/<KEY>` suffix or a `selectedIssue` query param is an ISSUE inside
+ * the project, not the project itself, and `parseJiraWorkItemRef` rejects a
+ * bare project key (no `-<digits>` suffix) outright, so `/browse/<KEY>` only
+ * ever reaches this resolver for a project key, never an issue key.
  */
 import type { ResourceProvider } from "../rules/agent-key.js";
 import { githubIssueRefFromUrl, githubPrRefFromUrl } from "./github-issue-ref.js";
 import { formatGithubIssueRef } from "./github-issue-ref.js";
 import { formatGithubPrRef } from "./github-pr-ref.js";
 import { parseJiraWorkItemRef } from "./jira-work-item-ref.js";
+import { parseJiraProjectRef } from "./jira-project-ref.js";
 import { isZendeskSubdomain, parseZendeskTicketRef } from "./zendesk-ticket-ref.js";
 import { parseWebpageRef } from "./webpage-ref.js";
 
@@ -122,6 +138,25 @@ function resolveJiraWorkItem(u: URL, jiraHost: string): ResourceIdentity | null 
   return ref ? { provider: "jira-work", id: ref.key } : null;
 }
 
+/** The new-UI project/board form: `/jira/software/c/projects/<KEY>` or `/jira/software/projects/<KEY>`, with anything (or nothing) after it. */
+const PROJECT_PATH_RE = /^\/jira\/software\/(?:c\/)?projects\/([^/]+)(?:\/.*)?$/;
+
+/** The project key candidate this URL's path names, or `null` for a URL naming none — validation/case-folding happens one level up, in `resolveJiraProject`. */
+function jiraProjectKeyCandidate(u: URL): string | null {
+  const browse = BROWSE_PATH_RE.exec(u.pathname);
+  if (browse) return browse[1]!;
+  const project = PROJECT_PATH_RE.exec(u.pathname);
+  return project ? project[1]! : null;
+}
+
+function resolveJiraProject(u: URL, jiraHost: string): ResourceIdentity | null {
+  if (u.hostname !== jiraHost) return null;
+  const candidate = jiraProjectKeyCandidate(u);
+  if (!candidate) return null;
+  const ref = parseJiraProjectRef(candidate);
+  return ref ? { provider: "jira-project", id: ref.key } : null;
+}
+
 function resolveGithub(u: URL, canonicalUrl: string): ResourceIdentity | null {
   if (u.hostname !== GITHUB_HOST) return null;
   const issue = githubIssueRefFromUrl(canonicalUrl);
@@ -158,6 +193,7 @@ export function resolveUrlToResource(url: string, deps: UrlToResourceDeps): UrlT
   const u = new URL(canonicalUrl);
   const resource =
     resolveJiraWorkItem(u, deps.jiraHost) ??
+    resolveJiraProject(u, deps.jiraHost) ??
     resolveGithub(u, canonicalUrl) ??
     resolveZendeskTicket(u, deps.zendeskSubdomain);
   return { canonicalUrl, resource };
