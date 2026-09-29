@@ -1,6 +1,18 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import { isExtensionOrigin } from "../web/origin-guard.js";
+import type { RestoredResumePolicy } from "../agents/argv.js";
+
+/**
+ * FACTORY-491 — the epic's own reading of an ambiguous director steer
+ * (FACTORY-467 comment 27788: "defaulting to buddy or genius only" read as
+ * both being canary candidates, not a choice between them), stated
+ * explicitly here and in the PR description so the director can correct it
+ * in one line. These are managed-session definition names
+ * (`managedSessionShortDisplayId`, src/rules/session-definition-type.ts),
+ * not issue keys.
+ */
+export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -467,6 +479,7 @@ export interface ConfigEnv {
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
   BUTCHR_EXTENSION_ORIGINS?: string | undefined;
+  BUTCHR_RESTORED_RESUME?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -488,6 +501,17 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     if (value !== undefined) roleProviders[role] = parseOrder(value, key);
   }
   const model = env.BUTCHR_AGENT_MODEL === undefined ? undefined : required(env.BUTCHR_AGENT_MODEL, "BUTCHR_AGENT_MODEL");
+  // FACTORY-491: BUTCHR_RESTORED_RESUME = "off" | "all" | a comma-separated
+  // list of managed-session names. Unset defaults to DEFAULT_RESTORED_RESUME_AGENTS
+  // (see that constant's own doc comment) — "off"/today's behaviour is never
+  // the silent default, so enabling the canary further is opt-in but it
+  // ships live for its own agreed default set.
+  const restoredResumeRaw = env.BUTCHR_RESTORED_RESUME?.trim();
+  const restoredResume: RestoredResumePolicy = restoredResumeRaw === undefined || restoredResumeRaw === ""
+    ? new Set(DEFAULT_RESTORED_RESUME_AGENTS)
+    : restoredResumeRaw === "off" || restoredResumeRaw === "all"
+    ? restoredResumeRaw
+    : new Set(restoredResumeRaw.split(",").map((name) => name.trim()).filter(Boolean));
   const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
   const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
   const token = env.ATLASSIAN_TOKEN_FILE
@@ -609,7 +633,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   return {
     atlassian: { site, email, token },
-    agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}) },
+    agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
     parkedMinutes,
