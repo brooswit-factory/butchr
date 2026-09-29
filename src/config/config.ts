@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
-import { isExtensionOrigin } from "../web/origin-guard.js";
 import type { RestoredResumePolicy } from "../agents/argv.js";
 
 /**
@@ -13,6 +12,22 @@ import type { RestoredResumePolicy } from "../agents/argv.js";
  * not issue keys.
  */
 export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
+
+/**
+ * FACTORY-497 (implementing FACTORY-475, epic FACTORY-330 — operator
+ * decision quoted verbatim in FACTORY-330 comment 27837: "not only the
+ * default, the only option. I want it to be the only path, and the others
+ * cleaned out."): Clevr's manifest.json pins a fixed `"key"` (see that
+ * repo's README, "Fixed extension id"), so its extension id is stable
+ * across every install rather than path-derived, and it is now the ONLY
+ * allowed origin — hardcoded, not configurable. There is no allowlist to
+ * widen or narrow any more: an operator-supplied `BUTCHR_EXTENSION_ORIGINS`
+ * is read only long enough to warn that it is ignored (see
+ * `ignoredExtensionOriginsWarning` below), never merged into this value.
+ * This replaces the FACTORY-475/FACTORY-477 default-plus-additive-override
+ * scheme that briefly existed before this ticket.
+ */
+const CLEVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -405,7 +420,7 @@ export interface Config {
   /**
    * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the
    * Origin-allowlist auth for browser-extension-facing daemon routes
-   * (`GET /resources/for-url`, `GET /agents/:agentKey/pty` — see
+   * (`GET`/`POST /resources/for-url`, `GET /agents/:agentKey/pty` — see
    * `../web/origin-guard.ts`).
    *
    * FACTORY-464/FACTORY-465 dropped this section's original bearer-token
@@ -418,12 +433,13 @@ export interface Config {
    * that sets `Origin: chrome-extension://<allowlisted-id>` by hand — see
    * `../web/origin-guard.ts`'s own header for this stated in full.
    *
-   * DELIBERATELY ALWAYS PRESENT (unlike `github`/`rocketchat`, which are
-   * `undefined` when off): a guarded route always has an `extensionAuth`
-   * object to pass straight to the guard, with NO config-shape branch of
-   * its own. An empty/unset `BUTCHR_EXTENSION_ORIGINS` yields `allowedOrigins:
-   * []`, which the guard treats as "reject everything" — fail-closed by
-   * construction, never "no allowlist configured, so allow everything".
+   * FACTORY-497 (implementing FACTORY-475): NOT CONFIGURABLE any more.
+   * `allowedOrigins` is always exactly `[CLEVR_EXTENSION_ORIGIN]` — there is
+   * no env var, default-plus-override, or operator allowlist left to
+   * describe here. DELIBERATELY ALWAYS PRESENT (unlike `github`/
+   * `rocketchat`, which are `undefined` when off): a guarded route always
+   * has an `extensionAuth` object to pass straight to the guard, with NO
+   * config-shape branch of its own.
    */
   extensionAuth: { allowedOrigins: string[] };
 }
@@ -478,6 +494,7 @@ export interface ConfigEnv {
   BUTCHR_LIZARD_APPROVAL_SOUND_PATH?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
+  /** FACTORY-497: no longer a real config knob — kept only so `loadConfig` can detect a daemon environment that still sets it and warn once (`ignoredExtensionOriginsWarning`); it is never read into `Config.extensionAuth`. */
   BUTCHR_EXTENSION_ORIGINS?: string | undefined;
   BUTCHR_RESTORED_RESUME?: string | undefined;
 }
@@ -622,14 +639,10 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const maxAgents = env.BUTCHR_MAX_AGENTS ? Number(env.BUTCHR_MAX_AGENTS) : 8;
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
-  // FACTORY-464/FACTORY-465: NEVER default an empty/unset allowlist to
-  // anything but `[]` — the guard (`../web/origin-guard.ts`) treats that as
-  // "reject every origin", the fail-closed default this section must keep
-  // (see `Config.extensionAuth`'s own doc comment).
-  const extensionOrigins = env.BUTCHR_EXTENSION_ORIGINS ? env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : [];
-  for (const origin of extensionOrigins) {
-    if (!isExtensionOrigin(origin)) throw new Error(`BUTCHR_EXTENSION_ORIGINS contains an invalid chrome-extension:// origin: ${JSON.stringify(origin)}`);
-  }
+  // FACTORY-497: hardcoded, the only allowed origin — see
+  // `CLEVR_EXTENSION_ORIGIN`'s own doc comment at this file's top for why
+  // there is nothing left to parse from the environment here.
+  const extensionOrigins = [CLEVR_EXTENSION_ORIGIN];
 
   return {
     atlassian: { site, email, token },
@@ -664,6 +677,21 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     maxAgents,
     extensionAuth: { allowedOrigins: extensionOrigins },
   };
+}
+
+/**
+ * FACTORY-497: a daemon whose environment still sets `BUTCHR_EXTENSION_ORIGINS`
+ * (e.g. an existing systemd drop-in from before this ticket) must not
+ * silently ignore it — this names the exact ignored variable and states
+ * that only Clevr's fixed id is allowed, so an operator who still has that
+ * drop-in in place sees why it no longer does anything. `undefined` when
+ * the variable is unset, meaning nothing to warn about. Pure, like
+ * `loadConfig`/`describeConfig`; the caller (`src/daemon/index.ts`) is
+ * responsible for actually logging it once, at startup.
+ */
+export function ignoredExtensionOriginsWarning(env: ConfigEnv): string | undefined {
+  if (env.BUTCHR_EXTENSION_ORIGINS === undefined) return undefined;
+  return "BUTCHR_EXTENSION_ORIGINS is set but ignored — only Clevr's fixed extension id is allowed now (FACTORY-497/FACTORY-475)";
 }
 
 function required(v: string | undefined, name: string): string {
@@ -775,6 +803,8 @@ export const describeConfig = (c: Config): string =>
   `lizardApprovalSound=${c.lizardApprovalSound ? `enabled overridePath=${c.lizardApprovalSound.overridePath ?? "(default: drovr's bundled asset)"}` : "disabled"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents} ` +
-  // FACTORY-464/FACTORY-465: no token to ever log — an empty allowlist is
-  // itself the fail-closed state (see `Config.extensionAuth`'s own doc comment).
+  // FACTORY-464/FACTORY-465: no token to ever log. FACTORY-497: always
+  // exactly Clevr's fixed id now — see `Config.extensionAuth`'s own doc
+  // comment; the "EMPTY" fallback is dead code path kept only because
+  // `allowedOrigins` is still typed as an array, never actually empty.
   `extensionAuth=origins=${c.extensionAuth.allowedOrigins.join(",") || "EMPTY — every origin rejected"}`;
