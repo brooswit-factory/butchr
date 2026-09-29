@@ -49,6 +49,54 @@ describe("GET /resources/for-url", () => {
   });
 });
 
+// FACTORY-480: the route Clevr's extension service worker actually uses —
+// see src/web/view.ts's own comment for why the GET above is unusable from
+// that context (Chrome sends no Origin on a service-worker GET) and why the
+// GET route above is kept unchanged regardless.
+describe("POST /resources/for-url", () => {
+  test("extensionAuth omitted (empty allowlist): 403, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(403);
+  });
+  test("missing Origin header: 403, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "origin required" });
+  });
+  test("Origin not allowlisted: 403, and no resourcesForUrl call", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: OTHER_ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "origin not allowed" });
+  });
+  test("allowlisted origin: 200 with CORS headers for exactly that origin, never *, url read from JSON body", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }) }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://example.com" }),
+    }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ...stubResponse, url: "https://example.com" });
+    expect(res.headers.get("access-control-allow-origin")).toBe(ORIGIN);
+    expect(res.headers.get("access-control-allow-origin")).not.toBe("*");
+  });
+  test("missing/non-string url in body: treated as empty string, same as the GET route's absent query.url", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }) }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify({}),
+    }));
+    expect(res.status).toBe(200);
+    expect((await res.json() as { url: string }).url).toBe("");
+  });
+});
+
 describe("OPTIONS /resources/for-url (CORS preflight)", () => {
   test("extensionAuth omitted (empty allowlist): 403", async () => {
     const app = liveView(fakeMcp, baseDeps());
@@ -71,6 +119,16 @@ describe("OPTIONS /resources/for-url (CORS preflight)", () => {
     expect(res.status).toBe(204);
     expect(res.headers.get("access-control-allow-origin")).toBe(ORIGIN);
     expect(res.headers.get("access-control-allow-origin")).not.toBe("*");
+  });
+  // FACTORY-480: a JSON-body POST triggers a real preflight (content-type:
+  // application/json isn't a CORS-safelisted header value), so the
+  // preflight response must advertise POST and content-type or the browser
+  // blocks the actual POST after a "successful" preflight.
+  test("allowlisted origin: advertises POST alongside GET, and content-type in allow-headers", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", { method: "OPTIONS", headers: { origin: ORIGIN } }));
+    expect(res.headers.get("access-control-allow-methods")).toBe("GET, POST, OPTIONS");
+    expect(res.headers.get("access-control-allow-headers")).toBe("content-type");
   });
 });
 
