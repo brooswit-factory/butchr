@@ -39,9 +39,11 @@ describe("provider selection", () => {
   });
   test("config preserves defaults, selects either provider and rejects invalid input", () => {
     const env = { ATLASSIAN_SITE: "https://example.invalid", ATLASSIAN_EMAIL: "test", ATLASSIAN_TOKEN: "fake" };
-    expect(loadConfig(env, () => "").agent).toEqual({ provider: "claude" });
+    // FACTORY-491: BUTCHR_RESTORED_RESUME unset defaults to {buddy, genius} —
+    // see DEFAULT_RESTORED_RESUME_AGENTS' own doc comment (src/config/config.ts).
+    expect(loadConfig(env, () => "").agent).toEqual({ provider: "claude", restoredResume: new Set(["buddy", "genius"]) });
     for (const provider of ["claude", "codex"] as const) {
-      expect(loadConfig({ ...env, BUTCHR_AGENT_PROVIDER: provider, BUTCHR_AGENT_MODEL: " custom " }, () => "").agent).toEqual({ provider, model: "custom" });
+      expect(loadConfig({ ...env, BUTCHR_AGENT_PROVIDER: provider, BUTCHR_AGENT_MODEL: " custom " }, () => "").agent).toEqual({ provider, model: "custom", restoredResume: new Set(["buddy", "genius"]) });
     }
     expect(() => loadConfig({ ...env, BUTCHR_AGENT_PROVIDER: "other" }, () => "")).toThrow("BUTCHR_AGENT_PROVIDER");
     expect(() => loadConfig({ ...env, BUTCHR_AGENT_MODEL: " " }, () => "")).toThrow("BUTCHR_AGENT_MODEL");

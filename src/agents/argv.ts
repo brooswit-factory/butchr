@@ -31,8 +31,22 @@ export const KICKOFF_PROMPT = "follow your CLAUDE.md";
  */
 export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;
+/**
+ * FACTORY-491 (director item 5, FACTORY-467 comment 27774/27788): the
+ * `BUTCHR_RESTORED_RESUME` canary/kill switch for herdr-restored-pane
+ * resume-in-place (`isHerdrRestoredPane`, src/agents/herd.ts) — `"off"`
+ * disables it fleet-wide (today's allowlist/stop+spawn behaviour,
+ * unconditionally), `"all"` enables it for every managed session, and a
+ * `ReadonlySet` enables it only for the named managed sessions (their bare
+ * definition name — `managedSessionShortDisplayId`,
+ * src/rules/session-definition-type.ts — e.g. `"buddy"`). Parsed once in
+ * `loadConfig` (src/config/config.ts); see that parse for the default.
+ */
+export type RestoredResumePolicy = "off" | "all" | ReadonlySet<string>;
 export interface AgentConfig {
   provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string;
+  /** FACTORY-491 — see `RestoredResumePolicy`'s own doc comment. Defaults to `{buddy, genius}` in `loadConfig` when `BUTCHR_RESTORED_RESUME` is unset. */
+  restoredResume?: RestoredResumePolicy;
   /**
    * FACTORY-314 (PR #513 review fix) — set ONLY by `HerdrHerd.resumeInPlace()`
    * (src/agents/herd.ts) for a model/effort-only change on a still-alive

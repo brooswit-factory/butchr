@@ -2,6 +2,7 @@ import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
+import { RESTORED_PANE_STALE_REASON_PREFIX } from "../agents/herd.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
@@ -48,6 +49,8 @@ export interface LoopDeps {
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /** FACTORY-501 — see `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment; threaded straight through. */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   /** Reconcile daemon-owned (agent:*, pr:*) labels on this poll's `issues`. */
   syncLabels?: (issues: readonly JiraIssue[]) => Promise<ReadonlySet<string>>;
   /**
@@ -242,6 +245,26 @@ export interface ReconcileOptions {
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
   /** State for `onResumeWaiting`'s consecutive-poll count; see `ResumeDeferGuard`. Defaults to a fresh (per-call) instance, matching `guard`'s own default shape. */
   resumeDeferGuard?: ResumeDeferGuard;
+  /**
+   * FACTORY-501 — called ONCE PER POLL (never per-issue) with the exact set
+   * of issues found `"deferred"`/`"stuck"` THIS poll on the
+   * herdr-RESTORED-PANE path specifically — identified at the point `reason`
+   * is read, by `reason.startsWith(RESTORED_PANE_STALE_REASON_PREFIX)`
+   * (`src/agents/herd.ts`), BEFORE `resumeDeferGuard`/`onResumeWaiting` ever
+   * see it. A restored-pane issue never increments `resumeDeferGuard`'s
+   * count and never triggers `onResumeWaiting` — that notice is written for
+   * a model/effort change and would describe the wrong problem here (see
+   * FACTORY-500's item-2 proposal thread); this hook exists so the
+   * RESTORED-pane path gets its own, correctly-worded, wall-clock,
+   * repeating escalation instead — see `src/agents/restored-pane-escalation.ts`
+   * for the actual detector `src/daemon/index.ts` wires in here. The
+   * model/effort path is completely unaffected: this hook is NEVER called
+   * with a model/effort-only deferred/stuck issue, and `onResumeWaiting`'s
+   * own poll-counted, once-only behaviour for that path is untouched by this
+   * ticket. Optional; omitted, no restored-pane escalation runs (existing
+   * behaviour before FACTORY-501, and every caller/test that predates it).
+   */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   /**
    * BUTCHR-66/83: resource ids currently `"asleep"` — see `planReconcile`'s
    * `atRest` param, which this is threaded straight through to. Defaults to
@@ -736,6 +759,13 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       failures.push({ id: issue, stage: "stop", error: e });
     }
   }
+  // FACTORY-501: issues found herdr-restored-pane-`"deferred"`/`"stuck"`
+  // THIS poll, accumulated across the loop below and handed to
+  // `opts.checkRestoredPaneDeferred` ONCE, after the loop — never per-issue
+  // (see that option's own doc comment for why a single per-poll call, not
+  // an inline notify, is what lets the detector prune a resolved id's
+  // tracked state for free).
+  const restoredPaneDeferredThisPoll: string[] = [];
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
     let reason = info.reason;
@@ -749,6 +779,16 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // honest, distinct explanation.
     if (info.resumable && herd.resumeInPlace) {
       const spec = desired.get(issue)!;
+      // FACTORY-501: read BEFORE `resumeInPlace` overwrites `reason` further
+      // below (the "unresumable"/"failed" rewrite) — `info.reason` is the
+      // ONLY point in this loop the herdr-restored-pane classification
+      // (`isHerdrRestoredPane`, src/agents/herd.ts) is still legible as
+      // such, via the shared `RESTORED_PANE_STALE_REASON_PREFIX` constant
+      // both sides agree on. A model/effort-only resumable issue's reason
+      // never starts with this prefix, so this split touches the restored
+      // path ONLY — see `ReconcileOptions.checkRestoredPaneDeferred`'s own
+      // doc comment for the full scope argument.
+      const isRestoredPane = info.reason.startsWith(RESTORED_PANE_STALE_REASON_PREFIX);
       let outcome: Awaited<ReturnType<NonNullable<Herd["resumeInPlace"]>>>;
       try {
         outcome = await herd.resumeInPlace(spec);
@@ -757,21 +797,36 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
         continue;
       }
       if (outcome === "deferred" || outcome === "stuck") {
-        const count = resumeDeferGuard.count(issue);
-        if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
+        if (isRestoredPane) {
+          // FACTORY-501: deliberately NEVER touches `resumeDeferGuard`/
+          // `onResumeWaiting` — that notice is worded for a model/effort
+          // change and would describe the wrong problem for a restored
+          // pane (FACTORY-500 item-2 proposal thread); this issue's own
+          // wall-clock escalation is handled entirely by
+          // `checkRestoredPaneDeferred` below, once per poll.
+          restoredPaneDeferredThisPoll.push(issue);
+        } else {
+          const count = resumeDeferGuard.count(issue);
+          if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
+        }
         continue; // no stop, no spawn, no guard admission — retried next poll
       }
-      resumeDeferGuard.clear(issue);
+      resumeDeferGuard.clear(issue); // no-op for a restored-pane issue, which never populates this guard
       if (outcome === "resumed") {
         if (opts.onResumePreserved) await opts.onResumePreserved(issue);
         continue;
       }
-      // outcome is "unresumable" or "failed": fall through to the
-      // stop-then-fresh-spawn path below, same as any other stale reason,
-      // with an honest, DISTINCT reason for each — a genuine "no id to
-      // resume with" reads differently from "we tried and it didn't stay up".
+      // outcome is "unresumable", "unresumable-transcript-gone", or
+      // "failed": fall through to the stop-then-fresh-spawn path below, same
+      // as any other stale reason, with an honest, DISTINCT reason for each
+      // — a genuine "no id to resume with" reads differently from "we found
+      // the id but its transcript is gone", which reads differently again
+      // from "we tried and it didn't stay up" (FACTORY-470/472 PR #560
+      // review: the id-vs-transcript distinction was previously conflated).
       reason = outcome === "failed"
         ? "session lost: resume failed (the relaunched session did not stay alive — see the pane for details)"
+        : outcome === "unresumable-transcript-gone"
+        ? "session lost: a transcript for the persisted session id could not be found (the id was determined, but its transcript is gone)"
         : "session lost: session id could not be determined";
     }
     if (!guard.admit(issue, poll)) {
@@ -839,6 +894,14 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // throws (see daemon/index.ts's own `.catch` around its Jira comment).
     if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
   }
+  // FACTORY-501: called ONCE PER POLL, unconditionally (even with an empty
+  // array) — an empty call still matters, since it is what lets the
+  // detector's own pruning (`RestoredPaneEscalationTracker.forgetMissing`,
+  // src/agents/restored-pane-escalation.ts) clear a PREVIOUSLY-deferred
+  // issue's tracked state the moment it stops appearing here, with no
+  // separate "terminal outcome" signal needed — see
+  // `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment.
+  if (opts.checkRestoredPaneDeferred) await opts.checkRestoredPaneDeferred(restoredPaneDeferredThisPoll);
   // BUTCHR-147: called once per poll, after every isolated spawn/stop/respawn
   // attempt above — never gates or delays anything (see ReconcileOptions.checkReconcileFailure's own doc comment).
   // REVIEW FIX (PR #204 round 1): `running` (captured once, above, same
@@ -1015,6 +1078,8 @@ export interface GenericLoopDeps<T> {
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /** FACTORY-501 — see `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment; threaded straight through. */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
   /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above — same placement rule as `checkParked`, no `related` needed. Optional; omitted, abandoned-worker detection simply never runs. */
@@ -1126,6 +1191,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
         ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
+        ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
         guard: respawnGuard,
         resumeDeferGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
@@ -1300,6 +1366,7 @@ export function startLoop(deps: LoopDeps): Stop {
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
     ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
+    ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
     ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
     ...(deps.checkAbandoned ? { checkAbandoned: deps.checkAbandoned } : {}),

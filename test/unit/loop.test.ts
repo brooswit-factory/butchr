@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd, ResumeDeferGuard, RESUME_WAITING_NOTICE_AT_POLLS } from "../../src/daemon/loop.js";
+import { RESTORED_PANE_STALE_REASON_PREFIX } from "../../src/agents/herd.js";
+import { createRestoredPaneEscalationDetector } from "../../src/agents/restored-pane-escalation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
 import { agentFoldSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
@@ -2382,5 +2384,128 @@ describe("reconcileNow: FACTORY-314 resumeInPlace routing", () => {
     expect(herd.stopped).toEqual(["S"]);
     expect(herd.spawned).toEqual(["S"]);
     expect(respawns).toEqual([{ issue: "S", reason: "argv lacks --permission-mode bypassPermissions" }]);
+  });
+});
+
+describe("reconcileNow: FACTORY-501 restored-pane wall-clock defer-and-escalate", () => {
+  const spec = (k: string) => ({ key: k, issuetype: "Task" as const, summary: "s", parent: null });
+  const MIN = 60_000;
+  const RESTORED_REASON = `${RESTORED_PANE_STALE_REASON_PREFIX} after a host reset as a bare \`claude --resume\` (--mcp-config) — relaunching on the same session with butchr's full flag set`;
+
+  function fakeRestoredHerd(
+    stale: Array<{ issue: string; reason: string; resumable?: boolean }>,
+    outcomeOf: (issue: string) => "resumed" | "deferred" | "stuck" | "unresumable",
+  ) {
+    const running = new Set(stale.map((s) => s.issue));
+    const spawned: string[] = [], stopped: string[] = [], resumeCalls: string[] = [];
+    const herd: Herd & { spawned: string[]; stopped: string[]; resumeCalls: string[] } = {
+      spawned, stopped, resumeCalls,
+      async runningIssues() { return [...running]; },
+      async staleIssues() { return stale.filter((s) => running.has(s.issue)).map((s) => ({ issue: s.issue, reason: s.reason, observedArgv: ["claude", "--resume", "x"], resumable: s.resumable ?? false })); },
+      async spawn(sp) { spawned.push(sp.key); running.add(sp.key); },
+      async stop(i) { stopped.push(i); running.delete(i); },
+      async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
+      async nudge() { return { delivered: true }; },
+      async resumeInPlace(sp) { resumeCalls.push(sp.key); return outcomeOf(sp.key); },
+    };
+    return herd;
+  }
+
+  test("a restored-pane deferred issue is reported to checkRestoredPaneDeferred every poll, never touches onResumeWaiting/resumeDeferGuard, never stops or spawns", async () => {
+    const herd = fakeRestoredHerd([{ issue: "R", reason: RESTORED_REASON, resumable: true }], () => "deferred");
+    const resumeDeferGuard = new ResumeDeferGuard();
+    const waiting: unknown[] = [];
+    const deferredCalls: string[][] = [];
+    for (let i = 0; i < RESUME_WAITING_NOTICE_AT_POLLS + 5; i++) {
+      await reconcileNow(herd, new Map([["R", spec("R")]]), {
+        resumeDeferGuard,
+        onResumeWaiting: (issue, outcome, count) => { waiting.push({ issue, outcome, count }); },
+        checkRestoredPaneDeferred: async (deferred) => { deferredCalls.push([...deferred]); },
+      });
+    }
+    expect(waiting).toEqual([]); // the model/effort notice never fires for a restored-pane issue
+    expect(deferredCalls.every((d) => d.length === 1 && d[0] === "R")).toBe(true);
+    expect(herd.stopped).toEqual([]);
+    expect(herd.spawned).toEqual([]);
+  });
+
+  test("no stop()/spawn() is ever called on the restored-pane deferred path, however long the deferral lasts", async () => {
+    const herd = fakeRestoredHerd([{ issue: "R", reason: RESTORED_REASON, resumable: true }], () => "deferred");
+    for (let i = 0; i < 500; i++) {
+      await reconcileNow(herd, new Map([["R", spec("R")]]), { checkRestoredPaneDeferred: async () => {} });
+    }
+    expect(herd.stopped).toEqual([]);
+    expect(herd.spawned).toEqual([]);
+  });
+
+  test("wired through the REAL detector: first-notice at the wall-clock threshold, no notice in between, repeat-notice at the interval, reset-on-terminal-outcome (resumed) starts a fresh clock", async () => {
+    let now = 0;
+    let outcome: "resumed" | "deferred" | "stuck" | "unresumable" = "deferred";
+    const herd = fakeRestoredHerd([{ issue: "R", reason: RESTORED_REASON, resumable: true }], () => outcome);
+    const posted: string[] = [];
+    const preserved: string[] = [];
+    const detector = createRestoredPaneEscalationDetector({
+      now: () => now,
+      addComment: async (id) => { posted.push(id); },
+      firstThresholdMs: 10 * MIN,
+      repeatIntervalMs: 60 * MIN,
+    });
+    async function poll() {
+      await reconcileNow(herd, new Map([["R", spec("R")]]), {
+        checkRestoredPaneDeferred: detector.check,
+        onResumePreserved: (i) => { preserved.push(i); },
+      });
+    }
+    // Minute-by-minute for 12 minutes: still deferred throughout.
+    for (let m = 0; m <= 12; m++) { now = m * MIN; await poll(); }
+    expect(posted).toEqual(["R"]); // fired exactly once, at m=10
+    // Advance to just before the repeat interval — no second notice yet.
+    now = 10 * MIN + 59 * MIN;
+    await poll();
+    expect(posted).toEqual(["R"]);
+    // Cross the repeat interval — second notice.
+    now = 10 * MIN + 60 * MIN;
+    await poll();
+    expect(posted).toEqual(["R", "R"]);
+    // Now it resumes — a terminal outcome. The streak must reset.
+    outcome = "resumed";
+    now += MIN;
+    await poll();
+    expect(preserved).toEqual(["R"]);
+    // A brand-new deferral streak, far later on the clock, must wait its OWN
+    // 10-minute threshold rather than firing immediately (which it would if
+    // the old streak's clock had leaked through).
+    outcome = "deferred";
+    now += MIN;
+    await poll(); // first poll of the new streak
+    now += 9 * MIN;
+    await poll(); // 9 minutes into the new streak — not due yet
+    expect(posted).toEqual(["R", "R"]);
+    now += MIN; // 10 minutes into the new streak
+    await poll();
+    expect(posted).toEqual(["R", "R", "R"]);
+  });
+
+  test("HARD CONSTRAINT: a model/effort-only deferred issue is completely unaffected — checkRestoredPaneDeferred is called every poll but NEVER with this issue, and onResumeWaiting keeps its old once-only, poll-counted behaviour with its old arguments, even across a wall-clock span well past the new restored-pane thresholds", async () => {
+    const herd = fakeRestoredHerd([{ issue: "M", reason: "argv lacks --model/--effort matching the current definition/rule", resumable: true }], () => "deferred");
+    const resumeDeferGuard = new ResumeDeferGuard();
+    const waiting: Array<{ issue: string; outcome: string; count: number }> = [];
+    const deferredCalls: string[][] = [];
+    // Real production wiring never advances a fake wall clock for this
+    // path at all — onResumeWaiting is poll-counted, not wall-clock — so
+    // this drives many polls (well past RESUME_WAITING_NOTICE_AT_POLLS,
+    // and far more polls than would ever be needed to cross the new
+    // restored-pane thresholds by count alone) and asserts neither new
+    // behaviour leaks in.
+    for (let i = 0; i < RESUME_WAITING_NOTICE_AT_POLLS + 50; i++) {
+      await reconcileNow(herd, new Map([["M", spec("M")]]), {
+        resumeDeferGuard,
+        onResumeWaiting: (issue, outcome, count) => { waiting.push({ issue, outcome, count }); },
+        checkRestoredPaneDeferred: async (deferred) => { deferredCalls.push([...deferred]); },
+      });
+    }
+    expect(waiting).toEqual([{ issue: "M", outcome: "deferred", count: RESUME_WAITING_NOTICE_AT_POLLS }]);
+    expect(deferredCalls.length).toBe(RESUME_WAITING_NOTICE_AT_POLLS + 50);
+    expect(deferredCalls.every((d) => d.length === 0)).toBe(true); // never once contains "M"
   });
 });
