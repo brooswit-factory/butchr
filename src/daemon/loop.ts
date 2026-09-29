@@ -766,12 +766,17 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
         if (opts.onResumePreserved) await opts.onResumePreserved(issue);
         continue;
       }
-      // outcome is "unresumable" or "failed": fall through to the
-      // stop-then-fresh-spawn path below, same as any other stale reason,
-      // with an honest, DISTINCT reason for each — a genuine "no id to
-      // resume with" reads differently from "we tried and it didn't stay up".
+      // outcome is "unresumable", "unresumable-transcript-gone", or
+      // "failed": fall through to the stop-then-fresh-spawn path below, same
+      // as any other stale reason, with an honest, DISTINCT reason for each
+      // — a genuine "no id to resume with" reads differently from "we found
+      // the id but its transcript is gone", which reads differently again
+      // from "we tried and it didn't stay up" (FACTORY-470/472 PR #560
+      // review: the id-vs-transcript distinction was previously conflated).
       reason = outcome === "failed"
         ? "session lost: resume failed (the relaunched session did not stay alive — see the pane for details)"
+        : outcome === "unresumable-transcript-gone"
+        ? "session lost: a transcript for the persisted session id could not be found (the id was determined, but its transcript is gone)"
         : "session lost: session id could not be determined";
     }
     if (!guard.admit(issue, poll)) {

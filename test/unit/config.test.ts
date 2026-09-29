@@ -15,7 +15,7 @@ describe("loadConfig", () => {
     }, noRead);
     expect(c.agent).toEqual({ provider: "agy", providers: ["claude", "agy", "codex"], roleProviders: {
       project: ["agy", "claude"], epic: ["agy", "codex"], story: ["codex", "agy"], task: ["agy"],
-    } });
+    }, restoredResume: new Set(["buddy", "genius"]) });
     expect(describeConfig(c)).toContain("provider=agy");
     for (const order of ["agy,agy", "agy,unknown", "agy,", ""]) {
       expect(() => loadConfig({ ...base, BUTCHR_AGENT_PROVIDERS: order }, noRead)).toThrow("ordered list");

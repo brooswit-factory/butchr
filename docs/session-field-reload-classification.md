@@ -654,3 +654,79 @@ each one actually needs closed:
 | `workingDirectory` | A, nudge-only | A, nudge-only | source reading (`SpawnSpec.cwd`, `kickoffFor`, `checkArgv`) |
 | `brief` | A, nudge-only | A, nudge-only | source reading (same seams as above) |
 | `vendor` | undetected (would be C) | undetected (would be C) | source reading (`staleIssues()`'s self-referential provider comparison) |
+
+## FACTORY-470/472 — a herdr-restored pane is B too, but not via a definition-field edit
+
+Everything above classifies what happens when a *definition field* changes
+under a still-running agent. This is a different trigger entirely, added
+after the survey above: after a host hard reset, herdr's OWN restore
+mechanism (independent of butchr, outside this repo's source) relaunches a
+workspace's Claude process as a bare `claude --resume <pre-boot-session-id>`,
+with **none** of butchr's own launch flags at all (permission-mode,
+mcp-config, development-channels, model/effort) — no field changed; butchr's
+flags were simply never there on this particular launch.
+
+This is now class B (`HerdrHerd.staleIssues()`/`isHerdrRestoredPane()`,
+`src/agents/herd.ts`), via a mechanism deliberately distinct from the
+allowlist Required Finding 2 above describes:
+
+- **Not FACTORY-411/#556's allowlist.** A herdr-restored pane's `checkArgv`
+  reason always lists `--mcp-config` as missing (among others) —
+  `resumableArgvReason` never allows that flag, so this case is
+  `resumable: false` under the allowlist alone, always (the "0 of 15 real
+  panes" gap this ticket closes).
+- **An identity check instead:** does the pane's own observed `--resume
+  <id>` argument match the workspace's persisted session id
+  (`workspaceSessionId`, the same value FACTORY-314/418 already trust)? A
+  match means this is unambiguously the same conversation, whatever flags
+  are missing, and is resumable via the existing `resumeInPlace()`
+  full-flag relaunch regardless of which/how-many flags differ. No match —
+  including an absent or FACTORY-418-invalidated persisted id — falls
+  through unchanged to today's allowlist/stop+spawn behaviour.
+- Subject to the same class-B precondition as every other B entry above:
+  the relaunch only ever resumes the id `resumeInPlace()` itself already
+  verified has a real transcript.
+
+### FACTORY-491 — director review hardening on top of the above
+
+- **The discriminator now requires ALL THREE of butchr's own launch flags
+  absent** (`--permission-mode`, `--mcp-config`,
+  `--dangerously-load-development-channels` — verified directly against the
+  pinned `@brooswit/drovr`'s own `REQUIRED_CLAUDE_FLAGS` constant), not just
+  `--mcp-config` alone. A pane missing only `--mcp-config` while still
+  carrying one of the other two is not butchr's own launch omitting
+  everything — it is a narrower, different drift.
+- **`--resume` argv parsing now accepts `--resume=<id>`, `-r <id>`, and
+  `-r=<id>`**, not just the separate-argument `--resume <id>` form the
+  pre-existing `indexOf + 1` match already handled. herdr's REAL measured
+  restore shape (admin-assembly on codey, relayed via FACTORY-467 comment
+  27815) is `["claude", "--resume", "<id>", "--model", "haiku"]` — the
+  separate-argument form — so this is defensive hardening against a future
+  launcher/herdr change, not a fix for a currently-broken case.
+- **A `launch_pending: true` pane (herdr's own signal for a claude launch
+  still in flight, no `agent_session` registered yet) is never classified
+  herdr-restored**, even when its observed argv already carries a `--resume`
+  matching the persisted session id — closes a hazard where an in-flight
+  butchr-owned launch could be misread as a herdr restore before its own
+  flags have fully landed.
+- **`BUTCHR_RESTORED_RESUME` gates the whole identity path behind a
+  canary/kill switch** (`off` / a comma-separated list of managed-session
+  names / `all`; see `.env.example` and `RestoredResumePolicy`,
+  `src/agents/argv.ts`, for the exact contract). Defaults to `buddy,genius`.
+  An ordinary (non-managed-session) task/story/epic agent has no stable name
+  to gate on, so it is reachable ONLY under the `all` policy — under the
+  default and under any named list, it keeps today's allowlist/stop+spawn
+  behaviour unconditionally, same as `off`.
+- **Every restored-pane classification now logs the observed argv** under a
+  `[herdr-restore]` journal tag, so a future silent no-op in the argv
+  parsing above is diagnosable from the journal alone.
+- **`resumeInPlace()`'s `"failed"` outcome now closes the pane by id
+  directly**, inside the method itself, before returning — defence in
+  depth alongside `reconcileNow`'s own identity-matched `herd.stop()` in the
+  fallthrough. Real herdr removes a bare-shell pane's `agent.list()` entry
+  entirely once it is confirmed empty (measured by admin-assembly on codey,
+  relayed via FACTORY-467 comment 27770/27774), so that identity match may
+  have nothing left to find by the time the fallthrough runs — this closes
+  the SAME pane id while it is still
+  known with certainty, from the entry `staleIssues()`/`resumeInPlace()`
+  resolved before the relaunch attempt.
