@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/butchr-logo.png" alt="butchr" width="240"></p>
+
 # butchr
 
 Agents support selectable Claude (default) and Codex providers. See
