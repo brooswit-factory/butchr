@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { resolveResourceLink } from "../../src/resources/resource-link.js";
 import { buildDashboardRows } from "../../src/agents/dashboard.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
+import { resourceKeyOf } from "../../src/agents/workspace.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 
 const deps = (projectUrl: string | (() => Promise<string>) = "https://wroosbit.atlassian.net/wiki/spaces/KAN/pages/1") => ({
   jiraSite: "https://wroosbit.atlassian.net",
@@ -63,21 +65,29 @@ describe("resolveResourceLink: tier -> correct target (BUTCHR-339 mutation 7 —
   // "is this a project id" in the whole codebase). This test pins the
   // EQUIVALENCE directly: real rows from the real `buildDashboardRows`, one
   // per tier, each resolving to the target its OWN `tier.kind` implies.
+  //
+  // FACTORY-407: `row.resourceKey` is now the FULL agent key, so — exactly
+  // like the real wiring in `src/daemon/index.ts`'s own `resourceLink` —
+  // this decodes it back to the bare provider-native id (`resourceKeyOf`)
+  // before handing it to `resolveResourceLink`, which itself still operates
+  // on bare ids only.
   test("equivalence with tier.kind: a REAL issue-tier row (from buildDashboardRows) resolves to Jira, a REAL project-tier row resolves to Confluence — the key-shape decision and tier.kind never disagree", async () => {
+    const issueKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "KAN-9" });
+    const projectKey = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "task", resourceId: "KAN" });
     const rows = buildDashboardRows(
       [
-        { resource_key: "KAN-9", agent_status: "idle", pane_id: "p1" },
-        { resource_key: "KAN", agent_status: "idle", pane_id: "p2" },
+        { agent_key: issueKey, agent_status: "idle", pane_id: "p1" },
+        { agent_key: projectKey, agent_status: "idle", pane_id: "p2" },
       ],
       { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) },
     );
     const issueRow = rows.find((r) => r.tier.kind === "issue")!;
     const projectRow = rows.find((r) => r.tier.kind === "project")!;
-    expect(issueRow.resourceKey).toBe("KAN-9");
-    expect(projectRow.resourceKey).toBe("KAN");
+    expect(issueRow.resourceKey).toBe(issueKey);
+    expect(projectRow.resourceKey).toBe(projectKey);
 
-    const issueResult = await resolveResourceLink(issueRow.resourceKey, deps("https://wroosbit.atlassian.net/wiki/x"));
-    const projectResult = await resolveResourceLink(projectRow.resourceKey, deps("https://wroosbit.atlassian.net/wiki/x"));
+    const issueResult = await resolveResourceLink(resourceKeyOf(issueRow.resourceKey), deps("https://wroosbit.atlassian.net/wiki/x"));
+    const projectResult = await resolveResourceLink(resourceKeyOf(projectRow.resourceKey), deps("https://wroosbit.atlassian.net/wiki/x"));
     if (!issueResult.ok || !projectResult.ok) throw new Error("expected both to resolve");
     expect(issueResult.url).toBe("https://wroosbit.atlassian.net/browse/KAN-9"); // matches issueRow.tier.kind === "issue"
     expect(projectResult.url).toBe("https://wroosbit.atlassian.net/wiki/x"); // matches projectRow.tier.kind === "project"

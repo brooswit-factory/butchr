@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
+import { isExtensionOrigin } from "../web/origin-guard.js";
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -389,6 +390,30 @@ export interface Config {
    * by this cap.
    */
   maxAgents: number;
+  /**
+   * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the
+   * Origin-allowlist auth for browser-extension-facing daemon routes
+   * (`GET /resources/for-url`, `GET /agents/:agentKey/pty` — see
+   * `../web/origin-guard.ts`).
+   *
+   * FACTORY-464/FACTORY-465 dropped this section's original bearer-token
+   * half (`BUTCHR_EXTENSION_TOKEN`) — an operator-decided, deliberate
+   * security-posture change, not an oversight: the daemon binds
+   * loopback-only, and the operator judged that on a single-user local box
+   * an Origin-allowlist-only check is enough. `Origin` is browser-enforced,
+   * so this still protects against another website open in a browser tab,
+   * but NOT against another local process (a script, another user, `curl`)
+   * that sets `Origin: chrome-extension://<allowlisted-id>` by hand — see
+   * `../web/origin-guard.ts`'s own header for this stated in full.
+   *
+   * DELIBERATELY ALWAYS PRESENT (unlike `github`/`rocketchat`, which are
+   * `undefined` when off): a guarded route always has an `extensionAuth`
+   * object to pass straight to the guard, with NO config-shape branch of
+   * its own. An empty/unset `BUTCHR_EXTENSION_ORIGINS` yields `allowedOrigins:
+   * []`, which the guard treats as "reject everything" — fail-closed by
+   * construction, never "no allowlist configured, so allow everything".
+   */
+  extensionAuth: { allowedOrigins: string[] };
 }
 
 export interface ConfigEnv {
@@ -441,6 +466,7 @@ export interface ConfigEnv {
   BUTCHR_LIZARD_APPROVAL_SOUND_PATH?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
+  BUTCHR_EXTENSION_ORIGINS?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -572,6 +598,15 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const maxAgents = env.BUTCHR_MAX_AGENTS ? Number(env.BUTCHR_MAX_AGENTS) : 8;
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
+  // FACTORY-464/FACTORY-465: NEVER default an empty/unset allowlist to
+  // anything but `[]` — the guard (`../web/origin-guard.ts`) treats that as
+  // "reject every origin", the fail-closed default this section must keep
+  // (see `Config.extensionAuth`'s own doc comment).
+  const extensionOrigins = env.BUTCHR_EXTENSION_ORIGINS ? env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : [];
+  for (const origin of extensionOrigins) {
+    if (!isExtensionOrigin(origin)) throw new Error(`BUTCHR_EXTENSION_ORIGINS contains an invalid chrome-extension:// origin: ${JSON.stringify(origin)}`);
+  }
+
   return {
     atlassian: { site, email, token },
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}) },
@@ -603,6 +638,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(lizardApprovalSound ? { lizardApprovalSound } : {}),
     projectAllowlist,
     maxAgents,
+    extensionAuth: { allowedOrigins: extensionOrigins },
   };
 }
 
@@ -714,4 +750,7 @@ export const describeConfig = (c: Config): string =>
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
   `lizardApprovalSound=${c.lizardApprovalSound ? `enabled overridePath=${c.lizardApprovalSound.overridePath ?? "(default: drovr's bundled asset)"}` : "disabled"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
-  `maxAgents=${c.maxAgents}`;
+  `maxAgents=${c.maxAgents} ` +
+  // FACTORY-464/FACTORY-465: no token to ever log — an empty allowlist is
+  // itself the fail-closed state (see `Config.extensionAuth`'s own doc comment).
+  `extensionAuth=origins=${c.extensionAuth.allowedOrigins.join(",") || "EMPTY — every origin rejected"}`;

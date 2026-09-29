@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -20,6 +20,7 @@ import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, sing
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
@@ -37,11 +38,14 @@ import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
+import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
+import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { createLabelSync } from "../labels/sync.js";
@@ -54,7 +58,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment } from "../agents/respawn.js";
+import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
@@ -144,6 +148,14 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
+// Jira site as a bare, lower-cased HOST (never the full `https://` URL
+// `config.atlassian.site` is), and its Zendesk subdomain read directly from
+// `ZENDESK_SUBDOMAIN`, the SAME env var `zendesk-ticket.ts` itself reads
+// (never routed through `Config`, matching that module's own convention —
+// see this ticket's own doc for why Zendesk config isn't centralized there).
+const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -765,7 +777,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -783,6 +795,7 @@ const { app, mcp } = buildApp({
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
+        if (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((r) => r.id === rule.id)) return githubPrStaffingResult.reason;
         if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
         return null;
       },
@@ -806,6 +819,36 @@ const { app, mcp } = buildApp({
   resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
     ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
     : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+  // FACTORY-339: NO I/O here, same discipline as `dashboard` above —
+  // `dashboardFeed.snapshot()` is the SAME already-polled staffed-agent
+  // registry `/dashboard` itself serves, never a second poll or a live
+  // per-request query (see `../resources/resource-lookup.ts`'s own header
+  // for why re-running each rule's query here would be wrong).
+  resourcesForUrl: async (url) => buildResourcesForUrlResponse(url, resourceLookupDeps, dashboardFeed.snapshot().rows),
+  extensionAuth: config.extensionAuth,
+  // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330):
+  // `GET /agents/:agentKey/pty`'s deps. `resolve`/`isLive` read the SAME
+  // `dashboardFeed.snapshot()` `resourcesForUrl` above already reads — no
+  // new poll, no new I/O, same discipline as every other route in this
+  // object. `read`/`send` are this daemon's own existing pane helpers
+  // (defined below, already used by the detector loops). `pollMs` (250ms)
+  // is this daemon's own choice, not herdr's — see `docs/pty-attach.md`'s
+  // Config section for why: fast enough to feel interactive for a person
+  // typing, far above herdr's own per-call cost to matter as load.
+  ptyAttach: {
+    resolve: (agentKey) => resolvePtyPane(agentKey, dashboardFeed.snapshot().rows),
+    isLive: (agentKey, pane) => isPaneStillLive(agentKey, pane, dashboardFeed.snapshot().rows),
+    // Wrapped rather than passed directly: `readPaneForPty`/`sendPane` are
+    // declared further down this file, and `buildApp(...)` runs at
+    // module-evaluation time — a direct reference here would be a TDZ
+    // error. These closures aren't evaluated until a socket actually calls
+    // them, by which point the module has finished loading. `read` is
+    // `readPaneForPty`, NOT the detectors' `readPane` — see that function's
+    // own doc comment for why (ANSI must survive for a real terminal).
+    read: (pane) => readPaneForPty(pane),
+    send: (pane, text) => sendPane(pane, text),
+    pollMs: 250,
+  },
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -851,6 +894,23 @@ if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE
 
 const readPane = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "detection", strip_ansi: true })).read.text;
 const sendPane = async (paneId: string, text: string) => { await herdr.pane.sendText({ pane_id: paneId, text }); };
+// FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the PTY
+// endpoint's OWN read, deliberately NOT `readPane` above. `readPane` passes
+// `strip_ansi: true`, correct for the detectors that use it (they want
+// plain text), but wrong here: FACTORY-338 puts xterm.js on the other end
+// of `/agents/:agentKey/pty`'s socket, and ANSI-stripped output has no
+// colour, no cursor positioning, no redraw — a dead scrolling text dump,
+// not a terminal (FACTORY-330's own correction on this ticket, 2026-09-28).
+// `source: "visible"` (not `readPane`'s `"detection"`) matches what this is
+// FOR — the pane's current on-screen contents, the same thing a real
+// terminal shows, not a detector's parse-friendly scrollback view. `format:
+// "ansi"` alongside `strip_ansi: false` is this daemon's reading of "don't
+// strip ANSI" as also meaning "ask for the ANSI-bearing format", not just
+// leaving the default in place — see `docs/pty-attach.md`'s Contract
+// section for this stated plainly, and `src/terminal/pty-bridge.ts`'s own
+// header for why the bridge sends each read as a full-screen redraw rather
+// than a diff once ANSI is in play.
+const readPaneForPty = async (paneId: string) => (await herdr.pane.read({ pane_id: paneId, source: "visible", format: "ansi", strip_ansi: false })).read.text;
 
 const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) }) : undefined;
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
@@ -880,9 +940,14 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
  * `speakOnOwnChannel`/`ops.addComment` would otherwise post a doomed Jira
  * write against — a real escalation silently lost for exactly the
  * long-lived (persistent/singleton) agents this ticket exists to support.
- * `resourceOfCwd` itself is UNCHANGED and still used for the dashboard/
- * label-sync status map, where the bogus fallback is a harmless, never-
- * looked-up orphan entry, not a write.
+ * `resourceOfCwd` itself is UNCHANGED and still used for the label-sync
+ * status map (`statusMapFromAgents`, which needs the BARE key to match a
+ * Jira search's own issue keys). FACTORY-407: the dashboard no longer goes
+ * through `resourceOfCwd` at all — `agentStatusesFeedingDashboard` below
+ * feeds `buildDashboardRows` the FULL owned key (`ownedAgentOfCwd` itself,
+ * undiscarded) via a separate `agent_key` field, because `resourceOfCwd`'s
+ * bare fallback is exactly what made every real `AgentDashboardRow.resourceKey`
+ * undecodable — see that ticket for the full history.
  */
 const escalationTargetOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
@@ -936,7 +1001,12 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
-      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })) };
+      // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
+      // own correlation identifier (`buildDashboardRows`); `resource_key`
+      // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
+      // `statusMapFromAgents` below already needs. One `ownedAgentOfCwd` call
+      // per agent either way — `resourceOfCwd` already makes its own.
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: ownedAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
@@ -1420,6 +1490,29 @@ runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  // FACTORY-314: a model/effort-only change resumed the SAME session —
+  // distinct marker/wording from `onRespawn` above (never "re-read your
+  // ticket"), same query-level-agent exclusion (no single ticket to post to).
+  onResumePreserved: async (agent) => {
+    console.error(`  [reconcile] ${agent} resumed in place (session preserved)`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, resumePreservedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-314: fires once (not per-poll) after RESUME_WAITING_NOTICE_AT_POLLS
+  // consecutive deferred/stuck polls — never a trigger to force a restart,
+  // only a heads-up that a model/effort change is still waiting.
+  onResumeWaiting: async (agent, outcome, consecutivePolls) => {
+    console.error(`  [reconcile] ${agent} resume still waiting after ${consecutivePolls} polls (${outcome})`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    const why = outcome === "deferred"
+      ? "it has stayed mid-turn across every poll since"
+      : "its pane never returned to a shell prompt after being asked to exit — it may need a human to look at it";
+    await ops.addComment(issue, `[butchr:resume] A model/effort change for ${agent} is still waiting to resume (checked ${consecutivePolls} polls ago and every poll since): ${why}. Nothing was interrupted; the daemon will keep retrying rather than force a restart.`).catch((e) =>
+      console.error(`  WARNING: [reconcile] resume-waiting notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
@@ -1757,6 +1850,58 @@ const blockingEscalationTimer = setInterval(() => {
     .finally(() => { blockingEscalationPollInFlight = false; });
 }, 5_000);
 blockingEscalationTimer.unref?.();
+
+// FACTORY-363/FACTORY-397: drovr's SEPARATE login-expired watcher
+// (`createLoginExpiredWatcher`, `@brooswit/drovr` >= 0.16.3,
+// src/agents/login-expired-alert.ts) — its OWN independent poll loop, own
+// timer, own read of the fleet, deliberately NOT sharing
+// `blockingEscalationTimer` above: that timer feeds ONLY
+// `escalator.onDrovrUnknownDialog`, whose managed-session-only routing is
+// exactly the trap this condition must not inherit (a keyed pane — both real
+// incidents, FACTORY-314/w1T and FACTORY-324/w1V — resolves `managedSessionOf`
+// to null there and would be silently dropped). This tracker has no
+// managed-session concept at all: every pane drovr reports reaches the
+// host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
+// the full design and why its delivery (a journal line + a `/health` sibling
+// field, both below) survives a dead Claude credential.
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+const loginExpiredWatcher = createLoginExpiredWatcher({
+  onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
+  onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
+});
+let loginExpiredPollInFlight = false;
+const loginExpiredTimer = setInterval(() => {
+  if (loginExpiredPollInFlight) return;
+  loginExpiredPollInFlight = true;
+  loginExpiredWatcher.poll(herdr)
+    .catch((e) => console.error(`  [login-expired] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { loginExpiredPollInFlight = false; });
+}, 5_000);
+loginExpiredTimer.unref?.();
+
+// FACTORY-425 (implements FACTORY-419): host-side counting of Codex
+// unrecognised-dialog sightings per fingerprint — a FOURTH, independent poll
+// loop, own timer, own read of the fleet, same isolation reasoning as
+// `loginExpiredTimer`/`blockingEscalationTimer` above. Deliberately calls
+// ONLY `scanPendingCodexApprovals` (a pure read — never
+// `approveCodexApproval`/`autoAnswerCodexApprovals`, either of which can
+// press keys for a RECOGNISED dialog): this loop observes and counts, never
+// answers or classifies, per FACTORY-419's own scope correction. See
+// `src/agents/codex-dialog-sightings.ts`'s own header for why this counts
+// EPISODES, not polls, and for why there was no existing
+// aggregate-count-by-fingerprint surface in this repo (for either vendor) to
+// mirror.
+const codexDialogSightings = createCodexDialogSightingsTracker({ log: (line) => console.log(line), now: () => Date.now() });
+let codexDialogSightingsPollInFlight = false;
+const codexDialogSightingsTimer = setInterval(() => {
+  if (codexDialogSightingsPollInFlight) return;
+  codexDialogSightingsPollInFlight = true;
+  scanPendingCodexApprovals(herdr)
+    .then((result) => codexDialogSightings.onScan(result.unrecognised))
+    .catch((e) => console.error(`  [codex-unrecognised] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { codexDialogSightingsPollInFlight = false; });
+}, 5_000);
+codexDialogSightingsTimer.unref?.();
 
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by

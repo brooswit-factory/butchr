@@ -197,6 +197,111 @@ failure shapes have their own dedicated regression test in
 `test/unit/herd.test.ts` (search for `FACTORY-75`), mirroring FACTORY-43's
 positive/negative pair pattern exactly.
 
+### FACTORY-314: "restart" became "resume" for Claude, same-session, same session id
+
+Everything above ("exactly one restart") described the ORIGINAL behaviour:
+`stop()` the agent, then `spawn()` it fresh — a brand-new Claude Code
+session with no memory of the interrupted one. That threw away real,
+sometimes long, conversations on every effort/model change, including a
+daemon restart that changed nothing on one axis (the observed `model: opus
+-> opus, effort: max -> medium` case that motivated this ticket). FACTORY-314
+replaces that ONE case — a Claude agent, currently alive, whose ONLY
+staleness is this model/effort comparison (`StaleAgent.resumable`, set only
+by the push site above and only for `provider === "claude"`) — with a
+same-pane, same-session-id relaunch instead:
+
+1. `buildWorkspace()` mints/persists NO session id at all — the real
+   fresh-launch path (`ManagedHerdrLifecycle.start()`, `@brooswit/drovr`)
+   builds its own `agent.start` params via Drovr's own
+   `buildAgentStartParams()`, which has no `--session-id` concept for
+   Claude, so anything butchr passed there would never have reached the
+   real launch anyway (this was round 1's mistake, caught in review before
+   merge). Instead, the REAL id Claude actually picked is discovered AFTER
+   a confirmed-successful launch, from Claude's own transcript directory
+   for that workspace's cwd (`discoverClaudeSessionId`,
+   src/agents/workspace.ts) — a short bounded poll
+   (`SESSION_DISCOVERY_ATTEMPTS`/`SESSION_DISCOVERY_POLL_MS`, src/agents/herd.ts)
+   since the transcript file can lag the launch's own liveness
+   confirmation. Positively tied to THIS launch: `discoverClaudeSessionId`
+   takes the wall-clock instant captured just before the launch attempt
+   began and NEVER returns a transcript created before it (`birthtimeMs`,
+   deliberately immutable-once-created unlike `mtime`) — so a workspace
+   directory already holding an OLDER transcript from a prior respawn of
+   the same issue can never be silently mistaken for this launch's own; it
+   falls through to `undefined` (logged, one-time fresh-restart-at-next-poll)
+   rather than a wrong-but-real guess. The discovered id is then persisted
+   (`persistDiscoveredSessionId`, `.butchr-session-id.json`,
+   `workspaceSessionId`) for `resumeInPlace()` below to use later. A FAILED
+   discovery (epic review on PR #513, round 3) does not just skip that
+   write — it actively INVALIDATES any id already on disk from an earlier
+   launch of this same workspace (`invalidatePersistedSessionId`), and only
+   then logs the WARNING. Without this, a workspace directory that already
+   held an older persisted id AND its transcript (both stable across
+   respawns — the project folder is per-cwd, and `resumeInPlace()`'s own
+   `claudeTranscriptExists` is a bare `existsSync`) would let a later
+   model/effort change silently `--resume` a DIFFERENT, already-finished
+   conversation and report it "preserved" — the `after`/`birthtimeMs` bound
+   above only protects *discovery*; this closes the matching gap on the
+   *persisted* side, so a failed discovery here always means the next
+   `resumeInPlace()` sees no id at all (`"unresumable"`, honest fresh
+   restart) rather than a stale one.
+2. `HerdrHerd.resumeInPlace()` (src/agents/herd.ts) — reached from
+   `reconcileNow`'s respawn loop (src/daemon/loop.ts) BEFORE the ordinary
+   `stop()`+`spawn()` path, and only for a `resumable` staleness — first
+   re-verifies the persisted id still has a real transcript
+   (`claudeTranscriptExists`; a missing/stale id falls back to
+   `"unresumable"`, an honest "session id could not be determined" fresh
+   restart rather than ever resuming a guess), then waits for the agent to
+   be idle/done (NEVER interrupts a turn: `"deferred"` if it's mid-turn,
+   retried next poll, no stop, no spawn), asks it to `/exit`, confirms the
+   pane's foreground is back to a shell (`"stuck"` and left alone if it
+   never is — never relaunched onto a stuck pane, never killed; the same
+   `"stuck"` outcome also covers a measured live race where herdr briefly
+   still holds the OLD process's agent name even after its pane left the
+   claude foreground, surfacing as `agent_name_taken` on the relaunch
+   attempt — treated as a safe retry-next-poll, not a thrown failure), then
+   relaunches on the exact SAME pane with `--resume <persisted-id>` plus
+   the NEW model/effort plus every other flag a fresh launch carries
+   (`--permission-mode`, `--mcp-config`, the development-channels flag) —
+   built by the SAME `agentStartParams()`/`spawnArgs()` a fresh launch uses,
+   so the FACTORY-43 launch/stale-check symmetry requirement holds by
+   construction. `buildWorkspace()` runs again as part of this, ONLY after
+   a brief post-launch liveness check confirms the relaunch actually stayed
+   alive (an unavailable model, etc., reports `"failed"` instead, leaving
+   the persisted model/effort untouched so the agent stays visibly stale
+   rather than looking falsely "already matching" next poll) — re-persisting
+   the new model/effort (session id is untouched here; a `--resume` relaunch
+   keeps the same id by definition), so the very next poll's ordinary
+   comparison above sees the new values and does not flag this agent stale
+   again.
+3. Deliberately NOT built on `ManagedHerdrLifecycle` (`@brooswit/drovr`,
+   pinned 0.15.1): that class's only "continue after a change" path
+   (`replacePaneId`, used by `HerdrHerd.recoverQuota()` for provider
+   fallback) always creates a brand-NEW pane/workspace and re-imports the
+   old conversation by replaying its transcript as one big synthetic prompt
+   — real, already-shipped plumbing, but a different session id and a
+   token-costly reimport, not a true resume. `resumeInPlace()` instead calls
+   the raw `agent.start` (via `startManagedAgent`, `@brooswit/drovr`)
+   directly against the EXISTING pane id, which a real herdr instance
+   confirmed accepts a native `--resume` relaunch cleanly (see this ticket's
+   own comment trail for the exact commands and evidence).
+4. `resumeInPlace()`/`spawn()` share the SAME per-issue exclusive queue
+   (`HerdrHerd`'s own `exclusive()`), so a reconcile poll landing DURING the
+   brief window where the pane shows a bare shell (between the `/exit` and
+   the relaunch) never races a concurrent ordinary spawn into
+   `ManagedHerdrLifecycle.start()` — the FACTORY-300 hazard (`this.active`
+   unresolvable, `HandoffBlocked("Current worker disappeared")`) that window
+   would otherwise risk. See `test/unit/herd.test.ts`'s own
+   `"FACTORY-300: a concurrent ordinary herd.spawn()..."` test.
+
+Every OTHER stale reason (a genuine argv-flag mismatch, a non-Claude
+provider, a workspace with no persisted session id yet — one-time at
+deploy) keeps the ORIGINAL stop-then-fresh-spawn behaviour, unchanged. The
+two outcomes are told apart in the ticket comment itself: a preserved
+resume never says "re-read your ticket" (`resumePreservedComment`,
+src/agents/respawn.ts); a genuine loss still does, with an honest reason
+(`respawnComment`).
+
 ## Back-compat: the deprecated `tier` field
 
 Existing `tier1`..`tier5` managed-session definitions (the 8 live codey

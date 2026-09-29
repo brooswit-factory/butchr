@@ -338,3 +338,124 @@ describe("project-manager Claude permissions", () => {
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
   });
 });
+
+describe("FACTORY-108: codex lizard mode — manual-approval launch", () => {
+  // Today's behaviour, unchanged: absent spec.lizardMode still launches
+  // Codex with --dangerously-bypass-approvals-and-sandbox (drovr's own
+  // launch.bypassApprovalsAndSandbox===false ? [] : [flag] default).
+  test("absent lizardMode: codex still launches with --dangerously-bypass-approvals-and-sandbox, same as before this ticket", () => {
+    const args = spawnArgs(spec, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+    const launch = agentLaunchConfig(spec, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && "bypassApprovalsAndSandbox" in launch).toBe(false);
+  });
+
+  test("lizardMode: false behaves exactly like absent — still bypasses", () => {
+    const args = spawnArgs({ ...spec, lizardMode: false }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+
+  // The actual fix: lizardMode: true is Codex's own "manual approval mode"
+  // launch signal — the Codex counterpart of Claude's permissionMode:
+  // "default" — and omitting the bypass flag is what lets a pending Codex
+  // approval dialog exist at all for autoAnswerCodexApprovals to answer
+  // (src/agents/permission-answer-loop.ts).
+  test("lizardMode: true drops --dangerously-bypass-approvals-and-sandbox from a codex launch", () => {
+    const args = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    const launch = agentLaunchConfig({ ...spec, lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
+  // Ignored entirely by the other two vendors — present or absent, neither
+  // launch's argv changes (SpawnSpec.lizardMode's own doc comment).
+  test("lizardMode is ignored entirely by Claude and Agy launches", () => {
+    const claudeWith = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "claude" });
+    const claudeWithout = spawnArgs(spec, "/w/KAN-783", { provider: "claude" });
+    expect(claudeWith).toEqual(claudeWithout);
+    const agyWith = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "agy" });
+    const agyWithout = spawnArgs(spec, "/w/KAN-783", { provider: "agy" });
+    expect(agyWith).toEqual(agyWithout);
+  });
+
+  // The pre-existing unconditional jira-project case (a freeform project
+  // manager's own always-manual review mode) is independent of lizardMode —
+  // it still drops the flag on its own with lizardMode absent, and adding
+  // lizardMode: true changes nothing further (the OR short-circuits).
+  test("the jira-project unconditional bypass-drop is unaffected by lizardMode either way", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const withoutLizard = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(withoutLizard).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    const withLizard = spawnArgs({ ...pm, lizardMode: true }, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(withLizard).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+  });
+});
+
+// FACTORY-314 (PR #513 review fix): `--resume` — appended ONLY by
+// `agentStartParams()`/`spawnArgs()`, and ONLY when `agent.resumeSessionId`
+// is set (`HerdrHerd.resumeInPlace()`'s own caller). A fresh Claude launch
+// NEVER gets `--session-id` from butchr at all: it runs under Claude's own
+// auto-generated session id, discovered afterward from its transcript
+// directory (`discoverClaudeSessionId`, src/agents/workspace.ts) — nothing
+// this function builds reaches the real fresh-launch path anyway (Drovr's
+// `ManagedHerdrLifecycle.start()` uses its OWN `buildAgentStartParams`, never
+// this one, for a fresh spawn; see `agentStartParams`'s own doc comment).
+describe("agentStartParams — FACTORY-314 session id / resume", () => {
+  const { mkdtempSync, rmSync, writeFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs");
+  const { tmpdir } = require("node:os") as typeof import("node:os");
+  const { join } = require("node:path") as typeof import("node:path");
+
+  function withDir<T>(fn: (dir: string) => T): T {
+    const dir = mkdtempSync(join(tmpdir(), "argv-session-id-"));
+    try { return fn(dir); } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  test("a fresh Claude launch NEVER gets --session-id, even when the workspace happens to have a discovered id persisted from an earlier launch", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("11111111-1111-1111-1111-111111111111"));
+      const args = spawnArgs(spec, dir);
+      expect(args).not.toContain("--session-id");
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("a fresh Claude launch omits the flag entirely with no persisted id either (a workspace from before this ticket, or the very first spawn)", () => {
+    withDir((dir) => {
+      mkdirSync(dir, { recursive: true });
+      const args = spawnArgs(spec, dir);
+      expect(args).not.toContain("--session-id");
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("agent.resumeSessionId set emits --resume instead of --session-id, even when a persisted id also exists (the persisted id itself, if consistent, or a caller-chosen one)", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
+      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" });
+      expect(args).toEqual(expect.arrayContaining(["--resume", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]));
+      expect(args).not.toContain("--session-id");
+    });
+  });
+
+  test("non-Claude providers never get either flag", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+      const args = spawnArgs(spec, dir, { provider: "agy" });
+      expect(args).not.toContain("--session-id");
+      expect(args).not.toContain("--resume");
+    });
+  });
+
+  test("a resumed launch still carries every OTHER flag a fresh launch has — DoD 1b", () => {
+    withDir((dir) => {
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("cccccccc-cccc-cccc-cccc-cccccccccccc"));
+      const fresh = spawnArgs(spec, dir);
+      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "cccccccc-cccc-cccc-cccc-cccccccccccc" });
+      for (const flag of ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels=server:butchr"]) {
+        expect(fresh).toContain(flag);
+        expect(resumed).toContain(flag);
+      }
+      expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
+    });
+  });
+});

@@ -155,12 +155,20 @@ test('free-form project workspace has no ticket workflow, preserves review and c
 // FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42): permissionMode
 // reaches the spawn spec when the rule sets it (overriding agentLaunchConfig's
 // own unconditional jira-project "auto" default, src/agents/argv.ts, since
-// spec.permissionMode's spread there runs after it); lizardMode never does.
-test('permissionMode is forwarded onto the spawn spec when the rule sets it; lizardMode never is', () => {
+// spec.permissionMode's spread there runs after it). FACTORY-108: lizardMode
+// is forwarded too, though — per jira-project-type.ts's own comment — a
+// jira-project Codex agent already launches with
+// bypassApprovalsAndSandbox:false unconditionally (agentLaunchConfig's own
+// jira-project special case, asserted above), so forwarding it here changes
+// no argv; kept only for consistency with every other rule kind's own
+// permissionMode/lizardMode pairing.
+test('permissionMode and lizardMode are both forwarded onto the spawn spec when the rule sets them', () => {
  const [lizardRule] = parseRules({ rules: [{ ...rule, permissionMode: 'default', lizardMode: true }] });
  const spec = specForProject({ agentKey: 'jira-project:managers:PROJ', rule: lizardRule!, project: { id: '1', key: 'PROJ', name: 'Project' } });
  expect(spec.permissionMode).toBe('default');
- expect(spec).not.toHaveProperty('lizardMode');
+ expect(spec.lizardMode).toBe(true);
  const [plain] = parseRules({ rules: [rule] });
- expect(specForProject({ agentKey: 'jira-project:managers:PROJ', rule: plain!, project: { id: '1', key: 'PROJ', name: 'Project' } }).permissionMode).toBeUndefined();
+ const plainSpec = specForProject({ agentKey: 'jira-project:managers:PROJ', rule: plain!, project: { id: '1', key: 'PROJ', name: 'Project' } });
+ expect(plainSpec.permissionMode).toBeUndefined();
+ expect(plainSpec).not.toHaveProperty('lizardMode');
 });

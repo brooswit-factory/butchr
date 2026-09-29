@@ -1,12 +1,12 @@
 import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events';
 import { createHash } from "node:crypto";
-import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceModel, workspaceEffort, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
-import { agentLaunchConfig, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
@@ -40,6 +40,27 @@ export interface StaleAgent {
   reason: string;
   /** The offending process's real argv, for the log line and Jira notice. */
   observedArgv: string[];
+  /**
+   * FACTORY-314, widened by FACTORY-411/FACTORY-424 — `true` for a Claude
+   * agent whose staleness is EITHER the `resolvedAgentOf` model/effort
+   * comparison below, OR a `checkArgv`/`checkManagedAgentArgv` failure whose
+   * ENTIRE reason is confined to the three fields the classification doc
+   * (`docs/session-field-reload-classification.md`) names as generalizable:
+   * `permissionMode`, `strictMcpConfig`, and the `mcpServers` `channel`-flag
+   * half — see `resumableArgvReason()`, this file, for the exact per-reason
+   * classification and why it must be a deliberate allowlist, never a
+   * blanket "any checkArgv failure is resumable". Never `true` for a
+   * non-Claude provider, or for a `checkArgv` failure that mixes an allowed
+   * flag with ANY other one (a mixed reason means at least one field outside
+   * the verified set changed too, and this ticket only verified `claude
+   * --resume` tolerating the three fields above, individually and together
+   * with model/effort — not an unbounded combination with unverified
+   * flags). The reconcile loop (`src/daemon/loop.ts`) reads this to choose
+   * `herd.resumeInPlace()` over today's `herd.stop()`+`herd.spawn()`; every
+   * OTHER stale reason leaves this `false`/absent and keeps today's
+   * fresh-restart behaviour completely unchanged.
+   */
+  resumable?: boolean;
 }
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
@@ -92,6 +113,66 @@ export interface Herd {
    * `staleIssues()`'s identical lookup.
    */
   providerOf?(issue: string): Promise<ManagedAgentProvider | null>;
+  /**
+   * FACTORY-314 — relaunch a `StaleAgent.resumable` issue's Claude session on
+   * the SAME pane with `--resume <persisted-session-id>` plus the new
+   * model/effort and the full flag set, instead of `stop()`+`spawn()`
+   * (which discards the conversation). Deliberately NOT `ManagedHerdrLifecycle`-based:
+   * that class always mints a brand-new pane/workspace for ANY
+   * "continue after change" request (verified against the pinned drovr
+   * 0.15.1 source — see the ticket's own comment trail), the wrong tool for
+   * relaunching in place.
+   *
+   * FIVE outcomes, each with a DIFFERENT caller response (`reconcileNow`,
+   * src/daemon/loop.ts):
+   * - `"resumed"`: success — conversation preserved, SAME session id, and
+   *   CONFIRMED alive (see `"failed"` below for the case this rules out).
+   *   Comment: "session preserved", never "re-read your ticket".
+   * - `"deferred"`: the agent is mid-turn right now — never interrupts a
+   *   turn. The caller retries a later poll; no stop, no spawn, no comment
+   *   per-poll (a bounded consecutive-count notice only, `ResumeDeferGuard`).
+   * - `"stuck"`: EITHER `/exit` was sent but the pane never returned to a
+   *   shell prompt (a dialog, a hang) — do NOT relaunch onto it, do NOT kill
+   *   it — OR (MEASURED live) the pane DID return to a shell but herdr
+   *   rejects the relaunch with `agent_name_taken`: the old process can
+   *   still hold the pane's agent name for a moment even after it stops
+   *   being the reported foreground process. Same non-destructive retry as
+   *   `"deferred"` either way, distinguished only in the eventual notice's
+   *   wording (a human likely needs to look, not just wait).
+   * - `"unresumable"`: resuming isn't possible for a reason unrelated to
+   *   timing (no persisted session id — a pre-FACTORY-314 workspace — or the
+   *   running provider isn't Claude, or the agent disappeared entirely). The
+   *   caller falls back to today's stop-then-fresh-spawn, with a comment
+   *   that says plainly the session was lost and why ("session id could not
+   *   be determined").
+   * - `"failed"`: the relaunch was ACCEPTED by herdr but Claude did not stay
+   *   up (an unavailable model, or any other immediate exit) — caught by a
+   *   brief post-launch liveness check, since herdr accepting a launch only
+   *   means the process started. The model/effort files are deliberately
+   *   left UNCHANGED (persisted only after a CONFIRMED-alive relaunch — see
+   *   this method's own body) so a failed attempt stays detectable rather
+   *   than looking "already matching" on the next poll. The caller falls
+   *   back to today's stop-then-fresh-spawn, with a comment that says
+   *   plainly the resume failed and why.
+   * Never throws for any of the five; only a genuine herdr/RPC failure does.
+   *
+   * FACTORY-426: REQUIRED, not optional — `scopedHerd` (src/daemon/loop.ts),
+   * the one wrapper production's real reconcile call site actually goes
+   * through, explicitly delegates named `Herd` members instead of spreading
+   * (see that function's own doc comment for why). `resumeInPlace` being
+   * declared optional here is exactly what let `scopedHerd` silently omit it
+   * from that list and still compile — `herd.resumeInPlace` was `undefined`
+   * on every real poll, so the `if (info.resumable && herd.resumeInPlace)`
+   * guard below was false on every poll and control fell straight through to
+   * the old stop()+spawn() path, even though every regression test (built on
+   * a fake `Herd` object that DOES define `resumeInPlace`, calling
+   * `reconcileNow` directly rather than through `scopedHerd`) passed. Making
+   * this required means a `Herd` implementation or fake that forgets it
+   * fails to COMPILE, closing the gap TypeScript couldn't catch when it was
+   * optional. A fake that has no use for real resume behaviour can implement
+   * it as `async () => "unresumable"`.
+   */
+  resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">;
 }
 
 export interface ManagedHerdAgent {
@@ -129,6 +210,129 @@ export const PANE_READINESS_TIMEOUT_MS = 5_000;
 
 /** @deprecated Historical reproduction-script budget; runtime uses Drovr's deadline. */
 export const PANE_BUSY_MAX_RETRIES = 4;
+
+/**
+ * FACTORY-314 — how long `resumeInPlace()` waits for a pane it just asked to
+ * `/exit` to actually show a shell in its foreground, polling every
+ * `RESUME_EXIT_POLL_MS`. Bounded deliberately: a pane that never returns to
+ * a shell (stuck on a confirmation, a hung process) must never be relaunched
+ * onto — see that method's own doc comment for why the caller aborts rather
+ * than force-killing anything when this deadline passes.
+ */
+export const RESUME_EXIT_TIMEOUT_MS = 10_000;
+export const RESUME_EXIT_POLL_MS = 250;
+
+/**
+ * FACTORY-314 (FACTORY-312 review, 26137 point 2) — how long `resumeInPlace()`
+ * waits after `startManagedAgent` returns before confirming Claude actually
+ * stayed up. Herdr accepting the launch only means the process STARTED; an
+ * unavailable model or similar exits almost immediately (measured: exit 1
+ * within a couple seconds) and this is the only thing that catches it.
+ */
+export const RESUME_LAUNCH_VERIFY_MS = 3_000;
+
+/**
+ * FACTORY-314 (PR #513 review fix) — how many times `startProviders()`
+ * retries `discoverClaudeSessionId` after a fresh Claude launch (waiting
+ * `SESSION_DISCOVERY_POLL_MS` between attempts) before giving up and logging
+ * a WARNING. MEASURED necessary live: a single check immediately after
+ * `ManagedHerdrLifecycle.start()` returns can race Claude's own
+ * transcript-file creation (see `startProviders`'s own doc comment on this
+ * exact seam) and find nothing even though the launch is genuinely healthy.
+ *
+ * ITERATION-COUNTED, deliberately NOT a `this.monotonicNow()` deadline like
+ * `resumeInPlace()`'s own exit-wait loop: this one is reached by EVERY
+ * successful Claude spawn, including every existing test that fakes `wait`
+ * as instant (`instant = () => Promise.resolve()`) without also faking
+ * `monotonicNow` in lockstep. A wall-clock deadline compared against REAL
+ * `performance.now()` would not budge while `wait` resolves instantly,
+ * turning a discovery that legitimately never finds anything (any test with
+ * no real transcript on disk) into a real ~15s stall PER SPAWN — measured
+ * directly: it hung this ticket's own test suite. Counting attempts instead
+ * ties the bound to `wait()` itself, so a faked instant `wait` makes the
+ * whole retry loop resolve in microtasks, exactly like every other bounded
+ * loop in this file that is exercised under `instant`.
+ */
+export const SESSION_DISCOVERY_ATTEMPTS = 15;
+export const SESSION_DISCOVERY_POLL_MS = 1_000;
+
+/**
+ * FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 3) — the
+ * deliberate, per-reason `checkArgv`/`checkManagedAgentArgv` allowlist that
+ * decides whether a `StaleAgent` from a `checkArgv` FAILURE (as opposed to
+ * the separate `resolvedAgentOf` model/effort push site) may set
+ * `resumable: true`. `checkManagedAgentArgv` (`@brooswit/drovr`) returns
+ * ONE joined string, `"argv lacks " + missing.join(", ")` — never a
+ * structured list — so this parses that exact, verified format back apart
+ * (each piece is `"<flag>"` or `"<flag> <value...>"`) rather than
+ * re-deriving the comparison itself. Deliberately NOT exported from drovr as
+ * constants (`CLAUDE_STRICT_MCP_FLAG`/`CLAUDE_DEVELOPMENT_CHANNELS_FLAG`),
+ * so the three literal flag strings below are verified directly against the
+ * pinned `@brooswit/drovr` version's own `checkManagedAgentArgv` source
+ * (`node_modules/@brooswit/drovr/dist/index.js`) — re-verify them there if
+ * the pinned version ever changes.
+ *
+ * A DELIBERATE ALLOWLIST, never a blanket "any checkArgv failure is
+ * resumable" — the classification doc is explicit that only THESE three
+ * fields were ever verified (FACTORY-314's own Step 0 style test) to have
+ * `claude --resume` tolerate the flag changing: `permissionMode`
+ * (`--permission-mode`), `strictMcpConfig` (`--strict-mcp-config`), and the
+ * `mcpServers` `channel`-flag half (`--dangerously-load-development-channels`).
+ * Every OTHER `checkArgv` reason — a `--mcp-config` VALUE mismatch, a
+ * `--dangerously-bypass-approvals-and-sandbox`/`--cd`/`--config` mismatch (a
+ * DIFFERENT `AgentConfig`/`spec.cwd` shape this ticket never verified `--resume`
+ * against), or any future flag `checkManagedAgentArgv` ever grows — must stay
+ * `false`, including when it appears ALONGSIDE an allowed flag in the SAME
+ * `missing` list: a mixed reason means at least one unverified field changed
+ * too, which is a combination this ticket never tested.
+ */
+export function resumableArgvReason(reason: string, provider: ManagedAgentProvider): boolean {
+  if (provider !== "claude") return false;
+  const prefix = "argv lacks ";
+  if (!reason.startsWith(prefix)) return false;
+  const pieces = reason.slice(prefix.length).split(", ");
+  if (pieces.length === 0) return false;
+  const ALLOWED_FLAGS = new Set(["--permission-mode", "--strict-mcp-config", "--dangerously-load-development-channels"]);
+  return pieces.every((piece) => ALLOWED_FLAGS.has(piece.split(" ")[0] ?? ""));
+}
+
+/**
+ * FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 4: "Treat
+ * Claude-only as a stated property") — `staleIssues()`'s own `checkArgv`-
+ * failure push site delegates its `resumable`/`reason` computation here,
+ * pulled out into its own named, directly testable function per PR #541
+ * review (the reason-rewrite branch had no test of its own — an allowlist
+ * unit test on `resumableArgvReason` proves WHETHER a reason is resumable,
+ * a different claim from what the respawn comment SAYS when it isn't).
+ *
+ * `provider` is the REAL, currently-observed provider (`providerOfPane`'s
+ * own result) — never guessed downstream from the reason string alone. If
+ * this SAME reason would have been resumable on a Claude agent but this
+ * agent's actual provider isn't Claude, the respawn comment states that
+ * explicitly instead of reading as a bare argv diff with no hint that the
+ * session loss is an intentional, Claude-only limitation rather than a bug.
+ *
+ * NOTE ON REACHABILITY: today, `spawnArgs`'s non-Claude branches
+ * (`src/agents/argv.ts`, the `provider === "codex"` shape) never emit
+ * `--permission-mode`/`--strict-mcp-config`/`--dangerously-load-development-channels`
+ * at all, so `expected` never calls for them on a non-Claude agent and this
+ * rewrite branch cannot currently be reached through `staleIssues()`'s own
+ * `checkArgv` comparison for those flags specifically — it exists for the
+ * day a non-Claude provider's expected argv DOES grow one of these fields
+ * (or an equivalent), so that day doesn't also require remembering to wire
+ * this message up. Tested directly (this function, not through a
+ * synthetic/unreachable `staleIssues()` fixture) for exactly this reason.
+ */
+export function staleArgvOutcome(reason: string, provider: ManagedAgentProvider): { reason: string; resumable: boolean } {
+  const resumable = resumableArgvReason(reason, provider);
+  if (!resumable && provider !== "claude" && resumableArgvReason(reason, "claude")) {
+    return {
+      resumable,
+      reason: `session lost: its definition changed ${reason.replace(/^argv lacks /, "")}, a field that CAN preserve a session on a Claude-vendor agent, but this agent's provider (${provider}) is not Claude — butchr's resume-in-place mechanism is Claude-only by construction (no verified --resume-equivalent exists for any other provider), so this is a stated limitation, not a defect`,
+    };
+  }
+  return { reason, resumable };
+}
 
 /**
  * BUTCHR-320: the single tag every spawn-attempt outcome line is emitted
@@ -179,6 +383,23 @@ export const PANE_BUSY_MAX_RETRIES = 4;
  * bounded), so only the failure line's field order matters here.
  */
 export const SPAWN_TAG = "[spawn]";
+
+/**
+ * FACTORY-426 (epic-authorized observability gap, FACTORY-73/FACTORY-312
+ * comment 27451): before this, `resumeInPlace` never logged anything of its
+ * own — its five outcomes were only visible indirectly, through whatever
+ * (if anything) `reconcileNow`'s callers did with them (`onResumePreserved`/
+ * `onResumeWaiting`, wired in `src/daemon/index.ts`, cover exactly two of
+ * the five). A `"stuck"`/`"unresumable"`/`"failed"` outcome with no
+ * subscriber wired left NO trace anywhere that a resume was even attempted —
+ * the exact blind spot that let this ticket's own strand regression run
+ * live before anyone noticed. Every `resumeInPlaceExclusive` outcome now
+ * logs under this tag, mirroring `SPAWN_TAG`'s own shape (`grep`-able,
+ * `issue`/outcome first, free text last) so `journalctl | grep RESUME_TAG`
+ * gives a complete attempt history independent of which callbacks a given
+ * loop happens to wire.
+ */
+export const RESUME_TAG = "[resume]";
 
 /**
  * FACTORY-75 (PR #473 review fix) — `staleIssues()`'s own argv fallback for
@@ -515,9 +736,24 @@ export class HerdrHerd implements Herd {
       // here, never a value recomputed independently of that spawn.
       const permissionMode = workspacePermissionMode(cwd);
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      // FACTORY-108: same read-the-workspace-back shape as permissionMode/
+      // strictMcpConfig above, for a Codex lizard agent's own
+      // bypassApprovalsAndSandbox-dropping launch signal (SpawnSpec.lizardMode) —
+      // without this, a lizard Codex agent's real (bypass-flag-less) argv
+      // would forever mismatch a naively-recomputed "expected" argv that
+      // still assumes the bypass flag, respawn-looping it forever.
+      const lizardMode = workspaceLizardMode(cwd);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
-      if (!check.ok) { out.push({ issue, reason: check.reason, observedArgv: proc.argv }); continue; }
+      if (!check.ok) {
+        // FACTORY-411/FACTORY-424 (classification doc, Finding 2, points 3
+        // & 4): the SECOND push site that may ever set `resumable` — see
+        // `staleArgvOutcome`'s own doc comment for the exact, deliberate
+        // per-reason allowlist and the Claude-only reason rewrite.
+        const { reason, resumable } = staleArgvOutcome(check.reason, provider);
+        out.push({ issue, reason, observedArgv: proc.argv, resumable });
+        continue;
+      }
       // FACTORY-75: `--model`/`--effort` are deliberately excluded from
       // `checkArgv`/`checkManagedAgentArgv`'s own comparison just above
       // (this method's own top comment: "issuetype/summary/parent don't
@@ -584,6 +820,12 @@ export class HerdrHerd implements Herd {
             issue,
             reason: `argv lacks --model/--effort matching the current definition/rule (model: ${persistedModel ?? "(default)"} -> ${liveResolved.model ?? persistedModel ?? "(default)"}, effort: ${persistedEffort ?? "(default)"} -> ${liveResolved.effort ?? persistedEffort ?? "(default)"})`,
             observedArgv: proc.argv,
+            // FACTORY-314: this is the ONLY push site that can ever set
+            // `resumable` — reached only after `checkArgv` above already
+            // passed (`check.ok`, never the "Codex MCP isolation" or
+            // `checkArgv` failure pushes) and only for Claude, the only
+            // provider this ticket's `--resume` mechanism covers.
+            resumable: provider === "claude",
           });
         }
       }
@@ -748,6 +990,21 @@ export class HerdrHerd implements Herd {
     await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
     if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
     const label = await this.labelFor(spec.key);
+    // FACTORY-314 (PR #513 review fix): captured by `prepare()` below, purely
+    // so a SUCCESSFUL Claude launch can discover its REAL session id
+    // afterward (see the `result.status === "success"` block) — `prepare()`
+    // is the only place that resolves `home`, and it isn't part of
+    // `ManagedHerdrResult`, so there is nothing to read it back from otherwise.
+    let preparedHome: string | undefined;
+    // FACTORY-314 (epic review on PR #513, "trap 2"): the wall-clock instant
+    // BEFORE the launch attempt begins — the lower bound `discoverClaudeSessionId`
+    // filters candidate transcripts against, so a workspace directory that
+    // already holds an OLDER transcript (a prior respawn of this SAME
+    // issue) can never be silently mistaken for this launch's own. `Date.now()`,
+    // not `this.monotonicNow()`: transcript timestamps are wall-clock, and
+    // `monotonicNow` is deliberately unrelated to it (see that field's own
+    // doc comment) — the two are never comparable.
+    const launchStartedAt = Date.now();
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label,
@@ -773,12 +1030,73 @@ export class HerdrHerd implements Herd {
         const prepared = await this.prepareWorkspace({ provider, cwd: dir, unattended: true });
         const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string"
           ? prepared.HOME : undefined;
+        preparedHome = home;
         return { launch, ...(home ? { env: { HOME: home }, home } : {}) };
       },
     });
     if (result.status === "success") {
       this.refused.delete(spec.key);
       await this.reportFullAgentKey(spec.key);
+      // FACTORY-314 (PR #513 review fix): a fresh Claude launch runs under
+      // Claude's OWN auto-generated session id — nothing butchr passes
+      // reaches the real launch argv (`ManagedHerdrLifecycle.start()` builds
+      // its own `agent.start` params via Drovr's `buildAgentStartParams`,
+      // which has no `--session-id` concept at all; see `agentStartParams`'s
+      // own doc comment in src/agents/argv.ts for the ONE place that DOES,
+      // never reached by this path). So the real id is discovered AFTER the
+      // fact, from Claude's own transcript directory for this workspace
+      // (`discoverClaudeSessionId`, src/agents/workspace.ts) — the newest
+      // transcript for this cwd, right after a launch this method itself
+      // just confirmed succeeded, is unambiguous. Persisted so a later
+      // model/effort-only change can `--resume` it for real, instead of a
+      // pre-minted id Claude never actually used.
+      //
+      // RETRIED, not a single check: MEASURED live against a real herdr
+      // (throwaway workspace, real `HerdrHerd.spawn()`) that a single
+      // discovery attempt immediately after `ManagedHerdrLifecycle.start()`
+      // returns can race Claude's own transcript-file creation and find
+      // nothing — `KICKOFF_VERIFY_MS` (drovr, ~12s) confirms the AGENT is
+      // idle/alive, not that its transcript file has been written yet
+      // (slower under MCP-connection retries, model cold-start, etc.). A
+      // bounded poll closes this gap cheaply: the common case still returns
+      // on the FIRST check (the file is usually already there).
+      if (result.account.provider === "claude") {
+        const dir = workspaceDirFor(spec.key);
+        // FACTORY-418 (fixed here, inside FACTORY-411's PR — see that
+        // ticket for why it's routed through this story instead of its
+        // own): invalidate BEFORE the discovery poll starts, not only in
+        // the poll's failure branch below. An earlier launch of this SAME
+        // workspace may have persisted a session id of its own; if a
+        // daemon death or a non-ENOENT `discoverClaudeSessionId` error hits
+        // mid-poll, control never reaches the `else` branch that used to be
+        // the only place this ran, so that stale id (and its still-present
+        // transcript, since `claudeTranscriptExists` is a bare existsSync)
+        // would survive on disk. A LATER model/effort (or now
+        // permissionMode/strictMcpConfig/mcpServers-channel) change would
+        // then find it, find its transcript still sitting in the same
+        // per-cwd project folder, and `--resume` it: a silent, confidently
+        // wrong resume into a different, already-finished conversation,
+        // reported as "PRESERVED". Clearing it as soon as a fresh launch is
+        // confirmed successful — before the poll can be interrupted — means
+        // the ONLY way a stale id survives this launch is if discovery
+        // itself then succeeds and re-persists a fresh one.
+        invalidatePersistedSessionId(dir);
+        let discovered: string | undefined;
+        for (let attempt = 0; attempt < SESSION_DISCOVERY_ATTEMPTS; attempt++) {
+          discovered = discoverClaudeSessionId(dir, preparedHome, launchStartedAt);
+          if (discovered || attempt === SESSION_DISCOVERY_ATTEMPTS - 1) break;
+          await this.wait(SESSION_DISCOVERY_POLL_MS);
+        }
+        if (discovered) persistDiscoveredSessionId(dir, discovered);
+        else {
+          // Already invalidated above, before the poll began. Nothing left
+          // to clear here — `workspaceSessionId` already fails safe to
+          // `undefined`, so `resumeInPlace()`'s existing `if (!sessionId)
+          // return "unresumable"` check catches this launch — an honest
+          // fresh restart next time, never a wrong guess. Logged only.
+          this.log?.(`WARNING: [spawn] ${spec.key} could not discover a native Claude session id after a successful launch — a later model/effort change will fall back to a fresh restart instead of resuming`);
+        }
+      }
     } else {
       if (result.status === "blocked") this.log?.(`[provider-fallback] ${spec.key} blocked: ${result.reason}`);
       const current = await this.lifecycle(spec.key).resolveCurrent();
@@ -913,6 +1231,206 @@ export class HerdrHerd implements Herd {
 
   async paneFor(issue: string): Promise<string | null> {
     return (await this.byIssue()).get(issue)?.pane ?? null;
+  }
+
+  /**
+   * See the `Herd.resumeInPlace` interface doc for the full contract.
+   * FACTORY-426: logs under `RESUME_TAG` exactly once per call, covering
+   * all five outcomes AND a thrown error uniformly — see that tag's own
+   * doc comment for why this wrapper (rather than scattering `this.log?.()`
+   * through `resumeInPlaceExclusive`'s many return points) is where this
+   * lives: one call site can't miss a branch the way N scattered ones could.
+   */
+  async resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
+    const issue = spec.key;
+    try {
+      const outcome = await this.exclusive(issue, () => this.resumeInPlaceExclusive(spec));
+      this.log?.(`${RESUME_TAG} ${issue} ${outcome}`);
+      return outcome;
+    } catch (e) {
+      this.log?.(`${RESUME_TAG} ${issue} threw — ${(e as Error)?.message ?? e}`);
+      throw e;
+    }
+  }
+
+  private async resumeInPlaceExclusive(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
+    const issue = spec.key;
+    // Routed through `this.exclusive` (above), the SAME per-issue queue
+    // `spawn()`/`stop()` already use — a concurrent ordinary `herd.spawn()`
+    // for this same issue (e.g. a reconcile poll landing mid-relaunch, which
+    // would otherwise see a bare shell in `byIssue()` and treat this issue
+    // as "desired but not running") simply queues behind this call and, once
+    // it runs, finds the resumed agent already present (`spawnExclusive`'s
+    // own no-op check) — it never reaches `ManagedHerdrLifecycle.start()` at
+    // all, so FACTORY-300's `this.active`-can't-resolve `HandoffBlocked`
+    // never triggers from this window. Verified with a fake-`Herd`
+    // reconcile-path test (test/unit/herd.test.ts) that fires a concurrent
+    // `spawn()` mid-window and asserts exactly this: no throw, no duplicate
+    // pane, a plain no-op after the resume settles.
+    const entry = (await this.byIssue()).get(issue);
+    if (!entry) return "unresumable"; // no longer running — nothing to resume; the ordinary spawn loop picks it up
+    const { pane, cwd } = entry;
+    const sessionId = workspaceSessionId(cwd);
+    if (!sessionId) return "unresumable"; // pre-FACTORY-314 workspace (or genuinely unknown) — caller falls back to fresh-restart with an honest "session lost: session id could not be determined" reason
+    const found = await this.providerOfPane(pane);
+    if (!found || found.provider !== "claude") return "unresumable"; // this ticket's --resume mechanism covers Claude only
+    // FACTORY-314 (PR #513 review fix): verify the id we are ABOUT TO RESUME
+    // still has a real transcript before doing anything else — a stale or
+    // corrupted persisted id must fail safe to "unresumable" (an honest
+    // fresh restart) rather than attempting to resume a conversation that
+    // no longer exists. Same `home` resolution `spawnExclusive`'s own
+    // `prepare()` uses, since that's what determines where Claude's
+    // transcripts actually live for an isolated-HOME launch.
+    const prepared = await this.prepareWorkspace({ provider: "claude", cwd, unattended: true });
+    const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string" ? prepared.HOME : undefined;
+    if (!claudeTranscriptExists(cwd, sessionId, home)) return "unresumable";
+    // Idle-only, race-closed as tightly as this SDK allows: two reads of the
+    // SAME evidence (`agent_status`) back-to-back, immediately before acting
+    // — see `Herd.resumeInPlace`'s own doc comment for why no finer
+    // "a turn just started" signal exists here to close this tighter.
+    const isIdle = async () => {
+      const current = await this.lifecycle(issue).resolveCurrent().catch(() => undefined);
+      return current?.agent_status === "idle" || current?.agent_status === "done";
+    };
+    if (!(await isIdle())) return "deferred";
+    if (!(await isIdle())) return "deferred";
+    await this.herdr.pane.sendText({ pane_id: pane, text: "/exit" } as Parameters<DrovrClient["pane"]["sendText"]>[0]);
+    await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]);
+    // FACTORY-426 (epic review, comment 27460): from HERE ON, `/exit` has
+    // been sent — the pane may already be empty, or become empty at any
+    // point below. `ManagedHerdrLifecycle` (the class `spawnExclusive`'s
+    // ORDINARY spawn path relies on, via `startProviders`/`lifecycle().start()`)
+    // keeps its OWN private "current worker" identity, and `resumeInPlace`
+    // never goes through that class at all (raw `pane.sendText`/`startManagedAgent`
+    // instead, precisely so it can reuse the SAME pane) — so that identity is
+    // NEVER updated here, success or failure. If a post-exit outcome below
+    // returns "stuck" (a bare retry, no stop/spawn) or lets an error
+    // propagate (reconcileNow's `failures.push(...); continue;` — ALSO a bare
+    // retry) while the pane is ACTUALLY empty, nothing ever clears that stale
+    // identity: `ManagedHerdrLifecycle.start()`'s own precondition
+    // (`!existing && this.active` -> `HandoffBlocked: Current worker
+    // disappeared; refusing implicit replacement`) then rejects every future
+    // ordinary spawn attempt for this issue, forever — confirmed live
+    // (FACTORY-73/FACTORY-394, FACTORY-312 comment 27407) as a genuine
+    // permanent stall, not a hypothetical.
+    //
+    // THE FLOOR (verbatim from the epic's review): "resumeInPlace must never
+    // return an outcome that leads to a bare retry while the pane is empty.
+    // Before returning any non-'resumed' outcome from the post-exit region,
+    // re-check the pane; if it is empty, the outcome must be one that routes
+    // to stop-then-spawn — never 'stuck', never a propagated throw." `"failed"`
+    // is that route: `reconcileNow`'s fallthrough for `"failed"`/`"unresumable"`
+    // already calls `herd.stop(issue)` (a real `lifecycle(issue).stop()`,
+    // which clears `ManagedHerdrLifecycle.active`) BEFORE `herd.spawn()` — the
+    // exact reset an empty pane needs before the next launch attempt can
+    // succeed instead of hitting the disappeared-worker guard. A pane that is
+    // STILL occupied (by claude or anything else) is left alone exactly as
+    // before: `"stuck"` there is a genuinely safe, non-destructive retry,
+    // never a wedge, since nothing needs recovering.
+    const postExitOutcome = async (): Promise<"stuck" | "failed"> => (await this.providerOfPane(pane)) ? "stuck" : "failed";
+    const deadline = this.monotonicNow() + RESUME_EXIT_TIMEOUT_MS;
+    while (this.monotonicNow() < deadline && (await this.providerOfPane(pane))) {
+      await this.wait(RESUME_EXIT_POLL_MS);
+    }
+    if (await this.providerOfPane(pane)) return await postExitOutcome(); // still occupied: a fresh read through the SAME shared decision point every other exit below uses, rather than a one-off inline check — a pane that finishes exiting between here and the read this performs correctly falls through to "failed" instead of repeating this file's own "stuck" verdict on an already-empty pane.
+    const preference = spec.agents?.find((p) => p.harness === "claude");
+    const selected: AgentConfig = { ...this.agent, provider: "claude", resumeSessionId: sessionId };
+    if (preference?.model) selected.model = preference.model;
+    if (preference?.effort) selected.effort = preference.effort;
+    // FACTORY-312 review (26137, point 1): the argv is built from `cwd`
+    // DIRECTLY — deliberately NOT via the FULL `buildWorkspace()` here,
+    // before the relaunch is even attempted. Persisting the new model/effort
+    // BEFORE knowing the relaunch succeeded would make a FAILED resume
+    // indistinguishable from a healthy one on the very next poll (the
+    // persisted-vs-live comparison would already "match", so a stuck-on-old-
+    // flags agent would never be flagged again). Same shared builder
+    // (`agentStartParams`, src/agents/argv.ts) a fresh launch and
+    // `staleIssues()`'s own comparison use, so this relaunch's argv shape is
+    // judged by the identical module that built it — the SAME pane_id as
+    // before, never a new workspace/pane, unlike a fresh spawn.
+    //
+    // FACTORY-411/FACTORY-424 (classification doc, Finding 2, point 2): that
+    // reasoning covers the staleness-BOOKKEEPING files (model/effort/
+    // permission-mode/strict-mcp-config, never read by Claude itself, only
+    // compared against by a LATER `staleIssues()` poll) — it does NOT cover
+    // `mcp.json`, which Claude reads as real file CONTENT on its very first
+    // post-resume turn. The relaunched process's argv (built from `spec`
+    // just below) already carries the new channel flag correctly regardless
+    // of timing, but if `mcp.json` itself is still the OLD content, the
+    // relaunch would silently start with stale tool bindings. So this one
+    // file — and only this one — is written NOW, before the relaunch
+    // attempt, via the same writer `buildWorkspace()` itself calls
+    // (`writeClaudeMcpJson`, src/agents/workspace.ts) rather than the full
+    // function: it carries no anti-regression timing concern of its own
+    // (Claude re-reads it fresh every turn regardless of what `staleIssues()`
+    // believes), so writing it early costs nothing and fixes the gap: a
+    // FAILED resume leaves it pointing at the NEW bindings, same as it would
+    // once `buildWorkspace()` runs again on this workspace's next successful
+    // spawn/resume anyway.
+    writeClaudeMcpJson(cwd, spec, this.mcpUrl);
+    const params = agentStartParams(spec, cwd, pane, nameFor(issue), selected, this.mcpUrl);
+    try {
+      await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
+    } catch (e) {
+      // FACTORY-314 (PR #513 review fix, live-tested against a real herdr):
+      // MEASURED — the OLD claude process can still hold this pane's agent
+      // name in herdr's own bookkeeping for a moment even after
+      // `providerOfPane` above stopped seeing it in the foreground (a
+      // narrow gap between "no longer the reported foreground process" and
+      // "herdr has fully released the name"), so `agent.start` here can
+      // genuinely reject with `agent_name_taken` even though every check
+      // above passed.
+      //
+      // FACTORY-426 (epic review, comment 27460, required addition 1):
+      // this used to return "stuck" unconditionally for `agent_name_taken`
+      // and rethrow every OTHER error — both a bare retry (reconcileNow's
+      // `continue` for "stuck", or its `failures.push(...); continue;` for a
+      // propagated throw), and both wrong the instant this catch is reached:
+      // by construction, `/exit` has ALREADY been confirmed to have emptied
+      // this pane before `startManagedAgent` was even attempted (the check
+      // just above this try/catch only falls through when the pane is
+      // empty). So EVERY error here — `agent_name_taken` or anything else —
+      // means the relaunch itself failed against a pane we already know is
+      // vacated, never "we can't yet tell if it's safe to touch" the way the
+      // exit-wait timeout's own "stuck" genuinely is. Routing through the
+      // same `postExitOutcome()` decision point as every other exit in this
+      // method keeps that one exception explicit: if something DID
+      // materialize in the pane between the check above and now (any
+      // provider, not just claude), this still safely reports "stuck"
+      // instead of stopping something that showed up; otherwise (the
+      // expected case) it reports "failed", which routes through
+      // `reconcileNow`'s existing stop-then-spawn fallback — clearing
+      // `ManagedHerdrLifecycle.active` via `herd.stop()` before the next
+      // launch attempt, instead of leaving it stale forever.
+      const outcome = await postExitOutcome();
+      if (outcome === "stuck") throw e; // pane unexpectedly occupied again — preserve the original error rather than mask it with a plain retry verdict; the caller still gets a "stuck"-shaped non-destructive path via the failures/notify wiring around thrown errors.
+      return outcome; // "failed" — pane confirmed empty; the caller's stop-then-spawn fallback recovers it.
+    }
+    // FACTORY-312 review (26137, point 2): herdr accepting the launch only
+    // means the PROCESS started — an unavailable model (Step 0.2: measured
+    // exit 1, "issue with the selected model") or any other immediate
+    // failure exits the pane back to a shell within seconds, and
+    // `startManagedAgent`'s own readiness wait does not catch that (it only
+    // retries herdr's `agent_pane_busy`, never checks the process stays
+    // alive). A brief settle-and-verify closes that gap: if claude did not
+    // stay up, this resume attempt FAILED — no loop, no empty pane left
+    // behind (a claude process may still be there, exited to a fresh shell
+    // prompt, which the caller's own eventual fresh spawn reclaims), and the
+    // model/effort files are correctly left UNCHANGED (see the ordering note
+    // above) — a real, distinct failure, not a "resumed".
+    await this.wait(RESUME_LAUNCH_VERIFY_MS);
+    const launched = await this.providerOfPane(pane);
+    if (!launched || launched.provider !== "claude") return "failed";
+    // Re-persists model/effort/permission-mode/etc. for THIS relaunch, ONLY
+    // now that it's confirmed alive. Session id is untouched by
+    // `buildWorkspace()` (it no longer manages that file at all — see
+    // `discoverClaudeSessionId`/`persistDiscoveredSessionId`,
+    // src/agents/workspace.ts): a `--resume` relaunch keeps the SAME id by
+    // definition, so there is nothing to rediscover here. The very next
+    // poll's `staleIssues()` then compares model/effort against these NEW
+    // values and does not flag this agent stale again (FACTORY-43 no-loop).
+    buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
+    return "resumed";
   }
 
   /**

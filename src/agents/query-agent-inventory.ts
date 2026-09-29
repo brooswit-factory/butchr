@@ -83,7 +83,7 @@
 import type { AgentEffort, AgentHarness, AgentPreference, AgentRole, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
 import { loadRules, rulesPath } from "../rules/rules.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
-import type { DashboardResponse, DashboardRow } from "./dashboard.js";
+import type { AdmissionCensusField, AdmissionView, DashboardResponse, DashboardRow } from "./dashboard.js";
 import {
   listSessionDefinitions,
   type SessionDefinitionListDeps,
@@ -213,6 +213,60 @@ function liveAndWithheldRuleKeys(rows: readonly DashboardRow[]): { live: Readonl
   return { live, withheld };
 }
 
+/**
+ * FACTORY-136: every rule provider's own admission-source name, verified by
+ * reading every `admissionController.admit(...)` call site in
+ * `src/daemon/index.ts` — each rule-driving loop admits under its own
+ * `ADMISSION_SOURCE_*` constant, and every one of those constants' STRING
+ * VALUE equals the `ResourceProvider` it drives, with exactly one exception:
+ * the `jira-work` loop (`runResourceLoop(ruleResourceType, ...)`, the plain
+ * Jira issue/project-search rule engine) admits under the source name
+ * `"issue"`, not `"jira-work"` — confirmed by `ownsRuleAgent`/the `enabled`
+ * filter in `src/rules/resource-type.ts` both keying on `resourceProvider
+ * === "jira-work"` while the SAME loop's own `admission:` callback in
+ * `index.ts` passes `ADMISSION_SOURCE_ISSUE = "issue"`. No other provider has
+ * this mismatch. The mapping is TOTAL and 1:1 over every `ResourceProvider` —
+ * no two providers share a source, and no provider spans more than one.
+ * `"managed-sessions"` (`ADMISSION_SOURCE_MANAGED_SESSIONS`) has no entry
+ * here: it is never a `Rule.resourceProvider` value, only the built-in
+ * managed-session-definitions loop's own admission bucket, which this module
+ * already handles separately (`SessionDefinitionInventoryEntry`, no
+ * `staffed`/`reason` of its own).
+ */
+const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
+  "jira-work": "issue",
+  "github-issue": "github-issue",
+  "github-pr": "github-pr",
+  "jira-idea": "jira-idea",
+  "zendesk-ticket": "zendesk-ticket",
+  "jira-project": "jira-project",
+  filesystem: "filesystem",
+};
+
+/**
+ * A rule's own covering admission source's census entry, resolved from
+ * `AdmissionView.sources` (`./dashboard.ts`) via `RULE_ADMISSION_SOURCE`.
+ *
+ * FACTORY-340: a source CAN be entirely absent from `admission.sources` in a
+ * real daemon — `src/daemon/index.ts`'s conditional `sources:` list omits a
+ * provider's entry whenever that provider's own client failed to construct
+ * (e.g. `github-pr`'s `githubPrs = githubPrStaffingResult.run && config.github`
+ * being falsy when an enabled `github-pr` rule exists but `config.github` is
+ * unset — no `GITHUB_TOKEN_FILE`/`BUTCHR_GITHUB_ORGS`), independent of
+ * whether `configReasonFor` (below) also happens to cover that provider. The
+ * previous doc comment here claimed this was structurally impossible; it was
+ * wrong (epic-reviewer finding on FACTORY-136). Returns `{ source, absent:
+ * true }` in that case — resolved via `RULE_ADMISSION_SOURCE` all the same,
+ * so the source name is still known and reportable even though its census
+ * entry is not — rather than `undefined`, so `ruleStaffingReason` below can
+ * never mistake "not present in the census" for "reported and fine".
+ */
+function admissionSourceCensusFor(rule: Rule, admission: AdmissionView): { source: string; census: AdmissionCensusField } | { source: string; absent: true } {
+  const source = RULE_ADMISSION_SOURCE[rule.resourceProvider];
+  const entry = admission.sources.find((s) => s.source === source);
+  return entry ? { source: entry.source, census: entry.census } : { source, absent: true };
+}
+
 export interface RuleStaffingDeps {
   /** From `githubIssueStaffing`/`zendeskTicketStaffing` (or any future provider's own equivalent) — `null` when this rule's provider has no config/credential problem right now (may still be unstaffed for another reason below). Never consulted for a disabled rule. */
   configReason: string | null;
@@ -232,6 +286,31 @@ export interface RuleStaffingDeps {
    * from this flag being `false` must read as true under BOTH cases.
    */
   dashboardChecked: boolean;
+  /**
+   * FACTORY-136: this rule's own covering admission source's census entry
+   * (`admissionSourceCensusFor`, above) — INDEPENDENT of `dashboardChecked`:
+   * either can fail alone (see `AdmissionView`'s own doc comment on
+   * `./dashboard.ts`). This is what closes the remaining gap `dashboardChecked`
+   * does not cover — a rule whose admission source is declined or has never
+   * reported has no way to know whether a matched resource is currently being
+   * withheld by the fleet-wide cap (`withheld` above is built only from
+   * sources that HAVE reported), so asserting a genuine zero in that case
+   * would repeat exactly the defect FACTORY-132 fixed for the agent census.
+   *
+   * FACTORY-340: `{ source, absent: true }` — no `census` field at all — is
+   * a DISTINCT case from `{ source, census }` with `census.checked === false`:
+   * both mean "this rule's covering source cannot currently vouch for a
+   * zero", but `absent` means the source was never even DECLARED this poll
+   * (see `admissionSourceCensusFor`'s own doc comment for the real
+   * `github-pr`-without-`config.github` case that makes this reachable),
+   * while `census.checked === false` means it was declared and reported a
+   * decline. `ruleStaffingReason` below treats both as COULD NOT CHECK.
+   * `undefined` remains a third, allowed value for existing tests/fixtures
+   * that construct `RuleStaffingDeps` directly and want to skip this branch
+   * entirely — a real daemon path (via `admissionSourceCensusFor`) never
+   * produces it, only `{ source, absent: true }` or `{ source, census }`.
+   */
+  admissionSourceCensus: { source: string; census: AdmissionCensusField } | { source: string; absent: true } | undefined;
 }
 
 /**
@@ -253,7 +332,25 @@ export interface RuleStaffingDeps {
  *    whether or not an earlier one did) → `staffed: null` (neither true nor
  *    false — this daemon genuinely cannot say), `"census unavailable: ..."`.
  *    Must never collapse into `UNSTAFFED` — that was this exact defect.
- * 6. Otherwise: a real, current zero — worded per `execution` mode, since
+ * 6. FACTORY-136/FACTORY-340: the admission source covering this rule's own
+ *    provider (`admissionSourceCensus`, resolved via `RULE_ADMISSION_SOURCE`)
+ *    has NOT reported this poll — declined, never-reported, OR (FACTORY-340)
+ *    entirely ABSENT from this poll's admission census (`{ source, absent:
+ *    true }` — see `admissionSourceCensusFor`'s own doc comment for the real
+ *    `github-pr`-without-`config.github` case this covers) → `staffed: null`
+ *    (the SAME tri-state FACTORY-132 introduced, not a distinct fourth
+ *    state — see this function's own module-level discussion of that
+ *    choice), naming the unavailable source in the reason. This is checked
+ *    strictly AFTER the agent-census check (5) and AFTER the withheld check
+ *    (4): a rule already known live or withheld (freshly observed OR carried
+ *    forward from an earlier successful report of THIS SAME source) keeps
+ *    that answer regardless of this poll's admission state, and a fully-down
+ *    agent census is reported as that broader, more fundamental unknown
+ *    rather than this narrower one. Only a rule whose provider's OWN source
+ *    is unavailable (declined, never-reported, or absent) is affected — a
+ *    rule whose source reported this poll keeps today's behaviour exactly,
+ *    unchanged by this branch.
+ * 7. Otherwise: a real, current zero — worded per `execution` mode, since
  *    "no matching resources" is not quite the right claim for a
  *    `singleton`/`persistent` rule's one query-level agent (see `Rule.execution`'s
  *    own doc comment, `../rules/rules.ts`).
@@ -265,6 +362,18 @@ export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffe
   if (deps.live.has(key)) return { staffed: true, reason: null };
   if (deps.withheld.has(key)) return { staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" };
   if (!deps.dashboardChecked) return { staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" };
+  if (deps.admissionSourceCensus && "absent" in deps.admissionSourceCensus) {
+    return {
+      staffed: null,
+      reason: `census unavailable: the "${deps.admissionSourceCensus.source}" admission source covering this rule is not present in this poll's admission census, so an admission-cap withholding for this rule cannot currently be ruled out`,
+    };
+  }
+  if (deps.admissionSourceCensus && !deps.admissionSourceCensus.census.checked) {
+    return {
+      staffed: null,
+      reason: `census unavailable: the "${deps.admissionSourceCensus.source}" admission source covering this rule has not reported this poll (${deps.admissionSourceCensus.census.reason}), so an admission-cap withholding for this rule cannot currently be ruled out`,
+    };
+  }
   return {
     staffed: false,
     reason: rule.execution === "swarm" ? "no matching resources this poll" : "no live agent observed for this rule this poll",
@@ -410,7 +519,13 @@ export interface BuildQueryAgentInventoryDeps {
 export async function buildQueryAgentInventory(deps: BuildQueryAgentInventoryDeps): Promise<QueryAgentInventory> {
   const { live, withheld } = liveAndWithheldRuleKeys(deps.dashboard.rows);
   const rules = deps.rulesFile.rules.map((rule) =>
-    buildRuleInventoryEntry(rule, { configReason: deps.configReasonFor(rule), live, withheld, dashboardChecked: deps.dashboard.checked }),
+    buildRuleInventoryEntry(rule, {
+      configReason: deps.configReasonFor(rule),
+      live,
+      withheld,
+      dashboardChecked: deps.dashboard.checked,
+      admissionSourceCensus: admissionSourceCensusFor(rule, deps.dashboard.admission),
+    }),
   );
   const { entries: sessionDefinitions, errors: sessionErrors } = await buildSessionDefinitionInventory(deps.sessionDefinitions);
   const errors: FileErrorEntry[] = [...(deps.rulesFile.error ? [deps.rulesFile.error] : []), ...sessionErrors];

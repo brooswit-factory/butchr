@@ -42,6 +42,7 @@ function fakeHerd(initial: string[] = []): Herd & { spawned: string[]; stopped: 
     async stop(i) { stopped.push(i); running.delete(i); },
     async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -278,6 +279,7 @@ describe("reconcileNow: checkPinnedActive is called with exactly desired ∩ run
         async stop(i) { stopped.push(i); },
         async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
         async nudge() { return { delivered: true }; },
+        async resumeInPlace() { return "unresumable" as const; },
       };
       await reconcileNow(herd, desired, withHook ? { checkPinnedActive: async () => { /* observes and speaks only */ } } : {});
       return { spawned, stopped };

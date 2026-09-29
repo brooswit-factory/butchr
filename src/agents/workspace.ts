@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, renameSync, rmdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirSync, statSync, renameSync, rmdirSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
@@ -129,6 +129,35 @@ export interface SpawnSpec {
   permissionMode?: string;
   /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
   strictMcpConfig?: boolean;
+  /**
+   * FACTORY-108: Codex's own "lizard mode" launch signal — the Codex twin of
+   * `permissionMode` above, not of `SessionDefinition.lizardMode`/`Rule.lizardMode`
+   * (which stay daemon-side-only for CLAUDE, per those fields' own doc
+   * comments). `agentLaunchConfig`'s Codex branch (src/agents/argv.ts) reads
+   * this to omit `--dangerously-bypass-approvals-and-sandbox` (Codex's manual
+   * approval mode) when true — Codex has no `permissionMode` concept, so
+   * there is nothing else on `SpawnSpec` a Codex launch could pair its own
+   * lizard mode with. Ignored entirely by the Claude and Agy branches of
+   * `agentLaunchConfig` — present or absent, neither launch's argv changes,
+   * so a `specForSessionDefinition`/rule-engine caller may set this
+   * unconditionally without knowing which vendor a launch will ultimately
+   * use (a `Rule`'s `agentPreferences` is a ranked fallback, decided at spawn
+   * time, not spec-build time — see `docs/execution-modes.md`'s "no
+   * Codex-vendor rejection" section). A `SessionDefinition`, which DOES fix
+   * its vendor at load time, only ever sets this for `vendor: "codex"` (see
+   * `specForSessionDefinition`) — never for `vendor: "claude"`, preserving
+   * that vendor's existing "lizardMode never reaches SpawnSpec" contract
+   * exactly. Same FACTORY-43 persist-at-spawn/read-back stale-argv shape as
+   * `permissionMode`/`strictMcpConfig`: `.butchr-lizard-mode.json`
+   * (`buildWorkspace`/`workspaceLizardMode` below), read back by
+   * `HerdrHerd.staleIssues()` (src/agents/herd.ts) — without this, a lizard
+   * Codex agent's real (bypass-flag-less) argv would forever mismatch a
+   * naively-recomputed "expected" argv that still assumes the bypass flag,
+   * respawn-looping it forever (the exact FACTORY-43 bug, for this field).
+   * Absent/`false` means today's behaviour exactly — no flag change, ordinary
+   * `--dangerously-bypass-approvals-and-sandbox` default.
+   */
+  lizardMode?: boolean;
   /**
    * BUTCHR-408: additional MCP servers this agent may connect to, beyond
    * butchr's own — a managed-session definition's own `mcpServers`
@@ -687,6 +716,59 @@ export function assertNoInheritedMcpConfig(dir: string): void {
   }
 }
 
+/**
+ * FACTORY-411/FACTORY-424 (session-field-reload-classification.md, Finding
+ * 2, point 2) — extracted out of `buildWorkspace` below so `resumeInPlace()`
+ * (src/agents/herd.ts) can regenerate JUST this file BEFORE attempting a
+ * relaunch, for the `mcpServers` channel-flag case: the relaunched process's
+ * argv is built straight from `spec` (correct immediately), but Claude reads
+ * `mcp.json`'s CONTENT fresh from disk — if this file were only rewritten
+ * AFTER a confirmed-alive relaunch (as `buildWorkspace`'s other, staleness-
+ * bookkeeping writes deliberately still are — see `resumeInPlaceExclusive`'s
+ * own doc comment on that ordering, and why it must NOT change for those
+ * other files), the relaunched process would read the STALE tool-binding set
+ * on its very first turn even though its own argv already claims the new
+ * channel. Byte-identical behavior to the equivalent block `buildWorkspace`
+ * used to inline directly — moving it doesn't change what it writes, only
+ * who else can call it and when.
+ *
+ * BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
+ * mcp.json alongside butchr's own and any externalMcpServers, `channel:
+ * true` or not — mcp.json is what gives Claude MCP TOOL access; the
+ * channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
+ * additive decision about PUSH notifications. No bindings -> byte-identical
+ * to before (Object.fromEntries([]) spreads nothing). A binding's headers
+ * are the union of its (per-RULE, env-resolved, potentially secret)
+ * `headersEnvVar` value and its (per-AGENT, always non-secret)
+ * `accountHeader` value — see `resolveMcpServerHeaders`/
+ * `resolveAccountHeader`'s own doc comments for why these are two
+ * different resolution mechanisms sharing one binding shape, not two
+ * competing ones.
+ */
+export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string): void {
+  let hasSecretHeaders = false;
+  const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
+    const envHeaders = resolveMcpServerHeaders(b);
+    if (envHeaders) hasSecretHeaders = true;
+    const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
+    const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
+    return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
+  }));
+  const mcpJsonPath = join(dir, "mcp.json");
+  writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
+  // Review finding, PR #387: a bound server's resolved header VALUE (often
+  // a bearer token) must never sit in a group/other-readable file at the
+  // default umask. `writeFileSync`'s own `mode` option only ever applies
+  // when it CREATES the file (a rebuilt workspace's mcp.json already
+  // exists), so this is an explicit chmod, not a write option, and only
+  // when this write
+  // actually carries a secret; a binding-less (or headers-less) mcp.json
+  // keeps its exact previous permissions, untouched. `accountHeader`'s own
+  // value (an account NAME, never a secret) never sets `hasSecretHeaders`
+  // by itself — only `headersEnvVar`'s resolution does.
+  if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
@@ -724,6 +806,12 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // respawned every poll forever.
   if (spec.permissionMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-permission-mode.json"),JSON.stringify(spec.permissionMode)); }
   if (spec.strictMcpConfig !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-strict-mcp-config.json"),JSON.stringify(spec.strictMcpConfig)); }
+  // FACTORY-108: same "persist non-secret spawn intent, re-derive it at
+  // staleness-check time" shape as `.butchr-permission-mode.json` above, for
+  // Codex's own lizard-mode launch signal (see `SpawnSpec.lizardMode`'s own
+  // doc comment for why this one DOES need it, unlike the daemon-side-only
+  // Claude case).
+  if (spec.lizardMode !== undefined) { mkdirSync(dir,{recursive:true}); writeFileSync(join(dir,".butchr-lizard-mode.json"),JSON.stringify(spec.lizardMode)); }
   // FACTORY-75: same "persist non-secret spawn intent, re-derive it at
   // staleness-check time" shape as `.butchr-permission-mode.json` above —
   // the two-axis (`modelPower`/`effort`) mechanism resolves to a concrete
@@ -781,41 +869,7 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") {
-    // BUTCHR-408/BUTCHR-411/BUTCHR-412: a bound server (spec.mcpServers) lands in
-    // mcp.json alongside butchr's own and any externalMcpServers, `channel:
-    // true` or not — mcp.json is what gives Claude MCP TOOL access; the
-    // channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
-    // additive decision about PUSH notifications. No bindings -> byte-identical
-    // to before (Object.fromEntries([]) spreads nothing). A binding's headers
-    // are the union of its (per-RULE, env-resolved, potentially secret)
-    // `headersEnvVar` value and its (per-AGENT, always non-secret)
-    // `accountHeader` value — see `resolveMcpServerHeaders`/
-    // `resolveAccountHeader`'s own doc comments for why these are two
-    // different resolution mechanisms sharing one binding shape, not two
-    // competing ones.
-    let hasSecretHeaders = false;
-    const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-      const envHeaders = resolveMcpServerHeaders(b);
-      if (envHeaders) hasSecretHeaders = true;
-      const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
-      const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
-      return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
-    }));
-    const mcpJsonPath = join(dir, "mcp.json");
-    writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: { butchr: { type: "http", url: mcpUrl, headers: mcpIdentityHeaders(spec) }, ...Object.fromEntries((spec.externalMcpServers ?? []).map((s) => [s.name, { type: "http", url: s.url, headers: s.headers }])), ...bound } }, null, 2));
-    // Review finding, PR #387: a bound server's resolved header VALUE (often
-    // a bearer token) must never sit in a group/other-readable file at the
-    // default umask. `writeFileSync`'s own `mode` option only ever applies
-    // when it CREATES the file (a rebuilt workspace's mcp.json already
-    // exists), so this is an explicit chmod, not a write option, and only
-    // when this write
-    // actually carries a secret; a binding-less (or headers-less) mcp.json
-    // keeps its exact previous permissions, untouched. `accountHeader`'s own
-    // value (an account NAME, never a secret) never sets `hasSecretHeaders`
-    // by itself — only `headersEnvVar`'s resolution does.
-    if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
-  }
+  if (provider === "claude") writeClaudeMcpJson(dir, spec, mcpUrl);
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -1020,6 +1074,12 @@ export function workspaceStrictMcpConfig(dir: string): SpawnSpec["strictMcpConfi
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }
 
+/** Same shape as `workspacePermissionMode` above, for `spec.lizardMode` (`.butchr-lizard-mode.json`) — FACTORY-108, Codex's own lizard-mode launch signal. */
+export function workspaceLizardMode(dir: string): SpawnSpec["lizardMode"] {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-lizard-mode.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
 /**
  * FACTORY-75 — same read-the-workspace-back shape as `workspacePermissionMode`
  * above, for the model this workspace was ACTUALLY launched with
@@ -1042,4 +1102,126 @@ export function workspaceModel(dir: string): string | undefined {
 export function workspaceEffort(dir: string): AgentPreference["effort"] {
   try { return JSON.parse(readFileSync(join(dir, ".butchr-effort.json"), "utf8")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — this workspace's own persisted Claude
+ * session id (`.butchr-session-id.json`), DISCOVERED from Claude's own
+ * transcript directory right after a successful fresh launch
+ * (`discoverClaudeSessionId`/`persistDiscoveredSessionId` below,
+ * `HerdrHerd.startProviders`), never pre-minted by butchr itself — a fresh
+ * Claude launch runs under Claude's OWN auto-generated session id, and
+ * nothing butchr passes reaches that real launch's argv (Drovr's
+ * `ManagedHerdrLifecycle.start()` builds its own `agent.start` params via
+ * `buildAgentStartParams`, which has no `--session-id` concept at all).
+ * `undefined` for a workspace spawned by a build before this ticket, one
+ * whose discovery failed (a WARNING is logged when that happens — see
+ * `startProviders`), or a non-Claude provider — all mean "no known session
+ * id", the same fail-safe shape `workspaceModel`/`workspaceEffort` already
+ * use for their own missing file.
+ */
+export function workspaceSessionId(dir: string): string | undefined {
+  try { return JSON.parse(readFileSync(join(dir, ".butchr-session-id.json"), "utf8")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — Claude Code's own encoding of a working
+ * directory into its `~/.claude/projects/<encoded>/` transcript folder name.
+ * Matches Drovr's OWN encoding EXACTLY (`resolve(cwd).replace(/[^a-zA-Z0-9]/g,
+ * "-")`, verified against the pinned 0.15.1 source, `readClaudeTranscriptTail`/
+ * `readNativeTranscript` in `node_modules/@brooswit/drovr/dist/index.js`) —
+ * duplicated here rather than imported because Drovr does not export it,
+ * only functions that already know the session id and just need to read one
+ * specific transcript; this file needs to LIST a directory to find out what
+ * id Claude picked in the first place, which Drovr has no function for.
+ */
+function claudeProjectDir(dir: string, home: string = homedir()): string {
+  return join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix; epic review on PR #513, "trap 2") — the id
+ * of a `.jsonl` transcript under this workspace's own Claude project folder
+ * that is POSITIVELY TIED to a launch started at or after `after` (epoch
+ * ms, `Date.now()`-comparable) — never merely "the newest file present".
+ * That distinction is load-bearing, not cosmetic: a workspace directory is
+ * unique per issue (`workspaceDirFor`), but is NOT guaranteed to hold only
+ * ONE transcript ever — a prior respawn of the SAME issue leaves its OLDER
+ * transcript sitting right there. Picking "whatever's newest" with no time
+ * bound would, on a slow launch, silently resolve to that OLDER transcript
+ * instead of failing safe — a WRONG id that still validates and still
+ * resumes, restoring the agent into someone else's finished conversation
+ * with no error at all. Filtering by `created >= after` (birth time,
+ * falling back to mtime when a filesystem doesn't report birth time)
+ * closes that: nothing can be created before the launch that is about to
+ * produce it, so a transcript failing this check is BY CONSTRUCTION not
+ * this launch's, and `after` omitted means "no bound" (only used where a
+ * caller has already scoped candidates some other way — no caller in this
+ * codebase does that yet). No qualifying transcript returns `undefined`,
+ * the same fail-safe "cannot establish it — don't guess" contract
+ * `HerdrHerd.startProviders`'s own caller already treats as "session lost:
+ * id unknown" rather than resuming a best guess.
+ */
+export function discoverClaudeSessionId(dir: string, home?: string, after?: number): string | undefined {
+  const projectDir = claudeProjectDir(dir, home);
+  let entries: string[];
+  try { entries = readdirSync(projectDir); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  let newest: { id: string; created: number } | undefined;
+  for (const entry of entries) {
+    if (!entry.endsWith(".jsonl")) continue;
+    let stat: ReturnType<typeof statSync>;
+    try { stat = statSync(join(projectDir, entry)); }
+    catch { continue; } // a transcript removed between readdir and stat — not a candidate
+    // `birthtimeMs` is 0 (or absent) on a filesystem that doesn't track
+    // creation time — fall back to `mtimeMs` there rather than treating
+    // every entry as "created at epoch 0" (which `after` would then reject
+    // outright on every filesystem that lacks birth time).
+    const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+    if (after !== undefined && created < after) continue; // exists, but predates this launch — not a candidate, ever
+    if (!newest || created > newest.created) newest = { id: entry.slice(0, -".jsonl".length), created };
+  }
+  return newest?.id;
+}
+
+/** Persists a discovered (or resumed) session id — the write half of `workspaceSessionId`. */
+export function persistDiscoveredSessionId(dir: string, sessionId: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify(sessionId));
+}
+
+/**
+ * FACTORY-314 (epic review on PR #513, round 3) — the OTHER half of
+ * `persistDiscoveredSessionId`'s "never a guess" contract, closing a gap a
+ * failed discovery left wide open. `.butchr-session-id.json` was previously
+ * ONLY ever written, never invalidated: `startProviders()`'s own discovery
+ * failure branch just logged a WARNING and moved on, leaving an OLDER id
+ * from a PRIOR launch of this same workspace on disk. That id's transcript
+ * is still sitting right there too (`claudeTranscriptExists` is a bare
+ * `existsSync`, and the project folder is per-cwd, stable across respawns —
+ * see `discoverClaudeSessionId`'s own doc comment for why), so a LATER
+ * model/effort change would find a persisted id that validates cleanly and
+ * `--resume` it — silently resuming a DIFFERENT, already-finished
+ * conversation and reporting it "PRESERVED". Called from that same
+ * discovery-failure branch instead of merely logging: removing the file
+ * (tolerating ENOENT — nothing to remove is not an error) makes
+ * `workspaceSessionId` fail-safe back to `undefined`, so `resumeInPlace()`'s
+ * existing `if (!sessionId) return "unresumable"` check catches it — an
+ * honest fresh restart, never a wrong-but-real resume.
+ */
+export function invalidatePersistedSessionId(dir: string): void {
+  try { rmSync(join(dir, ".butchr-session-id.json")); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+}
+
+/**
+ * FACTORY-314 (PR #513 review fix) — whether a transcript for `sessionId`
+ * actually exists under this workspace's Claude project folder. Consulted
+ * by `resumeInPlace()` right before attempting `--resume <id>`: a stale or
+ * corrupted persisted id must fail safe to "unresumable" (an honest fresh
+ * restart) rather than resuming a nonexistent conversation.
+ */
+export function claudeTranscriptExists(dir: string, sessionId: string, home?: string): boolean {
+  return existsSync(join(claudeProjectDir(dir, home), `${sessionId}.jsonl`));
 }

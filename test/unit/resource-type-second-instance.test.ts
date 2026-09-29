@@ -71,6 +71,9 @@ function fakeHerd(): Herd & { spawned: string[]; stopped: string[]; notified: ne
     async nudge() {
       return { delivered: true };
     },
+    async resumeInPlace() {
+      return "unresumable" as const;
+    },
   };
 }
 

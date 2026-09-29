@@ -14,7 +14,9 @@ export function specForProject(m: ProjectMatch): SpawnSpec {
  return m.spec ?? { key:m.agentKey,resource:m.project.key,issuetype:'project',summary:m.project.name,parent:null,brief:m.rule.brief,
  ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}),
  // FACTORY-87: overrides agentLaunchConfig's own unconditional jira-project `permissionMode: "auto"` default (src/agents/argv.ts) only when set.
- ...(m.rule.permissionMode ? {permissionMode:m.rule.permissionMode}: {}) };
+ ...(m.rule.permissionMode ? {permissionMode:m.rule.permissionMode}: {}),
+ // FACTORY-108: a jira-project Codex agent already launches with bypassApprovalsAndSandbox:false unconditionally (agentLaunchConfig's own jira-project special case) regardless of this field, so forwarding it here changes no argv — kept for consistency with every other provider's own permissionMode/lizardMode pairing.
+ ...(m.rule.lizardMode ? {lizardMode:true}: {}) };
 }
 
 export interface CreateJiraProjectResourceTypeDeps {

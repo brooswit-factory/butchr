@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { changeNudge, notifyReasonTag } from "../../src/agents/change-nudge.js";
+import { changeNudge, notifyReasonTag, sessionDefinitionFieldNudge } from "../../src/agents/change-nudge.js";
 import type { NotifyReason } from "../../src/resources/types.js";
 
 /**
@@ -92,6 +92,19 @@ describe("changeNudge", () => {
       );
     }
   });
+
+  // FACTORY-417: `definitionField` is only ever produced for a managed-session
+  // definition (src/rules/session-definition-type.ts), which renders through
+  // `sessionDefinitionFieldNudge` below, never through this function — but the
+  // type is shared, so a `definitionField` reason passed here anyway (should
+  // never happen in practice) must still fall back honestly rather than
+  // mis-render, same precedent as the `pr`-through-`changeNudge` test above.
+  test("a definitionField reason passed through anyway (should never happen — renders via sessionDefinitionFieldNudge) falls back honestly rather than mis-rendering", () => {
+    const reason: NotifyReason = { definitionField: { brief: "new brief" } };
+    expect(changeNudge("KAN-1", "KAN-1", reason)).toBe(
+      "[butchr] Ticket KAN-1 was updated (reason not determinable from the poll) — re-read it.",
+    );
+  });
 });
 
 describe("notifyReasonTag", () => {
@@ -158,5 +171,34 @@ describe("notifyReasonTag", () => {
       notifyReasonTag({ undetermined: "checked-unchanged" }),
     ]);
     expect(rendered.size).toBe(4);
+  });
+
+  test("definitionField names which field(s) moved", () => {
+    expect(notifyReasonTag({ definitionField: { brief: "x" } })).toBe(" (definitionField:brief)");
+    expect(notifyReasonTag({ definitionField: { workingDirectory: "/x" } })).toBe(" (definitionField:workingDirectory)");
+    expect(notifyReasonTag({ definitionField: { brief: "x", workingDirectory: "/x" } })).toBe(" (definitionField:brief,workingDirectory)");
+  });
+});
+
+describe("sessionDefinitionFieldNudge", () => {
+  test("brief only: pushes the new content directly, not a re-read instruction", () => {
+    const msg = sessionDefinitionFieldNudge("/defs/a.json", { brief: "Tend the new repo." });
+    expect(msg).toContain("[butchr] Managed-session definition /defs/a.json was edited:");
+    expect(msg).toContain("act on this new brief now:\n\nTend the new repo.");
+    expect(msg).not.toContain("brief.md");
+    expect(msg).not.toContain("workingDirectory");
+  });
+
+  test("workingDirectory only: names the new directory as an instruction, explicit that it is not a cwd move", () => {
+    const msg = sessionDefinitionFieldNudge("/defs/a.json", { workingDirectory: "/repo/new" });
+    expect(msg).toContain("operate in /repo/new from now on");
+    expect(msg).toContain("does not move your process's actual shell cwd");
+    expect(msg).not.toContain("brief");
+  });
+
+  test("both changed in the same poll: both sentences present", () => {
+    const msg = sessionDefinitionFieldNudge("/defs/a.json", { brief: "New brief.", workingDirectory: "/repo/new" });
+    expect(msg).toContain("act on this new brief now:\n\nNew brief.");
+    expect(msg).toContain("operate in /repo/new from now on");
   });
 });

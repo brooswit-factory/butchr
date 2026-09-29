@@ -102,7 +102,55 @@ agent row carries on `/`. All three are percent-encoded, `--`-joined tokens —
 safe as both an HTML `id` and a URL fragment, with no `:`/`/`/`#` of their
 own.
 
-## The additive change to the existing agent view (`/`)
+## FACTORY-407: `resourceKey` actually carries the correlation identifier now
+
+Every section above describes the intended contract as FACTORY-81/FACTORY-72
+originally designed it: `AgentDashboardRow.resourceKey`/`WithheldDashboardRow.resourceKey`
+is a full `encodeAgentKey`/`encodeQueryAgentKey` value, decodable via
+`decodeAnyAgentKey`. Between that design and FACTORY-407, it never actually
+was — `src/daemon/index.ts` fed `buildDashboardRows` the BARE provider-native
+resource id (`resourceOfCwd(a.cwd)`, which discards `resourceProvider`/`ruleId`
+via `resourceKeyOf`), so every real agent row's `resourceKey` was exactly the
+one shape `decodeAnyAgentKey` can never produce a match for ("a bare issue key
+contains no `:` and never decodes" — `src/rules/agent-key.ts`'s own header).
+The forward/back cross-links above, `query-agent-inventory.ts`'s own
+`live`/`withheld` correlation, and the `/resource/:key/open` route's
+provider-aware redirect (`src/daemon/index.ts`'s `resourceLink`, which already
+called `decodeAgentKey(key)` on this same value) were all written against the
+intended full-key contract and were all silently broken against a real daemon
+— a green suite coexisted with this because every existing test hand-built its
+`DashboardRow` fixtures with the correct (full) shape directly, never through
+`buildDashboardRows`'s own real input path.
+
+FACTORY-407's fix: `src/agents/dashboard.ts`'s `DashboardAgent` gained a
+SECOND field, `agent_key` — the full owned key (`ownedAgentOfCwd(cwd)` in
+`src/daemon/index.ts`, undiscarded) — alongside the pre-existing bare
+`resource_key` (which stays bare; label-sync's own status map, keyed by a Jira
+search's own issue keys, still needs exactly that). `buildDashboardRows` now
+builds `AgentDashboardRow.resourceKey` from `agent_key`, not `resource_key`,
+and decodes it internally wherever the OLD bare-id lookup (`isProjectId`/
+`issueMeta`) is still needed. The admission census's own `withheld` keys
+needed NO change at all: `admissionController.admit()`'s candidates were
+already the full `unitAgentKey` shape (`src/rules/execution.ts` — the same
+value every `runResourceLoop` desired-set entry and spawned agent id already
+uses), so `WithheldDashboardRow.resourceKey` (`bucket.withheld` verbatim,
+`updateWithheldRows`) was already correct — it was the AGENT row's own bare
+stripping that broke the `deps.agentKeys.has(...)` "agent wins" comparison
+between the two row kinds, not the withheld side. See `AgentDashboardRow`/
+`WithheldDashboardRow`'s own doc comments in `dashboard.ts` for the exact
+per-field reasoning.
+
+**Swarm ambiguity (the "several rules may match one resource" case
+`agent-key.ts`'s own header names):** resolved, not guessed. A `swarm` rule's
+per-resource agent's own key already carries the exact `ruleId` it was
+spawned under (`encodeAgentKey({resourceProvider, ruleId, resourceId})`,
+`src/rules/resource-type.ts` et al.) — correlation reads that `ruleId` directly
+off the agent's own key, never by re-matching the bare resource id against
+every enabled rule. So when two different swarm rules both match the same
+resource, each spawns its own agent under its own distinct key, and each
+row's `staffed:true` attributes to the correct rule with no ambiguity —
+proven directly in `test/unit/query-agent-inventory.test.ts`'s "two DIFFERENT
+swarm rules matching the SAME resource" case.
 
 Per this ticket's own requirement 7, the ONLY change to the pre-existing
 `renderDashboard`/`renderAgentRow` (`src/web/dashboard-page.ts`) is:
@@ -114,8 +162,10 @@ Per this ticket's own requirement 7, the ONLY change to the pre-existing
    overridable via the new, OPTIONAL `RenderDashboardOpts.configLinkHref`
    — same pure-URL-builder pattern as the pre-existing
    `terminalLinkHref`/`resourceLinkHref`). Nothing renders when the
-   resourceKey fails to decode at all (nothing in this daemon produces that
-   today).
+   resourceKey fails to decode at all — see FACTORY-407 below for why that
+   is now the genuinely-rare, defensive-only case this line always meant it
+   to be, rather than (pre-FACTORY-407) the case every real running agent's
+   row actually hit.
 3. A withheld row gets no back-link — requirement 3 speaks of the "running
    agent row" specifically, and a withheld row's own `reason` field already
    names the admission cap.
@@ -171,6 +221,119 @@ comment), for config data rather than agent-status data:
   (required, not optional-with-a-default), supplied by `GET /configurations`
   from the SAME `dashboard()` snapshot whose `.rows` it already passes, so
   the matches and the flag they depend on always come from one snapshot.
+
+### A rule's OWN admission source, not just the agent census (FACTORY-136)
+
+The COULD NOT CHECK idiom above closes the gap for the whole-fleet agent
+census (`DashboardResponse.checked`) but, before FACTORY-136, left a second,
+narrower gap open: each rule provider's `admission-cap withheld` reason
+depends on that provider's OWN admission source (`admission.sources[]` on
+`DashboardResponse`, `src/agents/dashboard.ts`) having reported THIS poll —
+a source that is declined or has never reported keeps its PRIOR withheld
+rows (or none, if it has never reported at all), so a rule whose one covering
+source is down had no way to know whether a matched resource was currently
+withheld, and fell through to the final "genuine zero" branch worded
+`UNSTAFFED: no matching resources this poll` even though the true state was
+unknown.
+
+`ruleStaffingReason` (`src/agents/query-agent-inventory.ts`) closes this by
+resolving each rule's own covering admission source via a verified,
+total, 1:1 mapping (`RULE_ADMISSION_SOURCE` in that module — every
+`ResourceProvider`'s own admission-source name, confirmed by reading every
+`admissionController.admit(...)` call site in `src/daemon/index.ts`; the
+one non-identity mapping is `jira-work` → `"issue"`). When that source's own
+`census.checked === false` (declined OR never-reported) AND the rule has no
+live agent and no withheld row (from ANY poll, including one carried
+forward from an earlier successful report of that same source), the rule
+reports `staffed: null` with a reason naming the unavailable source and its
+own decline reason (`"census-threw"` / `"census-untrusted"` /
+`"never-reported"`) — e.g. `COULD NOT CHECK: census unavailable: the "issue"
+admission source covering this rule has not reported this poll
+(never-reported), so an admission-cap withholding for this rule cannot
+currently be ruled out`.
+
+**Design decision (DoD requirement 3):** this is the SAME `staffed: null`
+tri-state FACTORY-132 introduced for the agent census — not a distinct
+fourth state, and NOT a second render flag. `renderStaffed`
+(`src/web/config-inventory-page.ts`) already renders any `staffed === null`
+as `COULD NOT CHECK: <reason>` regardless of which census produced it, so
+this fix needed no change to that function, `RenderConfigInventoryOpts`, or
+`GET /configurations`'s own wiring — only the reason TEXT distinguishes the
+two causes. `RenderConfigInventoryOpts.agentCensusChecked` keeps its
+existing, narrower meaning (`DashboardResponse.checked` — the agent census
+only) and drives ONLY the cross-link area's COULD NOT CHECK vs. "no running
+agent" choice, which is unaffected by this ticket: a rule's cross-link area
+answers "is there a live agent row", a question the agent census alone
+already answers regardless of admission-source state.
+
+**Check order** (unchanged for every existing branch): disabled → provider
+config reason → live agent → admission-cap withheld → agent census
+unavailable (`!dashboardChecked`) → **this rule's own admission source
+unavailable (NEW)** → genuine observed zero. The new check sits strictly
+after the broader agent-census check and after the withheld-row check, so a
+fully-down agent census is still reported as that broader unknown, and a
+rule with an already-known live or withheld row (fresh or carried forward)
+keeps that answer regardless of this poll's admission-source state. A rule
+whose covering source reported this poll is completely unaffected — see
+`test/unit/query-agent-inventory.test.ts`'s "FACTORY-136" describe block
+(through a REAL `createDashboardFeed`/`createAdmissionController`, control
+case included) and `test/unit/config-inventory-page.test.ts`'s own
+FACTORY-136 render-level block.
+
+### A source ABSENT from the census, not just unchecked (FACTORY-340)
+
+FACTORY-136 (above) closed the gap for a source that IS declared this poll
+but declined or never reported. The epic reviewer found a narrower, real gap
+in that fix on the story's own PR: a source can be entirely ABSENT from
+`admission.sources[]` — never declared at all — and `admissionSourceCensusFor`
+(`src/agents/query-agent-inventory.ts`) treated that the same as "reported
+and fine" (returning `undefined`, which `ruleStaffingReason` skips), on the
+theory that a rule's own provider is always why its source is declared. That
+theory is false for exactly one provider today: `github-pr`. Unlike
+`github-issue`/`zendesk-ticket`, whose "missing token/config" reason was
+already wired into `configReasonFor` (this module's own `RuleStaffingDeps.
+configReason`), `github-pr` had NO config-reason coverage before this ticket
+— `src/daemon/index.ts` builds its `sources:` list conditionally
+(`githubPrs = githubPrStaffingResult.run && config.github`), omitting
+`ADMISSION_SOURCE_GITHUB_PR` whenever `config.github` is unset even though an
+enabled `github-pr` rule exists — so a `github-pr` rule with no GitHub
+config fell all the way through to the final "genuine zero" branch, reading
+`UNSTAFFED: no matching resources this poll`, in exactly the state where a
+withholding cannot be ruled out. "GitHub rules without a token" is named in
+epic FACTORY-68's own acceptance criteria — this was a real reachable case,
+not a theoretical one.
+
+Two independent fixes landed together:
+
+- **`admissionSourceCensusFor` now returns `{ source, absent: true }`**
+  instead of `undefined` when the rule's covering source is not present in
+  `admission.sources[]` at all. `ruleStaffingReason` treats this the same as
+  a declared-but-unchecked source (the SAME `staffed: null` tri-state, worded
+  `census unavailable: the "<source>" admission source covering this rule is
+  not present in this poll's admission census, ...`) — this closes the gap
+  for ANY current or future provider whose source can go missing from the
+  census for a reason `configReasonFor` does not (yet) cover.
+- **`configReasonFor` (`src/daemon/index.ts`) now also covers `github-pr`**,
+  mirroring the existing `github-issue`/`zendesk-ticket` lines with
+  `githubPrStaffingResult`'s own reason — this is the specific, informative
+  fix for the reachable case above: because `configReasonFor` is checked
+  BEFORE the admission-source-absent branch (see "Check order" below), a
+  `github-pr` rule with no GitHub config now reads `UNSTAFFED: github-pr
+  rules not staffed (<ids>): set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS` —
+  a real, specific config fact — rather than either the misleading old
+  "no matching resources" OR a generic COULD NOT CHECK that names no cause.
+
+Both fixes are needed for the full safety argument: the `absent` branch alone
+makes the CORRECTNESS claim true for every provider (never a false
+UNSTAFFED), while the `github-pr` `configReasonFor` line makes the
+config-reason page CONSISTENT — `github-pr` now surfaces a real reason
+exactly like `github-issue`/`zendesk-ticket` always have, instead of relying
+on the newer, less specific tri-state to paper over a gap in the older
+config-reason wiring. See `test/unit/query-agent-inventory.test.ts`'s
+"FACTORY-340" tests (both the direct `ruleStaffingReason` unit test and case
+(e) through a real `createDashboardFeed`/`createAdmissionController`) and
+`test/unit/app.test.ts`'s own FACTORY-340 end-to-end test (real routes,
+`github-pr` rule, no GitHub config).
 
 ### Stale carry-forward: "agent wins" is unaffected
 

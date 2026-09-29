@@ -86,6 +86,7 @@ export function specForGithubIssue({ agentKey, rule, issue }: GithubIssueMatch):
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -107,6 +108,7 @@ export function specForGithubIssueQuery(rule: Rule, agentKey: string): SpawnSpec
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 

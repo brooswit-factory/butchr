@@ -118,6 +118,7 @@ function fakeHerd(runningKeys: () => string[]): Herd {
     async stop() {},
     async paneFor(i) { return runningKeys().includes(i) ? `pane-${i}` : null; },
     async nudge() { return { delivered: true }; },
+    async resumeInPlace() { return "unresumable" as const; },
   };
 }
 
@@ -357,6 +358,7 @@ describe("BUTCHR-305/BUTCHR-238 end-to-end reachability: real reconcileNow + rea
         async stop(i) { stopped.push(i); },
         async paneFor() { return null; },
         async nudge() { return { delivered: true }; },
+        async resumeInPlace() { return "unresumable" as const; },
       };
       const resourceType = createProjectResourceType(w.deps);
       const desired = desiredFrom(await resourceType.discovery.search(), resourceType);
