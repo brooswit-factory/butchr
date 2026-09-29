@@ -97,7 +97,7 @@ import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
-import { loadRocketChatAuth, createRocketChatClient } from "../resources/rocketchat.js";
+import { loadRocketChatAuth, createRocketChatClient, createRocketChatPoster } from "../resources/rocketchat.js";
 import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
 import { rcUsernameFor } from "../accounts/identity.js";
 import { createFileNexusManifestPublisher } from "../accounts/nexus-manifest.js";
@@ -1719,6 +1719,35 @@ startManagedSessionsLoop({
 // escalation dedupe and ANSWER directive are read from the resource its
 // speech actually lives on (a Confluence footer comment on its root doc),
 // not from a Jira issue endpoint that never resolves for it.
+// FACTORY-369: a SEPARATE Rocket.Chat identity from `rcAuth`/`rcClient`
+// above — that one is account-management only (see its own comment); a
+// managed-session escalation posting to #team-admin needs a different
+// Nexus grant that may not exist yet (see `Config.managedEscalationRocketChat`'s
+// own doc comment). Absent/invalid credential: `teamAdminNotify` stays
+// undefined and every escalation degrades to the loud journal line
+// `escalation-loop.ts` already writes unconditionally (AC 6) — never a
+// startup crash, exactly like `rcAuth`'s own "optional, refuse at point of
+// use" contract above.
+const managedEscalationAuth = config.managedEscalationRocketChat
+  ? loadRocketChatAuth({
+      ROCKETCHAT_URL: config.managedEscalationRocketChat.url,
+      ROCKETCHAT_ADMIN_USER_ID: config.managedEscalationRocketChat.adminUserId,
+      ROCKETCHAT_ADMIN_TOKEN_FILE: config.managedEscalationRocketChat.adminTokenFile,
+    })
+  : { ok: false as const, reason: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL/_USER_ID/_TOKEN_FILE not set" };
+if (!managedEscalationAuth.ok) {
+  console.error(`  managed-session #team-admin escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
+} else {
+  console.error(`  managed-session #team-admin escalation enabled → #${config.managedEscalationRocketChat!.room} (Rocket.Chat)`);
+}
+const teamAdminNotify = managedEscalationAuth.ok
+  ? (() => {
+      const poster = createRocketChatPoster({ fetchImpl: fetch, url: managedEscalationAuth.url, adminUserId: managedEscalationAuth.adminUserId, adminToken: managedEscalationAuth.adminToken });
+      const room = config.managedEscalationRocketChat!.room;
+      return async (text: string) => { await poster.postMessage(room, text); };
+    })()
+  : undefined;
+
 const escalator = createEscalator({
   read: readPane,
   send: sendPane,
@@ -1753,6 +1782,9 @@ const escalator = createEscalator({
   // widens the keyless path to a loud journal line + a `/health` stalled
   // mark; anything else keeps today's log-only behavior.
   managedSessionOf: managedSessionOfPane,
+  // FACTORY-369: absent (undefined) whenever `managedEscalationAuth` isn't
+  // ok — see that constant's own comment just above for the fallback.
+  ...(teamAdminNotify ? { teamAdminNotify } : {}),
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —

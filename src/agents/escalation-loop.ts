@@ -3,6 +3,7 @@ import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER,
 import type { CaptureSink } from "./session-limit-watch.js";
 import { findMarked, RateCap, HOUR_MS } from "./escalation-helper.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
+import { managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 
 const FOLLOWUP_MS = 15 * 60_000;
 const DEBOUNCE_POLLS = 2;
@@ -176,6 +177,24 @@ export interface EscalatorDeps {
    * production default.
    */
   managedSessionCaptureTimeoutMs?: number;
+  /**
+   * FACTORY-369: "post this text to this room" — the ONE narrow interface a
+   * managed-session escalation is delivered through, injected so this
+   * module never inlines a bare `fetch`/RC call. Bound to a specific room
+   * (`#team-admin`) and identity by the caller (`src/daemon/index.ts`, from
+   * `Config.managedEscalationRocketChat` / `RocketChatPoster`) — this
+   * function takes only the fully-composed message text. MUST THROW on any
+   * delivery failure (transport, RC refusal, anything) and MUST NOT be
+   * called again concurrently for work this module has already retried —
+   * every caller below treats a rejection as "not delivered — retry next
+   * qualifying poll, never latch as handled" (AC 7), mirroring this file's
+   * existing `escalateUnresponsive`/`escalate` fail-safe-by-not-latching
+   * discipline for its Jira paths. Optional: absent means #team-admin
+   * routing is not configured, and every managed-session escalation stays
+   * exactly what it already was before this ticket — a loud, complete
+   * `[managed-escalation]` journal line, nothing else (AC 6).
+   */
+  teamAdminNotify?: (text: string) => Promise<void>;
 }
 
 interface PaneState {
@@ -568,6 +587,19 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   }
   const unresponsive = new Map<string, UnresponsiveEntry>();
   const unresponsiveInFlight = new Set<string>();
+  /**
+   * FACTORY-369 AC 2: the managed-session mirror of `unresponsive` above —
+   * same shape (`UnresponsiveEntry`), same `deps.unresponsiveMinutes` gate,
+   * same consecutive-pollSeq/gap-resets-the-episode semantics, but keyed
+   * into `markManagedSessionStalled` (the SAME sink `handleManagedSessionBlocked`/
+   * `onDrovrUnknownDialog` already use) once the threshold is reached,
+   * instead of `escalateUnresponsive`'s Jira comment — a managed session has
+   * no ticket to post an unresponsive-alarm comment on, same reason
+   * `onBlocked`'s own `issue === null` branch needed `handleManagedSessionBlocked`
+   * in the first place. See `handleManagedSessionUnresponsive` below.
+   */
+  const managedUnresponsive = new Map<string, UnresponsiveEntry>();
+  const managedUnresponsiveInFlight = new Set<string>();
   const unresponsiveCap = new RateCap(UNRESPONSIVE_MAX_PER_HOUR, HOUR_MS);
   // BUTCHR-124 review (PR #180, non-blocking finding): mirrors parked.ts's
   // own `cappedLogged` — one WARNING per target while capped, not one per
@@ -662,26 +694,138 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     fp: string;
     /** ISO timestamp of this episode's first escalated poll — carried into `ManagedSessionEscalation.since`. */
     since: string;
+    /** The dialog's question — `"(sustained unparseable pane — no recognized dialog)"` for the onNoPrompt path (FACTORY-369 AC 2), which has no parsed question at all. Retained (not just used once) so a #team-admin retry attempt on a LATER poll can recompose the exact same message without re-reading the pane. */
+    question: string;
+    options: readonly string[];
+    /** `null` when no capture sink is wired, or the capture itself failed/timed out — see `captureManagedSessionEscalationText`. Never re-captured on a retry: the pane's live text may have already moved on. */
+    capturePath: string | null;
+    /** Set once `deps.teamAdminNotify` has been called and RESOLVED for this exact episode — AC 4/AC 7: a `undefined` value here (not "no notifier configured") is exactly what makes a retry attempt next poll, never a second attempt for an already-delivered post. */
+    notifiedAt?: number;
   }
   const managedSessionStalled = new Map<string, ManagedSessionEntry>();
+  // FACTORY-369: mirrors `inFlight`/`unresponsiveInFlight`'s own guard —
+  // `deps.teamAdminNotify` is awaited, and this file's callers are
+  // fire-and-forget on a timer, so two overlapping polls for the same pane
+  // must never both be mid-POST at once (which could double-post if the
+  // first's failure/success races the second's read of `notifiedAt`).
+  const teamAdminInFlight = new Set<string>();
+  /**
+   * FACTORY-369 (AC 4 extension, FACTORY-367 comment 26602/26603): a
+   * per-PANE cap on NEW #team-admin posts, independent of whether the
+   * dedupe fingerprint itself stays stable. FACTORY-146 measured (FACTORY-357
+   * generalised) that a dialog's recognized question/options can drift with
+   * how much unrelated scrollback chatter sits above it — if that ever
+   * degrades this pane's per-fingerprint dedupe to per-poll, this is the
+   * backstop that keeps #team-admin from receiving an unbounded stream:
+   * mirrors `escalate()`'s own per-pane rate cap for the Jira path above
+   * (KAN-756 item E — keyed by PANE, not by target, for the identical
+   * reason: a pane can rack up many distinct "new" fingerprints in a burst,
+   * and the thing worth bounding is posts-per-pane, not posts-per-fingerprint,
+   * which by construction only ever fires once each). This is NOT a fix for
+   * the underlying recognizer instability (FACTORY-146/FACTORY-359's job) —
+   * it only bounds the blast radius if that instability is present.
+   */
+  const MANAGED_TEAM_ADMIN_MAX_PER_HOUR = 3;
+  const managedTeamAdminCap = new RateCap(MANAGED_TEAM_ADMIN_MAX_PER_HOUR, HOUR_MS);
+  const managedTeamAdminCappedLogged = new Set<string>();
+
+  /**
+   * FACTORY-369 AC 3/AC 10: `@admin-assembly` normally, `@director` when the
+   * STUCK SESSION IS admin-assembly itself (the routing spec's own
+   * self-reference case, binding per FACTORY-358 comment 26435/FACTORY-367).
+   * `sessionName` is the managed session's own bare display name
+   * (`managedSessionShortDisplayId`, e.g. `"admin-assembly"` from
+   * `.../admin-assembly.json`) — the same short id already shown in every
+   * other managed-session surface (herdr labels, `/health`), so a reader
+   * recognizes it without needing to know this ticket's internal `agentKey`
+   * encoding.
+   */
+  function teamAdminMention(sessionName: string): string {
+    return sessionName === "admin-assembly" ? "@director" : "@admin-assembly";
+  }
+
+  /**
+   * FACTORY-369 AC 10: the post's text must stand alone for a HUMAN reading
+   * #team-admin — legible without an agent to interpret it, because the
+   * mentioned agent may be down for the same reason the session is (see
+   * this file's own header note on AC 10, and FACTORY-367's "LATE-ARRIVING
+   * REQUIREMENT" section). Every field the routing spec requires is a
+   * labeled line: session name, pane id, the dialog's question and options,
+   * the fingerprint, and the capture file path — never packed into prose a
+   * reader has to parse.
+   */
+  function teamAdminMessage(target: ManagedSessionTarget, paneId: string, question: string, options: readonly string[], fp: string, capturePath: string | null): string {
+    const sessionName = managedSessionShortDisplayId(target.definitionPath);
+    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
+    return [
+      `${teamAdminMention(sessionName)} managed session **${sessionName}** is blocked and cannot answer for itself — it has no Jira ticket, so it cannot escalate the way a normal agent would.`,
+      "",
+      `session: ${sessionName}`,
+      `pane: ${paneId}`,
+      `question: ${question}`,
+      `options: ${optionsLine}`,
+      `fingerprint: ${fp}`,
+      `capture: ${capturePath ?? "(none)"}`,
+    ].join("\n");
+  }
+
+  /** The clear-up follow-up — FACTORY-369 AC 5, posted once when a dialog a notice was already sent about clears. */
+  function teamAdminClearedMessage(target: ManagedSessionTarget, paneId: string, fp: string): string {
+    const sessionName = managedSessionShortDisplayId(target.definitionPath);
+    return `managed session **${sessionName}** (pane ${paneId}, fingerprint ${fp}) is no longer blocked — the dialog above has cleared.`;
+  }
+
+  /**
+   * FACTORY-369: attempts the #team-admin post for `entry`'s CURRENT episode
+   * — called both right after a fresh mark (AC 1/2) and, harmlessly, on
+   * every repeat poll of an already-marked episode whose post has not yet
+   * SUCCEEDED (AC 7's retry). A no-op the moment `entry.notifiedAt` is set
+   * (delivered — never re-posted, AC 4) or `deps.teamAdminNotify` is absent
+   * (not configured — AC 6 is already satisfied by the journal line
+   * `markManagedSessionStalled` always writes regardless of this function).
+   * FAILS OPEN and NEVER THROWS: a rejected post is logged and left
+   * unlatched (`entry.notifiedAt` stays `undefined`) so the NEXT qualifying
+   * poll retries — mirrors `escalateUnresponsive`'s own null-means-retry
+   * discipline for the Jira path (AC 7).
+   */
+  async function attemptTeamAdminNotify(paneId: string, entry: ManagedSessionEntry): Promise<void> {
+    if (entry.notifiedAt !== undefined) return;
+    if (!deps.teamAdminNotify) return;
+    if (teamAdminInFlight.has(paneId)) return;
+    teamAdminInFlight.add(paneId);
+    try {
+      const text = teamAdminMessage(entry.target, paneId, entry.question, entry.options, entry.fp, entry.capturePath);
+      await deps.teamAdminNotify(text);
+      entry.notifiedAt = deps.now();
+      deps.log(`${MANAGED_ESCALATION_MARKER} posted to #team-admin for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}`);
+    } catch (e) {
+      deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} — will retry next qualifying poll: ${(e as Error)?.message ?? e}`);
+    } finally {
+      teamAdminInFlight.delete(paneId);
+    }
+  }
 
   /**
    * Log + mark once per (pane, fingerprint) episode — the shared core both
    * `handleManagedSessionBlocked` (Butchr's own KAN-756-hardened dialog
-   * parser, below) and `onDrovrUnknownDialog` (FACTORY-45 Part B: drovr's
-   * `createBlockingEscalationWatcher` hook, src/daemon/index.ts) funnel
-   * into — two independent detectors, one mark. A NO-OP whenever the
-   * TRACKED fingerprint for this pane is unchanged (dedupe is the in-memory
-   * map itself, never a re-read of anything external: there is no comment
-   * channel to adopt from, unlike `escalate`/`escalateUnresponsive` above,
-   * so a daemon restart mid-episode simply re-logs once — acceptable per
-   * this ticket's own reduced scope, unlike the Jira flow's restart-safe
-   * adoption). KNOWN, ACCEPTED RESIDUAL: Butchr's own parser and drovr's
-   * may derive slightly different fingerprints for the SAME real dialog
-   * (different text-extraction), so the two detectors racing the same
-   * episode can each log once under their own fingerprint — an extra
-   * journal line, never a functional miss, and the mark still reads
-   * "stalled" correctly either way.
+   * parser, below), `onDrovrUnknownDialog` (FACTORY-45 Part B: drovr's
+   * `createBlockingEscalationWatcher` hook, src/daemon/index.ts), and
+   * (FACTORY-369) `handleManagedSessionUnresponsive` (the sustained-
+   * unparseable path, onNoPrompt below) all funnel into — three detectors,
+   * one mark. A NO-OP whenever the TRACKED fingerprint for this pane is
+   * unchanged (dedupe is the in-memory map itself, never a re-read of
+   * anything external: there is no comment channel to adopt from, unlike
+   * `escalate`/`escalateUnresponsive` above, so a daemon restart mid-episode
+   * simply re-logs once — acceptable per this ticket's own reduced scope,
+   * unlike the Jira flow's restart-safe adoption) EXCEPT that it still
+   * retries the #team-admin post if that post has not yet succeeded
+   * (FACTORY-369 AC 7) — the journal mark and the RC delivery are tracked
+   * independently for exactly this reason. KNOWN, ACCEPTED RESIDUAL:
+   * Butchr's own parser and drovr's may derive slightly different
+   * fingerprints for the SAME real dialog (different text-extraction), so
+   * the two detectors racing the same episode can each log once under their
+   * own fingerprint — an extra journal line, never a functional miss, and
+   * the mark still reads "stalled" correctly either way.
    *
    * FACTORY-50 (Part C): also durably captures the pane's full text via
    * `captureManagedSessionEscalationText` for a genuinely NEW episode
@@ -691,18 +835,48 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    */
   async function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): Promise<void> {
     const prior = managedSessionStalled.get(paneId);
-    if (prior?.fp === fp) return; // already logged + marked for this exact dialog this episode
+    if (prior?.fp === fp) {
+      await attemptTeamAdminNotify(paneId, prior); // already logged + marked this episode — only a pending RC retry remains to attempt
+      return;
+    }
     const since = new Date(deps.now()).toISOString();
-    managedSessionStalled.set(paneId, { target, fp, since });
     const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
-    const optionsLine = options.map((o, i) => `${i + 1}. ${o}`).join(" | ");
+    const entry: ManagedSessionEntry = { target, fp, since, question, options, capturePath };
+    managedSessionStalled.set(paneId, entry);
+    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
+    // AC 6: this line fires unconditionally, whether or not #team-admin
+    // routing is configured — a loud, complete journal line is the
+    // not-configured fallback, and a diagnostic record either way.
     deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
+    // AC 4 extension: the journal line above always fires (it's this
+    // ticket's not-configured fallback, AC 6) — only the #team-admin POST
+    // is capped, and only per-PANE, so a genuinely stable fleet (one real
+    // dialog, one fingerprint) never comes near this and a drifting one is
+    // bounded rather than unbounded.
+    if (!managedTeamAdminCap.allow(paneId, deps.now())) {
+      if (!managedTeamAdminCappedLogged.has(paneId)) {
+        managedTeamAdminCappedLogged.add(paneId);
+        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin rate cap reached (${MANAGED_TEAM_ADMIN_MAX_PER_HOUR}/hour) for pane ${paneId} — further managed-session dialogs on this pane are being logged only until the cap frees up`);
+      }
+      return;
+    }
+    managedTeamAdminCappedLogged.delete(paneId);
+    managedTeamAdminCap.record(paneId, deps.now());
+    await attemptTeamAdminNotify(paneId, entry);
   }
 
-  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. */
+  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. FACTORY-369 AC 5: fires the clear-up follow-up post once, but only for an episode that was actually delivered to #team-admin (`notifiedAt` set) — an episode nobody was ever told about needs no "never mind". */
   function clearManagedSessionStalled(paneId: string, reason: string): void {
-    if (!managedSessionStalled.delete(paneId)) return;
+    const entry = managedSessionStalled.get(paneId);
+    if (!entry) return;
+    managedSessionStalled.delete(paneId);
     deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} ${reason} — clearing stalled mark`);
+    if (entry.notifiedAt !== undefined && deps.teamAdminNotify) {
+      const text = teamAdminClearedMessage(entry.target, paneId, entry.fp);
+      void deps.teamAdminNotify(text).catch((e) =>
+        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin clear-up post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}: ${(e as Error)?.message ?? e}`),
+      );
+    }
   }
 
   async function handleManagedSessionBlocked(paneId: string, target: ManagedSessionTarget, prompt: Prompt): Promise<void> {
@@ -1096,6 +1270,11 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     for (const paneId of unresponsive.keys()) {
       if (!blocked.has(paneId)) unresponsive.delete(paneId);
     }
+    // FACTORY-369: same cleanup, for the managed-session mirror of the
+    // tracker above (`handleManagedSessionUnresponsive`, onNoPrompt below).
+    for (const paneId of managedUnresponsive.keys()) {
+      if (!blocked.has(paneId)) managedUnresponsive.delete(paneId);
+    }
     // FACTORY-45: "clear the stalled mark when the dialog clears" — the
     // herd no longer reporting this pane blocked AT ALL is the resolution
     // signal (mirrors the `unresponsive` cleanup just above); a fingerprint
@@ -1106,6 +1285,59 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     for (const [paneId] of managedSessionStalled) {
       if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
+  }
+
+  /**
+   * FACTORY-369 AC 2: the managed-session mirror of the BUTCHR-124 sustained
+   * blocked-and-unparseable alarm — same gate (`deps.unresponsiveMinutes`,
+   * `managedUnresponsive`'s own `UnresponsiveEntry` shape, the identical
+   * consecutive-pollSeq/gap-resets-the-episode rules as `unresponsive`
+   * above), but funnels into `markManagedSessionStalled` (the SAME sink
+   * `handleManagedSessionBlocked`/`onDrovrUnknownDialog` use) once the
+   * threshold is reached, instead of `escalateUnresponsive`'s Jira comment —
+   * a managed session has no ticket to post that comment to, the identical
+   * reason `onBlocked`'s own `issue === null` branch needed a different
+   * route in the first place. There is no PARSED dialog here, so `question`/
+   * `options` are synthetic placeholders (AC 1's fields still all appear in
+   * the #team-admin post — see `teamAdminMessage`'s "(none)" rendering for
+   * empty `options`) and the fingerprint is `hashText(text)` (already
+   * computed by the caller, `onNoPrompt`, for its own dedupe of the plain
+   * journal line just above) — a genuinely different unparseable text is
+   * exactly as much a "new" episode here as a new dialog fingerprint is for
+   * `handleManagedSessionBlocked`.
+   */
+  function handleManagedSessionUnresponsive(paneId: string, textHash: string, pollSeq: number): void {
+    const prior = managedUnresponsive.get(paneId);
+    if (prior && pollSeq <= prior.lastPollSeq) return; // stale/out-of-order, same guard as `unresponsive`'s own
+    const consecutive = !!prior && pollSeq === prior.lastPollSeq + 1;
+    const u: UnresponsiveEntry = consecutive ? prior! : { firstObservedAt: deps.now(), lastPollSeq: pollSeq };
+    u.lastPollSeq = pollSeq;
+    managedUnresponsive.set(paneId, u);
+
+    if (u.escalatedAt !== undefined) return; // this episode already handled
+    const elapsedMinutes = Math.floor((deps.now() - u.firstObservedAt) / 60_000);
+    if (elapsedMinutes < deps.unresponsiveMinutes) return; // not sustained long enough yet — the gate AC 2 requires
+    if (managedUnresponsiveInFlight.has(paneId)) return;
+
+    managedUnresponsiveInFlight.add(paneId);
+    void (async () => {
+      try {
+        const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
+        if (session) {
+          u.escalatedAt = deps.now();
+          await markManagedSessionStalled(paneId, session, "(sustained unparseable pane — no recognized dialog)", [], textHash);
+        }
+        // `session === null`: not a managed session (unowned/legacy, or a
+        // query-level agent) — nothing more to do here; the plain
+        // "blocked with no parseable dialog" journal line (onNoPrompt, above
+        // this call) already fired and stays the only signal, exactly as
+        // before this ticket.
+      } catch (e) {
+        deps.log(`WARNING: [managed-escalation] error resolving managed-session identity for sustained-unparseable pane ${paneId}: ${(e as Error)?.message ?? e}`);
+      } finally {
+        managedUnresponsiveInFlight.delete(paneId);
+      }
+    })();
   }
 
   function onNoPrompt(paneId: string, issue: string | null, text: string, pollSeq: number): void {
@@ -1122,10 +1354,12 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
     }
 
-    // BUTCHR-124: sustained blocked-and-unparseable alarm. No addressable
-    // target — mirrors onBlocked's own refusal for issue === null — so there
-    // is nothing to track or escalate.
-    if (issue === null) return;
+    // FACTORY-369 AC 2: a keyless pane widens to the SAME managed-session
+    // check `onBlocked` already does for `issue === null` — every OTHER
+    // keyless pane (unowned/legacy, query-level) still falls through to
+    // nothing, exactly as before this ticket (see
+    // `handleManagedSessionUnresponsive`'s own doc comment).
+    if (issue === null) { handleManagedSessionUnresponsive(paneId, h, pollSeq); return; }
 
     const prior = unresponsive.get(paneId);
     // Stale/out-of-order guard, same reasoning as handleBlocked's: a LATER
