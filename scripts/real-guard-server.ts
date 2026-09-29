@@ -25,6 +25,7 @@
  * Env:
  *   REAL_GUARD_PORT             — port to listen on (127.0.0.1 only, same as the real daemon — src/daemon/listen.ts)
  *   REAL_GUARD_ALLOWED_ORIGINS  — comma-separated chrome-extension://<id> origins (may be empty/absent — same "empty means disabled" default `liveView` itself uses)
+ *   REAL_GUARD_JIRA_HOST        — (FACTORY-532) this daemon's configured Jira site host, passed straight through to `resolveUrlToResource`'s `deps.jiraHost` unchanged; defaults to "example.atlassian.net" (this script's original, hardcoded value) when absent/empty
  *
  * Prints exactly one line, `REAL_GUARD_READY <port>`, once listening — the
  * driving test greps stdout for it the same way
@@ -67,11 +68,23 @@ function main(): void {
 
   // No agents staffed, no rows — an empty-but-real dashboard snapshot, so
   // `buildResourcesForUrlResponse` (unmodified production code) always
-  // resolves to `{ resource: null, agents: [] }` for any URL, which is a
-  // perfectly normal, honest response shape (see docs/resources-for-url.md)
-  // and is enough to prove the GUARD's behavior, which is this test's whole
-  // point — not the resource-matching logic, which the unit tests under
-  // test/unit already cover.
+  // resolves to `{ resource: <whatever REAL_GUARD_JIRA_HOST matches, or
+  // null>, agents: [] }`, which is a perfectly normal, honest response shape
+  // (see docs/resources-for-url.md) and is enough to prove the GUARD's
+  // behavior, which is this test's whole point — not the resource-matching
+  // logic itself, which the unit tests under test/unit already cover.
+  //
+  // FACTORY-532: `REAL_GUARD_JIRA_HOST` (default "example.atlassian.net",
+  // this script's original hardcoded value — unchanged for every existing
+  // caller that doesn't set it) lets a real-browser test in the `cleavr`
+  // repo point this daemon's configured Jira host at whatever host its own
+  // locally-served test page actually navigates to (e.g. `127.0.0.1`, the
+  // only host `cleavr`'s `manifest.json` grants script-injection permission
+  // for) — otherwise a `jira-project`/`jira-work` resource could never
+  // resolve to non-null against a page this script can actually load real
+  // Chrome onto. Still real, unmodified `buildResourcesForUrlResponse`;
+  // only which host counts as "this daemon's own Jira site" is configurable.
+  const jiraHost = process.env.REAL_GUARD_JIRA_HOST?.trim() || "example.atlassian.net";
   const view: ViewDeps = {
     state: async () => [],
     open: notImplemented("open"),
@@ -81,7 +94,7 @@ function main(): void {
     header: () => ({ build: null }),
     resourceLink: notImplemented("resourceLink"),
     configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
-    resourcesForUrl: (url) => Promise.resolve(buildResourcesForUrlResponse(url, { jiraHost: "example.atlassian.net" }, [])),
+    resourcesForUrl: (url) => Promise.resolve(buildResourcesForUrlResponse(url, { jiraHost }, [])),
     extensionAuth,
     // ptyAttach deliberately omitted: `/agents/:agentKey/pty` is reachable
     // through the SAME `extensionAuth` guard as `/resources/for-url` (see
