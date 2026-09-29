@@ -8,6 +8,7 @@ import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } from "./origin-guard.js";
+import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 
@@ -84,6 +85,20 @@ export interface ViewDeps {
    */
   extensionAuth?: OriginGuardDeps;
   /**
+   * FACTORY-476 (implementing FACTORY-474): the journal-logger for a
+   * rejection from `extensionAuth`'s guard, on every route it gates — see
+   * `./origin-guard-log.ts` for the line shape, the rate-limit/dedupe
+   * contract, and why `origin` still gets sanitized despite being logged
+   * "verbatim". Optional so every pre-existing `ViewDeps` literal keeps
+   * compiling unchanged; an omitted value defaults to
+   * `createOriginGuardLogger()` (real clock, `console.error`) — the same
+   * "absent means the safe default, never disabled" discipline
+   * `extensionAuth` above already follows. A test that needs to control the
+   * clock or capture emitted lines builds its own with
+   * `createOriginGuardLogger({ now, log })` and passes it here.
+   */
+  originGuardLog?: OriginGuardLogger;
+  /**
    * FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the
    * `GET /agents/:agentKey/pty` WebSocket's own deps — resolving an agent
    * key to a pane, checking that pane is still live on each poll tick, and
@@ -122,6 +137,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
   // header for why an empty allowlist must never read as "no auth
   // required".
   const extensionAuth: OriginGuardDeps = deps.extensionAuth ?? { allowedOrigins: [] };
+  // FACTORY-476: same "absent means the safe default" discipline as
+  // `extensionAuth` immediately above — see `ViewDeps.originGuardLog`'s own
+  // doc comment.
+  const originGuardLog: OriginGuardLogger = deps.originGuardLog ?? createOriginGuardLogger();
   // FACTORY-453: one entry per currently-open `/agents/:agentKey/pty` socket — see `PtySession`'s own doc comment for why this exists instead of closing over per-connection state directly.
   const ptySessions = new Map<string, PtySession>();
   return new Elysia()
@@ -245,15 +264,29 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // fallback to "unauthenticated". `deps.resourcesForUrl` is only ever
     // called once the guard has already said `ok`.
     .options("/resources/for-url", ({ request, set }) => {
-      const preflight = preflightExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      const origin = request.headers.get("origin");
+      const preflight = preflightExtensionOrigin({ origin }, extensionAuth);
       set.status = preflight.status;
       for (const [k, v] of Object.entries(preflight.headers)) set.headers[k] = v;
+      // FACTORY-476: `preflight.reason` is present only on refusal — see
+      // `preflightExtensionOrigin`'s own doc comment. `new URL(...).pathname`
+      // strips the query string unconditionally (this route takes none, but
+      // the shared logger's own contract — ticket criterion 2 — is "never
+      // the query string", not "never on routes known to carry one").
+      if (preflight.reason) originGuardLog.reject({ method: "OPTIONS", path: new URL(request.url).pathname, origin, result: preflight.reason });
       return "";
     })
     .get("/resources/for-url", async ({ request, query, set }) => {
-      const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      const origin = request.headers.get("origin");
+      const guard = checkExtensionOrigin({ origin }, extensionAuth);
       for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!guard.ok) {
+        // FACTORY-476: `?url=` carries the page URL the extension is
+        // looking at — this logs `pathname` only, never `request.url` whole.
+        originGuardLog.reject({ method: "GET", path: new URL(request.url).pathname, origin, result: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
       if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // `query.url` is the raw `?url=` value; Elysia decodes it the same way
       // `URLSearchParams` would, so the ticket's own `url=<percent-encoded>`
@@ -285,8 +318,16 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       backpressureLimit: 4 * 1024 * 1024,
       closeOnBackpressureLimit: true,
       beforeHandle({ request, params, set }) {
-        const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+        const origin = request.headers.get("origin");
+        const guard = checkExtensionOrigin({ origin }, extensionAuth);
         if (!guard.ok) {
+          // FACTORY-476: the PTY upgrade path — ticket criterion 1's third
+          // route. `params.agentKey` is never logged here (only the path
+          // itself), and this only ever fires for the origin-guard refusal,
+          // never for a resolve failure (malformed key / unknown pane) below
+          // — those are a different, already-diagnosable refusal, not this
+          // ticket's scope.
+          originGuardLog.reject({ method: "GET", path: new URL(request.url).pathname, origin, result: guard.reason });
           set.status = guard.status;
           return guard.body;
         }
