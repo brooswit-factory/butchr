@@ -2934,6 +2934,77 @@ describe("resumeInPlace", () => {
     });
   });
 
+  // FACTORY-470/472 (boss review on FACTORY-472, relaying FACTORY-312/PR
+  // #551): resumeInPlaceExclusive is SHARED between the pre-existing
+  // model/effort resume path and this ticket's herdr-restored-pane path —
+  // a relaunch failing AFTER `/exit` has already landed (the measured-live
+  // `agent_name_taken` race) is reachable through EITHER, and FACTORY-312's
+  // review found it leaves `ManagedHerdrLifecycle`'s `this.active` pointing
+  // at a pane that no longer exists (set as a `resolveCurrent()` READ side
+  // effect from THIS SAME attempt's own pre-`/exit` `isIdle()` check, per
+  // the pinned drovr source, `resolveCurrent()`,
+  // node_modules/@brooswit/drovr/dist/index.js) — nothing here ever calls
+  // `.stop()` to clear it.
+  //
+  // WHAT THIS TEST ACTUALLY FOUND, exercised through the REAL
+  // `resumeInPlaceExclusive` + `spawnExclusive` code paths (not bypassed or
+  // synthesized): a bare subsequent `herd.spawn()` on the SAME issue does
+  // NOT reach `ManagedHerdrLifecycle.start()` at all — it never gets far
+  // enough to hit the `this.active` guard FACTORY-312 described, because
+  // `HerdrHerd.byIssue()` (this file) decides "has a live agent" from
+  // `agent.list()` reporting a `cwd`/`pane_id` at all, NEVER from whether
+  // `a.agent` names a recognized provider — so a pane still sitting at a
+  // bare shell (foreground `undefined`, exactly this fixture's shape after
+  // `/exit`) still counts as occupied, and `spawnExclusive`'s own no-op
+  // check (`if (byIssue().has(issue)) return`) short-circuits BEFORE
+  // `startProviders()`/`.start()` is ever called. The herd.spawn() call
+  // below resolves — it does NOT throw `HandoffBlocked` — but the issue is
+  // STILL never actually recovered: no new spawn attempt is made either
+  // (`f.started` gains no second entry), so it stays silently stuck on the
+  // empty pane rather than loudly wedged. That is a DIFFERENT observable
+  // symptom than the thrown-exception shape FACTORY-312's comment
+  // describes, not a contradiction of it — whether their live measurement
+  // hit a path where `agent.list()` omits a bare-shell pane entirely
+  // (making `existing` genuinely undefined further down, past this no-op
+  // check) is exactly the kind of gap between this fixture and real herdr
+  // worth flagging rather than silently reconciling. NOT fixing either
+  // shape here — FACTORY-312/#551's own scope — recorded on FACTORY-470 as
+  // a concrete finding instead.
+  test("FACTORY-470/472 (documents a KNOWN, currently-unfixed wedge — see FACTORY-312/PR #551): a herdr-restored pane's relaunch colliding AFTER /exit leaves it stuck — a later ordinary herd.spawn() silently no-ops rather than recovering it", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // Same herdr-restore shape as the happy-path test above — seed this
+        // BEFORE forcing the collision, so the seed call itself succeeds.
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        // Force ONLY the upcoming relaunch attempt to collide, the same
+        // agent_name_taken shape FACTORY-312 measured live.
+        f.client.agent.start = async (p: any) => {
+          f.started.push(p);
+          throw HerdrError.from("agent.start", { code: "agent_name_taken", message: "agent name already used" });
+        };
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("stuck"); // /exit already succeeded; the relaunch then collided
+
+        // A later ordinary spawn neither throws NOR actually recovers the
+        // issue — see the doc comment above for why (byIssue()'s residency
+        // check, not the this.active guard, is what fires here).
+        await expect(herd.spawn(spec)).resolves.toBeUndefined();
+        expect(f.started).toHaveLength(1); // no second, recovering spawn attempt was made
+      });
+    });
+  });
+
   // FACTORY-470/472 acceptance criterion 3/4: a pane that LOOKS
   // herdr-restored (a bare `--resume <id>` argv) but whose transcript is
   // genuinely gone must still fail safe — FACTORY-418's invalidation is
