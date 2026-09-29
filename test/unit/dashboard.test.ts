@@ -1,8 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { buildDashboardRows, createDashboardFeed, initialDashboardSnapshot, ownsDashboardAgent, type AgentDashboardRow, type DashboardAgent, type DashboardRow, type IssueMeta } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, createDashboardFeed, initialDashboardSnapshot, ownsDashboardAgent, cwdAgentResolvers, type AgentDashboardRow, type DashboardAgent, type DashboardRow, type IssueMeta } from "../../src/agents/dashboard.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
+
+describe("cwdAgentResolvers (FACTORY-532): a jira-project pane is visible to the dashboard only, never to label sync or the escalator", () => {
+  const projectKey = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "unity-manager", resourceId: "GK" });
+  const workKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" });
+  const { ownedAgentOfCwd, dashboardAgentOfCwd } = cwdAgentResolvers((cwd) => (cwd === "/p" ? projectKey : cwd === "/w" ? workKey : null));
+  test("jira-project cwd: null for the escalation/label path, the full key for the dashboard", () => {
+    expect(ownedAgentOfCwd("/p")).toBeNull();
+    expect(dashboardAgentOfCwd("/p")).toBe(projectKey);
+  });
+  test("jira-work cwd: resolves on both", () => {
+    expect(ownedAgentOfCwd("/w")).toBe(workKey);
+    expect(dashboardAgentOfCwd("/w")).toBe(workKey);
+  });
+  test("an unresolvable cwd is null on both", () => {
+    expect(ownedAgentOfCwd("/x")).toBeNull();
+    expect(dashboardAgentOfCwd(undefined)).toBeNull();
+  });
+});
 
 describe("ownsDashboardAgent (FACTORY-532, implementing FACTORY-531): jira-project is visible, other non-jira-work providers stay hidden (FACTORY-461's own scope, untouched)", () => {
   test("a jira-work agent is owned", () => {

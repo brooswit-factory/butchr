@@ -19,7 +19,7 @@ import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
-import { createDashboardFeed, DASHBOARD_DETECTOR, ownsDashboardAgent, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { createDashboardFeed, cwdAgentResolvers, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
@@ -934,16 +934,14 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
  * The ticket a pane's workspace works, for rule-engine workspaces only — a
  * legacy workspace is never attributed to its ticket.
  *
- * FACTORY-532 (implementing FACTORY-531): gated by `ownsDashboardAgent`
- * (`src/agents/dashboard.ts`, jira-work + jira-project only), not the
- * narrower `ownsRuleAgent` alone — see that predicate's own doc comment for
- * why (FACTORY-461, the same hiding for github-issue/github-pr/
- * zendesk-ticket/filesystem, is a deliberately separate, still-open concern).
+ * Deliberately gated by `ownsRuleAgent` (jira-work only): this feeds
+ * `resourceOfCwd` (label sync) and `escalationTargetOfCwd` (the
+ * blocked-dialog escalator), and neither may ever see a `jira-project`
+ * manager pane (an escalation target there would open a Confluence-comment
+ * write and control channel on it). The dashboard's own, wider gate is
+ * `dashboardAgentOfCwd` below.
  */
-const ownedAgentOfCwd = (cwd: string | null | undefined): string | null => {
-  const id = agentIdOfWorkspacePath(cwd);
-  return id && ownsDashboardAgent(id) ? id : null;
-};
+const { ownedAgentOfCwd, dashboardAgentOfCwd } = cwdAgentResolvers(agentIdOfWorkspacePath);
 const resourceOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
   return id ? resourceKeyOf(id) : null;
@@ -961,7 +959,7 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
  * status map (`statusMapFromAgents`, which needs the BARE key to match a
  * Jira search's own issue keys). FACTORY-407: the dashboard no longer goes
  * through `resourceOfCwd` at all — `agentStatusesFeedingDashboard` below
- * feeds `buildDashboardRows` the FULL owned key (`ownedAgentOfCwd` itself,
+ * feeds `buildDashboardRows` the FULL key (`dashboardAgentOfCwd`,
  * undiscarded) via a separate `agent_key` field, because `resourceOfCwd`'s
  * bare fallback is exactly what made every real `AgentDashboardRow.resourceKey`
  * undecodable — see that ticket for the full history.
@@ -1021,9 +1019,9 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
       // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
       // own correlation identifier (`buildDashboardRows`); `resource_key`
       // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
-      // `statusMapFromAgents` below already needs. One `ownedAgentOfCwd` call
-      // per agent either way — `resourceOfCwd` already makes its own.
-      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: ownedAgentOfCwd(a.cwd) })) };
+      // `statusMapFromAgents` below already needs. `agent_key` uses the
+      // dashboard-only `dashboardAgentOfCwd`; `resource_key` stays on `ownedAgentOfCwd`.
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: dashboardAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);

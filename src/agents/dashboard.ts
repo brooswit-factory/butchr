@@ -53,7 +53,7 @@ import type { AdmissionCensus } from "./admission.js";
 /**
  * FACTORY-532 (implementing FACTORY-531): which providers' agents get a
  * dashboard row at all — this is the predicate `src/daemon/index.ts`'s
- * `ownedAgentOfCwd` feeds `DashboardAgent.agent_key` through, and therefore
+ * `dashboardAgentOfCwd` (`cwdAgentResolvers`) feeds `DashboardAgent.agent_key` through, and therefore
  * the predicate `buildDashboardRows` below (only an agent with a truthy
  * `agent_key` produces a row) ultimately gates. `jira-work` (`ownsRuleAgent`)
  * and `jira-project` (`ownsJiraProjectAgent`) ONLY — a DELIBERATELY NARROW
@@ -65,6 +65,24 @@ import type { AdmissionCensus } from "./admission.js";
  * first.
  */
 export const ownsDashboardAgent = (id: string): boolean => ownsRuleAgent(id) || ownsJiraProjectAgent(id);
+
+/**
+ * The two cwd -> agent-key resolvers, deliberately split. `ownedAgentOfCwd`
+ * (jira-work only, `ownsRuleAgent`) feeds label sync and the blocked-dialog
+ * escalator, and must resolve `null` for a `jira-project` manager pane.
+ * `dashboardAgentOfCwd` (`ownsDashboardAgent`) feeds ONLY the dashboard's
+ * `agent_key` — and so the same snapshot that gates `/agents/:agentKey/pty`.
+ */
+export const cwdAgentResolvers = (agentIdOfCwd: (cwd: string | null | undefined) => string | null) => ({
+  ownedAgentOfCwd: (cwd: string | null | undefined): string | null => {
+    const id = agentIdOfCwd(cwd);
+    return id && ownsRuleAgent(id) ? id : null;
+  },
+  dashboardAgentOfCwd: (cwd: string | null | undefined): string | null => {
+    const id = agentIdOfCwd(cwd);
+    return id && ownsDashboardAgent(id) ? id : null;
+  },
+});
 
 /** The name this endpoint registers itself under in the shared coverage tracker (src/daemon/coverage.ts) — see this module's own header for why the recordChecked/recordDeclined calls themselves live in src/daemon/index.ts instead. */
 export const DASHBOARD_DETECTOR = "dashboard";
