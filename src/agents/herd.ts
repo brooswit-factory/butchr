@@ -33,6 +33,17 @@ export interface NudgeResult {
   refusal?: SessionLimitRefusal;
 }
 
+/**
+ * FACTORY-501 — the fixed prefix every `StaleAgent.reason` produced by the
+ * herdr-restored-pane classification below starts with. Exported so
+ * `src/daemon/loop.ts` can distinguish a restored-pane `"deferred"`/`"stuck"`
+ * outcome from the model/effort-only resume path (FACTORY-312/PR #551) at
+ * the point the staleness reason is known, WITHOUT re-deriving the
+ * classification itself (`isHerdrRestoredPane`, this file) a second time —
+ * a single source of truth for the exact string both sides must agree on.
+ */
+export const RESTORED_PANE_STALE_REASON_PREFIX = "session preserved: herdr restored this pane";
+
 /** A running agent found to be stale: its process argv lacks butchr's spawn flags. */
 export interface StaleAgent {
   issue: string;
@@ -926,7 +937,7 @@ export class HerdrHerd implements Herd {
           this.log?.(`[herdr-restore] ${issue} classified as herdr-restored — observed argv: ${JSON.stringify(proc.argv)}`);
           out.push({
             issue,
-            reason: `session preserved: herdr restored this pane after a host reset as a bare \`claude --resume\` (${check.reason.replace(/^argv lacks /, "")}) — relaunching on the same session with butchr's full flag set`,
+            reason: `${RESTORED_PANE_STALE_REASON_PREFIX} after a host reset as a bare \`claude --resume\` (${check.reason.replace(/^argv lacks /, "")}) — relaunching on the same session with butchr's full flag set`,
             observedArgv: proc.argv,
             resumable: true,
           });

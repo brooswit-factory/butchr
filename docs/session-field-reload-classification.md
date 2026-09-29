@@ -730,3 +730,52 @@ allowlist Required Finding 2 above describes:
   the SAME pane id while it is still
   known with certainty, from the entry `staleIssues()`/`resumeInPlace()`
   resolved before the relaunch attempt.
+
+### FACTORY-501 — bounding a restored pane that never resolves (option b: defer-and-escalate)
+
+Everything above assumes `resumeInPlace()` eventually settles to a terminal
+outcome. It does not have to: a restored pane whose agent stays mid-turn
+makes `resumeInPlace()` return `"deferred"` on every single poll, forever —
+by design (see `resumeInPlace`'s own doc comment, `src/agents/herd.ts`),
+NEVER falling back to `stop()`+`spawn()` on this path, since a `"deferred"`
+outcome is returned at herdr's own `isIdle()` check, before any `/exit` is
+sent — a fresh spawn there would destroy the conversation of an agent that
+merely stayed busy, which is exactly the outcome FACTORY-467 exists to
+prevent.
+
+Left there, that agent runs indefinitely without butchr's `--permission-
+mode`, `--mcp-config`, or channels: alive, but silently degraded, with no
+bound and no notice. FACTORY-501 (FACTORY-500 item 2) closes that
+WITHOUT ever touching the retry itself — a pure observer, `src/agents/
+restored-pane-escalation.ts` — by tracking the WALL-CLOCK time (not poll
+count) of each issue's first consecutive restored-pane deferral and
+escalating (a ticket comment, or a journal line for a managed session with
+no ticket) at a first threshold (`RESTORED_PANE_ESCALATION_FIRST_MS`,
+~10 minutes) and repeating (`RESTORED_PANE_ESCALATION_REPEAT_MS`, ~1 hour)
+for as long as the streak continues. The split from the existing
+model/effort-only `onResumeWaiting` notice (`RESUME_WAITING_NOTICE_AT_POLLS`,
+`src/daemon/loop.ts`) is made at the point `reconcileNow` reads a stale
+issue's own `reason` string, via the shared
+`RESTORED_PANE_STALE_REASON_PREFIX` constant (`src/agents/herd.ts`) both
+sides agree on — the model/effort path is untouched, keeps its old
+poll-counted once-only notice with its old wording, and never gains a
+wall-clock or repeating escalation.
+
+**Reachable on the managed-session path, not just the issue tier.**
+`onResumeWaiting`/`onResumePreserved` were found, in the course of this
+same ticket, to be unwired on the managed-session reconcile loop
+(`src/daemon/session-definitions-loop.ts` passes only `onRespawn` to
+`runResourceLoop`) — so a restored-pane escalation wired only through that
+shape would have silently never appeared for `buddy`/`genius`, the exact
+canary set this story gates widening beyond. `ReconcileOptions
+.checkRestoredPaneDeferred`/`GenericLoopDeps.checkRestoredPaneDeferred` is
+threaded through BOTH the issue/rule-agent loop and
+`ManagedSessionsLoopDeps.checkRestoredPaneDeferred` explicitly, with its own
+Jira-comment-vs-journal-log addComment wiring in `src/daemon/index.ts`,
+mirroring `checkCrashLoop`'s existing identical split (see that field's own
+doc comment, `src/daemon/session-definitions-loop.ts`, for the crash-loop
+precedent this follows). `onResumePreserved` being unwired for managed
+sessions (so a *successful* restored-pane resume may post no "session
+preserved" notice there) is a separate, PRE-EXISTING gap this ticket found
+but did not fix — reported to the epic, out of this ticket's scope.
+  resolved before the relaunch attempt.
