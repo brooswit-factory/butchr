@@ -3005,6 +3005,51 @@ describe("resumeInPlace", () => {
     });
   });
 
+  // FACTORY-470/472 (epic review, FACTORY-470 comment 27586): the SAME
+  // post-/exit-failure question, but for the OTHER branch of
+  // `resumeInPlaceExclusive`'s `startManagedAgent` catch — any error that
+  // is NOT `agent_name_taken` is re-thrown raw (`throw e`), rather than
+  // caught and reported as `"stuck"`. `resumeInPlace()` itself REJECTS in
+  // this case, so the caller (`reconcileNow`, src/daemon/loop.ts) never
+  // even reaches the `outcome === "stuck"` branch — it hits its OWN
+  // `catch (e) { failures.push(...); continue; }`, no stop, no spawn,
+  // exactly like the agent_name_taken case one poll earlier. Exercised here
+  // one level down, directly on `HerdrHerd`, since `reconcileNow`'s own
+  // failure-isolation for this stage is unrelated to this ticket and
+  // already covered elsewhere (test/unit/loop.test.ts).
+  test("FACTORY-470/472 (documents the SAME KNOWN wedge for the OTHER failure branch — see FACTORY-312/PR #551): a herdr-restored pane's relaunch throwing a non-agent_name_taken error rejects resumeInPlace(), and a later ordinary herd.spawn() still doesn't recover it", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        // A DIFFERENT HerdrError code — anything but agent_name_taken — so
+        // resumeInPlaceExclusive's catch re-throws instead of returning "stuck".
+        f.client.agent.start = async (p: any) => {
+          f.started.push(p);
+          throw HerdrError.from("agent.start", { code: "transport_error", message: "herdr RPC transport hiccup" });
+        };
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        // /exit already succeeded; the relaunch then threw a non-agent_name_taken
+        // error — resumeInPlace() propagates it rather than returning a status.
+        await expect(herd.resumeInPlace(spec)).rejects.toThrow(/transport hiccup/);
+
+        // Same shape as the agent_name_taken case: a later ordinary spawn
+        // neither throws nor actually recovers the issue (byIssue()'s
+        // residency check, not the this.active guard, is what fires here).
+        await expect(herd.spawn(spec)).resolves.toBeUndefined();
+        expect(f.started).toHaveLength(1); // no second, recovering spawn attempt was made
+      });
+    });
+  });
+
   // FACTORY-470/472 acceptance criterion 3/4: a pane that LOOKS
   // herdr-restored (a bare `--resume <id>` argv) but whose transcript is
   // genuinely gone must still fail safe — FACTORY-418's invalidation is
