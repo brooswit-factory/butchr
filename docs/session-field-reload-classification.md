@@ -654,3 +654,35 @@ each one actually needs closed:
 | `workingDirectory` | A, nudge-only | A, nudge-only | source reading (`SpawnSpec.cwd`, `kickoffFor`, `checkArgv`) |
 | `brief` | A, nudge-only | A, nudge-only | source reading (same seams as above) |
 | `vendor` | undetected (would be C) | undetected (would be C) | source reading (`staleIssues()`'s self-referential provider comparison) |
+
+## FACTORY-470/472 — a herdr-restored pane is B too, but not via a definition-field edit
+
+Everything above classifies what happens when a *definition field* changes
+under a still-running agent. This is a different trigger entirely, added
+after the survey above: after a host hard reset, herdr's OWN restore
+mechanism (independent of butchr, outside this repo's source) relaunches a
+workspace's Claude process as a bare `claude --resume <pre-boot-session-id>`,
+with **none** of butchr's own launch flags at all (permission-mode,
+mcp-config, development-channels, model/effort) — no field changed; butchr's
+flags were simply never there on this particular launch.
+
+This is now class B (`HerdrHerd.staleIssues()`/`isHerdrRestoredPane()`,
+`src/agents/herd.ts`), via a mechanism deliberately distinct from the
+allowlist Required Finding 2 above describes:
+
+- **Not FACTORY-411/#556's allowlist.** A herdr-restored pane's `checkArgv`
+  reason always lists `--mcp-config` as missing (among others) —
+  `resumableArgvReason` never allows that flag, so this case is
+  `resumable: false` under the allowlist alone, always (the "0 of 15 real
+  panes" gap this ticket closes).
+- **An identity check instead:** does the pane's own observed `--resume
+  <id>` argument match the workspace's persisted session id
+  (`workspaceSessionId`, the same value FACTORY-314/418 already trust)? A
+  match means this is unambiguously the same conversation, whatever flags
+  are missing, and is resumable via the existing `resumeInPlace()`
+  full-flag relaunch regardless of which/how-many flags differ. No match —
+  including an absent or FACTORY-418-invalidated persisted id — falls
+  through unchanged to today's allowlist/stop+spawn behaviour.
+- Subject to the same class-B precondition as every other B entry above:
+  the relaunch only ever resumes the id `resumeInPlace()` itself already
+  verified has a real transcript.

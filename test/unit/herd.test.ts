@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -2094,6 +2094,38 @@ describe("staleArgvOutcome", () => {
   });
 });
 
+// FACTORY-470/472: the identity check that classifies a herdr-restored
+// pane (herdr's OWN restore after a host hard reset — a bare
+// `claude --resume <pre-boot-session-id>`, none of butchr's flags)
+// as resumable via the SAME full-flag `resumeInPlace()` path, WITHOUT
+// widening FACTORY-411/#556's flag-diff allowlist and without a new
+// field-by-field staleness classifier — see `isHerdrRestoredPane`'s own
+// doc comment (src/agents/herd.ts) for the full reasoning.
+describe("isHerdrRestoredPane", () => {
+  test("true: the pane's own --resume value matches the persisted session id", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123"], "abc-123")).toBe(true);
+  });
+  test("false: no persisted session id at all (never discovered, or invalidated by FACTORY-418)", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123"], undefined)).toBe(false);
+  });
+  test("false: the pane's --resume value names a DIFFERENT session than the one persisted", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "some-other-id"], "abc-123")).toBe(false);
+  });
+  test("false: no --resume flag in argv at all (an ordinary fresh-spawned agent, not herdr-restored)", () => {
+    expect(isHerdrRestoredPane(["claude", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+  // PR #560 review: the --resume match alone is not enough — a pane butchr
+  // ITSELF relaunched via resumeInPlace() also carries --resume <persisted
+  // id> forever afterward. Without the --mcp-config discriminator, any
+  // LATER unrelated drift on that already-`--resume`d pane would be
+  // misclassified "herdr restored" instead of going through the ordinary
+  // allowlist path — silently widening resume-in-place to other
+  // definition-change cases, which this ticket's scope excludes.
+  test("false: --resume matches, but --mcp-config IS present — a pane butchr itself already relaunched, not a herdr restore", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--mcp-config", "/some/mcp.json", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+});
+
 describe("resumeInPlace", () => {
   const instant = () => Promise.resolve();
   const CLAUDE_PROC = { pid: 1, argv: ["claude"], name: "claude" };
@@ -2397,7 +2429,7 @@ describe("resumeInPlace", () => {
   // persisted id whose transcript no longer exists (corrupted state, or a
   // discovery bug) must fail safe — never attempt `--resume` against a
   // conversation that isn't there.
-  test("unresumable: a persisted session id whose transcript is missing — never attempts /exit", async () => {
+  test("unresumable-transcript-gone: a persisted session id whose transcript is missing — never attempts /exit", async () => {
     await withTempWorkspaces(async () => {
       const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
       const { tmpdir } = require("node:os") as typeof import("node:os");
@@ -2409,7 +2441,12 @@ describe("resumeInPlace", () => {
         const f = statefulHerdr("w1:p1", cwd);
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace({ key, issuetype: "Task", summary: "s", parent: null });
-        expect(outcome).toBe("unresumable");
+        // PR #560 review: a DISTINCT outcome from the bare "unresumable"
+        // the OTHER two tests around this one assert — the id here WAS
+        // determined ("ghost-session"); only its transcript is gone, which
+        // deserves its own honest respawn-comment wording, not "session id
+        // could not be determined" (see src/daemon/loop.ts's reason mapping).
+        expect(outcome).toBe("unresumable-transcript-gone");
         expect(f.sent).toEqual([]);
       } finally {
         rmSync(home, { recursive: true, force: true });
@@ -2547,20 +2584,29 @@ describe("resumeInPlace", () => {
   function fakeHerdrFullCycle(cwd: string) {
     const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; foreground: "claude" | "shell" } = { agents: [], foreground: "shell" };
     let paneCounter = 0;
+    // FACTORY-470/472: the REAL argv the last successful `agent.start` was
+    // called with — needed by `staleIssues()`'s own `isHerdrRestoredPane`
+    // check (this ticket), which PR #551's own tests never exercised
+    // through this fixture. Additive only: every existing #551 test still
+    // gets the exact same fixed shell/claude foreground shape it always did.
+    let lastArgv: string[] = ["claude"];
     const started: any[] = []; const closed: string[] = []; const sent: any[] = []; const creates: any[] = [];
     let nameTakenNext = false;
+    let otherErrorNext = false;
     const client = {
       agent: {
         list: async () => ({ agents: state.agents.map((a) => ({ ...a })) }),
         start: async (p: any) => {
           started.push(p);
           if (nameTakenNext) { nameTakenNext = false; throw HerdrError.from("agent.start", { code: "agent_name_taken", message: "agent name already used" }); }
+          if (otherErrorNext) { otherErrorNext = false; throw new Error("herdr RPC transport hiccup"); }
+          lastArgv = ["claude", ...(p.args ?? [])];
           state.agents = [...state.agents.filter((a) => a.pane_id !== p.pane_id), { pane_id: p.pane_id, cwd, agent: "claude", agent_status: "idle" }];
           state.foreground = "claude";
         },
       },
       pane: {
-        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: ["claude"], name: "claude" }] : [] } }),
+        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); state.foreground = "shell"; },
         close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); },
@@ -2571,6 +2617,10 @@ describe("resumeInPlace", () => {
     return {
       client: client as any, started, closed, sent, creates, state,
       setNameTakenOnNextStart: () => { nameTakenNext = true; },
+      // FACTORY-470/472: force the NEXT `agent.start` to throw a non-
+      // agent_name_taken error — the second door PR #551's floor fix
+      // covers (`postExitOutcome()` applies identically to both).
+      setOtherErrorOnNextStart: () => { otherErrorNext = true; },
       // Simulates herdr's OWN bookkeeping eventually forgetting a dead
       // pane's agent-name registration (the "old process can still hold
       // this pane's agent name... for a moment" gap `staleIssues()`'s own
@@ -2850,6 +2900,253 @@ describe("resumeInPlace", () => {
         expect(mcpJson.mcpServers.chan1).toEqual({ type: "http", url: "http://example/mcp" });
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
+    });
+  });
+
+  // PR #560 review — the scope-creep case `isHerdrRestoredPane`'s own
+  // --mcp-config discriminator exists to close: a pane butchr ITSELF
+  // already relaunched via resumeInPlace() (so its live argv carries
+  // `--resume <id>` PLUS the full flag set, `--mcp-config` included) that
+  // LATER drifts for an unrelated, ordinary reason must still be classified
+  // through FACTORY-411/#556's allowlist as before — never mistaken for a
+  // herdr restore just because `--resume` is present. Without the
+  // discriminator, this would be silently misclassified "herdr restored"
+  // and relaunched via the identity path with the WRONG stated reason,
+  // quietly widening resume-in-place's reach to any drift on any
+  // already-`--resume`d pane — exactly what FACTORY-470 puts out of scope.
+  test("staleIssues(): a pane already relaunched via resumeInPlace (carries --resume AND the full flag set) that later drifts is classified via the ordinary allowlist, never as 'herdr restored'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/factory-918.json" });
+      const cwd = ensureWorkspaceDir(key);
+      const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
+      persistDiscoveredSessionId(cwd, "already-resumed-session");
+      const f = statefulHerdr("w1:p1", cwd);
+      // The argv THIS workspace's own prior resumeInPlace() relaunch would
+      // have produced — full flags (--mcp-config included), PLUS --resume.
+      // Never a herdr-restore shape: butchr itself built this argv.
+      const priorArgv = spawnArgs(
+        { key, issuetype: "managed-session", summary: "", parent: null, resource: "/etc/defs/factory-918.json" },
+        cwd, { provider: "claude", resumeSessionId: "already-resumed-session" },
+      );
+      await f.client.agent.start({ args: priorArgv.slice(1) }); // drop the leading "claude" positional; statefulHerdr re-adds it
+      f.started.length = 0;
+      // A later, unrelated drift: the definition now binds a NEW channel
+      // server (FACTORY-411/#556's own allowed shape) that the persisted
+      // `.butchr-mcp-servers.json` doesn't know about yet.
+      const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify([binding]));
+
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      // The ordinary allowlist path fired (FACTORY-411/#556) — NOT this
+      // ticket's herdr-restored identity path.
+      expect(stale[0]!.reason).toContain("--dangerously-load-development-channels");
+      expect(stale[0]!.reason).not.toContain("herdr restored");
+      expect(stale[0]!.resumable).toBe(true); // still resumable — just via the allowlist, not the identity check
+    });
+  });
+
+  // FACTORY-470/472 — the ticket's own headline case: herdr's OWN
+  // restore-after-host-hard-reset (independent of butchr, outside this
+  // repo's source) produces exactly this shape — a live claude process
+  // whose observed argv is a bare `--resume <pre-boot-session-id>`, none of
+  // butchr's own flags (permission-mode, mcp-config, channels) at all. This
+  // is the "0 of 15 real panes" gap: under FACTORY-411/#556's allowlist
+  // alone, its checkArgv reason always also lists `--mcp-config` (never on
+  // that allowlist), so it would be `resumable: false` forever. Asserts the
+  // identity path (`isHerdrRestoredPane`) is what actually classifies it —
+  // not a coincidental allowlist pass — then relaunches with the FULL flag
+  // set (same builder a fresh spawn uses, per this ticket's scope decision)
+  // and proves no respawn loop across SEVERAL consecutive polls afterward
+  // (FACTORY-470 review comment: the persisted-id equality this mechanism
+  // relies on must not drift after the relaunch it itself triggers).
+  test("FACTORY-470/472: a herdr-restored pane (bare `claude --resume <id>`, no butchr flags) is classified resumable via identity, relaunches with the full flag set, and is never flagged again across several consecutive polls", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-914" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // Simulate herdr's own restore: a bare `claude --resume <id>` —
+        // never something butchr itself built (contrast with every other
+        // test in this file, which seeds `lastArgv` via a real
+        // `spawnArgs(...)`/`agentStartParams(...)` call).
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true);
+        expect(stale[0]!.reason).toContain("herdr restored");
+        // Confirm the IDENTITY path fired, not a coincidental allowlist
+        // pass: this reason's missing-flag list includes --mcp-config,
+        // which resumableArgvReason must still refuse on its own.
+        const missing = stale[0]!.reason.match(/\(([^)]+)\)/)?.[1] ?? "";
+        expect(missing).toContain("--mcp-config");
+        expect(resumableArgvReason(`argv lacks ${missing}`, "claude")).toBe(false);
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        const args: string[] = f.started[0]!.args;
+        expect(args[args.indexOf("--resume") + 1]).toBe("original-session");
+        expect(args).toEqual(expect.arrayContaining([
+          "--model", "claude-opus-5", "--effort", "medium",
+          "--permission-mode", DEFAULT_PERMISSION_MODE,
+          "--mcp-config", join(cwd, "mcp.json"),
+        ]));
+        expect(f.started[0]!.pane_id).toBe("w1:p1"); // same pane, never a new one
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+
+        for (let poll = 0; poll < 3; poll++) {
+          expect(await herd.staleIssues()).toEqual([]);
+        }
+      });
+    });
+  });
+
+  // FACTORY-470/472 (boss review on FACTORY-472, relaying FACTORY-312/PR
+  // #551 — now MERGED, rebased onto here): resumeInPlaceExclusive is SHARED
+  // between the pre-existing model/effort resume path and this ticket's
+  // herdr-restored-pane path — a relaunch failing AFTER `/exit` has already
+  // landed (the measured-live `agent_name_taken` race) is reachable through
+  // EITHER. Before #551, this left `ManagedHerdrLifecycle`'s `this.active`
+  // pointing at a gone pane forever (a permanent wedge — this file's own
+  // git history has the version of this test that proved it). #551's floor
+  // fix re-checks pane occupancy post-collision and reports `"failed"`
+  // (never `"stuck"`) when the pane is confirmed empty, which routes
+  // through `reconcileNow`'s existing stop-then-spawn fallback. Proven here
+  // through the REAL `resumeInPlaceExclusive` + `spawnExclusive` code paths
+  // (via `fakeHerdrFullCycle`, the same fixture PR #551's own recovery test
+  // uses, extended only to track argv — see that fixture's own doc comment)
+  // — this ticket's herdr-restored classification reaches the exact same
+  // recovery #551 already proved for the model/effort path, not a new one.
+  test("FACTORY-470/472 + FACTORY-312/#551: a herdr-restored pane's relaunch colliding with agent_name_taken AFTER /exit reports 'failed' and a later herd.stop()+herd.spawn() actually recovers it", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-herdr-restored-wedge-"));
+      try {
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, "original-session.jsonl"), "{}");
+        persistDiscoveredSessionId(cwd, "original-session");
+
+        const f = fakeHerdrFullCycle(cwd);
+        // Seed the herdr-restore shape directly (this daemon never itself
+        // launched this pane — no prior herd.spawn(), unlike PR #551's own
+        // recovery test): a bare `claude --resume <id>`, none of butchr's
+        // flags. Calling the real `agent.start` (not HerdrHerd's) sets
+        // `state.agents`/`lastArgv`/`foreground` exactly as a real launch would.
+        await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        f.setNameTakenOnNextStart();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed"); // not "stuck" — #551's floor fix in effect
+        expect(f.sent.some((s) => s.text === "/exit")).toBe(true); // confirms /exit really was sent before the collision
+
+        // herdr eventually forgets the dead pane's registration (see
+        // fakeHerdrFullCycle's own doc comment for why this is the honest
+        // way to reach the state this test cares about), then
+        // reconcileNow's ACTUAL contract for a "failed" outcome —
+        // herd.stop() THEN herd.spawn() — mirrored directly.
+        f.forgetAllAgents();
+        await herd.stop(spec.key);
+        await herd.spawn(spec);
+
+        expect(f.started).toHaveLength(2); // the collision attempt, then the recovering spawn — f.started was reset after seeding, so this counts only the two attempts this test drives
+        expect(f.state.agents).toHaveLength(1);
+        expect(f.state.agents[0]!.pane_id).not.toBe("w1:p1"); // a genuinely NEW pane — an honest fresh restart, since the herdr-restored session's own history is what was actually lost here (not this ticket's scope to prevent — only a CLEAN relaunch collision is)
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-470/472 (epic review, FACTORY-470 comment 27586): the SAME
+  // question for the OTHER door of `resumeInPlaceExclusive`'s
+  // `startManagedAgent` catch — any error that is NOT `agent_name_taken`.
+  // #551's floor fix applies the identical `postExitOutcome()` re-check to
+  // this branch too: with the pane confirmed empty, ANY relaunch error now
+  // reports `"failed"` (never a raw propagated throw), so it recovers the
+  // same way as the agent_name_taken door above.
+  test("FACTORY-470/472 + FACTORY-312/#551: a herdr-restored pane's relaunch throwing a non-agent_name_taken error AFTER /exit ALSO reports 'failed' and recovers the same way", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-herdr-restored-wedge-2-"));
+      try {
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, "original-session.jsonl"), "{}");
+        persistDiscoveredSessionId(cwd, "original-session");
+
+        const f = fakeHerdrFullCycle(cwd);
+        await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        f.setOtherErrorOnNextStart();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed"); // never a raw propagated throw — #551's floor fix applies to this door too
+
+        f.forgetAllAgents();
+        await herd.stop(spec.key);
+        await herd.spawn(spec);
+
+        expect(f.started).toHaveLength(2); // the collision attempt, then the recovering spawn
+        expect(f.state.agents).toHaveLength(1);
+        expect(f.state.agents[0]!.pane_id).not.toBe("w1:p1");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-470/472 acceptance criterion 3/4: a pane that LOOKS
+  // herdr-restored (a bare `--resume <id>` argv) but whose transcript is
+  // genuinely gone must still fail safe — FACTORY-418's invalidation is
+  // unconditional, whatever detection path found the pane resumable-looking.
+  test("FACTORY-470/472: a herdr-restored-looking pane with a genuinely missing transcript falls back to unresumable, never relaunched", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-915" });
+      const cwd = workspaceDirFor(key);
+      persistDiscoveredSessionId(cwd, "vanished-session"); // persisted, but no transcript file exists anywhere
+      const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
+      try {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "vanished-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true); // the identity match alone can't know the transcript is gone
+        const outcome = await herd.resumeInPlace({ key, issuetype: "Task", summary: "s", parent: null });
+        expect(outcome).toBe("unresumable-transcript-gone"); // resumeInPlaceExclusive's own transcript check catches it — id was known, only the transcript is gone
+        expect(f.started).toEqual([]); // never attempted a relaunch
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 });

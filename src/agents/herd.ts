@@ -55,7 +55,12 @@ export interface StaleAgent {
    * the verified set changed too, and this ticket only verified `claude
    * --resume` tolerating the three fields above, individually and together
    * with model/effort — not an unbounded combination with unverified
-   * flags). The reconcile loop (`src/daemon/loop.ts`) reads this to choose
+   * flags). Widened AGAIN by FACTORY-470/472 via a SEPARATE, non-allowlist
+   * push site: a herdr-restored pane (a bare `claude --resume <id>` after a
+   * host hard reset, missing ALL of butchr's flags including `--mcp-config`
+   * — never allowlist-eligible) is also `true`, decided by identity
+   * (`isHerdrRestoredPane()`, this file) rather than by which flags are
+   * missing. The reconcile loop (`src/daemon/loop.ts`) reads this to choose
    * `herd.resumeInPlace()` over today's `herd.stop()`+`herd.spawn()`; every
    * OTHER stale reason leaves this `false`/absent and keeps today's
    * fresh-restart behaviour completely unchanged.
@@ -123,7 +128,7 @@ export interface Herd {
    * 0.15.1 source — see the ticket's own comment trail), the wrong tool for
    * relaunching in place.
    *
-   * FIVE outcomes, each with a DIFFERENT caller response (`reconcileNow`,
+   * SIX outcomes, each with a DIFFERENT caller response (`reconcileNow`,
    * src/daemon/loop.ts):
    * - `"resumed"`: success — conversation preserved, SAME session id, and
    *   CONFIRMED alive (see `"failed"` below for the case this rules out).
@@ -139,12 +144,21 @@ export interface Herd {
    *   being the reported foreground process. Same non-destructive retry as
    *   `"deferred"` either way, distinguished only in the eventual notice's
    *   wording (a human likely needs to look, not just wait).
-   * - `"unresumable"`: resuming isn't possible for a reason unrelated to
-   *   timing (no persisted session id — a pre-FACTORY-314 workspace — or the
-   *   running provider isn't Claude, or the agent disappeared entirely). The
-   *   caller falls back to today's stop-then-fresh-spawn, with a comment
-   *   that says plainly the session was lost and why ("session id could not
-   *   be determined").
+   * - `"unresumable"`: resuming isn't possible because no id could ever be
+   *   pinned down — no persisted session id at all (a pre-FACTORY-314
+   *   workspace), or the running provider isn't Claude, or the agent
+   *   disappeared entirely. The caller falls back to today's
+   *   stop-then-fresh-spawn, with a comment that says plainly the session
+   *   id could not be determined.
+   * - `"unresumable-transcript-gone"` (FACTORY-470/472): a DIFFERENT,
+   *   narrower unresumable shape — the id WAS determined (it's the exact
+   *   value compared against the pane's own observed argv, or the
+   *   previously-persisted id), but its transcript is gone. Reported with
+   *   its own distinct comment ("a transcript for the persisted session id
+   *   could not be found") rather than the misleading "session id could not
+   *   be determined" — that phrase is simply false when the id is known and
+   *   only its transcript is missing. Same stop-then-fresh-spawn fallback as
+   *   `"unresumable"` otherwise.
    * - `"failed"`: the relaunch was ACCEPTED by herdr but Claude did not stay
    *   up (an unavailable model, or any other immediate exit) — caught by a
    *   brief post-launch liveness check, since herdr accepting a launch only
@@ -154,7 +168,7 @@ export interface Herd {
    *   than looking "already matching" on the next poll. The caller falls
    *   back to today's stop-then-fresh-spawn, with a comment that says
    *   plainly the resume failed and why.
-   * Never throws for any of the five; only a genuine herdr/RPC failure does.
+   * Never throws for any of the six; only a genuine herdr/RPC failure does.
    *
    * FACTORY-426: REQUIRED, not optional — `scopedHerd` (src/daemon/loop.ts),
    * the one wrapper production's real reconcile call site actually goes
@@ -172,7 +186,7 @@ export interface Herd {
    * optional. A fake that has no use for real resume behaviour can implement
    * it as `async () => "unresumable"`.
    */
-  resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">;
+  resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed">;
 }
 
 export interface ManagedHerdAgent {
@@ -332,6 +346,76 @@ export function staleArgvOutcome(reason: string, provider: ManagedAgentProvider)
     };
   }
   return { reason, resumable };
+}
+
+/**
+ * FACTORY-470/472 — herdr's OWN pane-restore mechanism (independent of
+ * butchr, and outside this repo's source) relaunches a workspace's Claude
+ * process, after a host hard reset, as a bare `claude --resume
+ * <pre-boot-session-id>` with NONE of butchr's own launch flags
+ * (permission-mode, mcp-config, development-channels, model/effort). Its
+ * `checkArgv` reason therefore always lists ALL of those as missing,
+ * including `--mcp-config` — never on `resumableArgvReason`'s allowlist
+ * above, so this pane is `resumable: false` under that mechanism, always
+ * (the measured "0 of 15 real panes" gap this ticket exists to close).
+ *
+ * This is deliberately NOT handled by widening that allowlist, and not by
+ * a new field-by-field staleness classifier: a herdr-restored pane is not
+ * "one flag drifted on an agent butchr itself launched" (what the allowlist
+ * reasons about) — it is butchr's OWN launch flags being entirely absent,
+ * on a process butchr never itself started this daemon lifetime. The
+ * question that actually matters is identity, not which flags differ: is
+ * this observed process a continuation of the SAME conversation butchr has
+ * on record for this workspace? That is exactly the signal FACTORY-314/418
+ * already trust — `workspaceSessionId(cwd)`, the persisted id `resumeInPlace()`
+ * verifies a transcript for before ever relaunching anything — just read
+ * from a different place: the pane's own observed `--resume <id>` argument,
+ * rather than "no id at all" (the case FACTORY-418 already handles).
+ *
+ * A match means this is unambiguously the same conversation, whatever flags
+ * herdr's restore omitted, and is safe to hand to the existing full-flag
+ * `resumeInPlace()` relaunch (`resumeInPlaceExclusive`, this file) exactly
+ * as any other `resumable` issue is. No match — including when
+ * `persistedSessionId` is absent (never discovered) or was invalidated by
+ * FACTORY-418 (its transcript removed, or a fresh launch's discovery poll
+ * never completed) — falls straight through to today's allowlist/stop+spawn
+ * behaviour, unchanged: this function returns `false` for any case it isn't
+ * certain about, by construction (only a defined, matching pair is `true`).
+ *
+ * EMPIRICALLY VERIFIED (this ticket, isolated scratch directory, real
+ * `claude` binary, no production daemon or fleet pane involved): a fresh
+ * non-interactive session's `session_id`, resumed twice in a row with
+ * `claude --resume <id> -p ...`, reported the IDENTICAL `session_id` both
+ * times, backed by the SAME single transcript file on disk throughout (no
+ * new file minted) — the persisted-id side of this equality does not drift
+ * across repeated resumes, so this check cannot itself introduce a
+ * FACTORY-43 respawn loop by the id moving out from under it. See this
+ * file's `resumeInPlaceExclusive` for the pre-existing, independent
+ * corollary: it deliberately never re-runs session-id discovery after a
+ * successful relaunch, precisely because the id is expected to be stable.
+ *
+ * PR #560 REVIEW FIX — the `--resume` identity match ALONE is broader than
+ * "herdr restored": a pane butchr itself relaunched via `resumeInPlace()`
+ * (this ticket's own new path, or the pre-existing model/effort one) ALSO
+ * carries `--resume <persisted id>` from then on — forever, since neither
+ * path ever changes it. Without a second check, any LATER, genuinely
+ * different drift on such an already-`--resume`d pane (e.g. a definition's
+ * `mcpServers` binding changing) would ALSO match this identity check and
+ * get silently relabelled "herdr restored" — exactly the "widen resume-in-
+ * place to other definition-change cases" this ticket's own scope
+ * explicitly excludes. The discriminator: butchr's OWN launches — a fresh
+ * spawn AND every `resumeInPlace()` relaunch alike — unconditionally emit
+ * `--mcp-config` (`agentLaunchConfig`'s claude branch, src/agents/argv.ts,
+ * never optional). Herdr's OWN bare restore emits NONE of butchr's flags,
+ * `--mcp-config` included. So `--mcp-config`'s outright ABSENCE from the
+ * observed argv — never "present with a stale value", which is a real,
+ * different drift this function must not swallow — is what actually means
+ * "butchr did not launch this," not the `--resume` match by itself.
+ */
+export function isHerdrRestoredPane(observedArgv: readonly string[], persistedSessionId: string | undefined): boolean {
+  if (!persistedSessionId) return false;
+  if (argvFlagValue(observedArgv, "--resume") !== persistedSessionId) return false;
+  return !observedArgv.includes("--mcp-config");
 }
 
 /**
@@ -746,6 +830,22 @@ export class HerdrHerd implements Herd {
       const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) {
+        // FACTORY-470/472: a herdr-restored pane (this file's own
+        // `isHerdrRestoredPane` doc comment has the full reasoning) is
+        // resumable via the SAME full-flag `resumeInPlace()` path below,
+        // regardless of which/how-many of butchr's flags its `checkArgv`
+        // reason lists as missing — an identity match, not an allowlisted
+        // field diff, so it is checked BEFORE (and independently of)
+        // `staleArgvOutcome`'s allowlist just below.
+        if (provider === "claude" && isHerdrRestoredPane(proc.argv, workspaceSessionId(cwd))) {
+          out.push({
+            issue,
+            reason: `session preserved: herdr restored this pane after a host reset as a bare \`claude --resume\` (${check.reason.replace(/^argv lacks /, "")}) — relaunching on the same session with butchr's full flag set`,
+            observedArgv: proc.argv,
+            resumable: true,
+          });
+          continue;
+        }
         // FACTORY-411/FACTORY-424 (classification doc, Finding 2, points 3
         // & 4): the SECOND push site that may ever set `resumable` — see
         // `staleArgvOutcome`'s own doc comment for the exact, deliberate
@@ -1236,12 +1336,12 @@ export class HerdrHerd implements Herd {
   /**
    * See the `Herd.resumeInPlace` interface doc for the full contract.
    * FACTORY-426: logs under `RESUME_TAG` exactly once per call, covering
-   * all five outcomes AND a thrown error uniformly — see that tag's own
+   * all outcomes AND a thrown error uniformly — see that tag's own
    * doc comment for why this wrapper (rather than scattering `this.log?.()`
    * through `resumeInPlaceExclusive`'s many return points) is where this
    * lives: one call site can't miss a branch the way N scattered ones could.
    */
-  async resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
+  async resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed"> {
     const issue = spec.key;
     try {
       const outcome = await this.exclusive(issue, () => this.resumeInPlaceExclusive(spec));
@@ -1253,7 +1353,7 @@ export class HerdrHerd implements Herd {
     }
   }
 
-  private async resumeInPlaceExclusive(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
+  private async resumeInPlaceExclusive(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed"> {
     const issue = spec.key;
     // Routed through `this.exclusive` (above), the SAME per-issue queue
     // `spawn()`/`stop()` already use — a concurrent ordinary `herd.spawn()`
@@ -1276,14 +1376,20 @@ export class HerdrHerd implements Herd {
     if (!found || found.provider !== "claude") return "unresumable"; // this ticket's --resume mechanism covers Claude only
     // FACTORY-314 (PR #513 review fix): verify the id we are ABOUT TO RESUME
     // still has a real transcript before doing anything else — a stale or
-    // corrupted persisted id must fail safe to "unresumable" (an honest
-    // fresh restart) rather than attempting to resume a conversation that
-    // no longer exists. Same `home` resolution `spawnExclusive`'s own
-    // `prepare()` uses, since that's what determines where Claude's
-    // transcripts actually live for an isolated-HOME launch.
+    // corrupted persisted id must fail safe (an honest fresh restart) rather
+    // than attempting to resume a conversation that no longer exists. Same
+    // `home` resolution `spawnExclusive`'s own `prepare()` uses, since
+    // that's what determines where Claude's transcripts actually live for
+    // an isolated-HOME launch.
     const prepared = await this.prepareWorkspace({ provider: "claude", cwd, unattended: true });
     const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string" ? prepared.HOME : undefined;
-    if (!claudeTranscriptExists(cwd, sessionId, home)) return "unresumable";
+    // FACTORY-470/472 (PR #560 review): a DISTINCT outcome from the three
+    // `"unresumable"` returns above — those mean no id could ever be pinned
+    // down at all; this one means the id WAS determined (it's `sessionId`,
+    // right above) but its transcript specifically is gone. Conflating the
+    // two produces a false "session id could not be determined" comment
+    // when the id was never in doubt — only its transcript is.
+    if (!claudeTranscriptExists(cwd, sessionId, home)) return "unresumable-transcript-gone";
     // Idle-only, race-closed as tightly as this SDK allows: two reads of the
     // SAME evidence (`agent_status`) back-to-back, immediately before acting
     // — see `Herd.resumeInPlace`'s own doc comment for why no finer
