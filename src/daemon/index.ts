@@ -65,6 +65,7 @@ import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
+import { createRestoredPaneEscalationDetector } from "../agents/restored-pane-escalation.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
@@ -1276,6 +1277,32 @@ const managedSessionCrashLoopDetector = createCrashLoopDetector({
   comments: () => Promise.resolve([]),
   log: (line) => console.error(`  ${line}`),
 });
+// FACTORY-501 (FACTORY-500 item 2, option b) — audible-only escalation for a
+// herdr-restored pane stuck "deferred"/"stuck" on `herd.resumeInPlace()`, so
+// a busy-forever restored agent is never silently degraded with no notice —
+// see `src/agents/restored-pane-escalation.ts`'s own top comment for the
+// full mechanism. TWO SEPARATE INSTANCES, same reasoning as
+// issueCrashLoopDetector/managedSessionCrashLoopDetector above: an issue-tier
+// agent has a Jira ticket to comment on, a managed-session agent (buddy,
+// genius) does not.
+const issueRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => {
+    if (isQueryLevelAgent(id)) { console.error(`  [restored-pane-escalation] ${id}: query-level agent — no single ticket to comment on, skipping`); return; }
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-501: a managed-session agent has NO Jira ticket to comment on at
+// all — same reasoning as `managedSessionCrashLoopDetector` immediately
+// above, and every id this instance ever sees is one of these ids (wired
+// ONLY into `startManagedSessionsLoop` below), so `addComment` always logs
+// rather than branching on `isQueryLevelAgent`.
+const managedSessionRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => { console.error(`  [managed-sessions:restored-pane-escalation] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
 // see src/agents/reconcile-failure.ts for the full mechanism, and that
 // module's own top comment for why this is independent of (not a
@@ -1520,6 +1547,12 @@ runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, `[butchr:resume] A model/effort change for ${agent} is still waiting to resume (checked ${consecutivePolls} polls ago and every poll since): ${why}. Nothing was interrupted; the daemon will keep retrying rather than force a restart.`).catch((e) =>
       console.error(`  WARNING: [reconcile] resume-waiting notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  // FACTORY-501: the herdr-RESTORED-PANE deferred/stuck counterpart of
+  // `onResumeWaiting` immediately above — see
+  // `src/agents/restored-pane-escalation.ts`'s own top comment. Never called
+  // for a model/effort-only deferral (src/daemon/loop.ts's own split at the
+  // `RESTORED_PANE_STALE_REASON_PREFIX` check).
+  checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
@@ -1691,6 +1724,13 @@ startManagedSessionsLoop({
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   checkCrashLoop: managedSessionCrashLoopDetector.check,
+  // FACTORY-501: REQUIRED wiring — without this, a restored-pane escalation
+  // would silently never fire for buddy/genius (the canary set), the exact
+  // gap FACTORY-500 found in `onResumeWaiting`/`onResumePreserved` above
+  // `startManagedSessionsLoop` never receiving them either. See
+  // `ManagedSessionsLoopDeps.checkRestoredPaneDeferred`'s own doc comment
+  // (src/daemon/session-definitions-loop.ts).
+  checkRestoredPaneDeferred: managedSessionRestoredPaneEscalationDetector.check,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),

@@ -73,6 +73,22 @@ export interface ManagedSessionsLoopDeps {
    * the gap this ticket reports.
    */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
+  /**
+   * FACTORY-501 — same seam as `ReconcileOptions.checkRestoredPaneDeferred`/
+   * `GenericLoopDeps.checkRestoredPaneDeferred` (src/daemon/loop.ts).
+   * REQUIRED for the escalation to ever reach a managed-session agent
+   * (buddy, genius — the canary set): before this field existed,
+   * `onResumeWaiting`/`onResumePreserved` were ALSO never passed here (see
+   * this file's own top comment — the ONE rule, `builtinManagedSessionsRule`
+   * — and `checkCrashLoop`'s doc comment immediately above for the identical
+   * gap already found and fixed for crash-loop detection), so a
+   * restored-pane escalation wired only through `onResumeWaiting`-shaped
+   * plumbing would have silently never fired for exactly the agents this
+   * story exists to protect. Threaded straight through to `runResourceLoop`
+   * below. Optional; omitted, no restored-pane escalation runs for managed
+   * sessions (existing behaviour before FACTORY-501).
+   */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -145,6 +161,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
+    ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? MANAGED_SESSIONS_POLL_MS,
     onError: (e) => {
