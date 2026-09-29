@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
-import { loadConfig, describeConfig } from "../config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning } from "../config/config.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
@@ -148,6 +148,13 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-497: an existing systemd drop-in from before this ticket may still
+// set BUTCHR_EXTENSION_ORIGINS — say so once rather than silently ignoring it.
+{
+  const ignoredExtensionOrigins = ignoredExtensionOriginsWarning(process.env as Record<string, string | undefined>);
+  if (ignoredExtensionOrigins) console.error(`butchr: ${ignoredExtensionOrigins}`);
+}
 
 // FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
 // Jira site as a bare, lower-cased HOST (never the full `https://` URL

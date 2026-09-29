@@ -17,8 +17,8 @@ NO `Origin` header at all (Chrome only stamps `Origin` on a POST from that
 context — measured against headless Chrome for Testing 148 with a real
 built `clevr` extension; see FACTORY-478's comments for the full
 measurement). The strict Origin-required guard below therefore 403s
-`GET /resources/for-url` on every real Clevr install, and no
-`BUTCHR_EXTENSION_ORIGINS` entry can fix that — it's not a config problem.
+`GET /resources/for-url` on every real Clevr install, and no config
+change can fix that — it's not a config problem.
 **Clevr's own client now uses `POST /resources/for-url` (URL in the JSON
 body) instead**, because that's the request shape Chrome does stamp with
 `Origin` from a service worker. `GET` is KEPT, unchanged, for any other
@@ -104,11 +104,16 @@ byte-for-byte).
 
 ## Config
 
-| env var | required | effect |
-|---|---|---|
-| `BUTCHR_EXTENSION_ORIGINS` | optional | comma-separated `chrome-extension://<id>` origins allowed to reach it. **UNSET defaults to `chrome-extension://geffpgminecanhmpafbliajpeleoocan` alone** — Clevr's fixed extension id (FACTORY-475/FACTORY-477; see the `clevr` repo's README, "Fixed extension id"), so a fresh Clevr install needs no daemon-side config. A non-empty explicit value is ADDITIVE (it adds to that default, not replacing it); an explicitly EMPTY value fails closed to no origins at all — the endpoint is DISABLED (403 on every request), losing even the default. A request whose `Origin` header is absent, or present but not in the resulting list, is refused (403). |
+FACTORY-497 (implementing FACTORY-475): not configurable. Only
+`chrome-extension://geffpgminecanhmpafbliajpeleoocan` — Clevr's fixed
+extension id (see the `clevr` repo's README, "Fixed extension id") — is ever
+allowed; there is no env var, and no way to add or replace it. A request
+whose `Origin` header is absent, or present but not that exact id, is
+refused (403). A daemon whose environment still sets the old
+`BUTCHR_EXTENSION_ORIGINS` (e.g. a leftover systemd drop-in) gets a one-line
+startup warning naming it as ignored, and is otherwise unaffected.
 
-Parsed once in `src/config/config.ts` into `Config.extensionAuth` and
+Set once in `src/config/config.ts` into `Config.extensionAuth` and
 consumed by the reusable guard in `src/web/origin-guard.ts`
 (`checkExtensionOrigin`/`preflightExtensionOrigin`) — built as a standalone
 mechanism, not wired into this one route, because `GET /agents/:agentKey/pty`
@@ -176,4 +181,4 @@ fresh query might turn up.
 - `src/resources/resource-lookup.ts` — joins that mapping to the staffed-agent registry; builds the response.
 - `src/web/origin-guard.ts` — the reusable Origin-allowlist guard.
 - `src/web/view.ts` — route wiring (`GET`/`OPTIONS /resources/for-url`).
-- `src/config/config.ts` — `BUTCHR_EXTENSION_ORIGINS` parsing.
+- `src/config/config.ts` — the hardcoded `Config.extensionAuth` (FACTORY-497).

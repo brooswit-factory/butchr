@@ -7,14 +7,9 @@ answered "which agents serve this page" (`GET /resources/for-url`, see
 `docs/resources-for-url.md`); this endpoint is the other half — letting a
 browser tab actually attach to and drive one of those agents' terminals.
 
-FACTORY-455 (implementing FACTORY-454) had added a SECOND credential
-channel, `Sec-WebSocket-Protocol`, alongside `Authorization` — because a
-browser cannot set `Authorization` on a WebSocket handshake at all.
-**FACTORY-464/FACTORY-465 then removed `BUTCHR_EXTENSION_TOKEN` (and both
-credential channels along with it) entirely** — see "Security tradeoff"
-below. Both channels existed only to carry a token that no longer exists;
-this endpoint is now gated on the `Origin` allowlist alone, the exact same
-guard `GET /resources/for-url` uses.
+**FACTORY-464/FACTORY-465 removed `BUTCHR_EXTENSION_TOKEN` entirely** — see
+"Security tradeoff" below. This endpoint is now gated on the `Origin`
+allowlist alone, the exact same guard `GET /resources/for-url` uses.
 
 ## Contract
 
@@ -30,9 +25,8 @@ see `src/rules/agent-key.ts`). The upgrade is refused (never opened) when:
 
 | condition | result |
 |---|---|
-| `BUTCHR_EXTENSION_ORIGINS` explicitly EMPTY | `403` on every request — fail-closed, losing even the default below, the endpoint is effectively disabled |
 | `Origin` header ABSENT | `403` — the only credential left, so an absent one has nothing to fall back to |
-| `Origin` present but not in `BUTCHR_EXTENSION_ORIGINS` | `403` |
+| `Origin` present but not Clevr's fixed id | `403` |
 | `:agentKey` does not decode as a valid agent key | `404`, `"not a valid agent key: <key>"` |
 | `:agentKey` decodes fine but names no currently-live agent row | `404`, `"no such live pane: <key> (not one of this daemon's own running agents)"` — the SAME wording `/agents/pane/:pane/attach` (`src/terminal/open.ts`'s `attachRefusalMessage`) uses for an unknown pane, deliberately reused rather than reinvented |
 
@@ -137,13 +131,13 @@ instead.
 
 ## Config
 
-| env var | required | effect |
-|---|---|---|
-| `BUTCHR_EXTENSION_ORIGINS` | optional | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses — see that doc's Config section for the default (Clevr's fixed id), the additive-override behavior, and the explicit-empty fail-closed case. |
-
-Read once into `Config.extensionAuth` (`src/config/config.ts`) and consumed
-here through `src/web/origin-guard.ts` — the exact same mechanism
-`/resources/for-url` uses, not a second one.
+FACTORY-497: not configurable. `Config.extensionAuth` (`src/config/config.ts`)
+is always exactly Clevr's fixed extension id — the SAME allowlist
+`/resources/for-url` uses — and is consumed here through
+`src/web/origin-guard.ts`, the exact same mechanism, not a second one. There
+is no env var left to set; a daemon whose environment still sets the old
+`BUTCHR_EXTENSION_ORIGINS` gets a one-line startup warning saying so and is
+otherwise unaffected (see that doc's Config section).
 
 `/health`, `/state`, `/dashboard`, `/agents`, and `/resources/for-url` are
 all unaffected by this endpoint — they remain exactly as
@@ -151,11 +145,9 @@ authenticated/unauthenticated as before this change.
 
 ## Security tradeoff (FACTORY-464/FACTORY-465)
 
-This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`,
-sent via `Authorization` or, for a browser caller that cannot set
-`Authorization` on a WebSocket handshake at all, via `Sec-WebSocket-Protocol`
-— FACTORY-454/FACTORY-455). That requirement is GONE: the operator weighed
-the tradeoff and chose to drop it — "one should just be able to start Clevr
+This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`).
+That requirement is GONE: the operator weighed the tradeoff and chose to
+drop it — "one should just be able to start Clevr
 and work if butchr is there." The daemon binds loopback-only
 (`src/daemon/listen.ts`), and on a single-user local box, the operator judged
 an Origin-allowlist-only check sufficient.
@@ -203,8 +195,7 @@ route without a new, equally deliberate operator decision.
 - `src/web/origin-guard.ts` — the reusable Origin-allowlist guard
   (`checkExtensionOrigin`/`preflightExtensionOrigin`), shared verbatim with
   `GET /resources/for-url`.
-- `src/config/config.ts` — `BUTCHR_EXTENSION_ORIGINS` parsing into
-  `Config.extensionAuth`.
+- `src/config/config.ts` — the hardcoded `Config.extensionAuth` (FACTORY-497).
 - `src/terminal/pty-attach.ts` — resolves `:agentKey` to a live pane (and re-checks liveness) over the dashboard snapshot; the refusal vocabulary, reusing `src/terminal/open.ts`'s wording for the "unknown/not-live" case.
 - `src/terminal/pty-bridge.ts` — the pure framing/tick logic: parses client frames, decides what to send and when to close, with no socket, herdr client, or timer of its own.
 - `src/web/view.ts` — the actual `.ws("/agents/:agentKey/pty", ...)` route: the `beforeHandle` Origin gate, the poll-loop wiring, back-pressure config, and the message/close handlers.
