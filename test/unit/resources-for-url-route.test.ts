@@ -94,6 +94,52 @@ describe("POST /resources/for-url", () => {
     expect(res.status).toBe(200);
     expect((await res.json() as { url: string }).url).toBe("");
   });
+  // FACTORY-487: an allowlisted-origin request with the wrong (or missing)
+  // content-type used to silently fall through to the "no url" empty-string
+  // case instead of being refused — Elysia only parses `body` when it
+  // recognizes the content-type, so a mismatched one just left `body`
+  // unparsed, indistinguishable from a JSON body with no `url` field.
+  test("wrong content-type: 415, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => { throw new Error("must not be called"); } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "text/plain" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(415);
+    expect(await res.json()).toEqual({ error: "content-type must be application/json" });
+  });
+  test("missing content-type: 415, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => { throw new Error("must not be called"); } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(415);
+  });
+  test("content-type with a charset suffix is still accepted (200)", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }) }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json; charset=utf-8" }, body: JSON.stringify({ url: "https://example.com" }),
+    }));
+    expect(res.status).toBe(200);
+    expect((await res.json() as { url: string }).url).toBe("https://example.com");
+  });
+  // Elysia itself only recognizes the exact-case media type as JSON (measured:
+  // it leaves `body` unparsed for `Application/JSON`) — this route's own
+  // content-type check is matched to that, case-sensitively, on purpose, so
+  // it never reports 200 on a request Elysia didn't actually parse as JSON.
+  test("differently-cased media type: 415, not silently treated as JSON", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => { throw new Error("must not be called"); } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "Application/JSON" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(415);
+  });
+  test("non-allowlisted origin with wrong content-type: still 403 — Origin guard runs first", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => { throw new Error("must not be called"); } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: OTHER_ORIGIN, "content-type": "text/plain" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(403);
+  });
 });
 
 describe("OPTIONS /resources/for-url (CORS preflight)", () => {
