@@ -7,7 +7,7 @@ import type { DashboardResponse } from "../agents/dashboard.js";
 import type { QueryAgentInventory } from "../agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
-import { checkBearerOrigin, checkBearerOriginForUpgrade, preflightBearerOrigin, type BearerOriginGuardDeps } from "./bearer-origin-guard.js";
+import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } from "./origin-guard.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 
@@ -76,21 +76,21 @@ export interface ViewDeps {
    */
   resourcesForUrl?: (url: string) => Promise<ResourcesForUrlResponse>;
   /**
-   * FACTORY-339: the bearer-token + Origin-allowlist guard config for
-   * `GET /resources/for-url` (see `./bearer-origin-guard.ts`). Optional,
-   * same reasoning as `resourcesForUrl` above — absent means disabled, the
-   * same "never silently open" default the guard itself enforces for an
-   * `undefined` token.
+   * FACTORY-339: the Origin-allowlist guard config for
+   * `GET /resources/for-url` (see `./origin-guard.ts`). Optional, same
+   * reasoning as `resourcesForUrl` above — absent means an empty
+   * `allowedOrigins`, which the guard treats as "reject everything", the
+   * same "never silently open" default it enforces generally.
    */
-  extensionAuth?: BearerOriginGuardDeps;
+  extensionAuth?: OriginGuardDeps;
   /**
    * FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the
    * `GET /agents/:agentKey/pty` WebSocket's own deps — resolving an agent
    * key to a pane, checking that pane is still live on each poll tick, and
    * reading/writing its text. Optional, same "absent means disabled"
    * discipline as `resourcesForUrl` above: this route is gated by the SAME
-   * `extensionAuth` token/origin guard (see `./bearer-origin-guard.ts`'s
-   * `checkBearerOriginForUpgrade`), and an omitted `ptyAttach` makes it
+   * `extensionAuth` origin guard (see `./origin-guard.ts`'s
+   * `checkExtensionOrigin`), and an omitted `ptyAttach` makes it
    * unreachable regardless of `extensionAuth`.
    */
   ptyAttach?: {
@@ -116,11 +116,12 @@ interface PtySession {
 
 /** The live view: the page, its data (/state), the connected-agents feed (/agents), and the open action. */
 export function liveView(mcp: McpHandle, deps: ViewDeps) {
-  // FACTORY-339: `undefined` (either half omitted) means DISABLED, never
-  // open — see `ViewDeps.extensionAuth`'s own doc comment and
-  // `bearer-origin-guard.ts`'s header for why an absent token must never
-  // read as "no auth required".
-  const extensionAuth: BearerOriginGuardDeps = deps.extensionAuth ?? { token: undefined, allowedOrigins: [] };
+  // FACTORY-339: an omitted `extensionAuth` means an empty allowlist, which
+  // `origin-guard.ts` treats as DISABLED (every origin rejected) — see
+  // `ViewDeps.extensionAuth`'s own doc comment and `origin-guard.ts`'s
+  // header for why an empty allowlist must never read as "no auth
+  // required".
+  const extensionAuth: OriginGuardDeps = deps.extensionAuth ?? { allowedOrigins: [] };
   // FACTORY-453: one entry per currently-open `/agents/:agentKey/pty` socket — see `PtySession`'s own doc comment for why this exists instead of closing over per-connection state directly.
   const ptySessions = new Map<string, PtySession>();
   return new Elysia()
@@ -233,26 +234,27 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       set.headers["location"] = r.url;
       return "";
     })
-    // FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the ONLY
-    // guarded route in this file — every other route above is deliberately
+    // FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): one of two
+    // guarded routes in this file — every other route above is deliberately
     // unauthenticated (see `docs/resources-for-url.md`'s own "why not the
     // others" note). Never open the same way `/dashboard`/`/agents` are:
-    // `extensionAuth` above is `{ token: undefined, allowedOrigins: [] }`
-    // whenever this daemon's config doesn't set `BUTCHR_EXTENSION_TOKEN`, and
-    // `checkBearerOrigin` turns that into a hard 503 refusal per request,
-    // never a fallback to "unauthenticated". `deps.resourcesForUrl` is only
-    // ever called once the guard has already said `ok`.
+    // `extensionAuth` above is `{ allowedOrigins: [] }` whenever this
+    // daemon's config doesn't set `BUTCHR_EXTENSION_ORIGINS`, and
+    // `checkExtensionOrigin` turns that into a hard 403 refusal per request
+    // (no allowlisted origin can ever match an empty list), never a
+    // fallback to "unauthenticated". `deps.resourcesForUrl` is only ever
+    // called once the guard has already said `ok`.
     .options("/resources/for-url", ({ request, set }) => {
-      const preflight = preflightBearerOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      const preflight = preflightExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
       set.status = preflight.status;
       for (const [k, v] of Object.entries(preflight.headers)) set.headers[k] = v;
       return "";
     })
     .get("/resources/for-url", async ({ request, query, set }) => {
-      const guard = checkBearerOrigin({ authorization: request.headers.get("authorization"), origin: request.headers.get("origin") }, extensionAuth);
+      const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
       for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
       if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: no token configured" }; }
+      if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // `query.url` is the raw `?url=` value; Elysia decodes it the same way
       // `URLSearchParams` would, so the ticket's own `url=<percent-encoded>`
       // contract needs no extra decoding here. Absent entirely is treated as
@@ -262,18 +264,17 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const url = typeof query["url"] === "string" ? query["url"] : "";
       return deps.resourcesForUrl(url);
     })
-    // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the ONLY
-    // other guarded route in this file, and the highest-risk one — a
-    // WebSocket that gives a browser keystroke access to a live agent's
-    // terminal. See `docs/pty-attach.md` for the full contract, framing,
-    // close-reason and back-pressure policy, and — most importantly — why
-    // this route's Origin rule is STRICTER than `/resources/for-url`'s
-    // above: `checkBearerOriginForUpgrade`, not `checkBearerOrigin`, because
-    // CORS does not apply to WebSocket upgrades (see that function's own
-    // doc comment in `./bearer-origin-guard.ts`). `beforeHandle` runs before
-    // Elysia ever calls `server.upgrade()`, so a refusal here is an ordinary
-    // HTTP response (401/403/404/503) — the socket is never opened at all,
-    // never opened-then-closed.
+    // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the other
+    // guarded route in this file, and the highest-risk one — a WebSocket
+    // that gives a browser keystroke access to a live agent's terminal. See
+    // `docs/pty-attach.md` for the full contract, framing, close-reason and
+    // back-pressure policy. Since FACTORY-464/FACTORY-465 dropped the bearer
+    // token, this route's Origin rule is now the SAME `checkExtensionOrigin`
+    // `/resources/for-url` uses above — see `./origin-guard.ts`'s own header
+    // for why the two routes no longer need separate guard functions.
+    // `beforeHandle` runs before Elysia ever calls `server.upgrade()`, so a
+    // refusal here is an ordinary HTTP response (403/404/503) — the socket
+    // is never opened at all, never opened-then-closed.
     .ws("/agents/:agentKey/pty", {
       // Bun-native back-pressure policy (see `docs/pty-attach.md`'s Contract
       // section for the justification): once a slow client's own unread
@@ -284,28 +285,14 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       backpressureLimit: 4 * 1024 * 1024,
       closeOnBackpressureLimit: true,
       beforeHandle({ request, params, set }) {
-        const guard = checkBearerOriginForUpgrade(
-          {
-            authorization: request.headers.get("authorization"),
-            origin: request.headers.get("origin"),
-            subprotocol: request.headers.get("sec-websocket-protocol"),
-          },
-          extensionAuth,
-        );
+        const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
         if (!guard.ok) {
           set.status = guard.status;
           return guard.body;
         }
-        // FACTORY-455: echoed back ONLY when auth actually went through the
-        // subprotocol channel (`checkBearerOriginForUpgrade` sets this) —
-        // never for header auth, which offered no subprotocol to select
-        // from in the first place. See `PTY_BEARER_SUBPROTOCOL_MARKER`'s own
-        // doc comment in `./bearer-origin-guard.ts` for why this must be
-        // exactly the marker and never the token.
-        if (guard.selectedSubprotocol) set.headers["sec-websocket-protocol"] = guard.selectedSubprotocol;
         if (!deps.ptyAttach) {
           set.status = 503;
-          return { error: "endpoint disabled: no token configured" };
+          return { error: "endpoint disabled: not configured" };
         }
         const agentKey = decodeURIComponent(params.agentKey);
         const resolution = deps.ptyAttach.resolve(agentKey);
