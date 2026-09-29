@@ -38,6 +38,17 @@ import type { GuardRejectReason } from "./origin-guard.js";
  * `/resources/for-url` is unaffected — `normalizeRoutePattern` returns it
  * unchanged.
  *
+ * FAIL-CLOSED ON AN UNRECOGNIZED PATH: `normalizeRoutePattern` does NOT
+ * pass an unmatched path through as-is. A path that is neither a known
+ * fixed path nor a match for a known dynamic pattern collapses to the one
+ * fixed `UNKNOWN_ROUTE_PATTERN` bucket instead. PR #577's own review caught
+ * a live instance of why this matters: the first version of the PTY
+ * pattern didn't tolerate a trailing slash, so `/agents/x/pty/` fell
+ * through unmatched and the raw agent key reached the dedupe key and the
+ * journal line anyway — the exact hole (a) exists to close, one route
+ * shape away from the one this function already knew. See
+ * `normalizeRoutePattern`'s own doc comment for the full reasoning.
+ *
  * RATE-LIMIT/DEDUPE (ticket criterion 3 of FACTORY-474, tightened by
  * FACTORY-502): at most one line per distinct (method, ROUTE PATTERN,
  * origin, result) per `windowMs` (default 60s) — a polling extension
@@ -111,13 +122,40 @@ function sanitizeField(raw: string): string {
   return flattened.length > MAX_FIELD_CHARS ? `${flattened.slice(0, MAX_FIELD_CHARS)}…` : flattened;
 }
 
-/** The only guarded route with a variable path segment today — see this module's own header, "ROUTE-PATTERN NORMALIZATION". Any future guarded route with its own dynamic segment needs its own pattern added here. */
-const PTY_ROUTE_RE = /^\/agents\/[^/]+\/pty$/;
+/** Every FIXED guarded path this module knows about — passed through unchanged by `normalizeRoutePattern` below. Anything not in this set AND not matching a known dynamic pattern (`PTY_ROUTE_RE`) is UNRECOGNIZED and collapses to `UNKNOWN_ROUTE_PATTERN`, never passed through raw — see this module's own header and the FAIL-CLOSED note on `normalizeRoutePattern`. */
+const KNOWN_FIXED_PATHS = new Set<string>(["/resources/for-url"]);
 
-/** Collapses a raw request path to its route PATTERN before it's used as a dedupe key or printed — see this module's own header. A path that isn't a known dynamic route (e.g. the fixed `/resources/for-url`) is returned unchanged. */
+/** The only guarded route with a variable path segment today — see this module's own header, "ROUTE-PATTERN NORMALIZATION". `\/*$` tolerates one or more trailing slashes (`/agents/x/pty/`, `/agents/x/pty//`, ...): a real Elysia route match, an attacker-crafted request, and this module's own dedupe key must all agree on whether a trailing slash is "the same route", and treating it as a DIFFERENT unrecognized path would have handed the raw agent key straight back out through the fail-closed catch-all below anyway — so it's folded into the same pattern instead. Any future guarded route with its own dynamic segment needs its own pattern added here (and to `KNOWN_FIXED_PATHS` if it has none). */
+const PTY_ROUTE_RE = /^\/agents\/[^/]+\/pty\/*$/;
+
+/** Every request path this module has never seen before collapses to this ONE fixed bucket — see `normalizeRoutePattern`'s FAIL-CLOSED note. */
+const UNKNOWN_ROUTE_PATTERN = "/:unknown-route";
+
+/**
+ * Collapses a raw request path to its route PATTERN before it's used as a
+ * dedupe key or printed — see this module's own header. A known FIXED path
+ * (`KNOWN_FIXED_PATHS`) is returned unchanged; a known dynamic route
+ * (`PTY_ROUTE_RE`) is collapsed to its pattern.
+ *
+ * FAIL-CLOSED, DELIBERATELY: anything that matches NEITHER — a route
+ * variant this module was never taught about, e.g. a trailing slash this
+ * function's own author didn't anticipate — does NOT fall through to the
+ * raw path. It collapses to the single, fixed `UNKNOWN_ROUTE_PATTERN`
+ * bucket instead. This was FACTORY-502's own review finding (PR #577):
+ * an earlier version of this function passed an unrecognized path through
+ * unchanged, which meant `/agents/x/pty/` (a trailing slash `PTY_ROUTE_RE`
+ * didn't yet tolerate) still carried the raw agent key straight into both
+ * the dedupe key and the printed line — the exact flood vector criterion
+ * (a) exists to close, just one route-shape away. Passing an unrecognized
+ * path through "because we don't know what it is yet" is precisely
+ * backwards: not recognizing a path is the ONE case this function can be
+ * sure might be attacker-controlled and unbounded, so it's the case that
+ * most needs collapsing, not the case that gets a free pass.
+ */
 function normalizeRoutePattern(path: string): string {
+  if (KNOWN_FIXED_PATHS.has(path)) return path;
   if (PTY_ROUTE_RE.test(path)) return "/agents/:agentKey/pty";
-  return path;
+  return UNKNOWN_ROUTE_PATTERN;
 }
 
 function originGuardLine(r: OriginGuardRejection, pattern: string): string {

@@ -105,6 +105,31 @@ describe("createOriginGuardLogger", () => {
     expect(lines[0]).not.toContain("agent-49");
   });
 
+  test("FACTORY-502 (a) [PR #577 review]: the PTY route dedupes on the pattern even WITH a trailing slash — many distinct agent keys with a trailing slash still produce exactly one line, never the raw key", () => {
+    const { lines, log } = collector();
+    let t = 0;
+    const logger = createOriginGuardLogger({ now: () => t, log });
+    for (let i = 0; i < 50; i++) {
+      logger.reject({ method: "GET", path: `/agents/agent-${i}/pty/`, origin: "chrome-extension://x", result: "origin not allowed" });
+    }
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toBe(`${ORIGIN_GUARD_TAG} method=GET path=/agents/:agentKey/pty origin=chrome-extension://x result=origin not allowed`);
+    expect(lines[0]).not.toContain("agent-0");
+    expect(lines[0]).not.toContain("agent-49");
+  });
+
+  test("FACTORY-502 (a): an unrecognized path (neither a known fixed path nor a known dynamic pattern) fails CLOSED to one fixed bucket, never passed through raw", () => {
+    const { lines, log } = collector();
+    let t = 0;
+    const logger = createOriginGuardLogger({ now: () => t, log });
+    for (let i = 0; i < 10; i++) {
+      logger.reject({ method: "GET", path: `/agents/${i}/pty/extra-segment`, origin: "chrome-extension://x", result: "origin not allowed" });
+    }
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("path=/:unknown-route");
+    expect(lines[0]).not.toContain("extra-segment");
+  });
+
   test("FACTORY-502 (a): a fixed route path with no dynamic segment is left unchanged by route-pattern normalization", () => {
     const { lines, log } = collector();
     const logger = createOriginGuardLogger({ now: () => 0, log });
@@ -201,26 +226,30 @@ describe("createOriginGuardLogger", () => {
     const { lines, log } = collector();
     let t = 0;
     const logger = createOriginGuardLogger({ now: () => t, log, windowMs: 1_000 });
-    logger.reject({ method: "GET", path: "/a", origin: "chrome-extension://x", result: "origin not allowed" }); // t=0, key A
+    // Distinct ORIGINS, not distinct paths — FACTORY-502's fail-closed
+    // catch-all (PR #577 review) collapses any path this module doesn't
+    // recognize to the SAME single bucket, so origin is what keeps A/B/C
+    // distinct dedupe keys here.
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://a", result: "origin not allowed" }); // t=0, key A
     t += 500;
-    logger.reject({ method: "GET", path: "/b", origin: "chrome-extension://x", result: "origin not allowed" }); // t=500, key B
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://b", result: "origin not allowed" }); // t=500, key B
     t += 499;
     // t=999: A is still live (999<1000) — repeating it must hit the
     // no-re-`set` branch above, not extend its position/TTL.
-    logger.reject({ method: "GET", path: "/a", origin: "chrome-extension://x", result: "origin not allowed" });
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://a", result: "origin not allowed" });
     expect(lines.length).toBe(2); // suppressed repeat of A — no 3rd line yet
 
     t += 2; // t=1001: A (recorded at 0) is now expired (1001>=1000); B (recorded at 500) is not (501<1000)
-    logger.reject({ method: "GET", path: "/c", origin: "chrome-extension://x", result: "origin not allowed" }); // t=1001, key C — triggers the prune
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://c", result: "origin not allowed" }); // t=1001, key C — triggers the prune
     expect(lines.length).toBe(3); // C emits; prune ran but didn't touch B
 
     // A was pruned: repeating it now is a brand-new key and emits again.
-    logger.reject({ method: "GET", path: "/a", origin: "chrome-extension://x", result: "origin not allowed" });
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://a", result: "origin not allowed" });
     expect(lines.length).toBe(4);
 
     // B was NOT pruned (the early exit correctly stopped at it, unexpired):
     // repeating it now is still a live-key suppression, not a fresh emit.
-    logger.reject({ method: "GET", path: "/b", origin: "chrome-extension://x", result: "origin not allowed" });
+    logger.reject({ method: "GET", path: "/resources/for-url", origin: "chrome-extension://b", result: "origin not allowed" });
     expect(lines.length).toBe(4);
   });
 
