@@ -385,6 +385,23 @@ export function staleArgvOutcome(reason: string, provider: ManagedAgentProvider)
 export const SPAWN_TAG = "[spawn]";
 
 /**
+ * FACTORY-426 (epic-authorized observability gap, FACTORY-73/FACTORY-312
+ * comment 27451): before this, `resumeInPlace` never logged anything of its
+ * own — its five outcomes were only visible indirectly, through whatever
+ * (if anything) `reconcileNow`'s callers did with them (`onResumePreserved`/
+ * `onResumeWaiting`, wired in `src/daemon/index.ts`, cover exactly two of
+ * the five). A `"stuck"`/`"unresumable"`/`"failed"` outcome with no
+ * subscriber wired left NO trace anywhere that a resume was even attempted —
+ * the exact blind spot that let this ticket's own strand regression run
+ * live before anyone noticed. Every `resumeInPlaceExclusive` outcome now
+ * logs under this tag, mirroring `SPAWN_TAG`'s own shape (`grep`-able,
+ * `issue`/outcome first, free text last) so `journalctl | grep RESUME_TAG`
+ * gives a complete attempt history independent of which callbacks a given
+ * loop happens to wire.
+ */
+export const RESUME_TAG = "[resume]";
+
+/**
  * FACTORY-75 (PR #473 review fix) — `staleIssues()`'s own argv fallback for
  * `--model`/`--effort`, used ONLY when `workspaceModel`/`workspaceEffort`
  * (src/agents/workspace.ts) find no persisted file: a workspace spawned by
@@ -1216,9 +1233,24 @@ export class HerdrHerd implements Herd {
     return (await this.byIssue()).get(issue)?.pane ?? null;
   }
 
-  /** See the `Herd.resumeInPlace` interface doc for the full contract. */
+  /**
+   * See the `Herd.resumeInPlace` interface doc for the full contract.
+   * FACTORY-426: logs under `RESUME_TAG` exactly once per call, covering
+   * all five outcomes AND a thrown error uniformly — see that tag's own
+   * doc comment for why this wrapper (rather than scattering `this.log?.()`
+   * through `resumeInPlaceExclusive`'s many return points) is where this
+   * lives: one call site can't miss a branch the way N scattered ones could.
+   */
   async resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
-    return this.exclusive(spec.key, () => this.resumeInPlaceExclusive(spec));
+    const issue = spec.key;
+    try {
+      const outcome = await this.exclusive(issue, () => this.resumeInPlaceExclusive(spec));
+      this.log?.(`${RESUME_TAG} ${issue} ${outcome}`);
+      return outcome;
+    } catch (e) {
+      this.log?.(`${RESUME_TAG} ${issue} threw — ${(e as Error)?.message ?? e}`);
+      throw e;
+    }
   }
 
   private async resumeInPlaceExclusive(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "failed"> {
@@ -1264,11 +1296,43 @@ export class HerdrHerd implements Herd {
     if (!(await isIdle())) return "deferred";
     await this.herdr.pane.sendText({ pane_id: pane, text: "/exit" } as Parameters<DrovrClient["pane"]["sendText"]>[0]);
     await this.herdr.pane.sendKeys({ pane_id: pane, keys: ["enter"] } as Parameters<DrovrClient["pane"]["sendKeys"]>[0]);
+    // FACTORY-426 (epic review, comment 27460): from HERE ON, `/exit` has
+    // been sent — the pane may already be empty, or become empty at any
+    // point below. `ManagedHerdrLifecycle` (the class `spawnExclusive`'s
+    // ORDINARY spawn path relies on, via `startProviders`/`lifecycle().start()`)
+    // keeps its OWN private "current worker" identity, and `resumeInPlace`
+    // never goes through that class at all (raw `pane.sendText`/`startManagedAgent`
+    // instead, precisely so it can reuse the SAME pane) — so that identity is
+    // NEVER updated here, success or failure. If a post-exit outcome below
+    // returns "stuck" (a bare retry, no stop/spawn) or lets an error
+    // propagate (reconcileNow's `failures.push(...); continue;` — ALSO a bare
+    // retry) while the pane is ACTUALLY empty, nothing ever clears that stale
+    // identity: `ManagedHerdrLifecycle.start()`'s own precondition
+    // (`!existing && this.active` -> `HandoffBlocked: Current worker
+    // disappeared; refusing implicit replacement`) then rejects every future
+    // ordinary spawn attempt for this issue, forever — confirmed live
+    // (FACTORY-73/FACTORY-394, FACTORY-312 comment 27407) as a genuine
+    // permanent stall, not a hypothetical.
+    //
+    // THE FLOOR (verbatim from the epic's review): "resumeInPlace must never
+    // return an outcome that leads to a bare retry while the pane is empty.
+    // Before returning any non-'resumed' outcome from the post-exit region,
+    // re-check the pane; if it is empty, the outcome must be one that routes
+    // to stop-then-spawn — never 'stuck', never a propagated throw." `"failed"`
+    // is that route: `reconcileNow`'s fallthrough for `"failed"`/`"unresumable"`
+    // already calls `herd.stop(issue)` (a real `lifecycle(issue).stop()`,
+    // which clears `ManagedHerdrLifecycle.active`) BEFORE `herd.spawn()` — the
+    // exact reset an empty pane needs before the next launch attempt can
+    // succeed instead of hitting the disappeared-worker guard. A pane that is
+    // STILL occupied (by claude or anything else) is left alone exactly as
+    // before: `"stuck"` there is a genuinely safe, non-destructive retry,
+    // never a wedge, since nothing needs recovering.
+    const postExitOutcome = async (): Promise<"stuck" | "failed"> => (await this.providerOfPane(pane)) ? "stuck" : "failed";
     const deadline = this.monotonicNow() + RESUME_EXIT_TIMEOUT_MS;
     while (this.monotonicNow() < deadline && (await this.providerOfPane(pane))) {
       await this.wait(RESUME_EXIT_POLL_MS);
     }
-    if (await this.providerOfPane(pane)) return "stuck"; // never returned to a shell (a dialog, a hang) — do NOT relaunch onto it, do NOT kill it; leave the agent alone for a human/next-poll
+    if (await this.providerOfPane(pane)) return await postExitOutcome(); // still occupied: a fresh read through the SAME shared decision point every other exit below uses, rather than a one-off inline check — a pane that finishes exiting between here and the read this performs correctly falls through to "failed" instead of repeating this file's own "stuck" verdict on an already-empty pane.
     const preference = spec.agents?.find((p) => p.harness === "claude");
     const selected: AgentConfig = { ...this.agent, provider: "claude", resumeSessionId: sessionId };
     if (preference?.model) selected.model = preference.model;
@@ -1315,14 +1379,32 @@ export class HerdrHerd implements Herd {
       // narrow gap between "no longer the reported foreground process" and
       // "herdr has fully released the name"), so `agent.start` here can
       // genuinely reject with `agent_name_taken` even though every check
-      // above passed. This is exactly the "can't safely tell it's clear"
-      // shape `"stuck"` already exists for — do NOT let it surface as a
-      // raw thrown failure (which would still be safe, just needlessly
-      // alarming for a condition that resolves itself next poll): report
-      // it the same non-destructive way as a pane that never left claude's
-      // foreground. Any OTHER error is a genuine failure and still throws.
-      if (e instanceof HerdrError && e.code === "agent_name_taken") return "stuck";
-      throw e;
+      // above passed.
+      //
+      // FACTORY-426 (epic review, comment 27460, required addition 1):
+      // this used to return "stuck" unconditionally for `agent_name_taken`
+      // and rethrow every OTHER error — both a bare retry (reconcileNow's
+      // `continue` for "stuck", or its `failures.push(...); continue;` for a
+      // propagated throw), and both wrong the instant this catch is reached:
+      // by construction, `/exit` has ALREADY been confirmed to have emptied
+      // this pane before `startManagedAgent` was even attempted (the check
+      // just above this try/catch only falls through when the pane is
+      // empty). So EVERY error here — `agent_name_taken` or anything else —
+      // means the relaunch itself failed against a pane we already know is
+      // vacated, never "we can't yet tell if it's safe to touch" the way the
+      // exit-wait timeout's own "stuck" genuinely is. Routing through the
+      // same `postExitOutcome()` decision point as every other exit in this
+      // method keeps that one exception explicit: if something DID
+      // materialize in the pane between the check above and now (any
+      // provider, not just claude), this still safely reports "stuck"
+      // instead of stopping something that showed up; otherwise (the
+      // expected case) it reports "failed", which routes through
+      // `reconcileNow`'s existing stop-then-spawn fallback — clearing
+      // `ManagedHerdrLifecycle.active` via `herd.stop()` before the next
+      // launch attempt, instead of leaving it stale forever.
+      const outcome = await postExitOutcome();
+      if (outcome === "stuck") throw e; // pane unexpectedly occupied again — preserve the original error rather than mask it with a plain retry verdict; the caller still gets a "stuck"-shaped non-destructive path via the failures/notify wiring around thrown errors.
+      return outcome; // "failed" — pane confirmed empty; the caller's stop-then-spawn fallback recovers it.
     }
     // FACTORY-312 review (26137, point 2): herdr accepting the launch only
     // means the PROCESS started — an unavailable model (Step 0.2: measured
