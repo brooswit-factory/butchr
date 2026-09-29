@@ -1,5 +1,23 @@
 # Managed-session definition fields: hot-reload / resume / fresh-restart classification
 
+**CORRECTION NOTICE (FACTORY-411, 2026-09-28), from live measurement, not
+a re-read.** This doc's original entries for `permissionMode`,
+`strictMcpConfig`, and `mcpServers`' `channel` flag (for a managed-session
+agent) classified them as **"C, detected via `checkArgv`."** That
+detection claim is wrong: `staleIssues()` builds `expected` for these three
+fields from a workspace bookkeeping file `buildWorkspace()` writes only at
+spawn or post-resume, never refreshed from the live definition on an
+ordinary poll — so a live edit to any of them can never make `checkArgv`
+fail, and `staleIssues()` never reports the agent as stale for that reason
+at all. Confirmed by direct observation (a live definition edit left
+unresolved for 1h45m against a healthy, continuously-polling daemon) as
+well as by source reading; the codebase's own doc comment at
+`src/daemon/index.ts` (on why `lizardMode` is read live) independently
+names this as deliberate FACTORY-43 behaviour, not an oversight. Corrected
+in place at each field's own entry below and in the summary table; the
+original text is kept underneath each correction as history, not to be
+trusted for detection. See FACTORY-411's PR for the full write-up.
+
 FACTORY-413 (story FACTORY-410, epic FACTORY-394). A survey, not an
 implementation: for every field of a managed-session definition
 (`SessionDefinition`, `src/resources/session-definition.ts`), what actually
@@ -140,7 +158,43 @@ comparison that still exists on `main`
 
 Subject to the class-B precondition above.
 
-### `permissionMode` — **C**, on both the branch and `main`
+### `permissionMode` — **undetected/inert as a live edit, not "C, detected via `checkArgv`"**
+
+**CORRECTION (FACTORY-411, live measurement, 2026-09-28) — the original
+entry below is WRONG about detection and is kept underneath, unedited, as
+history.** It reasoned from `checkManagedAgentArgv`'s own comparison logic
+without checking what `staleIssues()` actually feeds it as `expected` for
+this field. Read live at `src/agents/herd.ts`: the `permissionMode` used to
+build `expected` is `workspacePermissionMode(cwd)` — the value
+`buildWorkspace()` persisted to `.butchr-permission-mode.json` at the
+agent's own last spawn (or last successful `resumeInPlace`), never a fresh
+read of the CURRENT definition. `buildWorkspace()` is the file's *only*
+writer (`src/agents/workspace.ts`) and runs *only* at spawn or at
+`resumeInPlace()`'s own post-success re-persist — never on an ordinary poll
+of an already-running, non-stale agent. So `expected` and the running
+process's *real* argv are built from the same frozen snapshot and can never
+diverge from a live definition edit alone: `checkArgv` returns `ok: true`
+forever, and `staleIssues()` never reports this agent as stale for a
+`permissionMode` change, regardless of `resumable`. **Confirmed by direct
+observation**, not just by re-reading the code differently: a throwaway
+managed-session agent's definition was edited from `permissionMode:
+"default"` to `"acceptEdits"` and left running against a healthy,
+continuously-polling daemon (`/health` confirmed `pollLoop: ok` throughout)
+for 1h45m; `.butchr-permission-mode.json` never changed from `"default"`
+and the running process's argv never changed either. Contrast with
+`modelPower`/`effort` immediately above, whose comparison uses
+`resolvedAgentOf(...)`, a callback re-resolved live every poll from the
+CURRENT definition/rule — the live-vs-frozen-snapshot split is the whole
+difference. The codebase's own doc comment (`src/daemon/index.ts`, on why
+`lizardMode` is read live) independently confirms this is DELIBERATE
+FACTORY-43 behaviour, not an oversight: "...deliberately LIVE rather than
+persisted-at-spawn the way `permissionMode`/`strictMcpConfig` are."
+**Correct classification: undetected/inert, same category as `mcpServers`'
+non-channel content below — a class B candidate cannot be built on top of
+a `checkArgv` failure that never fires.** See FACTORY-411's own PR for the
+full write-up.
+
+--- original entry below, kept as history, NOT to be trusted for detection ---
 
 **Evidence: source reading.** `permissionMode` reaches `agentLaunchConfig`
 (`src/agents/argv.ts`) as a real Claude CLI flag (`--permission-mode`),
@@ -167,7 +221,20 @@ together — this is a *scope* limit of the mechanism as built, not a
 in `staleIssues()`, and only for the model/effort comparison. Nothing else
 routes through it. See Finding 2 below for whether/how this could change.
 
-### `strictMcpConfig` — **C**, on both the branch and `main`
+### `strictMcpConfig` — **undetected/inert as a live edit, not "C, detected via `checkArgv`"**
+
+**CORRECTION (FACTORY-411, live measurement, 2026-09-28) — same correction
+as `permissionMode` immediately above, same mechanism.** `expected`'s
+`strictMcpConfig` is `workspaceStrictMcpConfig(cwd)`, read back from
+`.butchr-strict-mcp-config.json`, written only by `buildWorkspace()` at
+spawn/post-resume — never refreshed from a live definition edit on an
+ordinary poll. A `strictMcpConfig` edit alone can never make `checkArgv`
+fail, so it is never detected as stale, not "C, detected." **Correct
+classification: undetected/inert.** See the `permissionMode` correction
+above for the full reasoning and the live measurement; not repeated here
+to avoid two sources of truth for the same evidence.
+
+--- original entry below, kept as history, NOT to be trusted for detection ---
 
 **Evidence: source reading**, same mechanism as `permissionMode`.
 `strictMcpConfig: true` adds `--strict-mcp-config`
@@ -178,7 +245,36 @@ missing.push(...)`). Same `checkArgv`-failure path, same "no `resumable`
 ever set" conclusion, same fresh-restart-always-today reason as
 `permissionMode`.
 
-### `mcpServers` — **split within the one field: C for a `channel` toggle, undetected/inert for everything else**, both on the branch and `main`
+### `mcpServers` — **undetected/inert for a `channel`-flag edit too (for a managed session), not just for everything else**
+
+**CORRECTION (FACTORY-411, live measurement, 2026-09-28), scoped precisely:
+this correction applies to a MANAGED-SESSION agent's `channel`-flag edit
+specifically (point 1 below) — points 2 and 3's own conclusions ("undetected"
+for non-channel content, and the pre-relaunch `mcp.json`-staleness risk)
+were already correct and are unchanged.** Point 1 below reasoned from
+`checkManagedAgentArgv`'s own comparison logic without checking what
+`staleIssues()` feeds it as `expected.mcpServers` for a managed session.
+Read live at `src/agents/herd.ts`: for a managed-session agent specifically,
+`expected`'s `mcpServers` is `workspaceMcpServers(cwd) ?? []` — read back
+from a bookkeeping file `buildWorkspace()` writes only at spawn or at
+`resumeInPlace()`'s own post-success re-persist, never refreshed from the
+CURRENT definition on an ordinary poll (same shape, same writer function,
+same live-measurement method as the `permissionMode` correction above — see
+that entry for the 1h45m observation this reasoning is checked against, not
+repeated here). A managed-session `channel:true` add/remove therefore can
+never make `checkArgv` fail either: `resumable` never gets a chance to
+matter because `staleIssues()` never reports this agent as stale for a
+`channel`-flag edit in the first place. **A rule-engine agent's
+`mcpServers` (via `mcpBindingsOf`, the non-managed-session branch of the
+same ternary) is unaffected by this correction — that path already reads
+live from the rule, per its own doc comment in `herd.ts`; this correction
+is about the managed-session branch only, which is FACTORY-411/FACTORY-424's
+entire candidate set.** Correct classification for the managed-session
+`channel`-flag case: undetected/inert, same category as point 2's
+non-channel content — the whole field is now one category for a managed
+session, not split.
+
+--- original entry below, kept as history, NOT to be trusted for detection ---
 
 **Evidence: source reading**, three separate seams inspected:
 
@@ -543,9 +639,9 @@ each one actually needs closed:
 | `modelPower` | B, subject to the precondition | C | branch source + branch test execution (112/112) |
 | `effort` | B, subject to the precondition | C | branch source + branch test execution (112/112) |
 | `tier` (deprecated) | B, subject to the precondition | C | branch source + branch test execution (112/112) |
-| `permissionMode` | C | C | source reading (drovr `checkManagedAgentArgv`) |
-| `strictMcpConfig` | C | C | source reading (drovr `checkManagedAgentArgv`) |
-| `mcpServers` (`channel` flag) | C | C | source reading (drovr `checkManagedAgentArgv`) |
+| `permissionMode` | **undetected/inert (CORRECTED, was "C" — see entry)** | **undetected/inert (CORRECTED, was "C" — see entry)** | FACTORY-411 live measurement (1h45m observed), supersedes original source reading |
+| `strictMcpConfig` | **undetected/inert (CORRECTED, was "C" — see entry)** | **undetected/inert (CORRECTED, was "C" — see entry)** | FACTORY-411 live measurement, same mechanism as `permissionMode`, supersedes original source reading |
+| `mcpServers` (`channel` flag, managed session) | **undetected/inert (CORRECTED, was "C" — see entry)** | **undetected/inert (CORRECTED, was "C" — see entry)** | FACTORY-411 live measurement, supersedes original source reading — rule-engine `mcpServers` (non-managed-session) unaffected |
 | `mcpServers` (other content) | undetected/inert | undetected/inert | source reading (`buildWorkspace` call sites) |
 | `lizardMode` | A | A | source reading (doc comments + read site) |
 | `execution` | A (inert) | A (inert) | source reading (unread field) |

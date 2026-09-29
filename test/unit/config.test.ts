@@ -338,27 +338,23 @@ describe("loadConfig", () => {
   });
 });
 
-describe("extensionAuth (FACTORY-339)", () => {
-  test("defaults to disabled (token undefined, no origins), never open", () => {
+describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token)", () => {
+  test("defaults to an empty allowlist — fail-closed, every origin rejected", () => {
     const c = loadConfig(base, noRead);
-    expect(c.extensionAuth).toEqual({ token: undefined, allowedOrigins: [] });
+    expect(c.extensionAuth).toEqual({ allowedOrigins: [] });
   });
-  test("BUTCHR_EXTENSION_TOKEN and BUTCHR_EXTENSION_ORIGINS are read, trimmed and split on commas", () => {
-    const c = loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: " secret ", BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop, chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba " }, noRead);
-    expect(c.extensionAuth).toEqual({ token: "secret", allowedOrigins: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
-  });
-  test("an all-whitespace token is treated as unset (disabled), not an empty string token", () => {
-    expect(loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: "   " }, noRead).extensionAuth.token).toBeUndefined();
+  test("BUTCHR_EXTENSION_ORIGINS is read, trimmed and split on commas", () => {
+    const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop, chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba " }, noRead);
+    expect(c.extensionAuth).toEqual({ allowedOrigins: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
   });
   test("rejects a BUTCHR_EXTENSION_ORIGINS entry that isn't a well-formed chrome-extension:// origin", () => {
     for (const bad of ["https://evil.example", "chrome-extension://tooshort", "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP", "not-a-uri-at-all"]) {
-      expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: "t", BUTCHR_EXTENSION_ORIGINS: bad }, noRead)).toThrow("BUTCHR_EXTENSION_ORIGINS");
+      expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: bad }, noRead)).toThrow("BUTCHR_EXTENSION_ORIGINS");
     }
   });
-  test("describeConfig never includes the token value, only whether one is set and its length", () => {
-    expect(describeConfig(loadConfig(base, noRead))).toContain("extensionAuth=disabled (BUTCHR_EXTENSION_TOKEN unset)");
-    const d = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_TOKEN: "supersecret", BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
-    expect(d).toContain("extensionAuth=enabled(token=***(11 chars)) origins=chrome-extension://abcdefghijklmnopabcdefghijklmnop");
-    expect(d).not.toContain("supersecret");
+  test("describeConfig reports the allowlist, and names the fail-closed consequence when it's empty — no token to ever leak", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("extensionAuth=origins=EMPTY — every origin rejected");
+    const d = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
+    expect(d).toContain("extensionAuth=origins=chrome-extension://abcdefghijklmnopabcdefghijklmnop");
   });
 });

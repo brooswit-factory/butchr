@@ -21,73 +21,55 @@ function baseDeps(overrides: Partial<ViewDeps> = {}): ViewDeps {
 }
 
 describe("GET /resources/for-url", () => {
-  test("token unset (extensionAuth omitted): 503, disabled, never calls resourcesForUrl", async () => {
-    const app = liveView(fakeMcp, baseDeps());
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x"));
-    expect(res.status).toBe(503);
-    expect(await res.json()).toEqual({ error: "endpoint disabled: no token configured" });
-  });
-  test("missing Authorization header: 401", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x"));
-    expect(res.status).toBe(401);
-  });
-  test("wrong token: 401", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { authorization: "Bearer wrong" } }));
-    expect(res.status).toBe(401);
-  });
-  test("token set but Origin not allowlisted: 403, and no resourcesForUrl call", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { authorization: "Bearer s3cr3t", origin: OTHER_ORIGIN } }));
+  test("extensionAuth omitted (empty allowlist): 403, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { origin: ORIGIN } }));
     expect(res.status).toBe(403);
   });
-  test("correct token, no Origin header: 200, no CORS headers set", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }) }));
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https%3A%2F%2Fexample.com", { headers: { authorization: "Bearer s3cr3t" } }));
+  test("missing Origin header: 403, never calls resourcesForUrl", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x"));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "origin required" });
+  });
+  test("Origin not allowlisted: 403, and no resourcesForUrl call", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
+    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { origin: OTHER_ORIGIN } }));
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: "origin not allowed" });
+  });
+  test("allowlisted origin: 200 with CORS headers for exactly that origin, never *, and no token required anywhere", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }) }));
+    const res = await app.handle(new Request("http://local/resources/for-url?url=https%3A%2F%2Fexample.com", { headers: { origin: ORIGIN } }));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ...stubResponse, url: "https://example.com" });
-    expect(res.headers.get("access-control-allow-origin")).toBeNull();
-  });
-  test("correct token from the allowlisted origin: 200 with CORS headers for exactly that origin, never *", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
-    const res = await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { authorization: "Bearer s3cr3t", origin: ORIGIN } }));
-    expect(res.status).toBe(200);
     expect(res.headers.get("access-control-allow-origin")).toBe(ORIGIN);
     expect(res.headers.get("access-control-allow-origin")).not.toBe("*");
-  });
-  test("the token itself is never echoed back in any response body or header", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t-value", allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse }));
-    for (const req of [
-      new Request("http://local/resources/for-url?url=https://x"),
-      new Request("http://local/resources/for-url?url=https://x", { headers: { authorization: "Bearer wrong" } }),
-      new Request("http://local/resources/for-url?url=https://x", { headers: { authorization: "Bearer s3cr3t-value", origin: ORIGIN } }),
-    ]) {
-      const res = await app.handle(req);
-      const text = await res.text();
-      expect(text).not.toContain("s3cr3t-value");
-      expect([...res.headers.values()].join(" ")).not.toContain("s3cr3t-value");
-    }
   });
 });
 
 describe("OPTIONS /resources/for-url (CORS preflight)", () => {
-  test("token unset: 503", async () => {
+  test("extensionAuth omitted (empty allowlist): 403", async () => {
     const app = liveView(fakeMcp, baseDeps());
     const res = await app.handle(new Request("http://local/resources/for-url", { method: "OPTIONS", headers: { origin: ORIGIN } }));
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(403);
   });
   test("non-allowlisted origin: 403", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] } }));
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] } }));
     const res = await app.handle(new Request("http://local/resources/for-url", { method: "OPTIONS", headers: { origin: OTHER_ORIGIN } }));
     expect(res.status).toBe(403);
   });
-  test("allowlisted origin: 204 with Authorization allowed and never a wildcard origin", async () => {
-    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { token: "s3cr3t", allowedOrigins: [ORIGIN] } }));
+  test("missing origin: 403", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] } }));
+    const res = await app.handle(new Request("http://local/resources/for-url", { method: "OPTIONS" }));
+    expect(res.status).toBe(403);
+  });
+  test("allowlisted origin: 204, never a wildcard origin", async () => {
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] } }));
     const res = await app.handle(new Request("http://local/resources/for-url", { method: "OPTIONS", headers: { origin: ORIGIN } }));
     expect(res.status).toBe(204);
     expect(res.headers.get("access-control-allow-origin")).toBe(ORIGIN);
-    expect(res.headers.get("access-control-allow-headers")).toContain("Authorization");
+    expect(res.headers.get("access-control-allow-origin")).not.toBe("*");
   });
 });
 
