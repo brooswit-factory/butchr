@@ -283,13 +283,32 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // travels in a JSON body instead of a query string, because that's the
     // request shape Chrome stamps with `Origin: chrome-extension://<id>`
     // from an MV3 service worker (a GET from that context never carries
-    // one — see this route group's own header comment above). The guard
-    // check happens BEFORE the body is ever read, same discipline as the
-    // GET route.
+    // one — see this route group's own header comment above). The Origin
+    // check below is the first thing THIS HANDLER does with the request —
+    // it is not a claim about Elysia's own parse step, which has already
+    // read the raw body by the time any handler runs; the guard just never
+    // looks at what was parsed before deciding to refuse.
     .post("/resources/for-url", async ({ request, body, set }) => {
       const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
       for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
       if (!guard.ok) { set.status = guard.status; return guard.body; }
+      // FACTORY-487: Elysia parses `body` from whatever `content-type` says,
+      // but silently — a non-JSON or missing content-type just leaves `body`
+      // unparsed (`undefined`) or, for some content-types, the raw text,
+      // which the fallback below would otherwise treat identically to
+      // "valid JSON with no `url` field". Reject it explicitly instead of
+      // guessing at intent from a malformed request. Matched the same way
+      // Elysia itself matches it when deciding whether to parse JSON at all
+      // (exact media type, case-sensitive, an optional `;`-params suffix
+      // ignored) — checked to be measured, not assumed: Elysia does NOT
+      // recognize `Application/JSON` as JSON, so accepting it here would
+      // just reproduce the same silent-empty-string bug this check exists
+      // to close, one case away.
+      const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim();
+      if (contentType !== "application/json") {
+        set.status = 415;
+        return { error: "content-type must be application/json" };
+      }
       if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // Same "absent/malformed is just the empty-string case" discipline as
       // the GET route's own `query.url` handling above — `body` is whatever
