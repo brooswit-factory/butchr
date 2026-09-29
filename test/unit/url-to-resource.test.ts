@@ -24,6 +24,44 @@ describe("resolveUrlToResource — Jira", () => {
   });
 });
 
+describe("resolveUrlToResource — Jira project/board (FACTORY-532)", () => {
+  test("the new-UI project form: /jira/software/c/projects/<KEY>", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/c/projects/BUTCHR", deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+  });
+  test("a board under that prefix, with query string", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/c/projects/BUTCHR/boards/119?issueType=10010", deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+  });
+  test("backlog, list and timeline paths under the same prefix", () => {
+    for (const path of ["backlog", "list", "timeline", "boards/119/backlog"]) {
+      expect(resolveUrlToResource(`https://acme.atlassian.net/jira/software/c/projects/BUTCHR/${path}`, deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+    }
+  });
+  test("the older project form: /jira/software/projects/<KEY>", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/projects/BUTCHR/boards/1", deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+  });
+  test("case-folds the project key, same as parseJiraProjectRef", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/c/projects/butchr", deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+  });
+  test("/browse/<KEY> for a bare project key is the project home, not an issue", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/browse/BUTCHR", deps).resource).toEqual({ provider: "jira-project", id: "BUTCHR" });
+  });
+  test("/browse/<KEY> for an issue key stays jira-work, never jira-project", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/browse/BUTCHR-12", deps).resource).toEqual({ provider: "jira-work", id: "BUTCHR-12" });
+  });
+  test("an issue-detail URL under the project prefix stays jira-work, never jira-project", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/c/projects/BUTCHR/issues/BUTCHR-12", deps).resource).toEqual({ provider: "jira-work", id: "BUTCHR-12" });
+  });
+  test("a board URL carrying ?selectedIssue= stays jira-work, never jira-project", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/jira/software/projects/BUTCHR/boards/1?selectedIssue=BUTCHR-12", deps).resource).toEqual({ provider: "jira-work", id: "BUTCHR-12" });
+  });
+  test("wrong Jira host resolves to no resource, even for an otherwise well-formed project path", () => {
+    expect(resolveUrlToResource("https://other.atlassian.net/jira/software/c/projects/BUTCHR", deps).resource).toBeNull();
+  });
+  test("an unrelated Atlassian URL (e.g. Confluence) is still not a resource", () => {
+    expect(resolveUrlToResource("https://acme.atlassian.net/wiki/spaces/BUTCHR/overview", deps).resource).toBeNull();
+  });
+});
+
 describe("resolveUrlToResource — GitHub", () => {
   test("an issue URL", () => {
     expect(resolveUrlToResource("https://github.com/brooswit-factory/butchr/issues/42", deps).resource).toEqual({ provider: "github-issue", id: "brooswit-factory/butchr#42" });

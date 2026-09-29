@@ -86,10 +86,16 @@ fixed here so a future reader doesn't have to wonder):
 | URL shape | provider | id |
 |---|---|---|
 | `https://<this daemon's Jira site>/browse/<KEY>`, the new-UI `.../issues/<KEY>` form, or `...?selectedIssue=<KEY>` | `jira-work` | the issue key, case-folded uppercase |
+| `https://<this daemon's Jira site>/jira/software/c/projects/<KEY>/…`, `.../jira/software/projects/<KEY>/…` (boards, backlog, list, timeline, any path or query under that prefix), or the bare `/browse/<KEY>` project home | `jira-project` | the project key, case-folded uppercase (FACTORY-532, implementing FACTORY-531) |
 | `https://github.com/<owner>/<repo>/issues/<n>` | `github-issue` | `<owner>/<repo>#<n>`, lowercased |
 | `https://github.com/<owner>/<repo>/pull/<n>` | `github-pr` | `<owner>/<repo>#<n>`, lowercased |
 | `https://<this daemon's ZENDESK_SUBDOMAIN>.zendesk.com/agent/tickets/<id>` | `zendesk-ticket` | `<subdomain>#<id>` |
 | anything else | — | `resource: null` (normal, not an error) |
+
+`jira-work` is always checked before `jira-project`: an `/issues/<KEY>`
+suffix or a `?selectedIssue=<KEY>` query names a specific issue INSIDE the
+project, not the project itself, and `/browse/<KEY>` only ever falls through
+to `jira-project` for a key with no `-<digits>` issue suffix.
 
 Strict host matching only — Jira is checked against THIS daemon's own
 configured site, GitHub only against the literal host `github.com`, Zendesk
@@ -174,6 +180,18 @@ reads the SAME `DashboardResponse.rows` snapshot `/dashboard` itself serves
 so a resource match here is, by construction, a resource this daemon has
 ALREADY matched and (at least tried to) staff — never a hypothetical one a
 fresh query might turn up.
+
+**FACTORY-532 dashboard-visibility carve-out.** The dashboard rows this
+endpoint reads are only produced for an agent whose workspace resolves to an
+"owned" agent key (`src/daemon/index.ts`'s `ownedAgentOfCwd`, gated by
+`src/agents/dashboard.ts`'s `ownsDashboardAgent`) — `jira-work` and
+`jira-project` only. FACTORY-461 (open, unowned) documents the SAME hiding
+for `github-issue`/`github-pr`/`zendesk-ticket`/`filesystem`: a resource of
+one of those providers resolves correctly here, but `agents` is always `[]`
+for it regardless of what's actually staffed, indistinguishable from "no
+agent running". `jira-project` is deliberately carved out ahead of a general
+fix because this endpoint's own Cleavr consumer needs it now; the other
+providers' visibility is FACTORY-461's decision to make, not this ticket's.
 
 ## Files
 

@@ -59,6 +59,13 @@ describe("GET /agents/:agentKey/pty — upgrade refusals (HTTP-level, before any
     expect(res.status).toBe(403);
     expect((await res.json() as { error: string }).error).toBe("origin not allowed");
   });
+  test("non-allowlisted Origin on a jira-project manager key: 403 (FACTORY-532 widened the dashboard snapshot, not the guard)", async () => {
+    const projectKey = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "unity-manager", resourceId: "GK" });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(projectKey)}/pty`, { headers: { upgrade: "websocket", origin: OTHER_ORIGIN } }));
+    expect(res.status).toBe(403);
+    expect((await res.json() as { error: string }).error).toBe("origin not allowed");
+  });
   test("malformed agent key: refused (404), Origin otherwise allowlisted", async () => {
     // Uses the REAL `resolvePtyPane` (via `resolveDeps` below), not the
     // always-"unknown-pane" fake `liveResolveDeps` above — a fake that never
