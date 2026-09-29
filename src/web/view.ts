@@ -258,12 +258,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // guarded routes in this file — every other route above is deliberately
     // unauthenticated (see `docs/resources-for-url.md`'s own "why not the
     // others" note). Never open the same way `/dashboard`/`/agents` are:
-    // `extensionAuth` above is `{ allowedOrigins: [] }` whenever this
-    // daemon's config doesn't set `BUTCHR_EXTENSION_ORIGINS`, and
-    // `checkExtensionOrigin` turns that into a hard 403 refusal per request
-    // (no allowlisted origin can ever match an empty list), never a
-    // fallback to "unauthenticated". `deps.resourcesForUrl` is only ever
-    // called once the guard has already said `ok`.
+    // FACTORY-497 hardcoded `extensionAuth` above to Clevr's fixed id alone
+    // — not configurable any more — and `checkExtensionOrigin` refuses (403)
+    // any other origin, including an absent one, never a fallback to
+    // "unauthenticated". `deps.resourcesForUrl` is only ever called once the
+    // guard has already said `ok`.
     //
     // FACTORY-480: a real MV3 service-worker GET (Clevr's own
     // `fetchResources`) carries NO `Origin` header at all — Chrome only

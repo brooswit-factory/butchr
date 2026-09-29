@@ -136,5 +136,5 @@ export function preflightExtensionOrigin(req: { origin: string | null }, deps: O
 /** `chrome-extension://<32-char id>` — a real Chrome extension id is always exactly 32 lowercase letters `a`-`p` (base16 over that alphabet), never anything else. */
 const EXTENSION_ORIGIN_RE = /^chrome-extension:\/\/[a-p]{32}$/;
 
-/** True only for a well-formed `chrome-extension://<id>` origin — used to validate `BUTCHR_EXTENSION_ORIGINS` entries at config-load time, before any request is ever checked against them. */
+/** True only for a well-formed `chrome-extension://<id>` origin. */
 export const isExtensionOrigin = (origin: string): boolean => EXTENSION_ORIGIN_RE.test(origin);
