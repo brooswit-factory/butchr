@@ -873,19 +873,18 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       expect(ta.posts.length).toBe(1);
     });
 
-    // FACTORY-367 comment 26602/26603 (AC 4 extension): the dedupe IDENTITY
-    // (the fingerprint parsePrompt/fingerprint() derive) must be invariant
-    // to how much unrelated scrollback chatter sits above the real dialog on
-    // screen — FACTORY-146 measured this drifting for some captured shapes.
-    // Proof technique per that comment: take a REAL captured pane (TRUST,
-    // the trust dialog fixture already used elsewhere in this file — its own
-    // 7 non-decorative lines immediately above the option block already
-    // exceed prompt.ts's own QUESTION_TAIL window of 6, so the extracted
-    // "question" never actually reaches into whatever precedes it),
-    // prepend N synthetic chatter lines, and assert the identity is
-    // IDENTICAL across N = 0/3/9/20 AND that the whole sequence produces
-    // exactly one post — not a re-poll of one clean fixture.
-    test("dedupe identity is invariant to unrelated chatter prepended above a real captured dialog — a test re-polling one clean fixture would not catch this", async () => {
+    // FACTORY-367 comment 26602/26603 first raised this, but that version
+    // (prepend-only) was itself corrected a FOURTH time in comment 26758,
+    // which superseded it on exactly this point: chatter placed ABOVE
+    // `parsePrompt`'s bounded QUESTION_TAIL(6) window leaves the identity
+    // identical "for free", so a prepend-only test proves nothing about the
+    // hazard AC 4 exists to catch (PR #559 review, first round, caught this
+    // test citing the superseded comment and doing exactly the prepend-only
+    // thing 26758 was written to rule out). Kept here, honestly labeled, as
+    // the WEAKER, still-true case — chatter genuinely outside the window
+    // really is safe — but it is not a substitute for the in-window test
+    // below, which is what AC 4 as currently written actually requires.
+    test("chatter placed OUTSIDE parsePrompt's extraction window (prepended well above a real captured dialog) leaves identity unaffected — the safe case, not the one AC 4's correction is about", async () => {
       const chatterLine = "2026-09-27T12:00:00Z some prior unrelated tool output line";
       const withChatter = (n: number) => Array.from({ length: n }, () => chatterLine).join("\n") + (n ? "\n" : "") + TRUST;
 
@@ -901,16 +900,49 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       expect(ta.posts.length).toBe(1); // not 4
     });
 
-    // Defense-in-depth backstop (independent of the invariance above): if a
-    // captured shape's identity DOES drift poll-to-poll despite the above,
-    // a per-pane rate cap still bounds #team-admin posts rather than letting
-    // them grow unboundedly with the number of distinct "fingerprints" seen.
-    test("a genuinely drifting fingerprint (a new one every poll) is bounded by a per-pane rate cap, not left unbounded", async () => {
+    // AC 4 extension per FACTORY-367 comment 26758 (the correction that
+    // superseded 26602/26603 on this point): chatter injected INSIDE the
+    // extraction window — i.e. among the up-to-6 lines `parsePrompt`
+    // actually takes as `question` — not merely prepended above it.
+    // Measured directly against REAL and TRUST (real captured-pane fixtures
+    // already used throughout this file) at N = 1, 2, 5 injected lines
+    // (the ticket's named drift points), placed immediately before the
+    // option block so they fall inside QUESTION_TAIL(6): the identity DOES
+    // drift for both fixtures at every N — this is FACTORY-378's diagnosed
+    // defect (`parsePrompt` takes the literal last 6 preceding lines with
+    // no anchor to the dialog's own frame), reachable here exactly as
+    // predicted, not a new defect and not something this ticket fixes.
+    // This is the ticket's own explicitly anticipated outcome ("If AC 4 ...
+    // turn out to be unachievable because extraction itself is corrupting
+    // things, that is a legitimate finding — report it with what you
+    // measured... do not reach into prompt.ts") — reported as a comment on
+    // FACTORY-369. What THIS test asserts instead: the per-pane rate cap
+    // already built for exactly this contingency (`MANAGED_TEAM_ADMIN_MAX_PER_HOUR`)
+    // bounds the resulting #team-admin exposure rather than leaving it
+    // unbounded, so a pane whose identity drifts every poll still does not
+    // spam the channel — the outcome AC 4's binding routing spec forbids.
+    function injectInWindow(fixture: string, n: number): string {
+      const lines = fixture.split("\n");
+      const optionLineIdx = lines.findIndex((l) => /^\s*(❯|>)?\s*(\d+\.\s+|No, exit|Yes, I trust)/.test(l));
+      const chatter = Array.from({ length: n }, (_, i) => `in-window chatter line ${i}`);
+      return [...lines.slice(0, optionLineIdx), ...chatter, ...lines.slice(optionLineIdx)].join("\n");
+    }
+
+    test("AC 4 extension: in-window chatter injection (1/2/5 lines) DOES drift the identity for REAL and TRUST — a measured FACTORY-378 finding, not fixed here", () => {
+      for (const fixture of [REAL, TRUST]) {
+        const base = fingerprint(parsePrompt(fixture)!);
+        for (const n of [1, 2, 5]) {
+          const drifted = fingerprint(parsePrompt(injectInWindow(fixture, n))!);
+          expect(drifted).not.toBe(base); // measured drift, matches FACTORY-378's diagnosis — see comment above
+        }
+      }
+    });
+
+    test("a fingerprint that genuinely drifts every poll (in-window chatter, or any other cause) is bounded by a per-pane rate cap, not left unbounded", async () => {
       const ta = fakeTeamAdmin();
       const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
-      for (let i = 0; i < 10; i++) {
-        // A distinct dialog each time (distinct question -> distinct fingerprint).
-        const prompt = parsePrompt(`Distinct dialog #${i}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+      for (let n = 1; n <= 10; n++) {
+        const prompt = parsePrompt(injectInWindow(REAL, n))!; // a new in-window chatter length each poll -> a new fingerprint each poll
         await h.poll("p1", null, prompt);
       }
       expect(ta.posts.length).toBeLessThanOrEqual(3);
@@ -1013,14 +1045,14 @@ describe("createEscalator — #team-admin routing for managed-session escalation
   // and options, not adversarial neighbouring lines. This is a fidelity
   // check on what THIS ticket's delivery path does with `prompt.question`/
   // `prompt.options` (teamAdminMessage quotes them verbatim, nothing more,
-  // nothing less) — it is NOT a fix for FACTORY-378 (parsePrompt's own
-  // extraction-window defect, out of scope here). The adversarial lines
-  // below sit OUTSIDE prompt.ts's QUESTION_TAIL(6) window ahead of TRUST's
-  // own 7 non-decorative lines (see the AC 4-extension test above, same
-  // fixture, same reasoning for why TRUST is chosen), so this proves the
-  // delivery path is faithful to whatever parsePrompt legitimately hands
-  // it — it does not by itself prove parsePrompt is immune to in-window
-  // chatter (FACTORY-378's job, not this ticket's).
+  // nothing less) — it is deliberately NOT a test of `parsePrompt`'s own
+  // extraction window (that's FACTORY-378's in-window drift, measured and
+  // reported separately in the "AC 4 extension" tests above). The
+  // adversarial lines below sit OUTSIDE prompt.ts's QUESTION_TAIL(6) window
+  // ahead of TRUST's own 7 non-decorative lines ON PURPOSE — this test's
+  // job is "does OUR delivery code corrupt a question parsePrompt already
+  // got right", not "is parsePrompt's window itself safe" (already known
+  // not to be, per FACTORY-378 and the measured drift above).
   describe("AC 11: payload fidelity — quotes the dialog, not its neighbours", () => {
     test("adversarial lines styled as butchr's own journal output, or as ticket text with a plausible-looking error string, never reach the #team-admin payload", async () => {
       const adversarialLines = [
