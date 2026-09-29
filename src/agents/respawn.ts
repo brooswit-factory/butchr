@@ -22,12 +22,14 @@ export function respawnComment(issue: string, reason: string, atIso: string): st
 export const RESUME_MARKER = "[butchr:resume]";
 
 /**
- * FACTORY-314 — the ticket notice posted after `herd.resumeInPlace()`
- * succeeds: a model/effort-only change relaunched the SAME Claude session
- * (same session id) rather than starting fresh. Deliberately NEVER says
- * "re-read your ticket" — that instruction is exactly wrong for an agent
- * that still holds its own conversation.
+ * FACTORY-314, worded generally by FACTORY-470/472 — the ticket notice
+ * posted after `herd.resumeInPlace()` succeeds, whether that relaunch was
+ * for a model/effort-only change or (FACTORY-470/472) a herdr-restored pane
+ * relaunched with butchr's full flag set: either way the SAME Claude
+ * session (same session id) continued rather than starting fresh.
+ * Deliberately NEVER says "re-read your ticket" — that instruction is
+ * exactly wrong for an agent that still holds its own conversation.
  */
 export function resumePreservedComment(issue: string, atIso: string): string {
-  return `${RESUME_MARKER} ${issue}'s agent was relaunched by the daemon at ${atIso} with a changed model and/or effort. Its session was PRESERVED — this is the SAME conversation, resumed with the new settings. Nothing was lost, and your ticket has not changed; carry on exactly where you left off.`;
+  return `${RESUME_MARKER} ${issue}'s agent was relaunched by the daemon at ${atIso} on the same session, with its current launch settings (model, effort, permission-mode, mcp-config, and channels) applied. Its session was PRESERVED — this is the SAME conversation, resumed with the current settings. Nothing was lost, and your ticket has not changed; carry on exactly where you left off.`;
 }
