@@ -258,13 +258,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // guarded routes in this file — every other route above is deliberately
     // unauthenticated (see `docs/resources-for-url.md`'s own "why not the
     // others" note). Never open the same way `/dashboard`/`/agents` are:
-    // FACTORY-497 hardcoded `extensionAuth` above to Clevr's fixed id alone
+    // FACTORY-497 hardcoded `extensionAuth` above to Cleavr's fixed id alone
     // — not configurable any more — and `checkExtensionOrigin` refuses (403)
     // any other origin, including an absent one, never a fallback to
     // "unauthenticated". `deps.resourcesForUrl` is only ever called once the
     // guard has already said `ok`.
     //
-    // FACTORY-480: a real MV3 service-worker GET (Clevr's own
+    // FACTORY-480: a real MV3 service-worker GET (Cleavr's own
     // `fetchResources`) carries NO `Origin` header at all — Chrome only
     // stamps `Origin` on a POST from that context — so the strict guard
     // above 403s every real install of the GET-only route below, and no
@@ -273,7 +273,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // allowlisted Origin itself (e.g. `curl -H Origin: ...`, exactly what
     // `docs/resources-for-url.md` already documented) — it is not removed
     // because nothing here requires removing it, and removing it would be
-    // a needless behavior change for such a caller. Clevr itself now uses
+    // a needless behavior change for such a caller. Cleavr itself now uses
     // the POST route below, which Chrome DOES stamp with Origin from the
     // same service-worker context.
     .options("/resources/for-url", ({ request, set }) => {
@@ -310,7 +310,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const url = typeof query["url"] === "string" ? query["url"] : "";
       return deps.resourcesForUrl(url);
     })
-    // FACTORY-480: the route Clevr's extension service worker actually uses
+    // FACTORY-480: the route Cleavr's extension service worker actually uses
     // now — same guard, same response shape as the GET above, but the URL
     // travels in a JSON body instead of a query string, because that's the
     // request shape Chrome stamps with `Origin: chrome-extension://<id>`

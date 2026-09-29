@@ -49,7 +49,7 @@ describe("GET /resources/for-url", () => {
   });
 });
 
-// FACTORY-480: the route Clevr's extension service worker actually uses —
+// FACTORY-480: the route Cleavr's extension service worker actually uses —
 // see src/web/view.ts's own comment for why the GET above is unusable from
 // that context (Chrome sends no Origin on a service-worker GET) and why the
 // GET route above is kept unchanged regardless.

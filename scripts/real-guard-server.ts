@@ -1,6 +1,6 @@
 /**
  * FACTORY-478/FACTORY-480: a minimal, REAL HTTP server for the real-browser
- * regression test that lives in the `clevr` repo (see that repo's
+ * regression test that lives in the `cleavr` repo (see that repo's
  * `scripts/real-daemon-origin-test.mjs`) — every route and every guard
  * function this file wires up is the ACTUAL production code
  * (`src/daemon/app.ts`'s `buildApp`, `src/web/view.ts`'s `liveView`,
@@ -28,7 +28,7 @@
  *
  * Prints exactly one line, `REAL_GUARD_READY <port>`, once listening — the
  * driving test greps stdout for it the same way
- * `clevr/scripts/smoke-test.mjs` already greps `fake-pty-server.mjs`'s own
+ * `cleavr/scripts/smoke-test.mjs` already greps `fake-pty-server.mjs`'s own
  * `FAKE_PTY_PORT=<port>` line.
  */
 import { buildApp } from "../src/daemon/app.js";
@@ -100,7 +100,7 @@ function main(): void {
 
   // TEST-ONLY instrumentation, never shipped: records every request this
   // process sees for the WebSocket-upgrade route, specifically so the
-  // driving browser test (clevr's scripts/real-daemon-origin-test.mjs) can
+  // driving browser test (cleavr's scripts/real-daemon-origin-test.mjs) can
   // answer DoD #2 ("record whether Origin is present on the PTY WebSocket
   // upgrade") — a browser's WebSocket API exposes no HTTP status/headers on
   // a failed upgrade, so the server side has to be the one keeping the
