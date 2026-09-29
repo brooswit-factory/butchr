@@ -6,12 +6,17 @@ agent on it, with a dropdown when several agents serve it). This endpoint is
 the Butchr-side answer to "does this URL match a resource, and which agents
 serve it?".
 
+FACTORY-464/FACTORY-465 (a deliberate, operator-decided security-posture
+change) dropped the bearer-token requirement this endpoint originally had —
+see "Security tradeoff" below before assuming the `Authorization` header
+still does anything here. It doesn't; this route is now gated on the
+`Origin` allowlist alone.
+
 ## Contract
 
 ```
 GET /resources/for-url?url=<percent-encoded browser URL>
-Authorization: Bearer <BUTCHR_EXTENSION_TOKEN>
-Origin: chrome-extension://<id>   (only when the caller IS an extension; optional otherwise)
+Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below)
 ```
 
 Response, always exactly this shape (both `resource` and `agents` are
@@ -71,21 +76,36 @@ byte-for-byte).
 
 | env var | required | effect |
 |---|---|---|
-| `BUTCHR_EXTENSION_TOKEN` | to enable the endpoint | shared bearer token; **UNSET means the endpoint is DISABLED (503 on every request), never open**. Never generated, persisted, or logged by this daemon — an operator sets it themselves, out of band, exactly once. |
-| `BUTCHR_EXTENSION_ORIGINS` | no | comma-separated `chrome-extension://<id>` origins allowed to read the response. A request whose `Origin` header is present and not in this list is refused (403) before its `Authorization` header is even inspected. |
+| `BUTCHR_EXTENSION_ORIGINS` | to enable the endpoint | comma-separated `chrome-extension://<id>` origins allowed to reach it. **UNSET/EMPTY means the endpoint is DISABLED (403 on every request), never open.** A request whose `Origin` header is absent, or present but not in this list, is refused (403). |
 
-Both are parsed once in `src/config/config.ts` into `Config.extensionAuth`
-and consumed by the reusable guard in `src/web/bearer-origin-guard.ts`
-(`checkBearerOrigin`/`preflightBearerOrigin`) — built as a standalone
-mechanism, not wired into this one route, because the later Clevr
-terminal-attach story reuses the exact same auth model. CORS response
-headers (`Access-Control-Allow-Origin`, `Vary: Origin`) are emitted ONLY for
-an allowlisted origin and are NEVER `*`. `OPTIONS /resources/for-url`
-answers the CORS preflight the same way, without ever checking a bearer
-token (browsers never send `Authorization` on a preflight).
+Parsed once in `src/config/config.ts` into `Config.extensionAuth` and
+consumed by the reusable guard in `src/web/origin-guard.ts`
+(`checkExtensionOrigin`/`preflightExtensionOrigin`) — built as a standalone
+mechanism, not wired into this one route, because `GET /agents/:agentKey/pty`
+(FACTORY-453) reuses the exact same guard. CORS response headers
+(`Access-Control-Allow-Origin`, `Vary: Origin`) are emitted ONLY for an
+allowlisted origin and are NEVER `*`. `OPTIONS /resources/for-url` answers
+the CORS preflight the same way.
 
 `/health`, `/state`, `/dashboard`, and `/agents` are unaffected — they stay
 exactly as unauthenticated as before this change.
+
+## Security tradeoff (FACTORY-464/FACTORY-465)
+
+This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`)
+in addition to the Origin allowlist. That requirement is GONE: the operator
+weighed the tradeoff and chose to drop it — "one should just be able to
+start Clevr and work if butchr is there." The daemon binds loopback-only
+(`src/daemon/listen.ts`), and on a single-user local box, the operator judged
+an Origin-allowlist-only check sufficient.
+
+**What this does and does not protect against.** `Origin` is enforced by the
+browser, so this still stops another website open in a browser tab from
+reaching this endpoint. **It does NOT stop any other local process** — a
+script, another user on the same box, `curl` — from setting
+`Origin: chrome-extension://<allowlisted-id>` by hand; nothing here can tell
+that apart from the real extension. This is accepted as reasonable for a
+single-user local box, not overlooked.
 
 ## WHY THE STAFFED-AGENT REGISTRY, NOT A LIVE QUERY
 
@@ -120,6 +140,6 @@ fresh query might turn up.
 
 - `src/resources/url-to-resource.ts` — pure, I/O-free URL → resource mapping.
 - `src/resources/resource-lookup.ts` — joins that mapping to the staffed-agent registry; builds the response.
-- `src/web/bearer-origin-guard.ts` — the reusable bearer-token + origin-allowlist guard.
+- `src/web/origin-guard.ts` — the reusable Origin-allowlist guard.
 - `src/web/view.ts` — route wiring (`GET`/`OPTIONS /resources/for-url`).
-- `src/config/config.ts` — `BUTCHR_EXTENSION_TOKEN`/`BUTCHR_EXTENSION_ORIGINS` parsing.
+- `src/config/config.ts` — `BUTCHR_EXTENSION_ORIGINS` parsing.
