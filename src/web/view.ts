@@ -320,9 +320,17 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // check happens BEFORE the body is ever read, same discipline as the
     // GET route.
     .post("/resources/for-url", async ({ request, body, set }) => {
-      const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      const origin = request.headers.get("origin");
+      const guard = checkExtensionOrigin({ origin }, extensionAuth);
       for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!guard.ok) {
+        // FACTORY-493: this route's own rejection was silent until now — see
+        // FACTORY-476's dedupe-key comment (`origin-guard-log.ts`) for why
+        // `method: "POST"` here doesn't suppress the GET route's own line.
+        originGuardLog.reject({ method: "POST", path: new URL(request.url).pathname, origin, result: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
       if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // Same "absent/malformed is just the empty-string case" discipline as
       // the GET route's own `query.url` handling above — `body` is whatever

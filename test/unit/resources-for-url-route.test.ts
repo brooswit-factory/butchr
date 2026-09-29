@@ -196,6 +196,79 @@ describe("FACTORY-476: guard rejections on /resources/for-url are logged, allowe
   });
 });
 
+describe("FACTORY-493: POST /resources/for-url guard rejections are logged too", () => {
+  test("POST missing Origin: one line, method=POST, origin 'absent', result 'origin required'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse, originGuardLog }));
+    await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://secret.example/page" }),
+    }));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("method=POST");
+    expect(lines[0]).toContain("path=/resources/for-url");
+    expect(lines[0]).toContain("origin=absent");
+    expect(lines[0]).toContain("result=origin required");
+    expect(lines[0]).not.toContain("secret.example");
+    expect(lines[0]).not.toContain("?");
+  });
+  test("POST non-allowlisted origin: one line, origin verbatim, result 'origin not allowed'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse, originGuardLog }));
+    await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: OTHER_ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(lines).toEqual([expect.stringContaining(`method=POST path=/resources/for-url origin=${OTHER_ORIGIN} result=origin not allowed`)]);
+  });
+  test("POST with an empty allowlist and a well-formed origin: result 'allowlist empty'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ resourcesForUrl: async () => stubResponse, originGuardLog }));
+    await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("method=POST");
+    expect(lines[0]).toContain("result=allowlist empty");
+  });
+  test("an allowed POST logs nothing", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async (url) => ({ ...stubResponse, url }), originGuardLog }));
+    const res = await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(res.status).toBe(200);
+    expect(lines).toEqual([]);
+  });
+  test("POST and GET rejections for the same path/origin are not deduped against each other", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse, originGuardLog }));
+    await app.handle(new Request("http://local/resources/for-url?url=https://x", { headers: { origin: OTHER_ORIGIN } }));
+    await app.handle(new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: OTHER_ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    }));
+    expect(lines.length).toBe(2);
+    expect(lines[0]).toContain("method=GET");
+    expect(lines[1]).toContain("method=POST");
+  });
+  test("a repeated POST rejection within the dedupe window logs only once", async () => {
+    const lines: string[] = [];
+    let t = 0;
+    const originGuardLog = createOriginGuardLogger({ now: () => t, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: { allowedOrigins: [ORIGIN] }, resourcesForUrl: async () => stubResponse, originGuardLog }));
+    const req = () => new Request("http://local/resources/for-url", {
+      method: "POST", headers: { origin: OTHER_ORIGIN, "content-type": "application/json" }, body: JSON.stringify({ url: "https://x" }),
+    });
+    await app.handle(req());
+    t += 1_000;
+    await app.handle(req());
+    expect(lines.length).toBe(1);
+  });
+});
+
 describe("existing routes are unaffected", () => {
   test("/health still works with no auth, unauthenticated by design", async () => {
     const app = liveView(fakeMcp, baseDeps({ health: () => ({ ok: true }) as any }));
