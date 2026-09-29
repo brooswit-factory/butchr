@@ -1,4 +1,4 @@
-# `GET /resources/for-url` — URL → resource resolution + agent lookup
+# `GET`/`POST /resources/for-url` — URL → resource resolution + agent lookup
 
 FACTORY-339 (implementing FACTORY-335, epic FACTORY-330 — "Clevr", a Chrome
 extension that slides a Claude terminal in for a page IF Butchr is running an
@@ -12,15 +12,45 @@ see "Security tradeoff" below before assuming the `Authorization` header
 still does anything here. It doesn't; this route is now gated on the
 `Origin` allowlist alone.
 
+FACTORY-478/FACTORY-480: a real MV3 extension service worker's GET carries
+NO `Origin` header at all (Chrome only stamps `Origin` on a POST from that
+context — measured against headless Chrome for Testing 148 with a real
+built `clevr` extension; see FACTORY-478's comments for the full
+measurement). The strict Origin-required guard below therefore 403s
+`GET /resources/for-url` on every real Clevr install, and no
+`BUTCHR_EXTENSION_ORIGINS` entry can fix that — it's not a config problem.
+**Clevr's own client now uses `POST /resources/for-url` (URL in the JSON
+body) instead**, because that's the request shape Chrome does stamp with
+`Origin` from a service worker. `GET` is KEPT, unchanged, for any other
+caller that can present a real `Origin` header itself (e.g. `curl -H
+"Origin: chrome-extension://<id>"`) — it still requires a present
+allowlisted Origin, exactly as before; it was not removed because nothing
+about the fix requires removing it, and doing so would be a needless
+behavior change for such a caller. Do not add a variant that accepts an
+absent Origin on either method — see "Security tradeoff" below for why that
+line is never to be crossed on this route.
+
 ## Contract
 
 ```
-GET /resources/for-url?url=<percent-encoded browser URL>
+POST /resources/for-url
 Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below)
+Content-Type: application/json
+
+{"url": "<browser URL, plain, not percent-encoded>"}
 ```
 
-Response, always exactly this shape (both `resource` and `agents` are
-ALWAYS present, never omitted):
+```
+GET /resources/for-url?url=<percent-encoded browser URL>
+Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below;
+                                   NOTE: a real MV3 service-worker GET never
+                                   carries this — see above — so this form
+                                   is unreachable from Clevr's own extension
+                                   context and exists for other callers only)
+```
+
+Both forms answer with the same response shape (both `resource` and
+`agents` are ALWAYS present, never omitted):
 
 ```jsonc
 {
@@ -85,7 +115,11 @@ mechanism, not wired into this one route, because `GET /agents/:agentKey/pty`
 (FACTORY-453) reuses the exact same guard. CORS response headers
 (`Access-Control-Allow-Origin`, `Vary: Origin`) are emitted ONLY for an
 allowlisted origin and are NEVER `*`. `OPTIONS /resources/for-url` answers
-the CORS preflight the same way.
+the CORS preflight the same way, advertising both `GET` and `POST` in
+`Access-Control-Allow-Methods` and `content-type` in
+`Access-Control-Allow-Headers` (FACTORY-480: the JSON-body POST is a
+non-simple request, so the browser preflights it, and blocks the real POST
+afterward unless the preflight response says `content-type` is allowed).
 
 `/health`, `/state`, `/dashboard`, and `/agents` are unaffected — they stay
 exactly as unauthenticated as before this change.

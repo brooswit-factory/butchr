@@ -60,11 +60,12 @@ function corsHeadersFor(origin: string): Record<string, string> {
 }
 
 /**
- * The whole guard for a guarded route — both the plain HTTP route
- * (`GET /resources/for-url`) and the WebSocket upgrade route
- * (`GET /agents/:agentKey/pty`) — see this module's own header for why one
- * rule now covers both. `origin` is `null` when the header is absent — pass
- * `Request.headers.get("origin")` straight through. Never throws.
+ * The whole guard for a guarded route — the plain HTTP routes
+ * (`GET`/`POST /resources/for-url`, FACTORY-480 added the POST) and the
+ * WebSocket upgrade route (`GET /agents/:agentKey/pty`) — see this module's
+ * own header for why one rule now covers both. `origin` is `null` when the
+ * header is absent — pass `Request.headers.get("origin")` straight through.
+ * Never throws.
  */
 export function checkExtensionOrigin(req: { origin: string | null }, deps: OriginGuardDeps): GuardOutcome {
   if (req.origin === null) {
@@ -86,7 +87,13 @@ export function preflightExtensionOrigin(req: { origin: string | null }, deps: O
     status: 204,
     headers: {
       ...corsHeadersFor(req.origin),
-      "access-control-allow-methods": "GET, OPTIONS",
+      // FACTORY-480: `POST /resources/for-url` carries a JSON body
+      // (`content-type: application/json`, not a CORS-safelisted value for
+      // that header), which is why a POST here triggers a preflight at all —
+      // `access-control-allow-headers` must list it or the browser blocks
+      // the actual request after a successful preflight.
+      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-headers": "content-type",
     },
   };
 }
