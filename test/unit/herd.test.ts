@@ -2356,13 +2356,20 @@ describe("resumeInPlace", () => {
 
   // FACTORY-489 (FACTORY-312 review correction): pins the launchPending
   // guard's PLACEMENT, not just its existence. A guard placed BEFORE
-  // `providerOfPane` would return "deferred" forever on a pane whose
-  // agent.list() entry still lags with launch_pending:true after the
-  // underlying claude process has already died — silently swallowing the
-  // existing "unresumable" -> stop()/spawn() recovery that a "no process
-  // found" providerOfPane result already provides for that case. This test
-  // can only pass if the guard runs AFTER providerOfPane: the entry itself
-  // (and launch_pending:true) is present, but the pane's OS process is gone.
+  // `providerOfPane` would return "deferred" for one detection pass on a
+  // pane whose agent.list() entry still lags with launch_pending:true after
+  // the underlying claude process has already died — herdr clears the
+  // managed agent once it observes the exit, so that guard-first ordering
+  // would only delay, by one poll, the existing "unresumable" ->
+  // stop()/spawn() recovery that a "no process found" providerOfPane result
+  // already provides for that case; this test proves the guard runs AFTER
+  // providerOfPane instead, so that recovery is immediate rather than
+  // delayed. The entry itself (and launch_pending:true) is present, but the
+  // pane's OS process is gone. NOTE: the fixture (statefulHerdr with
+  // processGone:true) holds launch_pending true INDEFINITELY, since it does
+  // not model herdr's own release path — its shape pins the guard's
+  // placement, not a claim about how long the real launch_pending state
+  // persists after a process dies.
   test("unresumable, NOT deferred: launch_pending true but the pane's OS process is already gone — the existing providerOfPane gate wins, not the launchPending guard", async () => {
     await withTempWorkspaces(async () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });

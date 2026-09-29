@@ -1510,13 +1510,15 @@ export class HerdrHerd implements Herd {
     // `agent_session` has registered.
     //
     // Checked HERE, deliberately AFTER `providerOfPane` rather than before
-    // it: `launchPending` can still read true after the underlying claude
-    // process has already died (herdr's bookkeeping lagging the OS), and a
-    // guard placed ahead of `providerOfPane` would then return "deferred"
-    // on every poll of an already-empty pane, forever — silently replacing
-    // the existing "unresumable" -> stop()/spawn() recovery that
-    // `providerOfPane` finding nothing already provides for that case.
-    // Placing this guard after it lets that door close first.
+    // it: `launchPending` can still read true for one detection pass after
+    // the underlying claude process has already died — herdr clears the
+    // managed agent (launch_pending goes false) once it observes the exit,
+    // but a guard placed ahead of `providerOfPane` would return "deferred"
+    // for that one pass, delaying the existing "unresumable" ->
+    // stop()/spawn() recovery by a poll until herdr's bookkeeping catches
+    // up. Placing this guard after `providerOfPane` closes that door first,
+    // so the FACTORY-426 "no bare retry on an empty pane" floor holds
+    // exactly, not merely probabilistically.
     //
     // The bound on this deferral is NOT uniform (source read of herdr at
     // the running version's tag, not a live measurement). herdr's Pending
