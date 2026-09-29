@@ -8,11 +8,11 @@ const deps: OriginGuardDeps = { allowedOrigins: [ORIGIN] };
 describe("checkExtensionOrigin", () => {
   test("missing Origin header is refused (403) — the only credential left, so absent means refused", () => {
     const r = checkExtensionOrigin({ origin: null }, deps);
-    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} });
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {}, reason: "origin required" });
   });
   test("a non-allowlisted Origin is rejected (403)", () => {
     const r = checkExtensionOrigin({ origin: OTHER_ORIGIN }, deps);
-    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin not allowed" }, corsHeaders: {} });
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin not allowed" }, corsHeaders: {}, reason: "origin not allowed" });
   });
   test("an allowlisted origin succeeds with CORS headers for exactly that origin, never *", () => {
     const r = checkExtensionOrigin({ origin: ORIGIN }, deps);
@@ -27,6 +27,16 @@ describe("checkExtensionOrigin", () => {
     expect(checkExtensionOrigin({ origin: ORIGIN }, empty).ok).toBe(false);
     expect(checkExtensionOrigin({ origin: null }, empty).ok).toBe(false);
   });
+  test("FACTORY-476: an empty allowlist with a present origin classifies as its own distinct reason, not the ordinary non-allowlisted-origin one — but the wire body's wording is unchanged", () => {
+    const empty: OriginGuardDeps = { allowedOrigins: [] };
+    const r = checkExtensionOrigin({ origin: ORIGIN }, empty);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin not allowed" }, corsHeaders: {}, reason: "allowlist empty" });
+  });
+  test("FACTORY-476: an absent Origin against an empty allowlist is still classified as 'origin required', not 'allowlist empty' — the more specific fact wins", () => {
+    const empty: OriginGuardDeps = { allowedOrigins: [] };
+    const r = checkExtensionOrigin({ origin: null }, empty);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {}, reason: "origin required" });
+  });
   test("no response ever carries a wildcard CORS origin", () => {
     for (const origin of [null, ORIGIN, OTHER_ORIGIN]) {
       const r = checkExtensionOrigin({ origin }, deps);
@@ -37,8 +47,8 @@ describe("checkExtensionOrigin", () => {
 
 describe("preflightExtensionOrigin", () => {
   test("missing or non-allowlisted Origin is refused (403)", () => {
-    expect(preflightExtensionOrigin({ origin: null }, deps)).toEqual({ status: 403, headers: {} });
-    expect(preflightExtensionOrigin({ origin: OTHER_ORIGIN }, deps)).toEqual({ status: 403, headers: {} });
+    expect(preflightExtensionOrigin({ origin: null }, deps)).toEqual({ status: 403, headers: {}, reason: "origin required" });
+    expect(preflightExtensionOrigin({ origin: OTHER_ORIGIN }, deps)).toEqual({ status: 403, headers: {}, reason: "origin not allowed" });
   });
   test("an allowlisted origin gets a 204 with CORS headers, never a wildcard origin", () => {
     const r = preflightExtensionOrigin({ origin: ORIGIN }, deps);
@@ -48,7 +58,7 @@ describe("preflightExtensionOrigin", () => {
   });
   test("an empty allowlist refuses even an origin shaped like a real extension id", () => {
     const empty: OriginGuardDeps = { allowedOrigins: [] };
-    expect(preflightExtensionOrigin({ origin: ORIGIN }, empty)).toEqual({ status: 403, headers: {} });
+    expect(preflightExtensionOrigin({ origin: ORIGIN }, empty)).toEqual({ status: 403, headers: {}, reason: "allowlist empty" });
   });
 });
 
