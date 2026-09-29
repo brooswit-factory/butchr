@@ -1,4 +1,4 @@
-# `GET /agents/:agentKey/pty` — authenticated WebSocket PTY attach
+# `GET /agents/:agentKey/pty` — WebSocket PTY attach, Origin-gated
 
 FACTORY-453 (implementing FACTORY-337, epic FACTORY-330 — "Clevr", a Chrome
 extension that slides a Claude terminal into a web page, attached to the
@@ -7,18 +7,21 @@ answered "which agents serve this page" (`GET /resources/for-url`, see
 `docs/resources-for-url.md`); this endpoint is the other half — letting a
 browser tab actually attach to and drive one of those agents' terminals.
 
-FACTORY-455 (implementing FACTORY-454) added a SECOND credential channel,
-`Sec-WebSocket-Protocol`, alongside `Authorization` — see "Two credential
-channels" below for why both exist and neither is redundant.
+FACTORY-455 (implementing FACTORY-454) had added a SECOND credential
+channel, `Sec-WebSocket-Protocol`, alongside `Authorization` — because a
+browser cannot set `Authorization` on a WebSocket handshake at all.
+**FACTORY-464/FACTORY-465 then removed `BUTCHR_EXTENSION_TOKEN` (and both
+credential channels along with it) entirely** — see "Security tradeoff"
+below. Both channels existed only to carry a token that no longer exists;
+this endpoint is now gated on the `Origin` allowlist alone, the exact same
+guard `GET /resources/for-url` uses.
 
 ## Contract
 
 ```
 GET /agents/:agentKey/pty
 Upgrade: websocket
-Authorization: Bearer <BUTCHR_EXTENSION_TOKEN>        (non-browser callers)
-Sec-WebSocket-Protocol: clevr.bearer, <BUTCHR_EXTENSION_TOKEN>   (browser callers — see below)
-Origin: chrome-extension://<id>   (REQUIRED here — see Security below)
+Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below)
 ```
 
 `:agentKey` is one of the `agentKey` values `GET /resources/for-url` returns
@@ -27,91 +30,15 @@ see `src/rules/agent-key.ts`). The upgrade is refused (never opened) when:
 
 | condition | result |
 |---|---|
-| `BUTCHR_EXTENSION_TOKEN` unset | `503`, endpoint disabled entirely, regardless of which channel a credential arrives on |
-| `Origin` header ABSENT | `403`, even with an otherwise-valid credential on either channel |
+| `BUTCHR_EXTENSION_ORIGINS` unset/empty | `403` on every request — fail-closed, the endpoint is effectively disabled |
+| `Origin` header ABSENT | `403` — the only credential left, so an absent one has nothing to fall back to |
 | `Origin` present but not in `BUTCHR_EXTENSION_ORIGINS` | `403` |
-| Neither `Authorization` nor a valid `Sec-WebSocket-Protocol` credential present | `401` |
-| `Authorization` present but wrong | `401` |
-| `Authorization` absent and the `Sec-WebSocket-Protocol` credential wrong | `401` |
 | `:agentKey` does not decode as a valid agent key | `404`, `"not a valid agent key: <key>"` |
 | `:agentKey` decodes fine but names no currently-live agent row | `404`, `"no such live pane: <key> (not one of this daemon's own running agents)"` — the SAME wording `/agents/pane/:pane/attach` (`src/terminal/open.ts`'s `attachRefusalMessage`) uses for an unknown pane, deliberately reused rather than reinvented |
 
 All of the above happen in Elysia's `beforeHandle`, which runs BEFORE the
-WebSocket upgrade — a refusal is an ordinary HTTP response, and the socket
-is never opened at all.
-
-## Two credential channels, and why both exist
-
-**A browser's `WebSocket` constructor cannot set arbitrary request headers —
-it cannot send `Authorization` on the handshake at all.** This was measured,
-not assumed: Chrome's `declarativeNetRequest` `modifyHeaders` (the obvious
-workaround) was tested against a real WebSocket upgrade on Chrome for Testing
-148 and does NOT rewrite the handshake's headers, even though the identical
-rule correctly adds `Authorization` to an ordinary `fetch()` to the same
-host. So for Clevr (FACTORY-338), the header channel is simply unreachable —
-this is not a style preference, it is the only way a browser-based caller
-can authenticate this endpoint at all. **Do not delete the
-`Sec-WebSocket-Protocol` path as "redundant" with `Authorization` — for the
-one caller this whole endpoint exists to serve, it is the ONLY path.**
-
-`Authorization: Bearer <token>` keeps working completely unchanged — curl, a
-CLI, a test, anything that CAN set arbitrary headers still authenticates
-exactly as before FACTORY-455. `Sec-WebSocket-Protocol` is checked ONLY when
-`Authorization` is absent; when both are somehow present, `Authorization`
-takes priority and the subprotocol value is not even consulted. Both
-channels share the SAME `BUTCHR_EXTENSION_TOKEN`, the SAME Origin rule (see
-below — unchanged by this addition), and the SAME constant-time comparison
-(`bearer-origin-guard.ts`'s `constantTimeEqual`, invoked exactly once, via
-`checkBearerOrigin`, regardless of which channel the credential arrived on).
-
-### The exact subprotocol shape
-
-A browser client opens:
-
-```js
-new WebSocket(url, ["clevr.bearer", "<BUTCHR_EXTENSION_TOKEN>"])
-```
-
-which Chrome sends as `Sec-WebSocket-Protocol: clevr.bearer, <token>` (RFC
-6455 §4.3's comma-separated list). The server requires EXACTLY that
-two-element shape — the fixed marker `clevr.bearer`
-(`PTY_BEARER_SUBPROTOCOL_MARKER` in `src/web/bearer-origin-guard.ts`) first,
-the token second, nothing more and nothing less. Anything else (no
-subprotocol header, only the marker, the marker in the wrong position, extra
-entries) is treated exactly like a missing `Authorization` header: `401`,
-not a distinguishable error.
-
-**The server echoes back ONLY the marker, NEVER the token,** as the selected
-`Sec-WebSocket-Protocol` on a successful subprotocol-authenticated upgrade.
-This is not optional politeness — it is required for two independent
-reasons: (1) a response header containing the bearer token would defeat the
-whole "never log/echo the token" discipline this endpoint otherwise
-maintains, and (2) **a browser REJECTS a handshake whose selected
-subprotocol is not one the client itself offered** — selecting nothing, or
-selecting the token, are both wrong; only selecting the marker (which the
-client DID offer) lets the handshake complete. A header-authenticated
-connection (no subprotocol offered at all) gets no `Sec-WebSocket-Protocol`
-in the response either — there is nothing to select from.
-
-### Charset: why `BUTCHR_EXTENSION_TOKEN` itself is constrained, not encoded
-
-RFC 6455 §4.3 restricts a subprotocol value to HTTP token characters (RFC
-2616 §2.2) — no whitespace, no `"`, `,`, `/`, `:`, `;`, control characters,
-or non-ASCII. Rather than invent a second encoding (e.g. base64url) that the
-subprotocol value would need decoding out of on every request — with its own
-decode-failure mode, and a token that reaches the comparison that is never
-quite the raw `BUTCHR_EXTENSION_TOKEN` bytes — **this codebase instead
-requires `BUTCHR_EXTENSION_TOKEN` itself to already consist only of HTTP
-token characters**, checked ONCE at config load
-(`src/config/config.ts`, via `bearer-origin-guard.ts`'s `isHttpTokenChars`).
-A token that fails this check refuses the daemon at startup with the
-offending characters named — loud and immediate, never a token that appears
-to load fine and then silently fails to authenticate (or gets mangled/
-truncated) on the first subprotocol-authenticated request. Any token
-generated by a common "random hex/base64url secret" convention already
-satisfies this; a JWT-shaped token (dot-separated base64url segments) does
-too. Only a token someone deliberately puts a space, comma, or quote in
-would ever hit this refusal.
+WebSocket upgrade — a refusal is an ordinary HTTP response (403/404) — the
+socket is never opened at all.
 
 Once open, the pane the socket attached to is re-checked on every poll tick
 against the SAME staffed-agent registry the initial resolve used. If it goes
@@ -212,42 +139,46 @@ instead.
 
 | env var | required | effect |
 |---|---|---|
-| `BUTCHR_EXTENSION_TOKEN` | to enable the endpoint | the SAME shared bearer token `GET /resources/for-url` uses — and, since FACTORY-455, the SAME token accepted on EITHER credential channel above, never a second token. **UNSET means the endpoint is DISABLED (503 on every upgrade attempt), never open.** Must consist only of HTTP token characters (see "Charset" above) — validated at config load, not silently accepted and later mangled. |
-| `BUTCHR_EXTENSION_ORIGINS` | no | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses. |
+| `BUTCHR_EXTENSION_ORIGINS` | to enable the endpoint | the SAME comma-separated `chrome-extension://<id>` allowlist `/resources/for-url` uses. **UNSET/EMPTY means the endpoint is DISABLED (403 on every upgrade attempt), never open.** |
 
-Both are read once into `Config.extensionAuth` (`src/config/config.ts`) and
-consumed here through `src/web/bearer-origin-guard.ts` — the exact same
-mechanism `/resources/for-url` uses, not a second one.
+Read once into `Config.extensionAuth` (`src/config/config.ts`) and consumed
+here through `src/web/origin-guard.ts` — the exact same mechanism
+`/resources/for-url` uses, not a second one.
 
 `/health`, `/state`, `/dashboard`, `/agents`, and `/resources/for-url` are
 all unaffected by this endpoint — they remain exactly as
 authenticated/unauthenticated as before this change.
 
-## WHY the Origin rule is STRICTER here than `/resources/for-url`'s
+## Security tradeoff (FACTORY-464/FACTORY-465)
 
-`checkBearerOrigin` (the guard `/resources/for-url` uses) deliberately
-**allows a request with no `Origin` header at all** — it only rejects an
-Origin that is present and not allowlisted. That is correct and deliberate
-for an ordinary cross-origin `fetch()`: a browser always sends `Origin` on
-one, and CORS handles the rest, so there is no way for an unlisted page to
-make that specific request succeed.
+This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`,
+sent via `Authorization` or, for a browser caller that cannot set
+`Authorization` on a WebSocket handshake at all, via `Sec-WebSocket-Protocol`
+— FACTORY-454/FACTORY-455). That requirement is GONE: the operator weighed
+the tradeoff and chose to drop it — "one should just be able to start Clevr
+and work if butchr is there." The daemon binds loopback-only
+(`src/daemon/listen.ts`), and on a single-user local box, the operator judged
+an Origin-allowlist-only check sufficient.
 
-**That reasoning does not hold for a WebSocket upgrade, because browsers do
-not apply CORS to WebSockets.** An Origin-less upgrade is exactly what ANY
-page the user has open could send — there is no CORS backstop catching it.
-Calling `checkBearerOrigin` verbatim on this endpoint's upgrade path would
-accept that request and hand it a live, keystroke-capable terminal socket.
+**What this does and does not protect against.** `Origin` is enforced by the
+browser, so this still stops another website open in a browser tab from
+reaching this endpoint. **It does NOT stop any other local process** — a
+script, another user on the same box, `curl` — from setting
+`Origin: chrome-extension://<allowlisted-id>` by hand and driving a live
+agent's terminal; nothing here can tell that apart from the real extension.
+This is accepted as reasonable for a single-user local box, not overlooked.
 
-So this endpoint uses `checkBearerOriginForUpgrade`
-(`src/web/bearer-origin-guard.ts`), a strict sibling that refuses an ABSENT
-`Origin` (403) exactly like a present-but-not-allowlisted one, before the
-token is ever inspected. **Do not "simplify" this route to reuse
-`checkBearerOrigin` directly, and do not "harmonize" the two routes' Origin
-rules to match** — they differ on purpose, because one is CORS-covered and
-the other structurally cannot be. `test/unit/bearer-origin-guard.test.ts`
-and `test/unit/pty-attach-route.test.ts` both cover the missing-Origin case
-specifically, separately from the wrong-Origin case (a different code path
-and a different bug class).
+Because there is no longer a token to fall back to, `checkExtensionOrigin`
+now refuses an ABSENT `Origin` (403) exactly like a present-but-unlisted one
+— this is a change from `checkBearerOrigin`'s pre-FACTORY-465 behavior on the
+plain HTTP route, which used to allow a missing `Origin` through on a valid
+token alone. With the token gone, `Origin` is the only credential left on
+either route, so both now use the SAME rule and the SAME guard function —
+`src/web/origin-guard.ts` no longer needs a separate "strict" variant for the
+WebSocket-upgrade path, because the only thing that used to distinguish it
+from the plain HTTP route (the bearer token's absent-Origin exception) is
+gone. Do not reintroduce a token-based bypass of the Origin check on either
+route without a new, equally deliberate operator decision.
 
 ## Security model, summarized
 
@@ -262,28 +193,26 @@ and a different bug class).
   poll tick.** Both read the same already-polled `dashboardFeed.snapshot()`
   every other route in `src/daemon/index.ts` reads — never a fresh provider
   call.
-- **Token/Origin gate at upgrade, never after, on either credential
-  channel.** A refusal is a plain HTTP response; the socket is never opened
-  and then closed. The Origin rule (strict, `checkBearerOriginForUpgrade`)
-  is identical regardless of whether the credential arrived via
-  `Authorization` or `Sec-WebSocket-Protocol` — FACTORY-455 added the second
-  channel, not a second Origin policy.
-- **Nothing sensitive is logged.** No route or bridge code here logs token
-  values, socket payloads, or keystrokes.
+- **Origin gate at upgrade, never after.** A refusal is a plain HTTP
+  response; the socket is never opened and then closed.
+- **Nothing sensitive is logged.** No route or bridge code here logs socket
+  payloads or keystrokes. (There is no longer a token to log either.)
 
 ## Files
 
-- `src/web/bearer-origin-guard.ts` — adds `checkBearerOriginForUpgrade`, the strict Origin-required sibling of `checkBearerOrigin`; FACTORY-455 extended it with the `Sec-WebSocket-Protocol` fallback (`extractSubprotocolBearer`, `PTY_BEARER_SUBPROTOCOL_MARKER`) and the charset check (`isHttpTokenChars`).
-- `src/config/config.ts` — FACTORY-455: validates `BUTCHR_EXTENSION_TOKEN` against `isHttpTokenChars` at load time.
+- `src/web/origin-guard.ts` — the reusable Origin-allowlist guard
+  (`checkExtensionOrigin`/`preflightExtensionOrigin`), shared verbatim with
+  `GET /resources/for-url`.
+- `src/config/config.ts` — `BUTCHR_EXTENSION_ORIGINS` parsing into
+  `Config.extensionAuth`.
 - `src/terminal/pty-attach.ts` — resolves `:agentKey` to a live pane (and re-checks liveness) over the dashboard snapshot; the refusal vocabulary, reusing `src/terminal/open.ts`'s wording for the "unknown/not-live" case.
 - `src/terminal/pty-bridge.ts` — the pure framing/tick logic: parses client frames, decides what to send and when to close, with no socket, herdr client, or timer of its own.
-- `src/web/view.ts` — the actual `.ws("/agents/:agentKey/pty", ...)` route: the `beforeHandle` auth+resolve gate, the poll-loop wiring, back-pressure config, and the message/close handlers.
+- `src/web/view.ts` — the actual `.ws("/agents/:agentKey/pty", ...)` route: the `beforeHandle` Origin gate, the poll-loop wiring, back-pressure config, and the message/close handlers.
 - `src/daemon/index.ts` — wires real deps: `resolvePtyPane`/`isPaneStillLive` over `dashboardFeed.snapshot()`, the new ANSI-preserving `readPaneForPty` (distinct from the detectors' ANSI-stripping `readPane`), `sendPane`, and the 250ms poll interval.
-- `test/unit/bearer-origin-guard.test.ts` — unit coverage for `checkBearerOriginForUpgrade`, including the missing-Origin case, plus (FACTORY-455) the `Sec-WebSocket-Protocol` channel (success + marker-only echo, wrong/missing credential, Authorization-takes-priority, Origin/token-unset unchanged), `extractSubprotocolBearer`, and `isHttpTokenChars`.
+- `test/unit/origin-guard.test.ts` — unit coverage for `checkExtensionOrigin`/`preflightExtensionOrigin`, including the missing-Origin and empty-allowlist (fail-closed) cases.
 - `test/unit/pty-attach.test.ts` — unit coverage for pane resolution/liveness/refusal wording.
 - `test/unit/pty-bridge.test.ts` — unit coverage for frame parsing and the per-tick decision, including an ANSI-sequence-survives-a-tick case.
-- `test/unit/pty-attach-route.test.ts` — end-to-end coverage over a real upgraded socket: successful attach and input/output round-trip, an ANSI escape sequence surviving the real socket byte-for-byte, a resize control frame not breaking the connection, every upgrade refusal (missing token, wrong token, token unset, missing Origin, wrong Origin, malformed key, unknown/not-live key), a `herdr.pane.read` failure, a pane disappearing between `beforeHandle` and `open`, the pane-disappearing close reason, and (FACTORY-455) the `Sec-WebSocket-Protocol` channel over a real socket — successful attach with the response's `.protocol` equal to the marker (never the token), a wrong subprotocol credential never opening the socket, and the HTTP-level refusals (wrong/missing subprotocol credential, token unset, missing/wrong Origin) all still applying to that channel.
-- `test/unit/config.test.ts` — (FACTORY-455) `BUTCHR_EXTENSION_TOKEN` charset validation: rejects characters invalid in a WebSocket subprotocol value, naming the offenders; accepts common secret shapes (hex, base64url, JWT-like).
+- `test/unit/pty-attach-route.test.ts` — end-to-end coverage over a real upgraded socket: successful attach and input/output round-trip, an ANSI escape sequence surviving the real socket byte-for-byte, a resize control frame not breaking the connection, every upgrade refusal (missing/wrong Origin, empty allowlist, malformed key, unknown/not-live key), a `herdr.pane.read` failure, and a pane disappearing between `beforeHandle` and `open`.
 
 ## A related, inherent limitation worth documenting here
 
