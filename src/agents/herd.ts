@@ -1493,22 +1493,40 @@ export class HerdrHerd implements Herd {
     const entry = (await this.byIssue()).get(issue);
     if (!entry) return "unresumable"; // no longer running — nothing to resume; the ordinary spawn loop picks it up
     const { pane, cwd, launchPending } = entry;
-    // FACTORY-489 (FACTORY-312, director measurement relayed via
-    // FACTORY-73/FACTORY-467): a pane whose claude launch is still pending
-    // can report `agent_status: "idle"`/`"done"` for several seconds before
-    // its `agent_session` registers — `providerOfPane` below can't tell that
-    // apart from a genuinely ready claude, since it only inspects the OS
-    // foreground process's argv/name, never `agent.list()`'s own
-    // `launch_pending`/`agent_session`. `launchPending` (`byIssue()`'s own
-    // doc comment has the wire signal) is the one field herdr exposes that
-    // DOES distinguish them, so it is checked here, early, before any other
-    // gate below could otherwise let `/exit` reach a claude that hasn't
-    // finished starting up.
-    if (launchPending) return "deferred";
     const sessionId = workspaceSessionId(cwd);
     if (!sessionId) return "unresumable"; // pre-FACTORY-314 workspace (or genuinely unknown) — caller falls back to fresh-restart with an honest "session lost: session id could not be determined" reason
     const found = await this.providerOfPane(pane);
     if (!found || found.provider !== "claude") return "unresumable"; // this ticket's --resume mechanism covers Claude only
+    // FACTORY-489 (FACTORY-312): `launchPending` has been on this entry all
+    // along — `byIssue()` already threads it through (added by #570 for the
+    // unrelated herdr-restored-pane classification) — and is deliberately
+    // ADOPTED here, not newly discovered. It matters because neither of the
+    // TWO gates just above can tell a launch-pending claude apart from a
+    // genuinely ready one: `providerOfPane` is a pure OS-process check
+    // (argv/name only), and `isIdle()` further below reads `agent_status`,
+    // which is computed from screen state independently of the
+    // managed-agent launch phase — a pane whose claude launch is still
+    // pending can report `agent_status: "idle"`/`"done"` before its
+    // `agent_session` has registered.
+    //
+    // Checked HERE, deliberately AFTER `providerOfPane` rather than before
+    // it: `launchPending` can still read true after the underlying claude
+    // process has already died (herdr's bookkeeping lagging the OS), and a
+    // guard placed ahead of `providerOfPane` would then return "deferred"
+    // on every poll of an already-empty pane, forever — silently replacing
+    // the existing "unresumable" -> stop()/spawn() recovery that
+    // `providerOfPane` finding nothing already provides for that case.
+    // Placing this guard after it lets that door close first.
+    //
+    // The bound on this deferral is NOT uniform (source read of herdr at
+    // the running version's tag, not a live measurement). herdr's Pending
+    // launch phase is deadline-bounded — a start timeout, 30s default/300s
+    // cap, after which herdr clears the managed agent itself — but its
+    // Blocked phase has no deadline and relies on the promotion conjunction
+    // instead, so a launch-pending deferral hit while the pane is Blocked
+    // is not bounded by anything herdr guarantees. This does not resolve
+    // "in practice"; it can persist.
+    if (launchPending) return "deferred";
     // FACTORY-314 (PR #513 review fix): verify the id we are ABOUT TO RESUME
     // still has a real transcript before doing anything else — a stale or
     // corrupted persisted id must fail safe (an honest fresh restart) rather

@@ -2191,7 +2191,7 @@ describe("resumeInPlace", () => {
    * changes when `pane.sendKeys` (the `/exit`) and `agent.start` (the
    * relaunch) are called, the same way a real pane would.
    */
-  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean; launchPending?: boolean } = {}) {
+  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean; launchPending?: boolean; processGone?: boolean } = {}) {
     let status: string = initialStatus;
     let foreground: "claude" | "shell" = "claude";
     // FACTORY-314 (epic review on PR #513, point 3): the REAL argv from the
@@ -2229,7 +2229,12 @@ describe("resumeInPlace", () => {
         },
       },
       pane: {
-        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
+        // FACTORY-489: `processGone` decouples processInfo from `foreground`
+        // — herdr's agent.list() bookkeeping can still list a pane as
+        // launch-pending claude for a moment after its actual OS process has
+        // already died; this simulates exactly that lag, independent of
+        // whatever `list()` above still reports.
+        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
         // FACTORY-491 (director item 3): records every defensive close so
@@ -2306,8 +2311,8 @@ describe("resumeInPlace", () => {
     });
   });
 
-  // FACTORY-489 (FACTORY-312, director measurement relayed via
-  // FACTORY-73/FACTORY-467): agent_status is computed from screen state
+  // FACTORY-489 (FACTORY-312, source read of herdr at the running version's
+  // tag, not a live measurement): agent_status is computed from screen state
   // independently of the managed-agent launch phase, so a pane whose claude
   // launch is still pending can report agent_status "idle"/"done" — a state
   // `isIdle()` alone would treat as ready to `/exit`. `launchPending` is the
@@ -2345,6 +2350,31 @@ describe("resumeInPlace", () => {
         expect(outcome).toBe("resumed");
         expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
         expect(f.started).toHaveLength(1);
+      });
+    });
+  });
+
+  // FACTORY-489 (FACTORY-312 review correction): pins the launchPending
+  // guard's PLACEMENT, not just its existence. A guard placed BEFORE
+  // `providerOfPane` would return "deferred" forever on a pane whose
+  // agent.list() entry still lags with launch_pending:true after the
+  // underlying claude process has already died — silently swallowing the
+  // existing "unresumable" -> stop()/spawn() recovery that a "no process
+  // found" providerOfPane result already provides for that case. This test
+  // can only pass if the guard runs AFTER providerOfPane: the entry itself
+  // (and launch_pending:true) is present, but the pane's OS process is gone.
+  test("unresumable, NOT deferred: launch_pending true but the pane's OS process is already gone — the existing providerOfPane gate wins, not the launchPending guard", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true, processGone: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("unresumable");
+        expect(f.sent).toEqual([]);
+        expect(f.started).toHaveLength(0);
       });
     });
   });
