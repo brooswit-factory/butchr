@@ -50,13 +50,45 @@ export interface OriginGuardDeps {
   allowedOrigins: readonly string[];
 }
 
+/**
+ * FACTORY-476: the three ways this guard refuses a request, told apart —
+ * a bare 403 in the journal can't distinguish "no Origin sent at all" from
+ * "sent one, but it's not on the list" from "the list itself is empty" (an
+ * operator misconfiguration, not a caller mistake). `checkExtensionOrigin`
+ * and `preflightExtensionOrigin` both classify with the SAME precedence
+ * (`classifyOrigin` below) so a caller logging this never has to reconcile
+ * two different orderings. This is a NEW, finer-grained signal for the
+ * logger `src/web/origin-guard-log.ts` adds on top of this guard — it does
+ * NOT change `GuardOutcome.body.error`'s wording, which stays exactly what
+ * it was before this ticket (an empty allowlist and a non-allowlisted
+ * origin both still say "origin not allowed" on the wire).
+ */
+export type GuardRejectReason = "origin required" | "origin not allowed" | "allowlist empty";
+
 export type GuardOutcome =
   | { ok: true; corsHeaders: Record<string, string> }
-  | { ok: false; status: number; body: { error: string }; corsHeaders: Record<string, string> };
+  | { ok: false; status: number; body: { error: string }; corsHeaders: Record<string, string>; reason: GuardRejectReason };
 
 /** CORS headers for an ALLOWLISTED origin only — never call this for a disallowed or absent origin. */
 function corsHeadersFor(origin: string): Record<string, string> {
   return { "access-control-allow-origin": origin, vary: "Origin" };
+}
+
+/**
+ * Shared classification behind both `checkExtensionOrigin` and
+ * `preflightExtensionOrigin` — `null` means "allowed", anything else is the
+ * specific reason it isn't. Order is deliberate: an absent Origin is always
+ * "origin required" even when the allowlist is also empty (there is nothing
+ * to compare it against either way, but "no credential offered" is the more
+ * specific, more actionable fact); an empty allowlist is checked before the
+ * membership test so a present-but-unlisted origin against a genuinely empty
+ * list reads as the operator-misconfiguration case, not an ordinary mismatch.
+ */
+function classifyOrigin(origin: string | null, deps: OriginGuardDeps): GuardRejectReason | null {
+  if (origin === null) return "origin required";
+  if (deps.allowedOrigins.length === 0) return "allowlist empty";
+  if (!deps.allowedOrigins.includes(origin)) return "origin not allowed";
+  return null;
 }
 
 /**
@@ -68,25 +100,28 @@ function corsHeadersFor(origin: string): Record<string, string> {
  * Never throws.
  */
 export function checkExtensionOrigin(req: { origin: string | null }, deps: OriginGuardDeps): GuardOutcome {
-  if (req.origin === null) {
-    return { ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} };
+  const reason = classifyOrigin(req.origin, deps);
+  if (reason !== null) {
+    // `body.error` deliberately does NOT vary between "allowlist empty" and
+    // "origin not allowed" — see `GuardRejectReason`'s own doc comment.
+    return { ok: false, status: 403, body: { error: reason === "origin required" ? "origin required" : "origin not allowed" }, corsHeaders: {}, reason };
   }
-  if (!deps.allowedOrigins.includes(req.origin)) {
-    return { ok: false, status: 403, body: { error: "origin not allowed" }, corsHeaders: {} };
-  }
-  return { ok: true, corsHeaders: corsHeadersFor(req.origin) };
+  return { ok: true, corsHeaders: corsHeadersFor(req.origin!) };
 }
 
 /**
  * The CORS preflight (`OPTIONS`) response for a route guarded by
- * `checkExtensionOrigin`.
+ * `checkExtensionOrigin`. `reason` is present only on refusal — same
+ * classification as `checkExtensionOrigin`, exposed here so a caller can log
+ * the OPTIONS rejection too, the same way it logs the GET one.
  */
-export function preflightExtensionOrigin(req: { origin: string | null }, deps: OriginGuardDeps): { status: number; headers: Record<string, string> } {
-  if (req.origin === null || !deps.allowedOrigins.includes(req.origin)) return { status: 403, headers: {} };
+export function preflightExtensionOrigin(req: { origin: string | null }, deps: OriginGuardDeps): { status: number; headers: Record<string, string>; reason?: GuardRejectReason } {
+  const reason = classifyOrigin(req.origin, deps);
+  if (reason !== null) return { status: 403, headers: {}, reason };
   return {
     status: 204,
     headers: {
-      ...corsHeadersFor(req.origin),
+      ...corsHeadersFor(req.origin!),
       // FACTORY-480: `POST /resources/for-url` carries a JSON body
       // (`content-type: application/json`, not a CORS-safelisted value for
       // that header), which is why a POST here triggers a preflight at all —

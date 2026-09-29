@@ -413,6 +413,6 @@ describe("guard behavior with the real config (FACTORY-497/FACTORY-475)", () => 
   test("absent Origin is still refused (403) even with the default allowlist populated", () => {
     const c = loadConfig(base, noRead);
     const r = checkExtensionOrigin({ origin: null }, c.extensionAuth);
-    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} });
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {}, reason: "origin required" });
   });
 });
