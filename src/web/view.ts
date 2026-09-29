@@ -66,18 +66,19 @@ export interface ViewDeps {
   configInventory: () => Promise<QueryAgentInventory>;
   /**
    * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the
-   * `GET /resources/for-url` body — see `../resources/resource-lookup.ts`'s
-   * own header for why this reads the staffed-agent registry
-   * (`dashboard()`'s SAME snapshot, never a second poll or a re-run query)
-   * rather than doing any I/O of its own. Optional so every pre-existing
-   * `ViewDeps` literal in this codebase's own tests keeps compiling
-   * unchanged; `extensionAuth` below defaults to disabled when either is
-   * absent, so an omitted `resourcesForUrl` is never reachable anyway.
+   * `GET`/`POST /resources/for-url` body (FACTORY-480 added the POST) — see
+   * `../resources/resource-lookup.ts`'s own header for why this reads the
+   * staffed-agent registry (`dashboard()`'s SAME snapshot, never a second
+   * poll or a re-run query) rather than doing any I/O of its own. Optional
+   * so every pre-existing `ViewDeps` literal in this codebase's own tests
+   * keeps compiling unchanged; `extensionAuth` below defaults to disabled
+   * when either is absent, so an omitted `resourcesForUrl` is never
+   * reachable anyway.
    */
   resourcesForUrl?: (url: string) => Promise<ResourcesForUrlResponse>;
   /**
    * FACTORY-339: the Origin-allowlist guard config for
-   * `GET /resources/for-url` (see `./origin-guard.ts`). Optional, same
+   * `GET`/`POST /resources/for-url` (see `./origin-guard.ts`). Optional, same
    * reasoning as `resourcesForUrl` above — absent means an empty
    * `allowedOrigins`, which the guard treats as "reject everything", the
    * same "never silently open" default it enforces generally.
@@ -244,6 +245,19 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // (no allowlisted origin can ever match an empty list), never a
     // fallback to "unauthenticated". `deps.resourcesForUrl` is only ever
     // called once the guard has already said `ok`.
+    //
+    // FACTORY-480: a real MV3 service-worker GET (Clevr's own
+    // `fetchResources`) carries NO `Origin` header at all — Chrome only
+    // stamps `Origin` on a POST from that context — so the strict guard
+    // above 403s every real install of the GET-only route below, and no
+    // allowlist entry can fix that (see FACTORY-478's measurement). The
+    // GET route is kept, UNCHANGED, for any caller that can present a real
+    // allowlisted Origin itself (e.g. `curl -H Origin: ...`, exactly what
+    // `docs/resources-for-url.md` already documented) — it is not removed
+    // because nothing here requires removing it, and removing it would be
+    // a needless behavior change for such a caller. Clevr itself now uses
+    // the POST route below, which Chrome DOES stamp with Origin from the
+    // same service-worker context.
     .options("/resources/for-url", ({ request, set }) => {
       const preflight = preflightExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
       set.status = preflight.status;
@@ -262,6 +276,27 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // `{ canonicalUrl: null, resource: null }`, the same normal "not a
       // resource" shape as any other unparseable input, never a special error.
       const url = typeof query["url"] === "string" ? query["url"] : "";
+      return deps.resourcesForUrl(url);
+    })
+    // FACTORY-480: the route Clevr's extension service worker actually uses
+    // now — same guard, same response shape as the GET above, but the URL
+    // travels in a JSON body instead of a query string, because that's the
+    // request shape Chrome stamps with `Origin: chrome-extension://<id>`
+    // from an MV3 service worker (a GET from that context never carries
+    // one — see this route group's own header comment above). The guard
+    // check happens BEFORE the body is ever read, same discipline as the
+    // GET route.
+    .post("/resources/for-url", async ({ request, body, set }) => {
+      const guard = checkExtensionOrigin({ origin: request.headers.get("origin") }, extensionAuth);
+      for (const [k, v] of Object.entries(guard.corsHeaders)) set.headers[k] = v;
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.resourcesForUrl) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      // Same "absent/malformed is just the empty-string case" discipline as
+      // the GET route's own `query.url` handling above — `body` is whatever
+      // Elysia parsed from the request (or `undefined`/non-JSON), never
+      // trusted to have the right shape.
+      const parsedUrl = (body as { url?: unknown } | undefined)?.url;
+      const url = typeof parsedUrl === "string" ? parsedUrl : "";
       return deps.resourcesForUrl(url);
     })
     // FACTORY-453 (implementing FACTORY-337, epic FACTORY-330): the other

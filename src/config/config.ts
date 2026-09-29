@@ -73,6 +73,29 @@ export interface Config {
     managedPrefix?: string;
   };
   /**
+   * FACTORY-369: a managed session's unanswerable-dialog escalation to
+   * Rocket.Chat's `#team-admin` — a SEPARATE identity/credential from
+   * `rocketchat` above, deliberately. That one is account-management ONLY
+   * (its own doc comment explains why, and `docs/real-rc-verification-runbook.md`
+   * §1.3 verifies its credential is REFUSED for posting-adjacent calls as a
+   * defence-in-depth check); the identity that may POST to a room is a
+   * different Nexus grant that did not exist when this ticket was filed
+   * (see `src/resources/rocketchat.ts`'s `RocketChatPoster`). OPTIONAL,
+   * same all-or-nothing shape as `rocketchat`/`github`: present only when
+   * BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL, _USER_ID and _TOKEN_FILE are ALL set;
+   * otherwise every managed-session escalation degrades to a loud,
+   * complete journal line only (`EscalatorDeps.teamAdminNotify` absent —
+   * see `src/agents/escalation-loop.ts`), never a crash and never a silent
+   * drop.
+   */
+  managedEscalationRocketChat?: {
+    url: string;
+    adminUserId: string;
+    adminTokenFile: string;
+    /** Defaults to `"team-admin"` (the routing spec's own room, FACTORY-358 comment 26435) when BUTCHR_TEAM_ADMIN_ROOM is unset. */
+    room: string;
+  };
+  /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
    * kickoff that never worked counts from first observed running, since it
@@ -418,6 +441,10 @@ export interface ConfigEnv {
   ROCKETCHAT_TOKEN_DIR?: string | undefined;
   ROCKETCHAT_NEXUS_MANIFEST_FILE?: string | undefined;
   ROCKETCHAT_MANAGED_PREFIX?: string | undefined;
+  BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL?: string | undefined;
+  BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?: string | undefined;
+  BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?: string | undefined;
+  BUTCHR_TEAM_ADMIN_ROOM?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
@@ -503,6 +530,20 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     rocketchat = { url: rcUrl, adminUserId: rcAdminUserId, adminTokenFile: rcAdminTokenFile, userCapThreshold, temporaryAccountCapThreshold, tokenDir, nexusManifestFile, ...(managedPrefix ? { managedPrefix } : {}) };
   }
 
+  // FACTORY-369: a SEPARATE identity from `rocketchat` above — see
+  // `Config.managedEscalationRocketChat`'s own doc comment for why. Same
+  // "optional, never a startup crash for unrelated config" contract: a
+  // stray BUTCHR_TEAM_ADMIN_ROOM with the credential otherwise unset must
+  // never crash a daemon that isn't using this feature at all.
+  const teamAdminUrl = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL?.trim();
+  const teamAdminAdminUserId = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?.trim();
+  const teamAdminTokenFile = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?.trim();
+  let managedEscalationRocketChat: Config["managedEscalationRocketChat"];
+  if (teamAdminUrl && teamAdminAdminUserId && teamAdminTokenFile) {
+    const room = env.BUTCHR_TEAM_ADMIN_ROOM?.trim() || "team-admin";
+    managedEscalationRocketChat = { url: teamAdminUrl, adminUserId: teamAdminAdminUserId, adminTokenFile: teamAdminTokenFile, room };
+  }
+
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
@@ -586,6 +627,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
     ...(rocketchat ? { rocketchat } : {}),
+    ...(managedEscalationRocketChat ? { managedEscalationRocketChat } : {}),
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
@@ -701,6 +743,7 @@ export const describeConfig = (c: Config): string =>
   `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
+  `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +

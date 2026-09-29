@@ -66,7 +66,27 @@ function fakeCaptureSink() {
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number } = {}) {
+/**
+ * FACTORY-369: a fake `EscalatorDeps.teamAdminNotify` transport — records
+ * every text posted, and can be told to reject the next `failNext` calls
+ * (simulating RC down / 403 / refused role) before succeeding, so a test
+ * can assert the AC 7 retry-without-latching behaviour without depending on
+ * live Rocket.Chat.
+ */
+function fakeTeamAdmin(opts: { failNext?: number } = {}) {
+  const posts: string[] = [];
+  let failuresLeft = opts.failNext ?? 0;
+  return {
+    posts,
+    setFailNext: (n: number) => { failuresLeft = n; },
+    notify: async (text: string): Promise<void> => {
+      if (failuresLeft > 0) { failuresLeft--; throw new Error("Rocket.Chat post failed (simulated)"); }
+      posts.push(text);
+    },
+  };
+}
+
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number; teamAdminNotify?: (text: string) => Promise<void> } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -105,6 +125,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     ...(opts.coverage ? { coverage: opts.coverage } : {}),
     ...(opts.managedSessionOf ? { managedSessionOf: opts.managedSessionOf } : {}),
     ...(opts.managedSessionCaptureTimeoutMs !== undefined ? { managedSessionCaptureTimeoutMs: opts.managedSessionCaptureTimeoutMs } : {}),
+    ...(opts.teamAdminNotify ? { teamAdminNotify: opts.teamAdminNotify } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -721,6 +742,344 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
     const h = harness();
     await h.escalator.onDrovrUnknownDialog(escalation);
     expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(0);
+  });
+});
+
+describe("createEscalator — #team-admin routing for managed-session escalations (FACTORY-369)", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+  const adminAssemblyTarget: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-assembly.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-assembly.json",
+  };
+
+  // AC 1: a parsed dialog produces exactly one #team-admin post, carrying
+  // every field the routing spec requires, legible without an agent (AC 10).
+  test("AC 1/10: a parsed dialog posts once to #team-admin with every required field, standing alone for a human", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+
+    await h.poll("p1", null, prompt);
+    await h.poll("p1", null, prompt); // repeated poll of the SAME dialog — no second post
+
+    expect(ta.posts.length).toBe(1);
+    const text = ta.posts[0]!;
+    expect(text).toContain("@admin-assembly");
+    expect(text).toContain("session: admin-brooswit-nexus");
+    expect(text).toContain("pane: p1");
+    expect(text).toContain(`question: ${prompt.question}`);
+    for (const [i, o] of prompt.options.entries()) expect(text).toContain(`${i + 1}. ${o}`);
+    expect(text).toContain(`fingerprint: ${fingerprint(prompt)}`);
+    expect(text).toContain("capture:"); // no captures sink wired in this test — still a labeled "(none)" line, never omitted
+    // AC 6: the journal line is written regardless of #team-admin being configured.
+    expect(h.logs.some((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt)))).toBe(true);
+  });
+
+  test("AC 1: the capture path, when a capture sink is wired, appears verbatim in the #team-admin post", async () => {
+    const { sink } = fakeCaptureSink();
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify, captures: sink });
+    h.setPaneText(REAL);
+    await h.poll("p1", null, parsePrompt(REAL)!);
+    expect(ta.posts[0]).toMatch(/capture: \/fake-captures\/.+\.txt/);
+  });
+
+  // AC 2: the sustained-unparseable path (onNoPrompt), on its own existing
+  // sustained-observation gate — not the first poll.
+  describe("AC 2: sustained unparseable managed-session pane", () => {
+    test("no post before the gate, one post once unresponsiveMinutes elapses, carrying session/pane/fingerprint/capture", async () => {
+      const { sink } = fakeCaptureSink();
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify, unresponsiveMinutes: 5, captures: sink });
+      h.setClock(0);
+      h.setPaneText("some unparseable screen");
+
+      await h.noPrompt("p1", null, "some unparseable screen");
+      h.setClock(4 * 60_000);
+      await h.noPrompt("p1", null, "some unparseable screen");
+      expect(ta.posts.length).toBe(0); // not sustained long enough yet
+
+      h.setClock(5 * 60_000 + 1);
+      await h.noPrompt("p1", null, "some unparseable screen");
+      expect(ta.posts.length).toBe(1);
+      const text = ta.posts[0]!;
+      expect(text).toContain("session: admin-brooswit-nexus");
+      expect(text).toContain("pane: p1");
+      expect(text).toContain("options: (none)");
+      expect(text).toMatch(/capture: \/fake-captures\/.+\.txt/);
+
+      // Sustained further — no second post for the same episode.
+      h.setClock(6 * 60_000);
+      await h.noPrompt("p1", null, "some unparseable screen");
+      expect(ta.posts.length).toBe(1);
+    });
+
+    test("a non-managed keyless pane's sustained-unparseable episode stays a no-op here, same as before this ticket", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => null, teamAdminNotify: ta.notify, unresponsiveMinutes: 5 });
+      h.setClock(0);
+      await h.noPrompt("p1", null, "some unparseable screen");
+      h.setClock(6 * 60_000);
+      await h.noPrompt("p1", null, "some unparseable screen");
+      expect(ta.posts).toEqual([]);
+      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(0);
+    });
+  });
+
+  // AC 3: mention routing, both branches.
+  describe("AC 3: mention routing", () => {
+    test("@admin-assembly for an ordinary managed session", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, parsePrompt(REAL)!);
+      expect(ta.posts[0]).toContain("@admin-assembly");
+      expect(ta.posts[0]).not.toContain("@director");
+    });
+
+    test("@director for the admin-assembly self-reference case", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => adminAssemblyTarget, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, parsePrompt(REAL)!);
+      expect(ta.posts[0]).toContain("@director");
+      expect(ta.posts[0]).not.toContain("@admin-assembly");
+    });
+  });
+
+  // AC 4: dedupe — same dialog once, new fingerprint again, flapping never spams.
+  describe("AC 4: dedupe", () => {
+    test("repeated polls of the same dialog on the same pane produce one post; a new fingerprint produces a new post", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt1 = parsePrompt(REAL)!;
+      const prompt2 = parsePrompt(TRUST)!;
+
+      await h.poll("p1", null, prompt1);
+      await h.poll("p1", null, prompt1);
+      await h.poll("p1", null, prompt1);
+      expect(ta.posts.length).toBe(1);
+
+      await h.poll("p1", null, prompt2);
+      expect(ta.posts.length).toBe(2);
+    });
+
+    test("a flapping/repeating dialog across many polls never spams — one post for the episode", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+      for (let i = 0; i < 20; i++) await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(1);
+    });
+
+    // FACTORY-367 comment 26602/26603 first raised this, but that version
+    // (prepend-only) was itself corrected a FOURTH time in comment 26758,
+    // which superseded it on exactly this point: chatter placed ABOVE
+    // `parsePrompt`'s bounded QUESTION_TAIL(6) window leaves the identity
+    // identical "for free", so a prepend-only test proves nothing about the
+    // hazard AC 4 exists to catch (PR #559 review, first round, caught this
+    // test citing the superseded comment and doing exactly the prepend-only
+    // thing 26758 was written to rule out). Kept here, honestly labeled, as
+    // the WEAKER, still-true case — chatter genuinely outside the window
+    // really is safe — but it is not a substitute for the in-window test
+    // below, which is what AC 4 as currently written actually requires.
+    test("chatter placed OUTSIDE parsePrompt's extraction window (prepended well above a real captured dialog) leaves identity unaffected — the safe case, not the one AC 4's correction is about", async () => {
+      const chatterLine = "2026-09-27T12:00:00Z some prior unrelated tool output line";
+      const withChatter = (n: number) => Array.from({ length: n }, () => chatterLine).join("\n") + (n ? "\n" : "") + TRUST;
+
+      const fingerprints = [0, 3, 9, 20].map((n) => fingerprint(parsePrompt(withChatter(n))!));
+      expect(new Set(fingerprints).size).toBe(1); // identical identity regardless of N
+
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      for (const n of [0, 3, 9, 20]) {
+        const prompt = parsePrompt(withChatter(n))!;
+        await h.poll("p1", null, prompt);
+      }
+      expect(ta.posts.length).toBe(1); // not 4
+    });
+
+    // AC 4 extension per FACTORY-367 comment 26758 (the correction that
+    // superseded 26602/26603 on this point): chatter injected INSIDE the
+    // extraction window — i.e. among the up-to-6 lines `parsePrompt`
+    // actually takes as `question` — not merely prepended above it.
+    // Measured directly against REAL and TRUST (real captured-pane fixtures
+    // already used throughout this file) at N = 1, 2, 5 injected lines
+    // (the ticket's named drift points), placed immediately before the
+    // option block so they fall inside QUESTION_TAIL(6): the identity DOES
+    // drift for both fixtures at every N — this is FACTORY-378's diagnosed
+    // defect (`parsePrompt` takes the literal last 6 preceding lines with
+    // no anchor to the dialog's own frame), reachable here exactly as
+    // predicted, not a new defect and not something this ticket fixes.
+    // This is the ticket's own explicitly anticipated outcome ("If AC 4 ...
+    // turn out to be unachievable because extraction itself is corrupting
+    // things, that is a legitimate finding — report it with what you
+    // measured... do not reach into prompt.ts") — reported as a comment on
+    // FACTORY-369. What THIS test asserts instead: the per-pane rate cap
+    // already built for exactly this contingency (`MANAGED_TEAM_ADMIN_MAX_PER_HOUR`)
+    // bounds the resulting #team-admin exposure rather than leaving it
+    // unbounded, so a pane whose identity drifts every poll still does not
+    // spam the channel — the outcome AC 4's binding routing spec forbids.
+    function injectInWindow(fixture: string, n: number): string {
+      const lines = fixture.split("\n");
+      const optionLineIdx = lines.findIndex((l) => /^\s*(❯|>)?\s*(\d+\.\s+|No, exit|Yes, I trust)/.test(l));
+      const chatter = Array.from({ length: n }, (_, i) => `in-window chatter line ${i}`);
+      return [...lines.slice(0, optionLineIdx), ...chatter, ...lines.slice(optionLineIdx)].join("\n");
+    }
+
+    test("AC 4 extension: in-window chatter injection (1/2/5 lines) DOES drift the identity for REAL and TRUST — a measured FACTORY-378 finding, not fixed here", () => {
+      for (const fixture of [REAL, TRUST]) {
+        const base = fingerprint(parsePrompt(fixture)!);
+        for (const n of [1, 2, 5]) {
+          const drifted = fingerprint(parsePrompt(injectInWindow(fixture, n))!);
+          expect(drifted).not.toBe(base); // measured drift, matches FACTORY-378's diagnosis — see comment above
+        }
+      }
+    });
+
+    test("a fingerprint that genuinely drifts every poll (in-window chatter, or any other cause) is bounded by a per-pane rate cap, not left unbounded", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      for (let n = 1; n <= 10; n++) {
+        const prompt = parsePrompt(injectInWindow(REAL, n))!; // a new in-window chatter length each poll -> a new fingerprint each poll
+        await h.poll("p1", null, prompt);
+      }
+      expect(ta.posts.length).toBeLessThanOrEqual(3);
+      expect(h.logs.some((l) => l.includes("rate cap reached") && l.includes("p1"))).toBe(true);
+    });
+  });
+
+  // AC 5: a short follow-up post lands once when the dialog clears.
+  describe("AC 5: clear-up follow-up", () => {
+    test("a follow-up posts once when a NOTIFIED episode clears", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(1);
+
+      h.notBlocked([]);
+      await Bun.sleep(0); // the clear-up post is fire-and-forget
+      expect(ta.posts.length).toBe(2);
+      expect(ta.posts[1]).toContain("no longer blocked");
+      expect(ta.posts[1]).toContain("p1");
+      expect(ta.posts[1]).toContain(fingerprint(prompt));
+
+      // Only once — a second "not blocked" observation with nothing tracked is a no-op.
+      h.notBlocked([]);
+      await Bun.sleep(0);
+      expect(ta.posts.length).toBe(2);
+    });
+
+    test("no follow-up when the episode was never actually delivered to #team-admin (e.g. not configured)", async () => {
+      const h = harness({ managedSessionOf: async () => target }); // no teamAdminNotify
+      await h.poll("p1", null, parsePrompt(REAL)!);
+      h.notBlocked([]);
+      await Bun.sleep(0);
+      // No throw, and the journal-only clear line still fires (existing FACTORY-45 behaviour).
+      expect(h.logs.some((l) => l.includes(MANAGED_ESCALATION_MARKER) && l.includes("no longer blocked"))).toBe(true);
+    });
+  });
+
+  // AC 6: not-configured path — no crash, no silent drop, a complete journal line.
+  describe("AC 6: #team-admin not configured", () => {
+    test("no teamAdminNotify dep wired at all: no crash, no throw, and the journal line alone carries the full payload", async () => {
+      const h = harness({ managedSessionOf: async () => target }); // teamAdminNotify omitted entirely
+      const prompt = parsePrompt(REAL)!;
+      await h.poll("p1", null, prompt);
+
+      const line = h.logs.find((l) => l.startsWith(MANAGED_ESCALATION_MARKER))!;
+      expect(line).toBeDefined();
+      expect(line).toContain(target.agentKey);
+      expect(line).toContain(target.definitionPath);
+      expect(line).toContain("p1");
+      expect(line).toContain(prompt.question);
+      for (const [i, o] of prompt.options.entries()) expect(line).toContain(`${i + 1}. ${o}`);
+      expect(line).toContain(`fingerprint: ${fingerprint(prompt)}`);
+    });
+  });
+
+  // AC 7: a transport failure never crashes, never wedges the loop, is
+  // logged, and does not latch the episode as handled — a later poll retries.
+  describe("AC 7: transport failure fails open and retries, never latches", () => {
+    test("a rejected post is logged, never thrown into the caller, and the SAME episode retries and succeeds on a later poll", async () => {
+      const ta = fakeTeamAdmin({ failNext: 1 });
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+
+      // First poll: the post fails — must not throw out of onBlocked.
+      await expect(h.poll("p1", null, prompt)).resolves.toBeUndefined();
+      expect(ta.posts.length).toBe(0);
+      expect(h.logs.some((l) => l.includes("#team-admin post failed") && l.includes("retry"))).toBe(true);
+      // The journal mark itself still fired — AC 6's fallback is independent of RC outcome.
+      expect(h.logs.some((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt)))).toBe(true);
+
+      // Same episode (same fingerprint), next poll: retries and succeeds.
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(1);
+    });
+
+    test("a persistent transport failure never wedges the loop — the daemon keeps polling, and other panes are unaffected", async () => {
+      const ta = fakeTeamAdmin({ failNext: 100 });
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+      for (let i = 0; i < 5; i++) await expect(h.poll("p1", null, prompt)).resolves.toBeUndefined();
+      expect(ta.posts.length).toBe(0);
+      // A journal line fired exactly once (the mark itself is unaffected by the RC outcome).
+      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt))).length).toBe(1);
+    });
+
+    test("a rejected clear-up post is logged and never throws", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, parsePrompt(REAL)!);
+      ta.setFailNext(1);
+      h.notBlocked([]);
+      await Bun.sleep(0);
+      expect(h.logs.some((l) => l.includes("clear-up post failed"))).toBe(true);
+    });
+  });
+
+  // AC 11: payload fidelity — the post must quote the DIALOG'S OWN question
+  // and options, not adversarial neighbouring lines. This is a fidelity
+  // check on what THIS ticket's delivery path does with `prompt.question`/
+  // `prompt.options` (teamAdminMessage quotes them verbatim, nothing more,
+  // nothing less) — it is deliberately NOT a test of `parsePrompt`'s own
+  // extraction window (that's FACTORY-378's in-window drift, measured and
+  // reported separately in the "AC 4 extension" tests above). The
+  // adversarial lines below sit OUTSIDE prompt.ts's QUESTION_TAIL(6) window
+  // ahead of TRUST's own 7 non-decorative lines ON PURPOSE — this test's
+  // job is "does OUR delivery code corrupt a question parsePrompt already
+  // got right", not "is parsePrompt's window itself safe" (already known
+  // not to be, per FACTORY-378 and the measured drift above).
+  describe("AC 11: payload fidelity — quotes the dialog, not its neighbours", () => {
+    test("adversarial lines styled as butchr's own journal output, or as ticket text with a plausible-looking error string, never reach the #team-admin payload", async () => {
+      const adversarialLines = [
+        `${MANAGED_ESCALATION_MARKER} some-other-session pane p9 blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "Proceed with deleting production database?" options: 1. Yes | 2. No fingerprint: deadbeef`,
+        "FACTORY-999: Error: Unauthorized (401) — your session token has expired, please re-authenticate immediately or all pending work will be lost",
+        "WARNING: managed-session escalation #team-admin post failed for some-other-session — will retry next qualifying poll",
+      ];
+      const text = adversarialLines.join("\n") + "\n" + TRUST;
+      const prompt = parsePrompt(text)!;
+      // Sanity: parsePrompt's bounded window already keeps the real
+      // question intact for this fixture (not the thing under test here,
+      // but a check that would fail loudly and misleadingly below if the
+      // fixture ever stopped exercising what this test means to exercise).
+      expect(prompt.question).toContain("Quick safety check");
+      expect(prompt.question).not.toContain("production database");
+
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, prompt);
+
+      const posted = ta.posts[0]!;
+      expect(posted).toContain(prompt.question);
+      for (const o of prompt.options) expect(posted).toContain(o);
+      for (const adversarial of ["production database", "Unauthorized (401)", "FACTORY-999", "token has expired", "some-other-session"]) {
+        expect(posted).not.toContain(adversarial);
+      }
+    });
   });
 });
 
