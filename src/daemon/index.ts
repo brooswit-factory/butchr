@@ -19,7 +19,7 @@ import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, join } from "node:path";
 import { StatusFloorTracker } from "../agents/status-floor.js";
-import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { createDashboardFeed, DASHBOARD_DETECTOR, ownsDashboardAgent, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
@@ -930,10 +930,19 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // existing seam, do not add a second reader". Behaviour-preserving: this is
 // the exact closure `syncLabels` was already given, moved to a name instead
 // of an inline argument.
-/** The ticket a pane's workspace works, for rule-engine workspaces only — a legacy workspace is never attributed to its ticket. */
+/**
+ * The ticket a pane's workspace works, for rule-engine workspaces only — a
+ * legacy workspace is never attributed to its ticket.
+ *
+ * FACTORY-532 (implementing FACTORY-531): gated by `ownsDashboardAgent`
+ * (`src/agents/dashboard.ts`, jira-work + jira-project only), not the
+ * narrower `ownsRuleAgent` alone — see that predicate's own doc comment for
+ * why (FACTORY-461, the same hiding for github-issue/github-pr/
+ * zendesk-ticket/filesystem, is a deliberately separate, still-open concern).
+ */
 const ownedAgentOfCwd = (cwd: string | null | undefined): string | null => {
   const id = agentIdOfWorkspacePath(cwd);
-  return id && ownsRuleAgent(id) ? id : null;
+  return id && ownsDashboardAgent(id) ? id : null;
 };
 const resourceOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);

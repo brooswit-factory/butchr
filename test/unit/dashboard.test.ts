@@ -1,8 +1,26 @@
 import { describe, expect, test } from "bun:test";
-import { buildDashboardRows, createDashboardFeed, initialDashboardSnapshot, type AgentDashboardRow, type DashboardAgent, type DashboardRow, type IssueMeta } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, createDashboardFeed, initialDashboardSnapshot, ownsDashboardAgent, type AgentDashboardRow, type DashboardAgent, type DashboardRow, type IssueMeta } from "../../src/agents/dashboard.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
+
+describe("ownsDashboardAgent (FACTORY-532, implementing FACTORY-531): jira-project is visible, other non-jira-work providers stay hidden (FACTORY-461's own scope, untouched)", () => {
+  test("a jira-work agent is owned", () => {
+    expect(ownsDashboardAgent(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" }))).toBe(true);
+  });
+  test("a jira-project agent is owned — this is the carve-out FACTORY-532 adds", () => {
+    expect(ownsDashboardAgent(encodeAgentKey({ resourceProvider: "jira-project", ruleId: "triage", resourceId: "BUTCHR" }))).toBe(true);
+  });
+  test("a github-issue agent stays hidden — FACTORY-461's scope, not widened by this ticket", () => {
+    expect(ownsDashboardAgent(encodeAgentKey({ resourceProvider: "github-issue", ruleId: "triage", resourceId: "acme/repo#1" }))).toBe(false);
+  });
+  test("a zendesk-ticket agent stays hidden", () => {
+    expect(ownsDashboardAgent(encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "triage", resourceId: "acme#1" }))).toBe(false);
+  });
+  test("garbage input is not owned", () => {
+    expect(ownsDashboardAgent("not:a:valid:key:at:all")).toBe(false);
+  });
+});
 
 /** FACTORY-407: the bare provider-native resource id these fixtures have always named their agents by — unchanged. */
 function resourceIdFor(name: string): string {
