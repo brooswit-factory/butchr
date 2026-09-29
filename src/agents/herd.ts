@@ -1492,7 +1492,19 @@ export class HerdrHerd implements Herd {
     // pane, a plain no-op after the resume settles.
     const entry = (await this.byIssue()).get(issue);
     if (!entry) return "unresumable"; // no longer running — nothing to resume; the ordinary spawn loop picks it up
-    const { pane, cwd } = entry;
+    const { pane, cwd, launchPending } = entry;
+    // FACTORY-489 (FACTORY-312, director measurement relayed via
+    // FACTORY-73/FACTORY-467): a pane whose claude launch is still pending
+    // can report `agent_status: "idle"`/`"done"` for several seconds before
+    // its `agent_session` registers — `providerOfPane` below can't tell that
+    // apart from a genuinely ready claude, since it only inspects the OS
+    // foreground process's argv/name, never `agent.list()`'s own
+    // `launch_pending`/`agent_session`. `launchPending` (`byIssue()`'s own
+    // doc comment has the wire signal) is the one field herdr exposes that
+    // DOES distinguish them, so it is checked here, early, before any other
+    // gate below could otherwise let `/exit` reach a claude that hasn't
+    // finished starting up.
+    if (launchPending) return "deferred";
     const sessionId = workspaceSessionId(cwd);
     if (!sessionId) return "unresumable"; // pre-FACTORY-314 workspace (or genuinely unknown) — caller falls back to fresh-restart with an honest "session lost: session id could not be determined" reason
     const found = await this.providerOfPane(pane);
