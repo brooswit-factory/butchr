@@ -37,72 +37,87 @@ import type { ViewDeps } from "../src/web/view.js";
 import { buildResourcesForUrlResponse } from "../src/resources/resource-lookup.js";
 import type { OriginGuardDeps } from "../src/web/origin-guard.js";
 
-const port = Number(process.env.REAL_GUARD_PORT);
-if (!Number.isInteger(port) || port <= 0) {
-  console.error("REAL_GUARD_PORT must be set to a positive integer");
-  process.exit(1);
-}
-
-const allowedOrigins = (process.env.REAL_GUARD_ALLOWED_ORIGINS ?? "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter((s) => s.length > 0);
-const extensionAuth: OriginGuardDeps = { allowedOrigins };
-
 const notImplemented = (name: string) => async () => {
   throw new Error(`real-guard-server.ts: ${name} is not implemented — this route is out of scope for the Origin-guard regression test`);
 };
 
-// No agents staffed, no rows — an empty-but-real dashboard snapshot, so
-// `buildResourcesForUrlResponse` (unmodified production code) always
-// resolves to `{ resource: null, agents: [] }` for any URL, which is a
-// perfectly normal, honest response shape (see docs/resources-for-url.md)
-// and is enough to prove the GUARD's behavior, which is this test's whole
-// point — not the resource-matching logic, which the unit tests under
-// test/unit already cover.
-const view: ViewDeps = {
-  state: async () => [],
-  open: notImplemented("open"),
-  openPane: notImplemented("openPane"),
-  health: () => ({ ok: true, components: [] }),
-  dashboard: async () => ({ checked: true, confirmedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: 0, sentinels: 0, sources: [] } }),
-  header: () => ({ build: null }),
-  resourceLink: notImplemented("resourceLink"),
-  configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
-  resourcesForUrl: (url) => Promise.resolve(buildResourcesForUrlResponse(url, { jiraHost: "example.atlassian.net" }, [])),
-  extensionAuth,
-  // ptyAttach deliberately omitted: `/agents/:agentKey/pty` is reachable
-  // through the SAME `extensionAuth` guard as `/resources/for-url` (see
-  // src/web/origin-guard.ts's own header for why one guard covers both),
-  // and this script's whole purpose is observing that guard's behavior on a
-  // WebSocket upgrade from a real browser — not standing up a real pane.
-  // With `ptyAttach` absent, a request that clears the guard gets a 503
-  // ("endpoint disabled"); one the guard itself rejects gets 403 first,
-  // `beforeHandle` never reaching the `!deps.ptyAttach` check at all. That
-  // difference (403 with `{error:"origin required"}` vs. anything else) is
-  // exactly the signal the driving test reads to answer "did this WebSocket
-  // upgrade carry Origin".
-};
+/**
+ * Everything that actually STARTS a server, gated behind `import.meta.main`
+ * (FACTORY-480 review feedback: this repo's own generated
+ * `test/load/*.load.test.ts` suite imports every source file just to prove
+ * it loads without throwing — see `scripts/load/inventory.ts` — and this
+ * file used to fail that at import time by reading `REAL_GUARD_PORT` and
+ * calling `process.exit(1)` at module scope whenever it was unset, which is
+ * exactly the load test's own environment). Importing this module is now
+ * always safe; only running it directly (`bun run scripts/real-guard-server.ts`)
+ * starts anything.
+ */
+function main(): void {
+  const port = Number(process.env.REAL_GUARD_PORT);
+  if (!Number.isInteger(port) || port <= 0) {
+    console.error("REAL_GUARD_PORT must be set to a positive integer");
+    process.exit(1);
+  }
 
-const { app } = buildApp(view);
+  const allowedOrigins = (process.env.REAL_GUARD_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const extensionAuth: OriginGuardDeps = { allowedOrigins };
 
-// TEST-ONLY instrumentation, never shipped: records every request this
-// process sees for the WebSocket-upgrade route, specifically so the driving
-// browser test (clevr's scripts/real-daemon-origin-test.mjs) can answer
-// DoD #2 ("record whether Origin is present on the PTY WebSocket upgrade")
-// — a browser's WebSocket API exposes no HTTP status/headers on a failed
-// upgrade, so the server side has to be the one keeping the record.
-// `onRequest` observes every request but changes nothing about how
-// `liveView`'s own real guard handles it.
-const wsLog: { path: string; origin: string | null; at: string }[] = [];
-app
-  .onRequest(({ request }) => {
-    const { pathname } = new URL(request.url);
-    if (pathname.startsWith("/agents/") && pathname.endsWith("/pty")) {
-      wsLog.push({ path: pathname, origin: request.headers.get("origin"), at: new Date().toISOString() });
-    }
-  })
-  .get("/__test__/ws-log", () => wsLog);
+  // No agents staffed, no rows — an empty-but-real dashboard snapshot, so
+  // `buildResourcesForUrlResponse` (unmodified production code) always
+  // resolves to `{ resource: null, agents: [] }` for any URL, which is a
+  // perfectly normal, honest response shape (see docs/resources-for-url.md)
+  // and is enough to prove the GUARD's behavior, which is this test's whole
+  // point — not the resource-matching logic, which the unit tests under
+  // test/unit already cover.
+  const view: ViewDeps = {
+    state: async () => [],
+    open: notImplemented("open"),
+    openPane: notImplemented("openPane"),
+    health: () => ({ ok: true, components: [] }),
+    dashboard: async () => ({ checked: true, confirmedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: 0, sentinels: 0, sources: [] } }),
+    header: () => ({ build: null }),
+    resourceLink: notImplemented("resourceLink"),
+    configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
+    resourcesForUrl: (url) => Promise.resolve(buildResourcesForUrlResponse(url, { jiraHost: "example.atlassian.net" }, [])),
+    extensionAuth,
+    // ptyAttach deliberately omitted: `/agents/:agentKey/pty` is reachable
+    // through the SAME `extensionAuth` guard as `/resources/for-url` (see
+    // src/web/origin-guard.ts's own header for why one guard covers both),
+    // and this script's whole purpose is observing that guard's behavior on
+    // a WebSocket upgrade from a real browser — not standing up a real
+    // pane. With `ptyAttach` absent, a request that clears the guard gets a
+    // 503 ("endpoint disabled"); one the guard itself rejects gets 403
+    // first, `beforeHandle` never reaching the `!deps.ptyAttach` check at
+    // all. That difference (403 with `{error:"origin required"}` vs.
+    // anything else) is exactly the signal the driving test reads to answer
+    // "did this WebSocket upgrade carry Origin".
+  };
 
-app.listen({ port, hostname: DAEMON_HOSTNAME });
-console.log(`REAL_GUARD_READY ${port}`);
+  const { app } = buildApp(view);
+
+  // TEST-ONLY instrumentation, never shipped: records every request this
+  // process sees for the WebSocket-upgrade route, specifically so the
+  // driving browser test (clevr's scripts/real-daemon-origin-test.mjs) can
+  // answer DoD #2 ("record whether Origin is present on the PTY WebSocket
+  // upgrade") — a browser's WebSocket API exposes no HTTP status/headers on
+  // a failed upgrade, so the server side has to be the one keeping the
+  // record. `onRequest` observes every request but changes nothing about
+  // how `liveView`'s own real guard handles it.
+  const wsLog: { path: string; origin: string | null; at: string }[] = [];
+  app
+    .onRequest(({ request }) => {
+      const { pathname } = new URL(request.url);
+      if (pathname.startsWith("/agents/") && pathname.endsWith("/pty")) {
+        wsLog.push({ path: pathname, origin: request.headers.get("origin"), at: new Date().toISOString() });
+      }
+    })
+    .get("/__test__/ws-log", () => wsLog);
+
+  app.listen({ port, hostname: DAEMON_HOSTNAME });
+  console.log(`REAL_GUARD_READY ${port}`);
+}
+
+if (import.meta.main) main();
