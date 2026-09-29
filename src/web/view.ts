@@ -364,11 +364,19 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         const guard = checkExtensionOrigin({ origin }, extensionAuth);
         if (!guard.ok) {
           // FACTORY-476: the PTY upgrade path — ticket criterion 1's third
-          // route. `params.agentKey` is never logged here (only the path
-          // itself), and this only ever fires for the origin-guard refusal,
-          // never for a resolve failure (malformed key / unknown pane) below
-          // — those are a different, already-diagnosable refusal, not this
-          // ticket's scope.
+          // route. This only ever fires for the origin-guard refusal, never
+          // for a resolve failure (malformed key / unknown pane) below —
+          // those are a different, already-diagnosable refusal, not this
+          // ticket's scope. `path` here IS `new URL(request.url).pathname`,
+          // which for this route contains the raw agent key
+          // (`/agents/<agentKey>/pty`) — FACTORY-502 found that this
+          // previous comment's claim ("only the path itself, never
+          // params.agentKey") was false reassurance: the path itself IS the
+          // agent key. `origin-guard-log.ts`'s own `normalizeRoutePattern`
+          // now collapses this to the fixed pattern `/agents/:agentKey/pty`
+          // before it's used as a dedupe key OR printed, so neither the
+          // journal line nor the dedupe map ever varies on the raw key —
+          // see that module's own header for why.
           originGuardLog.reject({ method: "GET", path: new URL(request.url).pathname, origin, result: guard.reason });
           set.status = guard.status;
           return guard.body;
