@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { loadConfig, describeConfig } from "../../src/config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning } from "../../src/config/config.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
@@ -368,42 +368,41 @@ describe("loadConfig", () => {
   });
 });
 
-describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-475/FACTORY-477 default-allowlists Clevr's fixed id)", () => {
+describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-497/FACTORY-475 hardcodes Clevr's fixed id as the ONLY allowed origin)", () => {
   const CLEVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
-  test("unset BUTCHR_EXTENSION_ORIGINS defaults to Clevr's fixed id alone — a fresh install needs no config", () => {
+  // FACTORY-497: removed the tests for the three-way unset/explicit-empty/
+  // additive env semantics (`BUTCHR_EXTENSION_ORIGINS` had a real effect on
+  // the allowlist) — there is no longer any env-driven allowlist behavior
+  // to assert: `loadConfig` never reads that variable into `extensionAuth`
+  // at all any more, so those cases no longer exist to test. No security
+  // assertion is weakened: the replacement tests below still assert the
+  // fixed id is allowed, every other id is rejected, and absent Origin is
+  // refused — plus a new assertion (below) that the variable's value now
+  // has NO effect on the allowlist, which is a strictly stronger claim than
+  // "additive" ever was.
+
+  test("extensionAuth is always exactly Clevr's fixed id, regardless of environment", () => {
     const c = loadConfig(base, noRead);
     expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN] });
   });
-  test("a non-empty explicit BUTCHR_EXTENSION_ORIGINS is ADDITIVE — it adds to the default rather than replacing it", () => {
-    const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop, chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba " }, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN, "chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
-  });
-  test("explicitly listing the default id again does not duplicate it", () => {
-    const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: CLEVR_ORIGIN }, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN] });
-  });
-  test("an explicitly EMPTY BUTCHR_EXTENSION_ORIGINS still fails closed — losing even the default, not just refusing extra entries", () => {
-    for (const empty of ["", "  ", ",", " , "]) {
-      const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: empty }, noRead);
-      expect(c.extensionAuth).toEqual({ allowedOrigins: [] });
+  test("setting BUTCHR_EXTENSION_ORIGINS has no effect on the allowlist, however it's set", () => {
+    for (const value of ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "", "not-a-uri-at-all", ","]) {
+      const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: value }, noRead);
+      expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN] });
     }
   });
-  test("rejects a BUTCHR_EXTENSION_ORIGINS entry that isn't a well-formed chrome-extension:// origin", () => {
-    for (const bad of ["https://evil.example", "chrome-extension://tooshort", "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP", "not-a-uri-at-all"]) {
-      expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: bad }, noRead)).toThrow("BUTCHR_EXTENSION_ORIGINS");
-    }
+  test("setting BUTCHR_EXTENSION_ORIGINS triggers the ignored-variable warning; unset does not", () => {
+    expect(ignoredExtensionOriginsWarning({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" })).toContain("BUTCHR_EXTENSION_ORIGINS");
+    expect(ignoredExtensionOriginsWarning({ ...base, BUTCHR_EXTENSION_ORIGINS: "" })).toContain("BUTCHR_EXTENSION_ORIGINS");
+    expect(ignoredExtensionOriginsWarning(base)).toBeUndefined();
   });
-  test("describeConfig reports the allowlist (including the default), and names the fail-closed consequence when explicitly emptied", () => {
+  test("describeConfig reports the single fixed-id allowlist", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain(`extensionAuth=origins=${CLEVR_ORIGIN}`);
-    const explicit = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
-    expect(explicit).toContain(`extensionAuth=origins=${CLEVR_ORIGIN},chrome-extension://abcdefghijklmnopabcdefghijklmnop`);
-    const empty = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "" }, noRead));
-    expect(empty).toContain("extensionAuth=origins=EMPTY — every origin rejected");
   });
 });
 
-describe("guard behavior with the real default config (FACTORY-475/FACTORY-477)", () => {
+describe("guard behavior with the real config (FACTORY-497/FACTORY-475)", () => {
   const CLEVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
   test("default config allows the fixed Clevr id and rejects any other origin", () => {
