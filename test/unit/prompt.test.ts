@@ -181,6 +181,103 @@ Enter to confirm · Esc to cancel`;
   });
 });
 
+// FACTORY-481 (implements FACTORY-378): parsePrompt/parseUnnumbered anchored
+// `question` (and so `fingerprint`, a pure function of question+options) to
+// arbitrary preceding scrollback via a plain `.slice(-QUESTION_TAIL)` tail
+// bound — so butchr's own notification chatter, interleaved above a real
+// dialog, could displace the real question and move the fingerprint between
+// polls, making `ANSWER <n> <fingerprint>` escalations unanswerable
+// (production evidence: FACTORY-327 comments 26314/26328/26332, three
+// fingerprints for one weekly-limit dialog). Fixed by anchoring `question` to
+// start fresh after the dialog's own opening rule line (`RULE`, prompt.ts) —
+// confirmed, by grepping every one of the 84 real captures under this
+// daemon's own `.captures/` corpus, to sit directly above the dialog's own
+// content in EVERY real capture, with arbitrary chatter above it and nothing
+// but the dialog below.
+//
+// REPRODUCTION (pre-fix, verified against the code on this branch's parent
+// commit by temporarily reverting the fix): trimming the fixture below to
+// just its own rule-anchored frame (no pre-existing chatter of its own) and
+// prepending N synthetic notification lines gave FIVE DIFFERENT fingerprints
+// for N = 0, 1, 3, 6, 20 (`question` grew a new chatter line each time,
+// dropping only the oldest once N > QUESTION_TAIL) — the exact drift
+// mechanism FACTORY-378 describes. Post-fix, all five N give the SAME
+// fingerprint AND the SAME (correct) question, asserted below.
+describe("FACTORY-481: question/fingerprint anchored to the dialog's own frame", () => {
+  const DELIM = "# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---\n";
+  const REAL_DIALOG_FIXTURE = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-weekly-limit-real.txt"), "utf8");
+  const fullPane = REAL_DIALOG_FIXTURE.slice(REAL_DIALOG_FIXTURE.indexOf(DELIM) + DELIM.length);
+  // Just the dialog's own frame (from its opening rule line down), with none
+  // of the fixture's own real pre-existing chatter above it — isolates the
+  // variable under test (N synthetic chatter lines) from the fixture's fixed
+  // scrollback, so the fingerprint-drift assertion below is not masked by an
+  // already-full QUESTION_TAIL window.
+  const dialogFrame = fullPane.slice(fullPane.indexOf("─".repeat(10)));
+  const REAL_QUESTION = "What do you want to do?";
+
+  function withChatter(n: number): string {
+    const chatter = Array.from({ length: n }, (_, i) => `[butchr] FACTORY-999: synthetic notification chatter line ${i} — re-read it.`);
+    return [...chatter, dialogFrame].join("\n");
+  }
+
+  const baseline = parsePrompt(dialogFrame)!;
+  test.each([0, 1, 3, 6, 20])("N=%i interleaved chatter lines: question is unchanged and correct, fingerprint is unchanged", (n) => {
+    const p = parsePrompt(withChatter(n));
+    expect(p).not.toBeNull();
+    // Both halves, per the epic's review note: id-stability alone would pass
+    // a STABLE id over a WRONG question (the exact drovr-side failure mode
+    // FACTORY-378 warns against) — so assert the content, not just the hash.
+    expect(p!.question).toBe(REAL_QUESTION);
+    expect(fingerprint(p!)).toBe(fingerprint(baseline));
+  });
+
+  test("using the fixture's own real pre-existing chatter (no synthetic lines at all): still the real question, still the same fingerprint", () => {
+    const p = parsePrompt(fullPane)!;
+    expect(p.question).toBe(REAL_QUESTION);
+    expect(fingerprint(p)).toBe(fingerprint(baseline));
+  });
+
+  test("negative: a real capture with butchr's own notification chatter interleaved, but no dialog, never parses as a prompt", () => {
+    const NEGATIVE = readFileSync(join(import.meta.dir, "../fixtures/pane-cap-chatter-no-dialog-real.txt"), "utf8");
+    const DELIM2 = "# --- pane text follows verbatim (ANSI already stripped) ---\n";
+    const pane = NEGATIVE.slice(NEGATIVE.indexOf(DELIM2) + DELIM2.length);
+    expect(parsePrompt(pane)).toBeNull();
+  });
+
+  // parseUnnumbered coverage (the ticket's own suspicion: "likely has the
+  // same slice(-QUESTION_TAIL) defect" — it did, fixed identically above).
+  // Reuses the un-numbered trust-dialog shape already established as a real
+  // Claude Code dialog elsewhere in this file, whose own leading rule line is
+  // exactly the same frame anchor being tested.
+  describe("parseUnnumbered: same anchor, same invariance", () => {
+    const TRUST_FRAME = `──────────────────────────────
+ Accessing workspace:
+ /home/brooswit/butchr-workspaces/KAN-706
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a
+ well-known open source project, or work from your team). If not, take a moment to review
+ what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ ❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel`;
+    const trustBaseline = parsePrompt(TRUST_FRAME)!;
+
+    function withChatter(n: number): string {
+      const chatter = Array.from({ length: n }, (_, i) => `[butchr] FACTORY-999: synthetic notification chatter line ${i} — re-read it.`);
+      return [...chatter, TRUST_FRAME].join("\n");
+    }
+
+    test.each([0, 1, 3, 6, 20])("N=%i interleaved chatter lines: options/current/fingerprint unchanged", (n) => {
+      const p = parsePrompt(withChatter(n));
+      expect(p).not.toBeNull();
+      expect(p!.options).toEqual(["No, exit", "Yes, I trust this folder"]);
+      expect(p!.current).toBe(1);
+      expect(fingerprint(p!)).toBe(fingerprint(trustBaseline));
+    });
+  });
+});
+
 describe("bypass-permissions acceptance dialog", () => {
   test("accepts by content (option 2), never the leading exit", () => {
     const p = parsePrompt(` You are running in Bypass
