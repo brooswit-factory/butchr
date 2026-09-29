@@ -4,7 +4,7 @@ import type { GuardRejectReason } from "./origin-guard.js";
  * FACTORY-476 (implementing FACTORY-474): makes an extension-origin guard
  * rejection (`src/web/origin-guard.ts`'s `checkExtensionOrigin`/
  * `preflightExtensionOrigin`) DIAGNOSABLE from the journal. Before this
- * ticket, a rejected `GET`/`OPTIONS /resources/for-url` or
+ * ticket, a rejected `GET`/`POST`/`OPTIONS /resources/for-url` or
  * `GET /agents/:agentKey/pty` produced a bare 403 and nothing else — "origin
  * required" vs "origin not allowed" vs "allowlist empty" (an operator
  * misconfiguration) could not be told apart without reproducing the request
