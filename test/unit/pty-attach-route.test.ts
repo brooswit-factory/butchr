@@ -82,14 +82,18 @@ describe("GET /agents/:agentKey/pty — upgrade refusals (HTTP-level, before any
 });
 
 describe("FACTORY-476: guard rejections on the PTY upgrade path are logged", () => {
-  test("MISSING Origin: one line, path without the agentKey's own query/fragment noise, result 'origin required'", async () => {
+  test("MISSING Origin: one line, path normalized to the route PATTERN (never the raw agentKey — FACTORY-502), result 'origin required'", async () => {
     const lines: string[] = [];
     const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
     const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps(), originGuardLog }));
     await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket" } }));
     expect(lines.length).toBe(1);
     expect(lines[0]).toContain("method=GET");
-    expect(lines[0]).toContain(`path=/agents/${encodeURIComponent(AGENT_KEY)}/pty`);
+    // FACTORY-502 (a): the dedupe key (and the printed line) is the ROUTE
+    // PATTERN, not the raw path — see origin-guard-log.ts's own header for
+    // why the agent key must never be the thing that varies either.
+    expect(lines[0]).toContain("path=/agents/:agentKey/pty");
+    expect(lines[0]).not.toContain(encodeURIComponent(AGENT_KEY));
     expect(lines[0]).toContain("origin=absent");
     expect(lines[0]).toContain("result=origin required");
   });
