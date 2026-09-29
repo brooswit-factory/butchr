@@ -74,6 +74,33 @@ export interface ManagedSessionsLoopDeps {
    */
   checkCrashLoop?: (spawning: readonly string[], desired: readonly string[]) => Promise<void>;
   /**
+   * FACTORY-505 — same seam as `ReconcileOptions.onResumeWaiting`/
+   * `GenericLoopDeps.onResumeWaiting` (src/daemon/loop.ts): fires ONCE,
+   * `RESUME_WAITING_NOTICE_AT_POLLS` consecutive polls into a model/effort-
+   * only `herd.resumeInPlace()` staying `"deferred"`/`"stuck"` for a managed-
+   * session agent (buddy, genius — the canary set). This is FACTORY-314's
+   * original notice — this file's own top comment names it, alongside
+   * `checkCrashLoop` above, as never having been passed here, so a managed
+   * session deferring a resume was silent however long it deferred.
+   * Threaded straight through to `runResourceLoop` below. Optional;
+   * omitted, no resume-waiting notice runs for managed sessions (existing
+   * behaviour before FACTORY-505).
+   */
+  onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /**
+   * FACTORY-505 — same seam as `ReconcileOptions.onResumePreserved`/
+   * `GenericLoopDeps.onResumePreserved` (src/daemon/loop.ts): fires once
+   * `herd.resumeInPlace()` succeeds for a managed-session agent (session
+   * preserved across a model/effort change). Wired for the same reason as
+   * `onResumeWaiting` immediately above — this is the quiet-success half of
+   * the same pair, and there is no principled reason to notify on the
+   * "still waiting" case but stay silent on the "it worked" case. Threaded
+   * straight through to `runResourceLoop` below. Optional; omitted, no
+   * resume-preserved notice runs for managed sessions (existing behaviour
+   * before FACTORY-505).
+   */
+  onResumePreserved?: (issue: string) => void | Promise<void>;
+  /**
    * FACTORY-501 — same seam as `ReconcileOptions.checkRestoredPaneDeferred`/
    * `GenericLoopDeps.checkRestoredPaneDeferred` (src/daemon/loop.ts).
    * REQUIRED for the escalation to ever reach a managed-session agent
@@ -161,6 +188,8 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
+    ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
+    ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
     ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? MANAGED_SESSIONS_POLL_MS,
