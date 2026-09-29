@@ -2191,7 +2191,7 @@ describe("resumeInPlace", () => {
    * changes when `pane.sendKeys` (the `/exit`) and `agent.start` (the
    * relaunch) are called, the same way a real pane would.
    */
-  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean } = {}) {
+  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean; launchPending?: boolean; processGone?: boolean } = {}) {
     let status: string = initialStatus;
     let foreground: "claude" | "shell" = "claude";
     // FACTORY-314 (epic review on PR #513, point 3): the REAL argv from the
@@ -2213,7 +2213,7 @@ describe("resumeInPlace", () => {
         // `agent: undefined` while keeping the entry, which is what
         // produced the review's own withdrawn "state 3" prediction; fixed
         // to match reality.
-        list: async () => ({ agents: foreground === "claude" ? [{ agent: "claude", agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] : [] }),
+        list: async () => ({ agents: foreground === "claude" ? [{ agent: "claude", agent_status: status, cwd, pane_id: pane, workspace_id: "w1", launch_pending: options.launchPending === true }] : [] }),
         start: async (p: any) => {
           started.push(p);
           // FACTORY-314 (PR #513 review fix, live-tested): the OLD process
@@ -2229,7 +2229,12 @@ describe("resumeInPlace", () => {
         },
       },
       pane: {
-        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
+        // FACTORY-489: `processGone` decouples processInfo from `foreground`
+        // — herdr's agent.list() bookkeeping can still list a pane as
+        // launch-pending claude for a moment after its actual OS process has
+        // already died; this simulates exactly that lag, independent of
+        // whatever `list()` above still reports.
+        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
         // FACTORY-491 (director item 3): records every defensive close so
@@ -2302,6 +2307,81 @@ describe("resumeInPlace", () => {
         expect(workspaceSessionId(cwd)).toBe("original-session"); // a --resume relaunch keeps the SAME id, never rediscovered
         expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
         expect(workspaceEffort(cwd)).toBe("medium");
+      });
+    });
+  });
+
+  // FACTORY-489 (FACTORY-312, source read of herdr at the running version's
+  // tag, not a live measurement): agent_status is computed from screen state
+  // independently of the managed-agent launch phase, so a pane whose claude
+  // launch is still pending can report agent_status "idle"/"done" — a state
+  // `isIdle()` alone would treat as ready to `/exit`. `launchPending` is the
+  // one signal that distinguishes it. This pair must be able to fail for
+  // the reason it tests and no other: (a) proves the guard actually blocks
+  // /exit when launch_pending is true even though agent_status says idle;
+  // (b) proves the SAME fixture/spec, with only launch_pending flipped to
+  // false, is NOT blocked — so (a) passing isn't just an artifact of some
+  // OTHER gate (missing session id, wrong provider, etc.) misfiring.
+  test("deferred: a launch-pending pane reporting agent_status idle is NOT resumed — no /exit is sent", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-901" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("deferred");
+        expect(f.sent).toEqual([]); // no /exit text, no enter keys — the pane was never touched
+        expect(f.started).toHaveLength(0); // no relaunch attempted either
+      });
+    });
+  });
+
+  test("negative control: the SAME idle pane, with launch_pending false, IS resumed — proves the fixture (and every other gate) is otherwise satisfied, so the guard above is what blocked it", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-902" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: false });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
+        expect(f.started).toHaveLength(1);
+      });
+    });
+  });
+
+  // FACTORY-489 (FACTORY-312 review correction): pins the launchPending
+  // guard's PLACEMENT, not just its existence. A guard placed BEFORE
+  // `providerOfPane` would return "deferred" for one detection pass on a
+  // pane whose agent.list() entry still lags with launch_pending:true after
+  // the underlying claude process has already died — herdr clears the
+  // managed agent once it observes the exit, so that guard-first ordering
+  // would only delay, by one poll, the existing "unresumable" ->
+  // stop()/spawn() recovery that a "no process found" providerOfPane result
+  // already provides for that case; this test proves the guard runs AFTER
+  // providerOfPane instead, so that recovery is immediate rather than
+  // delayed. The entry itself (and launch_pending:true) is present, but the
+  // pane's OS process is gone. NOTE: the fixture (statefulHerdr with
+  // processGone:true) holds launch_pending true INDEFINITELY, since it does
+  // not model herdr's own release path — its shape pins the guard's
+  // placement, not a claim about how long the real launch_pending state
+  // persists after a process dies.
+  test("unresumable, NOT deferred: launch_pending true but the pane's OS process is already gone — the existing providerOfPane gate wins, not the launchPending guard", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true, processGone: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("unresumable");
+        expect(f.sent).toEqual([]);
+        expect(f.started).toHaveLength(0);
       });
     });
   });
