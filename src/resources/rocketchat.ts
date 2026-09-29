@@ -125,10 +125,19 @@ export interface RocketChatClient {
   revokeManagedToken(userId: string): Promise<void>;
 }
 
-export function createRocketChatClient(deps: RocketChatClientDeps): RocketChatClient {
+/**
+ * The shared request plumbing behind BOTH `createRocketChatClient` (account
+ * management) and `createRocketChatPoster` (FACTORY-369: the #team-admin
+ * escalation post) — same auth headers, same redirect-refusal, same
+ * success:false-is-an-error handling. Factored out so a second client never
+ * has to re-derive this by hand; the two clients otherwise use entirely
+ * separate credentials (see `createRocketChatPoster`'s own doc comment for
+ * why they must never share one).
+ */
+function makeRequester(deps: RocketChatClientDeps): (path: string, what: string, init?: RequestInit) => Promise<{ status: number; body: any }> {
   const base = `${deps.url}/api/v1`;
   const headers = { "x-auth-token": deps.adminToken, "x-user-id": deps.adminUserId, accept: "application/json" };
-  const request = async (path: string, what: string, init: RequestInit = {}): Promise<{ status: number; body: any }> => {
+  return async (path: string, what: string, init: RequestInit = {}): Promise<{ status: number; body: any }> => {
     // redirect "error": the admin token must never be carried to another URL by a redirect.
     const res = await deps.fetchImpl(`${base}${path}`, { ...init, headers: { ...headers, ...(init.headers as Record<string, string> | undefined) }, redirect: "error" });
     let body: any = null;
@@ -140,6 +149,10 @@ export function createRocketChatClient(deps: RocketChatClientDeps): RocketChatCl
     if (body && typeof body === "object" && body.success === false) throw new RocketChatApiError(what, typeof body.error === "string" ? body.error : "unknown error");
     return { status: res.status, body };
   };
+}
+
+export function createRocketChatClient(deps: RocketChatClientDeps): RocketChatClient {
+  const request = makeRequester(deps);
   const mapUser = (u: any): RocketChatUser => ({ id: String(u.id ?? u._id), username: String(u.username), active: u.active !== false });
   return {
     async getUserByUsername(username) {
@@ -189,6 +202,40 @@ export function createRocketChatClient(deps: RocketChatClientDeps): RocketChatCl
         if (e instanceof RocketChatApiError && RC_TOKEN_NOT_FOUND_RE.test(e.rcError)) return;
         throw e;
       }
+    },
+  };
+}
+
+/**
+ * FACTORY-369: the ONE message-sending capability this module exposes —
+ * "post this text to this room" — deliberately separate from
+ * `RocketChatClient` above. That client is account-management ONLY by
+ * design (`docs/real-rc-verification-runbook.md` §1.3 verifies its
+ * credential is REFUSED for posting-adjacent calls, as a defence-in-depth
+ * check that its Nexus grant is no wider than requested); a managed
+ * session's blocked-dialog notice needs a DIFFERENT identity/credential —
+ * one scoped to post, not to manage users — which is why this is built from
+ * its own `RocketChatClientDeps` rather than added as a method on
+ * `RocketChatClient`. See `src/config/config.ts`'s
+ * `Config.managedEscalationRocketChat` for the separate env vars that
+ * configure it, and `src/agents/escalation-loop.ts`'s `EscalatorDeps.
+ * teamAdminNotify` for the narrow, injected interface this is wired behind
+ * at the call site — never a bare `fetch` inlined into escalation logic.
+ */
+export interface RocketChatPoster {
+  /** Posts `text` verbatim to `channel` (RC accepts either `"team-admin"` or `"#team-admin"`). Throws (RocketChatHttpError/RocketChatApiError, or a transport error) on any failure — the caller decides how to retry; this makes no retry decision of its own. */
+  postMessage(channel: string, text: string): Promise<void>;
+}
+
+export function createRocketChatPoster(deps: RocketChatClientDeps): RocketChatPoster {
+  const request = makeRequester(deps);
+  return {
+    async postMessage(channel, text) {
+      await request("/chat.postMessage", "post message", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ channel, text }),
+      });
     },
   };
 }

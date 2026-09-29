@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createRocketChatClient,
+  createRocketChatPoster,
   isRcUserNotFoundError,
   loadRocketChatAuth,
   RocketChatApiError,
@@ -196,6 +197,52 @@ describe("Rocket.Chat client", () => {
   test("no error message from this client ever contains the admin token", async () => {
     const { client } = fakeRc(() => json({}, 500));
     try { await client.countUsers(); throw new Error("unreached"); } catch (e) {
+      expect((e as Error).message).not.toContain(FAKE_TOKEN);
+    }
+  });
+});
+
+// FACTORY-369: a SEPARATE client from `createRocketChatClient` above — same
+// request plumbing (`makeRequester`), a DIFFERENT credential in production
+// (see this module's own `RocketChatPoster` doc comment for why), and
+// exactly one capability: post a message to a room.
+describe("Rocket.Chat poster (FACTORY-369)", () => {
+  function fakePoster(handler: (path: string, method: string, body: unknown) => Response) {
+    const calls: Call[] = [];
+    const fetchImpl = async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      calls.push({ method, url, headers: init?.headers as Record<string, string>, ...(init?.redirect ? { redirect: init.redirect } : {}), ...(typeof init?.body === "string" ? { body: init.body } : {}) });
+      const u = new URL(url);
+      return handler(u.pathname + u.search, method, init?.body ? JSON.parse(init.body as string) : undefined);
+    };
+    const poster = createRocketChatPoster({ fetchImpl, url: URL_BASE, adminUserId: ADMIN_ID, adminToken: FAKE_TOKEN });
+    return { calls, poster };
+  }
+
+  test("postMessage hits chat.postMessage with the channel/text, the admin id/token pair, and refuses redirects", async () => {
+    const { calls, poster } = fakePoster((path) => path === "/api/v1/chat.postMessage" ? json({ success: true }) : json({}, 404));
+    await poster.postMessage("team-admin", "@admin-assembly hello");
+    expect(calls).toHaveLength(1);
+    const c = calls[0]!;
+    expect(c.method).toBe("POST");
+    expect(c.url).toBe(`${URL_BASE}/api/v1/chat.postMessage`);
+    expect(JSON.parse(c.body!)).toEqual({ channel: "team-admin", text: "@admin-assembly hello" });
+    expect(c.headers["x-auth-token"]).toBe(FAKE_TOKEN);
+    expect(c.headers["x-user-id"]).toBe(ADMIN_ID);
+    expect(c.redirect).toBe("error");
+  });
+
+  test("a transport/API failure throws (RocketChatHttpError / RocketChatApiError), never resolves silently", async () => {
+    const { poster: down } = fakePoster(() => json({}, 503));
+    await expect(down.postMessage("team-admin", "x")).rejects.toBeInstanceOf(RocketChatHttpError);
+
+    const { poster: refused } = fakePoster(() => json({ success: false, error: "not authorized" }, 403));
+    await expect(refused.postMessage("team-admin", "x")).rejects.toBeInstanceOf(RocketChatApiError);
+  });
+
+  test("no error message from this poster ever contains the admin token", async () => {
+    const { poster } = fakePoster(() => json({}, 500));
+    try { await poster.postMessage("team-admin", "x"); throw new Error("unreached"); } catch (e) {
       expect((e as Error).message).not.toContain(FAKE_TOKEN);
     }
   });
