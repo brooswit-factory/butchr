@@ -48,6 +48,7 @@
  * links to every matching agent row via `opts.dashboardLinkHref` — the exact
  * inverse of the additive back-link `dashboard-page.ts` now renders.
  */
+import { ICON_HEAD_TAGS, ICON_MARK } from "./icons.js";
 import type { FileErrorEntry, QueryAgentInventory, RuleInventoryEntry, SessionDefinitionInventoryEntry } from "../agents/query-agent-inventory.js";
 import type { AgentDashboardRow, DashboardRow } from "../agents/dashboard.js";
 import { agentRowsForRule, agentRowsForSessionDefinition, ruleAnchorId, sessionAnchorId } from "../agents/config-inventory-links.js";
@@ -300,9 +301,9 @@ export function renderConfigInventory(result: ConfigInventoryFetchResult, rows: 
         );
       })()
     : `<div class="fetchfail">COULD NOT CHECK — fetching /config-inventory failed: ${esc(result.error)}. Nothing below reflects real configuration; this is NOT the same as "no configuration exists".</div>`;
-  return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr configurations</title>
+  return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr configurations</title>${ICON_HEAD_TAGS}
 <style>${STYLE}</style></head><body>
-<h1>butchr — configurations</h1>
+<h1>${ICON_MARK}butchr — configurations</h1>
 ${body}
 <div class="hint">read-only view of every configured query agent (rules + managed-session definitions), staffed or not · refreshes every ${refresh}s · <a class="link" href="/">back to agents</a></div>
 </body></html>`;
