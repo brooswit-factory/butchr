@@ -4,9 +4,9 @@ import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderO
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
+import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
-import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig } from "./argv.js";
+import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig, type RestoredResumePolicy } from "./argv.js";
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
@@ -412,10 +412,63 @@ export function staleArgvOutcome(reason: string, provider: ManagedAgentProvider)
  * different drift this function must not swallow — is what actually means
  * "butchr did not launch this," not the `--resume` match by itself.
  */
+/**
+ * FACTORY-491 (director item 1) — every form claude's own CLI accepts for
+ * `--resume`, not just the separate-argument shape `argvFlagValue`'s bare
+ * `indexOf + 1` already matched. Herdr's REAL restored argv, measured on
+ * codey by admin-assembly (FACTORY-467 comment 27815, relayed via
+ * FACTORY-470/FACTORY-491): `["claude", "--resume", "<id>", "--model",
+ * "haiku"]` — the separate-argument form, which the pre-existing match
+ * already handled; this is defensive hardening against a future
+ * launcher/herdr change silently emitting `--resume=<id>` or the short `-r`
+ * flag (in either form) with no warning, not a fix for a currently-broken
+ * case.
+ */
+function resumeArgvValue(argv: readonly string[]): string | undefined {
+  for (const token of argv) {
+    if (token.startsWith("--resume=")) return token.slice("--resume=".length);
+    if (token.startsWith("-r=")) return token.slice("-r=".length);
+  }
+  const flagIndex = argv.findIndex((token) => token === "--resume" || token === "-r");
+  return flagIndex >= 0 ? argv[flagIndex + 1] : undefined;
+}
+
+/**
+ * FACTORY-491 (director item 4) — the THREE flags butchr's own launches
+ * (a fresh spawn AND every `resumeInPlace()` relaunch alike) unconditionally
+ * emit, verified directly against the pinned `@brooswit/drovr`'s own
+ * `REQUIRED_CLAUDE_FLAGS` constant (`node_modules/@brooswit/drovr/dist/index.js`
+ * — re-verify there if the pinned version ever changes; deliberately not
+ * imported, the same reason `resumableArgvReason`'s own three-flag literal
+ * set isn't). Widened from `--mcp-config` alone (PR #560's own discriminator)
+ * because requiring only one of the three still lets a pane missing just
+ * the OTHER two pass this check — narrower than "herdr launched none of
+ * butchr's flags," the actual claim this function makes.
+ */
+const BUTCHR_LAUNCH_FLAGS = ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels"] as const;
+
 export function isHerdrRestoredPane(observedArgv: readonly string[], persistedSessionId: string | undefined): boolean {
   if (!persistedSessionId) return false;
-  if (argvFlagValue(observedArgv, "--resume") !== persistedSessionId) return false;
-  return !observedArgv.includes("--mcp-config");
+  if (resumeArgvValue(observedArgv) !== persistedSessionId) return false;
+  return !BUTCHR_LAUNCH_FLAGS.some((flag) => observedArgv.includes(flag));
+}
+
+/**
+ * FACTORY-491 (director item 5) — the `BUTCHR_RESTORED_RESUME` canary/kill
+ * switch gate: `"off"` never enables it (today's allowlist/stop+spawn
+ * behaviour, unconditionally); `"all"` enables it regardless of
+ * `agentName`; a `ReadonlySet` (the parsed comma-separated list,
+ * `loadConfig`, src/config/config.ts) enables it only when `agentName` is
+ * both defined and a member. `agentName` is `undefined` for a non-managed-
+ * session agent (an ordinary rule-engine task/story/epic worker has no
+ * stable name to gate on — see `isHerdrRestoredPane`'s own callsite in
+ * `staleIssues()` for how it's derived), which this never enables under
+ * `"off"`/a named list — only `"all"` ever widens to those.
+ */
+export function restoredResumeEnabledFor(policy: RestoredResumePolicy, agentName: string | undefined): boolean {
+  if (policy === "off") return false;
+  if (policy === "all") return true;
+  return agentName !== undefined && policy.has(agentName);
 }
 
 /**
@@ -707,9 +760,9 @@ export class HerdrHerd implements Herd {
     return confirmed;
   }
 
-  private async byIssue(): Promise<Map<string, { pane: string; cwd: string; status: string }>> {
+  private async byIssue(): Promise<Map<string, { pane: string; cwd: string; status: string; launchPending: boolean }>> {
     const { agents } = await this.herdr.agent.list();
-    const map = new Map<string, { pane: string; cwd: string; status: string }>();
+    const map = new Map<string, { pane: string; cwd: string; status: string; launchPending: boolean }>();
     const ambiguous = new Set<string>();
     for (const a of agents) {
       const cwd = a.cwd ?? null;
@@ -723,7 +776,12 @@ export class HerdrHerd implements Herd {
         map.delete(issue);
         ambiguous.add(issue);
       } else if (!ambiguous.has(issue)) {
-        map.set(issue, { pane: a.pane_id, cwd, status: a.agent_status });
+        // FACTORY-491 (director evidence, FACTORY-467 comment 27815): a
+        // pane whose claude launch is still pending is listed with
+        // `agent: "claude"` and no `agent_session` yet — `launch_pending`
+        // (herdr-sdk's own `AgentInfo.launch_pending`) is the wire signal
+        // for that, read straight through with no reinterpretation.
+        map.set(issue, { pane: a.pane_id, cwd, status: a.agent_status, launchPending: a.launch_pending === true });
       }
     }
     return map;
@@ -734,7 +792,7 @@ export class HerdrHerd implements Herd {
   }
 
   async managedAgents(): Promise<ManagedHerdAgent[]> {
-    return [...(await this.byIssue())].map(([issue, agent]) => ({ issue, ...agent }));
+    return [...(await this.byIssue())].map(([issue, { pane, cwd, status }]) => ({ issue, pane, cwd, status }));
   }
 
   /**
@@ -772,7 +830,7 @@ export class HerdrHerd implements Herd {
     if (this.agent.provider === "codex" && this.agent.codexSpawnBlocked) return [];
     if (this.agent.provider === "agy" && this.agent.agySpawnBlocked) return [];
     const out: StaleAgent[] = [];
-    for (const [issue, { pane, cwd }] of await this.byIssue()) {
+    for (const [issue, { pane, cwd, launchPending }] of await this.byIssue()) {
       if (this.refused.has(issue)) continue;
       if (!cwd) continue; // no cwd reported — can't build the expected argv — unknown, not stale
       const found = await this.providerOfPane(pane);
@@ -837,7 +895,35 @@ export class HerdrHerd implements Herd {
         // reason lists as missing — an identity match, not an allowlisted
         // field diff, so it is checked BEFORE (and independently of)
         // `staleArgvOutcome`'s allowlist just below.
-        if (provider === "claude" && isHerdrRestoredPane(proc.argv, workspaceSessionId(cwd))) {
+        //
+        // FACTORY-491 (director item 4, FACTORY-467 comment 27818): a pane
+        // whose claude launch is still pending (`launchPending`, this
+        // method's own loop variable — `byIssue()`'s doc comment has the
+        // wire signal) is NOT restorable — its argv may already carry a
+        // `--resume` matching the persisted id (e.g. butchr's OWN in-flight
+        // launch, not yet re-registered) with none of butchr's flags landed
+        // YET, which would otherwise misclassify a normal in-progress spawn
+        // as a herdr restore. Checked before the identity match itself.
+        //
+        // FACTORY-491 (director item 5): gated behind the
+        // `BUTCHR_RESTORED_RESUME` canary/kill switch — `restoredResumeEnabledFor`'s
+        // own doc comment has the full policy. `agentName` is this issue's
+        // managed-session bare definition name (`managedSessionShortDisplayId`)
+        // when it is one, `undefined` otherwise (an ordinary rule-engine
+        // agent has no stable name to gate on, so only an "all" policy ever
+        // reaches it).
+        const agentName = isManagedSession ? managedSessionShortDisplayId(decoded!.resourceId) : undefined;
+        if (
+          provider === "claude" &&
+          !launchPending &&
+          restoredResumeEnabledFor(this.agent.restoredResume ?? new Set(), agentName) &&
+          isHerdrRestoredPane(proc.argv, workspaceSessionId(cwd))
+        ) {
+          // FACTORY-491 (director item 1): log the observed argv on every
+          // restored-pane classification, so a future silent-no-op (a
+          // launcher/herdr argv-shape change this parsing doesn't yet cover)
+          // is diagnosable from the journal alone rather than inferred.
+          this.log?.(`[herdr-restore] ${issue} classified as herdr-restored — observed argv: ${JSON.stringify(proc.argv)}`);
           out.push({
             issue,
             reason: `session preserved: herdr restored this pane after a host reset as a bare \`claude --resume\` (${check.reason.replace(/^argv lacks /, "")}) — relaunching on the same session with butchr's full flag set`,
@@ -1334,6 +1420,32 @@ export class HerdrHerd implements Herd {
   }
 
   /**
+   * FACTORY-491 (director item 3) — defence in depth, not because a wedge
+   * is live: `herd.stop()`'s own `resolveCurrent()` identity match
+   * (pane_id AND cwd AND `agent === this.active.provider`, pinned
+   * `@brooswit/drovr` source) is what `reconcileNow`'s fallthrough
+   * normally relies on to close a pane before its fresh spawn, and that
+   * match could in principle skip this exact pane — real herdr's own
+   * behaviour (measured by admin-assembly, relayed via FACTORY-467 comment
+   * 27770/27774) removes a bare-shell pane's `agent.list()` entry entirely
+   * once `resumeInPlaceExclusive` confirms it empty, so `byIssue()` may no
+   * longer even list it by the time the fallthrough runs. Called ONLY from
+   * `resumeInPlaceExclusive`'s own `"failed"` return points, while `pane`
+   * is still known with certainty from the entry `byIssue()` resolved at
+   * the TOP of this call — never a general-purpose close, and never lets a
+   * close failure mask the real `"failed"` outcome the caller still needs
+   * to see (logged and swallowed, same fault-isolation shape as
+   * `relabelRunningAgent`'s own catch, just above).
+   */
+  private async closePaneDefensively(pane: string): Promise<void> {
+    try {
+      await this.herdr.pane.close(pane);
+    } catch (e) {
+      this.log?.(`WARNING: [herdr-restore] failed to close pane ${pane} defensively after a failed resume: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  /**
    * See the `Herd.resumeInPlace` interface doc for the full contract.
    * FACTORY-426: logs under `RESUME_TAG` exactly once per call, covering
    * all outcomes AND a thrown error uniformly — see that tag's own
@@ -1433,7 +1545,11 @@ export class HerdrHerd implements Herd {
     // STILL occupied (by claude or anything else) is left alone exactly as
     // before: `"stuck"` there is a genuinely safe, non-destructive retry,
     // never a wedge, since nothing needs recovering.
-    const postExitOutcome = async (): Promise<"stuck" | "failed"> => (await this.providerOfPane(pane)) ? "stuck" : "failed";
+    const postExitOutcome = async (): Promise<"stuck" | "failed"> => {
+      if (await this.providerOfPane(pane)) return "stuck";
+      await this.closePaneDefensively(pane);
+      return "failed";
+    };
     const deadline = this.monotonicNow() + RESUME_EXIT_TIMEOUT_MS;
     while (this.monotonicNow() < deadline && (await this.providerOfPane(pane))) {
       await this.wait(RESUME_EXIT_POLL_MS);
@@ -1526,7 +1642,10 @@ export class HerdrHerd implements Herd {
     // above) — a real, distinct failure, not a "resumed".
     await this.wait(RESUME_LAUNCH_VERIFY_MS);
     const launched = await this.providerOfPane(pane);
-    if (!launched || launched.provider !== "claude") return "failed";
+    if (!launched || launched.provider !== "claude") {
+      await this.closePaneDefensively(pane);
+      return "failed";
+    }
     // Re-persists model/effort/permission-mode/etc. for THIS relaunch, ONLY
     // now that it's confirmed alive. Session id is untouched by
     // `buildWorkspace()` (it no longer manages that file at all — see

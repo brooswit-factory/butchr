@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -2124,6 +2124,59 @@ describe("isHerdrRestoredPane", () => {
   test("false: --resume matches, but --mcp-config IS present — a pane butchr itself already relaunched, not a herdr restore", () => {
     expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--mcp-config", "/some/mcp.json", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
   });
+  // FACTORY-491 (director item 4): the discriminator must require ALL
+  // THREE of butchr's own launch flags absent — narrower than PR #560's
+  // original single-flag (--mcp-config) check, which a pane missing only
+  // --mcp-config but still carrying --permission-mode or the channels flag
+  // would have incorrectly passed.
+  test("false: --resume matches and --mcp-config is absent, but --permission-mode IS present — not every butchr flag is missing", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+  test("false: --resume matches and --mcp-config is absent, but --dangerously-load-development-channels IS present — not every butchr flag is missing", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--dangerously-load-development-channels", "server:x"], "abc-123")).toBe(false);
+  });
+  test("true: --resume matches and ALL THREE butchr flags are absent", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  // FACTORY-491 (director item 1): defensive hardening for forms herdr's
+  // OWN measured restore shape (FACTORY-467 comment 27815:
+  // `["claude", "--resume", "<id>", "--model", "haiku"]`, the separate-
+  // argument form the pre-existing indexOf+1 match already handled) does
+  // not presently produce — never a fix for a live break, sequenced by
+  // convenience rather than urgency (epic comment 27818).
+  test("true: the --resume=<id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume=abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("true: the short -r <id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "-r", "abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("true: the short -r=<id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "-r=abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("false: the --resume=<id> form names a DIFFERENT session than the one persisted", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume=some-other-id"], "abc-123")).toBe(false);
+  });
+});
+
+describe("restoredResumeEnabledFor", () => {
+  test("off never enables it, regardless of agent name", () => {
+    expect(restoredResumeEnabledFor("off", "buddy")).toBe(false);
+    expect(restoredResumeEnabledFor("off", undefined)).toBe(false);
+  });
+  test("all enables it for every agent, including one with no name at all", () => {
+    expect(restoredResumeEnabledFor("all", "buddy")).toBe(true);
+    expect(restoredResumeEnabledFor("all", "anything-else")).toBe(true);
+    expect(restoredResumeEnabledFor("all", undefined)).toBe(true);
+  });
+  test("a named list enables it only for a listed name", () => {
+    const policy = new Set(["buddy", "genius"]);
+    expect(restoredResumeEnabledFor(policy, "buddy")).toBe(true);
+    expect(restoredResumeEnabledFor(policy, "genius")).toBe(true);
+    expect(restoredResumeEnabledFor(policy, "someone-else")).toBe(false);
+  });
+  test("a named list never enables it for an agent with no name (an ordinary rule-engine agent, not a managed session)", () => {
+    expect(restoredResumeEnabledFor(new Set(["buddy", "genius"]), undefined)).toBe(false);
+  });
 });
 
 describe("resumeInPlace", () => {
@@ -2150,9 +2203,17 @@ describe("resumeInPlace", () => {
     let lastArgv: string[] = CLAUDE_PROC.argv;
     const sent: Array<{ text?: string; keys?: string[] }> = [];
     const started: any[] = [];
+    const closed: string[] = [];
     const client = {
       agent: {
-        list: async () => ({ agents: [{ agent: foreground === "claude" ? "claude" : undefined, agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] }),
+        // FACTORY-491 (director evidence, FACTORY-467 comment 27770/27774,
+        // measured by admin-assembly on real codey): a bare-shell pane's
+        // entry is ABSENT from herdr's agent.list — not present with
+        // `agent: undefined`. This fixture previously listed it with
+        // `agent: undefined` while keeping the entry, which is what
+        // produced the review's own withdrawn "state 3" prediction; fixed
+        // to match reality.
+        list: async () => ({ agents: foreground === "claude" ? [{ agent: "claude", agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] : [] }),
         start: async (p: any) => {
           started.push(p);
           // FACTORY-314 (PR #513 review fix, live-tested): the OLD process
@@ -2171,9 +2232,14 @@ describe("resumeInPlace", () => {
         processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
+        // FACTORY-491 (director item 3): records every defensive close so
+        // tests can assert `resumeInPlaceExclusive`'s own "failed" paths
+        // close the pane by id directly, independent of `herd.stop()`'s
+        // separate identity-matched close.
+        close: async (id: string) => { closed.push(id); },
       },
     };
-    return { client: client as any, sent, started };
+    return { client: client as any, sent, started, closed };
   }
 
   async function withTempWorkspaces<T>(fn: () => Promise<T>): Promise<T> {
@@ -2287,6 +2353,9 @@ describe("resumeInPlace", () => {
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
         expect(f.started).toHaveLength(1); // the attempt WAS made
+        // FACTORY-491 (director item 3): the pane is closed by id directly,
+        // defence in depth ahead of reconcileNow's own herd.stop()+spawn().
+        expect(f.closed).toEqual(["w1:p1"]);
         // Old values stand — never overwritten by a relaunch that didn't take.
         expect(workspaceModel(cwd)).toBe("claude-opus-5");
         expect(workspaceEffort(cwd)).toBe("high");
@@ -2325,6 +2394,9 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-491 (director item 3): closed by id directly, independent
+        // of herd.stop()'s own identity-matched close in the fallthrough.
+        expect(f.closed).toEqual(["w1:p1"]);
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });
@@ -2347,6 +2419,9 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-491 (director item 3): closed by id directly, independent
+        // of herd.stop()'s own identity-matched close in the fallthrough.
+        expect(f.closed).toEqual(["w1:p1"]);
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });
@@ -2372,6 +2447,10 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         await expect(herd.resumeInPlace(spec)).rejects.toThrow("transport hiccup");
         expect(workspaceSessionId(cwd)).toBe("original-session");
+        // FACTORY-491 (director item 3): the defensive close is scoped to a
+        // genuine "failed" outcome only — a re-occupied pane throws instead,
+        // and must not be closed out from under whatever now occupies it.
+        expect(f.closed).toEqual([]);
       });
     });
   });
@@ -2975,7 +3054,11 @@ describe("resumeInPlace", () => {
         await f.client.agent.start({ args: ["--resume", "original-session"] });
         f.started.length = 0;
 
-        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        // FACTORY-491: this test proves the identity mechanism itself, not
+        // the canary gate — enable BUTCHR_RESTORED_RESUME's policy for every
+        // agent so the herdr-restored classification below is reachable
+        // regardless of the {buddy, genius}-only production default.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
         const stale = await herd.staleIssues();
         expect(stale).toHaveLength(1);
         expect(stale[0]!.resumable).toBe(true);
@@ -3002,6 +3085,90 @@ describe("resumeInPlace", () => {
         for (let poll = 0; poll < 3; poll++) {
           expect(await herd.staleIssues()).toEqual([]);
         }
+      });
+    });
+  });
+
+  // FACTORY-491 (director item 5) — the canary/kill switch, exercised
+  // through `staleIssues()` end to end rather than only the pure
+  // `restoredResumeEnabledFor` unit above: a managed session named
+  // "buddy" is enabled by the {buddy, genius} default (the epic's own
+  // reading of the ambiguous director steer), an ordinary jira-work
+  // (non-managed-session) agent is NOT — the default policy names agents,
+  // and only a managed session has one to check against.
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME defaulting to {buddy, genius} enables identity classification for a managed session named 'buddy'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/buddy.json" });
+      const cwd = ensureWorkspaceDir(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: new Set(["buddy", "genius"]) });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true);
+        expect(stale[0]!.reason).toContain("herdr restored");
+      });
+    });
+  });
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME defaulting to {buddy, genius} does NOT enable identity classification for an ordinary (non-managed-session) agent — it has no name to match", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-919" });
+      const cwd = workspaceDirFor(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: new Set(["buddy", "genius"]) });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false); // falls through to the ordinary allowlist, which refuses --mcp-config
+      });
+    });
+  });
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME=off disables identity classification even for a canary-listed managed session", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/buddy.json" });
+      const cwd = ensureWorkspaceDir(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "off" });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false);
+      });
+    });
+  });
+  // FACTORY-491 (director item 4, FACTORY-467 comment 27818 + FACTORY-73's
+  // outstanding hazard question relayed on FACTORY-467, 2026-09-28
+  // 23:05Z: whether a `launch_pending: true` entry can report
+  // `agent_status: "idle"`, which would let `resumeInPlace` send `/exit`
+  // to a claude that has not finished starting) — checked BEFORE the
+  // identity match regardless of `agent_status`, so this guard holds even
+  // in that unresolved case.
+  test("FACTORY-491: a pane whose claude launch is still pending (launch_pending: true) is never classified herdr-restored, even when its argv already carries a matching --resume", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-920" });
+      const cwd = workspaceDirFor(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const client = {
+          agent: {
+            list: async () => ({ agents: [{ agent: "claude", agent_status: "idle", cwd, pane_id: "w1:p1", workspace_id: "w1", launch_pending: true }] }),
+          },
+          pane: {
+            processInfo: async () => ({ process_info: { pane_id: "w1:p1", foreground_processes: [{ pid: 1, name: "claude", argv: ["claude", "--resume", "original-session"] }] } }),
+          },
+        };
+        const herd = new HerdrHerd(client as any, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false); // falls through to the ordinary allowlist, which refuses --mcp-config
       });
     });
   });
@@ -3046,7 +3213,9 @@ describe("resumeInPlace", () => {
         await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
         f.started.length = 0;
 
-        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the wedge/recovery mechanism, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
         const stale = await herd.staleIssues();
         expect(stale).toHaveLength(1);
         expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
@@ -3055,6 +3224,10 @@ describe("resumeInPlace", () => {
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed"); // not "stuck" — #551's floor fix in effect
         expect(f.sent.some((s) => s.text === "/exit")).toBe(true); // confirms /exit really was sent before the collision
+        // FACTORY-491 (director item 3): closed by id directly, inside
+        // resumeInPlace itself — before reconcileNow's own fallthrough
+        // (mirrored below) ever runs its separate identity-matched close.
+        expect(f.closed).toEqual(["w1:p1"]);
 
         // herdr eventually forgets the dead pane's registration (see
         // fakeHerdrFullCycle's own doc comment for why this is the honest
@@ -3100,13 +3273,17 @@ describe("resumeInPlace", () => {
         await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
         f.started.length = 0;
 
-        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the wedge/recovery mechanism, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
         const stale = await herd.staleIssues();
         expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
 
         f.setOtherErrorOnNextStart();
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed"); // never a raw propagated throw — #551's floor fix applies to this door too
+        // FACTORY-491 (director item 3): closed by id directly, inside resumeInPlace itself.
+        expect(f.closed).toEqual(["w1:p1"]);
 
         f.forgetAllAgents();
         await herd.stop(spec.key);
@@ -3137,7 +3314,9 @@ describe("resumeInPlace", () => {
         const f = statefulHerdr("w1:p1", cwd);
         await f.client.agent.start({ args: ["--resume", "vanished-session"] });
         f.started.length = 0;
-        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the transcript-gone fail-safe, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
         const stale = await herd.staleIssues();
         expect(stale).toHaveLength(1);
         expect(stale[0]!.resumable).toBe(true); // the identity match alone can't know the transcript is gone
