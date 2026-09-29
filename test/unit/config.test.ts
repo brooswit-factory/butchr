@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { loadConfig, describeConfig } from "../../src/config/config.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
+import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
 const noRead = () => { throw new Error("should not read"); };
 const base = { ATLASSIAN_SITE: "https://x.atlassian.net/", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "tok" };
@@ -338,23 +339,52 @@ describe("loadConfig", () => {
   });
 });
 
-describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token)", () => {
-  test("defaults to an empty allowlist — fail-closed, every origin rejected", () => {
+describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-475/FACTORY-477 default-allowlists Clevr's fixed id)", () => {
+  const CLEVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+  test("unset BUTCHR_EXTENSION_ORIGINS defaults to Clevr's fixed id alone — a fresh install needs no config", () => {
     const c = loadConfig(base, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: [] });
+    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN] });
   });
-  test("BUTCHR_EXTENSION_ORIGINS is read, trimmed and split on commas", () => {
+  test("a non-empty explicit BUTCHR_EXTENSION_ORIGINS is ADDITIVE — it adds to the default rather than replacing it", () => {
     const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop, chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba " }, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
+    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN, "chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
+  });
+  test("explicitly listing the default id again does not duplicate it", () => {
+    const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: CLEVR_ORIGIN }, noRead);
+    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEVR_ORIGIN] });
+  });
+  test("an explicitly EMPTY BUTCHR_EXTENSION_ORIGINS still fails closed — losing even the default, not just refusing extra entries", () => {
+    for (const empty of ["", "  ", ",", " , "]) {
+      const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: empty }, noRead);
+      expect(c.extensionAuth).toEqual({ allowedOrigins: [] });
+    }
   });
   test("rejects a BUTCHR_EXTENSION_ORIGINS entry that isn't a well-formed chrome-extension:// origin", () => {
     for (const bad of ["https://evil.example", "chrome-extension://tooshort", "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP", "not-a-uri-at-all"]) {
       expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: bad }, noRead)).toThrow("BUTCHR_EXTENSION_ORIGINS");
     }
   });
-  test("describeConfig reports the allowlist, and names the fail-closed consequence when it's empty — no token to ever leak", () => {
-    expect(describeConfig(loadConfig(base, noRead))).toContain("extensionAuth=origins=EMPTY — every origin rejected");
-    const d = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
-    expect(d).toContain("extensionAuth=origins=chrome-extension://abcdefghijklmnopabcdefghijklmnop");
+  test("describeConfig reports the allowlist (including the default), and names the fail-closed consequence when explicitly emptied", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain(`extensionAuth=origins=${CLEVR_ORIGIN}`);
+    const explicit = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
+    expect(explicit).toContain(`extensionAuth=origins=${CLEVR_ORIGIN},chrome-extension://abcdefghijklmnopabcdefghijklmnop`);
+    const empty = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "" }, noRead));
+    expect(empty).toContain("extensionAuth=origins=EMPTY — every origin rejected");
+  });
+});
+
+describe("guard behavior with the real default config (FACTORY-475/FACTORY-477)", () => {
+  const CLEVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+  test("default config allows the fixed Clevr id and rejects any other origin", () => {
+    const c = loadConfig(base, noRead);
+    expect(checkExtensionOrigin({ origin: CLEVR_ORIGIN }, c.extensionAuth).ok).toBe(true);
+    expect(checkExtensionOrigin({ origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, c.extensionAuth).ok).toBe(false);
+  });
+  test("absent Origin is still refused (403) even with the default allowlist populated", () => {
+    const c = loadConfig(base, noRead);
+    const r = checkExtensionOrigin({ origin: null }, c.extensionAuth);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {} });
   });
 });

@@ -3,6 +3,25 @@ import { workspaceRoot } from "../agents/workspace.js";
 import { isExtensionOrigin } from "../web/origin-guard.js";
 
 /**
+ * FACTORY-475/FACTORY-477: Clevr's manifest.json now pins a fixed `"key"`
+ * (see that repo's README, "Fixed extension id"), so its extension id is
+ * stable across every install rather than path-derived. A fresh Clevr
+ * install therefore needs NO `BUTCHR_EXTENSION_ORIGINS` configuration to
+ * attach — this one id is allowlisted by default. This IS a deliberate
+ * widening of the default allowlist (previously `[]`, fail-closed, the same
+ * shape of change FACTORY-464 made to the auth requirement itself): any
+ * process on this box that can set an `Origin` header by hand can now spoof
+ * this exact origin without the operator ever having typed it into
+ * `BUTCHR_EXTENSION_ORIGINS` — see `../web/origin-guard.ts`'s own header for
+ * that tradeoff stated in full. `BUTCHR_EXTENSION_ORIGINS` remains an
+ * ADDITIVE override: explicit entries add to this default rather than
+ * replacing it (see `loadConfig` below for exactly how, and how an
+ * explicitly EMPTY value still fails closed to `[]` — losing even this
+ * default — rather than silently keeping it).
+ */
+const DEFAULT_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+/**
  * Butchr's configuration, parsed from the environment once at startup.
  *
  * The Atlassian credential is a classic API token used as HTTP Basic auth
@@ -386,9 +405,14 @@ export interface Config {
    * DELIBERATELY ALWAYS PRESENT (unlike `github`/`rocketchat`, which are
    * `undefined` when off): a guarded route always has an `extensionAuth`
    * object to pass straight to the guard, with NO config-shape branch of
-   * its own. An empty/unset `BUTCHR_EXTENSION_ORIGINS` yields `allowedOrigins:
-   * []`, which the guard treats as "reject everything" — fail-closed by
-   * construction, never "no allowlist configured, so allow everything".
+   * its own. UNSET `BUTCHR_EXTENSION_ORIGINS` yields `allowedOrigins:
+   * [DEFAULT_EXTENSION_ORIGIN]` (FACTORY-475/FACTORY-477 — Clevr's fixed
+   * id, see this file's top). An explicitly EMPTY `BUTCHR_EXTENSION_ORIGINS`
+   * yields `allowedOrigins: []` instead — fail-closed, losing even the
+   * default — which the guard treats as "reject everything"; a non-empty
+   * explicit value ADDS to the default rather than replacing it. See
+   * `loadConfig` below for exactly how "unset" is distinguished from
+   * "explicitly empty".
    */
   extensionAuth: { allowedOrigins: string[] };
 }
@@ -557,12 +581,20 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const maxAgents = env.BUTCHR_MAX_AGENTS ? Number(env.BUTCHR_MAX_AGENTS) : 8;
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
-  // FACTORY-464/FACTORY-465: NEVER default an empty/unset allowlist to
-  // anything but `[]` — the guard (`../web/origin-guard.ts`) treats that as
-  // "reject every origin", the fail-closed default this section must keep
-  // (see `Config.extensionAuth`'s own doc comment).
-  const extensionOrigins = env.BUTCHR_EXTENSION_ORIGINS ? env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : [];
-  for (const origin of extensionOrigins) {
+  // FACTORY-475/FACTORY-477: UNSET (`undefined`, never configured at all)
+  // defaults to Clevr's one fixed id. An explicitly EMPTY value (present in
+  // the env, but blank/whitespace/commas-only once parsed) must still fail
+  // closed to `[]` — losing even the default — the same "never silently
+  // open" discipline FACTORY-464/FACTORY-465 required of the old
+  // bearer-token check. A non-empty explicit value is ADDITIVE: it adds to
+  // the default rather than replacing it (`Set` dedupes in case an operator
+  // lists the default id explicitly too).
+  const explicitExtensionOrigins = env.BUTCHR_EXTENSION_ORIGINS === undefined ? undefined : env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean);
+  const extensionOrigins =
+    explicitExtensionOrigins === undefined ? [DEFAULT_EXTENSION_ORIGIN]
+    : explicitExtensionOrigins.length === 0 ? []
+    : [...new Set([DEFAULT_EXTENSION_ORIGIN, ...explicitExtensionOrigins])];
+  for (const origin of explicitExtensionOrigins ?? []) {
     if (!isExtensionOrigin(origin)) throw new Error(`BUTCHR_EXTENSION_ORIGINS contains an invalid chrome-extension:// origin: ${JSON.stringify(origin)}`);
   }
 
