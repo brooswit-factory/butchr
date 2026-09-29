@@ -1,7 +1,7 @@
 /**
  * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): a pure,
  * dependency-free-of-I/O mapping from a browser URL to at most one
- * `{ resourceProvider, resourceId }` — the identity half of "Clevr" (a Chrome
+ * `{ resourceProvider, resourceId }` — the identity half of "Cleavr" (a Chrome
  * extension that slides a Claude terminal in for a page IF Butchr is running
  * an agent on it). This module answers "what resource, if any, does this URL
  * name" ONLY; it never looks at the agent registry (`GET /resources/for-url`,

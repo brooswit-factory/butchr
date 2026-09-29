@@ -17,7 +17,7 @@ export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
  * FACTORY-497 (implementing FACTORY-475, epic FACTORY-330 — operator
  * decision quoted verbatim in FACTORY-330 comment 27837: "not only the
  * default, the only option. I want it to be the only path, and the others
- * cleaned out."): Clevr's manifest.json pins a fixed `"key"` (see that
+ * cleaned out."): Cleavr's manifest.json pins a fixed `"key"` (see that
  * repo's README, "Fixed extension id"), so its extension id is stable
  * across every install rather than path-derived, and it is now the ONLY
  * allowed origin — hardcoded, not configurable. There is no allowlist to
@@ -27,7 +27,7 @@ export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
  * This replaces the FACTORY-475/FACTORY-477 default-plus-additive-override
  * scheme that briefly existed before this ticket.
  */
-const CLEVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+const CLEAVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -434,7 +434,7 @@ export interface Config {
    * `../web/origin-guard.ts`'s own header for this stated in full.
    *
    * FACTORY-497 (implementing FACTORY-475): NOT CONFIGURABLE any more.
-   * `allowedOrigins` is always exactly `[CLEVR_EXTENSION_ORIGIN]` — there is
+   * `allowedOrigins` is always exactly `[CLEAVR_EXTENSION_ORIGIN]` — there is
    * no env var, default-plus-override, or operator allowlist left to
    * describe here. DELIBERATELY ALWAYS PRESENT (unlike `github`/
    * `rocketchat`, which are `undefined` when off): a guarded route always
@@ -640,9 +640,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
   // FACTORY-497: hardcoded, the only allowed origin — see
-  // `CLEVR_EXTENSION_ORIGIN`'s own doc comment at this file's top for why
+  // `CLEAVR_EXTENSION_ORIGIN`'s own doc comment at this file's top for why
   // there is nothing left to parse from the environment here.
-  const extensionOrigins = [CLEVR_EXTENSION_ORIGIN];
+  const extensionOrigins = [CLEAVR_EXTENSION_ORIGIN];
 
   return {
     atlassian: { site, email, token },
@@ -683,7 +683,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
  * FACTORY-497: a daemon whose environment still sets `BUTCHR_EXTENSION_ORIGINS`
  * (e.g. an existing systemd drop-in from before this ticket) must not
  * silently ignore it — this names the exact ignored variable and states
- * that only Clevr's fixed id is allowed, so an operator who still has that
+ * that only Cleavr's fixed id is allowed, so an operator who still has that
  * drop-in in place sees why it no longer does anything. `undefined` when
  * the variable is unset, meaning nothing to warn about. Pure, like
  * `loadConfig`/`describeConfig`; the caller (`src/daemon/index.ts`) is
@@ -691,7 +691,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
  */
 export function ignoredExtensionOriginsWarning(env: ConfigEnv): string | undefined {
   if (env.BUTCHR_EXTENSION_ORIGINS === undefined) return undefined;
-  return "BUTCHR_EXTENSION_ORIGINS is set but ignored — only Clevr's fixed extension id is allowed now (FACTORY-497/FACTORY-475)";
+  return "BUTCHR_EXTENSION_ORIGINS is set but ignored — only Cleavr's fixed extension id is allowed now (FACTORY-497/FACTORY-475)";
 }
 
 function required(v: string | undefined, name: string): string {
@@ -804,7 +804,7 @@ export const describeConfig = (c: Config): string =>
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents} ` +
   // FACTORY-464/FACTORY-465: no token to ever log. FACTORY-497: always
-  // exactly Clevr's fixed id now — see `Config.extensionAuth`'s own doc
+  // exactly Cleavr's fixed id now — see `Config.extensionAuth`'s own doc
   // comment; the "EMPTY" fallback is dead code path kept only because
   // `allowedOrigins` is still typed as an array, never actually empty.
   `extensionAuth=origins=${c.extensionAuth.allowedOrigins.join(",") || "EMPTY — every origin rejected"}`;

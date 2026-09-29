@@ -1,6 +1,6 @@
 # `GET`/`POST /resources/for-url` — URL → resource resolution + agent lookup
 
-FACTORY-339 (implementing FACTORY-335, epic FACTORY-330 — "Clevr", a Chrome
+FACTORY-339 (implementing FACTORY-335, epic FACTORY-330 — "Cleavr", a Chrome
 extension that slides a Claude terminal in for a page IF Butchr is running an
 agent on it, with a dropdown when several agents serve it). This endpoint is
 the Butchr-side answer to "does this URL match a resource, and which agents
@@ -15,11 +15,11 @@ still does anything here. It doesn't; this route is now gated on the
 FACTORY-478/FACTORY-480: a real MV3 extension service worker's GET carries
 NO `Origin` header at all (Chrome only stamps `Origin` on a POST from that
 context — measured against headless Chrome for Testing 148 with a real
-built `clevr` extension; see FACTORY-478's comments for the full
+built `cleavr` extension; see FACTORY-478's comments for the full
 measurement). The strict Origin-required guard below therefore 403s
-`GET /resources/for-url` on every real Clevr install, and no config
+`GET /resources/for-url` on every real Cleavr install, and no config
 change can fix that — it's not a config problem.
-**Clevr's own client now uses `POST /resources/for-url` (URL in the JSON
+**Cleavr's own client now uses `POST /resources/for-url` (URL in the JSON
 body) instead**, because that's the request shape Chrome does stamp with
 `Origin` from a service worker. `GET` is KEPT, unchanged, for any other
 caller that can present a real `Origin` header itself (e.g. `curl -H
@@ -45,7 +45,7 @@ GET /resources/for-url?url=<percent-encoded browser URL>
 Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below;
                                    NOTE: a real MV3 service-worker GET never
                                    carries this — see above — so this form
-                                   is unreachable from Clevr's own extension
+                                   is unreachable from Cleavr's own extension
                                    context and exists for other callers only)
 ```
 
@@ -67,7 +67,7 @@ Both forms answer with the same response shape (both `resource` and
   tracks — a normal outcome, never an error.
 - `agents` is `[]` in TWO distinct cases: `resource` is `null`, AND
   `resource` resolved but nothing is currently staffed on it. A caller
-  (Clevr) tells these apart ONLY by reading `resource` itself, never by
+  (Cleavr) tells these apart ONLY by reading `resource` itself, never by
   `agents.length` alone — "not a Butchr resource" and "a Butchr resource
   with nothing running" must render differently.
 - `agents` is sorted deterministically by `ruleId` — the dropdown's own
@@ -105,8 +105,8 @@ byte-for-byte).
 ## Config
 
 FACTORY-497 (implementing FACTORY-475): not configurable. Only
-`chrome-extension://geffpgminecanhmpafbliajpeleoocan` — Clevr's fixed
-extension id (see the `clevr` repo's README, "Fixed extension id") — is ever
+`chrome-extension://geffpgminecanhmpafbliajpeleoocan` — Cleavr's fixed
+extension id (see the `cleavr` repo's README, "Fixed extension id") — is ever
 allowed; there is no env var, and no way to add or replace it. A request
 whose `Origin` header is absent, or present but not that exact id, is
 refused (403). A daemon whose environment still sets the old
@@ -134,7 +134,7 @@ exactly as unauthenticated as before this change.
 This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`)
 in addition to the Origin allowlist. That requirement is GONE: the operator
 weighed the tradeoff and chose to drop it — "one should just be able to
-start Clevr and work if butchr is there." The daemon binds loopback-only
+start Cleavr and work if butchr is there." The daemon binds loopback-only
 (`src/daemon/listen.ts`), and on a single-user local box, the operator judged
 an Origin-allowlist-only check sufficient.
 
@@ -155,14 +155,14 @@ poll cadence and staffs one agent per matching resource
 be:
 
 - **slow** — a live query adds a full round trip (or several) to every
-  page load Clevr checks, on the critical path of a UI a person is staring
+  page load Cleavr checks, on the critical path of a UI a person is staring
   at;
 - **rate-limited** — by that provider, shared with every other thing this
   daemon does against the same credential;
 - **wrong** — it would report matches this daemon isn't actually staffing
   (a rule that matches the resource but was never enabled, or a resource
   excluded by a project allowlist) — exactly the false positive this
-  endpoint's whole consumer (Clevr's terminal-open dropdown) must never
+  endpoint's whole consumer (Cleavr's terminal-open dropdown) must never
   show. Offering a terminal for an agent that doesn't exist is worse than
   offering none.
 

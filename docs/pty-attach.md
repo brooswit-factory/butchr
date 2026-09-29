@@ -1,6 +1,6 @@
 # `GET /agents/:agentKey/pty` — WebSocket PTY attach, Origin-gated
 
-FACTORY-453 (implementing FACTORY-337, epic FACTORY-330 — "Clevr", a Chrome
+FACTORY-453 (implementing FACTORY-337, epic FACTORY-330 — "Cleavr", a Chrome
 extension that slides a Claude terminal into a web page, attached to the
 Butchr agent working on that page's resource). FACTORY-335/FACTORY-339
 answered "which agents serve this page" (`GET /resources/for-url`, see
@@ -26,7 +26,7 @@ see `src/rules/agent-key.ts`). The upgrade is refused (never opened) when:
 | condition | result |
 |---|---|
 | `Origin` header ABSENT | `403` — the only credential left, so an absent one has nothing to fall back to |
-| `Origin` present but not Clevr's fixed id | `403` |
+| `Origin` present but not Cleavr's fixed id | `403` |
 | `:agentKey` does not decode as a valid agent key | `404`, `"not a valid agent key: <key>"` |
 | `:agentKey` decodes fine but names no currently-live agent row | `404`, `"no such live pane: <key> (not one of this daemon's own running agents)"` — the SAME wording `/agents/pane/:pane/attach` (`src/terminal/open.ts`'s `attachRefusalMessage`) uses for an unknown pane, deliberately reused rather than reinvented |
 
@@ -132,7 +132,7 @@ instead.
 ## Config
 
 FACTORY-497: not configurable. `Config.extensionAuth` (`src/config/config.ts`)
-is always exactly Clevr's fixed extension id — the SAME allowlist
+is always exactly Cleavr's fixed extension id — the SAME allowlist
 `/resources/for-url` uses — and is consumed here through
 `src/web/origin-guard.ts`, the exact same mechanism, not a second one. There
 is no env var left to set; a daemon whose environment still sets the old
@@ -147,7 +147,7 @@ authenticated/unauthenticated as before this change.
 
 This endpoint used to require a shared bearer token (`BUTCHR_EXTENSION_TOKEN`).
 That requirement is GONE: the operator weighed the tradeoff and chose to
-drop it — "one should just be able to start Clevr
+drop it — "one should just be able to start Cleavr
 and work if butchr is there." The daemon binds loopback-only
 (`src/daemon/listen.ts`), and on a single-user local box, the operator judged
 an Origin-allowlist-only check sufficient.
