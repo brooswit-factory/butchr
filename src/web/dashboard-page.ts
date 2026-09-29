@@ -33,6 +33,7 @@
  * the simplest way to guarantee mutation 8 ("any status filled from a Jira
  * label") never happens is to make it a missing import, not a discipline.
  */
+import { ICON_HEAD_TAGS, ICON_MARK } from "./icons.js";
 import type { AdmissionView, DashboardResponse, AgentDashboardRow, WithheldDashboardRow, TierField } from "../agents/dashboard.js";
 import type { StatusFloor } from "../agents/status-floor.js";
 import { humanDuration } from "../agents/status-floor.js";
@@ -399,9 +400,9 @@ export function renderDashboard(response: DashboardResponse, opts: RenderDashboa
     .map((row) => (row.kind === "agent" ? renderAgentRow(row, stale, opts) : renderWithheldRow(row, opts, declinedSources.has(row.source))))
     .join("");
   const refresh = opts.refreshSeconds ?? 5;
-  return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr dashboard</title>
+  return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr dashboard</title>${ICON_HEAD_TAGS}
 <style>${STYLE}</style></head><body>
-<h1>butchr — dashboard</h1>
+<h1>${ICON_MARK}butchr — dashboard</h1>
 ${renderBuildHeader(opts.header, opts.now)}
 ${renderPageBanner(response, opts.now)}
 ${renderAdmission(response.admission, opts.now)}

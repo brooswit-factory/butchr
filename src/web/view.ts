@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import type { McpHandle } from "@brooswit/thatch";
 import { renderDashboard, type DashboardHeaderInfo } from "./dashboard-page.js";
+import { ICON_ROUTES } from "./icons.js";
 import { renderConfigInventory, type ConfigInventoryFetchResult } from "./config-inventory-page.js";
 import type { HealthStatus } from "../daemon/health.js";
 import type { DashboardResponse } from "../agents/dashboard.js";
@@ -11,6 +12,8 @@ import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } 
 import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
+
+const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
 export interface AgentState { issue: string; status: string; summary: string }
 
@@ -191,6 +194,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       });
       return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
     })
+    // Brand icons (favicon, apple-touch/PWA sizes) the two pages above link to; static, no I/O.
+    .get("/favicon-16.png", iconResponse)
+    .get("/favicon-32.png", iconResponse)
+    .get("/favicon.ico", iconResponse)
+    .get("/apple-touch-icon.png", iconResponse)
     // 503 (not just a false `ok`) when unhealthy, so a `curl -f` or any dumb
     // uptime checker goes red too — an endpoint nobody curls doesn't satisfy
     // "loud" (BUTCHR-18/BUTCHR-6).
