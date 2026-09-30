@@ -2432,6 +2432,10 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: herdr accepted the launch and nothing threw — no exit
+        // code is available from herdr for a pane's process, so this is the
+        // honest ceiling, not a gap.
+        expect(herd.lastResumeFailureDetail(key)).toBe("no exit status captured");
         expect(f.started).toHaveLength(1); // the attempt WAS made
         // FACTORY-491 (director item 3): the pane is closed by id directly,
         // defence in depth ahead of reconcileNow's own herd.stop()+spawn().
@@ -2474,6 +2478,10 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: the herdr rejection itself is the reason — carried
+        // through from the `agent.start` throw, not lost on the way to
+        // "failed".
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: agent.start: agent name already used [agent_name_taken]");
         // FACTORY-491 (director item 3): closed by id directly, independent
         // of herd.stop()'s own identity-matched close in the fallthrough.
         expect(f.closed).toEqual(["w1:p1"]);
@@ -2499,6 +2507,9 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: ANY relaunch error, not just `agent_name_taken`,
+        // survives as this outcome's reason.
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: transport hiccup");
         // FACTORY-491 (director item 3): closed by id directly, independent
         // of herd.stop()'s own identity-matched close in the fallthrough.
         expect(f.closed).toEqual(["w1:p1"]);
@@ -2938,6 +2949,54 @@ describe("resumeInPlace", () => {
       const herd2 = new HerdrHerd(f2.client, "http://x/mcp", instant, (l) => lines2.push(l));
       await expect(herd2.resumeInPlace(spec)).rejects.toThrow("herdr hiccup");
       expect(lines2).toEqual([`${RESUME_TAG} ${key} threw — herdr hiccup`]);
+    });
+  });
+
+  // FACTORY-525: the fix this ticket exists for — before it, `[resume] KEY
+  // failed` carried no reason at all (the exact shape agentsafety's batch 1
+  // report observed live). Covers both the log line AND the separate
+  // `lastResumeFailureDetail` accessor `reconcileNow` (loop.ts) reads to
+  // build its own respawn comment — one attempt, two consumers, same value.
+  test("FACTORY-525: a 'failed' outcome's log line and lastResumeFailureDetail both carry the reason — a herdr error when the relaunch itself was rejected", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-914" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const lines: string[] = [];
+        const f = statefulHerdr("w1:p1", cwd, "idle", { nameTaken: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(lines).toEqual([`${RESUME_TAG} ${key} failed — herdr error: agent.start: agent name already used [agent_name_taken]`]);
+        // Read-once: the SAME detail the log line already rendered is still
+        // there for a second, independent consumer (`reconcileNow`) — and is
+        // gone after that read, so a later unrelated poll never sees a stale
+        // detail from this attempt.
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: agent.start: agent name already used [agent_name_taken]");
+        expect(herd.lastResumeFailureDetail(key)).toBeUndefined();
+      });
+    });
+  });
+
+  // FACTORY-525: the OTHER half of "the herdr error and the exit status,
+  // where they are available" — when herdr accepted the launch and nothing
+  // threw, there is no herdr error and no exit code (herdr exposes none for
+  // a pane's process), so the log line must say so explicitly rather than
+  // printing nothing.
+  test("FACTORY-525: a 'failed' outcome with nothing thrown (Claude simply didn't stay up) logs 'no exit status captured'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-915" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const lines: string[] = [];
+        const f = statefulHerdr("w1:p1", cwd, "idle", { crashesOnStart: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(lines).toEqual([`${RESUME_TAG} ${key} failed — no exit status captured`]);
+      });
     });
   });
 

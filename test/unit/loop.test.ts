@@ -133,6 +133,7 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
       nudge: async () => ({ delivered: false }),
       providerOf: async () => null,
       resumeInPlace: async () => "unresumable",
+      lastResumeFailureDetail: () => undefined,
     };
     const scoped = scopedHerd(full, () => true);
     const dropped = Object.keys(full).filter((k) => typeof (scoped as unknown as Record<string, unknown>)[k] !== "function");
@@ -2274,11 +2275,16 @@ describe("reconcileNow: FACTORY-314 resumeInPlace routing", () => {
   function fakeResumableHerd(
     initial: string[],
     stale: Array<{ issue: string; reason: string; observedArgv: string[]; resumable?: boolean }>,
-    outcomes: Record<string, Array<"resumed" | "deferred" | "stuck" | "unresumable">>,
+    outcomes: Record<string, Array<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">>,
+    // FACTORY-525: keyed by issue, read once per `resumeInPlace()` call that
+    // returns "failed" — mirrors `HerdrHerd`'s own read-once contract so this
+    // fake stays a faithful stand-in for it.
+    failureDetail: Record<string, string> = {},
   ) {
     const running = new Set(initial);
     const spawned: string[] = [], stopped: string[] = [], resumeCalls: string[] = [];
-    const queues = new Map<string, Array<"resumed" | "deferred" | "stuck" | "unresumable">>(Object.entries(outcomes).map(([k, v]) => [k, [...v]]));
+    const queues = new Map<string, Array<"resumed" | "deferred" | "stuck" | "unresumable" | "failed">>(Object.entries(outcomes).map(([k, v]) => [k, [...v]]));
+    const detail = new Map(Object.entries(failureDetail));
     const herd: Herd & { spawned: string[]; stopped: string[]; running: Set<string>; resumeCalls: string[] } = {
       running, spawned, stopped, resumeCalls,
       async runningIssues() { return [...running]; },
@@ -2292,6 +2298,11 @@ describe("reconcileNow: FACTORY-314 resumeInPlace routing", () => {
         const q = queues.get(sp.key);
         if (!q || !q.length) return "unresumable";
         return q.length > 1 ? q.shift()! : q[0]!;
+      },
+      lastResumeFailureDetail(issue) {
+        const d = detail.get(issue);
+        detail.delete(issue);
+        return d;
       },
     };
     return herd;
@@ -2321,6 +2332,55 @@ describe("reconcileNow: FACTORY-314 resumeInPlace routing", () => {
     expect(herd.spawned).toEqual(["R"]);
     expect(preserved).toEqual([]);
     expect(respawns).toEqual([{ issue: "R", reason: "session lost: session id could not be determined" }]);
+  });
+
+  // FACTORY-525: the ticket's own acceptance test — a "failed" resume's
+  // respawn reason now carries the herdr error, read through
+  // `lastResumeFailureDetail`, instead of the old "see the pane for
+  // details" that told an operator nothing. The stop-then-fresh-spawn
+  // fallback itself (asserted below) is unchanged from the "unresumable"
+  // case above.
+  test("failed: falls through to today's stop-then-fresh-spawn, with the reason carrying the herdr error via lastResumeFailureDetail", async () => {
+    const herd = fakeResumableHerd(
+      ["R"],
+      [{ issue: "R", reason: "argv lacks --model/--effort matching the current definition/rule", observedArgv: ["claude"], resumable: true }],
+      { R: ["failed"] },
+      { R: "herdr error: agent.start: agent name already used [agent_name_taken]" },
+    );
+    const respawns: Array<{ issue: string; reason: string }> = []; const preserved: string[] = [];
+    await reconcileNow(herd, new Map([["R", spec("R")]]), {
+      onRespawn: (issue, reason) => { respawns.push({ issue, reason }); },
+      onResumePreserved: (i) => { preserved.push(i); },
+    });
+    expect(herd.stopped).toEqual(["R"]);
+    expect(herd.spawned).toEqual(["R"]);
+    expect(preserved).toEqual([]);
+    expect(respawns).toEqual([{
+      issue: "R",
+      reason: "session lost: resume failed (the relaunched session did not stay alive — herdr error: agent.start: agent name already used [agent_name_taken])",
+    }]);
+  });
+
+  // FACTORY-525: the explicit fallback this ticket asks for — a fake `Herd`
+  // that implements `resumeInPlace` but not the optional
+  // `lastResumeFailureDetail` accessor (every OTHER fake `Herd` in this
+  // suite, and a live `Herd` too old to know about this ticket) must still
+  // produce an honest reason, never a silent "see the pane for details".
+  test("failed: with no lastResumeFailureDetail implementation at all, the reason says so explicitly rather than printing nothing", async () => {
+    const herd = fakeResumableHerd(
+      ["R"],
+      [{ issue: "R", reason: "argv lacks --model/--effort matching the current definition/rule", observedArgv: ["claude"], resumable: true }],
+      { R: ["failed"] },
+    );
+    delete (herd as { lastResumeFailureDetail?: unknown }).lastResumeFailureDetail;
+    const respawns: Array<{ issue: string; reason: string }> = [];
+    await reconcileNow(herd, new Map([["R", spec("R")]]), {
+      onRespawn: (issue, reason) => { respawns.push({ issue, reason }); },
+    });
+    expect(respawns).toEqual([{
+      issue: "R",
+      reason: "session lost: resume failed (the relaunched session did not stay alive — no exit status captured)",
+    }]);
   });
 
   test("deferred: never stops, never spawns, never consumes RespawnGuard admission — a resumable issue can be 'deferred' every poll indefinitely with no suppression warning ever firing", async () => {

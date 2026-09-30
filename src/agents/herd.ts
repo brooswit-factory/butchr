@@ -171,14 +171,21 @@ export interface Herd {
    *   only its transcript is missing. Same stop-then-fresh-spawn fallback as
    *   `"unresumable"` otherwise.
    * - `"failed"`: the relaunch was ACCEPTED by herdr but Claude did not stay
-   *   up (an unavailable model, or any other immediate exit) — caught by a
-   *   brief post-launch liveness check, since herdr accepting a launch only
-   *   means the process started. The model/effort files are deliberately
-   *   left UNCHANGED (persisted only after a CONFIRMED-alive relaunch — see
-   *   this method's own body) so a failed attempt stays detectable rather
-   *   than looking "already matching" on the next poll. The caller falls
-   *   back to today's stop-then-fresh-spawn, with a comment that says
-   *   plainly the resume failed and why.
+   *   up (an unavailable model, or any other immediate exit), OR herdr
+   *   itself rejected the relaunch attempt against a pane already confirmed
+   *   empty — caught by a brief post-launch liveness check, since herdr
+   *   accepting a launch only means the process started. The model/effort
+   *   files are deliberately left UNCHANGED (persisted only after a
+   *   CONFIRMED-alive relaunch — see this method's own body) so a failed
+   *   attempt stays detectable rather than looking "already matching" on the
+   *   next poll. The caller falls back to today's stop-then-fresh-spawn,
+   *   with a comment that says plainly the resume failed and why.
+   *   FACTORY-525: the WHY — the herdr error when the relaunch itself was
+   *   rejected, or an explicit "no exit status captured" when Claude simply
+   *   didn't stay up with nothing thrown — is available via
+   *   `lastResumeFailureDetail(issue)` immediately after this outcome, since
+   *   herdr exposes no exit code for a pane's process and this string is the
+   *   only place that reason survives past this call.
    * Never throws for any of the six; only a genuine herdr/RPC failure does.
    *
    * FACTORY-426: REQUIRED, not optional — `scopedHerd` (src/daemon/loop.ts),
@@ -198,6 +205,24 @@ export interface Herd {
    * it as `async () => "unresumable"`.
    */
   resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed">;
+
+  /**
+   * FACTORY-525: the reason `resumeInPlace(spec)`'s most recent `"failed"`
+   * outcome for `issue` happened — the herdr error's own message when the
+   * relaunch attempt itself was rejected, or the literal "no exit status
+   * captured" when Claude simply did not stay up and nothing was ever
+   * thrown (herdr exposes no exit code for a pane's process, so this is the
+   * honest ceiling, not a gap in this method). `undefined` when `issue`'s
+   * last `resumeInPlace()` outcome was anything other than `"failed"`, or
+   * this detail was already read once (read-once, like the outcome itself —
+   * nothing here is meant to be polled).
+   * Optional, same reasoning as `providerOf` below: only `HerdrHerd`
+   * populates it, and a fake `Herd` with no interest in this detail needs no
+   * implementation. Unlike `resumeInPlace` itself, this one carries no
+   * FACTORY-426 "silently never called" hazard — a caller that skips it
+   * merely loses the extra detail, never the underlying respawn behaviour.
+   */
+  lastResumeFailureDetail?(issue: string): string | undefined;
 }
 
 export interface ManagedHerdAgent {
@@ -546,6 +571,17 @@ export const SPAWN_TAG = "[spawn]";
  * `issue`/outcome first, free text last) so `journalctl | grep RESUME_TAG`
  * gives a complete attempt history independent of which callbacks a given
  * loop happens to wire.
+ *
+ * FACTORY-525: a `"failed"` outcome's own line additionally carries
+ * ` — <detail>` at the end (same "free text last" placement `SPAWN_TAG`'s
+ * own doc comment argues for, and for the identical reason: `<detail>` can
+ * embed a server-supplied `HerdrError` message with no newline exclusion of
+ * its own) — the herdr error when the relaunch attempt itself was rejected,
+ * or the literal "no exit status captured" when Claude simply didn't stay
+ * up with nothing thrown. Before this, `[resume] KEY failed` carried no
+ * reason at all — see `Herd.lastResumeFailureDetail`'s own doc comment for
+ * the accessor a caller other than this log line reads the same detail
+ * through.
  */
 export const RESUME_TAG = "[resume]";
 
@@ -586,6 +622,15 @@ export class HerdrHerd implements Herd {
   private readonly lifecycles = new Map<string, ManagedHerdrLifecycle>();
   private readonly operations = new Map<string, Promise<unknown>>();
   private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
+  /** FACTORY-525: set by `resumeInPlaceExclusive` at each `"failed"` return point; see `lastResumeFailureDetail`'s own doc comment (`Herd` interface, above). */
+  private readonly resumeFailureDetail = new Map<string, string>();
+
+  /** See the `Herd.lastResumeFailureDetail` interface doc for the full contract. Read-once: cleared on read, same shape as `resumeInPlace`'s own outcome. */
+  lastResumeFailureDetail(issue: string): string | undefined {
+    const detail = this.resumeFailureDetail.get(issue);
+    this.resumeFailureDetail.delete(issue);
+    return detail;
+  }
 
   constructor(
     private readonly herdr: DrovrClient,
@@ -1468,7 +1513,12 @@ export class HerdrHerd implements Herd {
     const issue = spec.key;
     try {
       const outcome = await this.exclusive(issue, () => this.resumeInPlaceExclusive(spec));
-      this.log?.(`${RESUME_TAG} ${issue} ${outcome}`);
+      // FACTORY-525: non-destructive read (`.get`, not `lastResumeFailureDetail`)
+      // — the caller (loop.ts) still needs to read-and-clear this same detail
+      // itself once `resumeInPlace()` returns, to build its own respawn
+      // comment; this line must not consume it first.
+      const detail = outcome === "failed" ? this.resumeFailureDetail.get(issue) : undefined;
+      this.log?.(`${RESUME_TAG} ${issue} ${outcome}${detail ? ` — ${detail}` : ""}`);
       return outcome;
     } catch (e) {
       this.log?.(`${RESUME_TAG} ${issue} threw — ${(e as Error)?.message ?? e}`);
@@ -1478,6 +1528,11 @@ export class HerdrHerd implements Herd {
 
   private async resumeInPlaceExclusive(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed"> {
     const issue = spec.key;
+    // FACTORY-525: cleared at the TOP of every attempt, not just on a
+    // "failed" outcome — a stale detail from a PRIOR failed attempt must
+    // never survive to be misread against a later attempt that never fails
+    // (nothing below re-sets this on a non-"failed" outcome).
+    this.resumeFailureDetail.delete(issue);
     // Routed through `this.exclusive` (above), the SAME per-issue queue
     // `spawn()`/`stop()` already use — a concurrent ordinary `herd.spawn()`
     // for this same issue (e.g. a reconcile poll landing mid-relaunch, which
@@ -1588,9 +1643,17 @@ export class HerdrHerd implements Herd {
     // STILL occupied (by claude or anything else) is left alone exactly as
     // before: `"stuck"` there is a genuinely safe, non-destructive retry,
     // never a wedge, since nothing needs recovering.
-    const postExitOutcome = async (): Promise<"stuck" | "failed"> => {
+    // FACTORY-525: `causedBy`, when given, is the error a relaunch attempt
+    // ITSELF threw (herdr rejecting `startManagedAgent`) — the "herdr error"
+    // half of this ticket's reason. Omitted, the pane simply came up empty
+    // with nothing thrown (the exit-wait race below, or the post-launch
+    // liveness check further down) — herdr exposes no exit code for a
+    // pane's process, so "no exit status captured" is the honest ceiling,
+    // not a gap in this check.
+    const postExitOutcome = async (causedBy?: unknown): Promise<"stuck" | "failed"> => {
       if (await this.providerOfPane(pane)) return "stuck";
       await this.closePaneDefensively(pane);
+      this.resumeFailureDetail.set(issue, causedBy ? `herdr error: ${(causedBy as Error)?.message ?? causedBy}` : "no exit status captured");
       return "failed";
     };
     const deadline = this.monotonicNow() + RESUME_EXIT_TIMEOUT_MS;
@@ -1667,7 +1730,7 @@ export class HerdrHerd implements Herd {
       // `reconcileNow`'s existing stop-then-spawn fallback — clearing
       // `ManagedHerdrLifecycle.active` via `herd.stop()` before the next
       // launch attempt, instead of leaving it stale forever.
-      const outcome = await postExitOutcome();
+      const outcome = await postExitOutcome(e); // FACTORY-525: `e` is the herdr rejection itself — recorded as this "failed" outcome's detail, never surfaced if the pane turns out occupied ("stuck" below, original error rethrown instead).
       if (outcome === "stuck") throw e; // pane unexpectedly occupied again — preserve the original error rather than mask it with a plain retry verdict; the caller still gets a "stuck"-shaped non-destructive path via the failures/notify wiring around thrown errors.
       return outcome; // "failed" — pane confirmed empty; the caller's stop-then-spawn fallback recovers it.
     }
@@ -1687,6 +1750,11 @@ export class HerdrHerd implements Herd {
     const launched = await this.providerOfPane(pane);
     if (!launched || launched.provider !== "claude") {
       await this.closePaneDefensively(pane);
+      // FACTORY-525: herdr accepted the launch and nothing threw — Claude
+      // just didn't stay up. herdr exposes no exit code for a pane's
+      // process, so there is no number to report here; say so explicitly
+      // rather than leaving this "failed" outcome's detail unset.
+      this.resumeFailureDetail.set(issue, "no exit status captured");
       return "failed";
     }
     // Re-persists model/effort/permission-mode/etc. for THIS relaunch, ONLY

@@ -823,8 +823,17 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       // the id but its transcript is gone", which reads differently again
       // from "we tried and it didn't stay up" (FACTORY-470/472 PR #560
       // review: the id-vs-transcript distinction was previously conflated).
+      // FACTORY-525: `lastResumeFailureDetail` is read-once (cleared on
+      // read, `HerdrHerd`'s own doc comment) — this is the ONE place
+      // production reads it, immediately after the "failed" outcome that
+      // set it, before anything else can. Falls back to the same explicit
+      // "no exit status captured" wording `HerdrHerd` itself uses when a
+      // fake `Herd` implements `resumeInPlace` but not this optional
+      // accessor, so a missing implementation degrades to an honest
+      // "unavailable" rather than a silent "see the pane for details" that
+      // told an operator nothing this ticket didn't already know was wrong.
       reason = outcome === "failed"
-        ? "session lost: resume failed (the relaunched session did not stay alive — see the pane for details)"
+        ? `session lost: resume failed (the relaunched session did not stay alive — ${herd.lastResumeFailureDetail?.(issue) ?? "no exit status captured"})`
         : outcome === "unresumable-transcript-gone"
         ? "session lost: a transcript for the persisted session id could not be found (the id was determined, but its transcript is gone)"
         : "session lost: session id could not be determined";
@@ -1049,6 +1058,11 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     ...(herd.recoverQuota ? { recoverQuota: (spec: SpawnSpec) => herd.recoverQuota!(spec) } : {}),
     ...(herd.providerOf ? { providerOf: (issue: string) => herd.providerOf!(issue) } : {}),
     resumeInPlace: (spec: SpawnSpec) => herd.resumeInPlace(spec),
+    // FACTORY-525: forwarded explicitly for the SAME reason `providerOf` is,
+    // just above — an optional member silently dropped here would still
+    // compile, and this loop's own reason-string read (just above, in this
+    // same function) is production's only consumer of it.
+    ...(herd.lastResumeFailureDetail ? { lastResumeFailureDetail: (issue: string) => herd.lastResumeFailureDetail!(issue) } : {}),
   };
 }
 
