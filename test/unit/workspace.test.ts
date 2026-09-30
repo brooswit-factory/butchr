@@ -194,8 +194,14 @@ describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspac
   });
 
   test("posix behaviour is byte-identical: a managed session still gets its short, bare definition name, never the flat encoded slug", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/brooswit/.config/butchr/session-definitions/admin-assembly.json" });
-    expect(workspaceDirFor(key, "/root/butchr-workspaces")).toBe("/root/butchr-workspaces/filesystem/managed-sessions/admin-assembly");
+    // `platform` is explicitly pinned to "linux" here — never left at this
+    // suite's real `process.platform` — so this assertion means the same
+    // thing on every CI host, including the `windows` job (whose REAL
+    // `process.platform` is `win32`, which would silently flip this into a
+    // second win32 case rather than the POSIX-regression pin it is meant to
+    // be).
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/brooswit/.config/butchr/session-definitions/admin-assembly.json" }, "linux");
+    expect(workspaceDirFor(key, "/root/butchr-workspaces", "linux")).toBe("/root/butchr-workspaces/filesystem/managed-sessions/admin-assembly");
   });
 
   test("real mkdir + rmdir under a temp root: ensureWorkspaceDir actually creates the leaf this fix computes, and the created directory's own basename carries no `:`/`\\`/`/` — the assertion the windows CI job proves on real NTFS, since there `platform: win32` is also this run's real `process.platform`", () => {
