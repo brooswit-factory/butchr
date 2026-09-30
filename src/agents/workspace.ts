@@ -255,13 +255,25 @@ export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: str
   return WORKSPACE_PLACEHOLDERS.reduce((acc, name) => acc.replaceAll(`{{${name}}}`, values[name]), template);
 };
 
-/** Model per issue type: epics think hardest, tasks run fast. A project resource (BUTCHR-71) gets the SAME tier an epic gets, not the task default — it makes epic-level product judgment, not fast mechanical work. */
+/**
+ * Model per issue type: epics/stories think hardest, tasks run fast.
+ *
+ * FACTORY-526: `project` (BUTCHR-71) used to get the SAME tier an epic
+ * gets — "epic-level product judgment, not fast mechanical work" — but that
+ * made an operator-authored `jira-project` rule with no explicit
+ * `agentPreferences` model spawn Opus by default, with no rule-file signal
+ * that it would. A brand-new `jira-project` rule is exactly the case with no
+ * per-rule judgment behind the tier yet, so it now falls to the same
+ * `sonnet` every other unrecognised issue type gets; a rule that genuinely
+ * wants epic-tier judgment sets `agentPreferences[].model: "opus"` itself
+ * (see docs/agent-providers.md, docs/rules.example.json).
+ */
 export const modelFor = (issuetype: string): string =>
-  ({ epic: "opus", story: "opus", task: "sonnet", project: "opus" } as Record<string, string>)[issuetype.toLowerCase()] ?? "sonnet";
+  ({ epic: "opus", story: "opus", task: "sonnet" } as Record<string, string>)[issuetype.toLowerCase()] ?? "sonnet";
 
-/** Effort per issue type: all types run high for now, project (BUTCHR-71) included. */
+/** Effort per issue type. FACTORY-526: `project` moved off the `high` default for the same reason `modelFor` moved it off `opus` — see that function's own doc comment. */
 export const effortFor = (issuetype: string): string =>
-  ({ epic: "high", story: "high", task: "high", project: "high" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
+  ({ epic: "high", story: "high", task: "high", project: "low" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
 
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 

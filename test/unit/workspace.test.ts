@@ -338,20 +338,23 @@ describe("briefFor / modelFor", () => {
     expect(brief).toContain("not a message reaching you");
     expect(brief).toContain("not a way for an epic to talk to you");
   });
-  test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
+  test("models: epic=opus story=opus task=sonnet, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
-    // BUTCHR-71: a project resource gets the SAME tier an epic gets, not the
-    // task-level default — it makes epic-level product judgment.
-    expect(modelFor("project")).toBe("opus");
+    // FACTORY-526: a `jira-project` rule with no explicit agentPreferences
+    // model must not silently spawn Opus — `project` now falls to the same
+    // sonnet default every other unrecognised issue type gets. It used to
+    // get the epic tier (BUTCHR-71); that's now opt-in via agentPreferences.
+    expect(modelFor("project")).toBe("sonnet");
   });
-  test("effort: epic/story/task/project all high, unknown type also defaults to high without throwing", () => {
+  test("effort: epic/story/task high, project low, unknown type defaults to high without throwing", () => {
     expect(effortFor("Epic")).toBe("high");
     expect(effortFor("Story")).toBe("high");
     expect(effortFor("Task")).toBe("high");
-    expect(effortFor("project")).toBe("high");
+    // FACTORY-526: keep the missing-model default cheap on effort too.
+    expect(effortFor("project")).toBe("low");
     expect(() => effortFor("Whatever")).not.toThrow();
     expect(effortFor("Whatever")).toBe("high");
     expect(effortFor("EPIC")).toBe("high");

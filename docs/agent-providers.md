@@ -103,9 +103,12 @@ production factory task; service activation remains a separate operation.
 Set `BUTCHR_AGENT_PROVIDER=claude` (default), `codex`, or `agy`. Optionally set
 `BUTCHR_AGENT_MODEL` to a model available to that provider's account. Invalid
 providers and empty explicit model values fail configuration loading.
-Without an override Claude retains opus for epic/story/project, sonnet for
-task/other, and high effort. Codex inherits its CLI model/reasoning settings;
-Claude aliases and `--effort` are never sent to Codex.
+Without an override Claude retains opus/high for epic/story, sonnet/high for
+task/other. `project` (a `jira-project` rule's agent) is `sonnet`/`low` unless
+that rule's own `agentPreferences` says otherwise (FACTORY-526 — it used to
+share the epic tier, which let a new rule with no model spawn Opus with no
+rule-file signal that it would). Codex inherits its CLI model/reasoning
+settings; Claude aliases and `--effort` are never sent to Codex.
 
 Selection applies to new issue and project agents. Existing agents are not
 replaced merely because configuration changed. Their argv health is checked

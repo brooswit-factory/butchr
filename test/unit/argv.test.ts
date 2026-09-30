@@ -458,4 +458,16 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
       expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
     });
   });
+
+  // FACTORY-526: the incident this ticket fixes — a jira-project rule with no
+  // agentPreferences model used to spawn Opus/high via modelFor/effortFor's
+  // old "project" cell. No `agent.model`/`agent.effort` override here, same
+  // as a rule that left agentPreferences unset (or set it with no `model` on
+  // the matching harness entry) — either way `agent` arrives with no model.
+  test("a jira-project Claude agent with no agentPreferences model no longer spawns Opus", () => {
+    const pm = { key: "jira-project:unity-manager:GK", issuetype: "project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--model") + 1]).toBe("sonnet");
+    expect(args[args.indexOf("--effort") + 1]).toBe("low");
+  });
 });

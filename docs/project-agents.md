@@ -23,6 +23,16 @@ For example:
 }]}
 ```
 
+This example's `agentPreferences` names a harness (`codex`) but no `model`;
+Codex then just inherits its own CLI model/reasoning settings, unaffected by
+this doc. For Claude, `model`/`effort` left off an `agentPreferences` entry
+(or `agentPreferences` left off the rule entirely) default to `sonnet`/`low`
+for a `jira-project` rule specifically (FACTORY-526) — never the `opus`/`high`
+an epic or story agent gets — precisely so a brand-new rule like this one
+never spawns Opus before anyone has told it to. Set
+`"agentPreferences":[{"harness":"claude","model":"opus","effort":"high"}]`
+(or similar) to opt a rule into a pricier tier deliberately.
+
 Discovery reads every [Jira project search](https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-projects/#api-rest-api-3-project-search-get)
 page before filtering by lead and keys. Failed or incomplete discovery leaves
 existing agents running. Archived projects are excluded. The rule owns only
