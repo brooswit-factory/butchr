@@ -231,6 +231,118 @@ differently-managed host.
   that looks like that symptom on a native host, it is a different problem
   and should be investigated fresh, not treated as the same known issue.
 
+## Unity build environment (headless WebGL, FACTORY-563)
+
+Out of scope here: actually running a build. This section is a checklist
+for admin-assembly to get zippy able to run one by hand later (GK-8,
+project GK, epic GK-7); FACTORY-563 documents and scripts the checklist
+only. Everything below needs a human with real zippy access and Brooswit's
+own Unity credentials — nothing in this repo can perform any of it.
+
+**Target:** Unity **6000.0.20f1** — the version already running the manual
+GoodKnight builds referenced from GK-1 through GK-5 (per GK-8's own ticket
+comments); confirm this is still the version installed on zippy before
+trusting it, since a local Editor upgrade wouldn't be visible from this
+repo.
+
+### 1. Unity Hub + Editor + WebGL module
+
+Install via [Unity Hub's own CLI](https://docs.unity3d.com/hub/manual/HubCLI.html)
+(`unityhub` on PATH once Hub itself is installed) rather than the GUI
+installer, so this step is scriptable and repeatable:
+
+```powershell
+unityhub -- --headless install --version 6000.0.20f1 --module webgl --changeset <changeset-for-6000.0.20f1>
+```
+
+The `--changeset` value is Editor-version-specific and not reproduced here
+— Unity Hub's own release-notes/archive page for `6000.0.20f1` names it;
+look it up at install time rather than trusting a copied value that could
+already be stale. `scripts/windows-host/verify-unity-build-env.ps1` (below)
+checks whether an Editor at this version, with the WebGL module, is
+already present — run it first; it may already be done.
+
+### 2. License activation (`.ulf`)
+
+**The license file and `UNITY_PASSWORD` are Brooswit's — never commit
+either to git, paste either into a Jira/Confluence comment, or post either
+into chat.** Per GK-8's own comment thread: a Unity Personal entitlement
+(`UnityEntitlementLicense.xml`) already exists on zippy from prior manual
+Editor use, but that XML is **not** the `.ulf` format a scripted/CI
+activation needs — generating the actual `.ulf` requires Unity Hub's own
+`Preferences > Licenses > Add > Get a free personal license` flow (click Add
+even if Hub already shows a licence: Hub can show one without writing the
+file). The manual `.alf` route (`-createManualActivationFile`, upload at
+https://license.unity3d.com/manual) is NOT supported for Unity Personal per
+the Unity 6 manual; GameCI documents only an unverified browser dev-tools
+workaround for it. Never put the password on a command line.
+
+Once obtained, the `.ulf` goes at Unity's own default per-machine license
+location — `C:\ProgramData\Unity\Unity_lic.ulf` (the script also accepts the `config\` variant) — **never** inside
+this repo or `%USERPROFILE%\butchr*`. `scripts/windows-host/verify-unity-build-env.ps1`
+checks for its presence at that path (existence only — it never reads or
+prints license content) and reports missing/present, nothing more.
+
+### 3. `git-lfs`
+
+GoodKnight's own asset pipeline (per GK-8's build notes) needs `git-lfs` on
+PATH for a clone/checkout to pull real asset content rather than pointer
+files:
+
+```powershell
+winget install -e --id GitHub.GitLFS
+git lfs install
+```
+
+### 4. Smoke build command
+
+**Placeholder — GoodKnight PR #4's own CI workflow was not reachable from
+this checkout** (private repo, `brooswit-unity/GoodKnight`; `gh pr view 4
+--repo brooswit-unity/GoodKnight` returned "Could not resolve to a
+Repository" against this session's own `gh` auth) to copy its real
+`-executeMethod` target. Verify the actual method name against that PR's
+CI workflow file directly before using this for anything beyond a dry read
+of the pattern:
+
+```powershell
+& "C:\Program Files\Unity\Hub\Editor\6000.0.20f1\Editor\Unity.exe" `
+  -batchmode -nographics -quit `
+  -projectPath "<path-to-GoodKnight-checkout>" `
+  -executeMethod GoodKnight.Build.WebGLReleaseBuild `
+  -logFile -
+```
+
+`-logFile -` streams the log to stdout instead of Unity's default log file
+— useful for a first, interactive smoke run; drop it (or point it at a real
+path) for anything unattended. This command is **not run by FACTORY-563**
+— per that ticket's own scope comment, running the build is explicitly out
+of scope for this pass; a later ticket exercises it for real and reports
+the actual command/duration/output path.
+
+### Runbook — admin-assembly only
+
+1. Confirm the Unity Editor version currently installed on zippy still
+   matches `6000.0.20f1` (or update the target above if it's moved on).
+2. Run `.\scripts\windows-host\verify-unity-build-env.ps1` first — it may
+   already report Hub/Editor/module/git-lfs present and only the `.ulf`
+   missing, narrowing what's actually left.
+3. Install Unity Hub + the `6000.0.20f1` Editor + WebGL module (section 1)
+   if the checklist script reports them missing.
+4. Obtain `UNITY_PASSWORD` from Brooswit directly (never relayed through a
+   ticket/chat) and generate/place the real `.ulf` (section 2) — this step
+   cannot be delegated to a scripted flow without a human present for the
+   manual-activation upload step.
+5. Install `git-lfs` (section 3) if the checklist script reports it
+   missing, and run `git lfs pull` inside the GoodKnight checkout once
+   cloned.
+6. Verify the real `-executeMethod` target against GoodKnight PR #4's own
+   CI workflow (section 4) — this doc's value is a placeholder.
+7. Only once 1-6 are done: run the smoke command (section 4) by hand, once,
+   to confirm the environment actually builds — this is the first point at
+   which anything in this checklist actually invokes Unity. Report the
+   exact command, duration, and output path on whichever ticket picks that
+   up next (not this one).
+
 ## What was and wasn't tested off-Windows
 
 This workspace has no Windows host at all — nothing here was exercised
@@ -276,3 +388,13 @@ unverified — treat it as a documented option, not a recommendation, until
 it's been run for real. If you run this install and something here turns
 out wrong, that observation wins — update this doc, don't trust it over
 what you just measured.
+
+The same honesty applies to the "Unity build environment" section above:
+`scripts/windows-host/verify-unity-build-env.ps1` only does read-only
+existence checks (`Get-Command`, `Test-Path`), never invokes Unity or
+Unity Hub, and was exercised here only as plain PowerShell syntax-checked
+by `Get-Command -Syntax`/manual read — no real Unity Hub, Editor, or `.ulf`
+was available to check it against. The `-executeMethod` target and
+`--changeset` value are explicitly flagged placeholders above, not
+observed facts; treat the whole Unity section as unverified until someone
+with zippy access runs it for real and reports back what was wrong.
