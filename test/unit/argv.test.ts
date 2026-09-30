@@ -431,6 +431,20 @@ describe("FACTORY-577: codex spec.permissionMode honored", () => {
     expect(args).toContain(BYPASS_FLAG);
   });
 
+  // FACTORY-108 regression guard, required explicitly per FACTORY-577
+  // review: absent permissionMode with lizardMode: true must still yield
+  // manual — the third pre-existing case in the precedence comment above.
+  // (Already implied by the pre-existing "FACTORY-108: codex lizard mode"
+  // describe block below, which this fix does not touch; stated again here
+  // under its own name so this describe block is a complete, self-contained
+  // record of every case the FACTORY-577 precedence comment documents.)
+  test("absent permissionMode with lizardMode: true still yields manual, unchanged", () => {
+    const args = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
   // PRECEDENCE, both directions: an explicit permissionMode on a
   // jira-project-keyed agent overrides the jira-project manual default.
   test('explicit "bypassPermissions" on a jira-project agent overrides the jira-project manual default', () => {
@@ -445,11 +459,19 @@ describe("FACTORY-577: codex spec.permissionMode honored", () => {
     expect(args).not.toContain(BYPASS_FLAG);
   });
 
-  // PRECEDENCE over lizardMode too: an explicit permissionMode wins even
-  // when spec.lizardMode independently asks for manual approval.
-  test('explicit "bypassPermissions" overrides lizardMode: true', () => {
+  // PRECEDENCE over lizardMode too — this is the single most important new
+  // case: `permissionMode: "bypassPermissions"` + `lizardMode: true` is a
+  // genuinely self-contradictory definition (YOLO means no approval dialog
+  // ever appears, so lizardMode's auto-answering becomes dead code for that
+  // pane — see the precedence comment in agentLaunchConfig's Codex branch,
+  // src/agents/argv.ts, for the full reasoning on why explicit
+  // permissionMode deliberately wins anyway). Proven directly rather than
+  // left to fall out of evaluation order.
+  test('explicit "bypassPermissions" overrides lizardMode: true (the deliberate self-contradiction)', () => {
     const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions", lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
     expect(args).toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: "bypassPermissions", lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(true);
   });
 
   // Claude-path behavior is untouched by this fix: FACTORY-138's own
