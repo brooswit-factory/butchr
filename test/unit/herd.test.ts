@@ -14,6 +14,7 @@ import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/
 import { effectiveAgent } from "../../src/resources/session-definition.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
+import { absPath } from "../helpers/abs-path";
 
 const clearQuota = () => {
   processProviderAvailability.clear({ provider: "claude", accountId: "default" });
@@ -211,15 +212,15 @@ describe("HerdrHerd", () => {
     // path, not by the narrower buildWorkspace/agentLaunchConfig-only tests the PR review itself ran.
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
     await herd.spawn({
       key, issuetype: "managed-session", summary: "s", parent: null,
       brief: "Keep this repo's docs and dependency versions current.",
-      cwd: "/repo/some-project",
+      cwd: absPath("repo", "some-project"),
       agents: [{ harness: "claude", model: "sonnet" }],
     });
     expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
-    expect(f.started[0].args[0]).toContain("/repo/some-project");
+    expect(f.started[0].args[0]).toContain(absPath("repo", "some-project"));
     expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
     expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
   });
@@ -776,6 +777,7 @@ describe("staleIssues", () => {
   }
   const instant = () => Promise.resolve();
   const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
+  const DEF_RESOURCE = absPath("etc", "defs", "a.json"); // reused across most tests in this block
 
   test("AGY residents are checked using the Drovr launch contract", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
@@ -824,14 +826,14 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-mcp-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
       // "expected" reconstruction) uses, so the channel-flag joining format
       // is guaranteed consistent rather than hand-guessed here.
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", mcpServers }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, mcpServers }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -848,12 +850,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-mcp-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Missing the server:mud-bridge channel flag the definition now calls for.
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -880,13 +882,13 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
       // "expected" reconstruction) uses, so the flag value is guaranteed
       // consistent rather than hand-guessed here.
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", permissionMode: "auto" }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, permissionMode: "auto" }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -903,11 +905,11 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Missing the --permission-mode auto flag the persisted definition now calls for.
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -928,10 +930,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", strictMcpConfig: true }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, strictMcpConfig: true }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -948,10 +950,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -977,10 +979,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
-      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1002,12 +1004,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-on-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // The definition has just been edited to lizardMode: true, and the daemon persisted that at the last managed-sessions poll...
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
       // ...but the agent itself is still the one running from BEFORE the edit — still carrying the bypass flag.
-      const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillBypassedArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1024,11 +1026,11 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-off-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // No .butchr-lizard-mode.json — the definition has just been edited BACK to lizardMode: false/unset.
       // The agent itself is still the one running from BEFORE that edit — launched without the bypass flag.
-      const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillLizardArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       const stale = await herd.staleIssues();
@@ -1067,9 +1069,9 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-absent-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
-      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1094,8 +1096,8 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-default-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE };
       // The REAL buildWorkspace — no permissionMode on the spec, so
       // `.butchr-permission-mode.json` is never written (buildWorkspace only
       // persists an EXPLICIT value), matching a real spec-construction site
@@ -1121,8 +1123,8 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-deploy-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE };
       const cwd = buildWorkspace(spec, "http://x/mcp", "claude"); // no permissionMode persisted, same as before this ticket.
       // What every currently-running agent's argv actually looks like today: no --permission-mode flag was ever
       // sent by butchr, so Drovr's own `launch.permissionMode ?? "bypassPermissions"` fallback produced this value.
@@ -1164,11 +1166,11 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
       expect(await herd.staleIssues()).toEqual([]);
@@ -1185,12 +1187,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // Spawned a while ago at Sonnet/medium...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("medium"));
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       // ...but the definition now resolves to Fable/xhigh (an edit, or a table edit).
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
@@ -1217,13 +1219,13 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-respawn-clean-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // The respawn already happened: buildWorkspace persisted the NEW resolved model/effort...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
       // ...and the running process now reflects it too (argv itself never carries --model/--effort comparison, but the workspace persistence does).
-      const freshArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const freshArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
       for (let poll = 0; poll < 5; poll++) expect(await herd.staleIssues()).toEqual([]);
@@ -1248,12 +1250,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-e2e-power-scale-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const rule = builtinManagedSessionsRule("/etc/defs");
-      const resourcePath = "/etc/defs/admin-agentcost.json";
+      const rule = builtinManagedSessionsRule(absPath("etc", "defs"));
+      const resourcePath = absPath("etc", "defs", "admin-agentcost.json");
       const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: resourcePath });
       // The REAL resolver (effectiveAgent) and REAL spec builder (specForSessionDefinition) —
       // exactly what searchSessionDefinitions/specForSessionDefinitionUnit run in production.
-      const definitionAt100_70 = { workingDirectory: "/repo/admin-agentcost", brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+      const definitionAt100_70 = { workingDirectory: absPath("repo", "admin-agentcost"), brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
       const spec = specForSessionDefinition({ agentKey, rule, resource: { path: resourcePath, kind: "file", name: "admin-agentcost.json", size: 10, mtimeMs: 1 }, definition: definitionAt100_70 });
       expect(spec.agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]); // DoD item 1: modelPower=100/effort=70 -> Fable at xhigh.
       // The REAL buildWorkspace — persists .butchr-model.json/.butchr-effort.json exactly as a real spawn would.
@@ -1294,7 +1296,7 @@ describe("staleIssues", () => {
       const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-match-"));
       process.env.BUTCHR_WORKSPACES = root;
       try {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
         // A pre-existing build's real launch: agentLaunchConfig always emits both --model and --effort for Claude, unconditionally (its own default fallback resolved to sonnet/high here).
         const argv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default, not Drovr's bypassPermissions fallback.
@@ -1315,7 +1317,7 @@ describe("staleIssues", () => {
       const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-drift-"));
       process.env.BUTCHR_WORKSPACES = root;
       try {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // legacy: no persisted model/effort file.
         const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
@@ -1425,10 +1427,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-unresolved-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
-      const argv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const argv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => undefined);
       expect(await herd.staleIssues()).toEqual([]);
@@ -1843,8 +1845,8 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
     process.env.BUTCHR_WORKSPACES = root;
     try {
       // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
-      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
       expect(incoming > running).toBe(true); // pins the ordering this test relies on
       // `ensureWorkspaceDir`, not a bare `workspaceDirFor` string: a real
       // already-running agent's workspace is always claimed+stamped on disk
@@ -1873,8 +1875,8 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
     const root = mkdtempSync(join(tmpdir(), "herd-collide-before-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
-      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
       expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
       const runningCwd = ensureWorkspaceDir(running); // see the sibling test above for why this must be a real, stamped claim
       const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
@@ -1937,7 +1939,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
   });
 
   test("never touches a workspace whose pane cwd is NOT butchr's own (ownership proven via cwd, never via herdr's current label)", async () => {
-    const f = fakeHerdr([{ pane_id: "p1", cwd: "/home/someone/unrelated-project", workspace_id: "wX" }]);
+    const f = fakeHerdr([{ pane_id: "p1", cwd: absPath("home", "someone", "unrelated-project"), workspace_id: "wX" }]);
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     expect(f.renamed).toEqual([]);
@@ -1949,8 +1951,8 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const root = mkdtempSync(join(tmpdir(), "herd-relabel-collide-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-      const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+      const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
       // Real, stamped claims (FACTORY-118) — see the spawn-time collision
       // tests above for why a bare `workspaceDirFor` string here would leave
       // `agentIdOfWorkspacePath` unable to resolve either fake pane's cwd
@@ -3094,13 +3096,13 @@ describe("resumeInPlace", () => {
       // `.butchr-mcp-servers.json` (`workspaceMcpServers`) for THIS shape;
       // a bare rule-engine spec instead needs a `mcpBindingsOf` callback
       // this test doesn't wire up.
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/factory-913.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "factory-913.json") });
       const cwd = ensureWorkspaceDir(key);
       const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
-      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, resource: "/etc/defs/factory-913.json", mcpServers: [binding] };
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, resource: absPath("etc", "defs", "factory-913.json"), mcpServers: [binding] };
       await withResumableSession(cwd, "original-session", async (home) => {
         const f = statefulHerdr("w1:p1", cwd);
-        const oldArgv = spawnArgs({ key, issuetype: "managed-session", summary: "", parent: null, resource: "/etc/defs/factory-913.json" }, cwd);
+        const oldArgv = spawnArgs({ key, issuetype: "managed-session", summary: "", parent: null, resource: absPath("etc", "defs", "factory-913.json") }, cwd);
         await f.client.agent.start({ args: oldArgv });
         f.started.length = 0;
         const { writeFileSync } = require("node:fs") as typeof import("node:fs");
@@ -3134,7 +3136,7 @@ describe("resumeInPlace", () => {
   // already-`--resume`d pane — exactly what FACTORY-470 puts out of scope.
   test("staleIssues(): a pane already relaunched via resumeInPlace (carries --resume AND the full flag set) that later drifts is classified via the ordinary allowlist, never as 'herdr restored'", async () => {
     await withTempWorkspaces(async () => {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/factory-918.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "factory-918.json") });
       const cwd = ensureWorkspaceDir(key);
       const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
       persistDiscoveredSessionId(cwd, "already-resumed-session");
@@ -3143,7 +3145,7 @@ describe("resumeInPlace", () => {
       // have produced — full flags (--mcp-config included), PLUS --resume.
       // Never a herdr-restore shape: butchr itself built this argv.
       const priorArgv = spawnArgs(
-        { key, issuetype: "managed-session", summary: "", parent: null, resource: "/etc/defs/factory-918.json" },
+        { key, issuetype: "managed-session", summary: "", parent: null, resource: absPath("etc", "defs", "factory-918.json") },
         cwd, { provider: "claude", resumeSessionId: "already-resumed-session" },
       );
       await f.client.agent.start({ args: priorArgv.slice(1) }); // drop the leading "claude" positional; statefulHerdr re-adds it
@@ -3237,7 +3239,7 @@ describe("resumeInPlace", () => {
   // and only a managed session has one to check against.
   test("FACTORY-491: BUTCHR_RESTORED_RESUME defaulting to {buddy, genius} enables identity classification for a managed session named 'buddy'", async () => {
     await withTempWorkspaces(async () => {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/buddy.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "buddy.json") });
       const cwd = ensureWorkspaceDir(key);
       await withResumableSession(cwd, "original-session", async () => {
         const f = statefulHerdr("w1:p1", cwd);
@@ -3269,7 +3271,7 @@ describe("resumeInPlace", () => {
   });
   test("FACTORY-491: BUTCHR_RESTORED_RESUME=off disables identity classification even for a canary-listed managed session", async () => {
     await withTempWorkspaces(async () => {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/buddy.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "buddy.json") });
       const cwd = ensureWorkspaceDir(key);
       await withResumableSession(cwd, "original-session", async () => {
         const f = statefulHerdr("w1:p1", cwd);

@@ -74,7 +74,8 @@ describe("ensureAccount", () => {
     expect("token" in r).toBe(false); // BUTCHR-412: never returned — only the 0600 file's path is
     expect(typeof r.tokenFile).toBe("string");
     expect(readFileSync(r.tokenFile, "utf8").trim().length).toBeGreaterThan(0);
-    expect(statSync(r.tokenFile).mode & 0o777).toBe(0o600);
+    // FACTORY-569: NTFS has no POSIX permission bits — this file's mode is meaningless on win32.
+    if (process.platform !== "win32") expect(statSync(r.tokenFile).mode & 0o777).toBe(0o600);
     expect(calls.filter((c) => c.method === "createUser")).toHaveLength(1);
     expect(await store.get(AGENT)).toMatchObject({ agentKey: AGENT, rcUserId: r.rcUserId, username: r.username, policy: "temporary", tokenFile: r.tokenFile });
   });
@@ -83,7 +84,8 @@ describe("ensureAccount", () => {
   // itself (not just each file inside it) should be 0700 — otherwise every
   // managed account NAME is listable by another local user even though each
   // token's contents stay unreadable.
-  test("the token directory is created at 0700 when this call actually creates it", async () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("the token directory is created at 0700 when this call actually creates it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-rc-tokendir-"));
     try {
       const tokenDir = join(dir, "nested", "tokens");

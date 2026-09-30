@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { panesFor, groupOwnedPanes, aggregateVerdict } from "../../src/agents/residency-census.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
+import { absPath } from "../helpers/abs-path";
 
 const root = workspaceRoot();
 
@@ -25,7 +26,7 @@ describe("panesFor (BUTCHR-287) — pure ownership join, no agent.list() involve
   });
 
   test("a pane at a different cwd entirely is never owned", () => {
-    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: absPath("home", "someone", "some-other-project") }] as any[];
     expect(panesFor("BUTCHR-9", panes, root)).toEqual([]);
   });
 
@@ -62,7 +63,7 @@ describe("groupOwnedPanes (BUTCHR-287) — the inverse join, no candidate list n
   });
 
   test("a pane elsewhere entirely is never grouped", () => {
-    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
+    const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: absPath("home", "someone", "some-other-project") }] as any[];
     expect(groupOwnedPanes(panes, root).size).toBe(0);
   });
 

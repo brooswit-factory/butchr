@@ -16,13 +16,14 @@ import { listFilesystemResources } from "../../src/resources/filesystem.js";
 import type { SessionDefinition } from "../../src/resources/session-definition.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
+import { absPath } from "../helpers/abs-path";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
   ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
 
 /** A minimal valid definition body, as it would be written to a *.json file. */
 const goodDef = (over: Record<string, unknown> = {}) => ({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
+  workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });
 
 function fakeFiles(files: Record<string, string>) {
@@ -36,38 +37,38 @@ function fakeFiles(files: Record<string, string>) {
 
 describe("builtinManagedSessionsRule", () => {
   test("a filesystem rule, one file per direct child, fixed swarm/none/worker, over the given root", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     expect(rule.id).toBe(MANAGED_SESSIONS_RULE_ID);
     expect(rule.resourceProvider).toBe("filesystem");
     expect(rule.execution).toBe("swarm");
     expect(rule.account).toBe("none");
-    expect(JSON.parse(rule.query)).toEqual({ root: "/defs", kind: "file", maxDepth: 1 });
+    expect(JSON.parse(rule.query)).toEqual({ root: absPath("defs"), kind: "file", maxDepth: 1 });
   });
 });
 
 describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
-  const rule = builtinManagedSessionsRule("/defs");
+  const rule = builtinManagedSessionsRule(absPath("defs"));
 
   test("a valid, non-frozen definition is eligible", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef()) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef()) });
     const matches = await searchSessionDefinitions({ rule, list, read });
     expect(matches).toHaveLength(1);
     expect(matches[0]!.definition.vendor).toBe("claude");
-    expect(matches[0]!.agentKey).toBe(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" }));
+    expect(matches[0]!.agentKey).toBe(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") }));
   });
 
   test("invalid JSON is excluded and reported once via onInvalid, never crashes the poll, siblings still staff", async () => {
-    const { list, read } = fakeFiles({ "/defs/bad.json": "not json", "/defs/good.json": JSON.stringify(goodDef()) });
+    const { list, read } = fakeFiles({ [absPath("defs", "bad.json")]: "not json", [absPath("defs", "good.json")]: JSON.stringify(goodDef()) });
     const invalid: Array<[string, string]> = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, undefined, (p, e) => invalid.push([p, e]));
-    expect(matches.map((m) => m.resource.path)).toEqual(["/defs/good.json"]);
+    expect(matches.map((m) => m.resource.path)).toEqual([absPath("defs", "good.json")]);
     expect(invalid).toHaveLength(1);
-    expect(invalid[0]![0]).toBe("/defs/bad.json");
+    expect(invalid[0]![0]).toBe(absPath("defs", "bad.json"));
     expect(invalid[0]![1]).toContain("invalid JSON");
   });
 
   test("a schema-invalid definition (missing required field) is excluded and reported", async () => {
-    const { list, read } = fakeFiles({ "/defs/incomplete.json": JSON.stringify({ workingDirectory: "/x" }) });
+    const { list, read } = fakeFiles({ [absPath("defs", "incomplete.json")]: JSON.stringify({ workingDirectory: absPath("x") }) });
     const invalid: Array<[string, string]> = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, undefined, (p, e) => invalid.push([p, e]));
     expect(matches).toEqual([]);
@@ -75,21 +76,21 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
   });
 
   test("a frozen definition is VALID but excluded, reported distinctly via onFrozen (not onInvalid)", async () => {
-    const { list, read } = fakeFiles({ "/defs/frozen.json": JSON.stringify(goodDef({ frozen: true })) });
+    const { list, read } = fakeFiles({ [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })) });
     const invalid: string[] = [];
     const frozen: string[] = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, undefined, (p) => invalid.push(p), (p) => frozen.push(p));
     expect(matches).toEqual([]);
     expect(invalid).toEqual([]);
-    expect(frozen).toEqual(["/defs/frozen.json"]);
+    expect(frozen).toEqual([absPath("defs", "frozen.json")]);
   });
 
   test("a definition whose id would overflow the workspace-directory-name limit is skipped via onOversized, same as any other filesystem resource", async () => {
-    const oversized = `/defs/${"d".repeat(300)}.json`;
-    const { list, read } = fakeFiles({ [oversized]: JSON.stringify(goodDef()), "/defs/a.json": JSON.stringify(goodDef()) });
+    const oversized = absPath("defs", `${"d".repeat(300)}.json`);
+    const { list, read } = fakeFiles({ [oversized]: JSON.stringify(goodDef()), [absPath("defs", "a.json")]: JSON.stringify(goodDef()) });
     const skipped: string[] = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, (_r, p) => skipped.push(p));
-    expect(matches.map((m) => m.resource.path)).toEqual(["/defs/a.json"]);
+    expect(matches.map((m) => m.resource.path)).toEqual([absPath("defs", "a.json")]);
     expect(skipped).toEqual([oversized]);
   });
 
@@ -97,8 +98,8 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
     // Exactly the shape writeFileAtomic's own temp file takes (`.${uuid}.tmp`), and this ticket's own
     // EXDEV unarchive fallback's temp file — see isHiddenDefinitionFile's own doc comment for why.
     const { list, read } = fakeFiles({
-      "/defs/.abc123.tmp": JSON.stringify(goodDef()),
-      "/defs/good.json": JSON.stringify(goodDef()),
+      [absPath("defs", ".abc123.tmp")]: JSON.stringify(goodDef()),
+      [absPath("defs", "good.json")]: JSON.stringify(goodDef()),
     });
     const oversized: string[] = [], invalid: string[] = [], frozen: string[] = [];
     const matches = await searchSessionDefinitions(
@@ -107,14 +108,14 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
       (p) => invalid.push(p),
       (p) => frozen.push(p),
     );
-    expect(matches.map((m) => m.resource.path)).toEqual(["/defs/good.json"]);
+    expect(matches.map((m) => m.resource.path)).toEqual([absPath("defs", "good.json")]);
     expect(oversized).toEqual([]);
     expect(invalid).toEqual([]);
     expect(frozen).toEqual([]);
   });
 
   test("BUTCHR-455 review fix: a hidden basename with a FROZEN manifest is still never a candidate and never reported via onFrozen either", async () => {
-    const { list, read } = fakeFiles({ "/defs/.abc.tmp": JSON.stringify(goodDef({ frozen: true })) });
+    const { list, read } = fakeFiles({ [absPath("defs", ".abc.tmp")]: JSON.stringify(goodDef({ frozen: true })) });
     const frozen: string[] = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, undefined, undefined, (p) => frozen.push(p));
     expect(matches).toEqual([]);
@@ -140,23 +141,23 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
   // definition (the new mechanism) never triggers it.
   test("a tier-based definition is eligible AND reported via onDeprecatedTier; a modelPower/effort-based one is eligible and NOT reported", async () => {
     const { list, read } = fakeFiles({
-      "/defs/old.json": JSON.stringify(goodDef()),
-      "/defs/new.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 25, effort: 20 })),
+      [absPath("defs", "old.json")]: JSON.stringify(goodDef()),
+      [absPath("defs", "new.json")]: JSON.stringify(goodDef({ tier: undefined, modelPower: 25, effort: 20 })),
     });
     const deprecated: string[] = [];
     const matches = await searchSessionDefinitions({ rule, list, read }, undefined, undefined, undefined, undefined, (p) => deprecated.push(p));
-    expect(matches.map((m) => m.resource.path).sort()).toEqual(["/defs/new.json", "/defs/old.json"]);
-    expect(deprecated).toEqual(["/defs/old.json"]);
+    expect(matches.map((m) => m.resource.path).sort()).toEqual([absPath("defs", "new.json"), absPath("defs", "old.json")]);
+    expect(deprecated).toEqual([absPath("defs", "old.json")]);
   });
 
   test("mixed: one valid, one invalid, one frozen — only the valid one is eligible, nothing crashes", async () => {
     const { list, read } = fakeFiles({
-      "/defs/ok.json": JSON.stringify(goodDef()),
-      "/defs/bad.json": "{not json",
-      "/defs/frozen.json": JSON.stringify(goodDef({ frozen: true })),
+      [absPath("defs", "ok.json")]: JSON.stringify(goodDef()),
+      [absPath("defs", "bad.json")]: "{not json",
+      [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })),
     });
     const matches = await searchSessionDefinitions({ rule, list, read });
-    expect(matches.map((m) => m.resource.path)).toEqual(["/defs/ok.json"]);
+    expect(matches.map((m) => m.resource.path)).toEqual([absPath("defs", "ok.json")]);
   });
 });
 
@@ -164,15 +165,15 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
   test("the same (path, error) pair logs only once; a NEW error on the same path logs again", () => {
     const lines: string[] = [];
     const onInvalid = onceInvalidDefinition((l) => lines.push(l));
-    onInvalid("/defs/a.json", "boom"); onInvalid("/defs/a.json", "boom");
+    onInvalid(absPath("defs", "a.json"), "boom"); onInvalid(absPath("defs", "a.json"), "boom");
     expect(lines).toHaveLength(1);
-    onInvalid("/defs/a.json", "different problem");
+    onInvalid(absPath("defs", "a.json"), "different problem");
     expect(lines).toHaveLength(2);
   });
   test("the same frozen path logs only once", () => {
     const lines: string[] = [];
     const onFrozen = onceFrozenDefinition((l) => lines.push(l));
-    onFrozen("/defs/a.json"); onFrozen("/defs/a.json");
+    onFrozen(absPath("defs", "a.json")); onFrozen(absPath("defs", "a.json"));
     expect(lines).toHaveLength(1);
   });
   test("PR #394 review fix 3: the missing-root FYI logs only once, never respammed while it stays missing", () => {
@@ -188,7 +189,7 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
   test("the same tier-using path logs only once", () => {
     const lines: string[] = [];
     const onDeprecatedTier = onceDeprecatedTier((l) => lines.push(l));
-    onDeprecatedTier("/defs/a.json"); onDeprecatedTier("/defs/a.json");
+    onDeprecatedTier(absPath("defs", "a.json")); onDeprecatedTier(absPath("defs", "a.json"));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("deprecated");
     expect(lines[0]).toContain("modelPower");
@@ -197,7 +198,7 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
 
 describe("PR #394 review fix 3, end-to-end: a genuinely nonexistent well-known directory never fails the poll", () => {
   test("createManagedSessionResourceType against the REAL listFilesystemResources (not a fake) on a directory that does not exist", async () => {
-    const rule = builtinManagedSessionsRule("/definitely/does/not/exist/on/this/machine");
+    const rule = builtinManagedSessionsRule(absPath("definitely", "does", "not", "exist", "on", "this", "machine"));
     const logs: string[] = [];
     const type = createManagedSessionResourceType({ rule, list: listFilesystemResources, read: async () => "", log: (l) => logs.push(l) });
     const units = await type.discovery.search(); // must NOT throw
@@ -208,17 +209,17 @@ describe("PR #394 review fix 3, end-to-end: a genuinely nonexistent well-known d
 
 describe("specForSessionDefinition", () => {
   test("builds a SpawnSpec carrying the definition's cwd/permissionMode/vendor+tier-as-model/brief", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "codex", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
     };
     const spec = specForSessionDefinition(match);
     expect(spec.key).toBe(match.agentKey);
-    expect(spec.resource).toBe("/defs/a.json");
+    expect(spec.resource).toBe(absPath("defs", "a.json"));
     expect(spec.brief).toBe("Tend this repo.");
-    expect(spec.cwd).toBe("/repo/project");
+    expect(spec.cwd).toBe(absPath("repo", "project"));
     expect(spec.permissionMode).toBe("auto");
     expect(spec.agents).toEqual([{ harness: "codex", model: "gpt-5.6-terra" }]);
     expect(spec.parent).toBeNull();
@@ -231,31 +232,31 @@ describe("specForSessionDefinition", () => {
   // and effort for this path (unlike the deprecated tier path above, which
   // never carries an effort at all — see effectiveAgent's own doc comment).
   test("FACTORY-75: builds a SpawnSpec carrying the modelPower/effort-resolved model+effort, not tierToModel", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", modelPower: 100, effort: 70, permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", modelPower: 100, effort: 70, permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
     };
     expect(specForSessionDefinition(match).agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]);
   });
 
   test("BUTCHR-453/BUTCHR-463: carries the definition's own strictMcpConfig through to the SpawnSpec", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, strictMcpConfig: true },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, strictMcpConfig: true },
     };
     expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
 
   test("DROVR-42/FACTORY-67: for vendor claude, lizardMode is deliberately NEVER carried into the SpawnSpec — it never reaches the launched process's argv, unlike permissionMode/strictMcpConfig, so there is nothing for a stale-argv check to compare", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false, lizardMode: true },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false, lizardMode: true },
     };
     const spec = specForSessionDefinition(match);
     expect(spec).not.toHaveProperty("lizardMode");
@@ -263,11 +264,11 @@ describe("specForSessionDefinition", () => {
   });
 
   test("FACTORY-108: for vendor codex, lizardMode IS carried into the SpawnSpec — the opposite of the claude case above — so agentLaunchConfig's Codex branch (src/agents/argv.ts) can drop --dangerously-bypass-approvals-and-sandbox; absent/false forwards nothing, same as every other vendor's absent field", () => {
-    const rule = builtinManagedSessionsRule("/defs");
-    const base = { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const rule = builtinManagedSessionsRule(absPath("defs"));
+    const base = { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
     const match = (definition: typeof base & { lizardMode?: boolean }): SessionDefinitionMatch => ({
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"), definition,
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")), definition,
     });
     expect(specForSessionDefinition(match({ ...base, lizardMode: true })).lizardMode).toBe(true);
     expect(specForSessionDefinition(match(base))).not.toHaveProperty("lizardMode");
@@ -275,22 +276,22 @@ describe("specForSessionDefinition", () => {
   });
 
   test("carries the definition's own mcpServers through to the SpawnSpec (BUTCHR-408, type ported from S4)", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, mcpServers },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, mcpServers },
     };
     expect(specForSessionDefinition(match).mcpServers).toEqual(mcpServers);
   });
 
   test("specForSessionDefinitionUnit dispatches resource units; a query-kind unit (never actually produced) throws rather than silently mis-spawning", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const match: SessionDefinitionMatch = {
-      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" }),
-      rule, resource: res("/defs/a.json"),
-      definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false },
+      agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
+      rule, resource: res(absPath("defs", "a.json")),
+      definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false },
     };
     expect(specForSessionDefinitionUnit({ kind: "resource", match })).toEqual(specForSessionDefinition(match));
     const qkey = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: rule.id });
@@ -300,8 +301,8 @@ describe("specForSessionDefinition", () => {
 
 describe("ownsManagedSessionAgent", () => {
   test("recognises only the managed-sessions rule's own filesystem agent keys", () => {
-    expect(ownsManagedSessionAgent(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" }))).toBe(true);
-    expect(ownsManagedSessionAgent(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "some-other-rule", resourceId: "/defs/a.json" }))).toBe(false);
+    expect(ownsManagedSessionAgent(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") }))).toBe(true);
+    expect(ownsManagedSessionAgent(encodeAgentKey({ resourceProvider: "filesystem", ruleId: "some-other-rule", resourceId: absPath("defs", "a.json") }))).toBe(false);
     expect(ownsManagedSessionAgent(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "managed-sessions", resourceId: "BUTCHR-1" }))).toBe(false);
     expect(ownsManagedSessionAgent("not a key")).toBe(false);
   });
@@ -309,32 +310,32 @@ describe("ownsManagedSessionAgent", () => {
 
 describe("createManagedSessionResourceType", () => {
   test("one unit per eligible definition; frozen/invalid never appear", async () => {
-    let files: Record<string, string> = { "/defs/a.json": JSON.stringify(goodDef()), "/defs/frozen.json": JSON.stringify(goodDef({ frozen: true })) };
+    let files: Record<string, string> = { [absPath("defs", "a.json")]: JSON.stringify(goodDef()), [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })) };
     const { list, read } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; } });
     const units = await type.discovery.search();
-    expect(units.map((u) => type.discovery.idOf(u))).toEqual([encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" })]);
+    expect(units.map((u) => type.discovery.idOf(u))).toEqual([encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") })]);
     files = {};
     expect((await type.discovery.search()).length).toBe(0);
   });
 
   test("PR #394 review fix 1: `roles` is cleared and rebuilt every search from each eligible match's OWN manifest role, keyed by agent key — a frozen/removed definition's role does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/a.json": JSON.stringify(goodDef({ role: "sentinel" })),
-      "/defs/b.json": JSON.stringify(goodDef({ role: "worker" })),
+      [absPath("defs", "a.json")]: JSON.stringify(goodDef({ role: "sentinel" })),
+      [absPath("defs", "b.json")]: JSON.stringify(goodDef({ role: "worker" })),
     };
     const { list } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const roles = new Map<string, "worker" | "sentinel">();
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, roles });
-    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
-    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "b.json") });
     await type.discovery.search();
     expect(roles.get(keyA)).toBe("sentinel");
     expect(roles.get(keyB)).toBe("worker");
     // b.json goes frozen (still valid, but ineligible) — its role entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ role: "worker", frozen: true })) };
+    files = { [absPath("defs", "a.json")]: files[absPath("defs", "a.json")]!, [absPath("defs", "b.json")]: JSON.stringify(goodDef({ role: "worker", frozen: true })) };
     await type.discovery.search();
     expect(roles.get(keyA)).toBe("sentinel");
     expect(roles.has(keyB)).toBe(false);
@@ -342,23 +343,23 @@ describe("createManagedSessionResourceType", () => {
 
   test("BUTCHR-460: `accountPolicies` is cleared and rebuilt every search from each eligible match's OWN manifest account policy, keyed by agent key — a frozen/removed definition's policy does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/a.json": JSON.stringify(goodDef({ account: "temporary" })),
-      "/defs/b.json": JSON.stringify(goodDef({ account: "permanent" })),
-      "/defs/c.json": JSON.stringify(goodDef({})), // no `account` given — defaults to "none"
+      [absPath("defs", "a.json")]: JSON.stringify(goodDef({ account: "temporary" })),
+      [absPath("defs", "b.json")]: JSON.stringify(goodDef({ account: "permanent" })),
+      [absPath("defs", "c.json")]: JSON.stringify(goodDef({})), // no `account` given — defaults to "none"
     };
     const { list } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const accountPolicies = new Map<string, "none" | "temporary" | "permanent">();
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, accountPolicies });
-    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
-    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
-    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "b.json") });
+    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "c.json") });
     await type.discovery.search();
     expect(accountPolicies.get(keyA)).toBe("temporary");
     expect(accountPolicies.get(keyB)).toBe("permanent");
     expect(accountPolicies.get(keyC)).toBe("none");
     // b.json goes frozen (still valid, but ineligible) — its policy entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ account: "permanent", frozen: true })), "/defs/c.json": files["/defs/c.json"]! };
+    files = { [absPath("defs", "a.json")]: files[absPath("defs", "a.json")]!, [absPath("defs", "b.json")]: JSON.stringify(goodDef({ account: "permanent", frozen: true })), [absPath("defs", "c.json")]: files[absPath("defs", "c.json")]! };
     await type.discovery.search();
     expect(accountPolicies.get(keyA)).toBe("temporary");
     expect(accountPolicies.has(keyB)).toBe(false);
@@ -371,20 +372,20 @@ describe("createManagedSessionResourceType", () => {
   // what a managed-session definition CURRENTLY resolves to.
   test("FACTORY-75: `resolvedAgents` is cleared and rebuilt every search from each eligible match's OWN effectiveAgent() — a frozen/removed definition's entry does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/tier.json": JSON.stringify(goodDef()), // tier1 -> sonnet, no effort
-      "/defs/power.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70 })), // -> fable/xhigh
+      [absPath("defs", "tier.json")]: JSON.stringify(goodDef()), // tier1 -> sonnet, no effort
+      [absPath("defs", "power.json")]: JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70 })), // -> fable/xhigh
     };
     const { list } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const resolvedAgents = new Map<string, { model: string; effort?: "low" | "medium" | "high" | "xhigh" | "max" }>();
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, resolvedAgents });
-    const keyTier = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/tier.json" });
-    const keyPower = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/power.json" });
+    const keyTier = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "tier.json") });
+    const keyPower = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "power.json") });
     await type.discovery.search();
     expect(resolvedAgents.get(keyTier)).toEqual({ model: "sonnet" });
     expect(resolvedAgents.get(keyPower)).toEqual({ model: "fable", effort: "xhigh" });
     // power.json goes frozen (still valid, but ineligible) — its entry must not linger.
-    files = { "/defs/tier.json": files["/defs/tier.json"]!, "/defs/power.json": JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70, frozen: true })) };
+    files = { [absPath("defs", "tier.json")]: files[absPath("defs", "tier.json")]!, [absPath("defs", "power.json")]: JSON.stringify(goodDef({ tier: undefined, modelPower: 100, effort: 70, frozen: true })) };
     await type.discovery.search();
     expect(resolvedAgents.get(keyTier)).toEqual({ model: "sonnet" });
     expect(resolvedAgents.has(keyPower)).toBe(false);
@@ -392,21 +393,21 @@ describe("createManagedSessionResourceType", () => {
 
   test("FACTORY-138/FACTORY-108/FACTORY-106 (DROVR-42/FACTORY-67 lineage): `lizardModes` is cleared and rebuilt every search from each eligible match's OWN manifest lizardMode, keyed by agent key — a vendor:claude definition defaults to ELIGIBLE (true) when absent (only explicit false opts out); a vendor:codex definition defaults to NOT eligible (false) when absent (the opposite default, a deliberate story decision — codex CAN set the field, unlike the claude default flip, but its own launch only drops the bypass flag on an explicit true, so default-eligible would only add a scan that can never find anything to press) — only an explicit true resolves eligible for codex, and explicit false stays not-eligible same as absent; a frozen/removed definition's entry does not linger", async () => {
     let files: Record<string, string> = {
-      "/defs/a.json": JSON.stringify(goodDef({ lizardMode: false, permissionMode: "default" })),
-      "/defs/b.json": JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — defaults to true
-      "/defs/c.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: undefined })), // lizardMode absent, vendor codex — stays false
-      "/defs/d.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: true })), // lizardMode explicit true, vendor codex — eligible
-      "/defs/e.json": JSON.stringify(goodDef({ vendor: "codex", lizardMode: false })), // lizardMode explicit false, vendor codex — stays not-eligible, same outcome as absent
+      [absPath("defs", "a.json")]: JSON.stringify(goodDef({ lizardMode: false, permissionMode: "default" })),
+      [absPath("defs", "b.json")]: JSON.stringify(goodDef({})), // lizardMode absent, vendor claude — defaults to true
+      [absPath("defs", "c.json")]: JSON.stringify(goodDef({ vendor: "codex", lizardMode: undefined })), // lizardMode absent, vendor codex — stays false
+      [absPath("defs", "d.json")]: JSON.stringify(goodDef({ vendor: "codex", lizardMode: true })), // lizardMode explicit true, vendor codex — eligible
+      [absPath("defs", "e.json")]: JSON.stringify(goodDef({ vendor: "codex", lizardMode: false })), // lizardMode explicit false, vendor codex — stays not-eligible, same outcome as absent
     };
     const { list } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const lizardModes = new Map<string, boolean>();
     const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, lizardModes });
-    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
-    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
-    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/c.json" });
-    const keyD = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/d.json" });
-    const keyE = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/e.json" });
+    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
+    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "b.json") });
+    const keyC = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "c.json") });
+    const keyD = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "d.json") });
+    const keyE = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "e.json") });
     await type.discovery.search();
     expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.get(keyB)).toBe(true);
@@ -414,7 +415,7 @@ describe("createManagedSessionResourceType", () => {
     expect(lizardModes.get(keyD)).toBe(true);
     expect(lizardModes.get(keyE)).toBe(false);
     // b.json goes frozen (still valid, but ineligible) — its entry must not linger.
-    files = { "/defs/a.json": files["/defs/a.json"]!, "/defs/b.json": JSON.stringify(goodDef({ frozen: true })), "/defs/c.json": files["/defs/c.json"]!, "/defs/d.json": files["/defs/d.json"]!, "/defs/e.json": files["/defs/e.json"]! };
+    files = { [absPath("defs", "a.json")]: files[absPath("defs", "a.json")]!, [absPath("defs", "b.json")]: JSON.stringify(goodDef({ frozen: true })), [absPath("defs", "c.json")]: files[absPath("defs", "c.json")]!, [absPath("defs", "d.json")]: files[absPath("defs", "d.json")]!, [absPath("defs", "e.json")]: files[absPath("defs", "e.json")]! };
     await type.discovery.search();
     expect(lizardModes.get(keyA)).toBe(false);
     expect(lizardModes.has(keyB)).toBe(false);
@@ -422,12 +423,12 @@ describe("createManagedSessionResourceType", () => {
 
   test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {
     const files: Record<string, string> = {
-      "/defs/sentinel.json": JSON.stringify(goodDef({ role: "sentinel", workingDirectory: "/repo/sentinel" })),
-      "/defs/worker-a.json": JSON.stringify(goodDef({ role: "worker", workingDirectory: "/repo/worker-a" })),
-      "/defs/worker-b.json": JSON.stringify(goodDef({ role: "worker", workingDirectory: "/repo/worker-b" })),
+      [absPath("defs", "sentinel.json")]: JSON.stringify(goodDef({ role: "sentinel", workingDirectory: absPath("repo", "sentinel") })),
+      [absPath("defs", "worker-a.json")]: JSON.stringify(goodDef({ role: "worker", workingDirectory: absPath("repo", "worker-a") })),
+      [absPath("defs", "worker-b.json")]: JSON.stringify(goodDef({ role: "worker", workingDirectory: absPath("repo", "worker-b") })),
     };
     const { list, read } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const roles = new Map<string, "worker" | "sentinel">();
     const type = createManagedSessionResourceType({ rule, list, read, roles });
     const units = await type.discovery.search();
@@ -450,23 +451,23 @@ describe("createManagedSessionResourceType", () => {
   });
 
   test("activation is always active for whatever reaches it (frozen/invalid never do)", () => {
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list: async () => [], read: async () => "" });
-    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res("/defs/a.json"), definition: { workingDirectory: "/x", brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false } };
+    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res(absPath("defs", "a.json")), definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false } };
     expect(type.activation.verdictFor({ kind: "resource", match })).toBe("active");
   });
 });
 
 describe("createSessionDefinitionEventRules", () => {
   test("unchanged content never notifies; a size/mtime move notifies the resource's own agent only", async () => {
-    const rule = builtinManagedSessionsRule("/defs");
-    const definition = { workingDirectory: "/x", brief: "b", vendor: "claude" as const, tier: "tier3" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" });
+    const rule = builtinManagedSessionsRule(absPath("defs"));
+    const definition = { workingDirectory: absPath("x"), brief: "b", vendor: "claude" as const, tier: "tier3" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") });
     const unit = (r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition } });
     const type = createSessionDefinitionEventRules();
-    const unchanged = await type.poll({ primary: [unit(res("/defs/a.json"))], related: [] }, { primary: [unit(res("/defs/a.json"))], related: [] });
+    const unchanged = await type.poll({ primary: [unit(res(absPath("defs", "a.json")))], related: [] }, { primary: [unit(res(absPath("defs", "a.json")))], related: [] });
     expect(unchanged.changedPrimary).toEqual([]);
-    const changed = await type.poll({ primary: [unit(res("/defs/a.json", { mtimeMs: 1 }))], related: [] }, { primary: [unit(res("/defs/a.json", { mtimeMs: 2 }))], related: [] });
+    const changed = await type.poll({ primary: [unit(res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] }, { primary: [unit(res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] });
     expect(changed.changedPrimary).toEqual([key]);
     expect(await changed.decide(key, key, "primary")).toEqual({ deliver: true });
     expect(await changed.decide(key, "someone-else", "primary")).toEqual({ deliver: false });
@@ -482,16 +483,16 @@ describe("createSessionDefinitionEventRules", () => {
   // in `changedPrimary` for the ONE poll its [size, mtimeMs] pair actually
   // moved, never again once `prev` catches up to it) is inherited, not
   // reimplemented — this test only pins the NEW `reason`, not that property.
-  const rule = builtinManagedSessionsRule("/defs");
-  const baseDefinition: SessionDefinition = { workingDirectory: "/repo/old", brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false };
-  const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: "/defs/a.json" });
+  const rule = builtinManagedSessionsRule(absPath("defs"));
+  const baseDefinition: SessionDefinition = { workingDirectory: absPath("repo", "old"), brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false };
+  const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") });
   const unitWith = (def: SessionDefinition, r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition: def } });
 
   test("brief content move: delivers with { definitionField: { brief: <new> } }, workingDirectory absent from the reason", async () => {
     const type = createSessionDefinitionEventRules();
     const poll = await type.poll(
-      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
-      { primary: [unitWith({ ...baseDefinition, brief: "New brief." }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+      { primary: [unitWith(baseDefinition, res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief." }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
     );
     expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { brief: "New brief." } } });
   });
@@ -499,21 +500,21 @@ describe("createSessionDefinitionEventRules", () => {
   test("workingDirectory content move: delivers with { definitionField: { workingDirectory: <new> } }, brief absent from the reason", async () => {
     const type = createSessionDefinitionEventRules();
     const poll = await type.poll(
-      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
-      { primary: [unitWith({ ...baseDefinition, workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+      { primary: [unitWith(baseDefinition, res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, workingDirectory: absPath("repo", "new") }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
     );
-    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { workingDirectory: "/repo/new" } } });
+    expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true, reason: { definitionField: { workingDirectory: absPath("repo", "new") } } });
   });
 
   test("both brief and workingDirectory move in the same poll: both keys present in the one reason", async () => {
     const type = createSessionDefinitionEventRules();
     const poll = await type.poll(
-      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
-      { primary: [unitWith({ ...baseDefinition, brief: "New brief.", workingDirectory: "/repo/new" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+      { primary: [unitWith(baseDefinition, res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, brief: "New brief.", workingDirectory: absPath("repo", "new") }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
     );
     expect(await poll.decide(key, key, "primary")).toEqual({
       deliver: true,
-      reason: { definitionField: { brief: "New brief.", workingDirectory: "/repo/new" } },
+      reason: { definitionField: { brief: "New brief.", workingDirectory: absPath("repo", "new") } },
     });
   });
 
@@ -523,8 +524,8 @@ describe("createSessionDefinitionEventRules", () => {
   test("a non-brief/workingDirectory field move (e.g. vendor) still delivers with no reason — unchanged from before this ticket", async () => {
     const type = createSessionDefinitionEventRules();
     const poll = await type.poll(
-      { primary: [unitWith(baseDefinition, res("/defs/a.json", { mtimeMs: 1 }))], related: [] },
-      { primary: [unitWith({ ...baseDefinition, role: "sentinel" }, res("/defs/a.json", { mtimeMs: 2 }))], related: [] },
+      { primary: [unitWith(baseDefinition, res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, role: "sentinel" }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
     );
     expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true });
   });
@@ -554,20 +555,20 @@ function fakeHerd(initial: string[] = []): { herd: Herd; spawned: SpawnSpec[]; s
 describe("the managed-sessions built-in query loop — no-double-owner and add/modify/remove reconciliation", () => {
   test("spawns one agent per eligible definition, none for frozen/invalid, stops on removal", async () => {
     let files: Record<string, string> = {
-      "/defs/baker.json": JSON.stringify(goodDef({ workingDirectory: "/repo/baker-project" })),
-      "/defs/frozen.json": JSON.stringify(goodDef({ frozen: true })),
-      "/defs/broken.json": "not json",
+      [absPath("defs", "baker.json")]: JSON.stringify(goodDef({ workingDirectory: absPath("repo", "baker-project") })),
+      [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })),
+      [absPath("defs", "broken.json")]: "not json",
     };
     const { herd, spawned, stopped } = fakeHerd([]);
     const logs: string[] = [];
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
+      root: absPath("defs"), herd, deliver: async () => {},
       list: async () => Object.keys(files).map((p) => res(p)),
       read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; },
       log: (l) => logs.push(l), intervalMs: 5,
     });
     await tick();
-    const bakerKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/baker.json" });
+    const bakerKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "baker.json") });
     expect(spawned.map((s) => s.key)).toEqual([bakerKey]);
     expect(logs.some((l) => l.includes("frozen.json") && l.includes("frozen"))).toBe(true);
     expect(logs.some((l) => l.includes("broken.json") && l.includes("never staffed"))).toBe(true);
@@ -579,11 +580,11 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
   });
 
   test("no double-staffing: a definition whose agent is already running is never spawned again", async () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
     const { herd, spawned } = fakeHerd([key]);
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
-      list: async () => [res("/defs/a.json")],
+      root: absPath("defs"), herd, deliver: async () => {},
+      list: async () => [res(absPath("defs", "a.json"))],
       read: async () => JSON.stringify(goodDef()),
       log: () => {}, intervalMs: 5,
     });
@@ -593,31 +594,31 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
   });
 
   test("add: a new definition file appearing spawns exactly one new agent, existing ones untouched", async () => {
-    let files: Record<string, string> = { "/defs/a.json": JSON.stringify(goodDef()) };
+    let files: Record<string, string> = { [absPath("defs", "a.json")]: JSON.stringify(goodDef()) };
     const { herd, spawned } = fakeHerd([]);
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
+      root: absPath("defs"), herd, deliver: async () => {},
       list: async () => Object.keys(files).map((p) => res(p)),
       read: async (p) => files[p]!,
       log: () => {}, intervalMs: 5,
     });
     await tick();
-    const aKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const aKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
     expect(spawned.map((s) => s.key)).toEqual([aKey]);
-    files = { ...files, "/defs/b.json": JSON.stringify(goodDef()) };
+    files = { ...files, [absPath("defs", "b.json")]: JSON.stringify(goodDef()) };
     await tick();
     stop();
-    const bKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/b.json" });
+    const bKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "b.json") });
     expect(spawned.map((s) => s.key).sort()).toEqual([aKey, bKey].sort());
   });
 
   test("modify: editing an already-running definition's content does not force a respawn (no key change) — same precedent as every other rule provider", async () => {
     let body = goodDef({ brief: "original" });
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
     const { herd, spawned, stopped } = fakeHerd([]);
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
-      list: async () => [res("/defs/a.json", { mtimeMs: Date.now() })],
+      root: absPath("defs"), herd, deliver: async () => {},
+      list: async () => [res(absPath("defs", "a.json"), { mtimeMs: Date.now() })],
       read: async () => JSON.stringify(body),
       log: () => {}, intervalMs: 5,
     });
@@ -633,36 +634,36 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
 
   test("BUTCHR-408 staged scenarios (a-d): Baker directory agent, Candlestix Claude session, Candlestix Codex session, and a non-Rocket.Chat-channel-bound sentinel (mud-bridge director, real S4 McpServerBinding type) all validate and produce the expected spawn shape; a frozen mud player stays frozen — no agent", async () => {
     const files: Record<string, string> = {
-      "/defs/baker-repo.json": JSON.stringify(goodDef({
-        workingDirectory: "/repo/some-project", brief: "Keep this repo's docs current.", vendor: "claude", tier: "tier1", permissionMode: "default", role: "worker",
+      [absPath("defs", "baker-repo.json")]: JSON.stringify(goodDef({
+        workingDirectory: absPath("repo", "some-project"), brief: "Keep this repo's docs current.", vendor: "claude", tier: "tier1", permissionMode: "default", role: "worker",
       })),
-      "/defs/candlestix-factory-director.json": JSON.stringify(goodDef({
-        workingDirectory: "/var/candlestix/factory", brief: "Direct the factory channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
+      [absPath("defs", "candlestix-factory-director.json")]: JSON.stringify(goodDef({
+        workingDirectory: absPath("var", "candlestix", "factory"), brief: "Direct the factory channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
         execution: "persistent", account: "permanent", role: "sentinel",
       })),
-      "/defs/candlestix-codex-agent.json": JSON.stringify(goodDef({
-        workingDirectory: "/var/candlestix/codex-session", brief: "Codex channel agent.", vendor: "codex", tier: "tier1", permissionMode: "default", role: "worker",
+      [absPath("defs", "candlestix-codex-agent.json")]: JSON.stringify(goodDef({
+        workingDirectory: absPath("var", "candlestix", "codex-session"), brief: "Codex channel agent.", vendor: "codex", tier: "tier1", permissionMode: "default", role: "worker",
       })),
       // (d) the mud DIRECTOR (distinct from the 10 frozen mud PLAYERS below): bound to the
       // real, non-Rocket.Chat mud-bridge MCP server, channel:true, using the real
       // McpServerBinding type/validator (ported from S4's BUTCHR-395 branch into
       // src/rules/rules.ts). account:"none" — BUTCHR-411's own design point that a
       // channel binding needs no Rocket.Chat account at all.
-      "/defs/candlestix-mud-director.json": JSON.stringify(goodDef({
-        workingDirectory: "/var/candlestix/mud", brief: "Direct the MUD channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
+      [absPath("defs", "candlestix-mud-director.json")]: JSON.stringify(goodDef({
+        workingDirectory: absPath("var", "candlestix", "mud"), brief: "Direct the MUD channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
         execution: "persistent", account: "none", role: "sentinel",
         mcpServers: [{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }],
       })),
       // mud PLAYER: frozen (per BUTCHR-393: "10 MUD players ... frozen ... once unfrozen").
-      "/defs/candlestix-mud-player-1.json": JSON.stringify(goodDef({
-        workingDirectory: "/var/candlestix/mud/player-1", brief: "Play the MUD.", vendor: "claude", tier: "tier1", permissionMode: "default",
+      [absPath("defs", "candlestix-mud-player-1.json")]: JSON.stringify(goodDef({
+        workingDirectory: absPath("var", "candlestix", "mud", "player-1"), brief: "Play the MUD.", vendor: "claude", tier: "tier1", permissionMode: "default",
         execution: "persistent", account: "none", role: "sentinel", frozen: true,
       })),
     };
     const { herd, spawned } = fakeHerd([]);
     const logs: string[] = [];
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
+      root: absPath("defs"), herd, deliver: async () => {},
       list: async () => Object.keys(files).map((p) => res(p)),
       read: async (p) => files[p]!,
       log: (l) => logs.push(l), intervalMs: 5,
@@ -672,24 +673,24 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
 
     const byResource = new Map(spawned.map((s) => [s.resource, s]));
     expect(byResource.size).toBe(4); // the frozen mud player never spawns
-    expect(byResource.has("/defs/candlestix-mud-player-1.json")).toBe(false);
+    expect(byResource.has(absPath("defs", "candlestix-mud-player-1.json"))).toBe(false);
     expect(logs.some((l) => l.includes("candlestix-mud-player-1.json") && l.includes("frozen"))).toBe(true);
 
-    const baker = byResource.get("/defs/baker-repo.json")!;
-    expect(baker.cwd).toBe("/repo/some-project");
+    const baker = byResource.get(absPath("defs", "baker-repo.json"))!;
+    expect(baker.cwd).toBe(absPath("repo", "some-project"));
     expect(baker.agents).toEqual([{ harness: "claude", model: "sonnet" }]);
 
-    const director = byResource.get("/defs/candlestix-factory-director.json")!;
-    expect(director.cwd).toBe("/var/candlestix/factory");
+    const director = byResource.get(absPath("defs", "candlestix-factory-director.json"))!;
+    expect(director.cwd).toBe(absPath("var", "candlestix", "factory"));
     expect(director.permissionMode).toBe("auto");
     expect(director.agents).toEqual([{ harness: "claude", model: "sonnet" }]);
 
-    const codexAgent = byResource.get("/defs/candlestix-codex-agent.json")!;
-    expect(codexAgent.cwd).toBe("/var/candlestix/codex-session");
+    const codexAgent = byResource.get(absPath("defs", "candlestix-codex-agent.json"))!;
+    expect(codexAgent.cwd).toBe(absPath("var", "candlestix", "codex-session"));
     expect(codexAgent.agents).toEqual([{ harness: "codex", model: "gpt-5.6-luna" }]);
 
-    const mudDirector = byResource.get("/defs/candlestix-mud-director.json")!;
-    expect(mudDirector.cwd).toBe("/var/candlestix/mud");
+    const mudDirector = byResource.get(absPath("defs", "candlestix-mud-director.json"))!;
+    expect(mudDirector.cwd).toBe(absPath("var", "candlestix", "mud"));
     expect(mudDirector.mcpServers).toEqual([{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }]);
   });
 });
@@ -725,11 +726,11 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
 
   test("a managed session repeatedly spawned (its agent keeps dying) is reported through checkCrashLoop — never silent", async () => {
     const { herd, spawned } = fakeCrashLoopingHerd();
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/nexus.json" });
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "nexus.json") });
     const calls: { spawning: readonly string[]; desired: readonly string[] }[] = [];
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
-      list: async () => [res("/defs/nexus.json")],
+      root: absPath("defs"), herd, deliver: async () => {},
+      list: async () => [res(absPath("defs", "nexus.json"))],
       read: async () => JSON.stringify(goodDef({ tier: "tier4", permissionMode: "auto", execution: "persistent", account: "none", role: "sentinel" })),
       checkCrashLoop: async (spawning, desired) => { calls.push({ spawning, desired }); },
       log: () => {}, intervalMs: 5,
@@ -751,8 +752,8 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
   test("omitting checkCrashLoop is unaffected — today's exact behaviour for every caller that doesn't opt in", async () => {
     const { herd, spawned } = fakeCrashLoopingHerd();
     const stop = startManagedSessionsLoop({
-      root: "/defs", herd, deliver: async () => {},
-      list: async () => [res("/defs/nexus.json")],
+      root: absPath("defs"), herd, deliver: async () => {},
+      list: async () => [res(absPath("defs", "nexus.json"))],
       read: async () => JSON.stringify(goodDef()),
       log: () => {}, intervalMs: 5,
     });

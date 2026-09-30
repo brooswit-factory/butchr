@@ -171,7 +171,11 @@ describe("zendesk OAuth token loading", () => {
     }
   });
 
-  test("reads a real owner-only file, and refuses it once group-readable", () => {
+  // FACTORY-569: NTFS has no owner/group/other permission bits — chmod(0o640)
+  // does not make a file "group-readable" on win32, so this real-filesystem
+  // assertion is meaningless there (the fake-`io()` tests above already cover
+  // the same logic without touching real permissions).
+  test.skipIf(process.platform === "win32")("reads a real owner-only file, and refuses it once group-readable", () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-zd-token-"));
     try {
       const path = join(dir, "token");

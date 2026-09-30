@@ -4,6 +4,7 @@ import { renderDashboard, type RenderDashboardOpts } from "../../src/web/dashboa
 import { agentRowAnchorId, configAnchorForResourceKey, ruleAnchorId, sessionAnchorId } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { sessionAgentKey } from "../../src/resources/session-freeze.js";
+import { absPath } from "../helpers/abs-path";
 import {
   buildDashboardRows,
   buildAdmissionView,
@@ -857,7 +858,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
   });
 
   test("a managed-session row's back-link points at its OWN session anchor — never the generic managed-sessions rule anchor", () => {
-    const key = sessionAgentKey("/home/butchr/defs/foo.json");
+    const key = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });

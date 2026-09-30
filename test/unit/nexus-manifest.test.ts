@@ -19,7 +19,8 @@ describe("createFileNexusManifestPublisher (BUTCHR-412)", () => {
         { account: "butchr_a", tokenFile: "/tokens/butchr_a.token" },
         { account: "butchr_b", tokenFile: "/tokens/butchr_b.token" },
       ]);
-      expect(statSync(path).mode & 0o777).toBe(0o600);
+      // FACTORY-569: NTFS has no POSIX permission bits — this file's mode is meaningless on win32.
+      if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
       // A token VALUE never appears — only account names and file paths.
       expect(readFileSync(path, "utf8")).not.toMatch(/tok-/);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -58,7 +59,8 @@ describe("createFileNexusManifestPublisher (BUTCHR-412)", () => {
   // BUTCHR-412 review round 3, non-blocking finding: the directory itself
   // (not just the file) should be 0700, created only when this call actually
   // makes it — a pre-existing directory's own mode is left untouched.
-  test("creates its own directory at 0700 when absent", async () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("creates its own directory at 0700 when absent", async () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-nexus-manifest-dirmode-"));
     try {
       const nested = join(dir, "nested", "manifest.json");
@@ -67,7 +69,7 @@ describe("createFileNexusManifestPublisher (BUTCHR-412)", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  test("a pre-existing directory's mode is left untouched", async () => {
+  test.skipIf(process.platform === "win32")("a pre-existing directory's mode is left untouched", async () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-nexus-manifest-dirmode-existing-"));
     try {
       const path = join(dir, "manifest.json"); // dir itself already exists (mkdtempSync's own default mode)

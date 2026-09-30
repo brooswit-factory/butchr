@@ -9,6 +9,7 @@ import { rcUsernameFor } from "../../src/accounts/identity.js";
 import { fakeManifestPublisher, fakeRcClient, fakeStore, baseAccountManagerDeps } from "../fixtures/rocketchat-fakes.js";
 import type { Herd, SpawnSpec } from "../../src/agents/herd.js";
 import { wireManagedSessionArchiveRelease } from "../../src/agents/managed-session-account-release.js";
+import { absPath } from "../helpers/abs-path";
 
 const managedSessionId = (path: string, ruleId: string = MANAGED_SESSIONS_RULE_ID) =>
   encodeAgentKey({ resourceProvider: "filesystem", ruleId, resourceId: path });
@@ -34,8 +35,8 @@ function fakeExists(paths: Set<string>) {
 describe("wireManagedSessionArchiveRelease", () => {
   test("a \"stop\" release for a managed-session id upgrades to \"archive\" when the archive directory now holds the same basename", async () => {
     const { hooks, releaseCalls } = fakeHooks();
-    const id = managedSessionId("/home/butchr/.config/butchr/session-definitions/foo.json");
-    const exists = fakeExists(new Set(["/home/butchr/.config/butchr/session-definitions-archive/foo.json"]));
+    const id = managedSessionId(absPath("home", "butchr", ".config", "butchr", "session-definitions", "foo.json"));
+    const exists = fakeExists(new Set([absPath("home", "butchr", ".config", "butchr", "session-definitions-archive", "foo.json")]));
     const wrapped = wireManagedSessionArchiveRelease(hooks, { exists });
     await wrapped.release(id, "stop");
     expect(releaseCalls).toEqual([{ id, reason: "archive" }]);
@@ -43,7 +44,7 @@ describe("wireManagedSessionArchiveRelease", () => {
 
   test("a \"stop\" release for a managed-session id stays \"stop\" when nothing matching exists in the archive directory (deleted, invalidated, or frozen — not archived)", async () => {
     const { hooks, releaseCalls } = fakeHooks();
-    const id = managedSessionId("/home/butchr/.config/butchr/session-definitions/foo.json");
+    const id = managedSessionId(absPath("home", "butchr", ".config", "butchr", "session-definitions", "foo.json"));
     const wrapped = wireManagedSessionArchiveRelease(hooks, { exists: fakeExists(new Set()) });
     await wrapped.release(id, "stop");
     expect(releaseCalls).toEqual([{ id, reason: "stop" }]);
@@ -51,8 +52,8 @@ describe("wireManagedSessionArchiveRelease", () => {
 
   test("a \"respawn\" release is never upgraded, even if a same-basename file exists in the archive directory", async () => {
     const { hooks, releaseCalls } = fakeHooks();
-    const id = managedSessionId("/defs/foo.json");
-    const wrapped = wireManagedSessionArchiveRelease(hooks, { exists: fakeExists(new Set(["/defs-archive/foo.json"])) });
+    const id = managedSessionId(absPath("defs", "foo.json"));
+    const wrapped = wireManagedSessionArchiveRelease(hooks, { exists: fakeExists(new Set([absPath("defs-archive", "foo.json")])) });
     await wrapped.release(id, "respawn");
     expect(releaseCalls).toEqual([{ id, reason: "respawn" }]);
   });
@@ -67,10 +68,10 @@ describe("wireManagedSessionArchiveRelease", () => {
 
   test("respects the archive-dir env override (BUTCHR_SESSION_ARCHIVE_DIR), not just the sibling-suffix default", async () => {
     const { hooks, releaseCalls } = fakeHooks();
-    const id = managedSessionId("/defs/foo.json");
+    const id = managedSessionId(absPath("defs", "foo.json"));
     const wrapped = wireManagedSessionArchiveRelease(hooks, {
-      exists: fakeExists(new Set(["/custom-archive/foo.json"])),
-      env: { BUTCHR_SESSION_ARCHIVE_DIR: "/custom-archive" },
+      exists: fakeExists(new Set([absPath("custom-archive", "foo.json")])),
+      env: { BUTCHR_SESSION_ARCHIVE_DIR: absPath("custom-archive") },
     });
     await wrapped.release(id, "stop");
     expect(releaseCalls).toEqual([{ id, reason: "archive" }]);
@@ -78,8 +79,8 @@ describe("wireManagedSessionArchiveRelease", () => {
 
   test("a custom ruleId is honoured — an id under a DIFFERENT rule id is never treated as a managed-session agent even if it decodes as \"filesystem\"", async () => {
     const { hooks, releaseCalls } = fakeHooks();
-    const id = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "some-other-filesystem-rule", resourceId: "/defs/foo.json" });
-    const wrapped = wireManagedSessionArchiveRelease(hooks, { exists: fakeExists(new Set(["/defs-archive/foo.json"])) });
+    const id = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "some-other-filesystem-rule", resourceId: absPath("defs", "foo.json") });
+    const wrapped = wireManagedSessionArchiveRelease(hooks, { exists: fakeExists(new Set([absPath("defs-archive", "foo.json")])) });
     await wrapped.release(id, "stop");
     expect(releaseCalls).toEqual([{ id, reason: "stop" }]);
   });
@@ -107,8 +108,8 @@ describe("wireManagedSessionArchiveRelease", () => {
  * released account after the release path has run.
  */
 describe("BUTCHR-460 end to end: managed-session archive release through the real reconciler", () => {
-  const DEF_PATH = "/home/butchr/.config/butchr/session-definitions/foo.json";
-  const ARCHIVED_PATH = "/home/butchr/.config/butchr/session-definitions-archive/foo.json";
+  const DEF_PATH = absPath("home", "butchr", ".config", "butchr", "session-definitions", "foo.json");
+  const ARCHIVED_PATH = absPath("home", "butchr", ".config", "butchr", "session-definitions-archive", "foo.json");
   const KEY = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: DEF_PATH });
 
   function fakeHerd(): Herd & { running: Set<string>; spawnedSpecs: Map<string, SpawnSpec> } {
@@ -265,7 +266,7 @@ describe("BUTCHR-460 end to end: managed-session archive release through the rea
  * just the underlying refusal mechanism) is correct.
  */
 describe("BUTCHR-460 review round 1: a managed-session definition is never silently unaccounted", () => {
-  const KEY = managedSessionId("/defs/needs-account.json");
+  const KEY = managedSessionId(absPath("defs", "needs-account.json"));
 
   function fakeHerd(): Herd & { spawnedSpecs: Map<string, SpawnSpec> } {
     const running = new Set<string>();

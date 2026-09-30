@@ -10,9 +10,10 @@ import { listFilesystemResources, type FilesystemResource } from "../../src/reso
 import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 import { sessionFreezeTools, type SessionFreezeToolDeps } from "../../src/tools/session-freeze-tools.js";
 import { Refusal } from "../../src/tools/outcome.js";
+import { absPath } from "../helpers/abs-path";
 
 const goodDef = (over: Record<string, unknown> = {}) => ({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
+  workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });
 
 const agentKeyFor = (path: string): string => encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: path });
@@ -34,7 +35,7 @@ function fakeDeps(files: Record<string, string>, store: SessionFreezeStore = fak
     return files[path]!;
   };
   return {
-    dir: "/defs", list, read, files,
+    dir: absPath("defs"), list, read, files,
     freeze: { store, readFile: read, writeFile: async (p, c) => { files[p] = c; } },
     log: () => {},
   };
@@ -43,8 +44,8 @@ function fakeDeps(files: Record<string, string>, store: SessionFreezeStore = fak
 const call = (tools: Record<string, ToolDef<any>>, name: string, args: unknown, headers: Record<string, string>) =>
   Promise.resolve().then(() => tools[name]!.handler(args as never, { headers } as never));
 
-const DIRECTOR = "/defs/director.json";
-const CODEX_DIRECTOR = "/defs/codex-director.json";
+const DIRECTOR = absPath("defs", "director.json");
+const CODEX_DIRECTOR = absPath("defs", "codex-director.json");
 const director = { headers: { "x-butchr-agent": agentKeyFor(DIRECTOR) } };
 const codexDirector = { headers: { "x-butchr-agent": agentKeyFor(CODEX_DIRECTOR) } };
 
@@ -53,11 +54,11 @@ function stagedFiles(): Record<string, string> {
   return {
     [DIRECTOR]: JSON.stringify(goodDef()),
     [CODEX_DIRECTOR]: JSON.stringify(goodDef({ vendor: "codex" })),
-    "/defs/mud-player-freeze-only.json": JSON.stringify(goodDef({ freezeControllers: ["director"] })),
-    "/defs/mud-player-unfreeze-only.json": JSON.stringify(goodDef({ frozen: true, unfreezeControllers: ["director"] })),
-    "/defs/mud-player-codex.json": JSON.stringify(goodDef({ vendor: "codex", freezeControllers: ["codex-director"], unfreezeControllers: ["codex-director"] })),
-    "/defs/ungranted.json": JSON.stringify(goodDef()),
-    "/defs/broken.json": JSON.stringify({ ...goodDef(), vendor: "not-a-vendor", freezeControllers: ["director"] }),
+    [absPath("defs", "mud-player-freeze-only.json")]: JSON.stringify(goodDef({ freezeControllers: ["director"] })),
+    [absPath("defs", "mud-player-unfreeze-only.json")]: JSON.stringify(goodDef({ frozen: true, unfreezeControllers: ["director"] })),
+    [absPath("defs", "mud-player-codex.json")]: JSON.stringify(goodDef({ vendor: "codex", freezeControllers: ["codex-director"], unfreezeControllers: ["codex-director"] })),
+    [absPath("defs", "ungranted.json")]: JSON.stringify(goodDef()),
+    [absPath("defs", "broken.json")]: JSON.stringify({ ...goodDef(), vendor: "not-a-vendor", freezeControllers: ["director"] }),
   };
 }
 
@@ -67,7 +68,7 @@ describe("freeze_session / unfreeze_session — granted calls", () => {
     const tools = sessionFreezeTools(deps);
     const result = await call(tools, "freeze_session", { name: "mud-player-freeze-only" }, director.headers);
     expect(result).toEqual({ ok: true, name: "mud-player-freeze-only.json", gates: { manifestFrozen: true, storeFrozen: true } });
-    const written = JSON.parse(deps.files["/defs/mud-player-freeze-only.json"]!);
+    const written = JSON.parse(deps.files[absPath("defs", "mud-player-freeze-only.json")]!);
     expect(written.frozen).toBe(true);
     expect(written.freezeControllers).toEqual(["director"]); // preserved byte-for-value, not dropped by the rewrite
   });
@@ -77,7 +78,7 @@ describe("freeze_session / unfreeze_session — granted calls", () => {
     const tools = sessionFreezeTools(deps);
     const result = await call(tools, "unfreeze_session", { name: "mud-player-unfreeze-only" }, director.headers);
     expect(result).toEqual({ ok: true, name: "mud-player-unfreeze-only.json", gates: { manifestFrozen: false, storeFrozen: false } });
-    expect(JSON.parse(deps.files["/defs/mud-player-unfreeze-only.json"]!).frozen).toBe(false);
+    expect(JSON.parse(deps.files[absPath("defs", "mud-player-unfreeze-only.json")]!).frozen).toBe(false);
   });
 
   test("both claude and codex controllers/targets work identically — vendor plays no role in authorization", async () => {
@@ -118,7 +119,7 @@ describe("freeze_session / unfreeze_session — scope isolation", () => {
     await expect(call(tools, "freeze_session", { name: "ungranted" }, director.headers)).rejects.toBeInstanceOf(Refusal);
     await expect(call(tools, "unfreeze_session", { name: "ungranted" }, director.headers)).rejects.toBeInstanceOf(Refusal);
     // the ungranted file itself is untouched
-    expect(JSON.parse(deps.files["/defs/ungranted.json"]!).frozen).toBeUndefined();
+    expect(JSON.parse(deps.files[absPath("defs", "ungranted.json")]!).frozen).toBeUndefined();
   });
 
   test("the codex controller's own grant does not leak to the claude controller's targets, or vice versa", async () => {

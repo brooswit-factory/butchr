@@ -11,6 +11,7 @@ import {
   builtinManagedSessionsRule, createManagedSessionResourceType, sessionDefinitionProjectMatches,
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
+import { absPath } from "../helpers/abs-path";
 
 /**
  * FACTORY-53/FACTORY-71: wires a managed-session definition's own
@@ -27,7 +28,7 @@ const ref = (s: string): ResourceRef => parseResourceRef(s);
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
   ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
 const goodDef = (over: Record<string, unknown> = {}) => ({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
+  workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });
 
 function fakeFiles(files: Record<string, string>) {
@@ -78,17 +79,17 @@ const sessionAgentKey = (path: string, ruleId = "managed-sessions") => encodeAge
 describe("sessionDefinitionProjectMatches (pure)", () => {
   const match = (path: string, def: Record<string, unknown>): SessionDefinitionMatch => ({
     agentKey: sessionAgentKey(path),
-    rule: builtinManagedSessionsRule("/defs"),
+    rule: builtinManagedSessionsRule(absPath("defs")),
     resource: res(path),
     definition: { ...goodDef(), frozen: false, execution: "swarm", account: "none", role: "worker", ...def } as SessionDefinitionMatch["definition"],
   });
 
   test("a definition without linkedEventingProjects yields no matches", () => {
-    expect(sessionDefinitionProjectMatches(match("/defs/a.json", {}))).toEqual([]);
+    expect(sessionDefinitionProjectMatches(match(absPath("defs", "a.json"), {}))).toEqual([]);
   });
 
   test("one opted-in project yields one match: linkedEventing forced true, projectKey extracted, notifyAgentKey is the REAL session agent key", () => {
-    const m = match("/defs/a.json", { linkedEventingProjects: ["jira-project:BUTCHR"] });
+    const m = match(absPath("defs", "a.json"), { linkedEventingProjects: ["jira-project:BUTCHR"] });
     const matches = sessionDefinitionProjectMatches(m);
     expect(matches).toHaveLength(1);
     expect(matches[0]!.projectKey).toBe("BUTCHR");
@@ -98,7 +99,7 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
   });
 
   test("two opted-in projects yield two matches with DISTINCT state-owning agentKeys (no shared-key overwrite) but the SAME notifyAgentKey", () => {
-    const m = match("/defs/a.json", { linkedEventingProjects: ["jira-project:AAA", "jira-project:BBB"] });
+    const m = match(absPath("defs", "a.json"), { linkedEventingProjects: ["jira-project:AAA", "jira-project:BBB"] });
     const matches = sessionDefinitionProjectMatches(m);
     expect(matches).toHaveLength(2);
     expect(matches.map((x) => x.projectKey).sort()).toEqual(["AAA", "BBB"]);
@@ -107,7 +108,7 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
   });
 
   test("PR review (FACTORY-71), corrected by BUTCHR-471: the produced rule still carries no maxLinkedTurnsPerHour/maxLinkedItems of its own — there is still no per-definition or shared-constant cap value baked into this rule, and a real per-definition override remains a known, deliberately-deferred gap (FACTORY-78). What changed is that absent no longer means UNCAPPED: BUTCHR-471 moved the default (2 turns/hour, 25 items) to the ENFORCEMENT site (`effectiveMaxLinkedTurnsPerHour`/`effectiveMaxLinkedItems`, src/jira-watch/linked-eventing.ts), which reads this same absent-field rule, so a managed session is capped by the shared default exactly like an unconfigured jira-project rule now is — see test/unit/linked-eventing-default-caps.test.ts for that enforcement proof.", () => {
-    const m = match("/defs/a.json", { linkedEventingProjects: ["jira-project:BUTCHR"] });
+    const m = match(absPath("defs", "a.json"), { linkedEventingProjects: ["jira-project:BUTCHR"] });
     const [matched] = sessionDefinitionProjectMatches(m);
     expect(matched!.rule.maxLinkedTurnsPerHour).toBeUndefined();
     expect(matched!.rule.maxLinkedItems).toBeUndefined();
@@ -116,11 +117,11 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
 
 describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/FACTORY-71)", () => {
   test("an opted-in definition's project-issue change nudges the REAL session agent, not the synthetic watch key", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const led = fakeLinkedEventingDeps(world, membersByProject);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read, searchIssues: led.searchIssues, notify: led.notify, log: led.log });
 
     await type.discovery.search();
@@ -131,16 +132,16 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
     await type.discovery.related?.([]);
 
     expect(led.notified).toHaveLength(1);
-    expect(led.notified[0]!.agent).toBe(sessionAgentKey("/defs/a.json"));
+    expect(led.notified[0]!.agent).toBe(sessionAgentKey(absPath("defs", "a.json")));
   });
 
   test("a change to the project's own managed-link collection also nudges the session", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
     const store = fakeLinkStore();
     await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-2"));
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2") };
     const led = fakeLinkedEventingDeps(world, {}, { linkStore: store });
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read, searchIssues: led.searchIssues, notify: led.notify, linkStore: store, log: led.log });
 
     await type.discovery.search();
@@ -152,15 +153,15 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
     await type.discovery.related?.([]);
 
     expect(led.notified).toHaveLength(1);
-    expect(led.notified[0]!.agent).toBe(sessionAgentKey("/defs/a.json"));
+    expect(led.notified[0]!.agent).toBe(sessionAgentKey(absPath("defs", "a.json")));
     const events = (led.notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } }).linked.events;
     expect(events).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: "no longer linked" }]);
   });
 
   test("a definition with no linkedEventingProjects sees no behaviour change: zero linked-eventing searches, zero nudges", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef()) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef()) });
     const led = fakeLinkedEventingDeps({}, {});
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read, searchIssues: led.searchIssues, notify: led.notify, log: led.log });
 
     await type.discovery.search();
@@ -173,11 +174,11 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
   });
 
   test("a FROZEN opted-in session is never nudged: no match is even built for it, so it costs no search either", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) });
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1") };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const led = fakeLinkedEventingDeps(world, membersByProject, { isFrozen: async () => true });
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read, searchIssues: led.searchIssues, notify: led.notify, isFrozen: async () => true, log: led.log });
 
     await type.discovery.search();
@@ -191,11 +192,11 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
   });
 
   test("a session opted into TWO projects tracks both independently — neither's state overwrites the other's, and both nudges land on the SAME real session agent", async () => {
-    const { list, read } = fakeFiles({ "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:AAA", "jira-project:BBB"] })) });
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:AAA", "jira-project:BBB"] })) });
     const world: Record<string, JiraIssue> = { "AAA-1": issue("AAA-1"), "BBB-1": issue("BBB-1") };
     const membersByProject: Record<string, string[]> = { AAA: [], BBB: [] };
     const led = fakeLinkedEventingDeps(world, membersByProject);
-    const rule = builtinManagedSessionsRule("/defs");
+    const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list, read, searchIssues: led.searchIssues, notify: led.notify, log: led.log });
 
     await type.discovery.search();
@@ -208,13 +209,13 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
     await type.discovery.search();
     await type.discovery.related?.([]);
     expect(led.notified).toHaveLength(1);
-    expect(led.notified[0]!.agent).toBe(sessionAgentKey("/defs/a.json")); // still the REAL session agent, not a per-project synthetic key
+    expect(led.notified[0]!.agent).toBe(sessionAgentKey(absPath("defs", "a.json"))); // still the REAL session agent, not a per-project synthetic key
 
     membersByProject.BBB = ["BBB-1"]; // now BBB changes too — must still be tracked (not lost to the earlier overwrite)
     await type.discovery.search();
     await type.discovery.related?.([]);
     expect(led.notified).toHaveLength(2);
-    expect(led.notified[1]!.agent).toBe(sessionAgentKey("/defs/a.json"));
+    expect(led.notified[1]!.agent).toBe(sessionAgentKey(absPath("defs", "a.json")));
   });
 });
 
@@ -251,7 +252,7 @@ describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window 
       notify: async (agent, about) => { notified.push({ agent, about }); },
       now: () => now.value,
     };
-    const realSessionAgent = sessionAgentKey("/defs/a.json");
+    const realSessionAgent = sessionAgentKey(absPath("defs", "a.json"));
     const m: ProjectLinkedEventingMatch = {
       agentKey: `${realSessionAgent}\0linked:jira-project:BUTCHR`,
       rule: { id: "x", enabled: true, resourceProvider: "filesystem", query: "{}", brief: "b", execution: "swarm", account: "none", role: "worker", linkedEventing: true, maxLinkedTurnsPerHour: 1 },

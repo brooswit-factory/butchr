@@ -7,6 +7,7 @@ import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig,
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
+import { absPath } from "../helpers/abs-path";
 
 // FACTORY-118 review round 1: A2/A3/A4/A6 each need a test that PINS the
 // addendum's own claim directly, not just incidentally exercised as a side
@@ -49,8 +50,8 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
     const root = mkdtempSync(join(tmpdir(), "butchr-sticky-"));
     try {
       // Two different real paths reducing to the same "<parent>:<name>" short id — the FACTORY-90 collision example.
-      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
-      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/acme/rinth" });
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "acme", "rinth") });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "acme", "rinth") });
 
       const firstDirBeforeCollision = ensureWorkspaceDir(first, root);
       expect(firstDirBeforeCollision.endsWith("/acme:rinth")).toBe(true); // no collision yet — bare name
@@ -83,8 +84,8 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
       // Short ids "p:a.b" and "p:a-b" — two DIFFERENT directory names (no
       // directory-name collision between them at all) that both slug to
       // "...-p-a-b" (every non-alphanumeric character becomes "-").
-      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a.b" });
-      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a-b" });
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("p", "a.b") });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("p", "a-b") });
 
       const firstDir = ensureWorkspaceDir(first, root);
       expect(firstDir.endsWith("/p:a.b")).toBe(true); // no directory-NAME collision — claimed bare
@@ -103,7 +104,7 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
   test("Addendum A6: an in-directory bookkeeping stamp is a HINT, never an authority — a stamp copied into a foreign directory, or left at the wrong leaf for its own key, is never trusted", () => {
     const root = mkdtempSync(join(tmpdir(), "butchr-untrusted-stamp-"));
     try {
-      const realKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
+      const realKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "acme", "rinth") });
       const realDir = ensureWorkspaceDir(realKey, root);
       expect(readBookkeptAgentKey(realDir)).toBe(realKey);
       expect(agentIdOfWorkspacePath(realDir, root)).toBe(realKey);
@@ -252,21 +253,21 @@ describe("workspace identity", () => {
     const root = workspaceRoot();
     expect(agentIdOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
     expect(agentIdOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
-    expect(agentIdOfWorkspacePath("/tmp/KAN-42")).toBeNull();
+    expect(agentIdOfWorkspacePath(absPath("tmp", "KAN-42"))).toBeNull();
     expect(agentIdOfWorkspacePath(null)).toBeNull();
   });
   test("rule agent ids cover every provider and never a legacy workspace", () => {
-    const root = "/w";
-    expect(ruleAgentIdOfWorkspacePath("/w/jira-work/build/KAN-1", root)).toBe("jira-work:build:KAN-1");
-    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/acme%2Fweb%2342", root)).toBe("github-issue:triage:acme%2Fweb%2342");
-    expect(ruleAgentIdOfWorkspacePath("/w/jira-idea/ideas/IDEA-7", root)).toBe("jira-idea:ideas:IDEA-7");
-    expect(ruleAgentIdOfWorkspacePath("/w/zendesk-ticket/support/acme%2312", root)).toBe("zendesk-ticket:support:acme%2312");
-    expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
-    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
+    const root = absPath("w");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "jira-work", "build", "KAN-1"), root)).toBe("jira-work:build:KAN-1");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "github-issue", "triage", "acme%2Fweb%2342"), root)).toBe("github-issue:triage:acme%2Fweb%2342");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "jira-idea", "ideas", "IDEA-7"), root)).toBe("jira-idea:ideas:IDEA-7");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "zendesk-ticket", "support", "acme%2312"), root)).toBe("zendesk-ticket:support:acme%2312");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "kan-42"), root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath(join(root, "github-issue", "triage", "not-a-ref"), root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
   });
   test("BUTCHR-397: a query-level agent's workspace round-trips through workspaceDirFor/agentIdOfWorkspacePath and sits as a SIBLING of that rule's per-resource ones, never their parent", () => {
-    const root = "/w";
+    const root = absPath("w");
     const queryKey = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
     const resourceKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" });
     const queryDir = workspaceDirFor(queryKey, root);
@@ -720,6 +721,11 @@ describe("interpolate", () => {
   });
 });
 describe("buildWorkspace", () => {
+  // Reused across several managed-session fixtures below — one canonical filesystem resourceId.
+  const ETC_DEFS_A_JSON = absPath("etc", "defs", "a.json");
+  // Reused across several "never throws for a missing workspace dir" fixtures below.
+  const DOES_NOT_EXIST = absPath("does", "not", "exist");
+
   test("writes CLAUDE.md, interpolated brief.md, and mcp.json with x-issue", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
@@ -773,7 +779,7 @@ describe("buildWorkspace", () => {
     const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp");
       expect(dir).toBe(workspaceDirFor(key, root));
@@ -798,7 +804,7 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-tools-note-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const managedSpec: SpawnSpec = { key: managedKey, issuetype: "managed-session", summary: "s", parent: null, brief: "Tend it." };
       const managedDir = buildWorkspace(managedSpec, "http://x/mcp");
       const managedBrief = readFileSync(join(managedDir, "brief.md"), "utf8");
@@ -806,7 +812,7 @@ describe("buildWorkspace", () => {
       expect(managedBrief).not.toContain(FILESYSTEM_TOOLS_NOTE);
       expect(managedBrief).toContain("freeze_session");
 
-      const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
+      const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: absPath("repo", "a.md") });
       const plainSpec: SpawnSpec = { key: plainKey, issuetype: "filesystem", summary: "s", parent: null, brief: "Keep it current." };
       const plainDir = buildWorkspace(plainSpec, "http://x/mcp");
       const plainBrief = readFileSync(join(plainDir, "brief.md"), "utf8");
@@ -820,18 +826,18 @@ describe("buildWorkspace", () => {
   });
 
   test("PR #394 review fix (round 3): agentLaunchConfig keeps the launched PROCESS at the bookkeeping dir even when spec.cwd is set — see SpawnSpec.cwd's own doc comment (Drovr's launch.cwd===workspace.cwd invariant) — while mcp config stays anchored there too, for both vendors", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: "/repo/some-project" };
-    const bookkeepingDir = "/butchr-workspaces/filesystem/managed-sessions/%2Fetc%2Fdefs%2Fa.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
+    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: absPath("repo", "some-project") };
+    const bookkeepingDir = absPath("butchr-workspaces", "filesystem", "managed-sessions", "%2Fetc%2Fdefs%2Fa.json");
     const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
     expect(claudeLaunch.cwd).toBe(bookkeepingDir);
-    expect(claudeLaunch.cwd).not.toBe("/repo/some-project");
+    expect(claudeLaunch.cwd).not.toBe(absPath("repo", "some-project"));
     expect((claudeLaunch as { mcpConfigPath: string }).mcpConfigPath).toBe(`${bookkeepingDir}/mcp.json`);
     const codexLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "codex" });
     expect(codexLaunch.cwd).toBe(bookkeepingDir);
     // No spec.cwd: byte-for-byte unchanged behaviour for every other spec.
     const noOverride: SpawnSpec = { key: "AGY-1", issuetype: "Task", summary: "s", parent: null };
-    expect(agentLaunchConfig(noOverride, "/some/dir", "pane-1", "name", { provider: "claude" }).cwd).toBe("/some/dir");
+    expect(agentLaunchConfig(noOverride, absPath("some", "dir"), "pane-1", "name", { provider: "claude" }).cwd).toBe(absPath("some", "dir"));
   });
 
   test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors (round 3: the guarantee holds trivially now — butchr's process never even launches there)", () => {
@@ -847,7 +853,7 @@ describe("buildWorkspace", () => {
     writeFileSync(join(real, "mcp.json"), ownMcpJson);
     try {
       for (const provider of ["claude", "codex"] as const) {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: `/etc/defs/${provider}.json` });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", `${provider}.json`) });
         const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
         const dir = buildWorkspace(spec, "http://x/mcp", provider);
         const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
@@ -881,9 +887,11 @@ describe("buildWorkspace", () => {
       const mcp = JSON.parse(readFileSync(mcpJsonPath, "utf8"));
       expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
       expect(mcp.mcpServers["mud-bridge"]).toEqual({ type: "http", url: "https://mud.internal/mcp", headers: { Authorization: "Bearer secret-token" } });
-      // A resolved secret header value makes mcp.json 0600.
-      const mode = require("node:fs").statSync(mcpJsonPath).mode & 0o777;
-      expect(mode).toBe(0o600);
+      // A resolved secret header value makes mcp.json 0600. FACTORY-569: NTFS has no POSIX permission bits.
+      if (process.platform !== "win32") {
+        const mode = require("node:fs").statSync(mcpJsonPath).mode & 0o777;
+        expect(mode).toBe(0o600);
+      }
       // The persisted, staleness-check-only sidecar carries the binding's metadata (name/url/channel/headersEnvVar NAME) — never a resolved header value.
       const persisted = readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8");
       expect(persisted).not.toContain("secret-token");
@@ -897,7 +905,8 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("mcp.json keeps its default permissions when no binding resolves a secret header", () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("mcp.json keeps its default permissions when no binding resolves a secret header", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-mcp-nosecret-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -920,7 +929,7 @@ describe("buildWorkspace", () => {
     try {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceMcpServers(dir)).toBeUndefined();
-      expect(workspaceMcpServers("/does/not/exist")).toBeUndefined();
+      expect(workspaceMcpServers(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -958,8 +967,8 @@ describe("buildWorkspace", () => {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspacePermissionMode(dir)).toBeUndefined();
       expect(workspaceStrictMcpConfig(dir)).toBeUndefined();
-      expect(workspacePermissionMode("/does/not/exist")).toBeUndefined();
-      expect(workspaceStrictMcpConfig("/does/not/exist")).toBeUndefined();
+      expect(workspacePermissionMode(DOES_NOT_EXIST)).toBeUndefined();
+      expect(workspaceStrictMcpConfig(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -997,7 +1006,7 @@ describe("buildWorkspace", () => {
     try {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceLizardMode(dir)).toBeUndefined();
-      expect(workspaceLizardMode("/does/not/exist")).toBeUndefined();
+      expect(workspaceLizardMode(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -1052,8 +1061,8 @@ describe("buildWorkspace", () => {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceModel(dir)).toBeUndefined();
       expect(workspaceEffort(dir)).toBeUndefined();
-      expect(workspaceModel("/does/not/exist")).toBeUndefined();
-      expect(workspaceEffort("/does/not/exist")).toBeUndefined();
+      expect(workspaceModel(DOES_NOT_EXIST)).toBeUndefined();
+      expect(workspaceEffort(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -1084,7 +1093,7 @@ describe("buildWorkspace", () => {
 
     test("discoverClaudeSessionId returns the NEWEST transcript's id for this cwd, ignoring non-.jsonl files", async () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-"));
-      const dir = "/some/workspace/KAN-20";
+      const dir = absPath("some", "workspace", "KAN-20");
       try {
         fakeTranscript(home, dir, "older-session");
         await tick();
@@ -1100,7 +1109,7 @@ describe("buildWorkspace", () => {
     test("discoverClaudeSessionId returns undefined when the project folder doesn't exist (no launch has happened yet, or discovery is checked against the wrong home)", () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
       try {
-        expect(discoverClaudeSessionId("/some/workspace/KAN-21", home)).toBeUndefined();
+        expect(discoverClaudeSessionId(absPath("some", "workspace", "KAN-21"), home)).toBeUndefined();
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -1115,7 +1124,7 @@ describe("buildWorkspace", () => {
     // before the launch that produces it.
     test("discoverClaudeSessionId with `after` set NEVER returns a transcript created before that instant, even when it is the newest (or ONLY) one present — falls through to undefined instead of a wrong-but-real id", async () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-after-"));
-      const dir = "/some/workspace/KAN-24";
+      const dir = absPath("some", "workspace", "KAN-24");
       try {
         fakeTranscript(home, dir, "prior-respawns-old-session"); // a real, older transcript from BEFORE this launch
         await tick();
@@ -1170,7 +1179,7 @@ describe("buildWorkspace", () => {
     test("claudeTranscriptExists is true only for a REAL transcript, false for a missing one or the wrong home", () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-exists-"));
       const otherHome = mkdtempSync(join(tmpdir(), "claude-home-other-"));
-      const dir = "/some/workspace/KAN-22";
+      const dir = absPath("some", "workspace", "KAN-22");
       try {
         fakeTranscript(home, dir, "real-session");
         expect(claudeTranscriptExists(dir, "real-session", home)).toBe(true);
@@ -1205,7 +1214,7 @@ describe("buildWorkspace", () => {
     try {
       const codexDir = buildWorkspace({ key: "KAN-12", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "codex");
       expect(workspaceSessionId(codexDir)).toBeUndefined();
-      expect(workspaceSessionId("/does/not/exist")).toBeUndefined();
+      expect(workspaceSessionId(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -1261,7 +1270,7 @@ describe("buildWorkspace", () => {
     const evilDotMcpJson = JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } });
     writeFileSync(join(real, ".mcp.json"), evilDotMcpJson);
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp", "claude");
       const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider: "claude" });
@@ -1296,8 +1305,8 @@ describe("buildWorkspace", () => {
     const ancestorMcpJson = join(root, ".mcp.json");
     writeFileSync(ancestorMcpJson, JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } }));
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: "/repo/some-project" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: absPath("repo", "some-project") };
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(/would inherit/);
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(ancestorMcpJson);
       // Nothing was written before the guard fired — refuse-before-write, not partial-then-fail.
@@ -1400,7 +1409,8 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
   // VALUE landed in a group/other-readable mcp.json at the default umask.
   const mode = (path: string) => statSync(path).mode & 0o777;
 
-  test("mcp.json carrying a bound server's resolved header is chmod 0600 (owner-only)", () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("mcp.json carrying a bound server's resolved header is chmod 0600 (owner-only)", () => {
     withRoot(() => {
       process.env.BUTCHR_TEST_WS_PERM_HEADERS = JSON.stringify({ Authorization: "Bearer secret" });
       try {
@@ -1410,7 +1420,7 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  test("a binding-less mcp.json keeps its default (unchanged) permissions — not tightened when there is no secret to protect", () => {
+  test.skipIf(process.platform === "win32")("a binding-less mcp.json keeps its default (unchanged) permissions — not tightened when there is no secret to protect", () => {
     withRoot(() => {
       const dir = buildWorkspace({ key: "KAN-26", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp");
       const withoutBindings = mode(join(dir, "mcp.json"));
@@ -1433,14 +1443,14 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  test("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
+  test.skipIf(process.platform === "win32")("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
     withRoot(() => {
       const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
       expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
     });
   });
 
-  test("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
+  test.skipIf(process.platform === "win32")("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
     withRoot(() => {
       const spec = { key: "KAN-28", issuetype: "Task", summary: "s", parent: null };
       const dir = buildWorkspace(spec, "http://x/mcp"); // first build: no bindings, default perms
@@ -1472,7 +1482,7 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
       });
     });
 
-    test("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
+    test.skipIf(process.platform === "win32")("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
       withRoot(() => {
         const dir = buildWorkspace({ key: "KAN-31", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_x" }, "http://x/mcp");
         expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
@@ -1502,7 +1512,8 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
           const dir = buildWorkspace({ key: "KAN-34", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...rocketr, headersEnvVar: "BUTCHR_TEST_WS_ROCKETR_HEADERS" }], rocketchatAccount: "butchr_x" }, "http://x/mcp");
           const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
           expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "X-Extra": "v", "x-rocketr-account": "butchr_x" } });
-          expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
+          // FACTORY-569: NTFS has no POSIX permission bits.
+          if (process.platform !== "win32") expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
         } finally { delete process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS; }
       });
     });

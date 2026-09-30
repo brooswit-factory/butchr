@@ -1,5 +1,5 @@
 import { readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 
 /** Every .ts source that must be loadable: src/** and scripts/**, excluding tests and this generator's own output. */
 export function loadableFiles(root: string): string[] {
@@ -8,7 +8,13 @@ export function loadableFiles(root: string): string[] {
     for (const name of readdirSync(dir)) {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) { walk(p); continue; }
-      if (name.endsWith(".ts") && !name.endsWith(".d.ts")) out.push(relative(root, p));
+      // FACTORY-569: every downstream use of this string (loadTestPathFor's
+      // "/" split, the generated file's own import specifier) is POSIX-shaped
+      // on purpose — an ES module specifier is always "/"-separated, even on
+      // win32. `relative` returns the OS-native separator (backslash on
+      // win32), so it must be normalized here, once, rather than at each
+      // of those callers.
+      if (name.endsWith(".ts") && !name.endsWith(".d.ts")) out.push(relative(root, p).split(sep).join("/"));
     }
   };
   for (const top of ["src", "scripts"]) walk(join(root, top));

@@ -13,6 +13,7 @@ import {
   repairGitWorktrees,
   reverseMigrateWorkspaceLayout,
 } from "../../src/agents/workspace-migration.js";
+import { absPath } from "../helpers/abs-path";
 
 // Every test below passes its OWN explicit root/home/claudeJsonPath — never
 // the real ~/.claude or ~/.claude.json (FACTORY-118's own requirement). Each
@@ -71,7 +72,7 @@ describe("claudeProjectSlug — pinned to drovr's own algorithm", () => {
     // Same regex drovr's src/native-transcript.ts uses at both its own call sites
     // (resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-")) — verified by reading that file directly.
     const drovrFormula = (cwd: string) => resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-");
-    for (const p of ["/a/b.c_d%e~f/g", "/home/brooswit/日本語/résumé", "/a/~b/%2Fc"]) {
+    for (const p of [absPath("a", "b.c_d%e~f", "g"), absPath("home", "brooswit", "日本語", "résumé"), absPath("a", "~b", "%2Fc")]) {
       expect(claudeProjectSlug(p)).toBe(drovrFormula(p));
     }
   });
@@ -155,7 +156,7 @@ describe("migrateClaudeProjectSlug", () => {
 
   test("long-path truncation fallback: locates a real Claude-Code-shaped truncated+suffixed slug dir that claudeProjectSlug alone cannot reproduce, by prefix match", () => {
     const home = tempDir("butchr-slug-home-");
-    const oldCwd = "/" + "a".repeat(60) + "/" + "b".repeat(60) + "/" + "c".repeat(60) + "/" + "d".repeat(60);
+    const oldCwd = absPath("a".repeat(60), "b".repeat(60), "c".repeat(60), "d".repeat(60));
     const fullSlug = claudeProjectSlug(oldCwd);
     expect(fullSlug.length).toBeGreaterThan(200);
     // The empirically-observed real Claude Code shape (docs/workspace-layout.md): first 200 chars + "-" + a 6-char suffix.
@@ -175,7 +176,7 @@ describe("migrateClaudeProjectSlug", () => {
     const home = tempDir("butchr-slug-home-");
     const oldCwd = tempDir("butchr-old-cwd-");
     writeTranscript(home, oldCwd, "t.jsonl", "codeword-should-not-move");
-    const newCwd = "/" + "e".repeat(60) + "/" + "f".repeat(60) + "/" + "g".repeat(60) + "/" + "h".repeat(60);
+    const newCwd = absPath("e".repeat(60), "f".repeat(60), "g".repeat(60), "h".repeat(60));
     expect(claudeProjectSlug(newCwd).length).toBeGreaterThan(200);
 
     expect(() => migrateClaudeProjectSlug(oldCwd, newCwd, home)).toThrow(/over the 200-char threshold/);
@@ -453,11 +454,11 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
 
   test("moves the projects[oldCwd] entry to projects[newCwd]", () => {
     const dir = tempDir("butchr-claude-json-");
-    const oldCwd = "/old/workspace/path";
-    const newCwd = "/new/workspace/path";
+    const oldCwd = absPath("old", "workspace", "path");
+    const newCwd = absPath("new", "workspace", "path");
     const path = fakeClaudeJson(dir, {
       numStartups: 5,
-      projects: { [oldCwd]: { hasTrustDialogAccepted: true, allowedTools: ["Bash"] }, "/other/untouched": { hasTrustDialogAccepted: false } },
+      projects: { [oldCwd]: { hasTrustDialogAccepted: true, allowedTools: ["Bash"] }, [absPath("other", "untouched")]: { hasTrustDialogAccepted: false } },
     });
 
     const result = migrateClaudeSettingsEntry(oldCwd, newCwd, path);
@@ -466,15 +467,15 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
     expect(after.projects[oldCwd]).toBeUndefined();
     expect(after.projects[newCwd]).toEqual({ hasTrustDialogAccepted: true, allowedTools: ["Bash"] });
     // Untouched sibling entries and unrelated top-level fields survive the round trip.
-    expect(after.projects["/other/untouched"]).toEqual({ hasTrustDialogAccepted: false });
+    expect(after.projects[absPath("other", "untouched")]).toEqual({ hasTrustDialogAccepted: false });
     expect(after.numStartups).toBe(5);
   });
 
   test("no old entry present: no-old-entry, file untouched", () => {
     const dir = tempDir("butchr-claude-json-");
-    const path = fakeClaudeJson(dir, { projects: { "/unrelated": {} } });
+    const path = fakeClaudeJson(dir, { projects: { [absPath("unrelated")]: {} } });
     const before = readFileSync(path, "utf8");
-    const result = migrateClaudeSettingsEntry("/old/nowhere", "/new/nowhere", path);
+    const result = migrateClaudeSettingsEntry(absPath("old", "nowhere"), absPath("new", "nowhere"), path);
     expect(result.outcome).toBe("no-old-entry");
     expect(readFileSync(path, "utf8")).toBe(before);
   });
@@ -482,15 +483,15 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
   test("missing ~/.claude.json entirely: no-old-entry, never created as a side effect", () => {
     const dir = tempDir("butchr-claude-json-");
     const path = join(dir, ".claude.json"); // never written
-    const result = migrateClaudeSettingsEntry("/old", "/new", path);
+    const result = migrateClaudeSettingsEntry(absPath("old"), absPath("new"), path);
     expect(result.outcome).toBe("no-old-entry");
     expect(existsSync(path)).toBe(false);
   });
 
   test("never overwrites a non-empty target entry: refuses loudly, file left byte-for-byte untouched", () => {
     const dir = tempDir("butchr-claude-json-");
-    const oldCwd = "/old/workspace/path";
-    const newCwd = "/new/workspace/path";
+    const oldCwd = absPath("old", "workspace", "path");
+    const newCwd = absPath("new", "workspace", "path");
     const path = fakeClaudeJson(dir, {
       projects: { [oldCwd]: { hasTrustDialogAccepted: true }, [newCwd]: { hasTrustDialogAccepted: false, allowedTools: ["Read"] } },
     });
@@ -501,8 +502,8 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
 
   test("an EMPTY target entry ({}) is safe to proceed through", () => {
     const dir = tempDir("butchr-claude-json-");
-    const oldCwd = "/old/workspace/path";
-    const newCwd = "/new/workspace/path";
+    const oldCwd = absPath("old", "workspace", "path");
+    const newCwd = absPath("new", "workspace", "path");
     const path = fakeClaudeJson(dir, { projects: { [oldCwd]: { hasTrustDialogAccepted: true }, [newCwd]: {} } });
     const result = migrateClaudeSettingsEntry(oldCwd, newCwd, path);
     expect(result.outcome).toBe("moved");
@@ -511,8 +512,8 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
 
   test("idempotent and reversible: forward then forward-again is a no-op, forward then reverse restores exactly", () => {
     const dir = tempDir("butchr-claude-json-");
-    const oldCwd = "/old/workspace/path";
-    const newCwd = "/new/workspace/path";
+    const oldCwd = absPath("old", "workspace", "path");
+    const newCwd = absPath("new", "workspace", "path");
     const path = fakeClaudeJson(dir, { projects: { [oldCwd]: { hasTrustDialogAccepted: true, allowedTools: ["Bash", "Read"] } } });
 
     expect(migrateClaudeSettingsEntry(oldCwd, newCwd, path).outcome).toBe("moved");
@@ -531,7 +532,7 @@ describe("migrateClaudeSettingsEntry — ~/.claude.json's own per-project trust/
 // is exercised directly against hand-built DiscoveredLeaf rows.
 describe("planWorkspaceMigration — the operator migration script's pure decision function", () => {
   test("an old-layout, not-yet-migrated leaf (no stamp, legacy percent-encoded) is planned to migrate", () => {
-    const root = "/ws";
+    const root = absPath("ws");
     const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
     const leaf = key.split(":")[2]!; // the legacy encoded leaf, exactly as it lives on disk pre-migration
     const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf, stampedKey: null }], new Set());
@@ -539,7 +540,7 @@ describe("planWorkspaceMigration — the operator migration script's pure decisi
   });
 
   test("a live pane's cwd is never planned to migrate (Addendum A5) — left for the NEXT run", () => {
-    const root = "/ws";
+    const root = absPath("ws");
     const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
     const leaf = key.split(":")[2]!;
     const oldDir = join(root, "github-issue", "bugs", leaf);
@@ -548,7 +549,7 @@ describe("planWorkspaceMigration — the operator migration script's pure decisi
   });
 
   test("an identity-short-id provider (jira-work) is 'no-change', never proposed as a migration", () => {
-    const root = "/ws";
+    const root = absPath("ws");
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "KAN-1" });
     const leaf = key.split(":")[2]!;
     const plan = planWorkspaceMigration(root, [{ provider: "jira-work", ruleId: "triage", leaf, stampedKey: null }], new Set());
@@ -556,14 +557,14 @@ describe("planWorkspaceMigration — the operator migration script's pure decisi
   });
 
   test("an already-migrated (stamped, short-leaf) directory is 'no-change'", () => {
-    const root = "/ws";
+    const root = absPath("ws");
     const key = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/widgets#12" });
     const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf: "widgets#12", stampedKey: key }], new Set());
     expect(plan).toEqual([{ key, oldDir: join(root, "github-issue", "bugs", "widgets#12"), newDir: join(root, "github-issue", "bugs", "widgets#12"), action: "no-change" }]);
   });
 
   test("a foreign or unrecognisable leaf (no stamp, does not decode) is silently absent from the plan — never adopted (Addendum A6)", () => {
-    const root = "/ws";
+    const root = absPath("ws");
     const plan = planWorkspaceMigration(root, [{ provider: "github-issue", ruleId: "bugs", leaf: "not-a-valid-encoded-anything", stampedKey: null }], new Set());
     expect(plan).toEqual([]);
   });

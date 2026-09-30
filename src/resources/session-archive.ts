@@ -128,12 +128,22 @@ export type ArchiveResult =
  * is plausible) calling `archiveSessionDefinition`/`unarchiveSessionDefinition`
  * directly gets this check for free — it lives in the core function, not
  * the CLI layer.
+ *
+ * FACTORY-569: the `/`/`\` check alone misses a Windows DRIVE-RELATIVE form
+ * (`C:foo.json` — no separator at all, yet still resolves against drive
+ * `C:`'s own current directory, not `dir`) and a stream-qualified name
+ * (`a.json:hidden`, an NTFS Alternate Data Stream, a different underlying
+ * file from `a.json`) — `:` is reserved in a Windows basename outside the
+ * drive-letter position, so any bare `:` is refused here too, on every OS
+ * (never platform-gated: a POSIX host can still receive a Windows-shaped
+ * caller-supplied name over the same code path).
  */
 export function definitionBasenameProblem(fileName: string): string | null {
   if (fileName === "") return "must not be empty";
   if (fileName === "." || fileName === "..") return `must not be "." or ".."`;
   // Covers "absolute" too: every absolute path, POSIX (`/a/b`) or Windows (`C:\a`, `\\a`), contains one of these.
   if (fileName.includes("/") || fileName.includes("\\")) return `must be a bare file name, not a path (no "/" or "\\")`;
+  if (fileName.includes(":")) return `must be a bare file name, not a path (no ":")`;
   return null;
 }
 
