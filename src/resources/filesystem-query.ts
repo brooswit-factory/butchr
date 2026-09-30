@@ -20,6 +20,7 @@
  * change.
  */
 import { homedir as realHomedir } from "node:os";
+import { posix, win32 } from "node:path";
 
 export type FilesystemKind = "file" | "directory";
 
@@ -54,31 +55,62 @@ const PREDICATE_FIELDS = new Set(["predicateKind", "value", "name", "entryKind"]
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
 /**
- * `~` and `~/rest` expand against `home`; a bare `~user` form is refused
- * (`null`) rather than guessed at — resolving another account's home
- * directory needs a passwd lookup this module deliberately never performs
- * (no I/O at validation time). Anything not starting with `~` is returned
- * unchanged.
+ * FACTORY-558: the `node:path` flavor a POSIX-only absolute-path/segment
+ * check must use instead of a literal `/` — `win32` on Windows (accepts
+ * both `C:\...` and `C:/...`, and UNC `\\server\share\...`), `posix`
+ * everywhere else. Injectable so the same unit tests exercise BOTH
+ * behaviors on any OS, never guessed from the host's own literal separator.
  */
-export function expandHome(root: string, home: string = realHomedir()): string | null {
+export function pathModuleFor(platform: NodeJS.Platform = process.platform): typeof posix | typeof win32 {
+  return platform === "win32" ? win32 : posix;
+}
+
+/**
+ * `~` and `~/rest` (or, on `win32`, `~\rest`) expand against `home`; a bare
+ * `~user` form is refused (`null`) rather than guessed at — resolving
+ * another account's home directory needs a passwd lookup this module
+ * deliberately never performs (no I/O at validation time). Anything not
+ * starting with `~` is returned unchanged.
+ */
+export function expandHome(root: string, home: string = realHomedir(), platform: NodeJS.Platform = process.platform): string | null {
   if (root === "~") return home;
-  if (root.startsWith("~/")) return `${home.replace(/\/+$/, "")}${root.slice(1)}`;
+  const tildeSepRe = platform === "win32" ? /^~[\\/]/ : /^~\//;
+  if (tildeSepRe.test(root)) {
+    const trimRe = platform === "win32" ? /[\\/]+$/ : /\/+$/;
+    return `${home.replace(trimRe, "")}${root.slice(1)}`;
+  }
   if (root.startsWith("~")) return null;
   return root;
 }
 
-function rootProblems(root: unknown, home: string): string[] {
+/**
+ * Why `expanded` (already `~`-expanded) is not a usable canonical absolute
+ * path for `label`, or `[]`. Platform-aware absolute-ness and segment check
+ * shared by `rootProblems` below and `workingDirectoryProblems`
+ * (src/resources/session-definition.ts) — both need the exact same "must be
+ * absolute, no `.`/`..`/empty segments, no trailing separator except a bare
+ * root" rule, just against a different field name.
+ */
+export function absolutePathProblems(expanded: string, raw: string, label: string, platform: NodeJS.Platform = process.platform): string[] {
+  const p = pathModuleFor(platform);
+  if (!p.isAbsolute(expanded)) return [`${label} "${raw}" must be absolute (or start with ~)`];
+  const root = p.parse(expanded).root;
+  if (expanded === root) return [];
+  const trailingSepRe = platform === "win32" ? /[\\/]$/ : /\/$/;
+  if (trailingSepRe.test(expanded)) return [`${label} "${raw}" must not have a trailing slash`];
+  const sepRe = platform === "win32" ? /[\\/]/ : /\//;
+  const segments = expanded.slice(root.length).split(sepRe);
+  if (segments.some((s) => s === "" || s === "." || s === "..")) return [`${label} "${raw}" must not contain "." or ".." segments or repeated slashes`];
+  return [];
+}
+
+function rootProblems(root: unknown, home: string, platform: NodeJS.Platform): string[] {
   if (typeof root !== "string" || !root.trim()) return ["query.root must be a non-empty string"];
-  const expanded = expandHome(root.trim(), home);
+  const expanded = expandHome(root.trim(), home, platform);
   if (expanded === null) return [`query.root "${root}": ~user is not supported; use an absolute path`];
   if (expanded.length > MAX_ROOT_LENGTH) return [`query.root is longer than ${MAX_ROOT_LENGTH} characters`];
   if (expanded.includes("\0")) return [`query.root "${root}" contains a NUL byte`];
-  if (expanded[0] !== "/") return [`query.root "${root}" must be absolute (or start with ~)`];
-  if (expanded === "/") return [];
-  if (expanded.endsWith("/")) return [`query.root "${root}" must not have a trailing slash`];
-  const segments = expanded.slice(1).split("/");
-  if (segments.some((s) => s === "" || s === "." || s === "..")) return [`query.root "${root}" must not contain "." or ".." segments or repeated slashes`];
-  return [];
+  return absolutePathProblems(expanded, root, "query.root", platform);
 }
 
 function predicateProblems(raw: unknown, kind: unknown): string[] {
@@ -115,13 +147,13 @@ function predicateProblems(raw: unknown, kind: unknown): string[] {
  * empty result" discipline as `ZENDESK_SEARCH_LIMIT`, never the daemon's own
  * startup.
  */
-export function filesystemQueryProblems(query: string, home: string = realHomedir()): string[] {
+export function filesystemQueryProblems(query: string, home: string = realHomedir(), platform: NodeJS.Platform = process.platform): string[] {
   let doc: unknown;
   try { doc = JSON.parse(query); } catch (e) { return [`query is not valid JSON: ${(e as Error).message}`]; }
   if (!isObject(doc)) return ["query must be a JSON object"];
   const problems: string[] = [];
   for (const k of Object.keys(doc)) if (!QUERY_FIELDS.has(k)) problems.push(`query has unknown field "${k}"`);
-  problems.push(...rootProblems(doc.root, home));
+  problems.push(...rootProblems(doc.root, home, platform));
   if (doc.kind !== "file" && doc.kind !== "directory") problems.push(`query.kind must be "file" or "directory"`);
   if (doc.namePattern !== undefined && (typeof doc.namePattern !== "string" || !doc.namePattern || doc.namePattern.includes("/"))) {
     problems.push(`query.namePattern must be a non-empty string with no "/"`);
@@ -139,11 +171,11 @@ export function filesystemQueryProblems(query: string, home: string = realHomedi
  * after that check has already passed at rule-load time, same discipline as
  * `scopedTicketQuery`/`scopedIssueQuery`.
  */
-export function parseFilesystemQuery(query: string, home: string = realHomedir()): FilesystemQuery {
-  const problems = filesystemQueryProblems(query, home);
+export function parseFilesystemQuery(query: string, home: string = realHomedir(), platform: NodeJS.Platform = process.platform): FilesystemQuery {
+  const problems = filesystemQueryProblems(query, home, platform);
   if (problems.length) throw new Error(`filesystem query rejected: ${problems.join("; ")}`);
   const doc = JSON.parse(query) as Record<string, unknown>;
-  const root = expandHome((doc.root as string).trim(), home)!;
+  const root = expandHome((doc.root as string).trim(), home, platform)!;
   const out: FilesystemQuery = {
     root,
     kind: doc.kind as FilesystemKind,

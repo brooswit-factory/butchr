@@ -39,6 +39,20 @@ describe("sessionDefinitionProblems", () => {
     expect(at("~/work")).toEqual([]);
     expect(at("/")).toEqual([]);
   });
+  // FACTORY-558: platform injected (never `process.platform`), so this runs on any OS.
+  test("platform: win32 — accepts a drive-letter or UNC workingDirectory, backslash or forward slash", () => {
+    const WIN_HOME = "C:\\Users\\bob";
+    const at = (workingDirectory: unknown) => sessionDefinitionProblems({ ...good(), workingDirectory }, "def", WIN_HOME, "win32");
+    expect(at("relative\\path")[0]).toContain("must be absolute");
+    expect(at("C:\\repo\\")[0]).toContain("trailing slash");
+    expect(at("~otheruser\\x")[0]).toContain("~user is not supported");
+    expect(at("~\\work")).toEqual([]);
+    expect(at("~/work")).toEqual([]);
+    expect(at("C:\\repo\\project")).toEqual([]);
+    expect(at("C:/repo/project")).toEqual([]);
+    expect(at("\\\\server\\share\\project")).toEqual([]);
+    expect(at("C:\\")).toEqual([]);
+  });
   test("brief: must be a non-empty string", () => {
     expect(sessionDefinitionProblems({ ...good(), brief: "" }, "def")).toEqual(['def.brief must be a non-empty string']);
     expect(sessionDefinitionProblems({ ...good(), brief: "   " }, "def")).toEqual(['def.brief must be a non-empty string']);

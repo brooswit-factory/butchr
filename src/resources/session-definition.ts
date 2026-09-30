@@ -17,7 +17,7 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { expandHome } from "./filesystem-query.js";
+import { expandHome, pathModuleFor } from "./filesystem-query.js";
 import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
 import { formatResourceRef, parseResourceRef } from "./resource-ref.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, type AgentEffort } from "./power-scale.js";
@@ -413,22 +413,32 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
 
-function workingDirectoryProblems(raw: unknown, home: string): string[] {
+/**
+ * Deliberately does NOT reuse `absolutePathProblems`'s "." / ".." segment
+ * check — unlike `filesystemQueryProblems.root`, `workingDirectory` never
+ * has, and this ticket (FACTORY-558) leaves that unchanged: only the
+ * platform-aware absolute-ness and trailing-separator checks are shared.
+ */
+function workingDirectoryProblems(raw: unknown, home: string, platform: NodeJS.Platform): string[] {
   if (typeof raw !== "string" || !raw.trim()) return ["workingDirectory must be a non-empty string"];
-  const expanded = expandHome(raw.trim(), home);
+  const expanded = expandHome(raw.trim(), home, platform);
   if (expanded === null) return [`workingDirectory "${raw}": ~user is not supported; use an absolute path`];
   if (expanded.includes("\0")) return [`workingDirectory "${raw}" contains a NUL byte`];
-  if (expanded[0] !== "/") return [`workingDirectory "${raw}" must be absolute (or start with ~)`];
-  if (expanded !== "/" && expanded.endsWith("/")) return [`workingDirectory "${raw}" must not have a trailing slash`];
+  const p = pathModuleFor(platform);
+  if (!p.isAbsolute(expanded)) return [`workingDirectory "${raw}" must be absolute (or start with ~)`];
+  const root = p.parse(expanded).root;
+  if (expanded === root) return [];
+  const trailingSepRe = platform === "win32" ? /[\\/]$/ : /\/$/;
+  if (trailingSepRe.test(expanded)) return [`workingDirectory "${raw}" must not have a trailing slash`];
   return [];
 }
 
 /** Why a session-definition document is unusable, or `[]`. Same "collect every problem, never touch disk" discipline as `filesystemQueryProblems`. */
-export function sessionDefinitionProblems(doc: unknown, at: string, home: string = homedir()): string[] {
+export function sessionDefinitionProblems(doc: unknown, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): string[] {
   if (!isObject(doc)) return [`${at} must be a JSON object`];
   const problems: string[] = [];
   for (const k of Object.keys(doc)) if (!DEFINITION_FIELDS.has(k)) problems.push(`${at} has unknown field "${k}"`);
-  problems.push(...workingDirectoryProblems(doc.workingDirectory, home).map((p) => `${at}.${p}`));
+  problems.push(...workingDirectoryProblems(doc.workingDirectory, home, platform).map((p) => `${at}.${p}`));
   if (!nonEmpty(doc.brief)) problems.push(`${at}.brief must be a non-empty string`);
   if (!oneOf(SESSION_DEFINITION_VENDORS, doc.vendor)) problems.push(`${at}.vendor must be one of ${SESSION_DEFINITION_VENDORS.join(", ")}`);
   // FACTORY-75: `tier` (deprecated) and `modelPower`+`effort` (the new
@@ -472,12 +482,12 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
 }
 
 /** Throws with every collected problem (see `sessionDefinitionProblems`) when the document is invalid. Callers pass the raw parsed JSON — `parseSessionDefinitionFile` below is the read+JSON.parse+validate convenience most callers actually want. */
-export function parseSessionDefinition(doc: unknown, at: string, home: string = homedir()): SessionDefinition {
-  const problems = sessionDefinitionProblems(doc, at, home);
+export function parseSessionDefinition(doc: unknown, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): SessionDefinition {
+  const problems = sessionDefinitionProblems(doc, at, home, platform);
   if (problems.length) throw new Error(problems.join("\n"));
   const d = doc as Record<string, unknown>;
   return {
-    workingDirectory: expandHome((d.workingDirectory as string).trim(), home)!,
+    workingDirectory: expandHome((d.workingDirectory as string).trim(), home, platform)!,
     brief: (d.brief as string).trim(),
     vendor: d.vendor as SessionDefinitionVendor,
     ...(d.tier !== undefined ? { tier: d.tier as SessionTier } : {}),
@@ -500,11 +510,11 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
 }
 
 /** Parses a definition file's raw text: JSON syntax errors are reported the same way `loadRules` reports a bad rules.json — one clear message, never a stack trace. */
-export function parseSessionDefinitionFile(text: string, at: string, home: string = homedir()): SessionDefinition {
+export function parseSessionDefinitionFile(text: string, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): SessionDefinition {
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${at}: invalid JSON: ${(e as Error).message}`); }
-  return parseSessionDefinition(doc, at, home);
+  return parseSessionDefinition(doc, at, home, platform);
 }
 
 export interface SessionDefinitionsEnv { [name: string]: string | undefined; BUTCHR_SESSION_DEFINITIONS_DIR?: string | undefined; XDG_CONFIG_HOME?: string | undefined; HOME?: string | undefined }

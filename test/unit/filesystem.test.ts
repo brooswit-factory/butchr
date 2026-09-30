@@ -60,6 +60,27 @@ describe("isFilesystemResourceId", () => {
     expect(Buffer.byteLength(encodeURIComponent(overLimit), "utf8")).toBe(MAX_ENCODED_SEGMENT_BYTES + 1);
     expect(isFilesystemResourceId(overLimit)).toBe(false);
   });
+
+  // FACTORY-558: platform injected (never `process.platform`), so these run on any OS.
+  describe("platform: win32", () => {
+    test("accepts a canonical drive-letter path, a UNC share, and their bare roots", () => {
+      for (const id of ["C:\\", "C:\\Users\\x", "C:\\Users\\x\\file.txt", "\\\\server\\share", "\\\\server\\share\\x"]) {
+        expect(isFilesystemResourceId(id, "win32")).toBe(true);
+      }
+    });
+    test("rejects a forward-slash spelling — exactly one canonical separator on Windows", () => {
+      expect(isFilesystemResourceId("C:/Users/x", "win32")).toBe(false);
+    });
+    test("rejects anything not absolute, or not canonical, same shape rules as POSIX", () => {
+      for (const id of ["", "C:foo", "relative\\path", "C:\\Users\\", "C:\\Users\\\\x", "C:\\Users\\.\\x", "C:\\Users\\..\\x", "C:\\a\0b"]) {
+        expect(isFilesystemResourceId(id, "win32")).toBe(false);
+      }
+    });
+    test("a POSIX-shaped id is rejected on win32, and vice versa — the two never overlap", () => {
+      expect(isFilesystemResourceId("/a/b", "win32")).toBe(false);
+      expect(isFilesystemResourceId("C:\\Users\\x", "linux")).toBe(false);
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -74,6 +95,16 @@ describe("expandHome", () => {
     expect(expandHome("/abs", HOME)).toBe("/abs");
     expect(expandHome("relative", HOME)).toBe("relative");
     expect(expandHome("~otheruser/x", HOME)).toBeNull();
+  });
+
+  // FACTORY-558: platform injected, so this runs on any OS.
+  test("platform: win32 — expands ~ against a drive-letter home, accepting both a ~\\ and a ~/ home form", () => {
+    const WIN_HOME = "C:\\Users\\bob";
+    expect(expandHome("~", WIN_HOME, "win32")).toBe(WIN_HOME);
+    expect(expandHome("~\\repo", WIN_HOME, "win32")).toBe(`${WIN_HOME}\\repo`);
+    expect(expandHome("~/repo", WIN_HOME, "win32")).toBe(`${WIN_HOME}/repo`);
+    expect(expandHome("C:\\abs", WIN_HOME, "win32")).toBe("C:\\abs");
+    expect(expandHome("~otheruser\\x", WIN_HOME, "win32")).toBeNull();
   });
 });
 
@@ -148,6 +179,25 @@ describe("filesystemQueryProblems", () => {
     const problems = filesystemQueryProblems(JSON.stringify({ root: "", kind: "bad", maxDepth: 0 }), HOME);
     expect(problems.length).toBeGreaterThanOrEqual(3);
   });
+
+  // FACTORY-558: platform injected (never `process.platform`), so these run on any OS — including the `windows` CI job.
+  describe("platform: win32", () => {
+    const WIN_HOME = "C:\\Users\\bob";
+    const at = (root: string) => filesystemQueryProblems(JSON.stringify({ root, kind: "file" }), WIN_HOME, "win32");
+
+    test("accepts a drive-letter root with backslash or forward slash, a UNC root, and a ~ home form", () => {
+      for (const root of ["C:\\Users\\bob\\work", "C:/Users/bob/work", "\\\\server\\share\\work", "~\\work", "~/work", "C:\\"]) {
+        expect(at(root)).toEqual([]);
+      }
+    });
+    test("rejects a relative path, a trailing separator (except a bare drive root), and . / .. segments", () => {
+      expect(at("relative\\path")[0]).toContain("must be absolute");
+      expect(at("C:\\Users\\bob\\")[0]).toContain("trailing slash");
+      expect(at("C:\\Users\\..\\bob")[0]).toContain('"." or ".." segments');
+      expect(at("C:\\Users\\.\\bob")[0]).toContain('"." or ".." segments');
+      expect(at("C:\\Users\\\\bob")[0]).toContain('"." or ".." segments');
+    });
+  });
 });
 
 describe("parseFilesystemQuery", () => {
@@ -161,6 +211,12 @@ describe("parseFilesystemQuery", () => {
   test("an explicit maxDepth and predicate are carried through unchanged", () => {
     const q = parseFilesystemQuery(JSON.stringify({ root: "/tmp", kind: "directory", maxDepth: 3, predicate: { predicateKind: "hasEntry", name: "README.md", entryKind: "file" } }), HOME);
     expect(q).toEqual({ root: "/tmp", kind: "directory", maxDepth: 3, predicate: { predicateKind: "hasEntry", name: "README.md", entryKind: "file" } });
+  });
+
+  test("platform: win32 — resolves ~ against a drive-letter home", () => {
+    const WIN_HOME = "C:\\Users\\bob";
+    const q = parseFilesystemQuery(JSON.stringify({ root: "~\\work", kind: "file" }), WIN_HOME, "win32");
+    expect(q).toEqual({ root: `${WIN_HOME}\\work`, kind: "file", maxDepth: MAX_ALLOWED_DEPTH });
   });
 });
 

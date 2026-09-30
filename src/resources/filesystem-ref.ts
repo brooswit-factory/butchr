@@ -26,7 +26,7 @@
  * are validated differently on purpose, and must not be merged into one
  * function just because they share a domain concept (a filesystem path).
  */
-import { posix } from "node:path";
+import { posix, win32 } from "node:path";
 
 export interface FilesystemRef {
   path: string;
@@ -94,14 +94,51 @@ export function parseFilesystemRef(input: string): FilesystemRef | null {
  * the old check could never have rejected an id this one wouldn't already
  * reject. `searchFilesystemRules` (src/rules/filesystem-type.ts) is what
  * SKIPS (never throws) a resource this predicate rejects, logging why once.
+ *
+ * FACTORY-558: `encodeURIComponent`'s OUTPUT is always plain ASCII (every
+ * escaped byte becomes three ASCII characters, `%XX`), so its UTF-8 byte
+ * length and its UTF-16 code-unit count are the same number — the 255 figure
+ * below is simultaneously Linux/macOS's `NAME_MAX` (255 BYTES) AND NTFS's own
+ * per-component limit (255 UTF-16 CODE UNITS/characters): one constant, two
+ * platforms, not a Linux-only number that happens to be reused. What this
+ * check does NOT cover, on either platform but only bites on Windows in
+ * practice: the OS's LIMIT ON THE FULL PATH (no analogous default cap on
+ * Linux; Windows' classic `MAX_PATH` is ~260 characters without long-path
+ * support) — a workspace nested deep enough can still exceed that even when
+ * every individual component, this one included, is well under 255. Tracked
+ * as a follow-up, not fixed here.
  */
 export const MAX_ENCODED_SEGMENT_BYTES = 255;
 
-export function isFilesystemResourceId(id: string): boolean {
-  if (!id || id.includes("\0")) return false;
+function isPosixFilesystemResourceId(id: string): boolean {
   if (id === "/") return true;
   if (id[0] !== "/" || id.endsWith("/")) return false;
   const segments = id.slice(1).split("/");
-  if (!segments.every((s) => s !== "" && s !== "." && s !== "..")) return false;
+  return segments.every((s) => s !== "" && s !== "." && s !== "..");
+}
+
+/**
+ * FACTORY-558: the canonical Windows form is backslash-separated (matching
+ * `realpath`'s own native output there — see this file's own top comment on
+ * why a resource id must be exactly one spelling per real path), so a `/`
+ * anywhere in `id` is rejected outright rather than treated as an alternate
+ * separator. Accepts both a drive-letter root (`C:\`) and a UNC share root
+ * (`\\server\share`), same "bare root is valid, is not itself later reported
+ * as a resource" parity `isPosixFilesystemResourceId` gives `/`.
+ */
+function isWindowsFilesystemResourceId(id: string): boolean {
+  if (id.includes("/")) return false;
+  if (!win32.isAbsolute(id)) return false;
+  const root = win32.parse(id).root;
+  if (id === root) return true;
+  if (id.endsWith("\\")) return false;
+  const segments = id.slice(root.length).split("\\");
+  return segments.every((s) => s !== "" && s !== "." && s !== "..");
+}
+
+export function isFilesystemResourceId(id: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (!id || id.includes("\0")) return false;
+  const shapeOk = platform === "win32" ? isWindowsFilesystemResourceId(id) : isPosixFilesystemResourceId(id);
+  if (!shapeOk) return false;
   return Buffer.byteLength(encodeURIComponent(id), "utf8") <= MAX_ENCODED_SEGMENT_BYTES;
 }
