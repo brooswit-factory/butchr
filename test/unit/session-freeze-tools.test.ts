@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type { ToolDef } from "@brooswit/thatch";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../../src/rules/session-definition-type.js";
@@ -29,7 +29,7 @@ function fakeStore(initial: Record<string, boolean> = {}): SessionFreezeStore {
 /** In-memory definitions directory: `files` maps path -> raw JSON text, mutable so a freeze/unfreeze rewrite is observable. */
 function fakeDeps(files: Record<string, string>, store: SessionFreezeStore = fakeStore()): SessionFreezeToolDeps & { files: Record<string, string> } {
   const list = async (_q: FilesystemQuery): Promise<FilesystemResource[]> =>
-    Object.keys(files).map((path) => ({ path, kind: "file" as const, name: path.split("/").pop()!, size: 10, mtimeMs: 1 }));
+    Object.keys(files).map((path) => ({ path, kind: "file" as const, name: basename(path), size: 10, mtimeMs: 1 }));
   const read = async (path: string): Promise<string> => {
     if (!(path in files)) throw Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
     return files[path]!;

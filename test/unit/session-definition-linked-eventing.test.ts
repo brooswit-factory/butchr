@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { basename } from "node:path";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import type { NotifyReason } from "../../src/resources/types.js";
 import { createLinkedEventingState, type LinkedEventingDeps, type ProjectLinkedEventingMatch } from "../../src/jira-watch/linked-eventing.js";
@@ -26,7 +27,7 @@ import { absPath } from "../helpers/abs-path";
 
 const ref = (s: string): ResourceRef => parseResourceRef(s);
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
-  ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
+  ({ path, kind: "file", name: basename(path), size: 10, mtimeMs: 1000, ...over });
 const goodDef = (over: Record<string, unknown> = {}) => ({
   workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID } from "../../src/rules/session-definition-type.js";
 import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
@@ -13,7 +13,7 @@ import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 import { absPath } from "../helpers/abs-path";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
-  ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
+  ({ path, kind: "file", name: basename(path), size: 10, mtimeMs: 1000, ...over });
 
 const goodDef = (over: Record<string, unknown> = {}) => ({
   workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,

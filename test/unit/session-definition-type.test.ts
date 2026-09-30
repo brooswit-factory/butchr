@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { basename } from "node:path";
 import type { Herd } from "../../src/agents/herd.js";
 import type { SpawnSpec } from "../../src/agents/workspace.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
@@ -19,7 +20,7 @@ import { createAdmissionController } from "../../src/agents/admission.js";
 import { absPath } from "../helpers/abs-path";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
-  ({ path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over });
+  ({ path, kind: "file", name: basename(path), size: 10, mtimeMs: 1000, ...over });
 
 /** A minimal valid definition body, as it would be written to a *.json file. */
 const goodDef = (over: Record<string, unknown> = {}) => ({
