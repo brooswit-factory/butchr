@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { hostname } from "node:os";
 import type { BuildIdentity } from "../../src/agents/build-identity.js";
 import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
-import { currentSystemdInfo, deriveGroundTruth, groundTruthText, parseCgroup } from "../../src/agents/ground-truth.js";
+import { currentSystemdInfo, deriveGroundTruth, groundTruthText, parseCgroup, parseWindowsTaskEnv } from "../../src/agents/ground-truth.js";
 
 // groundTruthText's build/currency params are exercised in depth by
 // test/unit/build-currency.test.ts (both the pure resolver and the
@@ -34,6 +34,34 @@ describe("parseCgroup", () => {
   test("no *.service component at all: honest 'none', not a default", () => {
     const info = parseCgroup("0::/");
     expect(info).toEqual({ kind: "none" });
+  });
+});
+
+describe("parseWindowsTaskEnv (FACTORY-560)", () => {
+  test("both vars present: windows-task, unit is the task name, journalctl-slot names the log file", () => {
+    const info = parseWindowsTaskEnv({ BUTCHR_WINDOWS_TASK_NAME: "Butchr-Native", BUTCHR_WINDOWS_LOG_FILE: "C:\\Users\\broos\\AppData\\Local\\butchr\\logs\\butchr.log" });
+    expect(info.kind).toBe("windows-task");
+    if (info.kind === "windows-task") {
+      expect(info.unit).toBe("Butchr-Native");
+      expect(info.journalctl).toContain("C:\\Users\\broos\\AppData\\Local\\butchr\\logs\\butchr.log");
+      expect(info.journalctl).toContain("Get-Content");
+    }
+  });
+
+  test("missing task name: honest 'none', never a guessed task", () => {
+    expect(parseWindowsTaskEnv({ BUTCHR_WINDOWS_LOG_FILE: "C:\\logs\\butchr.log" })).toEqual({ kind: "none" });
+  });
+
+  test("missing log file: honest 'none', never a guessed path", () => {
+    expect(parseWindowsTaskEnv({ BUTCHR_WINDOWS_TASK_NAME: "Butchr-Native" })).toEqual({ kind: "none" });
+  });
+
+  test("blank/whitespace-only values are treated as absent, not a literal blank task/log", () => {
+    expect(parseWindowsTaskEnv({ BUTCHR_WINDOWS_TASK_NAME: "   ", BUTCHR_WINDOWS_LOG_FILE: "C:\\logs\\butchr.log" })).toEqual({ kind: "none" });
+  });
+
+  test("neither var set (an ordinary hand-started daemon on Windows): none", () => {
+    expect(parseWindowsTaskEnv({})).toEqual({ kind: "none" });
   });
 });
 
@@ -126,6 +154,23 @@ describe("groundTruthText", () => {
     expect(text).toContain("currency: UNKNOWN");
     expect(text).toContain("git not on PATH");
     expect(text).not.toContain("currency: CURRENT");
+  });
+
+  // FACTORY-560: a windows-task daemon has no systemd unit and no journalctl
+  // — this pins the relabeled lines, and that every OTHER kind (including
+  // "none", covered by the two tests above) keeps its original label text
+  // unchanged, so nothing that pins "systemd unit:"/"journalctl:" verbatim
+  // breaks just because this kind was added.
+  test("windows-task: the task name and a log-reading command are named under their own labels, never 'systemd unit'/'journalctl'", () => {
+    const text = groundTruthText(
+      { hostname: "zippy", port: 7717, pid: 4242, systemd: { kind: "windows-task", unit: "Butchr-Native", journalctl: 'Get-Content -Path "C:\\Users\\broos\\AppData\\Local\\butchr\\logs\\butchr.log" -Tail 200 -Wait' }, measuredAt: "2026-09-02T05:19:06.000Z" },
+      FIXTURE_BUILD,
+      FIXTURE_CURRENCY,
+    );
+    expect(text).toContain("scheduled task: Butchr-Native");
+    expect(text).toContain("diagnostics: Get-Content");
+    expect(text).toContain("butchr.log");
+    expect(text).not.toContain("systemd unit: Butchr-Native");
   });
 
   test("speaks in the first person about THIS daemon, never 'the fleet' or 'the deploy' (Requirement 3)", () => {

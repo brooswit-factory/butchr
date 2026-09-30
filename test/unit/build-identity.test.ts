@@ -186,6 +186,25 @@ describe("toBuildReport", () => {
     });
   });
 
+  // FACTORY-560: windows-task carries `unit`/`journalctl` the same shape as
+  // "user"/"system" (see ground-truth.ts's SystemdInfo doc comment) — this
+  // pins that toBuildReport needs no windows-task-specific branch to flatten
+  // it correctly.
+  test("windows-task: flattens the task name and log-diagnostics command the same way a systemd unit's fields flatten", () => {
+    const report = toBuildReport({
+      sha: "a".repeat(40),
+      shaProvenance: "baked",
+      shaDirty: false,
+      shaUnknownReason: null,
+      version: "1.2.3",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      pid: 4242,
+      systemd: { kind: "windows-task", unit: "Butchr-Native", journalctl: 'Get-Content -Path "C:\\logs\\butchr.log" -Tail 200 -Wait' },
+    });
+    expect(report.unit).toBe("Butchr-Native");
+    expect(report.journalctl).toContain("Get-Content");
+  });
+
   test("not under systemd: honest (none) unit and an empty journalctl command, never a guess", () => {
     const report = toBuildReport({
       sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no git",
