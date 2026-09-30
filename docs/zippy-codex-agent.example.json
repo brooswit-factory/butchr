@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "id": "runeleague-tasks",
+      "enabled": false,
+      "resourceProvider": "jira-work",
+      "query": "project = GK AND labels = runeleague AND issuetype = Task AND status IN (\"In Progress\", \"In Review\")",
+      "brief": "@builtin:task",
+      "agentPreferences": [{ "harness": "codex" }],
+      "permissionMode": "bypassPermissions"
+    }
+  ]
+}
