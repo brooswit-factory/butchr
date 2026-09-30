@@ -344,10 +344,25 @@ const legacyLeaf = (resourceId: string): string => encodeURIComponent(resourceId
  * pre-Addendum herdr-LABEL sanitization this ticket's own leaf naming does
  * NOT reuse — none of those are rewritten; the leaf is either the provider's
  * real short id, verbatim, or (on failure here) `legacyLeaf` above.
+ *
+ * FACTORY-570: `:` and `\` are additionally rejected on `platform: "win32"`
+ * — both are valid single-path-segment bytes on POSIX (kept permissive
+ * there, unchanged), but `\` is Windows's own separator and `:` is reserved
+ * for a drive letter, so a short id built from a Windows path that leaks
+ * either (e.g. `managedSessionShortDisplayId` misreading a backslash-joined
+ * path as if it had no separator at all) must fall back to `legacyLeaf`'s
+ * flat, fully percent-encoded slug rather than being joined verbatim — that
+ * literal join is exactly what produced this ticket's own `ENOENT: mkdir
+ * 'C:\...\filesystem\managed-sessions\C:\Users\...'` failure: Windows read
+ * the embedded drive letter and separators as real path structure. `platform`
+ * defaults to `process.platform`, injectable so this and every caller below
+ * can be exercised for both platforms from any host, same discipline as
+ * FACTORY-558's `isFilesystemResourceId`.
  */
-export function isValidLeaf(leaf: string): boolean {
+export function isValidLeaf(leaf: string, platform: NodeJS.Platform = process.platform): boolean {
   if (leaf.length === 0 || leaf === "." || leaf === "..") return false;
   if (leaf.includes("/") || leaf.includes("\0")) return false;
+  if (platform === "win32" && (leaf.includes(":") || leaf.includes("\\"))) return false;
   return Buffer.byteLength(leaf, "utf8") <= MAX_ENCODED_SEGMENT_BYTES;
 }
 
@@ -362,10 +377,10 @@ export function isValidLeaf(leaf: string): boolean {
  * nothing to disambiguate and nothing to stamp — the pre-existing
  * segment-decode path in `agentIdOfWorkspacePath` already recognises it.
  */
-function candidateLeaf(decoded: AgentKeyParts): { leaf: string; changed: boolean } {
+function candidateLeaf(decoded: AgentKeyParts, platform: NodeJS.Platform = process.platform): { leaf: string; changed: boolean } {
   const legacy = legacyLeaf(decoded.resourceId);
   const short = shortDisplayId(decoded.resourceProvider, decoded.ruleId, decoded.resourceId);
-  const leaf = isValidLeaf(short) ? short : legacy;
+  const leaf = isValidLeaf(short, platform) ? short : legacy;
   return { leaf, changed: leaf !== legacy };
 }
 
@@ -434,13 +449,13 @@ function slugCollides(candidateDir: string, root: string): boolean {
  *      loud log line.
  * Never mutates anything — a handful of reads, never a write.
  */
-export function newLayoutDirFor(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function newLayoutDirFor(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   // Not a rule-engine key at all, or a query-level key (Addendum A1: query agents keep their pre-FACTORY-118 leaf unchanged) — same fixed shape either way.
   if (!decoded || decoded.kind === "query") return join(root, ...id.split(SEGMENT_SEP));
 
   const ruleDir = join(root, decoded.resourceProvider, decoded.ruleId);
-  const { leaf, changed } = candidateLeaf(decoded);
+  const { leaf, changed } = candidateLeaf(decoded, platform);
   if (!changed) return join(ruleDir, leaf); // identity short id — always equals the legacy path; see candidateLeaf's own doc comment
 
   const bareDir = join(ruleDir, leaf);
@@ -485,11 +500,11 @@ const SEGMENT_SEP = ":";
  *      `ensureWorkspaceDir` below ever turns this into a real, stamped
  *      directory — this function itself never creates or writes anything.
  */
-export function workspaceDirFor(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function workspaceDirFor(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   if (!decoded) return join(root, id); // legacy/bare id — unchanged
 
-  const target = newLayoutDirFor(id, root);
+  const target = newLayoutDirFor(id, root, platform);
   if (readBookkeptAgentKey(target) === id) return target;
 
   const oldDir = join(root, ...id.split(SEGMENT_SEP));
@@ -526,8 +541,8 @@ export function workspaceDirFor(id: string, root: string = workspaceRoot()): str
  * write with nothing to show for it (the pre-existing segment-decode path in
  * `agentIdOfWorkspacePath` already recognises this exact directory).
  */
-export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function ensureWorkspaceDir(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   // Computed BEFORE `mkdirSync` below creates anything: `newLayoutDirFor`'s
   // own A4 slug-collision/A3 occupied-bare-name checks read what currently
   // EXISTS on disk, so evaluating it after this call's own `mkdirSync` would
@@ -535,8 +550,8 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // "occupied by someone else" and wrongly suffix itself — caught by
   // `workspace.test.ts`'s own "spec.cwd does NOT redirect buildWorkspace"
   // case before this ever shipped.
-  const target = decoded ? newLayoutDirFor(id, root) : null;
-  const dir = workspaceDirFor(id, root);
+  const target = decoded ? newLayoutDirFor(id, root, platform) : null;
+  const dir = workspaceDirFor(id, root, platform);
   mkdirSync(dir, { recursive: true });
   // FACTORY-118: stamp ONLY when `dir` is actually the NEW-layout location —
   // never the pre-migration three-deep one `workspaceDirFor` can also
@@ -554,7 +569,7 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // moved (`candidateLeaf`'s own `changed` flag) — see this function's own
   // doc comment for why an identity-short-id provider or a query-level key
   // must see no write at all.
-  const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded).changed;
+  const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded, platform).changed;
   // Compares against `target` (computed BEFORE `mkdirSync` above) — never a
   // fresh `newLayoutDirFor(id, root)` call here, which would see this call's
   // own just-created, not-yet-stamped directory as "occupied by someone
@@ -587,7 +602,7 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
  * rule loop's `ownsId` is what keeps it from ever stopping or adopting
  * them.
  */
-export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
+export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string | null {
   if (!cwd) return null;
   const rel = relative(root, cwd);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
@@ -608,17 +623,17 @@ export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: str
   // "belongs to another key", and never a duplicate spawn.
   const stamped = readBookkeptAgentKey(join(root, provider, ruleId, leaf));
   if (stamped) {
-    const decoded = decodeAgentKey(stamped);
-    if (decoded && decoded.resourceProvider === provider && decoded.ruleId === ruleId && legitimateLeafFor(decoded, leaf)) return stamped;
+    const decoded = decodeAgentKey(stamped, platform);
+    if (decoded && decoded.resourceProvider === provider && decoded.ruleId === ruleId && legitimateLeafFor(decoded, leaf, platform)) return stamped;
   }
   const key = segments.join(SEGMENT_SEP);
-  return decodeAnyAgentKey(key) ? key : null;
+  return decodeAnyAgentKey(key, platform) ? key : null;
 }
 
 /** Addendum A6's own validity check — see `agentIdOfWorkspacePath`'s doc comment for why this exists. */
-function legitimateLeafFor(decoded: AgentKeyParts, leaf: string): boolean {
+function legitimateLeafFor(decoded: AgentKeyParts, leaf: string, platform: NodeJS.Platform = process.platform): boolean {
   const key = encodeAgentKey(decoded);
-  const { leaf: shortLeaf, changed } = candidateLeaf(decoded);
+  const { leaf: shortLeaf, changed } = candidateLeaf(decoded, platform);
   if (!changed) return leaf === shortLeaf; // identity short id — the only legitimate leaf equals the (unchanged) legacy one too
   return leaf === shortLeaf || leaf === `${shortLeaf}-${collisionSuffix(key)}` || leaf === legacyLeaf(decoded.resourceId);
 }
@@ -657,9 +672,9 @@ export function workspaceDirsForResource(resourceProvider: ResourceProvider, res
  * query-level agent's workspace too (BUTCHR-397): it needs the same pane
  * care as any other rule-engine agent.
  */
-export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
-  const id = agentIdOfWorkspacePath(cwd, root);
-  return id && decodeAnyAgentKey(id) ? id : null;
+export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string | null {
+  const id = agentIdOfWorkspacePath(cwd, root, platform);
+  return id && decodeAnyAgentKey(id, platform) ? id : null;
 }
 
 /** The resource (Jira key) a herd id works: the decoded resource of an agent key, else the id itself. */

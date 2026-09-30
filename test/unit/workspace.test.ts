@@ -129,6 +129,92 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
   });
 });
 
+// FACTORY-570: on win32 a managed-session definition's resourceId is a
+// backslash-separated, drive-lettered Windows path
+// (`C:\Users\broos\...\codex-test.json`) — `managedSessionShortDisplayId`
+// (src/rules/session-definition-type.ts) looks for the LAST `/` to find the
+// bare definition name, finds none, and returns almost the whole raw path as
+// its "short id". Before this ticket, `isValidLeaf` accepted that string
+// verbatim (it only ever rejected `/`, never `:`/`\`), so it was joined
+// straight onto the workspace root — exactly the shape of butchr's own
+// reported failure: `ENOENT: no such file or directory, mkdir
+// 'C:\Users\broos\butchr-workspaces\filesystem\managed-sessions\C:\Users\broos\...'`.
+// `platform` is always injected here (never left at the suite's real
+// `process.platform`) so every case below runs, and proves the SAME thing,
+// on any CI host — including the `windows` job, where the injected value and
+// the real one now agree.
+describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspace leaf — never the raw drive path", () => {
+  const WIN_ROOT = "C:\\Users\\broos\\butchr-workspaces";
+  const WIN_RESOURCE_ID = "C:\\Users\\broos\\butchr\\config\\session-definitions\\codex-test.json";
+
+  test("isValidLeaf: `:` and `\\` are rejected on platform win32 (the hostile shape managedSessionShortDisplayId can produce for a Windows path), but stay valid on posix — Addendum A2's own permissive half, unchanged", () => {
+    // Unchanged, default-platform (posix in this suite) behaviour — the
+    // existing Addendum A2 pin above already covers `isValidLeaf(":")` at
+    // the default, but restated here as the explicit contrast this ticket's
+    // own fix depends on: same string, opposite verdict, platform-gated.
+    expect(isValidLeaf(":", "linux")).toBe(true);
+    expect(isValidLeaf(":", "win32")).toBe(false);
+    expect(isValidLeaf("\\", "linux")).toBe(true);
+    expect(isValidLeaf("\\", "win32")).toBe(false);
+    expect(isValidLeaf(WIN_RESOURCE_ID, "win32")).toBe(false); // the exact hostile "short id" shape this ticket fixes
+    expect(isValidLeaf("codex-test", "win32")).toBe(true); // an ordinary bare name is still fine on win32
+  });
+
+  test("newLayoutDirFor: a managed-session Windows resourceId falls back to the flat, fully percent-encoded legacy leaf — never the raw drive path with its `:`/`\\` intact", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+    const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
+    const leaf = dir.split(/[\\/]/).pop()!; // last path segment, either separator (this host's real path.join picks one)
+    expect(leaf).toBe(encodeURIComponent(WIN_RESOURCE_ID));
+    expect(leaf.includes(":")).toBe(false);
+    expect(leaf.includes("\\")).toBe(false);
+    expect(leaf.includes("/")).toBe(false);
+  });
+
+  test("UNC ids get the same flat treatment as a drive-letter id", () => {
+    const uncId = "\\\\server\\share\\defs\\x.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
+    const leaf = dir.split(/[\\/]/).pop()!;
+    expect(leaf).toBe(encodeURIComponent(uncId));
+    expect(leaf.includes(":")).toBe(false);
+    expect(leaf.includes("\\")).toBe(false);
+  });
+
+  test("round trip holds on win32: encode -> workspaceDirFor -> agentIdOfWorkspacePath decodes back to the exact original key, for a drive-letter id", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+    const dir = workspaceDirFor(key, WIN_ROOT, "win32");
+    expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
+  });
+
+  test("round trip holds on win32 for a UNC id too", () => {
+    const uncId = "\\\\server\\share\\defs\\x.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const dir = workspaceDirFor(key, WIN_ROOT, "win32");
+    expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
+  });
+
+  test("posix behaviour is byte-identical: a managed session still gets its short, bare definition name, never the flat encoded slug", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/brooswit/.config/butchr/session-definitions/admin-assembly.json" });
+    expect(workspaceDirFor(key, "/root/butchr-workspaces")).toBe("/root/butchr-workspaces/filesystem/managed-sessions/admin-assembly");
+  });
+
+  test("real mkdir + rmdir under a temp root: ensureWorkspaceDir actually creates the leaf this fix computes, and the created directory's own basename carries no `:`/`\\`/`/` — the assertion the windows CI job proves on real NTFS, since there `platform: win32` is also this run's real `process.platform`", () => {
+    const root = mkdtempSync(join(tmpdir(), "butchr-570-mkdir-"));
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+      const dir = ensureWorkspaceDir(key, root, "win32");
+      expect(existsSync(dir)).toBe(true);
+      const basename = dir.split(/[\\/]/).pop()!;
+      expect(basename.includes(":")).toBe(false);
+      expect(basename.includes("\\")).toBe(false);
+      expect(basename.includes("/")).toBe(false);
+      expect(basename).toBe(encodeURIComponent(WIN_RESOURCE_ID));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("workspace identity", () => {
   test("AGY writes cwd bridge identity and AGENTS.md while retaining existing work", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
