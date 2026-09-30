@@ -29,8 +29,9 @@ Root directory Unity Hub installs Editors under. Default:
 C:\Program Files\Unity\Hub\Editor.
 
 .PARAMETER LicenseFile
-Path Unity's own per-machine `.ulf` activation is expected at. Default:
-C:\ProgramData\Unity\config\Unity_lic.ulf. This script only checks
+Path(s) Unity's own per-machine `.ulf` activation is expected at. Default:
+C:\ProgramData\Unity\Unity_lic.ulf (what Unity Hub writes on a personal
+activation, per GameCI's docs) or the config\ variant. This script only checks
 existence — it never opens or prints this file.
 
 .EXAMPLE
@@ -43,7 +44,7 @@ existence — it never opens or prints this file.
 param(
     [string]$UnityVersion = "6000.0.20f1",
     [string]$HubEditorRoot = "C:\Program Files\Unity\Hub\Editor",
-    [string]$LicenseFile = "C:\ProgramData\Unity\config\Unity_lic.ulf"
+    [string[]]$LicenseFile = @("C:\ProgramData\Unity\Unity_lic.ulf", "C:\ProgramData\Unity\config\Unity_lic.ulf")
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,10 +80,11 @@ if (Test-Path $webglModule) {
 }
 
 # 3. License activation file (existence only — never opened)
-if (Test-Path $LicenseFile) {
-    Write-Host "[ok]      license file present ($LicenseFile) — presence only, not validated as a working activation"
+$licenseFound = $LicenseFile | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($licenseFound) {
+    Write-Host "[ok]      license file present ($licenseFound) — presence only, not validated as a working activation"
 } else {
-    Write-Host "[missing] license file not found at $LicenseFile — see docs/windows-native-host.md section 2 (needs Brooswit's UNITY_PASSWORD; not scriptable end-to-end)"
+    Write-Host "[missing] license file not found at $($LicenseFile -join ' or ') — see docs/windows-native-host.md section 2 (needs Brooswit's UNITY_PASSWORD; not scriptable end-to-end)"
     $missing += "unity-license"
 }
 

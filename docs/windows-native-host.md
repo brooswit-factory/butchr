@@ -270,15 +270,15 @@ into chat.** Per GK-8's own comment thread: a Unity Personal entitlement
 (`UnityEntitlementLicense.xml`) already exists on zippy from prior manual
 Editor use, but that XML is **not** the `.ulf` format a scripted/CI
 activation needs — generating the actual `.ulf` requires Unity Hub's own
-`Preferences > Licenses > Add` flow (or `Unity.exe -batchmode -nographics
--quit -username <email> -password <password> -serial <serial-if-Pro>
--createManualActivationFile`, which produces an `.alf` a human then
-uploads at https://license.unity3d.com/manual to get back the `.ulf` —
-Unity's own documented manual-activation flow for a machine without
-interactive browser access; this repo has not exercised it).
+`Preferences > Licenses > Add > Get a free personal license` flow (click Add
+even if Hub already shows a licence: Hub can show one without writing the
+file). The manual `.alf` route (`-createManualActivationFile`, upload at
+https://license.unity3d.com/manual) is NOT supported for Unity Personal per
+the Unity 6 manual; GameCI documents only an unverified browser dev-tools
+workaround for it. Never put the password on a command line.
 
 Once obtained, the `.ulf` goes at Unity's own default per-machine license
-location — `C:\ProgramData\Unity\config\Unity_lic.ulf` — **never** inside
+location — `C:\ProgramData\Unity\Unity_lic.ulf` (the script also accepts the `config\` variant) — **never** inside
 this repo or `%USERPROFILE%\butchr*`. `scripts/windows-host/verify-unity-build-env.ps1`
 checks for its presence at that path (existence only — it never reads or
 prints license content) and reports missing/present, nothing more.
