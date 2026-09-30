@@ -204,22 +204,40 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-      // FACTORY-577: an EXPLICIT `spec.permissionMode` picks the Codex launch
-      // mode directly and wins over every other signal below, in both
-      // directions — `"bypassPermissions"` => the bypass flag (set true
-      // explicitly, rather than resting on drovr's own `!== false` default,
-      // so the intent is legible here and in a test's assertion); any other
-      // explicit mode (`"default"`/`"acceptEdits"`/`"plan"`/`"auto"`) =>
-      // manual. ABSENT `spec.permissionMode` falls through to today's
-      // pre-existing rule, unchanged: `spec.lizardMode` is Codex's own
-      // "manual approval mode" launch signal (the Codex counterpart of
-      // Claude's `permissionMode: "default"` — Codex has no `permissionMode`
-      // concept of its own) — omitting the bypass flag is what lets the
-      // daemon's permission-answer timer's `autoAnswerCodexApprovals` pass
-      // (src/agents/permission-answer-loop.ts) ever see a pending dialog to
-      // answer at all (a bypassed launch shows none) — ORed with the
-      // pre-existing unconditional jira-project case (a freeform project
-      // manager's own always-manual review mode, unrelated to lizardMode).
+      // FACTORY-577: today's rule is THREE cases, in precedence order:
+      //   1. an EXPLICIT `spec.permissionMode` wins outright, in both
+      //      directions, over everything below — `"bypassPermissions"` =>
+      //      the bypass flag (set true explicitly, rather than resting on
+      //      drovr's own `!== false` default, so the intent is legible here
+      //      and in a test's assertion); any other explicit mode
+      //      (`"default"`/`"acceptEdits"`/`"plan"`/`"auto"`) => manual.
+      //   2. ABSENT `spec.permissionMode`: the pre-existing unconditional
+      //      jira-project case (a freeform project manager's own
+      //      always-manual review mode) => manual.
+      //   3. ABSENT `spec.permissionMode`, not jira-project: `spec.lizardMode`
+      //      is Codex's own "manual approval mode" launch signal (FACTORY-108
+      //      — the Codex counterpart of Claude's `permissionMode: "default"`,
+      //      Codex has no `permissionMode` concept of its own) — omitting the
+      //      bypass flag is what lets the daemon's permission-answer timer's
+      //      `autoAnswerCodexApprovals` pass (src/agents/permission-answer-loop.ts)
+      //      ever see a pending dialog to answer at all (a bypassed launch
+      //      shows none) — truthy => manual.
+      // DELIBERATE SELF-CONTRADICTION, case 1 over case 3: a managed-session
+      // definition can set `permissionMode: "bypassPermissions"` AND
+      // `lizardMode: true` at once (`specForSessionDefinition` forwards
+      // `lizardMode` for `vendor: "codex"` independently of the required
+      // `permissionMode` field — src/rules/session-definition-type.ts). Case
+      // 1 wins, so that pane launches bypassed — no approval dialog EVER
+      // appears, which makes `lizardMode`'s auto-answering dead code for it.
+      // This is intentional (FACTORY-577 decision, not an oversight): an
+      // explicit `permissionMode` is a stronger, launch-time-legible signal
+      // than `lizardMode`'s own manual-mode side effect, and a definition
+      // author who sets both has asked for two contradictory things — YOLO
+      // wins because it is the more specific, more recently-stated intent.
+      // If a future story wants `lizardMode: true` to instead force manual
+      // even over an explicit `bypassPermissions`, that is a precedence
+      // change to make deliberately here, not something to fall out of
+      // reordering this conditional.
       ...(spec.permissionMode !== undefined
         ? { bypassApprovalsAndSandbox: spec.permissionMode === "bypassPermissions" }
         : decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode
