@@ -45,26 +45,25 @@ export type AgentHarness = (typeof AGENT_HARNESSES)[number];
 export { AGENT_EFFORTS, type AgentEffort };
 /**
  * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
- * Claude permission-mode values `SessionDefinition.permissionMode` accepts
+ * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
  * an INDEPENDENT copy here rather than imported: that module already imports
  * `ExecutionMode`/`AccountPolicy`/`AgentRole`/`McpServerBinding` FROM this
  * file, so importing its `SESSION_PERMISSION_MODES` back would cycle this
- * file with it. Claude-only, like `SessionDefinition.permissionMode` —
- * silently never forwarded to a Codex or Agy launch (`agentLaunchConfig`,
- * src/agents/argv.ts, only ever reads `spec.permissionMode` on its Claude
- * branch). Unlike `SessionDefinition`, a `Rule` has no single fixed `vendor`
- * to validate this against — `agentPreferences` is a ranked FALLBACK list,
- * not one committed choice, and the harness an individual agent actually
- * gets is a runtime decision (`src/agents/herd.ts`) no validator here can
- * see — so there is deliberately no Codex-vendor rejection for this field: a
- * rule that falls back to Codex/Agy for one launch simply gets the same
- * silent no-op an absent `permissionMode` already gives that branch today —
- * the same "no rejection, validated-but-silently-unforwarded" treatment
- * `SessionDefinition.permissionMode` itself gets for a `vendor: "codex"`
- * definition (only `SessionDefinition.strictMcpConfig` is HARD-rejected
- * there — see that field's own doc comment). `Rule.lizardMode` below is a
- * DIFFERENT case as of FACTORY-108 — see its own doc comment.
+ * file with it. FACTORY-577: no longer Claude-only — `agentLaunchConfig`
+ * (src/agents/argv.ts) reads `spec.permissionMode` on its Codex branch too
+ * now (mapped onto `bypassApprovalsAndSandbox`), same as `permissionMode`'s
+ * own doc comment there. Still silently never forwarded to an Agy launch
+ * (that branch never reads it at all). Unlike `SessionDefinition`, a `Rule`
+ * has no single fixed `vendor` to validate this against — `agentPreferences`
+ * is a ranked FALLBACK list, not one committed choice, and the harness an
+ * individual agent actually gets is a runtime decision (`src/agents/herd.ts`)
+ * no validator here can see — so there is deliberately no Codex-vendor
+ * rejection for this field: a rule that falls back to Codex now gets the
+ * SAME explicit mapping a Claude launch gets (no longer a silent no-op),
+ * and a rule that falls back to Agy still gets the same silent no-op an
+ * absent `permissionMode` always gave that branch. `Rule.lizardMode` below
+ * is a DIFFERENT case as of FACTORY-108 — see its own doc comment.
  */
 export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
@@ -323,10 +322,14 @@ export interface Rule {
    */
   linkedDescriptionLinks?: boolean;
   /**
-   * FACTORY-87 — Claude `--permission-mode` for agents THIS rule launches,
+   * FACTORY-87 — the permission mode for agents THIS rule launches,
    * forwarded to `SpawnSpec.permissionMode` by every `specFor*` builder
    * (`specForMatch`/`specForRuleQuery`, `specForProject`,
    * `specForGithubIssue*`, `specForGithubPr*`, `specForFilesystem*`).
+   * Originally Claude's own `--permission-mode` only; FACTORY-577: also
+   * reaches a Codex-resolved launch now (mapped onto
+   * `bypassApprovalsAndSandbox` — see `RULE_PERMISSION_MODES`'s own doc
+   * comment above and `agentLaunchConfig`'s Codex branch, src/agents/argv.ts).
    * `src/agents/workspace.ts`'s persist-at-spawn/read-back stale-argv pair
    * (FACTORY-43) already reads `spec.permissionMode` generically for every
    * provider, not just managed sessions, so no new wiring is needed there —
@@ -372,22 +375,26 @@ export interface Rule {
    * it to its own live state) as `rule.lizardMode !== false`, regardless of
    * vendor — unchanged by FACTORY-108.
    *
-   * FACTORY-108: UNLIKE `permissionMode` above, and unlike scanning
-   * eligibility just described, this field is ALSO forwarded onto
-   * `SpawnSpec.lizardMode` by every `specFor*` builder (the same ones
-   * `permissionMode` threads through) — but there ONLY on an EXPLICIT `true`
-   * (`rule.lizardMode ? { lizardMode: true } : {}`), never merely-absent —
-   * so a Codex-resolved launch (`agentLaunchConfig`'s Codex branch,
-   * src/agents/argv.ts) can read it and drop
+   * FACTORY-108: unlike scanning eligibility just described, this field is
+   * ALSO forwarded onto `SpawnSpec.lizardMode` by every `specFor*` builder
+   * (the same ones `permissionMode` threads through) — but there ONLY on an
+   * EXPLICIT `true` (`rule.lizardMode ? { lizardMode: true } : {}`), never
+   * merely-absent — so a Codex-resolved launch (`agentLaunchConfig`'s Codex
+   * branch, src/agents/argv.ts) can read it and drop
    * `--dangerously-bypass-approvals-and-sandbox` only when a rule opted in
-   * explicitly. See `SpawnSpec.lizardMode`'s own doc comment
-   * (src/agents/workspace.ts) for the full contract, including the
-   * FACTORY-43-style persist-at-spawn/read-back stale-argv pair this now
-   * rides generically (nothing rule-specific was added for it). A Claude- or
-   * Agy-resolved launch still ignores it completely (neither branch of
-   * `agentLaunchConfig` reads `spec.lizardMode`), so the scanning-eligibility
-   * paragraph above remains the whole story for those two vendors — only a
-   * Codex fallback is new territory.
+   * explicitly, and only when `permissionMode` above is itself absent —
+   * FACTORY-577: `permissionMode`, when set, now ALSO reaches a Codex
+   * launch (mapped onto `bypassApprovalsAndSandbox`, same as it always has
+   * for Claude's own launch mode — see that field's own doc comment above)
+   * and wins over this field, in both directions. See `SpawnSpec.lizardMode`'s
+   * own doc comment (src/agents/workspace.ts) for the full contract,
+   * including the FACTORY-43-style persist-at-spawn/read-back stale-argv
+   * pair this now rides generically (nothing rule-specific was added for
+   * it). A Claude- or Agy-resolved launch still ignores THIS field
+   * completely (neither branch of `agentLaunchConfig` reads
+   * `spec.lizardMode`), so the scanning-eligibility paragraph above remains
+   * the whole story for those two vendors — only a Codex fallback is new
+   * territory.
    *
    * **Deliberate rule-side asymmetry (story decision, FACTORY-106/FACTORY-324):**
    * a rule-launched Codex agent with `lizardMode` merely ABSENT is "eligible"

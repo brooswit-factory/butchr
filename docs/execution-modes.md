@@ -177,11 +177,17 @@ hard-reject `lizardMode: true`/an explicit `permissionMode` for `vendor:
 ranked FALLBACK list (see "The vendor selector" below), and which harness an
 individual launch actually gets is a runtime decision no validator here can
 see. Both fields are therefore accepted unconditionally at the schema level;
-for a launch that happens to land on Codex or Agy, `permissionMode` is
-silently never forwarded (`agentLaunchConfig` only reads it on the Claude
-branch, the same silent-ignore precedent an absent `permissionMode` already
-has today) and `lizardMode` is silently inert (drovr's Claude-specific dialog
-recognition never matches a non-Claude pane) — never a validation error.
+FACTORY-577: for a launch that lands on Codex, `permissionMode` now IS
+forwarded (`agentLaunchConfig`'s Codex branch maps it onto
+`bypassApprovalsAndSandbox`, same as `SessionDefinition.permissionMode` —
+see docs/managed-sessions.md's "Per-vendor launch differences") — only an
+Agy-resolved launch still silently drops it (that branch never reads
+`permissionMode` at all). `lizardMode` is still silently inert for Codex
+only when `permissionMode` is itself absent from that spec (drovr's own
+Codex approval-answering has nothing to answer once the bypass flag is
+dropped) and inert outright for Agy (drovr's Claude-specific dialog
+recognition never matches a non-Claude pane) — never a validation error
+either way.
 
 **Absent means unchanged, verified.** A rules document that sets neither
 field loads and behaves byte-for-byte as before this ticket — no new key on

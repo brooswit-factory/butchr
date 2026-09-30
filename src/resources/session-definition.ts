@@ -29,13 +29,18 @@ export type SessionDefinitionVendor = (typeof SESSION_DEFINITION_VENDORS)[number
 /**
  * Permission modes a managed session may launch under. `"auto"` is the
  * ticket's own named case — "permission mode, including `auto` with a
- * strict MCP config" (BUTCHR-393/BUTCHR-408) — carried through verbatim to
- * `SpawnSpec.permissionMode` -> Drovr's `ClaudeAgentLaunch.permissionMode`
- * (untyped string there; validated here so a typo fails at load time, not
- * at launch). Codex has no `permissionMode` concept in
- * `CodexAgentLaunch` (its own `trustWorkspace`/`bypassApprovalsAndSandbox`
- * fields instead) — see docs/managed-sessions.md's "Per-vendor launch
- * differences" for what that means for a `vendor: "codex"` definition.
+ * strict MCP config" (BUTCHR-393/BUTCHR-408) — carried through to
+ * `SpawnSpec.permissionMode` (validated here so a typo fails at load time,
+ * not at launch), and from there to EITHER vendor's launch, per
+ * `agentLaunchConfig` (src/agents/argv.ts): verbatim to Drovr's
+ * `ClaudeAgentLaunch.permissionMode` for Claude, or (FACTORY-577) mapped
+ * onto `CodexAgentLaunch.bypassApprovalsAndSandbox` for Codex — Codex still
+ * has no `permissionMode` field of its own (its own
+ * `trustWorkspace`/`bypassApprovalsAndSandbox` fields instead), so
+ * `"bypassPermissions"` maps to `bypassApprovalsAndSandbox: true` and every
+ * other value here maps to `false` — see docs/managed-sessions.md's
+ * "Per-vendor launch differences" for the full mapping and what it means
+ * for a `vendor: "codex"` definition.
  */
 export const SESSION_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
@@ -247,9 +252,16 @@ export interface SessionDefinition {
    * `definition.lizardMode` is truthy, and `agentLaunchConfig`'s Codex branch
    * (src/agents/argv.ts) reads it to decide whether to omit
    * `--dangerously-bypass-approvals-and-sandbox` — Codex's own "manual
-   * approval mode" pairing, replacing the `permissionMode: "default"`
-   * pairing Claude uses (Codex has no `permissionMode` concept). This DOES
-   * need FACTORY-43's persist-at-spawn/read-back stale-argv pair, same shape
+   * approval mode" signal, the same shape `permissionMode: "default"`
+   * pairs with for Claude. **FACTORY-577: this is no longer the only signal
+   * a Codex launch reads** — a `codex` definition's own (required)
+   * `permissionMode` field now ALSO reaches the launch (mapped onto
+   * `bypassApprovalsAndSandbox` the same way it is for Claude's
+   * `--permission-mode`; see `SESSION_PERMISSION_MODES`'s own doc comment
+   * above), and an explicit `permissionMode` wins over this field, in both
+   * directions, exactly like it already won over the pre-existing
+   * `jira-project` rule default. This DOES still need FACTORY-43's
+   * persist-at-spawn/read-back stale-argv pair, same shape
    * as `permissionMode`/`strictMcpConfig` (`.butchr-lizard-mode.json`,
    * `workspaceLizardMode`, src/agents/workspace.ts) — see
    * `docs/permission-answer-loop.md`'s "Codex lizard mode" section for the
