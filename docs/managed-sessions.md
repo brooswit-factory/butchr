@@ -68,8 +68,8 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
 | `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
-| `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
-| `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
+| `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim; FACTORY-577: also mapped onto a Codex launch's `bypassApprovalsAndSandbox` (see "Per-vendor launch differences"). |
+| `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `lizardMode` | no | DROVR-42/FACTORY-67/FACTORY-138/FACTORY-108. Boolean, accepted at manifest load for BOTH vendors (no vendor rejection here, unlike `strictMcpConfig`, which is still rejected for `vendor: "codex"`). Absent → ELIGIBLE for a `vendor: "claude"` definition (the FACTORY-138 default, `lizardMode ?? (vendor === "claude")`); a `vendor: "codex"` definition stays NOT eligible when absent — the default applies to Claude only. Explicit `false` always means never scanned or touched, for either vendor. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **For `vendor: "claude"`:** never reaches `SpawnSpec` or the launched process's argv, whether from an explicit `true` or the FACTORY-138 default — read live, every poll, by the daemon's separate permission-answer timer. **For `vendor: "codex"` (FACTORY-108):** the opposite — only an EXPLICIT `true` reaches `SpawnSpec.lizardMode` and the launch argv (dropping `--dangerously-bypass-approvals-and-sandbox` so drovr's Codex approval-answering has a dialog to see); since Codex is never eligible by default, there is no default-driven argv change to worry about. See "Codex support" below for the full asymmetry. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
@@ -1123,7 +1123,12 @@ mechanism too" above) DOES reach `SpawnSpec.lizardMode` and the launch argv:
 or sets it explicitly `false`, launches exactly as it does today (bypass
 flag present); a rule- or eligibility-level DEFAULT resolving to `true` (see
 below) never by itself changes this — only the raw, explicit field read at
-launch-config time does.
+launch-config time does. FACTORY-577: all of the above is the `lizardMode`
+story ONLY when `permissionMode` is absent from that same launch spec — an
+explicit `permissionMode` (required on every `SessionDefinition`, so this
+absent case is rule-engine/jira agents only for a managed session) wins
+over `lizardMode` here too, in both directions; see "Per-vendor launch
+differences" below for the `permissionMode` mapping itself.
 
 **The flag choice is coupled to the captured fixture set, not a general
 policy choice.** drovr's Codex prompt recognition was measured against
@@ -1275,42 +1280,60 @@ manifest-load time, not at spawn time) — **including `"bypassPermissions"`**,
 which is honoured exactly as written, with no additional gate: a definition
 file is operator-authored config (the same trust level as `rules.json`
 itself), so a `bypassPermissions` manifest is presumed deliberate, same as
-every other field here. **Codex** has no `permissionMode`
-concept in `CodexAgentLaunch` (its own `trustWorkspace`/
-`bypassApprovalsAndSandbox` fields instead) — a `vendor: "codex"`
-definition's `permissionMode` is validated and stored like any other, but
-is simply not forwarded to a Codex launch. Building Codex-specific
-permission wiring is out of scope for this ticket.
+every other field here. **Codex** has no `permissionMode` field of its own
+in `CodexAgentLaunch` (its own `trustWorkspace`/`bypassApprovalsAndSandbox`
+fields instead) — but (FACTORY-577) `agentLaunchConfig`'s Codex branch
+(`src/agents/argv.ts`) now MAPS a definition's `permissionMode` onto
+`bypassApprovalsAndSandbox`: `"bypassPermissions"` => `true` (the bypass
+flag present — YOLO); any other value (`"default"`/`"acceptEdits"`/
+`"plan"`/`"auto"`) => `false` (manual approval). Since `permissionMode` is a
+REQUIRED field on every `SessionDefinition` (`sessionDefinitionProblems`
+rejects it absent), this means **every existing `vendor: "codex"` managed
+session that does not literally say `permissionMode: "bypassPermissions"`
+flips from unattended (bypass) to manual approval the moment this ships** —
+audit your manifests before upgrading if you have Codex managed sessions
+relying on the old silently-ignored behaviour. An explicit `permissionMode`
+also wins over both the `jira-project` rule-engine default and `lizardMode`
+below, in both directions — see "Lizard mode" below for how the two
+interact.
 
 `strictMcpConfig` reaches a **Claude** launch's `ClaudeAgentLaunch.strictMcpConfig`
 verbatim (Drovr >= 0.14.0, `@brooswit/drovr`; also validated at our layer —
 a non-boolean value fails at manifest-load time). **Codex** has no
-strict-MCP-config concept either, but is treated DIFFERENTLY from
-`permissionMode` above: a `vendor: "codex"` definition setting
+strict-MCP-config concept either: a `vendor: "codex"` definition setting
 `strictMcpConfig` (to any value, including `false`) is **REJECTED at
 manifest load** (`sessionDefinitionProblems`,
 `src/resources/session-definition.ts`) rather than silently validated,
-stored, and dropped. This is a deliberate departure from `permissionMode`'s
-own precedent, not an oversight: a silently-ignored `permissionMode` leaves
-a Codex operator with a cosmetic surprise (their manifest's wish is a
-no-op), but a silently-ignored `strictMcpConfig` would leave them believing
-they have an MCP-isolation security property they do not — the exact
+stored, and dropped. This is deliberate, not an oversight: a
+silently-ignored `strictMcpConfig` would leave an operator believing they
+have an MCP-isolation security property they do not — the exact
 silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
-first place. `test/unit/session-definition.test.ts` proves the rejection.
+first place. (`permissionMode` used to be cited here as this field's
+silent-ignore precedent; FACTORY-577 removed that precedent — see
+`permissionMode` above, which is no longer silently dropped for Codex
+either — so `strictMcpConfig`'s REJECT-at-load behaviour now stands on its
+own reasoning rather than by contrast.) `test/unit/session-definition.test.ts`
+proves the rejection.
 
-`lizardMode` is **NOT** `strictMcpConfig`'s precedent (FACTORY-108,
-superseding an earlier draft of this doc that said otherwise): a
-`vendor: "codex"` definition CAN set `lizardMode` — it is validated and
-stored like any other field, never rejected at manifest load. An explicit
-`true` reaches `SpawnSpec.lizardMode` and, via `agentLaunchConfig`'s Codex
-branch (`src/agents/argv.ts`), drops `--dangerously-bypass-approvals-and-sandbox`
-from the launch argv so drovr's Codex approval-answering (its own
-Codex-specific dialog recognition, not `classifyPermissionPrompt`, which
-stays Claude-only) has a dialog to see and answer. See the "Codex
-eligibility for SCANNING vs. LAUNCH" table above for the full
-absent/`true`/`false` matrix, which differs from `permissionMode`'s
-Claude-only default specifically because Codex's own launch condition is
-explicit-`true`-only, not "absent means eligible".
+`lizardMode`: a `vendor: "codex"` definition CAN set `lizardMode` — it is
+validated and stored like any other field, never rejected at manifest load.
+An explicit `true` reaches `SpawnSpec.lizardMode` and, via
+`agentLaunchConfig`'s Codex branch (`src/agents/argv.ts`), drops
+`--dangerously-bypass-approvals-and-sandbox` from the launch argv — but
+ONLY when the same definition's `permissionMode` is absent from the spec at
+that point (never true for a `SessionDefinition`, since `permissionMode` is
+required there; this absent case is for rule-engine/jira agents, which
+never set `spec.permissionMode`) — so drovr's Codex approval-answering (its
+own Codex-specific dialog recognition, not `classifyPermissionPrompt`,
+which stays Claude-only) has a dialog to see and answer. FACTORY-577: an
+explicit `permissionMode` wins over `lizardMode` in both directions —
+`permissionMode: "bypassPermissions"` still bypasses even with
+`lizardMode: true` set, and any other explicit `permissionMode` still means
+manual even with `lizardMode` absent/`false`. See the "Codex eligibility
+for SCANNING vs. LAUNCH" table above for the full absent/`true`/`false`
+matrix for SCANNING eligibility specifically, which is unaffected by any of
+this — `permissionMode` only ever changes LAUNCH argv, never scanning
+eligibility.
 
 ## Not in this version
 

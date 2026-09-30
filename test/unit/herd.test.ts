@@ -1042,6 +1042,38 @@ describe("staleIssues", () => {
     }
   });
 
+  // FACTORY-577/Correction 3: `checkManagedAgentArgv`'s bypass-flag
+  // comparison is one-directional (the whole block is gated behind
+  // `if (expected.includes(bypassFlag))`), so only manual -> YOLO is
+  // detectable in butchr today. This test proves that ONE direction for
+  // spec.permissionMode (as opposed to lizardMode, covered above); the
+  // opposite direction (YOLO -> manual) is NOT achievable here and is
+  // deliberately not asserted as if it respawned — see FACTORY-578's PR
+  // body/comment for the drovr ticket filed against the missing half.
+  test("FACTORY-577: a managed-session CODEX agent's definition changing permissionMode from manual to bypassPermissions (persisted at build time) IS flagged stale and respawns to pick up the bypass flag", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-toggle-to-bypass-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const cwd = ensureWorkspaceDir(key);
+      // The definition has just been edited to permissionMode: "bypassPermissions", and the daemon persisted that at the last managed-sessions poll...
+      writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("bypassPermissions"));
+      // ...but the agent itself is still the one running from BEFORE the edit — launched manual, no bypass flag.
+      const stillManualArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, permissionMode: "default" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillManualArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("FACTORY-108: a RULE-launched (non-managed-session) CODEX agent with lizardMode: true persisted is likewise honoured, not flagged stale for lacking the bypass flag — the persist/read-back path is not managed-session-only", async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
     const { tmpdir } = require("node:os") as typeof import("node:os");

@@ -204,16 +204,27 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-      // FACTORY-108: `spec.lizardMode` is Codex's own "manual approval mode"
-      // launch signal (the Codex counterpart of Claude's `permissionMode:
-      // "default"` — Codex has no `permissionMode` concept) — omitting the
-      // bypass flag is what lets the daemon's permission-answer timer's
-      // `autoAnswerCodexApprovals` pass (src/agents/permission-answer-loop.ts)
-      // ever see a pending dialog to answer at all (a bypassed launch shows
-      // none). ORed with the pre-existing unconditional jira-project case
-      // (a freeform project manager's own always-manual review mode,
-      // unrelated to lizardMode).
-      ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode ? {bypassApprovalsAndSandbox:false}: {}),
+      // FACTORY-577: an EXPLICIT `spec.permissionMode` picks the Codex launch
+      // mode directly and wins over every other signal below, in both
+      // directions — `"bypassPermissions"` => the bypass flag (set true
+      // explicitly, rather than resting on drovr's own `!== false` default,
+      // so the intent is legible here and in a test's assertion); any other
+      // explicit mode (`"default"`/`"acceptEdits"`/`"plan"`/`"auto"`) =>
+      // manual. ABSENT `spec.permissionMode` falls through to today's
+      // pre-existing rule, unchanged: `spec.lizardMode` is Codex's own
+      // "manual approval mode" launch signal (the Codex counterpart of
+      // Claude's `permissionMode: "default"` — Codex has no `permissionMode`
+      // concept of its own) — omitting the bypass flag is what lets the
+      // daemon's permission-answer timer's `autoAnswerCodexApprovals` pass
+      // (src/agents/permission-answer-loop.ts) ever see a pending dialog to
+      // answer at all (a bypassed launch shows none) — ORed with the
+      // pre-existing unconditional jira-project case (a freeform project
+      // manager's own always-manual review mode, unrelated to lizardMode).
+      ...(spec.permissionMode !== undefined
+        ? { bypassApprovalsAndSandbox: spec.permissionMode === "bypassPermissions" }
+        : decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode
+          ? { bypassApprovalsAndSandbox: false }
+          : {}),
       mcpServers: [
         {
           name: "butchr",

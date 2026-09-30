@@ -391,6 +391,76 @@ describe("FACTORY-108: codex lizard mode — manual-approval launch", () => {
   });
 });
 
+describe("FACTORY-577: codex spec.permissionMode honored", () => {
+  const BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+  const NON_BYPASS_MODES = SESSION_PERMISSION_MODES.filter((m) => m !== "bypassPermissions");
+
+  test('explicit "bypassPermissions" => codex launch has the bypass flag, bypassApprovalsAndSandbox true explicitly', () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(true);
+  });
+
+  test.each(NON_BYPASS_MODES)('explicit permissionMode %s => manual, bypass flag absent', (mode) => {
+    const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: mode }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
+  // Absent spec.permissionMode falls through to today's pre-existing rule
+  // exactly: unchanged for a jira-project-keyed agent (manual), a plain rule
+  // agent (bypass), and a non-jira-project resourceProvider key (bypass) —
+  // this case can never fire for a managed session (permissionMode is a
+  // required field there), only for rule-engine/jira agents.
+  test("absent permissionMode: jira-project-keyed agent stays manual, unchanged", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+  });
+
+  test("absent permissionMode: plain rule agent stays bypassed, unchanged", () => {
+    const args = spawnArgs(spec, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  test("absent permissionMode: a non-jira-project resourceProvider key stays bypassed, unchanged", () => {
+    const triage = { key: "jira-work:triage:KAN-1", issuetype: "Task", summary: "s", parent: null };
+    const args = spawnArgs(triage, "/w/KAN-1", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  // PRECEDENCE, both directions: an explicit permissionMode on a
+  // jira-project-keyed agent overrides the jira-project manual default.
+  test('explicit "bypassPermissions" on a jira-project agent overrides the jira-project manual default', () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "bypassPermissions" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  test('explicit "default" on a jira-project agent still yields manual (same as the default, redundantly)', () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "default" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+  });
+
+  // PRECEDENCE over lizardMode too: an explicit permissionMode wins even
+  // when spec.lizardMode independently asks for manual approval.
+  test('explicit "bypassPermissions" overrides lizardMode: true', () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions", lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  // Claude-path behavior is untouched by this fix: FACTORY-138's own
+  // default/precedence tests above already pin that; this just re-confirms
+  // spec.permissionMode still flows straight through unmodified for Claude.
+  test("Claude launch argv is unaffected by this fix", () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+  });
+});
+
 // FACTORY-314 (PR #513 review fix): `--resume` — appended ONLY by
 // `agentStartParams()`/`spawnArgs()`, and ONLY when `agent.resumeSessionId`
 // is set (`HerdrHerd.resumeInPlace()`'s own caller). A fresh Claude launch

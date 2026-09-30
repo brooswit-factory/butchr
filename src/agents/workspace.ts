@@ -125,9 +125,9 @@ export interface SpawnSpec {
    * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
    */
   cwd?: string;
-  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means `agentLaunchConfig` applies ITS OWN default (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, or `"auto"` for a `jira-project` agent) rather than sending nothing — see that function's own doc comment; FACTORY-138 changed this from "no flag sent, Drovr's own bypassPermissions fallback applies" to an explicit butchr-owned default. */
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). For Claude, absent means `agentLaunchConfig` applies ITS OWN default (`DEFAULT_PERMISSION_MODE`, `acceptEdits`) rather than sending nothing — see that function's own doc comment; FACTORY-138 changed this from "no flag sent, Drovr's own bypassPermissions fallback applies" to an explicit butchr-owned default. FACTORY-577: for Codex, `CodexAgentLaunch` still has no `permissionMode` field of its own, but `agentLaunchConfig`'s Codex branch now reads this field too, mapping it onto `bypassApprovalsAndSandbox` (`"bypassPermissions"` => `true`, any other explicit value => `false`) — no longer Claude only. Absent means unchanged pre-FACTORY-577 behaviour: the `jira-project`/`lizardMode` default (see that function's own doc comment). */
   permissionMode?: string;
-  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
+  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only — Codex has no strict-MCP-config concept, so a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts). FACTORY-577: `permissionMode` is no longer this field's silent-ignore precedent — it is now forwarded to a Codex launch too (see that field's own doc comment above) — so this field's REJECT-at-load behaviour stands on its own: a silently-ignored `strictMcpConfig` would leave an operator believing they have an MCP-isolation property they don't, which is worse than a silently-ignored knob and is why this one rejects instead of ignoring. Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
   strictMcpConfig?: boolean;
   /**
    * FACTORY-108: Codex's own "lizard mode" launch signal — the Codex twin of
@@ -135,9 +135,11 @@ export interface SpawnSpec {
    * (which stay daemon-side-only for CLAUDE, per those fields' own doc
    * comments). `agentLaunchConfig`'s Codex branch (src/agents/argv.ts) reads
    * this to omit `--dangerously-bypass-approvals-and-sandbox` (Codex's manual
-   * approval mode) when true — Codex has no `permissionMode` concept, so
-   * there is nothing else on `SpawnSpec` a Codex launch could pair its own
-   * lizard mode with. Ignored entirely by the Claude and Agy branches of
+   * approval mode) when true, but ONLY when `spec.permissionMode` is absent
+   * — FACTORY-577: an explicit `spec.permissionMode` now wins over this
+   * field entirely, in both directions (see `permissionMode`'s own doc
+   * comment above), the same way it already won over the pre-existing
+   * `jira-project` default. Ignored entirely by the Claude and Agy branches of
    * `agentLaunchConfig` — present or absent, neither launch's argv changes,
    * so a `specForSessionDefinition`/rule-engine caller may set this
    * unconditionally without knowing which vendor a launch will ultimately
