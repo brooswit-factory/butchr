@@ -130,14 +130,24 @@ function summaryOf(issue: unknown): string | undefined {
 
 /**
  * An Epic's children are Stories, a Story's children are Tasks. A Task is
- * the bottom of the hierarchy — no child type. A Bug is a BOSS, the same
- * tier as an Epic (FACTORY-37/FACTORY-39): it triages and creates Stories
- * for the fix rather than fixing the code itself, so it gets the identical
- * "Story" child type an Epic gets — never a new tier, never a new child
- * shape, just another caller type landing on the same row Epic already
- * occupies.
+ * the bottom of the hierarchy — no child type. A Bug is a BOSS
+ * (FACTORY-37/FACTORY-39): it triages and creates work for the fix rather
+ * than fixing the code itself.
+ *
+ * FACTORY-437: a Bug's child is an EPIC, not a Story — this is a deliberate
+ * DEPARTURE from Bug simply reusing Epic's own row, not a continuation of
+ * it. Reason: this Jira instance's native `parent` field is structurally
+ * Epic-only-as-parent (setting a Story's `parent` to a Bug, or a Task's to a
+ * Story, both fail live with "Given parent work item does not belong to
+ * appropriate hierarchy") — under the old Bug -> Story mapping, everything
+ * under a Bug could only ever carry butchr's own Implements link, never a
+ * native parent. Routing a Bug's fix chain through an Epic first means the
+ * Stories/Tasks under THAT Epic can carry a real native `parent`, closing
+ * that gap for the whole tree at once. Bugs themselves stay parentless
+ * top-level triage roots — that part is unchanged. Epic -> Story and Story
+ * -> Task inference are ALSO unchanged.
  */
-const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Task", Bug: "Story" };
+const CHILD_TYPE: Record<string, "Story" | "Task" | "Epic"> = { Epic: "Story", Story: "Task", Bug: "Epic" };
 
 // ---------------------------------------------------------------------------
 // BUTCHR-244: what a disposition write DOES and DOES NOT establish.
@@ -619,7 +629,17 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
       : `new_worker: ${callerKey}'s issue type ("${callerType ?? "unknown"}") has no defined child type — new_worker can only be called by an Epic or a Story`;
     throw new Refusal(msg);
   }
-  const role = childType === "Story" ? roles.story : roles.task;
+  // FACTORY-437: childType is now "Story" | "Task" | "Epic" (a Bug caller
+  // produces an Epic) — the Epic branch is staffed from `roles.epic`, the
+  // SAME role variable `newProjectWorker` below already uses to staff an
+  // Epic a PROJECT caller creates (BUTCHR-71). This deliberately does NOT
+  // follow jira_create_issue's own convention for a directly-created Epic
+  // ("caller-supplied assignee, or none — Epics are the human's") — that
+  // convention describes a DIFFERENT tool with no role map behind it at
+  // all; new_worker/newProjectWorker already staff an Epic by role
+  // uniformly, and this stays consistent with that existing precedent
+  // rather than introducing a second, divergent Epic-staffing rule.
+  const role = childType === "Story" ? roles.story : childType === "Task" ? roles.task : roles.epic;
   if (!role) throw new Refusal(noRoleMsg("new_worker", childType));
   const projectKey = projectKeyOf(callerIssue);
   if (!projectKey) throw new Refusal(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);

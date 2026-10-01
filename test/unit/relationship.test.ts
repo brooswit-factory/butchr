@@ -242,21 +242,31 @@ describe("newWorker: inference", () => {
     expect(child.assignee).toBe(ROLES.task);
   });
 
-  // FACTORY-39 (FACTORY-37): a Bug is a BOSS, the same tier as an Epic — it
-  // creates Stories for the fix rather than fixing the code itself, so it
-  // gets the identical grant an Epic caller gets here, never a new shape.
-  test("Bug caller -> Story child, staffed by roles.story (FACTORY-39: Bug is a boss, mirrors Epic)", async () => {
+  // FACTORY-437: a Bug is a BOSS, the same tier as an Epic (FACTORY-37/
+  // FACTORY-39) — but its own child is now an EPIC, not a Story, so that
+  // ticket's whole fix chain (the Epic's own Stories/Tasks) can carry a
+  // native Jira `parent` field, which this instance refuses for anything
+  // parented under a Bug directly.
+  test("Bug caller -> Epic child, staffed by roles.epic (FACTORY-437: Bug's fix chain now roots at an Epic, not a Story)", async () => {
     const { ops, addIssue, issues, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
     addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" });
     const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
     const child = issues.get(result.key)!;
-    expect(child.issuetype).toBe("Story");
-    expect(child.assignee).toBe(ROLES.story);
-    // The Story carries the Implements link back to the Bug — findBossKey
+    expect(child.issuetype).toBe("Epic");
+    expect(child.assignee).toBe(ROLES.epic);
+    // The Epic carries the Implements link back to the Bug — findBossKey
     // reads `bossKey`, set on the CHILD (from), never on the caller (to).
     expect(child.bossKey).toBe("BUTCHR-1");
     expect(result.implements).toBe("BUTCHR-1");
+  });
+
+  test("Bug caller with roles.epic unset refuses, naming BUTCHR_ASSIGNEE_EPIC (not BUTCHR_ASSIGNEE_STORY)", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" });
+    const { epic, ...rolesWithoutEpic } = ROLES;
+    await expect(newWorker(ops, rolesWithoutEpic, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } }))
+      .rejects.toThrow(/BUTCHR_ASSIGNEE_EPIC/);
   });
 
   test("Task caller REFUSES with a message that explains itself in words, not a type/enum error", async () => {
@@ -2545,20 +2555,22 @@ describe("newWorker: tier-identity collision (BUTCHR-110/S1, issue caller)", () 
 
   // FACTORY-39: a Bug caller has NO role variable at all (a Bug's assignee
   // is whoever the bug was filed to, never daemon-staffed) — this must say
-  // so honestly, never claim BUTCHR_ASSIGNEE_EPIC governs it (the wrong-
-  // variable failure this collision machinery's own doc comment warns
-  // against, just for the new tier this ticket adds).
-  test("Bug caller whose OWN assignee equals roles.story: identityCollision names the bug tier honestly (no role variable), never BUTCHR_ASSIGNEE_EPIC", async () => {
+  // so honestly. FACTORY-437: the Bug's own CHILD is now an Epic, so the
+  // variable that genuinely governs the collision is BUTCHR_ASSIGNEE_EPIC —
+  // asserting against BUTCHR_ASSIGNEE_STORY here would itself be the
+  // wrong-variable failure this collision machinery's own doc comment warns
+  // against, just pointed at the pre-FACTORY-437 child tier.
+  test("Bug caller whose OWN assignee equals roles.epic: identityCollision names the bug tier honestly (no role variable) and BUTCHR_ASSIGNEE_EPIC as the child's real governing var", async () => {
     const { ops, addIssue, issues, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR", assignee: ROLES.story });
+    addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR", assignee: ROLES.epic });
     const result = await newWorker(ops, ROLES, "BUTCHR-1", { summary: "s", disposition: { kind: "start" } });
     expect(result.identityCollision).toBeDefined();
     expect(result.identityCollision).toContain("bug tier");
     expect(result.identityCollision).toContain("no role variable");
-    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_STORY");
-    expect(result.identityCollision).not.toContain("BUTCHR_ASSIGNEE_EPIC");
-    expect(result.identityCollision).toContain(ROLES.story);
+    expect(result.identityCollision).toContain("BUTCHR_ASSIGNEE_EPIC");
+    expect(result.identityCollision).not.toContain("BUTCHR_ASSIGNEE_STORY");
+    expect(result.identityCollision).toContain(ROLES.epic);
   });
 
   test("non-collision: caller's own assignee differs from the child's role — no identityCollision, no comment, nothing added to the result", async () => {
