@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { ApiError } from "confluence.js/core";
 import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
@@ -9,18 +8,12 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
  * across calls in a way the simple call-recording `rig()` in tools.test.ts
  * isn't built for — this fake exists for that reason, not as a second
  * version of that one. Everything docs.ts doesn't touch (search, addComment,
- * …) is stubbed since it's never called. `createPageWithLabel`/
- * `getChildPages`/`getPageLabels` remain on this fake even though nothing in
- * docs.ts calls them anymore post-FACTORY-86 (they backed `ensureDoc`'s
- * retired creation path) — kept only because they're still part of the
- * `AtlassianOps` interface every fake must implement in full.
+ * …) is stubbed since it's never called.
  */
-function makeWorld(opts: { childPageSize?: number } = {}) {
-  const childPageSize = opts.childPageSize ?? 50;
+function makeWorld() {
   const issues = new Map<string, { summary: string; bossKey?: string; remoteLink?: { title: string; url: string } }>();
-  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
+  const pages = new Map<string, { title: string; body: string; version: number }>();
   const projectProperties = new Map<string, unknown>();
-  let nextId = 100;
   let upsertRemoteLinkCalls = 0;
 
   function addIssue(key: string, summary: string, bossKey?: string) {
@@ -89,24 +82,6 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
       issue.remoteLink = { ...object };
       return { id: 1 };
     },
-    getChildPages: async (parentId: string, cursor?: string) => {
-      const all = [...pages.entries()].filter(([, p]) => p.parentId === parentId).map(([id]) => id);
-      const start = cursor ? Number(cursor) : 0;
-      const slice = all.slice(start, start + childPageSize);
-      const nextIndex = start + childPageSize;
-      return {
-        results: slice.map((id) => ({ id, title: pages.get(id)!.title })),
-        ...(nextIndex < all.length ? { nextCursor: String(nextIndex) } : {}),
-      };
-    },
-    getPageLabels: async (pageId: string) => pages.get(pageId)?.labels ?? [],
-    createPageWithLabel: async (p) => {
-      const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
-      if (titleTaken) throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
-      const id = String(nextId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-      return { id, title: p.title, url: pageUrl(id) };
-    },
   commentOnPage: async () => ({ ok: true }),
   getPageComments: async () => ({ results: [] }),
   searchProjects: async () => ({ values: [] }),
@@ -126,7 +101,7 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
    * that needs a pre-existing doc to write into.
    */
   function seedIssueDoc(key: string, id: string, title: string, body: string, version = 1) {
-    pages.set(id, { parentId: "", title, body, labels: [], version });
+    pages.set(id, { title, body, version });
     const issue = issues.get(key);
     if (!issue) throw new Error(`fake world: no such issue ${key} — call addIssue first`);
     issue.remoteLink = { title, url: pageUrl(id) };
@@ -468,24 +443,15 @@ describe("docs.ts: findDoc — never creates, links, or infers a space/parent (F
     await expect(findDoc(ops, "not-a-key")).rejects.toThrow(/not a valid Jira key/);
   });
 
-  test("never calls createPageWithLabel/getChildPages/getPageLabels/upsertRemoteLink — the retired creation machinery is never reached", async () => {
+  test("never calls upsertRemoteLink — the retired creation machinery is never reached", async () => {
     const { ops, addIssue } = makeWorld();
     addIssue("BUTCHR-51", "instrumented");
-    let createCalled = false;
-    let childPagesCalled = false;
-    let pageLabelsCalled = false;
     let upsertCalled = false;
     const instrumentedOps: AtlassianOps = {
       ...ops,
-      createPageWithLabel: async (p) => { createCalled = true; return ops.createPageWithLabel(p); },
-      getChildPages: async (id, cursor) => { childPagesCalled = true; return ops.getChildPages(id, cursor); },
-      getPageLabels: async (id) => { pageLabelsCalled = true; return ops.getPageLabels(id); },
       upsertRemoteLink: async (key, globalId, relationship, object) => { upsertCalled = true; return ops.upsertRemoteLink(key, globalId, relationship, object); },
     };
     await findDoc(instrumentedOps, "BUTCHR-51");
-    expect(createCalled).toBe(false);
-    expect(childPagesCalled).toBe(false);
-    expect(pageLabelsCalled).toBe(false);
     expect(upsertCalled).toBe(false);
   });
 });
@@ -583,11 +549,11 @@ describe("docs.ts: set_doc — never creates; refuses a ticket with no doc (FACT
 // fresh per-ticket page, already has a real title from provisioning).
 // ---------------------------------------------------------------------------
 describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Contract 1)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
+  function seedRootDoc(pages: Map<string, { title: string; body: string; version: number }>, id: string, title: string, body: string) {
     // A project's root doc is provisioned AHEAD OF TIME (BUTCHR-62's doc: six
     // product projects + ASSIST already carry one) — seeded directly here,
     // never via ensureDoc, matching that reality.
-    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
+    pages.set(id, { title, body, version: 1 });
   }
 
   test("resolves the project's root doc via the EXISTING entity-property reader — same shape ensureDoc already reads, no second reader", async () => {
@@ -670,8 +636,8 @@ describe("docs.ts: projectRootDoc / getProjectDoc / setProjectDoc (BUTCHR-71 Con
 // tested for gets its own mirror here rather than being assumed to transfer.
 // ---------------------------------------------------------------------------
 describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTCHR-270)", () => {
-  function seedRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
-    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
+  function seedRootDoc(pages: Map<string, { title: string; body: string; version: number }>, id: string, title: string, body: string) {
+    pages.set(id, { title, body, version: 1 });
   }
 
   test("empty body -> complete: true, body: \"\", size.chars === 0 — distinct from not-found", async () => {
@@ -839,7 +805,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
   describe("version drift (BUTCHR-230 review)", () => {
     test("THE RULE IS IN THE WARNING ITSELF — a partial tells the caller to pin expectVersion and to discard-and-restart on drift", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
-      pages.set("940", { parentId: "", title: "big doc", body: "x".repeat(100), labels: [], version: 1 });
+      pages.set("940", { title: "big doc", body: "x".repeat(100), version: 1 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "940" } });
       const r: any = await getProjectDoc(ops, "CATA", 0, 10);
       expect(r.complete).toBe(false);
@@ -854,7 +820,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
 
     test("expectVersion is REQUIRED once offset > 0 — the splice is unrepresentable, not merely discouraged", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
-      pages.set("941", { parentId: "", title: "big doc", body: "x".repeat(100), labels: [], version: 1 });
+      pages.set("941", { title: "big doc", body: "x".repeat(100), version: 1 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "941" } });
       await expect(getProjectDoc(ops, "CATA", 10, 10)).rejects.toThrow(/expectVersion is required when offset > 0/);
       // offset 0 still needs nothing: a first slice has no earlier version to agree with.
@@ -863,7 +829,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
 
     test("a page edited mid-read REFUSES the continuation instead of splicing two versions", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
-      pages.set("942", { parentId: "", title: "edited doc", body: "x".repeat(100), labels: [], version: 3 });
+      pages.set("942", { title: "edited doc", body: "x".repeat(100), version: 3 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "942" } });
       const first: any = await getProjectDoc(ops, "CATA", 0, 10);
       expect(first.version).toBe(3);
@@ -875,7 +841,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
 
     test("an UNVERIFIABLE pin refuses too — a version that could not be read is not a satisfied pin", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
-      pages.set("943", { parentId: "", title: "versionless doc", body: "x".repeat(100), labels: [], version: 1 });
+      pages.set("943", { title: "versionless doc", body: "x".repeat(100), version: 1 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "943" } });
       pages.set("943", { ...pages.get("943")!, version: undefined as any });
       await expect(getProjectDoc(ops, "CATA", 10, 10, 1)).rejects.toThrow(/unverifiable/);
@@ -884,7 +850,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
     test("a matching pin reads through, and the full paginated round trip still reconstructs exactly", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
       const body = "a—b—c—d—e—f—g—h—i—j";
-      pages.set("944", { parentId: "", title: "pinned doc", body, labels: [], version: 9 });
+      pages.set("944", { title: "pinned doc", body, version: 9 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "944" } });
       const first: any = await getProjectDoc(ops, "CATA", 0, 5);
       expect(first.version).toBe(9);
@@ -901,7 +867,7 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
 
     test("expectVersion shape is validated: non-integer and non-positive refuse", async () => {
       const { ops, pages, setProjectProperty } = makeWorld();
-      pages.set("945", { parentId: "", title: "doc", body: "x".repeat(100), labels: [], version: 1 });
+      pages.set("945", { title: "doc", body: "x".repeat(100), version: 1 });
       setProjectProperty("CATA", { space: { key: "CATA" }, rootDoc: { id: "945" } });
       await expect(getProjectDoc(ops, "CATA", 10, 10, 2.5)).rejects.toThrow(/expectVersion must be a positive integer/);
       await expect(getProjectDoc(ops, "CATA", 10, 10, 0)).rejects.toThrow(/expectVersion must be a positive integer/);
@@ -921,14 +887,14 @@ describe("docs.ts: get_doc bounded range reads — project root doc branch (BUTC
 // ---------------------------------------------------------------------------
 describe("docs.ts: doc-write size budget (BUTCHR-250) — refuse only a write that is BOTH over budget AND growing", () => {
   function seedProjectRootDoc(
-    pages: Map<string, { parentId: string; title: string; body: string; labels: string[] }>,
+    pages: Map<string, { title: string; body: string }>,
     setProjectProperty: (projectKey: string, value: unknown) => void,
     projectKey: string,
     pageId: string,
     title: string,
     body: string,
   ) {
-    pages.set(pageId, { parentId: "", title, body, labels: [] });
+    pages.set(pageId, { title, body });
     setProjectProperty(projectKey, { space: { key: projectKey }, rootDoc: { id: pageId } });
   }
 
@@ -1010,7 +976,7 @@ describe("docs.ts: doc-write size budget (BUTCHR-250) — refuse only a write th
     addIssue("BUTCHR-90", "a task with an oversized doc already");
     const stored = "a".repeat(DOC_BODY_CHAR_BUDGET + 1_000);
     expect(stored.length).toBeGreaterThan(DOC_BODY_CHAR_BUDGET); // pin: fixture must genuinely be over budget
-    pages.set("900", { parentId: ROOT_DOC_ID, title: "A real title", body: stored, labels: [labelForKey("BUTCHR-90")], version: 1 });
+    pages.set("900", { title: "A real title", body: stored, version: 1 });
     issues.get("BUTCHR-90")!.remoteLink = { title: "A real title", url: "https://fake.atlassian.net/wiki/pages/900" };
 
     // growing an already-oversized ticket doc: refused
@@ -1112,8 +1078,8 @@ describe("docs.ts: set_doc / setProjectDoc — bounded receipt (BUTCHR-236)", ()
   // receipt contract doesn't need to know — it must stay bounded at ANY size.
   const FIELD_OBSERVED_OVERSIZE_CHARS = 81_019;
 
-  function seedProjectRootDoc(pages: Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>, id: string, title: string, body: string) {
-    pages.set(id, { parentId: "", title, body, labels: [], version: 1 });
+  function seedProjectRootDoc(pages: Map<string, { title: string; body: string; version: number }>, id: string, title: string, body: string) {
+    pages.set(id, { title, body, version: 1 });
   }
 
   describe("issue caller (setDoc)", () => {

@@ -96,26 +96,6 @@ export interface AtlassianOps {
   upsertRemoteLink(key: string, globalId: string, relationship: string, object: { title: string; url: string }): Promise<unknown>;
 
   /**
-   * One page of a parent page's DIRECT children (a real Confluence v2 read,
-   * cursor-paginated) — see src/tools/docs.ts for why this must never be
-   * answered from a CQL search. `cursor` continues a prior page; `nextCursor`
-   * is `undefined` once the caller has reached the end.
-   */
-  getChildPages(parentId: string, cursor?: string): Promise<{ results: Array<{ id: string; title?: string }>; nextCursor?: string }>;
-
-  /** A page's label names, direct read (not CQL — same reasoning as getChildPages). */
-  getPageLabels(pageId: string): Promise<string[]>;
-
-  /**
-   * Create a Confluence page WITH a label, atomically in one call. A
-   * deliberately SEPARATE op from `createPage` (see atlassian-real.ts for
-   * why) so that no existing caller of `createPage`/`confluence_create_page`
-   * changes behavior. `spaceKey` (not `spaceId`) because the underlying v1
-   * content API takes the space's key, not its numeric id.
-   */
-  createPageWithLabel(p: { spaceKey: string; parentId: string; title: string; body: string; label: string }): Promise<{ id: string; title: string; url: string }>;
-
-  /**
    * Read-modify-write: unions `labels` into the issue's CURRENT label set and
    * writes the result back. NEVER removes an existing label — there is no
    * other way to set a label on an issue that already exists (labels can
