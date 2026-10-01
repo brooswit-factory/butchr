@@ -256,6 +256,22 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1", BUTCHR_LIZARD_APPROVAL_SOUND_PATH: "/x/lizard.mp3" }, noRead))).toContain("lizardApprovalSound=enabled overridePath=/x/lizard.mp3");
   });
 
+  // FACTORY-581 SAFETY GUARD 4: OFF (undefined) by default — unset or
+  // blank/whitespace-only means permission-answering stays fleet-wide, the
+  // exact behaviour before this field existed; no new flag, only a narrowing
+  // value for the EXISTING eligiblePanes gate (src/daemon/index.ts).
+  test("permissionAnswerCanaryPaneLabel is absent unless BUTCHR_PERMISSION_ANSWER_CANARY_PANE is set to a non-empty value", () => {
+    expect(loadConfig(base, noRead).permissionAnswerCanaryPaneLabel).toBeUndefined();
+    expect(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "   " }, noRead).permissionAnswerCanaryPaneLabel).toBeUndefined();
+  });
+  test("BUTCHR_PERMISSION_ANSWER_CANARY_PANE (trimmed) sets the canary label", () => {
+    expect(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "  admin-brooswit-nexus  " }, noRead).permissionAnswerCanaryPaneLabel).toBe("admin-brooswit-nexus");
+  });
+  test("describeConfig reports the canary label, or that it's unset (fleet-wide)", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("permissionAnswerCanaryPaneLabel=(unset — permission-answering is fleet-wide)");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "admin-brooswit-nexus" }, noRead))).toContain("permissionAnswerCanaryPaneLabel=admin-brooswit-nexus");
+  });
+
   // BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope, default
   // OFF. Paired control, same shape as the github-orgs tests above: an
   // implementation that always returns [] (reject-everything) would pass

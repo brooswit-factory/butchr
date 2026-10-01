@@ -745,6 +745,64 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
   });
 });
 
+describe("createEscalator — onPermissionAnswered (FACTORY-581 SAFETY GUARD 3, butchr's half)", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+
+  test("clears the stalled mark with a tag distinct from onDrovrDialogResolved's, carrying drovr's own recognizedVia", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+    expect(h.escalator.managedSessionEscalations().length).toBe(1);
+
+    h.escalator.onPermissionAnswered("p1", "no-separator-file-edit");
+    expect(h.escalator.managedSessionEscalations()).toEqual([]);
+
+    const line = h.logs.find((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("no longer blocked"));
+    expect(line).toBeDefined();
+    expect(line).toContain("no longer blocked (answered: recognizedVia=no-separator-file-edit)");
+    // Distinct from the drovr-escalation-resolved tag and from the bare
+    // last-resort fallback — a reader greps on the full parenthesized form.
+    expect(line).not.toContain("no longer blocked (drovr)");
+  });
+
+  test("the tag is distinct per recognizedVia value — e.g. a pre-existing matcher vs the new file-edit fallback", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt1 = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt1);
+    h.escalator.onPermissionAnswered("p1", "no-separator-bash");
+    const bashLine = h.logs.find((l) => l.includes("no longer blocked (answered:"));
+    expect(bashLine).toContain("recognizedVia=no-separator-bash");
+
+    const prompt2 = parsePrompt(TRUST)!;
+    await h.poll("p1", null, prompt2);
+    h.escalator.onPermissionAnswered("p1", "no-separator-file-edit");
+    const fileEditLine = h.logs.filter((l) => l.includes("no longer blocked (answered:")).at(-1);
+    expect(fileEditLine).toContain("recognizedVia=no-separator-file-edit");
+  });
+
+  test("a pane with nothing tracked is a no-op — never logs, never throws (cheap for a non-managed-session pane)", () => {
+    const h = harness({ managedSessionOf: async () => target });
+    expect(() => h.escalator.onPermissionAnswered("p-untracked", "separator")).not.toThrow();
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(0);
+  });
+
+  test("preempts the generic onPoll fallback — the next poll finds nothing left to clear untagged", async () => {
+    const h = harness({ managedSessionOf: async () => target });
+    const prompt = parsePrompt(REAL)!;
+    await h.poll("p1", null, prompt);
+
+    h.escalator.onPermissionAnswered("p1", "no-separator-file-edit");
+    h.notBlocked([]); // the generic fallback's own trigger — pane no longer reported blocked at all
+
+    const clearLines = h.logs.filter((l) => l.includes(MANAGED_ESCALATION_MARKER) && l.includes("no longer blocked"));
+    expect(clearLines.length).toBe(1); // only the attributed line — the generic fallback found nothing to clear a second time
+    expect(clearLines[0]).toContain("recognizedVia=no-separator-file-edit");
+  });
+});
+
 describe("createEscalator — #team-admin routing for managed-session escalations (FACTORY-369)", () => {
   const target: ManagedSessionTarget = {
     agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",

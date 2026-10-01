@@ -347,6 +347,41 @@ export interface Config {
    */
   lizardApprovalSound?: { overridePath?: string };
   /**
+   * FACTORY-581 SAFETY GUARD 4: OPTIONAL, OFF by default (absent =
+   * `BUTCHR_PERMISSION_ANSWER_CANARY_PANE` unset/empty — fleet-wide, today's
+   * behaviour exactly, with no new feature flag of its own). When set, this
+   * is the ONLY pane label `permissionAnswerEligiblePanes`
+   * (src/daemon/index.ts) returns as eligible that tick, REGARDLESS of what
+   * `lizardModeLabel` itself would otherwise allow for every other pane —
+   * narrowing the EXISTING `PermissionAnswerLoopDeps.eligiblePanes` gate
+   * (`src/agents/permission-answer-loop.ts`'s own documented single
+   * enforcement point: "a pane left out of that map is never scanned or
+   * answered AT ALL") rather than inventing a second one, per FACTORY-460's
+   * diagnosis finding (d) and FACTORY-581's own instruction not to add a new
+   * flag. Canaries drovr 0.16.8 as a whole (the new file-edit fallback,
+   * recognizedVia `"no-separator-file-edit"`, plus every pre-existing
+   * matcher) on exactly one named pane rather than carving the file-edit
+   * shape out specifically — `eligiblePanes` has no per-dialog-type
+   * granularity to carve with, only per-pane, so this is the coarsest grain
+   * the existing gate offers, same grain FACTORY-67/DROVR-42 already
+   * establishes for `lizardMode` itself.
+   *
+   * ONE-STEP ROLLBACK: unset `BUTCHR_PERMISSION_ANSWER_CANARY_PANE` (or set
+   * it empty) and restart the daemon — every other pane's own
+   * `lizardModeLabel` eligibility reverts to exactly what it was before this
+   * field existed, with nothing else to undo. WIDEN TO FLEET-WIDE: the same
+   * one step, in the same direction — unset the variable once the canary
+   * window is judged safe.
+   *
+   * The label compared against is `lizardModeLabel`'s OWN return value (the
+   * resource id's basename, or the bare agent id for a query-level agent —
+   * see that function's own doc comment), not a raw pane id: a pane id can
+   * change across a respawn, but the label naming WHICH AGENT is stable,
+   * which is what lets an operator name the canary agent once rather than
+   * re-pointing this at a new pane id every time herdr reassigns one.
+   */
+  permissionAnswerCanaryPaneLabel?: string;
+  /**
    * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
    * project key must appear here to ever be staffed (see
    * `src/resources/project.ts`'s `ProjectResourceDeps.allowlist`, the one
@@ -492,6 +527,7 @@ export interface ConfigEnv {
   BUTCHR_PERMISSION_AUDIT_PATH?: string | undefined;
   BUTCHR_LIZARD_APPROVAL_SOUND?: string | undefined;
   BUTCHR_LIZARD_APPROVAL_SOUND_PATH?: string | undefined;
+  BUTCHR_PERMISSION_ANSWER_CANARY_PANE?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
   /** FACTORY-497: no longer a real config knob — kept only so `loadConfig` can detect a daemon environment that still sets it and warn once (`ignoredExtensionOriginsWarning`); it is never read into `Config.extensionAuth`. */
@@ -631,6 +667,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ? { ...(lizardApprovalSoundOverridePath ? { overridePath: lizardApprovalSoundOverridePath } : {}) }
     : undefined;
 
+  const permissionAnswerCanaryPaneLabel = env.BUTCHR_PERMISSION_ANSWER_CANARY_PANE?.trim() || undefined;
+
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
   // BUTCHR-284: unlike the *_MINUTES knobs above (fractional is meaningless
@@ -673,6 +711,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     captureDir,
     permissionAuditPath,
     ...(lizardApprovalSound ? { lizardApprovalSound } : {}),
+    ...(permissionAnswerCanaryPaneLabel ? { permissionAnswerCanaryPaneLabel } : {}),
     projectAllowlist,
     maxAgents,
     extensionAuth: { allowedOrigins: extensionOrigins },
@@ -801,6 +840,7 @@ export const describeConfig = (c: Config): string =>
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
   `lizardApprovalSound=${c.lizardApprovalSound ? `enabled overridePath=${c.lizardApprovalSound.overridePath ?? "(default: drovr's bundled asset)"}` : "disabled"} ` +
+  `permissionAnswerCanaryPaneLabel=${c.permissionAnswerCanaryPaneLabel ?? "(unset — permission-answering is fleet-wide)"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents} ` +
   // FACTORY-464/FACTORY-465: no token to ever log. FACTORY-497: always

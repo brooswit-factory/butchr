@@ -263,6 +263,34 @@ export interface Escalator {
    */
   onDrovrUnknownDialog: (escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }) => Promise<void>;
   onDrovrDialogResolved: (resolved: { paneId: string; fingerprint: string }) => void;
+  /**
+   * FACTORY-581 SAFETY GUARD 3 (butchr's half — see FACTORY-460's diagnosis
+   * comment (c): "GUARD 3 spans two repos"): the third, previously
+   * unattributed way a managed session's pane can clear — `@brooswit/drovr`
+   * >= 0.16.8's own standalone lizard-mode pass
+   * (`src/agents/permission-answer-loop.ts`'s `runPermissionAnswerTick`,
+   * wired via its `deps.onAnswered`) PRESSING a tool-permission dialog,
+   * distinct from both `onDrovrDialogResolved` above (an ESCALATED/unknown
+   * dialog's own resolution — a human or something else, never butchr's own
+   * answer pass) and the generic `onPoll` fallback below (a pane that simply
+   * stopped being reported blocked, with neither of the other two
+   * explaining why). Called for EVERY answered pane, managed session or
+   * not — `clearManagedSessionStalled` is already a no-op for a `paneId`
+   * with no tracked entry, so this costs nothing for a non-managed-session
+   * pane and needs no identity check of its own.
+   *
+   * `recognizedVia` is threaded straight through from drovr's own
+   * `AutoAnswerPermissionResult` (`PermissionPrompt["recognizedVia"]`:
+   * `"separator" | "no-separator-mcp-tool" | "no-separator-bash" |
+   * "no-separator-file-edit"`) rather than invented here — it is ALREADY the
+   * distinct, attributable tag per drovr matcher (including the new
+   * FACTORY-580/586/587 file-edit fallback), and reusing it is what makes
+   * this line compose with drovr's own JSONL audit attribution
+   * (`grep '"recognizedVia":"<value>"'`, `docs/permission-approval.md`
+   * GUARD 3/7) instead of duplicating or contradicting it — the composition
+   * FACTORY-460's diagnosis required.
+   */
+  onPermissionAnswered: (paneId: string, recognizedVia: string) => void;
 }
 
 /** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
@@ -916,6 +944,11 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     clearManagedSessionStalled(resolved.paneId, "no longer blocked (drovr)");
   }
 
+  /** See `Escalator.onPermissionAnswered`'s own doc comment. */
+  function onPermissionAnswered(paneId: string, recognizedVia: string): void {
+    clearManagedSessionStalled(paneId, `no longer blocked (answered: recognizedVia=${recognizedVia})`);
+  }
+
   /** Every managed session CURRENTLY marked stalled — see `Escalator.managedSessionEscalations`'s own doc comment. */
   function managedSessionEscalations(): readonly ManagedSessionEscalation[] {
     return [...managedSessionStalled.entries()].map(([paneId, e]) => ({
@@ -1282,6 +1315,20 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // `handleManagedSessionBlocked` itself (a new fp simply overwrites the
     // old entry and re-logs, satisfying "a new fingerprint escalates
     // again" without needing a separate clear step here).
+    //
+    // FACTORY-581 SAFETY GUARD 3: this is the LAST-RESORT, UNATTRIBUTED
+    // path — it only ever fires for a pane neither `onDrovrDialogResolved`
+    // (an escalated dialog's own resolution) nor `onPermissionAnswered`
+    // (drovr's lizard-mode pass pressing a tool-permission dialog, tagged
+    // with its own `recognizedVia`) already cleared: both of those call
+    // `clearManagedSessionStalled` directly and it is a no-op the second
+    // time (the entry is already gone), so a pane they attributed never
+    // reaches this untagged branch at all. What DOES reach it: a human
+    // typing directly into the pane, or any other clearing this detector's
+    // own callbacks do not observe. Left bare (no parenthesized reason) on
+    // purpose, so a reader can tell "attributed" from "not" at a glance —
+    // see the two other call sites of `clearManagedSessionStalled` for the
+    // attributed tags.
     for (const [paneId] of managedSessionStalled) {
       if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
@@ -1405,5 +1452,5 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     })();
   }
 
-  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved };
+  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved, onPermissionAnswered };
 }

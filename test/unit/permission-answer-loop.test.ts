@@ -240,6 +240,46 @@ describe("runPermissionAnswerTick", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("FACTORY-581 SAFETY GUARD 3: onAnswered fires once per answered Claude pane, with drovr's own recognizedVia, and a throwing onAnswered never fails the tick", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN, p2: ALWAYS_ALLOW_SCREEN });
+    const answered: { paneId: string; recognizedVia: string }[] = [];
+
+    const results = await runPermissionAnswerTick({
+      client,
+      eligiblePanes: allEligible,
+      auditPath,
+      onAnswered: (r) => { answered.push(r); throw new Error("boom — must never propagate"); },
+    });
+
+    expect(results).toHaveLength(2);
+    expect(answered).toHaveLength(2); // once per answered pane, despite each call throwing
+    expect(answered.map((a) => a.paneId).sort()).toEqual(["p1", "p2"]);
+    // ALWAYS_ALLOW_SCREEN has a `─────` separator above the question, so
+    // drovr's own classifier attributes it to the "separator" arm — the SAME
+    // value this test's own `results[].recognizedVia` already carries,
+    // confirming onAnswered is handed drovr's classification verbatim
+    // rather than a value reconstructed here.
+    expect(answered[0]?.recognizedVia).toBe("separator");
+    expect(results.find((r) => r.outcome === "answered" && r.paneId === "p1")).toMatchObject({ recognizedVia: "separator" });
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("onAnswered is never called when nothing is answered, and is optional (omitting it changes nothing)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "some ordinary working pane, nothing pending here" });
+    const answered: unknown[] = [];
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, onAnswered: (r) => answered.push(r) });
+
+    expect(results).toEqual([]);
+    expect(answered).toEqual([]);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("readTimeoutMs and operator, when given, are forwarded through to autoAnswerPermissions (operator lands in the audit record)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");

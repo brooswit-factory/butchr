@@ -1478,12 +1478,43 @@ anything beyond the plain log line happen:
    still up. Accepted deliberately, given this ticket's reduced scope — a
    duplicate journal line costs nothing a Jira rate cap would need to guard
    against.
-4. **Resolution**: when the herd no longer reports the pane blocked AT ALL
-   (`Escalator.onPoll`'s existing per-tick reset, which already ends every
-   other debounce/episode tracker in this module the same way), the entry is
-   removed from `managedSessionEscalations()` and one more
-   `[managed-escalation] ... no longer blocked — clearing stalled mark` line
-   is logged. The SAME fingerprint reappearing after a genuine clear is
+4. **Resolution, with a DISTINCT, ATTRIBUTABLE tag per clearing path**
+   (FACTORY-581 SAFETY GUARD 3, butchr's half — FACTORY-460's diagnosis
+   finding (c): "GUARD 3 spans two repos", drovr's own half being its JSONL
+   audit's `recognizedVia`/`operator`/`outcome` attribution,
+   `docs/permission-approval.md` GUARD 3/7 in `@brooswit/drovr`). A reader
+   greps `[managed-escalation] pane <id> no longer blocked` and the
+   parenthesized suffix (if any) says WHICH path cleared it:
+   - **`no longer blocked (answered: recognizedVia=<value>)`** —
+     `Escalator.onPermissionAnswered`, fired from drovr's own standalone
+     lizard-mode pass (`src/agents/permission-answer-loop.ts`'s
+     `runPermissionAnswerTick`, via its `deps.onAnswered`) actually
+     PRESSING a tool-permission dialog. `<value>` is drovr's own
+     `PermissionPrompt["recognizedVia"]` verbatim — `"separator"`,
+     `"no-separator-mcp-tool"`, `"no-separator-bash"`, or (`@brooswit/drovr`
+     >= 0.16.8, FACTORY-580/586/587) `"no-separator-file-edit"` for the new
+     file-edit/create fallback this release adds — composing directly with
+     drovr's own audit grep string (`grep
+     '"recognizedVia":"no-separator-file-edit"'`) rather than inventing a
+     second, contradicting tag.
+   - **`no longer blocked (drovr)`** — `Escalator.onDrovrDialogResolved`, an
+     ESCALATED/unknown dialog's own resolution (a human, or the dialog
+     disappearing some other way) — never butchr's own answer pass, which
+     by construction can only auto-answer a dialog this hook would NOT have
+     escalated in the first place (`escalationPayload`'s own
+     `optionFor(...) < 0` gate, `@brooswit/drovr`).
+   - **`no longer blocked`** (bare, no parenthesized reason) —
+     `Escalator.onPoll`'s existing per-tick reset, now the LAST-RESORT,
+     UNATTRIBUTED fallback: it only ever fires for a pane neither of the
+     two tagged paths above already cleared (both call
+     `clearManagedSessionStalled` directly, which is a no-op the second
+     time), so it means something this detector's own callbacks did not
+     observe — typically a human typing directly into the pane.
+
+   Whichever path fires, the entry is removed from
+   `managedSessionEscalations()` and exactly one
+   `[managed-escalation] ... no longer blocked ... — clearing stalled mark`
+   line is logged. The SAME fingerprint reappearing after a genuine clear is
    treated as a fresh episode (it escalates and logs again), never silently
    suppressed.
 5. **A durable pane-text capture** (FACTORY-50 Part C) — see "Pane-text

@@ -2010,11 +2010,19 @@ function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const decoded = decodeAnyAgentKey(id);
   return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
 }
+// FACTORY-581 SAFETY GUARD 4: canary narrowing, applied AFTER `lizardModeLabel`
+// decides a pane's label exactly as before — see `Config.permissionAnswerCanaryPaneLabel`'s
+// own doc comment for the one-step rollback/widen and why this rides the
+// existing `eligiblePanes` gate instead of a new flag. Unset (the default):
+// every pane `lizardModeLabel` allows stays eligible, byte-for-byte today's
+// behaviour.
 const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: string | null | undefined }[]): ReadonlyMap<string, string> => {
   const out = new Map<string, string>();
   for (const a of agents) {
     const label = lizardModeLabel(a.cwd);
-    if (label) out.set(a.pane_id, label);
+    if (!label) continue;
+    if (config.permissionAnswerCanaryPaneLabel !== undefined && label !== config.permissionAnswerCanaryPaneLabel) continue;
+    out.set(a.pane_id, label);
   }
   return out;
 };
@@ -2096,6 +2104,12 @@ startPermissionAnswerWatch(
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
     onApproved: approvalSoundNotifier.notifyApproved,
+    // FACTORY-581 SAFETY GUARD 3: attributes a managed-session pane's "no
+    // longer blocked" line to THIS pass, tagged with drovr's own
+    // `recognizedVia` — see `Escalator.onPermissionAnswered`'s own doc
+    // comment (src/agents/escalation-loop.ts). A no-op for every
+    // non-managed-session pane.
+    onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
     subscribe: subscribeAgentStatus,
   },
   PERMISSION_ANSWER_INTERVAL_MS,

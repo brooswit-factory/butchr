@@ -194,6 +194,57 @@ field loads and behaves byte-for-byte as before this ticket — no new key on
 any parsed `Rule`, no new `SpawnSpec` field on any `specFor*` output, no
 change to which panes the permission-answer timer scans.
 
+### Canary: narrowing `eligiblePanes` to one pane (FACTORY-581 SAFETY GUARD 4)
+
+`@brooswit/drovr` >= 0.16.8 (FACTORY-580/586/587) adds a new no-separator
+file-edit/create recognition sibling to `autoAnswerPermissions` — a new
+AUTO-ANSWER PATH the permission-answer timer presses keys through, same as
+every pre-existing matcher. Per FACTORY-460's diagnosis finding (d) and
+FACTORY-581's own instruction, there is **no new feature flag** for this: it
+rides the EXISTING `PermissionAnswerLoopDeps.eligiblePanes` gate
+(`src/agents/permission-answer-loop.ts`'s own documented single enforcement
+point — "a pane left out of that map is never scanned or answered AT ALL"),
+narrowed by one optional config value, `Config.permissionAnswerCanaryPaneLabel`
+(`BUTCHR_PERMISSION_ANSWER_CANARY_PANE`, trimmed; unset/blank is the default
+and means fleet-wide, unchanged).
+
+**What it does.** When set, `permissionAnswerEligiblePanes` in
+`src/daemon/index.ts` drops every pane whose `lizardModeLabel` does not
+EXACTLY equal this value — `lizardModeLabel` itself (and therefore
+`permissionMode`/`lizardMode` resolution above) is computed first and
+completely unchanged; the canary value only filters its OUTPUT. A pane whose
+label doesn't match is excluded from the eligible map exactly as if
+`lizardMode: false` had been set on it for this tick — never scanned, never
+answered, by the same construction `lizardMode: false` already uses.
+
+**Grain: per-pane, not per-dialog-type.** `eligiblePanes` has no concept of
+WHICH dialog a pane might show, only whether the pane is scanned at all —
+there is no way to carve "only the new file-edit fallback" out of a blanket
+pane gate without a second, dialog-type-aware flag, which is exactly what
+FACTORY-581 forbids inventing. So this canaries drovr 0.16.8 as a WHOLE (the
+new fallback plus every pre-existing matcher) on one named pane, the same
+coarse grain `lizardMode` itself already operates at — not a file-edit-only
+canary.
+
+**ONE-STEP ROLLBACK and widen.** Unset `BUTCHR_PERMISSION_ANSWER_CANARY_PANE`
+(or set it empty) and restart the daemon: every other pane's eligibility
+reverts to exactly what `lizardModeLabel` alone would produce, with nothing
+else to undo. Widening to fleet-wide after a successful canary window is the
+SAME one step, in the same direction.
+
+**Attribution during the canary.** Read `docs/managed-sessions.md`'s
+"Resolution, with a DISTINCT, ATTRIBUTABLE tag per clearing path" — a
+managed-session canary pane's cleared dialogs show up tagged
+`no longer blocked (answered: recognizedVia=no-separator-file-edit)`
+specifically for the new fallback, composing with drovr's own JSONL audit
+(`grep '"recognizedVia":"no-separator-file-edit"' <auditPath>`,
+`docs/permission-approval.md` GUARD 3/7 in `@brooswit/drovr`) rather than
+requiring a second, separate signal.
+
+**Absent means unchanged, verified** — same discipline as the rest of this
+section: a daemon started with no `BUTCHR_PERMISSION_ANSWER_CANARY_PANE`
+behaves byte-for-byte as before this field existed.
+
 ## The vendor selector: already there, not duplicated
 
 `agentPreferences[].harness` (`"claude" | "codex" | "agy"`, `src/rules/rules.ts`)

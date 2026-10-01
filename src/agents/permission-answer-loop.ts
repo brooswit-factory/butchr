@@ -264,6 +264,23 @@ export interface PermissionAnswerLoopDeps {
    */
   onApproved?: () => void;
   /**
+   * FACTORY-581 SAFETY GUARD 3: called once per ANSWERED Claude result this
+   * tick (never for Codex — `AutoAnswerCodexApprovalResult`'s `answered`
+   * variant carries `kind`, not `recognizedVia`; no managed session runs
+   * Codex today — `ruleLizardModeOf`'s own doc comment — so there is no
+   * attributable case to cover there yet), with the exact `paneId` and
+   * `recognizedVia` drovr returned. Lets a caller (the daemon's own
+   * `escalator.onPermissionAnswered`, src/daemon/index.ts) attribute a
+   * managed-session pane's "no longer blocked" line to THIS pass — distinct
+   * from an escalated dialog's own resolution — using drovr's own
+   * classification rather than a tag invented here. Same
+   * "never awaited, never allowed to affect this tick's own outcome"
+   * contract as `onApproved` immediately above, and called for EVERY
+   * answered pane (not only managed sessions): the callback is expected to
+   * no-op cheaply for anything it doesn't track.
+   */
+  onAnswered?: (result: { paneId: string; recognizedVia: string }) => void;
+  /**
    * FACTORY-98: called once per tick with the pane ids `eligiblePanes`
    * returned THIS tick — before any screen is scanned or pressed, and even
    * when the set is empty. Lets a caller (`permission-answer-watch.ts`'s
@@ -424,6 +441,7 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
           log(`[permission-answer] latency audit write failed for ${a.paneId}: ${(e as Error)?.message ?? e}`);
         }
         try { deps.onApproved?.(); } catch { /* FACTORY-100/FACTORY-103: a sound-notification failure must never affect this tick's own outcome */ }
+        try { deps.onAnswered?.({ paneId: a.paneId, recognizedVia: a.recognizedVia }); } catch { /* FACTORY-581 GUARD 3: same contract as onApproved above — never affects this tick's own outcome */ }
       }
       for (const f of failed) log(`[permission-answer] ${label(f.paneId)} (${f.paneId}) failed: ${f.reason} — ${f.detail}`);
     }
