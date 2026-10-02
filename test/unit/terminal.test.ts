@@ -46,7 +46,7 @@ describe("macOS Terminal.app", () => {
     expect(scriptOf(`a'b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a'\\\\''b'"`);
     expect(scriptOf(`a"b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a\\"b'"`);
     expect(scriptOf(`a\\b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a\\\\b'"`);
-    expect(scriptOf("x; rm -rf ~")).toBe(`tell application "Terminal" to do script "herdr agent attach 'x; rm -rf ~'"`);
+    expect(scriptOf("x; echo SHOULD-NOT-RUN")).toBe(`tell application "Terminal" to do script "herdr agent attach 'x; echo SHOULD-NOT-RUN'"`);
   });
 
   test("the prefix is only special as the whole prefix: anything else keeps the argv form", () => {
