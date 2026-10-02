@@ -167,6 +167,19 @@ describe("butchr webapp + open action", () => {
     expect(html).toContain("open terminal");
     expect(html).toContain("resource");
   });
+  // FACTORY-613 (replays FACTORY-432 / PR #546): route-level smoke test
+  // only — is `/dashboard-app` actually wired to src/web/static-assets.ts
+  // through the real app? The handler's own serving/traversal/fallback
+  // contract is exercised directly (with a real built-app-shaped temp dir)
+  // in test/unit/static-assets.test.ts. This deliberately does NOT assert
+  // 200 vs 404: whether `resolveWebRoot()`'s real filesystem lookup finds an
+  // actual `dist/web` depends on whether `bun run build:web` has been run in
+  // this checkout, which this test must not require or assume either way —
+  // only that the route never 500s.
+  test("GET /dashboard-app is wired to the static-asset handler (never a 500, regardless of whether the web app has been built yet)", async () => {
+    const r = await fetch(`${base}/dashboard-app`);
+    expect([200, 404]).toContain(r.status);
+  });
   test("GET /state returns the active agents", async () => {
     expect(await (await fetch(`${base}/state`)).json()).toEqual([{ issue: "KAN-9", status: "working", summary: "do a thing" }]);
   });

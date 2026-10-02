@@ -12,6 +12,7 @@ import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } 
 import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
+import { resolveWebRoot, serveStaticAsset } from "./static-assets.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -199,6 +200,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     .get("/favicon-32.png", iconResponse)
     .get("/favicon.ico", iconResponse)
     .get("/apple-touch-icon.png", iconResponse)
+    // FACTORY-613 (replays FACTORY-432 / PR #546): the built React dashboard
+    // app (dashboard-app/, vite.config.ts), served as static files from
+    // src/web/static-assets.ts. Plumbing only — nothing above links here
+    // yet, and no page currently served by `/` or `/configurations` changes
+    // behavior because of this route existing.
+    .get("/dashboard-app", () => serveStaticAsset(resolveWebRoot(), "/"))
+    .get("/dashboard-app/*", ({ params }) => serveStaticAsset(resolveWebRoot(), "/" + (params["*"] ?? "")))
     // 503 (not just a false `ok`) when unhealthy, so a `curl -f` or any dumb
     // uptime checker goes red too — an endpoint nobody curls doesn't satisfy
     // "loud" (BUTCHR-18/BUTCHR-6).
