@@ -27,7 +27,7 @@
 // fix and proves nothing about it; this one is the one that actually
 // distinguishes the two orderings.
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { HerdrHerd, SESSION_DISCOVERY_POLL_MS } from "../../src/agents/herd.js";
@@ -81,15 +81,25 @@ test("FACTORY-418: the discovery poll being interrupted mid-poll (daemon death /
     mkdirSync(projectDir, { recursive: true });
     const staleTranscript = join(projectDir, `${staleId}.jsonl`);
     writeFileSync(staleTranscript, "{}");
-    // Firmly backdate it — `discoverClaudeSessionId` filters candidates by
-    // `created >= launchStartedAt` (birthtime, falling back to mtime), and
-    // relying on plain wall-clock ordering between this write and the
-    // launch a few lines below risks the two landing in the same clock
-    // tick, which would make this test's own fixture race exactly the
-    // "picks the wrong, OLDER transcript" trap `discoverClaudeSessionId`'s
-    // own doc comment names — not the ordering this test exists to check.
-    const wellInThePast = new Date(Date.now() - 60_000);
-    utimesSync(staleTranscript, wellInThePast, wellInThePast);
+    // FACTORY-631/FACTORY-623/FACTORY-568: a `utimesSync` backdate here
+    // used to be this test's only defense, and its comment claimed it was
+    // enough — it is NOT. `utimesSync` sets atime/mtime, never birthtime,
+    // and `discoverClaudeSessionId` PREFERS `birthtimeMs` whenever a
+    // filesystem reports one (> 0) — measured directly on this worker's own
+    // checkout: after a 60s `utimesSync` backdate, `mtimeMs` was 60s in the
+    // past while `birthtimeMs` (the value the filter actually reads) was
+    // still "now". So the real margin this test relied on was whatever
+    // plain wall-clock gap existed between this write and `launchStartedAt
+    // = Date.now()` a few lines below (`HerdrHerd.startProviders`) — on the
+    // order of ~2ms in the full suite, i.e. exactly the FACTORY-623 flake's
+    // own margin, landing in the SAME millisecond often enough to make this
+    // test's own fixture race the "picks the wrong, OLDER transcript" trap
+    // `discoverClaudeSessionId`'s doc comment names — not the ordering this
+    // test exists to check. A real, awaited delay is the only thing that
+    // actually moves the value the filter reads (nothing can un-write
+    // `birthtimeMs` after the fact), comfortably larger than that ~2ms
+    // margin.
+    await new Promise((r) => setTimeout(r, 50));
     persistDiscoveredSessionId(cwd, staleId);
 
     const f = fakeHerdr([]);

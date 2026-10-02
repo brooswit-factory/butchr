@@ -1246,6 +1246,21 @@ export class HerdrHerd implements Herd {
     // not `this.monotonicNow()`: transcript timestamps are wall-clock, and
     // `monotonicNow` is deliberately unrelated to it (see that field's own
     // doc comment) — the two are never comparable.
+    //
+    // FACTORY-631/FACTORY-623/FACTORY-568 — considered and REJECTED:
+    // `performance.timeOrigin + performance.now()` in place of `Date.now()`,
+    // to give `launchStartedAt` the same sub-millisecond precision a
+    // transcript's own `birthtimeMs` carries. Measured on this worker's own
+    // checkout (Bun): `performance.timeOrigin + performance.now()` drifts
+    // AHEAD of both `Date.now()` and the filesystem's own `birthtimeMs` —
+    // the gap GROWS over the process lifetime (observed ~0.6ms at process
+    // start, ~0.9ms after a handful of calls a few ms apart; the two clocks
+    // are not the same clock). Using it here would make a newly-written,
+    // genuinely-this-launch's-own transcript compare as `created < after`
+    // — i.e. REJECTED — on EVERY call, strictly worse than the bug this
+    // ticket fixes. `Date.now()` stays the source; `discoverClaudeSessionId`
+    // itself (see its own doc comment, "MILLISECOND-GRANULARITY HAZARD")
+    // carries the fix for the truncation this leaves behind.
     const launchStartedAt = Date.now();
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),

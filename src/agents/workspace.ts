@@ -1173,7 +1173,9 @@ function claudeProjectDir(dir: string, home: string = homedir()): string {
  * FACTORY-314 (PR #513 review fix; epic review on PR #513, "trap 2") — the id
  * of a `.jsonl` transcript under this workspace's own Claude project folder
  * that is POSITIVELY TIED to a launch started at or after `after` (epoch
- * ms, `Date.now()`-comparable) — never merely "the newest file present".
+ * ms, `Date.now()`-comparable, ideally sub-millisecond precision — see
+ * "MILLISECOND-GRANULARITY HAZARD" below) — never merely "the newest file
+ * present".
  * That distinction is load-bearing, not cosmetic: a workspace directory is
  * unique per issue (`workspaceDirFor`), but is NOT guaranteed to hold only
  * ONE transcript ever — a prior respawn of the SAME issue leaves its OLDER
@@ -1191,12 +1193,63 @@ function claudeProjectDir(dir: string, home: string = homedir()): string {
  * the same fail-safe "cannot establish it — don't guess" contract
  * `HerdrHerd.startProviders`'s own caller already treats as "session lost:
  * id unknown" rather than resuming a best guess.
+ *
+ * FACTORY-631/FACTORY-623/FACTORY-568 — MILLISECOND-GRANULARITY HAZARD:
+ * `created` carries sub-millisecond precision wherever the filesystem
+ * reports birth time (ns-resolution birthtime on ext4 and most Linux
+ * filesystems), but `after` is always a whole-millisecond INTEGER in this
+ * codebase — `HerdrHerd.startProviders` passes `Date.now()`, a FLOOR of
+ * the real instant it names. (A sub-millisecond wall clock via
+ * `performance.timeOrigin + performance.now()` was tried here and
+ * discarded — measured on this worker's own checkout, that clock drifts
+ * AHEAD of both `Date.now()` and the filesystem's own `birthtimeMs`, and
+ * the gap GROWS over the process lifetime; using it made every
+ * newly-written, genuinely-this-launch's-own transcript compare as
+ * `created < after` — REJECTED on EVERY call, strictly worse than the bug
+ * this fixes. `Date.now()` stays the source of truth.) Because `after` is
+ * a floor, the real instant it names can be up to just under 1ms LATER
+ * than the integer itself, so a plain `created < after` does NOT reliably
+ * reject a transcript that predates the launch but happens to land in the
+ * SAME whole millisecond as `after` — `created` (e.g. `X.78`) compares
+ * `>= after` (`X`) even though it was written, in real time, before the
+ * call that produced `after`. That gap is exactly what let a stale
+ * transcript from a PRIOR launch get silently re-accepted.
+ *
+ * The fix: require `created >= after + AFTER_MARGIN_MS` (one whole extra
+ * millisecond) instead of `created >= after`, whenever `after` is an
+ * integer (`Number.isInteger` — true for every caller today; a future
+ * caller passing an already sub-millisecond `after` would need no margin
+ * at all, so this stays conditional rather than blanket). This is SAFE in
+ * the direction this filter exists to protect: for any write that happens
+ * strictly before the call producing an integer `after`, `created < after
+ * + AFTER_MARGIN_MS` always holds (the real call instant is itself `<
+ * after + 1`), so that transcript is still, unconditionally, never a
+ * candidate. The cost lands on the opposite, rare case: a transcript
+ * genuinely tied to THIS launch but written within under 1ms of `after`
+ * would also be wrongly rejected. In PRODUCTION this is a non-risk — a
+ * real Claude launch takes tens of milliseconds to seconds to write its
+ * first transcript line, nowhere close to sub-millisecond — but it is a
+ * REAL risk for a test fixture that writes a fake transcript synchronously
+ * right after capturing `after`: several in this codebase do exactly that
+ * and each needs a small, real, awaited delay before writing (see
+ * `withResumableSession`, `test/unit/herd.test.ts`, and the FACTORY-418
+ * test in `test/unit/herd-session-id-invalidation-ordering.test.ts`, for
+ * where this was measured and fixed). Do not widen `AFTER_MARGIN_MS`
+ * beyond what the floor requires: a bigger margin buys nothing more here
+ * and only widens that cost for whatever caller it falls on.
  */
+const AFTER_MARGIN_MS = 1;
 export function discoverClaudeSessionId(dir: string, home?: string, after?: number): string | undefined {
   const projectDir = claudeProjectDir(dir, home);
   let entries: string[];
   try { entries = readdirSync(projectDir); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  // See "MILLISECOND-GRANULARITY HAZARD" above: only a whole-millisecond
+  // INTEGER `after` is a potentially lossy floor — every caller today
+  // passes one (`Date.now()`), so the margin always applies in practice; a
+  // future caller passing an already sub-millisecond `after` would get the
+  // exact, margin-free bound instead.
+  const bound = after !== undefined && Number.isInteger(after) ? after + AFTER_MARGIN_MS : after;
   let newest: { id: string; created: number } | undefined;
   for (const entry of entries) {
     if (!entry.endsWith(".jsonl")) continue;
@@ -1208,7 +1261,7 @@ export function discoverClaudeSessionId(dir: string, home?: string, after?: numb
     // every entry as "created at epoch 0" (which `after` would then reject
     // outright on every filesystem that lacks birth time).
     const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
-    if (after !== undefined && created < after) continue; // exists, but predates this launch — not a candidate, ever
+    if (bound !== undefined && created < bound) continue; // exists, but predates this launch — not a candidate, ever
     if (!newest || created > newest.created) newest = { id: entry.slice(0, -".jsonl".length), created };
   }
   return newest?.id;

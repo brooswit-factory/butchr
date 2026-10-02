@@ -1139,6 +1139,52 @@ describe("buildWorkspace", () => {
       }
     });
 
+    // FACTORY-631/FACTORY-623/FACTORY-568 regression — the millisecond-
+    // granularity hazard, driven at FUNCTION level (not by looping the full
+    // `herd.test.ts` scenario, which the FACTORY-623 diagnosis measured as
+    // 0/40 locally: its margin is ~5-6ms alone, only ~1.6-2.0ms in the full
+    // suite — the wrong instrument here).
+    //
+    // A naive "write, then `Date.now()`" repro (as the FACTORY-623 diagnosis
+    // measured on ITS OWN host: stale id returned in 476/500 trials) is
+    // itself a TIMING RACE, and racing it is exactly the "loop and hope"
+    // approach that ticket's own diagnosis warns off — measured on THIS
+    // worker's own host/filesystem (see `/tmp` script output recorded in the
+    // PR description), the same race held 0/2000: this host's write+stat+
+    // `Date.now()` sequence consistently takes long enough to roll into the
+    // NEXT millisecond, so a bare timing race can't be trusted to fail here
+    // the way it failed on the diagnosis's host. Driving the exact defect
+    // deterministically needs no race at all: read the file's OWN real
+    // `created` back, then set `after := Math.floor(created)` — a value
+    // `Date.now()` COULD legitimately have produced for a launch starting
+    // anywhere in that same millisecond. By construction `Math.floor(created)
+    // <= created`, so the unmodified `created >= after` check ALWAYS held
+    // (measured 500/500 on this host) and wrongly treated the file as this
+    // launch's own; the fixed `created >= after + AFTER_MARGIN_MS` check
+    // requires `created >= Math.floor(created) + 1`, which is NEVER true,
+    // so the fix rejects it every time (see `discoverClaudeSessionId`'s own
+    // doc comment for why that margin is the correct, minimal one).
+    test("discoverClaudeSessionId never accepts a stale transcript whose `created` floors to the SAME whole millisecond as `after` (FACTORY-631/FACTORY-623/FACTORY-568)", () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-ms-hazard-"));
+      try {
+        const dir = absPath("some", "workspace", "KAN-25");
+        const projectDir = join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        const TRIALS = 200;
+        for (let i = 0; i < TRIALS; i++) {
+          const id = `stale-trial-${i}`;
+          const file = join(projectDir, `${id}.jsonl`);
+          writeFileSync(file, "{}");
+          const stat = statSync(file);
+          const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+          const after = Math.floor(created); // a `Date.now()`-shaped value sharing `created`'s own millisecond — the ambiguous case
+          expect(discoverClaudeSessionId(dir, home, after)).toBeUndefined();
+        }
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
     test("persistDiscoveredSessionId writes what workspaceSessionId reads back", () => {
       const root = mkdtempSync(join(tmpdir(), "bw-persist-discovered-"));
       try {

@@ -2302,6 +2302,24 @@ describe("resumeInPlace", () => {
    * home directory, never the real one. `persistDiscoveredSessionId` writes
    * the SAME `.butchr-session-id.json` `HerdrHerd.startProviders` itself
    * would have written after discovering it post-launch.
+   *
+   * FACTORY-631/FACTORY-623/FACTORY-568 hardening: at least one caller
+   * (the "FACTORY-314 (epic review, round 3)" test below) immediately
+   * follows this with a REAL `herd.spawn()`, whose own `launchStartedAt =
+   * Date.now()` (`HerdrHerd.startProviders`) is what `discoverClaudeSessionId`
+   * filters this very transcript against. Relying on plain wall-clock
+   * ordering between the write just below and that later `Date.now()` call
+   * risks landing in the SAME millisecond — exactly the "created >= after
+   * compares true on a sub-ms birthtime vs a whole-ms `after`" hazard
+   * `discoverClaudeSessionId`'s own doc comment now documents (its fixed
+   * `AFTER_MARGIN_MS` bound needs the write to be in a STRICTLY EARLIER
+   * millisecond, not merely "earlier" by some fraction). A real, awaited
+   * delay here is the only thing that actually moves the value the filter
+   * reads (`birthtimeMs`, immutable once written — `utimesSync` cannot
+   * touch it, see the FACTORY-418 test's own hardening a few lines below
+   * for where that was tried and measured ineffective) — comfortably larger
+   * than any CI scheduler jitter this suite has measured (~2ms in the full
+   * suite), without being large enough to slow the suite down meaningfully.
    */
   async function withResumableSession<T>(cwd: string, id: string, fn: (home: string) => Promise<T>): Promise<T> {
     const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
@@ -2313,6 +2331,7 @@ describe("resumeInPlace", () => {
       mkdirSync(projectDir, { recursive: true });
       writeFileSync(join(projectDir, `${id}.jsonl`), "{}");
       persistDiscoveredSessionId(cwd, id);
+      await new Promise((r) => setTimeout(r, 50)); // see doc comment above — a real gap, not a retry or a fix for the production bound
       return await fn(home);
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -2754,6 +2773,12 @@ describe("resumeInPlace", () => {
         // anything in the launch argv (`p.args`) — never influenced by butchr.
         f.client.agent.start = async (p: any) => {
           await realStart(p);
+          // FACTORY-631/FACTORY-623/FACTORY-568: see the matching comment
+          // on the FACTORY-426 fixture below — a real, awaited delay so
+          // this fake write lands safely past `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS`, the same way a real Claude launch's own
+          // (much slower) transcript write always does.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `${claudeChosenId}.jsonl`), "{}");
@@ -2869,6 +2894,16 @@ describe("resumeInPlace", () => {
         f.client.agent.start = async (p: any) => {
           await rawStart(p);
           sessionCounter++;
+          // FACTORY-631/FACTORY-623/FACTORY-568: a real, awaited delay, not
+          // a sleep standing in for the production fix — `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS` (see its own doc comment) requires a
+          // transcript to land in a STRICTLY LATER millisecond than
+          // `launchStartedAt` to be accepted as this launch's own. A real
+          // Claude launch takes tens of milliseconds to seconds to do that
+          // on its own; this fake `agent.start` writes synchronously, with
+          // no real elapsed time at all, so it needs an explicit, realistic
+          // gap to stay a true positive instead of flaking on that margin.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
@@ -2930,6 +2965,16 @@ describe("resumeInPlace", () => {
         f.client.agent.start = async (p: any) => {
           await rawStart(p);
           sessionCounter++;
+          // FACTORY-631/FACTORY-623/FACTORY-568: a real, awaited delay, not
+          // a sleep standing in for the production fix — `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS` (see its own doc comment) requires a
+          // transcript to land in a STRICTLY LATER millisecond than
+          // `launchStartedAt` to be accepted as this launch's own. A real
+          // Claude launch takes tens of milliseconds to seconds to do that
+          // on its own; this fake `agent.start` writes synchronously, with
+          // no real elapsed time at all, so it needs an explicit, realistic
+          // gap to stay a true positive instead of flaking on that margin.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
