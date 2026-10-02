@@ -40,7 +40,17 @@ instead. If you ever doubt it, verify live with `jira_get_issue`'s
      the parent's branch. If the repo gates releases with per-PR changelog
      fragments (check for a `changelog.d/` directory), add yours there instead
      of editing `CHANGELOG.md` or `package.json`'s version directly — the
-     version is assigned at merge, not on a branch. Your story reviews it;
+     version is assigned at merge, not on a branch. If the repo has no
+     `changelog.d/` yet and can carry a version at all (not a build-output or
+     README-only repo), and your task really changes it, your PR also wires in
+     the release gate (just-in-time rule): paste the job from
+     `consumer-stub/ci-release-gate.yml` in
+     `https://github.com/brooswit-factory/release-gate` (pinned `@v1`) into its
+     `ci.yml`, add `changelog.d/README.md` from the same repo's
+     `consumer-stub/changelog.d-README.md`, and add your own fragment. Do not
+     do this for a repo you were not asked to change, and do not open a
+     separate task for it; if the workflow edit needs approval, say so on
+     your ticket. Your story reviews it;
      **once your PR is approved, merge it yourself** — you own your merge.
      Remove the worktree when done:
      `git -C ~/code/<owner>/<repo> worktree remove "$PWD/<repo>"`.
