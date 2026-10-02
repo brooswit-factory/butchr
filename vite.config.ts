@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import { collectThirdPartyNotices } from "./scripts/build/web-notices.js";
+import { collectThirdPartyNoticesForBundle } from "./scripts/build/web-notices.js";
 
 /**
  * FACTORY-613 (replays FACTORY-432 / PR #546): bundles `dashboard-app/` (the
@@ -16,13 +16,32 @@ import { collectThirdPartyNotices } from "./scripts/build/web-notices.js";
  * `bun run` step) so `vite build` alone — the one command
  * `scripts/build/build.ts` already calls — always produces a complete
  * `dist/web/`, with no second script to remember to run.
+ *
+ * REVIEW FIX: `generateBundle` is the hook that actually sees every output
+ * chunk's real `modules` map — the review on butchr#614 found the first
+ * pass's declared-dependency-closure walk missed five packages (react,
+ * react-dom, scheduler, react-router, react-aria-components) that reach
+ * the bundle only through PEER dependencies. Collecting every chunk's
+ * module ids here and resolving packages from THOSE (see
+ * `web-notices.ts`'s own header) is what actually matches what shipped;
+ * `closeBundle` then fails the build (via `assertAllBundledPackagesCovered`,
+ * inside `collectThirdPartyNoticesForBundle`) if any bundled package is
+ * still missing, rather than writing a silently incomplete file.
  */
-const thirdPartyNoticesPlugin = (): Plugin => ({
-  name: "butchr-third-party-notices",
-  closeBundle() {
-    writeFileSync(join(import.meta.dirname, "dist", "web", "THIRD_PARTY_NOTICES.txt"), collectThirdPartyNotices(import.meta.dirname));
-  },
-});
+const thirdPartyNoticesPlugin = (): Plugin => {
+  const moduleIds: string[] = [];
+  return {
+    name: "butchr-third-party-notices",
+    generateBundle(_options, bundle) {
+      for (const chunk of Object.values(bundle)) {
+        if (chunk.type === "chunk") moduleIds.push(...Object.keys(chunk.modules));
+      }
+    },
+    closeBundle() {
+      writeFileSync(join(import.meta.dirname, "dist", "web", "THIRD_PARTY_NOTICES.txt"), collectThirdPartyNoticesForBundle(import.meta.dirname, moduleIds));
+    },
+  };
+};
 
 export default defineConfig({
   root: "dashboard-app",
