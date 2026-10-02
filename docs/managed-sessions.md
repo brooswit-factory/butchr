@@ -1646,25 +1646,53 @@ every room this feature uses — there is only one bot account, never one
 per room (`RocketChatPoster.postMessage(channel, text)`,
 `src/resources/rocketchat.ts`, already takes the room per call).
 
-**Mention/markup neutralisation (FACTORY-607 comment 28781).** Everything
-quoted from the pane — the dialog's question, every option, the
+**Operational prerequisite before enabling (FACTORY-611).** The
+`butchr-escalation` bot account MUST be a member of BOTH `#team-admin` and
+`#team-engineering` with post rights in each, before the credential is
+configured. A room the bot cannot post to is NOT detected up front — a
+refused post there currently fails and is retried on the usual schedule
+(see "Retry, never latch on failure" below) exactly like a transient
+transport failure, which reads as a hung/flaky feature rather than a
+missing room membership. Do a one-time manual smoke post from the bot
+account to each room before turning this on in production.
+
+**Mention/markup neutralisation (FACTORY-607 comment 28781, hardened by
+FACTORY-611 against agentsafety's independent probe of 8f4242d).**
+Everything quoted from the pane — the dialog's question, every option, the
 fingerprint, the capture path, and the session/pane identifiers — is
 NEVER trusted and is neutralised before being posted:
 
-- Every quoted field goes inside ONE fenced code block per message. Only
-  the message's HEADER line (the real, intended `@mention` of whoever
-  should answer, and the session's display name) sits outside it — the
-  session name is itself derived from the managed session's DEFINITION
-  FILENAME, which this module cannot assume is attacker-free (a definition
-  named e.g. `@all.json`), so it is run through the SAME neutralisation
-  pipeline as every quoted field even though it sits outside the block.
-  Nothing else is allowed to sit outside the block, so a multi-line
-  question cannot inject a header-looking line or a bare `@mention` that
-  reads as a second, unintended ping.
-- Every `@` inside the block has a zero-width space (U+200B) inserted right
-  after it — `@all`, `@here`, `@admin-assembly`, or any other handle, can
-  never resolve as a real mention, while remaining visually identical to a
-  human skimming the post.
+- Every quoted field goes inside ONE fenced code block per message, at a
+  FIXED 3-backtick fence. Only the message's HEADER line (the real,
+  intended `@mention` of whoever should answer, and the session's display
+  name) sits outside it — the session name is itself derived from the
+  managed session's DEFINITION FILENAME, which this module cannot assume is
+  attacker-free (a definition named e.g. `@all.json`), so it is run through
+  the SAME neutralisation pipeline as every quoted field even though it
+  sits outside the block. Nothing else is allowed to sit outside the
+  block, so a multi-line question cannot inject a header-looking line or a
+  bare `@mention` that reads as a second, unintended ping.
+- **The fence is a FIXED 3 backticks — never widened.** FACTORY-611
+  corrects a real bug in the original (FACTORY-607) design: Rocket.Chat
+  8.8's own parser (`@rocket.chat/message-parser` 0.32.0) recognizes ONLY a
+  3-backtick fence, so widening the fence past the content's longest
+  backtick run (what originally shipped) did nothing to stop a quoted run
+  of 3+ backticks from ending the block early, or preventing it from
+  forming a code block at all — RC never treats a wider fence as special.
+  Every run of 3 or more backticks inside quoted content is instead BROKEN,
+  by interleaving a zero-width space (U+200B) between each backtick — a run
+  of any length stops being something RC's parser could ever read as a
+  fence, while staying visually identical to a human skimming the post.
+  Every generated post is verified through the real parser in this repo's
+  own tests (a pinned `0.32.0` dev dependency), asserting exactly one
+  `CODE` node and no stray mention/link/channel/emoji node outside it.
+- Every `@` inside the block ALSO has a zero-width space (U+200B) inserted
+  right after it — `@all`, `@here`, `@admin-assembly`, or any other handle,
+  can never resolve as a real mention, while remaining visually identical
+  to a human skimming the post. Kept as defence in depth even once the
+  fence itself provably holds (via the real-parser test above): a quoted
+  field also appears in the header-adjacent session name, which sits
+  OUTSIDE the fenced block by design.
 - Every `://` inside the block is defanged the same way (a zero-width space
   after the colon) — this breaks both a bare URL and a markdown
   `[text](url)` link without visually mangling the text. (Choice: defang
@@ -1672,25 +1700,56 @@ NEVER trusted and is neutralised before being posted:
   latter isn't something this repo's test suite can exercise without a live
   Rocket.Chat instance.)
 - `\r` is stripped outright (never folded into `\n`); every other C0
-  control character and DEL is stripped too. `\n` itself is kept — a
-  genuinely multi-line question is real content — because confinement
-  inside the one fenced block is what neutralises a newline-based injection
-  attempt, not removing the newline.
-- The fence delimiting the block is always longer than the longest run of
-  backticks anywhere in the content (minimum 3) — content can never close
-  the block early, however many backticks it contains.
-- Each quoted field is capped at 2000 characters, with an explicit
+  control character and DEL is stripped too, along with bidi-control
+  characters (U+202A-202E, U+2066-2069, U+200E, U+200F, U+061C) and the
+  Unicode line/paragraph separators (U+2028, U+2029, U+0085 NEL).
+- **Every quoted field is flattened to a single visible line** (FACTORY-611):
+  an embedded newline is replaced with a visible ` ⏎ ` marker rather than
+  kept literal. This closes a real spoofing gap the original design left
+  open: confinement inside the fenced block stops Rocket.Chat's OWN
+  renderer from treating an embedded newline as a real line break, but it
+  does nothing to stop a multi-line question from putting, say,
+  `fingerprint: deadbeef` on its own line where a HUMAN skimming the
+  labelled lines inside the block could mistake it for the real one.
+  Flattening every field to one line makes that impossible regardless of
+  content.
+- Truncation never cuts in the middle of a UTF-16 surrogate pair (the cut
+  point backs up by one code unit rather than risk an unpaired surrogate
+  reaching the post).
+- Each quoted field is normally capped at 2000 characters, with an explicit
   `... [truncated N chars]` marker when it was cut. The options list is
   separately capped at 10 options, with a `[N more option(s) omitted]`
-  marker when there were more.
+  marker when there were more. **The question and options are also
+  redacted** (the same `redact()` the Jira escalation path already uses)
+  **before truncation**, so a credential-shaped substring is masked rather
+  than posted, and can never straddle the truncation cut.
+- **The capture file path is quoted as its BASENAME only** (FACTORY-611) —
+  the full path embeds the operator's home directory layout and the
+  managed session's own definition path, neither of which belongs in a
+  Rocket.Chat room; the filename alone is still enough for an operator to
+  locate the file.
+- **The whole composed message (header, fences, every field) is budgeted to
+  ~4,500 characters** against Rocket.Chat's 5,000-character
+  `Message_MaxAllowedSize` (FACTORY-611) — if the normal 2000-char field
+  caps would produce an over-budget post (e.g. a very long question plus
+  several long options), the question's and each option's own cap is
+  shrunk proportionally (with the same truncation-marker mechanism) until
+  the whole message fits, rather than risk Rocket.Chat refusing an
+  oversized post outright.
+- The `[managed-escalation]` journal line that always fires (see "Not
+  configured" below) interpolates the dialog's raw question/options into a
+  single log line — these are sanitized (control characters stripped,
+  embedded newlines flattened) the same way, so a newline or ESC byte in
+  the pane text cannot forge an extra journal line.
 
 This applies to EVERY message this feature posts — the per-tier escalation
 below, and the clear-up follow-up once the dialog resolves.
 
-**Routing and tiers (FACTORY-609).** An episode (first mark until the pane
-clears or the fingerprint changes — the SAME episode concept the section
-above already tracks) can reach up to three tiers, each posted AT MOST ONCE
-per episode:
+**Routing and tiers (FACTORY-609; the episode/tier-clock definition
+corrected by FACTORY-611 below).** An episode (first mark until the pane
+clears — see "Tier clock is keyed to blocked-since" below for why this is
+no longer "...or the fingerprint changes") can reach up to three tiers,
+each posted AT MOST ONCE per episode:
 
 | Tier | When | Ordinary managed session | admin-assembly's own pane |
 | --- | --- | --- | --- |
@@ -1726,25 +1785,61 @@ on the old `@director`/`#team-admin` behaviour for this one pane should
 watch `#team-engineering` instead, or override `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION`/`_ROOM`
 back to the old values if they genuinely need to keep it.
 
+**Tier clock is keyed to blocked-since, not fingerprint (FACTORY-611).**
+Tiers are keyed to a `blocked-since` instant for the PANE, reset ONLY when
+the pane actually clears — never by a text/fingerprint change while still
+blocked. This corrects a real bug in the original (FACTORY-609) design:
+every fingerprint change previously started a brand-new episode with a
+fresh tier clock and fresh per-tier latches, so a pane blocked 40 minutes
+on a dialog whose text flipped every minute produced 40 tier-1 posts and
+zero tier 2/3 — the director was never reached, however long the pane
+stayed stuck. A fingerprint change within an ALREADY-tracked episode now
+only updates that episode's own quoted text in place (logged once, tier
+clock and latches untouched); only a pane the herd stops reporting blocked
+at all ends the episode.
+
 **Rate cap interaction.** The existing per-pane hourly cap (3 posts/hour,
 `MANAGED_TEAM_ADMIN_MAX_PER_HOUR`) is consulted and consumed ONLY by a
-genuinely NEW episode's tier-1 mark — never by tier 2 or tier 3 of an
-already-marked episode, and never by a retry of a tier that already failed
-once. This is a deliberate decision, not an oversight: the cap's job is
-bounding how many DISTINCT episodes (e.g. a drifting dialog-recognizer
-racking up new "fingerprints" on the same pane) can post per pane per hour
-— exempting tiers 2/3 means one long episode's own three tiers can never
-exhaust a pane's entire budget and silently swallow a LATER, unrelated
-episode's tiers within the same hour.
+genuinely NEW episode's tier-1 mark (i.e. a pane that was not already
+tracked — see the tier-clock correction above for what no longer counts as
+"new") — never by tier 2 or tier 3 of an already-marked episode, and never
+by a retry of a tier that already failed once. This is a deliberate
+decision, not an oversight: the cap's job is bounding how many DISTINCT
+episodes (the pane actually clearing and re-blocking repeatedly) can post
+per pane per hour — exempting tiers 2/3 means one long episode's own three
+tiers can never exhaust a pane's entire budget and silently swallow a
+LATER, unrelated episode's tiers within the same hour.
 
-**Retry, never latch on failure.** Each tier's post is tracked
-independently (its own `tierNNotifiedAt` slot) — a transport failure for
-one tier is logged and retried on the next qualifying poll, and never
-blocks or is blocked by another tier's own attempt. The clear-up follow-up,
-once the dialog resolves, is replayed to every ROOM the episode actually
-reached (a normal episode that escalated past tier 2 into tier 3 reaches
-both `#team-admin` and `#team-engineering`, and gets its "no longer
-blocked" notice in both).
+**A rate-capped episode is journal-only for its entire lifetime
+(FACTORY-611).** A real bug in the original design let a capped episode's
+own LATER repeat polls post anyway: the cap denied only the very first
+poll's own attempt, left that tier unlatched, and the next poll of the SAME
+(now-tracked) episode retried it with no cap check at all — measured at up
+to 360 posts/hour for a pane whose fingerprint drifted every 2nd poll. A
+denied episode is now flagged and never posts to Rocket.Chat again for its
+whole lifetime, however many times it is re-evaluated; one clear WARNING
+line fires when the cap is first hit for a pane, not one per poll.
+
+**Retry, never latch on failure — but backed off (FACTORY-611).** Each
+tier's post is tracked independently (its own `tierNNotifiedAt` slot) — a
+transport failure for one tier is logged and retried on the next
+qualifying poll, and never blocks or is blocked by another tier's own
+attempt. A failed (or not-yet-attempted) tier is now retried, and its own
+WARNING re-logged, no more than once per ~60 seconds — a persistently
+refusing poster previously cost an attempt and a WARNING line on every
+single poll (measured: 361 of each in 30 minutes at 5s polls, across two
+tiers). The clear-up follow-up, once the dialog resolves, is replayed to
+every ROOM the episode actually reached (a normal episode that escalated
+past tier 2 into tier 3 reaches both `#team-admin` and `#team-engineering`,
+and gets its "no longer blocked" notice in both).
+
+**Whole-message size budget (FACTORY-611).** The composed message — header,
+fences, and every labelled field — is budgeted to ~4,500 characters against
+Rocket.Chat's 5,000-character `Message_MaxAllowedSize`, leaving headroom
+this module cannot predict exactly (multi-code-unit characters, routing
+quirks). If the normal per-field caps would produce an over-budget post,
+the question's and each option's own cap shrinks proportionally (with the
+same `... [truncated N chars]` marker) until the whole message fits.
 
 **Not configured.** With the three credential env vars unset, this whole
 feature is off: no Rocket.Chat post at any tier, ever — but each tier STILL
@@ -1758,14 +1853,16 @@ Rocket.Chat) can still see that a pane crossed the 10- and 20-minute
 thresholds and who would have been pinged.
 
 **Which path drives tier re-evaluation.** Elapsed time is only checked when
-something calls back into `markManagedSessionStalled` for an already-marked
-(pane, fingerprint) — Butchr's own poll (`handleManagedSessionBlocked`, via
-`onBlocked`) does this on every qualifying poll while the pane stays
-blocked, so for THAT detector tiers 2/3 fire on schedule regardless of
-anything else. Drovr's own hook (`onDrovrUnknownDialog`) is, by its own
-package's contract, called at most ONCE per (pane, fingerprint) episode —
-so if a dialog is recognized ONLY by drovr's detector and never by Butchr's
-own parser for the same pane, that episode's tier 2/3 re-evaluation depends
-on Butchr's own poll having ALSO marked it (which, per "Two detectors, one
-mark" above, happens whenever both detectors see the same episode) rather
-than on drovr re-calling its hook.
+something calls back into `markManagedSessionStalled` for an
+already-tracked PANE (FACTORY-611: keyed by pane, not by (pane,
+fingerprint) — see "Tier clock is keyed to blocked-since" above) —
+Butchr's own poll (`handleManagedSessionBlocked`, via `onBlocked`) does
+this on every qualifying poll while the pane stays blocked, so for THAT
+detector tiers 2/3 fire on schedule regardless of anything else. Drovr's
+own hook (`onDrovrUnknownDialog`) is, by its own package's contract, called
+at most ONCE per (pane, fingerprint) episode — so if a dialog is recognized
+ONLY by drovr's detector and never by Butchr's own parser for the same
+pane, that episode's tier 2/3 re-evaluation depends on Butchr's own poll
+having ALSO marked it (which, per "Two detectors, one mark" above, happens
+whenever both detectors see the same episode) rather than on drovr
+re-calling its hook.
