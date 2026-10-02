@@ -45,6 +45,11 @@ const thirdPartyNoticesPlugin = (): Plugin => {
 
 export default defineConfig({
   root: "dashboard-app",
+  // FACTORY-642: the app is served under /dashboard-app/ (src/web/view.ts
+  // registers /dashboard-app and /dashboard-app/*), but with no `base` Vite
+  // emitted asset URLs from `/` instead — `/assets/*` 404s because nothing
+  // serves assets there, only under `/dashboard-app/assets/*`.
+  base: "/dashboard-app/",
   plugins: [react(), thirdPartyNoticesPlugin()],
   build: {
     outDir: "../dist/web",
