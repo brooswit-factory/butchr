@@ -3181,6 +3181,54 @@ describe("createEscalator — FACTORY-611: harden the managed-session escalation
   });
 
   // =========================================================================
+  // Item 1 (direct assertions, per review of PR #612 — these two are not
+  // visible to the AST-based real-parser test above: a bidi/line-separator
+  // control or a lone surrogate changes the POST'S TEXT but not the parsed
+  // structure Rocket.Chat's parser produces, so `assertFenceHolds` alone
+  // cannot catch either being reintroduced. Confirmed by mutation: removing
+  // `BIDI_AND_LINE_CONTROLS` or reverting `safeTruncateIndex` turned 0 tests
+  // red before these existed.
+  // =========================================================================
+  describe("item 1 (direct assertions): bidi/line-separator stripping and surrogate-pair-safe truncation", () => {
+    test("bidi controls and Unicode line/paragraph separators never appear anywhere in the post or the journal mark line", async () => {
+      // U+202A-202E, U+2066-2069, U+200E, U+200F, U+061C, U+2028, U+2029, U+0085 (NEL).
+      const bidiChars = "\u202A\u202B\u202C\u202D\u202E\u2066\u2067\u2068\u2069\u200E\u200F\u061C\u2028\u2029\u0085";
+      const question = `before${bidiChars}after`;
+      const options = [`opt${bidiChars}ion`, "plain"];
+      const prompt = { question, options, current: 1 } as unknown as ReturnType<typeof parsePrompt>;
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.escalator.onBlocked("p1", null, prompt!, 1);
+      const text = ta.posts[0]!;
+      for (const ch of bidiChars) expect(text).not.toContain(ch);
+      const markLine = h.logs.find((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("marked stalled"))!;
+      expect(markLine).toBeDefined();
+      for (const ch of bidiChars) expect(markLine).not.toContain(ch);
+    });
+
+    test("truncation never splits a surrogate pair — no lone high or low surrogate reaches the post", async () => {
+      const cap = QUOTE_FIELD_CAP_FOR_TEST;
+      // Deliberately space-separated filler (never a 32+ contiguous alnum/
+      // symbol run) so redact()'s opaque-secret-blob heuristic never eats
+      // it before truncation is reached — the earlier version of this
+      // payload (a bare "x".repeat(...)) was fully redacted away, so
+      // truncation never actually ran; that's WHY the real-parser test
+      // alone never caught the surrogate-splitting bug.
+      const safeFiller = "ab cd ef gh ".repeat(400);
+      const prefix = safeFiller.slice(0, cap - 1); // an emoji (surrogate pair) lands exactly straddling the truncation cut
+      const question = `${prefix}😀${"ij kl ".repeat(10)}`;
+      const prompt = { question, options: ["plain"], current: 1 } as unknown as ReturnType<typeof parsePrompt>;
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.escalator.onBlocked("p1", null, prompt!, 1);
+      const text = ta.posts[0]!;
+      expect(text).toMatch(/\.\.\. \[truncated \d+ chars\]/); // confirms truncation genuinely happened
+      expect(text).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/); // no lone high surrogate
+      expect(text).not.toMatch(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/); // no lone low surrogate
+    });
+  });
+
+  // =========================================================================
   // Item 2: redaction — the existing redact() applied before quoting/
   // truncation, with the three fake-value shapes agentsafety measured.
   // =========================================================================
