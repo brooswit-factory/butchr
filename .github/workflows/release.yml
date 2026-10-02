@@ -1,10 +1,20 @@
+# DISABLED ON PURPOSE (FACTORY-620 / GitHub #615): there is no npm publisher
+# set up for @brooswit/butchr, so the old `publish` job's npm step 404'd on
+# every push to main. Brooswit decided: no npm publishing for now — she will
+# clone the repos; releases are a git tag plus a GitHub Release only. This
+# workflow was disabled via `gh workflow disable release` (FACTORY-601,
+# state `disabled_manually`) and must STAY disabled until Brooswit answers
+# the open versioning question — do not re-enable it and do not pick a
+# version as part of re-enabling it. The npm-publish step itself is removed
+# below so that re-enabling this workflow by accident can't publish
+# anywhere; what remains (collate fragments, commit, tag, GitHub Release)
+# is kept so the file stays usable once versioning is decided.
 name: release
 on:
   push:
     branches: [main]
 permissions:
   contents: write   # version-bump commit + tag + GitHub Release
-  id-token: write   # npm trusted publishing (OIDC) + provenance
 concurrency:
   group: release-main
   cancel-in-progress: false   # never cancel a merge's release — that would strand its fragment unreleased, silently
@@ -16,9 +26,6 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
-      - uses: actions/setup-node@v4
-        with: { node-version: "22", registry-url: "https://registry.npmjs.org" }
-      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5
       - run: bun install --frozen-lockfile
       - name: sync onto the current origin/main
         # cancel-in-progress:false serializes this workflow with itself — a second merge's run
@@ -34,10 +41,7 @@ jobs:
       - if: steps.collate.outputs.needed == 'true'
         run: bun run check && bun run build
       - if: steps.collate.outputs.needed == 'true'
-        name: publish to npm (OIDC, provenance)
-        run: npm publish --provenance --access public
-      - if: steps.collate.outputs.needed == 'true'
-        name: commit + push the version bump (published to npm above; recording it here can't double-publish if it needs a retry)
+        name: commit + push the version bump (no npm publish; tag + GitHub Release only — see header)
         env: { V: "${{ steps.collate.outputs.version }}" }
         run: |
           git config user.name "github-actions[bot]"

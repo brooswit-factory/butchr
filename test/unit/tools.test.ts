@@ -286,8 +286,8 @@ describe("comment identity tagging", () => {
 });
 
 describe("jira_create_issue: role assignment, implements/parent resolution, orphan opt-out (KAN-802)", () => {
-  const STORY_ID = "712020:e160cf60-6480-44de-8554-af5b81c584e2";
-  const TASK_ID = "712020:619ec5ec-2e92-492f-8979-91ccda318230";
+  const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
+  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -468,17 +468,17 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
   test("audit line for a Story with implements matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", parent: "KAN-794", implements: "KAN-794" }, conn);
-    expect(audits.some((a) => a.includes("create Story under KAN-794 implements KAN-794 → 712020:e160…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Story under KAN-794 implements KAN-794 → 000000:0000…"))).toBe(true);
   });
   test("audit line for a Task with implements matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s", parent: "KAN-794", implements: "KAN-795" }, conn);
-    expect(audits.some((a) => a.includes("create Task under KAN-794 implements KAN-795 → 712020:619e…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Task under KAN-794 implements KAN-795 → 000000:1111…"))).toBe(true);
   });
   test("audit line for orphan-by-request matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "none" }, conn);
-    expect(audits.some((a) => a.includes("create Story under (none) orphan by request → 712020:e160…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Story under (none) orphan by request → 000000:0000…"))).toBe(true);
   });
 });
 
@@ -633,8 +633,8 @@ describe("confluence_create_page parentId", () => {
 });
 
 describe("jira_assign (KAN-810)", () => {
-  const STORY_ID = "712020:e160cf60-6480-44de-8554-af5b81c584e2";
-  const TASK_ID = "712020:619ec5ec-2e92-492f-8979-91ccda318230";
+  const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
+  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {

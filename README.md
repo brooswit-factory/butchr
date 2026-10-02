@@ -40,12 +40,15 @@ one Elysia process
 
 ## Install & run
 
-On each machine:
+No npm package is published (see "Development" below for why) — clone and run from source on each machine:
 
 ```
-npm i -g @brooswit/butchr     # or pin a version
+git clone https://github.com/brooswit-factory/butchr.git
+cd butchr
+bun install
+bun run build
 cp .env.example .env          # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
-butchr                        # reads .env / the environment
+bun run start                 # reads .env / the environment
 ```
 
 As of 0.10.0, also set `BUTCHR_ASSIGNEE_STORY` and `BUTCHR_ASSIGNEE_TASK` (Atlassian accountIds) in `.env` before deploying — `jira_create_issue` assigns a Story/Task by role from these, and REFUSES to create one of that type if its role is unset and the caller passed no explicit `assignee`. Epics are unaffected.
@@ -57,12 +60,6 @@ herdr's own `blocked` classification is not the only blocked-detector: a pane he
 Since FACTORY-127/FACTORY-138 (operator decision, FACTORY-67), butchr's own default for a Claude agent (managed-session or rule-launched) that sets neither field is `permissionMode: "acceptEdits"` paired with lizard-eligible together — an agent that sets nothing gets both; an explicit `permissionMode` or `lizardMode: false` still wins. There is no global switch for this default: rolling one agent back means setting `permissionMode: "bypassPermissions"` explicitly on it — `jira-project` agents inherit this default like every other rule kind too, since FACTORY-129 removed their own unconditional `permissionMode: "auto"` override. "Lizard mode" (`lizardMode`) is a separate toggle that pairs with any `permissionMode` that prompts, not only `"default"`: a standalone 20s sweep (`src/agents/permission-answer-loop.ts`), plus an event-driven fast path that answers an eligible pane in about a second, auto-answers Claude's own tool-permission dialog ("Do you want to proceed?") on that agent's pane only — no other pane is ever touched — by pressing the plain "Yes" option (allow once), and only when it is unambiguously that option (`@brooswit/drovr`'s `autoAnswerPermissions`, `scope: "once"`); it never presses the "always allow" stored-rule option, and no rule persists past that one answer. `permissionMode: "acceptEdits"` auto-accepts file EDITS only — Bash and MCP tool prompts still appear, and those are what lizard mode answers, so it stays useful even in modes that already skip some prompts. Manual (`permissionMode: "default"`) plus lizard remains valid as an alternative pairing — Claude prompts before every tool call, and lizard mode still clears the tool-permission dialog unattended. Every attempt is audited to `BUTCHR_PERMISSION_AUDIT_PATH` (default `.permission-audit.jsonl` under the workspace root), and the journal names the agent and tool for each one. See [`docs/managed-sessions.md`](docs/managed-sessions.md)'s "Lizard mode" section and [`docs/permission-answer-loop.md`](docs/permission-answer-loop.md) for the field, cadence/timeout reasoning, and how this avoids double-answering with the two detectors above.
 
 Optionally set `BUTCHR_LIZARD_APPROVAL_SOUND` (any non-empty value; OFF/absent by default) to play a sound on **this daemon's own host** every time lizard mode auto-approves a prompt — the operator hears each unattended approval as it happens, not just from the audit log. With no override, the sound is `@brooswit/drovr`'s own bundled asset, resolved straight out of the installed package; set `BUTCHR_LIZARD_APPROVAL_SOUND_PATH` to a local file path (`~` expanded) instead. A burst of approvals within ~1.5s plays at most one sound. Never blocks, delays, or fails an approval — every failure mode (source unresolvable, no local player found) logs at most one warning and degrades to silence rather than retrying. Tries `gst-play-1.0`, `afplay` (macOS), `mpv`, `ffplay`, `paplay`, `pw-play`, then `aplay` (wav only), whichever is found on `PATH` first, remembering the first one that actually works. See [`docs/permission-answer-loop.md`](docs/permission-answer-loop.md)'s "Approval sound" section (`src/agents/approval-sound.ts`) for player selection, default-source resolution, and degrade-behaviour details.
-
-From source (development):
-
-```
-bun run start
-```
 
 **Label-write permission.** butchr writes `agent:*`/`pr:*` labels quietly (`notifyUsers=false`) so watchers aren't spammed on every status flip — but Jira Cloud only honours that for an account holding the **Administrator** project role (or global Administer Jira) on the board's project. Grant the daemon's Atlassian account that role on each project it labels tickets in. Without it, labels still sync — nothing is disabled — but every label change sends the ticket's watchers a Jira notification, and the daemon says so once at startup, e.g.:
 

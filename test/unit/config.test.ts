@@ -124,9 +124,9 @@ describe("loadConfig", () => {
     expect(c.assignees.task).toBeUndefined();
   });
   test("describeConfig includes the resolved accountIds and names the consequence when a role is unset, never a token", () => {
-    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:e160cf60-6480-44de-8554-af5b81c584e2", BUTCHR_ASSIGNEE_TASK: "712020:619ec5ec-2e92-492f-8979-91ccda318230" }, noRead));
-    expect(both).toContain("assignees=story:712020:e160");
-    expect(both).toContain("task:712020:619e");
+    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "000000:00000000-0000-0000-0000-000000000000", BUTCHR_ASSIGNEE_TASK: "000000:11111111-1111-1111-1111-111111111111" }, noRead));
+    expect(both).toContain("assignees=story:000000:0000");
+    expect(both).toContain("task:000000:1111");
     const none = describeConfig(loadConfig(base, noRead));
     expect(none).toContain("story:unset — Story creation will be refused");
     expect(none).toContain("task:unset — Task creation will be refused");
@@ -143,8 +143,8 @@ describe("loadConfig", () => {
     expect(c.assignees.epic).toBeUndefined();
   });
   test("describeConfig includes the resolved epic accountId, and names the consequence when unset, never a token", () => {
-    const set = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "712020:e160cf60-6480-44de-8554-af5b81c584e2" }, noRead));
-    expect(set).toContain("epic:712020:e160");
+    const set = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "000000:00000000-0000-0000-0000-000000000000" }, noRead));
+    expect(set).toContain("epic:000000:0000");
     const unset = describeConfig(loadConfig(base, noRead));
     expect(unset).toContain("epic:unset — Epic creation will be refused");
   });
