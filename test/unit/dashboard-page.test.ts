@@ -60,7 +60,7 @@ function elementText(html: string, openTagMarker: string, closeTag: string): str
 function opts(over: Partial<RenderDashboardOpts> = {}): RenderDashboardOpts {
   return {
     now: 0,
-    header: { build: { sha: "a".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.2.3" } },
+    header: { build: { sha: "a".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.2.3", versionProvenance: "tag", versionUnknownReason: null } },
     terminalLinkHref: (pane) => `/agents/pane/${encodeURIComponent(pane)}/attach`,
     resourceLinkHref: (key) => `/resource/${encodeURIComponent(key)}/open`,
     ...over,
@@ -532,7 +532,7 @@ describe("renderDashboard: mutation 8 — never a Jira-label-derived status (BUT
 // diverged/undetermined).
 // ---------------------------------------------------------------------------
 describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
-  const build = { sha: "b".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" };
+  const build = { sha: "b".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag" as const, versionUnknownReason: null };
   const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
 
   test("no currency sibling at all (older build): falls back to the build sha alone", () => {
@@ -716,7 +716,7 @@ describe("renderDashboard: the auto-refresh meta tag is present and coupled to t
 // ---------------------------------------------------------------------------
 describe("renderDashboard: the currency line carries its own age, never a bare 'checked' (BUTCHR-344 [correction], review item H1)", () => {
   test("a known checkedAt/now renders 'checked <age> ago', not a bare 'checked'", () => {
-    const build = { sha: "d".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0" };
+    const build = { sha: "d".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
     const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
     const html = renderDashboard(
       response,

@@ -300,7 +300,7 @@ describe("admissionView: mutation 3 — per-source independence, never smeared",
 });
 
 describe("buildHeaderView — currency, never red", () => {
-  const build = { sha: "abcdef0123456789", shaDirty: false, shaUnknownReason: null, version: "1.2.3" };
+  const build = { sha: "abcdef0123456789", shaDirty: false, shaUnknownReason: null, version: "1.2.3", versionProvenance: "tag" as const, versionUnknownReason: null };
   const base = { ref: "origin/main", sha: "x", changedAt: null, changedAtUnknownReason: null, fetchedAt: null, fetchedAtUnknownReason: null };
 
   test("no currency sibling at all (older build): falls back to the build sha alone", () => {
@@ -358,7 +358,7 @@ describe("buildHeaderView — currency, never red", () => {
   });
 
   test("no build sha at all: renders 'build sha unknown', with the reason when given", () => {
-    const v = buildHeaderView({ build: { sha: null, shaDirty: null, shaUnknownReason: "no provenance", version: "1.2.3" } }, NOW);
+    const v = buildHeaderView({ build: { sha: null, shaDirty: null, shaUnknownReason: "no provenance", version: "1.2.3", versionProvenance: "tag", versionUnknownReason: null } }, NOW);
     expect(v.buildText).toBe("build sha unknown (no provenance)");
   });
 });

@@ -170,7 +170,7 @@ describe("DashboardRoute — FACTORY-615: the real main dashboard at /dashboard-
       ],
       admission: ADMISSION,
     };
-    const health: HealthStatus = { ok: true, components: [], build: { sha: "abc123def456", shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "9.9.9", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" } };
+    const health: HealthStatus = { ok: true, components: [], build: { sha: "abc123def456", shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag", versionUnknownReason: null, startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" } };
     globalThis.fetch = routed({ "/dashboard": { body: response }, "/health": { body: health } });
     const { getByTestId, container } = render(<DashboardRoute />);
     await waitFor(() => expect(container.querySelector('[id="agent-jira-work%3Arule1%3AFACTORY-68"]')).toBeTruthy());

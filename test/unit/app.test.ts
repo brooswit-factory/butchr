@@ -34,7 +34,7 @@ const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, co
 // below that predates the dashboard PAGE and isn't exercising it — the page's
 // own render contract gets its dedicated fixtures in dashboard-page.test.ts,
 // and this file's own dedicated `GET /` describe block below.
-const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
+const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } });
 const noResourceLink = async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` });
 // FACTORY-72: a trivial, empty fixture for every existing ViewDeps literal
 // below that predates /config-inventory and isn't exercising it — that
@@ -257,7 +257,7 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     // sha and the stale-currency line the route is supposed to pass through
     // from `deps.header()` actually reach the served page.
     const header = (): DashboardHeaderInfo => ({
-      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" },
+      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag", versionUnknownReason: null },
       currency: {
         checkedAt: new Date(pollTime).toISOString(),
         verdict: { status: "stale", commitsBehind: 5, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },

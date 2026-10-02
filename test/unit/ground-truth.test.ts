@@ -14,6 +14,8 @@ const FIXTURE_BUILD: BuildIdentity = {
   shaDirty: false,
   shaUnknownReason: null,
   version: "1.2.3",
+  versionProvenance: "tag",
+  versionUnknownReason: null,
   startedAt: "2026-09-02T00:00:00.000Z",
   pid: 4242,
   systemd: { kind: "none" },

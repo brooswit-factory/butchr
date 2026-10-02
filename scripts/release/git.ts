@@ -57,6 +57,25 @@ export function latestVTag(cwd: string, head: string): TagRef | null {
 }
 
 /**
+ * Commits strictly between `tag` (exclusive) and `head` (inclusive) —
+ * `git rev-list --count <tag>..<head>`. 0 when `head` IS the tagged commit.
+ * Used by `src/agents/build-identity.ts` to report `X.Y.Z` (0 commits past
+ * the tag) vs `X.Y.Z+N` (N commits past it) as the daemon's own version,
+ * instead of the frozen `package.json` number.
+ */
+export function commitsSince(cwd: string, tag: string, head: string): number {
+  let out: string;
+  try {
+    out = git(cwd, ["rev-list", "--count", `${tag}..${head}`]).trim();
+  } catch (e) {
+    throw new Error(`could not count commits between ${tag} and ${head}: ${(e as Error).message.split("\n")[0]}`);
+  }
+  const n = Number(out);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`unexpected "git rev-list --count ${tag}..${head}" output: ${JSON.stringify(out)}`);
+  return n;
+}
+
+/**
  * `changelog.d/*.md` fragments ADDED strictly between `tag` (exclusive) and
  * `head` (inclusive) — `README.md` excluded. A fragment already present AT
  * `tag` is never returned: `--diff-filter=A` only matches a path that did
