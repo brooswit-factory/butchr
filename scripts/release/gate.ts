@@ -18,6 +18,8 @@ export interface Facts {
   schemaChanged: boolean;
   /** changelog.d/*.md fragments added by this branch (new files, not present at the merge-base) */
   newFragments: Fragment[];
+  /** Public surface under src/ (HTTP routes, BUTCHR_* env names) added/removed vs the merge-base. Absent = not measured. */
+  surface?: { added: string[]; removed: string[] };
   today: string; // YYYY-MM-DD, informational only now — no longer used to date a branch's entry
 }
 
@@ -88,6 +90,24 @@ export function evaluate(f: Facts): GateResult {
     v(highest !== null && highest !== "patch", highest !== null && highest !== "patch"
       ? `schema/herdr-api.schema.json changed and fragments declare at least minor (${highest})`
       : `schema/herdr-api.schema.json changed: that requires at least a MINOR bump — declare "bump: minor" or higher in a changelog.d/ fragment`);
+  }
+
+  // 6. public-surface drift ⇒ a minimum declared bump. Removing a route or env var breaks callers (major);
+  //    adding one is new capability (minor). Measured as a set diff over all of src/, so a move or rename
+  //    inside src/ that keeps the name is neutral, while a rename shows as a removal plus an addition.
+  if (f.surface && f.newFragments.length > 0) {
+    const highest = highestBump(f.newFragments);
+    const list = (xs: string[]) => xs.join(", ");
+    if (f.surface.removed.length > 0) {
+      v(highest === "major", highest === "major"
+        ? `public surface removed (${list(f.surface.removed)}) and fragments declare bump: major`
+        : `public surface removed (${list(f.surface.removed)}): that breaks callers and requires "bump: major" with a ### BREAKING section (highest declared: ${highest ?? "none"})`);
+    } else if (f.surface.added.length > 0) {
+      const ok = highest === "minor" || highest === "major";
+      v(ok, ok
+        ? `public surface added (${list(f.surface.added)}) and fragments declare at least minor (${highest})`
+        : `public surface added (${list(f.surface.added)}): that requires at least "bump: minor" (highest declared: ${highest ?? "none"})`);
+    }
   }
 
   return { required, bump: highestBump(f.newFragments), verdicts, ok: verdicts.every((x) => x.ok) };

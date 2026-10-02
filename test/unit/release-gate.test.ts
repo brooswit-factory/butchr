@@ -21,6 +21,31 @@ const base: Facts = {
 };
 const failing = (f: Partial<Facts>) => evaluate({ ...base, ...f }).verdicts.filter((v) => !v.ok).map((v) => v.reason);
 
+describe("release gate: a minimum bump derived from the public surface (FACTORY-624)", () => {
+  const withFrag = (bump: string, extra = "") => [frag("changelog.d/X.md", `bump: ${bump}\n${extra}### Fixed\n- a change\n`)];
+  test("an added route or env var needs at least minor; patch fails and says why", () => {
+    const surface = { added: ["route /new", "env BUTCHR_NEW"], removed: [] };
+    expect(failing({ surface, newFragments: withFrag("patch") })[0]).toMatch(/public surface added \(route \/new, env BUTCHR_NEW\).*at least "bump: minor"/);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("minor") }).ok).toBe(true);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("major", "### BREAKING\n- b\n") }).ok).toBe(true);
+  });
+  test("a removed route or env var needs major (and so a BREAKING section)", () => {
+    const surface = { added: [], removed: ["env BUTCHR_OLD"] };
+    expect(failing({ surface, newFragments: withFrag("minor") })[0]).toMatch(/public surface removed \(env BUTCHR_OLD\).*requires "bump: major"/);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("major", "### BREAKING\n- b\n") }).ok).toBe(true);
+  });
+  test("a rename (one removed, one added) is judged as a removal", () => {
+    expect(failing({ surface: { added: ["route /b"], removed: ["route /a"] }, newFragments: withFrag("minor") })[0]).toMatch(/removed/);
+  });
+  test("no surface change, or surface not measured, adds no verdict", () => {
+    expect(evaluate({ ...base, surface: { added: [], removed: [] } }).verdicts).toHaveLength(evaluate(base).verdicts.length);
+    expect(evaluate({ ...base }).ok).toBe(true);
+  });
+  test("a docs-only PR is exempt even if surface were reported", () => {
+    expect(evaluate({ ...base, changedFiles: ["README.md"], newFragments: [], surface: { added: ["env BUTCHR_X"], removed: [] } }).ok).toBe(true);
+  });
+});
+
 describe("release gate (version at merge, changelog.d fragments)", () => {
   test("happy path: gated change, unchanged version, one fragment, no new heading — passes", () => {
     const r = evaluate(base);

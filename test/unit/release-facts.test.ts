@@ -127,3 +127,22 @@ describe("gatherFacts.baseVersion is merge-base relative (KAN-788)", () => {
     } finally { process.chdir(cwd); }
   }, 20_000);
 });
+
+describe("surfaceAt / gatherFacts surface (FACTORY-624)", () => {
+  test("routes and BUTCHR_* names are diffed against the merge-base; a rename is a removal plus an addition", () => {
+    const d = mkdtempSync(join(tmpdir(), "surface-"));
+    const sh = (c: string) => execSync(c, { cwd: d, stdio: "ignore" });
+    sh("git init -q -b main && git config user.email t@t && git config user.name t && mkdir src");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.1.0" }));
+    writeFileSync(join(d, "CHANGELOG.md"), "# C\n## [0.1.0] - 2026-01-01\n### Added\n- a\n");
+    writeFileSync(join(d, "src/a.ts"), `app.get("/keep", h).post('/gone', h); const e = process.env.BUTCHR_KEEP ?? process.env.BUTCHR_GONE;\n`);
+    sh("git add -A && git commit -qm base && git checkout -qb feat");
+    writeFileSync(join(d, "src/a.ts"), "app.get(\"/keep\", h).put(`/fresh/:id`, h); const e = process.env.BUTCHR_KEEP ?? process.env.BUTCHR_FRESH;\n");
+    sh("git add -A && git commit -qm change");
+    const cwd = process.cwd(); process.chdir(d);
+    try {
+      const f = gatherFacts("main");
+      expect(f.surface).toEqual({ added: ["env BUTCHR_FRESH", "route /fresh/:id"], removed: ["env BUTCHR_GONE", "route /gone"] });
+    } finally { process.chdir(cwd); }
+  });
+});
