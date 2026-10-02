@@ -36,7 +36,8 @@ jobs:
         run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
   release-gate:
     name: release gate
-    if: github.event_name == 'pull_request'
+    # Runs on pull requests AND branch pushes: with a pull_request-only `if`, a branch pushed
+    # without a PR reported this required check as SKIPPED (FACTORY-626).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,4 +48,4 @@ jobs:
         with: { node-version: "22" }
       - run: bun install --frozen-lockfile
       - run: bun run scripts/release/check.ts
-        env: { RELEASE_BASE: "origin/${{ github.base_ref }}" }
+        env: { RELEASE_BASE: "origin/${{ github.base_ref || 'main' }}" }
