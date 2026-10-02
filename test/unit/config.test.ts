@@ -382,6 +382,61 @@ describe("loadConfig", () => {
       expect(d).toContain("adminTokenFile=/etc/ta-token");
     });
   });
+
+  // FACTORY-609 (Part B): always present, independent of the credential
+  // gate above — defaults to the director's own routing (FACTORY-607
+  // comment 28688), overridable per-value via env vars.
+  describe("managedEscalationRouting (FACTORY-609)", () => {
+    test("defaults match the director's routing (FACTORY-607 comment 28688) when nothing is set", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.managedEscalationRouting).toEqual({
+        normalMention: "@admin-assembly", normalRoom: "team-admin",
+        assemblyMention: "@manager-factory", assemblyRoom: "team-engineering",
+        directorMention: "@director", directorRoom: "team-engineering",
+        tier2Minutes: 10, tier3Minutes: 20,
+      });
+    });
+
+    test("every value is independently overridable via its own env var", () => {
+      const c = loadConfig({
+        ...base,
+        BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION: "@custom-answerer",
+        BUTCHR_TEAM_ADMIN_ROOM: "custom-admin-room",
+        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION: "@custom-manager",
+        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM: "custom-eng-room",
+        BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION: "@custom-director",
+        BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM: "custom-director-room",
+        BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "7",
+        BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "15",
+      }, noRead);
+      expect(c.managedEscalationRouting).toEqual({
+        normalMention: "@custom-answerer", normalRoom: "custom-admin-room",
+        assemblyMention: "@custom-manager", assemblyRoom: "custom-eng-room",
+        directorMention: "@custom-director", directorRoom: "custom-director-room",
+        tier2Minutes: 7, tier3Minutes: 15,
+      });
+    });
+
+    test("rejects a non-positive or non-numeric tier delay", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "0" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "not-a-number" }, noRead)).toThrow();
+    });
+
+    test("rejects tier3 <= tier2 — the director's own ordering is a correctness constraint, not a style preference", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "20" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "10" }, noRead)).toThrow();
+    });
+
+    test("describeConfig reports the full routing table", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("managedEscalationRouting=");
+      expect(d).toContain("@admin-assembly");
+      expect(d).toContain("@manager-factory");
+      expect(d).toContain("@director");
+      expect(d).toContain("tier2Minutes=10");
+      expect(d).toContain("tier3Minutes=20");
+    });
+  });
 });
 
 describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-497/FACTORY-475 hardcodes Cleavr's fixed id as the ONLY allowed origin)", () => {

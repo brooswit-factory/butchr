@@ -1804,16 +1804,22 @@ const managedEscalationAuth = config.managedEscalationRocketChat
       ROCKETCHAT_ADMIN_TOKEN_FILE: config.managedEscalationRocketChat.adminTokenFile,
     })
   : { ok: false as const, reason: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL/_USER_ID/_TOKEN_FILE not set" };
+// FACTORY-609 (Part B): the same one credential now posts to EITHER room —
+// there is no second Nexus grant, only a second ROOM, and RocketChatPoster
+// already takes a channel per call (FACTORY-607 comment 28784 item 4). The
+// routing values themselves (which room/mention each tier uses) live in
+// `config.managedEscalationRouting`, always present regardless of whether
+// this credential is configured — see that field's own doc comment.
+const managedEscalationRooms = [...new Set([config.managedEscalationRouting.normalRoom, config.managedEscalationRouting.assemblyRoom, config.managedEscalationRouting.directorRoom])];
 if (!managedEscalationAuth.ok) {
-  console.error(`  managed-session #team-admin escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
+  console.error(`  managed-session escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
 } else {
-  console.error(`  managed-session #team-admin escalation enabled → #${config.managedEscalationRocketChat!.room} (Rocket.Chat)`);
+  console.error(`  managed-session escalation enabled → #${managedEscalationRooms.join(", #")} (Rocket.Chat)`);
 }
 const teamAdminNotify = managedEscalationAuth.ok
   ? (() => {
       const poster = createRocketChatPoster({ fetchImpl: fetch, url: managedEscalationAuth.url, adminUserId: managedEscalationAuth.adminUserId, adminToken: managedEscalationAuth.adminToken });
-      const room = config.managedEscalationRocketChat!.room;
-      return async (text: string) => { await poster.postMessage(room, text); };
+      return async (room: string, text: string) => { await poster.postMessage(room, text); };
     })()
   : undefined;
 
@@ -1854,6 +1860,7 @@ const escalator = createEscalator({
   // FACTORY-369: absent (undefined) whenever `managedEscalationAuth` isn't
   // ok — see that constant's own comment just above for the fallback.
   ...(teamAdminNotify ? { teamAdminNotify } : {}),
+  managedEscalationRouting: config.managedEscalationRouting,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —

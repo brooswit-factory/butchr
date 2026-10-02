@@ -7,6 +7,7 @@ import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src
 import { tellWorker } from "../../src/tools/relationship.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import type { ManagedEscalationRouting } from "../../src/agents/escalation-helper.js";
 
 /**
  * BUTCHR-45: the REAL tell_worker/tagComment construction (src/tools/
@@ -67,26 +68,32 @@ function fakeCaptureSink() {
 }
 
 /**
- * FACTORY-369: a fake `EscalatorDeps.teamAdminNotify` transport — records
- * every text posted, and can be told to reject the next `failNext` calls
- * (simulating RC down / 403 / refused role) before succeeding, so a test
- * can assert the AC 7 retry-without-latching behaviour without depending on
- * live Rocket.Chat.
+ * FACTORY-369/FACTORY-609: a fake `EscalatorDeps.teamAdminNotify` transport —
+ * records every (room, text) posted, and can be told to reject the next
+ * `failNext` calls (simulating RC down / 403 / refused role) before
+ * succeeding, so a test can assert the AC 7 retry-without-latching
+ * behaviour without depending on live Rocket.Chat. `posts` stays a flat
+ * array of the TEXT only (most existing assertions check text content and
+ * never cared about the room) — `roomPosts` is the room alongside it, for
+ * the FACTORY-609 tests that do.
  */
 function fakeTeamAdmin(opts: { failNext?: number } = {}) {
   const posts: string[] = [];
+  const roomPosts: Array<{ room: string; text: string }> = [];
   let failuresLeft = opts.failNext ?? 0;
   return {
     posts,
+    roomPosts,
     setFailNext: (n: number) => { failuresLeft = n; },
-    notify: async (text: string): Promise<void> => {
+    notify: async (room: string, text: string): Promise<void> => {
       if (failuresLeft > 0) { failuresLeft--; throw new Error("Rocket.Chat post failed (simulated)"); }
       posts.push(text);
+      roomPosts.push({ room, text });
     },
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number; teamAdminNotify?: (text: string) => Promise<void> } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number; teamAdminNotify?: (room: string, text: string) => Promise<void>; managedEscalationRouting?: ManagedEscalationRouting } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -126,6 +133,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     ...(opts.managedSessionOf ? { managedSessionOf: opts.managedSessionOf } : {}),
     ...(opts.managedSessionCaptureTimeoutMs !== undefined ? { managedSessionCaptureTimeoutMs: opts.managedSessionCaptureTimeoutMs } : {}),
     ...(opts.teamAdminNotify ? { teamAdminNotify: opts.teamAdminNotify } : {}),
+    ...(opts.managedEscalationRouting ? { managedEscalationRouting: opts.managedEscalationRouting } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -897,12 +905,22 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       expect(ta.posts[0]).not.toContain("@director");
     });
 
-    test("@director for the admin-assembly self-reference case", async () => {
+    // FACTORY-609 (Part B) / FACTORY-607 comment 28784 item 3: a DELIBERATE
+    // BEHAVIOUR CHANGE from what FACTORY-369 shipped — the director's
+    // comment 28688 now routes admin-assembly's own pane to
+    // `@manager-factory` in `#team-engineering` for tiers 1-2 (tier 3 still
+    // goes to the director, same as every other managed session — see the
+    // "tier 3" test in the "FACTORY-609" describe block below). This test
+    // is UPDATED to the new intent per the ticket's own instruction, not
+    // deleted — the OLD assertion (`@director` in `#team-admin` for tiers
+    // 1-2) is exactly what this supersedes.
+    test("@manager-factory in #team-engineering for the admin-assembly self-reference case (tiers 1-2)", async () => {
       const ta = fakeTeamAdmin();
       const h = harness({ managedSessionOf: async () => adminAssemblyTarget, teamAdminNotify: ta.notify });
       await h.poll("p1", null, parsePrompt(REAL)!);
-      expect(ta.posts[0]).toContain("@director");
+      expect(ta.posts[0]).toContain("@manager-factory");
       expect(ta.posts[0]).not.toContain("@admin-assembly");
+      expect(ta.roomPosts[0]!.room).toBe("team-engineering");
     });
   });
 
@@ -2976,4 +2994,222 @@ describe("createEscalator — FACTORY-607 comment 28781 (Part A): quoted-content
   // here as a second, parallel "simulated" test — a simulated assertion
   // proves nothing about whether the REAL production code's removal turns
   // the REAL test red.
+});
+
+describe("createEscalator — FACTORY-609 (Part B): 0/10/20-minute tiers + routing config", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+  const adminAssemblyTarget: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-assembly.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-assembly.json",
+  };
+
+  // (a) immediate escalation
+  test("(a) tier 1 fires immediately on the first mark", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    h.setClock(0);
+    await h.poll("p1", null, parsePrompt(REAL)!);
+    expect(ta.posts.length).toBe(1);
+    expect(ta.roomPosts[0]!.room).toBe("team-admin");
+    expect(ta.posts[0]).toContain("tier: 1");
+  });
+
+  // (b) 10-minute re-escalation
+  test("(b) tier 2 fires at 10 minutes, same fingerprint, same episode", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1);
+
+    h.setClock(9 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1); // not yet due
+
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2);
+    expect(ta.posts[1]).toContain("tier: 2");
+    expect(ta.roomPosts[1]!.room).toBe("team-admin");
+
+    // No duplicate tier-2 on a later poll within the same episode.
+    h.setClock(15 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2);
+  });
+
+  // (c) 20-minute director tier
+  test("(c) tier 3 fires at 20 minutes, to the director in #team-engineering", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    h.setClock(19 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2); // tier 3 not yet due
+
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(3);
+    expect(ta.posts[2]).toContain("tier: 3");
+    expect(ta.posts[2]).toContain("@director");
+    expect(ta.roomPosts[2]!.room).toBe("team-engineering");
+
+    h.setClock(25 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(3); // no duplicate tier 3
+  });
+
+  // (d) assembly-pane routing variant
+  test("(d) admin-assembly's own pane: tiers 1-2 to @manager-factory in #team-engineering, tier 3 to @director in #team-engineering", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => adminAssemblyTarget, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+
+    expect(ta.posts.length).toBe(3);
+    expect(ta.roomPosts[0]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[0]).toContain("@manager-factory");
+    expect(ta.roomPosts[1]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[1]).toContain("@manager-factory");
+    expect(ta.roomPosts[2]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[2]).toContain("@director");
+  });
+
+  // (e) nothing after clear
+  test("(e) nothing further after the pane clears — the episode's clear-up is a single post, no further tiers", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(5 * 60_000);
+    h.notBlocked([]);
+    await Bun.sleep(0);
+    const afterClear = ta.posts.length;
+    expect(afterClear).toBe(2); // tier 1 + the clear-up
+
+    // Even if the clock keeps advancing well past 10/20 minutes, nothing
+    // more is posted for the now-cleared episode.
+    h.setClock(30 * 60_000);
+    h.notBlocked([]);
+    await Bun.sleep(0);
+    expect(ta.posts.length).toBe(afterClear);
+  });
+
+  // (f) no duplicate within an episode
+  test("(f) a retried poll within the same tier window never double-posts that tier", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    for (let i = 0; i < 5; i++) await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1);
+  });
+
+  // (g) no poster configured → journal lines only, including the new tier lines
+  test("(g) with no poster configured, tiers 1-3 all still produce journal lines, never a post", async () => {
+    const h = harness({ managedSessionOf: async () => target }); // no teamAdminNotify
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+    // The journal mark itself only fires once per NEW fingerprint (AC 6's
+    // existing contract is unchanged) — tiers are a Rocket.Chat-delivery
+    // concern layered on top, not a second journal line per tier. This
+    // test's job is: no crash, no throw, nothing posted — confirmed by the
+    // absence of any poster and by not throwing.
+    expect(h.logs.some((l) => l.startsWith(MANAGED_ESCALATION_MARKER))).toBe(true);
+  });
+
+  describe("config-driven routing — no literals buried in logic", () => {
+    test("a custom managedEscalationRouting dep changes rooms/mentions/delays without touching production code", async () => {
+      const ta = fakeTeamAdmin();
+      const customRouting: ManagedEscalationRouting = {
+        normalMention: "@custom-answerer", normalRoom: "custom-admin-room",
+        assemblyMention: "@custom-manager", assemblyRoom: "custom-eng-room",
+        directorMention: "@custom-director", directorRoom: "custom-director-room",
+        tier2Minutes: 2, tier3Minutes: 4,
+      };
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify, managedEscalationRouting: customRouting });
+      const prompt = parsePrompt(REAL)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt);
+      expect(ta.roomPosts[0]!.room).toBe("custom-admin-room");
+      expect(ta.posts[0]).toContain("@custom-answerer");
+
+      h.setClock(2 * 60_000);
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(2);
+
+      h.setClock(4 * 60_000);
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(3);
+      expect(ta.posts[2]).toContain("@custom-director");
+      expect(ta.roomPosts[2]!.room).toBe("custom-director-room");
+    });
+  });
+
+  describe("CAP DECISION: tiers 2/3 are exempt from the per-pane hourly rate cap", () => {
+    test("one long episode's three tiers are never swallowed by the 3/hour cap", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt);
+      h.setClock(10 * 60_000);
+      await h.poll("p1", null, prompt);
+      h.setClock(20 * 60_000);
+      await h.poll("p1", null, prompt);
+      // All three tiers delivered — if tiers 2/3 consumed the SAME 3/hour
+      // cap as tier 1 (keyed per pane), this episode alone would already be
+      // AT the cap by tier 3, which is fine in isolation, but see the next
+      // test for why that would be wrong.
+      expect(ta.posts.length).toBe(3);
+    });
+
+    test("a second, later episode on the same pane within the hour still gets its own tier 1", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt1 = parsePrompt(REAL)!;
+      const prompt2 = parsePrompt(TRUST)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt1);
+      h.setClock(10 * 60_000);
+      await h.poll("p1", null, prompt1);
+      h.setClock(20 * 60_000);
+      await h.poll("p1", null, prompt1); // episode 1: 3 posts, all within the hour
+      expect(ta.posts.length).toBe(3);
+
+      h.setClock(25 * 60_000);
+      await h.poll("p1", null, prompt2); // a NEW fingerprint — episode 2 starts
+      // If tiers 2/3 had consumed the cap, episode 2's tier 1 (a genuinely
+      // NEW mark, the 4th post this hour under the old accounting) would be
+      // silently dropped. Under this ticket's cap decision (tiers 2/3
+      // exempt — only NEW marks consult/consume the cap, so this is only
+      // episode 2's FIRST cap-consuming event, same as episode 1's was),
+      // it must still be delivered.
+      expect(ta.posts.length).toBe(4);
+    });
+  });
+
+  // Mutation-check results for tier 2 (test "(b)") and tier 3 (test "(c)")
+  // — each tier's production code genuinely deleted from
+  // markManagedSessionStalled, `bun test` run, the named test confirmed
+  // red, then reverted — are reported in the PR description.
 });

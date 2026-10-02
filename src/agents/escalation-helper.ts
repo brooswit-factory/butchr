@@ -69,3 +69,44 @@ export class RateCap {
 
 /** One hour, in milliseconds — the window escalation-loop.ts's rate cap uses. */
 export const HOUR_MS = 60 * 60_000;
+
+/**
+ * FACTORY-607 comment 28781 (Part A) / FACTORY-609 (Part B): the director's
+ * own routing defaults for a managed-session escalation, factored out here
+ * (dependency-free, like the rest of this module) so BOTH `src/config/
+ * config.ts` (the env-var parser, which must apply these exact values as
+ * defaults) and `src/agents/escalation-loop.ts` (which falls back to these
+ * when `EscalatorDeps.managedEscalationRouting` is omitted — e.g. by an
+ * existing test that predates this ticket) read a SINGLE literal, never two
+ * copies that could drift apart. FACTORY-607 comment 28784 item 3: this is a
+ * DELIBERATE BEHAVIOUR CHANGE from what FACTORY-369 shipped — assembly's own
+ * pane used to route to `@director` in `#team-admin`; it now routes to
+ * `@manager-factory` in `#team-engineering` for tiers 1-2, matching the
+ * director's comment 28688.
+ */
+export const MANAGED_ESCALATION_DEFAULTS = {
+  /** Tiers 1-2 for an ordinary managed session. */
+  normalMention: "@admin-assembly",
+  normalRoom: "team-admin",
+  /** Tiers 1-2 for the admin-assembly session's OWN pane (the self-reference case). */
+  assemblyMention: "@manager-factory",
+  assemblyRoom: "team-engineering",
+  /** Tier 3, for every managed session (including admin-assembly's own pane). */
+  directorMention: "@director",
+  directorRoom: "team-engineering",
+  /** Minutes after an episode's first mark before the tier-2 re-escalation. */
+  tier2Minutes: 10,
+  /** Minutes after an episode's first mark before the tier-3 director escalation. */
+  tier3Minutes: 20,
+} as const;
+
+export type ManagedEscalationRouting = {
+  normalMention: string;
+  normalRoom: string;
+  assemblyMention: string;
+  assemblyRoom: string;
+  directorMention: string;
+  directorRoom: string;
+  tier2Minutes: number;
+  tier3Minutes: number;
+};
