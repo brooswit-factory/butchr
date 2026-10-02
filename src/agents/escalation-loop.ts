@@ -534,6 +534,99 @@ async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: 
   return result;
 }
 
+// ===========================================================================
+// FACTORY-607 comment 28781 (Part A): quoted-content neutralisation for the
+// managed-session escalation posts ONLY — `teamAdminMessage`/`tierMessage`
+// and their clear-up siblings, below. Deliberately NOT applied to this
+// file's Jira-shaped comments (`escalationComment` in escalate.ts,
+// `unresponsiveComment` above): the director's requirement (comment 28781)
+// is scoped to the NEW butchr-escalation bot account posting a pane's
+// LIVE, attacker-reachable text into Rocket.Chat, where an unneutralised
+// `@all`/`@here` would ping real people FROM that bot account — a Jira
+// comment is posted by butchr's OWN existing account under its OWN existing
+// notification rules, a different exposure this ticket was never asked to
+// change, and the scope fence (FACTORY-607/comment 28784, "managed sessions
+// only") forbids touching that path regardless.
+// ===========================================================================
+
+/** A quoted field's character cap — stated here, not a magic number at each call site. Comment 28781 requires an EXPLICIT cap with a `... [truncated N chars]` marker; 2000 is generous for a dialog's question/option text (measured fixtures in this file's own tests are well under 200 chars) while still bounding a pathological pane's output. */
+const QUOTE_FIELD_CHAR_CAP = 2000;
+
+/** Comment 28781's "a cap on the number of options quoted" — options beyond this are omitted with a count, never silently dropped without saying so. */
+const QUOTE_OPTIONS_CAP = 10;
+
+/** U+200B (zero-width space) immediately after every `@` — splits `@all`/`@here`/`@admin-assembly`/any other handle so NOTHING outside the intended header mention can ever resolve as a mention, in Rocket.Chat or any other reader, while staying visually identical to a human skimming the post. */
+function neutralizeMentions(text: string): string {
+  return text.replace(/@/g, "@​");
+}
+
+/** Comment 28781's "links and markup defanged": `://` is what turns a quoted `https://...` into a clickable link, and what markdown's `[text](url)` needs too — breaking it with the same zero-width-space technique neutralizes both without visually mangling the text (CHOICE, stated in the PR description: defang `://` rather than test for non-linking, since Rocket.Chat's own autolink behaviour is not something this test suite can exercise without a live instance). */
+function defangLinks(text: string): string {
+  return text.replace(/:\/\//g, ":​//");
+}
+
+/** Comment 28781's "control characters and `\r` stripped or neutralised": `\r` is dropped outright (never folded into `\n`) so a CRLF-style line can never reintroduce a line break Rocket.Chat's renderer might treat differently than a bare `\n`; every other C0 control character and DEL is stripped too — none of them are legitimate dialog content. `\n` itself is deliberately preserved (multi-line questions are real) — comment 28781's "newlines handled so a multi-line prompt cannot inject a header-looking line ... outside the block" is satisfied by confinement (every quoted field lives inside ONE fenced code block, see `quotedBlock`), not by stripping the newline itself. */
+function stripControlChars(text: string): string {
+  return text.replace(/\r/g, "").replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, "");
+}
+
+/** Comment 28781's "a stated character cap with an explicit `... [truncated N chars]` marker". */
+function truncateField(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  return `${text.slice(0, cap)}... [truncated ${text.length - cap} chars]`;
+}
+
+/**
+ * The shared pipeline EVERY quoted field in a managed-session message goes
+ * through before composition: strip control chars/`\r` first (so the cap
+ * counts real content, not bytes about to be discarded), THEN cap length
+ * (so the truncation marker itself is never mangled by a later pass), THEN
+ * neutralise mentions and defang links (both are harmless to run after
+ * truncation — neither can re-lengthen the text past the cap in a way that
+ * matters, and running them last means a cut mid-`@`/mid-`://` can't produce
+ * a half-neutralised artifact at the truncation boundary).
+ */
+function quoteField(raw: string, cap: number = QUOTE_FIELD_CHAR_CAP): string {
+  return defangLinks(neutralizeMentions(truncateField(stripControlChars(raw), cap)));
+}
+
+/** The options line, capped on COUNT (comment 28781's "a cap on options quoted"), each option individually neutralised via `quoteField`. */
+function quoteOptionsLine(options: readonly string[]): string {
+  if (!options.length) return "(none)";
+  const capped = options.slice(0, QUOTE_OPTIONS_CAP);
+  const line = capped.map((o, i) => `${i + 1}. ${quoteField(o)}`).join(" | ");
+  const omitted = options.length - capped.length;
+  return omitted > 0 ? `${line} ... [${omitted} more option(s) omitted]` : line;
+}
+
+/**
+ * Comment 28781's "a fence longer than the longest backtick run in the
+ * content" (CHOICE, stated in the PR description: a longer fence, never
+ * replacing backtick runs in the content itself — this never alters the
+ * quoted text, only how it's delimited). Minimum 3, matching ordinary
+ * Markdown fence convention even when the content has no backticks at all.
+ */
+function fenceFor(body: string): string {
+  const runs = body.match(/`+/g) ?? [];
+  const longest = runs.reduce((m, r) => Math.max(m, r.length), 0);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+/**
+ * Compose the labeled, already-neutralised quoted-field lines as ONE fenced
+ * code block whose fence the content cannot close — everything pane-derived
+ * lives inside it, never only individually escaped, which is what makes a
+ * multi-line, adversarial field unable to inject a header-looking line or a
+ * bare `@mention` outside the block (comment 28781's confinement
+ * requirement — see `stripControlChars`'s own doc comment on why the
+ * newline itself is kept, not stripped).
+ */
+function quotedBlock(lines: readonly string[]): string {
+  const body = lines.join("\n");
+  const fence = fenceFor(body);
+  return [fence, body, fence].join("\n");
+}
+
 /**
  * The blocked-prompt escalation state machine: fingerprint a dialog, debounce
  * a transient block, escalate once per fingerprint to the blocked agent's own
@@ -784,23 +877,23 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    */
   function teamAdminMessage(target: ManagedSessionTarget, paneId: string, question: string, options: readonly string[], fp: string, capturePath: string | null): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
-    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
-    return [
-      `${teamAdminMention(sessionName)} managed session **${sessionName}** is blocked and cannot answer for itself — it has no Jira ticket, so it cannot escalate the way a normal agent would.`,
-      "",
-      `session: ${sessionName}`,
-      `pane: ${paneId}`,
-      `question: ${question}`,
-      `options: ${optionsLine}`,
-      `fingerprint: ${fp}`,
-      `capture: ${capturePath ?? "(none)"}`,
-    ].join("\n");
+    const header = `${teamAdminMention(sessionName)} managed session **${sessionName}** is blocked and cannot answer for itself — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
+    const block = quotedBlock([
+      `session: ${quoteField(sessionName)}`,
+      `pane: ${quoteField(paneId)}`,
+      `question: ${quoteField(question)}`,
+      `options: ${quoteOptionsLine(options)}`,
+      `fingerprint: ${quoteField(fp)}`,
+      `capture: ${capturePath ? quoteField(capturePath) : "(none)"}`,
+    ]);
+    return [header, "", block].join("\n");
   }
 
   /** The clear-up follow-up — FACTORY-369 AC 5, posted once when a dialog a notice was already sent about clears. */
   function teamAdminClearedMessage(target: ManagedSessionTarget, paneId: string, fp: string): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
-    return `managed session **${sessionName}** (pane ${paneId}, fingerprint ${fp}) is no longer blocked — the dialog above has cleared.`;
+    const block = quotedBlock([`session: ${quoteField(sessionName)}`, `pane: ${quoteField(paneId)}`, `fingerprint: ${quoteField(fp)}`]);
+    return [`managed session **${sessionName}** is no longer blocked — the dialog above has cleared.`, "", block].join("\n");
   }
 
   /**

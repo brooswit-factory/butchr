@@ -2869,3 +2869,111 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
     });
   });
 });
+
+describe("createEscalator — FACTORY-607 comment 28781 (Part A): quoted-content neutralisation", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+
+  // The exact adversarial content comment 28781 names: @all/@here/@admin-
+  // assembly, a bare link and a markdown link, and a triple-backtick run
+  // immediately followed by @here (the fence-closing attempt).
+  const ADVERSARIAL_QUESTION = [
+    "@all please look at this @here and also @admin-assembly",
+    "a link: https://example.com/x",
+    "markdown: [click](https://example.com)",
+    "```",
+    "@here",
+  ].join("\n");
+  const ADVERSARIAL_OPTIONS = ["@all yes", "@here no"] as const;
+
+  function postedTextFor(prompt: ReturnType<typeof parsePrompt>) {
+    return async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, prompt!);
+      return ta.posts[0]!;
+    };
+  }
+
+  test("no @all/@here/@admin-assembly mention survives outside the intended header mention", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. ${ADVERSARIAL_OPTIONS[0]}\n  2. ${ADVERSARIAL_OPTIONS[1]}\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    // The header's own intended mention is the ONLY plain "@word" substring
+    // allowed — strip it, then nothing else may contain an unneutralised @.
+    const headerMention = "@admin-assembly";
+    const withoutHeaderMention = text.replace(headerMention, "");
+    expect(withoutHeaderMention).not.toContain("@all");
+    expect(withoutHeaderMention).not.toContain("@here");
+    expect(withoutHeaderMention).not.toContain("@admin-assembly");
+    // The neutralised forms ARE present (zero-width space after every @),
+    // proving the content itself was quoted, not silently dropped.
+    expect(text).toContain("@​all");
+    expect(text).toContain("@​here");
+  });
+
+  test("a code-fence run in the content cannot close the quoting block early", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. ${ADVERSARIAL_OPTIONS[0]}\n  2. ${ADVERSARIAL_OPTIONS[1]}\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    // The message's own fence (surrounding the whole quoted block) must be
+    // STRICTLY LONGER than any backtick run the content itself contributes
+    // (here, a literal ``` from the adversarial question) — assert this
+    // structurally: find every backtick run in the text and confirm the
+    // block is delimited by the single longest one, appearing exactly twice
+    // (open/close), with every other run strictly shorter.
+    const runs = text.match(/`+/g)!;
+    const longest = Math.max(...runs.map((r) => r.length));
+    const longestRuns = runs.filter((r) => r.length === longest);
+    expect(longestRuns.length).toBe(2); // exactly the opening and closing fence
+    const contentRunLengths = runs.filter((r) => r.length !== longest).map((r) => r.length);
+    for (const len of contentRunLengths) expect(len).toBeLessThan(longest);
+  });
+
+  test("a long question is capped with an explicit truncation marker", async () => {
+    const longQuestion = "x".repeat(5000);
+    const prompt = parsePrompt(`${longQuestion}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).toMatch(/\.\.\. \[truncated \d+ chars\]/);
+    // The marker must actually have cut the content — not merely be present
+    // somewhere coincidentally.
+    expect(text).not.toContain("x".repeat(5000));
+  });
+
+  test("links are defanged — a bare URL and a markdown link both lose their '://' ", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).not.toContain("https://example.com");
+    expect(text).toContain("https:​//example.com");
+  });
+
+  test("\\r and other control characters are stripped from quoted content", async () => {
+    const dirty = "line one\r\nline two\x07bell\x00null";
+    const prompt = parsePrompt(`${dirty}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).not.toContain("\r");
+    expect(text).not.toContain("\x07");
+    expect(text).not.toContain("\x00");
+  });
+
+  test("options beyond the stated cap are omitted, not silently truncated without saying so", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const manyOptions = Array.from({ length: 15 }, (_, i) => `option ${i + 1}`);
+    const prompt = { question: "pick one", options: manyOptions, current: 1 } as unknown as ReturnType<typeof parsePrompt>;
+    // Bypass parsePrompt (it does not support 15 real options in these
+    // fixtures' format) — markManagedSessionStalled only needs .question/.options.
+    await h.escalator.onBlocked("p1", null, prompt!, 1);
+    const text = ta.posts[0]!;
+    expect(text).toContain("option 10");
+    expect(text).not.toContain("option 11");
+    expect(text).toMatch(/\[\d+ more option\(s\) omitted\]/);
+  });
+
+  // Mutation-check results for the five tests above (each neutralisation
+  // step reverted in turn, production code genuinely edited, `bun test`
+  // run, then reverted) are reported in the PR description, not re-asserted
+  // here as a second, parallel "simulated" test — a simulated assertion
+  // proves nothing about whether the REAL production code's removal turns
+  // the REAL test red.
+});

@@ -1624,3 +1624,59 @@ reply is (there is no ticket to reply on). If the SAME definition keeps
 re-blocking on the SAME dialog shape, that is exactly the signal to file it
 against FACTORY-46 (or whatever succeeds it) for drovr to learn to
 recognize.
+
+### Reaching a human: Rocket.Chat escalation, and quoted-content neutralisation (FACTORY-369/FACTORY-607)
+
+Everything above (the journal line, the `/health` mark, the pane-text
+capture) is observational — it tells an operator who already knows to look.
+FACTORY-369 added a Rocket.Chat post so a human doesn't have to be looking:
+on top of the journal line, a SEPARATE credential (never the account-
+management `rocketchat` config — see `Config.managedEscalationRocketChat`'s
+own doc comment in `src/config/config.ts` for why) posts one message to
+`#team-admin`, mentioning `@admin-assembly` (or `@director`, for
+admin-assembly's own pane — the self-reference case), once per episode.
+
+**Credential**: `BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL` / `_USER_ID` /
+`_TOKEN_FILE`, all-or-nothing — any one missing means this post is entirely
+disabled and every managed-session escalation behaves exactly as the
+section above describes. Never a crash, never a silent drop either way.
+
+**Mention/markup neutralisation (FACTORY-607 comment 28781).** The post
+interpolated the pane's own question/options directly into the message text
+with no neutralisation at all — a prompt containing `@all`, `@here`, or a
+markdown link could ping real people from the bot account, or break the
+post's own formatting. Everything quoted from the pane — the dialog's
+question, every option, the fingerprint, the capture path, and the
+session/pane identifiers — is now NEVER trusted and is neutralised before
+being posted:
+
+- Every quoted field goes inside ONE fenced code block in the message. Only
+  the message's HEADER line (the real, intended `@mention` of whoever
+  should answer) sits outside it — nothing else is allowed to sit outside
+  the block, so a multi-line question cannot inject a header-looking line
+  or a bare `@mention` that reads as a second, unintended ping.
+- Every `@` inside the block has a zero-width space (U+200B) inserted right
+  after it — `@all`, `@here`, `@admin-assembly`, or any other handle, can
+  never resolve as a real mention, while remaining visually identical to a
+  human skimming the post.
+- Every `://` inside the block is defanged the same way (a zero-width space
+  after the colon) — this breaks both a bare URL and a markdown
+  `[text](url)` link without visually mangling the text. (Choice: defang
+  `://` rather than attempt to prove Rocket.Chat won't autolink it — the
+  latter isn't something this repo's test suite can exercise without a live
+  Rocket.Chat instance.)
+- `\r` is stripped outright (never folded into `\n`); every other C0
+  control character and DEL is stripped too. `\n` itself is kept — a
+  genuinely multi-line question is real content — because confinement
+  inside the one fenced block is what neutralises a newline-based injection
+  attempt, not removing the newline.
+- The fence delimiting the block is always longer than the longest run of
+  backticks anywhere in the content (minimum 3) — content can never close
+  the block early, however many backticks it contains.
+- Each quoted field is capped at 2000 characters, with an explicit
+  `... [truncated N chars]` marker when it was cut. The options list is
+  separately capped at 10 options, with a `[N more option(s) omitted]`
+  marker when there were more.
+
+This applies to EVERY message this feature posts — the escalation itself,
+and the clear-up follow-up once the dialog resolves.
