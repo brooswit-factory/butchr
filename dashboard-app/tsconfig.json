@@ -34,6 +34,15 @@
     "../src/agents/dashboard.ts",
     "../src/agents/query-agent-inventory.ts",
     "../src/md.d.ts",
+    // FACTORY-615: the real dashboard view-model (`src/view-model/dashboard-view.ts`)
+    // additionally reads the cross-link helpers, the per-daemon currency
+    // shape, and `/health`'s own response shape — same "type-only-import
+    // the real shape, never hand-duplicate it" discipline as the two
+    // `dashboard.ts`/`query-agent-inventory.ts` entries above, so this
+    // program must resolve (and typecheck) their closure too.
+    "../src/agents/config-inventory-links.ts",
+    "../src/daemon/currency.ts",
+    "../src/daemon/health.ts",
     // FACTORY-614: the DOM-rendering component tests — see
     // `../tsconfig.json`'s own comment for why these five live here
     // instead of the root program.
@@ -42,6 +51,15 @@
     "../test/unit/dashboard-app-use-config-inventory.test.tsx",
     "../test/unit/dashboard-app-poll-status-view.test.tsx",
     "../test/unit/dashboard-app-app.test.tsx",
-    "../test/unit/dashboard-app-routes.test.tsx"
+    "../test/unit/dashboard-app-routes.test.tsx",
+    // FACTORY-615: task 3's own component tests (DOM-rendering, same reason
+    // as the block above). The plain-TS view-model tests
+    // (`dashboard-app-dashboard-view.test.ts`) stay in the root program,
+    // same as every other `test/unit/*.test.ts`.
+    "../test/unit/dashboard-app-use-health.test.tsx",
+    "../test/unit/dashboard-app-status-pill.test.tsx",
+    "../test/unit/dashboard-app-agent-row-card.test.tsx",
+    "../test/unit/dashboard-app-withheld-row-card.test.tsx",
+    "../test/unit/dashboard-app-dashboard-route.test.tsx"
   ]
 }

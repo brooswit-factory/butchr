@@ -1,0 +1,66 @@
+/**
+ * FACTORY-615: the row "card" — @launchpad-ui/components@0.25.0 ships no
+ * Card component (see AgentRowCard.tsx's own header), so this is a plain,
+ * token-styled container instead of a hard-coded one (requirement 2: every
+ * colour/spacing value below is a `--lp-*` token, never a hex literal).
+ */
+.dashboard-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--lp-spacing-300);
+  padding: var(--lp-spacing-300) var(--lp-spacing-400);
+  margin: var(--lp-spacing-200) 0;
+  border: var(--lp-border-width-100) solid var(--lp-color-border-ui-secondary);
+  border-radius: var(--lp-border-radius-medium);
+}
+
+.dashboard-row--withheld {
+  border-style: dashed;
+}
+
+.dashboard-row__key {
+  min-width: 90px;
+  color: var(--lp-color-text-interactive-base);
+}
+
+.dashboard-row__tier {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.dashboard-row__tier--cnc {
+  color: var(--lp-color-text-feedback-warning);
+  font-weight: 600;
+}
+
+.dashboard-row__pane {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.dashboard-row__floor {
+  font-size: var(--lp-font-size-400);
+  font-weight: 700;
+}
+
+.dashboard-row__floor-value {
+  font-size: var(--lp-font-size-400);
+}
+
+.dashboard-row__inexact {
+  color: var(--lp-color-text-feedback-warning);
+  margin-inline-start: var(--lp-spacing-100);
+}
+
+.dashboard-row__freshness {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.dashboard-row__freshness--stale {
+  color: var(--lp-color-text-feedback-warning);
+  font-weight: 600;
+}
+
+.dashboard-row__na {
+  color: var(--lp-color-text-ui-secondary);
+  font-style: italic;
+}

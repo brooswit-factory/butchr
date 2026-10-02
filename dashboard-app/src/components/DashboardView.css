@@ -1,0 +1,43 @@
+.dashboard-view__hdrline {
+  color: var(--lp-color-text-ui-secondary);
+  margin-bottom: var(--lp-spacing-100);
+}
+
+.dashboard-view__pagefresh {
+  color: var(--lp-color-text-ui-secondary);
+  margin-bottom: var(--lp-spacing-100);
+}
+
+.dashboard-view__empty {
+  color: var(--lp-color-text-ui-secondary);
+  padding: var(--lp-spacing-300) 0;
+}
+
+.dashboard-view__banner {
+  margin-bottom: var(--lp-spacing-300);
+}
+
+.dashboard-view__admission {
+  margin-bottom: var(--lp-spacing-400);
+  padding: var(--lp-spacing-300) var(--lp-spacing-400);
+  border: var(--lp-border-width-100) solid var(--lp-color-border-ui-secondary);
+  border-radius: var(--lp-border-radius-medium);
+}
+
+.dashboard-view__known {
+  color: var(--lp-color-text-feedback-success);
+}
+
+.dashboard-view__cnc {
+  color: var(--lp-color-text-feedback-warning);
+  font-weight: 600;
+}
+
+.dashboard-view__cnc-muted {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.dashboard-view__hint {
+  color: var(--lp-color-text-ui-secondary);
+  margin-top: var(--lp-spacing-400);
+}

@@ -35,6 +35,11 @@
     "test/unit/dashboard-app-use-config-inventory.test.tsx",
     "test/unit/dashboard-app-poll-status-view.test.tsx",
     "test/unit/dashboard-app-app.test.tsx",
-    "test/unit/dashboard-app-routes.test.tsx"
+    "test/unit/dashboard-app-routes.test.tsx",
+    "test/unit/dashboard-app-use-health.test.tsx",
+    "test/unit/dashboard-app-status-pill.test.tsx",
+    "test/unit/dashboard-app-agent-row-card.test.tsx",
+    "test/unit/dashboard-app-withheld-row-card.test.tsx",
+    "test/unit/dashboard-app-dashboard-route.test.tsx"
   ]
 }

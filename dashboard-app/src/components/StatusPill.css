@@ -1,0 +1,26 @@
+.status-pill {
+  display: inline-block;
+  padding: 2px var(--lp-spacing-200);
+  border-radius: var(--lp-border-radius-large);
+  white-space: nowrap;
+}
+
+/* herdr's `agent_status` domain (idle | working | blocked | done | unknown) plus this view's own "waiting" (a withheld row has no agent_status at all). Every colour below is a `--lp-color-*` token — no hard-coded hex (FACTORY-615 requirement 2). */
+.status-pill--working {
+  background: var(--lp-color-bg-feedback-success);
+  color: var(--lp-color-text-feedback-success);
+}
+.status-pill--blocked {
+  background: var(--lp-color-bg-feedback-error);
+  color: var(--lp-color-text-feedback-error);
+}
+.status-pill--idle,
+.status-pill--done,
+.status-pill--unknown {
+  background: var(--lp-color-bg-ui-tertiary);
+  color: var(--lp-color-text-ui-secondary);
+}
+.status-pill--waiting {
+  background: var(--lp-color-bg-feedback-info);
+  color: var(--lp-color-text-feedback-info);
+}
