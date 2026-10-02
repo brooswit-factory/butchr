@@ -44,7 +44,7 @@ import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type Permis
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
-import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
+import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMessage, terminalCommand } from "../terminal/open.js";
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
@@ -767,7 +767,7 @@ const { app, mcp } = buildApp({
     const pane = await herd.paneFor(issue);
     if (!pane) return { ok: false, error: "agent not running for " + issue };
     if (!terminalPrefix) return { ok: false, error: "no terminal emulator found (set BUTCHR_TERMINAL)" };
-    Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
+    Bun.spawn(terminalCommand(terminalPrefix, pane), { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
   // BUTCHR-267: pane-keyed sibling of `open` above — the dashboard row link
@@ -779,7 +779,7 @@ const { app, mcp } = buildApp({
   // handed to `herdr agent attach`.
   openPane: async (pane) => {
     const livePanes = (await herd.managedAgents()).map((agent) => agent.pane);
-    const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+    const hasDisplay = hasDesktopDisplay(process.env);
     const decision = resolveAttach(pane, livePanes, terminalPrefix ?? null, hasDisplay);
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });

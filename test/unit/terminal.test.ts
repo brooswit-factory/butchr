@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { terminalCommand, detectTerminalPrefix, parseTerminalEnv, KNOWN_TERMINALS, resolveAttach, attachRefusalMessage } from "../../src/terminal/open.js";
+import { terminalCommand, detectTerminalPrefix, parseTerminalEnv, KNOWN_TERMINALS, resolveAttach, attachRefusalMessage, hasDesktopDisplay, MACOS_TERMINAL_PREFIX } from "../../src/terminal/open.js";
 
 describe("terminal opener", () => {
   test("terminalCommand appends `herdr agent attach <target>` to the prefix", () => {
@@ -18,6 +18,70 @@ describe("terminal opener", () => {
   });
   test("every known terminal has a non-empty prefix", () => {
     for (const [, prefix] of KNOWN_TERMINALS) expect(prefix.length).toBeGreaterThan(0);
+  });
+});
+
+// macOS Terminal.app takes no command on its argv, so it is scripted through
+// osascript. The generated line has to survive two quoting layers (the shell
+// Terminal starts, then the AppleScript string literal around it).
+describe("macOS Terminal.app", () => {
+  const scriptOf = (target: string) => {
+    const argv = terminalCommand(MACOS_TERMINAL_PREFIX, target);
+    expect(argv[0]).toBe("osascript");
+    expect(argv.filter((a) => a === "-e")).toHaveLength(2);
+    return argv[2]!;
+  };
+
+  test("runs `herdr agent attach <target>` in a new Terminal window and brings it forward", () => {
+    expect(terminalCommand(MACOS_TERMINAL_PREFIX, "w1:p3")).toEqual([
+      "osascript",
+      "-e", `tell application "Terminal" to do script "herdr agent attach 'w1:p3'"`,
+      "-e", `tell application "Terminal" to activate`,
+    ]);
+  });
+
+  test("a target with shell and AppleScript metacharacters is quoted for both layers", () => {
+    // shell: it's single-quoted with an embedded quote written as '\''
+    // AppleScript: backslash and double quote are escaped inside the literal
+    expect(scriptOf(`a'b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a'\\\\''b'"`);
+    expect(scriptOf(`a"b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a\\"b'"`);
+    expect(scriptOf(`a\\b`)).toBe(`tell application "Terminal" to do script "herdr agent attach 'a\\\\b'"`);
+    expect(scriptOf("x; rm -rf ~")).toBe(`tell application "Terminal" to do script "herdr agent attach 'x; rm -rf ~'"`);
+  });
+
+  test("the prefix is only special as the whole prefix: anything else keeps the argv form", () => {
+    expect(terminalCommand(["macos-terminal", "-e"], "w1:p3")).toEqual(["macos-terminal", "-e", "herdr", "agent", "attach", "w1:p3"]);
+  });
+
+  test("detectTerminalPrefix prefers Terminal.app on darwin, even when an X11 emulator is installed", () => {
+    expect(detectTerminalPrefix((c) => c === "osascript" || c === "xterm", "darwin")).toEqual(["macos-terminal"]);
+  });
+
+  test("on darwin without osascript it falls back to the known list, and other platforms ignore osascript", () => {
+    expect(detectTerminalPrefix((c) => c === "xterm", "darwin")).toEqual(["xterm", "-e"]);
+    expect(detectTerminalPrefix((c) => c === "osascript", "linux")).toBeNull();
+    expect(detectTerminalPrefix((c) => c === "osascript" || c === "xterm", "linux")).toEqual(["xterm", "-e"]);
+  });
+
+  test("BUTCHR_TERMINAL=macos-terminal parses to the same prefix", () => {
+    expect(parseTerminalEnv("macos-terminal")).toEqual([...MACOS_TERMINAL_PREFIX]);
+  });
+
+  test("a live pane on darwin resolves to the osascript argv", () => {
+    const r = resolveAttach("w1:p3", ["w1:p3"], MACOS_TERMINAL_PREFIX, hasDesktopDisplay({}, "darwin"));
+    expect(r).toEqual({ ok: true, argv: terminalCommand(MACOS_TERMINAL_PREFIX, "w1:p3") });
+  });
+});
+
+describe("hasDesktopDisplay", () => {
+  test("X11 and Wayland hosts say so through the environment", () => {
+    expect(hasDesktopDisplay({ DISPLAY: ":0" }, "linux")).toBe(true);
+    expect(hasDesktopDisplay({ WAYLAND_DISPLAY: "wayland-0" }, "linux")).toBe(true);
+    expect(hasDesktopDisplay({}, "linux")).toBe(false);
+    expect(hasDesktopDisplay({ DISPLAY: "" }, "linux")).toBe(false);
+  });
+  test("macOS has no such variable, so a display is assumed there", () => {
+    expect(hasDesktopDisplay({}, "darwin")).toBe(true);
   });
 });
 
