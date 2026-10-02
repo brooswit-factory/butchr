@@ -437,6 +437,44 @@ describe("loadConfig", () => {
       expect(d).toContain("tier3Minutes=20");
     });
   });
+
+  describe("opsAlert (FACTORY-630)", () => {
+    test("defaults to the director's own room, mention and dedup window, with no env set at all", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.opsAlert).toEqual({ room: "team-admin", mention: "@director", dedupMinutes: 60 });
+    });
+
+    test("is ALWAYS present, even with no Rocket.Chat posting credential — the [butchr:ops-alert] journal line needs these values regardless of whether posting is configured", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.managedEscalationRocketChat).toBeUndefined();
+      expect(c.opsAlert.room).toBe("team-admin");
+    });
+
+    test("each value is overridable", () => {
+      const c = loadConfig({ ...base, BUTCHR_OPS_ALERT_ROOM: "team-engineering", BUTCHR_OPS_ALERT_MENTION: "@manager-factory", BUTCHR_OPS_ALERT_DEDUP_MINUTES: "15" }, noRead);
+      expect(c.opsAlert).toEqual({ room: "team-engineering", mention: "@manager-factory", dedupMinutes: 15 });
+    });
+
+    test("a literal `none` mention means post with NO mention — an empty env var cannot express that, since it is indistinguishable from unset", () => {
+      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "none" }, noRead).opsAlert.mention).toBe("");
+      // Empty/whitespace is UNSET, and so takes the default rather than
+      // silently producing an unmentioned room nobody asked for.
+      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "   " }, noRead).opsAlert.mention).toBe("@director");
+    });
+
+    test("rejects a non-positive or non-numeric dedup window rather than silently disabling dedup", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "0" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "-5" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "soon" }, noRead)).toThrow();
+    });
+
+    test("describeConfig names the room, the mention, the window, and says when no posting credential exists", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("opsAlert=#team-admin");
+      expect(d).toContain("dedupMinutes=60");
+      expect(d).toContain("NO posting credential");
+    });
+  });
 });
 
 describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-497/FACTORY-475 hardcodes Cleavr's fixed id as the ONLY allowed origin)", () => {

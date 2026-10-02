@@ -18,6 +18,7 @@ import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, join } from "node:path";
+import { hostname } from "node:os";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, cwdAgentResolvers, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
@@ -39,6 +40,7 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createOpsAlertRouter } from "../agents/ops-alert.js";
 import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
@@ -1940,7 +1942,26 @@ blockingEscalationTimer.unref?.();
 // host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
 // the full design and why its delivery (a journal line + a `/health` sibling
 // field, both below) survives a dead Claude credential.
-const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+// FACTORY-630: the PUSH destination for this alert, and for every later ops
+// condition that reuses the route. Built on the SAME `teamAdminNotify`
+// closure the managed-session escalator is wired behind above — one poster,
+// one credential, a second room per call, no second Rocket.Chat client. When
+// that credential is absent, `post` is undefined and the router degrades to
+// its own journal line, leaving this alert exactly as it behaved before this
+// ticket (the journal line and `/health` below are untouched by it).
+const opsAlertRouter = createOpsAlertRouter({
+  ...(teamAdminNotify ? { post: teamAdminNotify } : {}),
+  room: config.opsAlert.room,
+  mention: config.opsAlert.mention,
+  host: hostname(),
+  now: () => Date.now(),
+  log: (line) => console.log(line),
+  dedupWindowMs: config.opsAlert.dedupMinutes * 60_000,
+});
+if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
+else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
+
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now(), opsAlert: opsAlertRouter });
 const loginExpiredWatcher = createLoginExpiredWatcher({
   onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
   onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
