@@ -49,3 +49,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run scripts/release/check.ts
         env: { RELEASE_BASE: "origin/${{ github.base_ref || 'main' }}" }
+      - name: release dry-run (informational, not required — what the next release would compute to from this PR's own diff; see scripts/release/release.ts)
+        continue-on-error: true
+        run: bun run scripts/release/release.ts --dry-run

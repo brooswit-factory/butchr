@@ -32,9 +32,9 @@ export function parseChangelog(md: string): Entry[] {
 
 export const hasContent = (e: { sections: Partial<Record<Section, string[]>> }) => Object.values(e.sections).some((b) => b && b.length > 0);
 
-/** Build a `## [x.y.z] - YYYY-MM-DD` block collating bullets from several sources (fragments), by section, in SECTIONS order. */
-export function collateEntry(version: string, date: string, sources: { sections: Partial<Record<Section, string[]>> }[]): string {
-  const lines = [`## [${version}] - ${date}`];
+/** `### Section` / `- bullet` lines collating several sources (fragments), by section, in SECTIONS order — no heading. Shared by `collateEntry` (prefixes a `## [x.y.z] - date` heading, for `CHANGELOG.md`) and `collateNotes` (no heading, for a GitHub Release body). */
+function collateSectionLines(sources: { sections: Partial<Record<Section, string[]>> }[]): string[] {
+  const lines: string[] = [];
   for (const sec of SECTIONS) {
     const bullets = sources.flatMap((s) => s.sections[sec] ?? []);
     if (bullets.length) {
@@ -42,7 +42,17 @@ export function collateEntry(version: string, date: string, sources: { sections:
       for (const b of bullets) lines.push(`- ${b}`);
     }
   }
-  return lines.join("\n") + "\n";
+  return lines;
+}
+
+/** Build a `## [x.y.z] - YYYY-MM-DD` block collating bullets from several sources (fragments), by section, in SECTIONS order. */
+export function collateEntry(version: string, date: string, sources: { sections: Partial<Record<Section, string[]>> }[]): string {
+  return [`## [${version}] - ${date}`, ...collateSectionLines(sources)].join("\n") + "\n";
+}
+
+/** Same bullet collation as `collateEntry`, but with no version/date heading — for a GitHub Release body, which already carries the version in its own title. */
+export function collateNotes(sources: { sections: Partial<Record<Section, string[]>> }[]): string {
+  return collateSectionLines(sources).join("\n") + "\n";
 }
 
 /** Insert a collated entry block just above the first existing `## [x.y.z]` heading (or at the end, if there is none yet). */

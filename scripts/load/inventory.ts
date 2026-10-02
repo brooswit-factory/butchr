@@ -26,8 +26,8 @@ export const loadTestPathFor = (file: string) => `test/load/${file.replace(/\.ts
 
 /** Entry-point scripts run on import (they call process.exit / hit the network); they are load-tested as a subprocess with a guard env instead. */
 export const RUNS_ON_IMPORT = new Set([
-  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/collate.ts",
-  "scripts/release/notes.ts", "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
+  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/release.ts",
+  "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
   "scripts/verify-spawn-effort.ts", "scripts/verify-workspace-ground-truth.ts", "scripts/verify-review-commit-immutability.ts", "src/daemon/index.ts",
   // BUTCHR-250: a one-off vendoring script that fetches a live URL and
   // writes src/tools/html4-named-entities.generated.ts as a side effect of

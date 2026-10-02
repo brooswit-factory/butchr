@@ -1,23 +1,31 @@
-# DISABLED ON PURPOSE (FACTORY-620 / GitHub #615): there is no npm publisher
-# set up for @brooswit/butchr, so the old `publish` job's npm step 404'd on
-# every push to main. Brooswit decided: no npm publishing for now — she will
-# clone the repos; releases are a git tag plus a GitHub Release only. This
-# workflow was disabled via `gh workflow disable release` (FACTORY-601,
-# state `disabled_manually`) and must STAY disabled until Brooswit answers
-# the open versioning question — do not re-enable it and do not pick a
-# version as part of re-enabling it. The npm-publish step itself is removed
-# below so that re-enabling this workflow by accident can't publish
-# anywhere; what remains (collate fragments, commit, tag, GitHub Release)
-# is kept so the file stays usable once versioning is decided.
+# DISABLED ON PURPOSE (FACTORY-620 / GitHub #615, superseded by FACTORY-627):
+# there is no npm publisher set up for @brooswit/butchr, so the old `publish`
+# job's npm step 404'd on every push to main. Brooswit decided: no npm
+# publishing for now — she will clone the repos; releases are a git tag plus
+# a GitHub Release only. This workflow was disabled via `gh workflow disable
+# release` (FACTORY-601, state `disabled_manually`).
+#
+# FACTORY-627 rewrote this to "option B": the version is computed from the
+# latest `v*` tag plus the highest `changelog.d/` fragment bump since it
+# (scripts/release/release.ts) — NOT from `package.json` or a collate+commit
+# step. There is no commit to `main` at all now (so branch protection,
+# `enforce_admins`/required checks, is never touched by this workflow), no
+# `package.json` or `CHANGELOG.md` edit, and `changelog.d/` fragments are
+# never deleted (they simply stop counting once a tag is made past them —
+# see `scripts/release/git.ts`'s `fragmentsAddedSince`). This workflow STAYS
+# DISABLED until the director re-enables it (proven by
+# `scripts/release/release.ts --dry-run`, exercised on every PR by
+# `ci.yml`'s `release-gate` job) — do not re-enable it as part of reviewing
+# or merging this change.
 name: release
 on:
   push:
     branches: [main]
 permissions:
-  contents: write   # version-bump commit + tag + GitHub Release
+  contents: write   # tag + GitHub Release only — no commit/push to main, no npm
 concurrency:
   group: release-main
-  cancel-in-progress: false   # never cancel a merge's release — that would strand its fragment unreleased, silently
+  cancel-in-progress: false   # never cancel a merge's release — a second merge's own fragments must always be computed from THIS merge's new tag, not a torn-down intermediate state
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -32,32 +40,12 @@ jobs:
         # does not even START (checkout included) until this one finishes — but `checkout` pins
         # github.sha, the exact commit that triggered THIS run, which can already be stale by the
         # time the job actually executes (runner queueing, or another merge landing during it).
-        # Reset onto whatever origin/main actually is right now so the version we read and the
-        # fragments we collate are never a stale snapshot.
+        # Reset onto whatever origin/main actually is right now so the tag we compute from, and
+        # the fragments since it, are never a stale snapshot. scripts/release/release.ts reads
+        # HEAD, never GITHUB_SHA, for exactly this reason.
         run: git fetch origin main && git reset --hard origin/main
-      - id: collate
-        name: collate changelog.d/ fragments into a version
-        run: bun run scripts/release/collate.ts
-      - if: steps.collate.outputs.needed == 'true'
-        run: bun run check && bun run build
-      - if: steps.collate.outputs.needed == 'true'
-        name: commit + push the version bump (no npm publish; tag + GitHub Release only — see header)
-        env: { V: "${{ steps.collate.outputs.version }}" }
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json CHANGELOG.md changelog.d
-          git commit -m "release: v$V"
-          for i in 1 2 3; do
-            git push origin HEAD:main && break
-            if [ "$i" = 3 ]; then echo "::error::could not push the v$V release commit to main after 3 attempts — v$V IS published to npm; reconcile package.json/CHANGELOG.md on main by hand" && exit 1; fi
-            git fetch origin main
-            git rebase origin/main   # fragment deletions + our two file edits vs. someone else's unrelated commit: no textual overlap expected — fail rather than force past a real conflict
-          done
-      - if: steps.collate.outputs.needed == 'true'
-        name: tag + GitHub Release with the changelog entry
-        env: { GH_TOKEN: "${{ github.token }}", V: "${{ steps.collate.outputs.version }}" }
-        run: |
-          bun run scripts/release/notes.ts "$V"
-          git tag "v$V" && git push origin "v$V"
-          gh release create "v$V" --title "v$V" --notes-file release-notes.md
+      - name: identity for the annotated release tag (no commit ever made or pushed with it)
+        run: git config user.name "github-actions[bot]" && git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: compute + tag + GitHub Release (no commit, no npm — see header)
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: bun run scripts/release/release.ts
