@@ -301,6 +301,7 @@ describe("admissionView: mutation 3 — per-source independence, never smeared",
 
 describe("buildHeaderView — currency, never red", () => {
   const build = { sha: "abcdef0123456789", shaDirty: false, shaUnknownReason: null, version: "1.2.3" };
+  const base = { ref: "origin/main", sha: "x", changedAt: null, changedAtUnknownReason: null, fetchedAt: null, fetchedAtUnknownReason: null };
 
   test("no currency sibling at all (older build): falls back to the build sha alone", () => {
     const header: DashboardHeaderInfo = { build };
@@ -310,7 +311,7 @@ describe("buildHeaderView — currency, never red", () => {
   });
 
   test("current: renders 'current'", () => {
-    const header: DashboardHeaderInfo = { build, currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "current", base: { sha: "x", changedAt: null, fetchedAt: null }, dirtyUndeterminable: false } } };
+    const header: DashboardHeaderInfo = { build, currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "current", base, dirtyUndeterminable: false } } };
     const v = buildHeaderView(header, NOW);
     expect(v.currencyText).toContain("current");
   });
@@ -318,7 +319,7 @@ describe("buildHeaderView — currency, never red", () => {
   test("stale with commitsAhead exactly 0: renders 'behind by N'", () => {
     const header: DashboardHeaderInfo = {
       build,
-      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: 0, base: { sha: "x", changedAt: null, fetchedAt: null }, dirtyUndeterminable: false } },
+      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: 0, base, dirtyUndeterminable: false } },
     };
     const v = buildHeaderView(header, NOW);
     expect(v.currencyText).toContain("behind by 3");
@@ -327,7 +328,7 @@ describe("buildHeaderView — currency, never red", () => {
   test("stale with commitsAhead null: NEVER 'behind' — renders diverged/undetermined instead", () => {
     const header: DashboardHeaderInfo = {
       build,
-      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: null, base: { sha: "x", changedAt: null, fetchedAt: null }, dirtyUndeterminable: false } },
+      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: null, base, dirtyUndeterminable: false } },
     };
     const v = buildHeaderView(header, NOW);
     expect(v.currencyText).not.toContain("behind");
@@ -337,7 +338,7 @@ describe("buildHeaderView — currency, never red", () => {
   test("stale with commitsAhead > 0: also diverged/undetermined, never 'behind'", () => {
     const header: DashboardHeaderInfo = {
       build,
-      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: 2, base: { sha: "x", changedAt: null, fetchedAt: null }, dirtyUndeterminable: false } },
+      currency: { checkedAt: new Date(NOW - 1000).toISOString(), verdict: { status: "stale", commitsBehind: 3, commitsAhead: 2, base, dirtyUndeterminable: false } },
     };
     const v = buildHeaderView(header, NOW);
     expect(v.currencyText).not.toContain("behind");
@@ -351,13 +352,13 @@ describe("buildHeaderView — currency, never red", () => {
   });
 
   test("a known checkedAt renders 'checked <age> ago', never a bare 'checked'", () => {
-    const header: DashboardHeaderInfo = { build, currency: { checkedAt: new Date(NOW - 60_000).toISOString(), verdict: { status: "current", base: { sha: "x", changedAt: null, fetchedAt: null }, dirtyUndeterminable: false } } };
+    const header: DashboardHeaderInfo = { build, currency: { checkedAt: new Date(NOW - 60_000).toISOString(), verdict: { status: "current", base, dirtyUndeterminable: false } } };
     const v = buildHeaderView(header, NOW);
     expect(v.currencyText).toMatch(/checked .*\d.* ago/);
   });
 
   test("no build sha at all: renders 'build sha unknown', with the reason when given", () => {
-    const v = buildHeaderView({ build: { sha: null, shaDirty: null, shaUnknownReason: "no provenance" } }, NOW);
+    const v = buildHeaderView({ build: { sha: null, shaDirty: null, shaUnknownReason: "no provenance", version: "1.2.3" } }, NOW);
     expect(v.buildText).toBe("build sha unknown (no provenance)");
   });
 });
