@@ -111,6 +111,28 @@ describe("DashboardView — row identity and the daemon-level banner (FACTORY-61
     expect(getByRole("link", { name: "configurations" }).getAttribute("href")).toBe("/configurations");
   });
 
+  test("per-source admission rows render independently: a checked source and a declined source each carry only their own state (mutation 3)", () => {
+    const response: DashboardResponse = {
+      checked: true,
+      confirmedAt: "2026-01-01T00:09:55.000Z",
+      rows: [],
+      admission: {
+        ...ADMISSION,
+        sources: [
+          { source: "issue-tier", census: { checked: true, confirmedAt: "2026-01-01T00:09:50.000Z" } },
+          { source: "project-tier", census: { checked: false, declinedAt: "2026-01-01T00:09:50.000Z", reason: "untrusted" } },
+        ],
+      },
+    };
+    const { getByText } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
+    const checkedLine = getByText(/issue-tier: checked/);
+    const declinedLine = getByText(/project-tier: COULD NOT CHECK/);
+    expect(checkedLine.getAttribute("data-source")).toBe("issue-tier");
+    expect(checkedLine.textContent).not.toContain("untrusted");
+    expect(declinedLine.getAttribute("data-source")).toBe("project-tier");
+    expect(declinedLine.textContent).toContain("untrusted");
+  });
+
   test("admission residency's could-not-check case never renders as a known number", () => {
     const response: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:09:55.000Z", rows: [], admission: { ...ADMISSION, residency: null } };
     const { getByText } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
