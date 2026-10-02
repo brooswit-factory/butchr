@@ -1653,9 +1653,14 @@ NEVER trusted and is neutralised before being posted:
 
 - Every quoted field goes inside ONE fenced code block per message. Only
   the message's HEADER line (the real, intended `@mention` of whoever
-  should answer) sits outside it — nothing else is allowed to sit outside
-  the block, so a multi-line question cannot inject a header-looking line
-  or a bare `@mention` that reads as a second, unintended ping.
+  should answer, and the session's display name) sits outside it — the
+  session name is itself derived from the managed session's DEFINITION
+  FILENAME, which this module cannot assume is attacker-free (a definition
+  named e.g. `@all.json`), so it is run through the SAME neutralisation
+  pipeline as every quoted field even though it sits outside the block.
+  Nothing else is allowed to sit outside the block, so a multi-line
+  question cannot inject a header-looking line or a bare `@mention` that
+  reads as a second, unintended ping.
 - Every `@` inside the block has a zero-width space (U+200B) inserted right
   after it — `@all`, `@here`, `@admin-assembly`, or any other handle, can
   never resolve as a real mention, while remaining visually identical to a
@@ -1742,8 +1747,25 @@ both `#team-admin` and `#team-engineering`, and gets its "no longer
 blocked" notice in both).
 
 **Not configured.** With the three credential env vars unset, this whole
-feature is off: no Rocket.Chat post at any tier, ever — but the
-`[managed-escalation]` journal line still fires for every detector mark,
-exactly as the section above describes, with no additional tier-specific
-journal line (a tier's own attempt is a delivery concern layered on top of
-the one mark, not a second mark).
+feature is off: no Rocket.Chat post at any tier, ever — but each tier STILL
+logs its own `[managed-escalation] tier <N> due for ... (elapsed <M>m) —
+intended <mention> in #<room>` journal line, exactly once per tier per
+episode, on top of the existing detector-mark line. This is deliberate
+(director's acceptance criterion (g)): a complete journal trail of what
+WOULD have been posted, and to where, must exist whether or not posting
+itself is configured — an operator reading the journal alone (not
+Rocket.Chat) can still see that a pane crossed the 10- and 20-minute
+thresholds and who would have been pinged.
+
+**Which path drives tier re-evaluation.** Elapsed time is only checked when
+something calls back into `markManagedSessionStalled` for an already-marked
+(pane, fingerprint) — Butchr's own poll (`handleManagedSessionBlocked`, via
+`onBlocked`) does this on every qualifying poll while the pane stays
+blocked, so for THAT detector tiers 2/3 fire on schedule regardless of
+anything else. Drovr's own hook (`onDrovrUnknownDialog`) is, by its own
+package's contract, called at most ONCE per (pane, fingerprint) episode —
+so if a dialog is recognized ONLY by drovr's detector and never by Butchr's
+own parser for the same pane, that episode's tier 2/3 re-evaluation depends
+on Butchr's own poll having ALSO marked it (which, per "Two detectors, one
+mark" above, happens whenever both detectors see the same episode) rather
+than on drovr re-calling its hook.

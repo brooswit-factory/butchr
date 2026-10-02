@@ -619,7 +619,11 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     expect(h.sent).toEqual([]);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // once per (pane, fingerprint), not on every poll
+    // FACTORY-609 (PR #610 review, blocking finding 1): the mark line PLUS
+    // tier 1's own "due" line (unconditional, independent of whether a
+    // notifier is configured — the director's acceptance (g)) — once each
+    // per (pane, fingerprint), not on every poll.
+    expect(lines.length).toBe(2);
     expect(lines[0]).toContain(target.agentKey);
     expect(lines[0]).toContain(target.definitionPath);
     expect(lines[0]).toContain("p1");
@@ -642,7 +646,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     await h.poll("p1", null, prompt2);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(4); // 2 episodes x (mark line + tier-1-due line)
     expect(h.escalator.managedSessionEscalations()).toEqual([
       { agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: fingerprint(prompt2), since: expect.any(String) },
     ]);
@@ -663,7 +667,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     // episode — it escalates (and logs) again, not silently adopted.
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && !l.includes("no longer blocked"));
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(4); // 2 episodes x (mark line + tier-1-due line)
   });
 
   test("overlapping polls for the same keyless pane never double-log (inFlight guard)", async () => {
@@ -677,7 +681,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     expect(calls.length).toBe(1); // the second overlapping call never even reaches managedSessionOf
     calls[0]!();
     await Promise.all([p1, p2]);
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line
     expect(h.logs.some((l) => /previous poll is still in flight/.test(l))).toBe(true);
   });
 });
@@ -694,7 +698,7 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
     await h.escalator.onDrovrUnknownDialog(escalation);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).toContain(target.agentKey);
     expect(lines[0]).toContain(target.definitionPath);
     expect(lines[0]).toContain(escalation.question);
@@ -713,7 +717,7 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
     const h = harness({ managedSessionOf: async () => target });
     await h.escalator.onDrovrUnknownDialog(escalation);
     await h.escalator.onDrovrUnknownDialog(escalation);
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line, still just once each
   });
 
   test("onDialogResolved clears the mark, and a later onUnknownDialog re-escalates", async () => {
@@ -1102,8 +1106,10 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       const prompt = parsePrompt(REAL)!;
       for (let i = 0; i < 5; i++) await expect(h.poll("p1", null, prompt)).resolves.toBeUndefined();
       expect(ta.posts.length).toBe(0);
-      // A journal line fired exactly once (the mark itself is unaffected by the RC outcome).
-      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt))).length).toBe(1);
+      // The mark line and tier 1's own "due" line each fired exactly once
+      // (both are unaffected by the RC outcome — only the retried POST
+      // itself, logged as a separate WARNING line, repeats).
+      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt))).length).toBe(2);
     });
 
     test("a rejected clear-up post is logged and never throws", async () => {
@@ -2278,7 +2284,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).not.toContain("capture:");
   });
 
@@ -2300,7 +2306,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     expect(contents).toContain(fingerprint(prompt));
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     const path = `/fake-captures/${name}`;
     expect(lines[0]).toContain(path);
 
@@ -2352,7 +2358,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines.length).toBe(2); // mark line + tier-1-due line — still marked stalled and logged
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture failed"))).toBe(true);
   });
@@ -2369,7 +2375,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines.length).toBe(2); // mark line + tier-1-due line — still marked stalled and logged
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
     expect(cap.files.size).toBe(0); // the read never even produced text to write
@@ -2392,7 +2398,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
 
@@ -2409,13 +2415,13 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt); // times out at 20ms — logs once, no capture path
 
     const linesAfterTimeout = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(linesAfterTimeout.length).toBe(1);
+    expect(linesAfterTimeout.length).toBe(2); // mark line + tier-1-due line
     expect(linesAfterTimeout[0]).not.toContain("capture:");
 
     // Let the read finally resolve, well after the race was already lost.
     resolveRead!(REAL);
     await new Promise((r) => setTimeout(r, 30)); // give the late write a chance to land
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1); // no second/late line
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line — no second/late line
   });
 
   test("evicts the oldest managed-session capture, by timestamp, once at the file cap — never touching the sibling issue-keyed shape", async () => {
@@ -3120,21 +3126,74 @@ describe("createEscalator — FACTORY-609 (Part B): 0/10/20-minute tiers + routi
   });
 
   // (g) no poster configured → journal lines only, including the new tier lines
-  test("(g) with no poster configured, tiers 1-3 all still produce journal lines, never a post", async () => {
+  // PR #610 review (blocking finding 1): rewritten — the director's
+  // acceptance (g) requires a COMPLETE journal line per TIER, "whether or
+  // not posting is configured", not merely "at least one line exists". The
+  // previous version of this test only asserted the latter (true even on
+  // the pre-fix code) and its own title overclaimed what it checked.
+  test("(g) with no poster configured, tiers 1-3 each produce their OWN journal line, exactly once, never a post", async () => {
     const h = harness({ managedSessionOf: async () => target }); // no teamAdminNotify
     const prompt = parsePrompt(REAL)!;
     h.setClock(0);
     await h.poll("p1", null, prompt);
+    const afterTier1 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 1 due"));
+    expect(afterTier1.length).toBe(1);
+    expect(afterTier1[0]).toContain("pane p1");
+    expect(afterTier1[0]).toContain(`fingerprint ${fingerprint(prompt)}`);
+    expect(afterTier1[0]).toContain("elapsed 0m");
+    expect(afterTier1[0]).toContain("@admin-assembly");
+    expect(afterTier1[0]).toContain("#team-admin");
+
+    // Not yet due — repeat polls before 10 minutes never log a tier-2 line.
+    h.setClock(9 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(h.logs.filter((l) => l.includes("tier 2 due")).length).toBe(0);
+
     h.setClock(10 * 60_000);
     await h.poll("p1", null, prompt);
+    const afterTier2 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 2 due"));
+    expect(afterTier2.length).toBe(1); // exactly once, not re-logged on the next repeat poll below
+    expect(afterTier2[0]).toContain("elapsed 10m");
+
+    h.setClock(15 * 60_000);
+    await h.poll("p1", null, prompt); // same episode, tier 2 already logged/due — must not duplicate
+    expect(h.logs.filter((l) => l.includes("tier 2 due")).length).toBe(1);
+    expect(h.logs.filter((l) => l.includes("tier 3 due")).length).toBe(0); // not yet due
+
     h.setClock(20 * 60_000);
     await h.poll("p1", null, prompt);
-    // The journal mark itself only fires once per NEW fingerprint (AC 6's
-    // existing contract is unchanged) — tiers are a Rocket.Chat-delivery
-    // concern layered on top, not a second journal line per tier. This
-    // test's job is: no crash, no throw, nothing posted — confirmed by the
-    // absence of any poster and by not throwing.
-    expect(h.logs.some((l) => l.startsWith(MANAGED_ESCALATION_MARKER))).toBe(true);
+    const afterTier3 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 3 due"));
+    expect(afterTier3.length).toBe(1);
+    expect(afterTier3[0]).toContain("elapsed 20m");
+    expect(afterTier3[0]).toContain("@director");
+    expect(afterTier3[0]).toContain("#team-engineering");
+
+    h.setClock(25 * 60_000);
+    await h.poll("p1", null, prompt); // same episode — no further duplication of any tier's line
+    expect(h.logs.filter((l) => l.includes("tier 3 due")).length).toBe(1);
+
+    // No poster configured at any point — nothing was ever posted.
+    expect(h.sent).toEqual([]);
+  });
+
+  // PR #610 review (blocking finding 2): the header's own sessionName must
+  // be neutralised too — it is derived from the definition FILENAME, which
+  // this module cannot assume is attacker-free.
+  test("a session name containing '@all' is neutralised in the header, not just inside the quoted block", async () => {
+    const ta = fakeTeamAdmin();
+    const adversarialTarget: ManagedSessionTarget = {
+      agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2F%40all.json",
+      definitionPath: "/home/butchr/.config/butchr/session-definitions/@all.json",
+    };
+    const h = harness({ managedSessionOf: async () => adversarialTarget, teamAdminNotify: ta.notify });
+    await h.poll("p1", null, parsePrompt(REAL)!);
+    const text = ta.posts[0]!;
+    // The only legitimate "@word" outside the quoted block is the real,
+    // intended answerer mention — strip it, then nothing else (including
+    // the session name in the header) may contain a live "@all".
+    const withoutIntendedMention = text.replace("@admin-assembly", "");
+    expect(withoutIntendedMention).not.toContain("@all");
+    expect(text).toContain("@​all"); // the neutralised form IS present — the name was quoted, not dropped
   });
 
   describe("config-driven routing — no literals buried in logic", () => {

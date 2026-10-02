@@ -857,6 +857,20 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     tier3NotifiedAt?: number;
     /** Every room a tier of THIS episode was actually delivered to — the clear-up follow-up (FACTORY-369 AC 5) replays to each of them, since a human may be watching any one of the rooms this episode actually reached. Empty means nothing was ever delivered (not configured, or every attempt so far failed) — no clear-up is owed for an episode nobody was told about. */
     notifiedRooms: Set<string>;
+    /**
+     * PR #610 review (blocking finding 1): which tiers have already written
+     * their OWN once-per-episode `[managed-escalation]` journal line — the
+     * director's acceptance (g) requires a complete tier line "whether or
+     * not posting is configured", so this cannot reuse `tierNNotifiedAt`
+     * (which only ever gets set when `deps.teamAdminNotify` exists AND
+     * resolves — with no notifier configured it would stay `undefined`
+     * forever, so a gate on it would make the unconfigured case re-log
+     * every single poll instead of exactly once). This is the dedicated
+     * latch for the LOGGING side, entirely independent of whether the
+     * ROCKET.CHAT POST itself ever succeeds, is retried, or never happens
+     * at all.
+     */
+    loggedTiers: Set<1 | 2 | 3>;
   }
   const managedSessionStalled = new Map<string, ManagedSessionEntry>();
   // FACTORY-369: mirrors `inFlight`/`unresponsiveInFlight`'s own guard —
@@ -950,7 +964,13 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   ): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
     const tierLabel = tier === 1 ? "first escalation" : tier === 2 ? "re-escalation (10 min)" : "director escalation (20 min)";
-    const header = `${mention} managed session **${sessionName}** is blocked and cannot answer for itself (tier ${tier}: ${tierLabel}) — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
+    // PR #610 review: sessionName is derived from the DEFINITION FILENAME,
+    // which this module cannot assume is attacker-free (comment 28781's own
+    // "session/pane fields if attacker-influenced") — a definition named
+    // e.g. `@all.json` would otherwise ping from the header, which sits
+    // OUTSIDE the quoted block by design (only the real, intended mention
+    // belongs there). Quoted here too, same pipeline as every other field.
+    const header = `${mention} managed session **${quoteField(sessionName)}** is blocked and cannot answer for itself (tier ${tier}: ${tierLabel}) — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
     const block = quotedBlock([
       `session: ${quoteField(sessionName)}`,
       `pane: ${quoteField(paneId)}`,
@@ -968,7 +988,10 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   function tierClearedMessage(target: ManagedSessionTarget, paneId: string, fp: string): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
     const block = quotedBlock([`session: ${quoteField(sessionName)}`, `pane: ${quoteField(paneId)}`, `fingerprint: ${quoteField(fp)}`]);
-    return [`managed session **${sessionName}** is no longer blocked — the dialog above has cleared.`, "", block].join("\n");
+    // PR #610 review: same reasoning as tierMessage's header above — this
+    // header line also sits outside the quoted block, so sessionName must
+    // be quoted here too.
+    return [`managed session **${quoteField(sessionName)}** is no longer blocked — the dialog above has cleared.`, "", block].join("\n");
   }
 
   /**
@@ -977,16 +1000,33 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * tier 1; the elapsed-time evaluation in `markManagedSessionStalled`'s
    * repeat-poll branch for tiers 2/3) and, harmlessly, on every later
    * repeat poll of an already-due tier whose post has not yet SUCCEEDED
-   * (AC 7's retry). A no-op the moment this tier's own `*NotifiedAt` slot is
-   * set (delivered — never re-posted, AC 4) or `deps.teamAdminNotify` is
-   * absent (not configured — AC 6 is already satisfied by the journal line
-   * `markManagedSessionStalled` always writes regardless of this function).
-   * FAILS OPEN and NEVER THROWS: a rejected post is logged and left
-   * unlatched so the NEXT qualifying poll retries — mirrors
-   * `escalateUnresponsive`'s own null-means-retry discipline for the Jira
-   * path (AC 7).
+   * (AC 7's retry).
+   *
+   * PR #610 review (blocking finding 1): the director's acceptance (g)
+   * requires a COMPLETE `[managed-escalation]` journal line for every tier
+   * "whether or not posting is configured" — this function now writes that
+   * line FIRST, unconditionally, latched per-tier via `entry.loggedTiers`
+   * (see that field's own doc comment for why it cannot reuse
+   * `*NotifiedAt`). Only AFTER that does it attempt the actual Rocket.Chat
+   * post, which stays gated exactly as before: a no-op once this tier's own
+   * `*NotifiedAt` slot is set (delivered — never re-posted, AC 4) or
+   * `deps.teamAdminNotify` is absent (not configured). FAILS OPEN and NEVER
+   * THROWS: a rejected post is logged and left unlatched so the NEXT
+   * qualifying poll retries — mirrors `escalateUnresponsive`'s own
+   * null-means-retry discipline for the Jira path (AC 7).
    */
   async function attemptTierNotify(paneId: string, entry: ManagedSessionEntry, tier: 1 | 2 | 3, elapsedMinutes: number): Promise<void> {
+    const sessionName = managedSessionShortDisplayId(entry.target.definitionPath);
+    const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
+    const { mention, room } = routingFor(sessionName, tier, routing);
+
+    if (!entry.loggedTiers.has(tier)) {
+      entry.loggedTiers.add(tier);
+      deps.log(
+        `${MANAGED_ESCALATION_MARKER} tier ${tier} due for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (elapsed ${elapsedMinutes}m) — intended ${mention} in #${room}`,
+      );
+    }
+
     const alreadyNotifiedAt = tier === 1 ? entry.tier1NotifiedAt : tier === 2 ? entry.tier2NotifiedAt : entry.tier3NotifiedAt;
     if (alreadyNotifiedAt !== undefined) return;
     if (!deps.teamAdminNotify) return;
@@ -994,9 +1034,6 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     if (teamAdminInFlight.has(inFlightKey)) return;
     teamAdminInFlight.add(inFlightKey);
     try {
-      const sessionName = managedSessionShortDisplayId(entry.target.definitionPath);
-      const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
-      const { mention, room } = routingFor(sessionName, tier, routing);
       const text = tierMessage(tier, mention, entry.target, paneId, entry.question, entry.options, entry.fp, entry.capturePath, elapsedMinutes);
       await deps.teamAdminNotify(room, text);
       const notifiedAt = deps.now();
@@ -1006,8 +1043,6 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       entry.notifiedRooms.add(room);
       deps.log(`${MANAGED_ESCALATION_MARKER} posted to #${room} (tier ${tier}) for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}`);
     } catch (e) {
-      const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
-      const { room } = routingFor(managedSessionShortDisplayId(entry.target.definitionPath), tier, routing);
       deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #${room} post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (tier ${tier}) — will retry next qualifying poll: ${(e as Error)?.message ?? e}`);
     } finally {
       teamAdminInFlight.delete(inFlightKey);
@@ -1067,7 +1102,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const nowMs = deps.now();
     const since = new Date(nowMs).toISOString();
     const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
-    const entry: ManagedSessionEntry = { target, fp, since, sinceMs: nowMs, question, options, capturePath, notifiedRooms: new Set() };
+    const entry: ManagedSessionEntry = { target, fp, since, sinceMs: nowMs, question, options, capturePath, notifiedRooms: new Set(), loggedTiers: new Set() };
     managedSessionStalled.set(paneId, entry);
     const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
     // AC 6: this line fires unconditionally, whether or not #team-admin
