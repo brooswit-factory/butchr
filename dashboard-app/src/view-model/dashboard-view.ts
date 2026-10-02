@@ -20,11 +20,11 @@
  * A single withheld row can carry a could-not-check `tier` AND a
  * not-applicable agent-fields marker at once — see `withheldRowView`.
  */
-import { agentRowAnchorId, configAnchorForResourceKey } from "../../../src/agents/config-inventory-links.js";
 import type { AdmissionView, AgentDashboardRow, DashboardResponse, TierField, WithheldDashboardRow } from "../../../src/agents/dashboard.js";
 import { humanDuration, type StatusFloor } from "../../../src/agents/status-floor.js";
 import type { CurrencyReport } from "../../../src/daemon/currency.js";
-import { decodeAnyAgentKey } from "../../../src/rules/agent-key.js";
+import { decodeAnyAgentKey } from "./agent-key-display.js";
+import { agentRowAnchorId, configAnchorForResourceKey } from "./config-links.js";
 
 /** The subset of `BuildReport` (src/agents/build-identity.ts) this header actually reads — same narrow shape `dashboard-page.ts`'s own `DashboardBuildInfo` declares, kept independent so a test fixture here never has to fabricate herdr's full shape. */
 export interface DashboardBuildInfo {

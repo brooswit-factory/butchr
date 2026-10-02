@@ -35,12 +35,14 @@
     "../src/agents/query-agent-inventory.ts",
     "../src/md.d.ts",
     // FACTORY-615: the real dashboard view-model (`src/view-model/dashboard-view.ts`)
-    // additionally reads the cross-link helpers, the per-daemon currency
-    // shape, and `/health`'s own response shape — same "type-only-import
-    // the real shape, never hand-duplicate it" discipline as the two
+    // additionally type-only-reads the per-daemon currency shape and
+    // `/health`'s own response shape — same "type-only-import the real
+    // shape, never hand-duplicate it" discipline as the two
     // `dashboard.ts`/`query-agent-inventory.ts` entries above, so this
-    // program must resolve (and typecheck) their closure too.
-    "../src/agents/config-inventory-links.ts",
+    // program must resolve (and typecheck) their closure too. It does NOT
+    // include `../src/agents/config-inventory-links.ts` — see
+    // `dashboard-app/src/view-model/config-links.ts`'s own header for why
+    // that module is copied, not imported, in the browser bundle.
     "../src/daemon/currency.ts",
     "../src/daemon/health.ts",
     // FACTORY-614: the DOM-rendering component tests — see
