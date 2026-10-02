@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import type { RestoredResumePolicy } from "../agents/argv.js";
+import { MANAGED_ESCALATION_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
 
 /**
  * FACTORY-491 — the epic's own reading of an ambiguous director steer
@@ -122,6 +123,20 @@ export interface Config {
     /** Defaults to `"team-admin"` (the routing spec's own room, FACTORY-358 comment 26435) when BUTCHR_TEAM_ADMIN_ROOM is unset. */
     room: string;
   };
+  /**
+   * FACTORY-609 (Part B): rooms, mentions and the 10/20-minute tier delays
+   * for a managed-session escalation's tiered routing — "config, not
+   * literals" per the director's spec (FACTORY-607 comment 28778). ALWAYS
+   * present (unlike `managedEscalationRocketChat` above, which is gated on
+   * a credential that may not exist yet) — these values are needed for the
+   * `[managed-escalation]` journal line and the composed message text
+   * regardless of whether posting is actually configured, so there is
+   * nothing to gate. Defaults to `MANAGED_ESCALATION_DEFAULTS`
+   * (escalation-helper.ts) — the SAME constant `src/agents/escalation-loop.ts`
+   * falls back to when this dep is omitted, so there is exactly one place
+   * the director's default routing values are written down.
+   */
+  managedEscalationRouting: ManagedEscalationRouting;
   /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
@@ -508,6 +523,13 @@ export interface ConfigEnv {
   BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?: string | undefined;
   BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?: string | undefined;
   BUTCHR_TEAM_ADMIN_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
@@ -621,6 +643,37 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     managedEscalationRocketChat = { url: teamAdminUrl, adminUserId: teamAdminAdminUserId, adminTokenFile: teamAdminTokenFile, room };
   }
 
+  // FACTORY-609 (Part B): routing is ALWAYS present (see `Config.
+  // managedEscalationRouting`'s own doc comment for why it is not gated on
+  // `managedEscalationRocketChat` the way the credential above is) — every
+  // value here defaults to `MANAGED_ESCALATION_DEFAULTS`, the director's own
+  // routing (FACTORY-607 comment 28688), so an operator who sets none of
+  // these still gets correct behaviour. `normalRoom` deliberately reuses
+  // BUTCHR_TEAM_ADMIN_ROOM (already parsed above) rather than a second env
+  // var — tier 1/2 of an ordinary managed session is the SAME room
+  // FACTORY-369 already shipped under that name.
+  const managedEscalationAnswererMention = env.BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.normalMention;
+  const managedEscalationNormalRoom = env.BUTCHR_TEAM_ADMIN_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.normalRoom;
+  const managedEscalationAssemblyMention = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyMention;
+  const managedEscalationAssemblyRoom = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyRoom;
+  const managedEscalationDirectorMention = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.directorMention;
+  const managedEscalationDirectorRoom = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.directorRoom;
+  const managedEscalationTier2Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier2Minutes;
+  if (!Number.isFinite(managedEscalationTier2Minutes) || managedEscalationTier2Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES}`);
+  const managedEscalationTier3Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier3Minutes;
+  if (!Number.isFinite(managedEscalationTier3Minutes) || managedEscalationTier3Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES}`);
+  if (managedEscalationTier3Minutes <= managedEscalationTier2Minutes) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES (${managedEscalationTier3Minutes}) must be greater than BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES (${managedEscalationTier2Minutes})`);
+  const managedEscalationRouting: ManagedEscalationRouting = {
+    normalMention: managedEscalationAnswererMention,
+    normalRoom: managedEscalationNormalRoom,
+    assemblyMention: managedEscalationAssemblyMention,
+    assemblyRoom: managedEscalationAssemblyRoom,
+    directorMention: managedEscalationDirectorMention,
+    directorRoom: managedEscalationDirectorRoom,
+    tier2Minutes: managedEscalationTier2Minutes,
+    tier3Minutes: managedEscalationTier3Minutes,
+  };
+
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
@@ -703,6 +756,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(github ? { github } : {}),
     ...(rocketchat ? { rocketchat } : {}),
     ...(managedEscalationRocketChat ? { managedEscalationRocketChat } : {}),
+    managedEscalationRouting,
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
@@ -835,6 +889,7 @@ export const describeConfig = (c: Config): string =>
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
+  `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +

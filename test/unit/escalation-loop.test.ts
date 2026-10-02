@@ -7,6 +7,7 @@ import { fingerprint, parseDirective, MARKER as BLOCKED_MARKER } from "../../src
 import { tellWorker } from "../../src/tools/relationship.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../../src/tools/speak.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
+import type { ManagedEscalationRouting } from "../../src/agents/escalation-helper.js";
 
 /**
  * BUTCHR-45: the REAL tell_worker/tagComment construction (src/tools/
@@ -67,26 +68,32 @@ function fakeCaptureSink() {
 }
 
 /**
- * FACTORY-369: a fake `EscalatorDeps.teamAdminNotify` transport — records
- * every text posted, and can be told to reject the next `failNext` calls
- * (simulating RC down / 403 / refused role) before succeeding, so a test
- * can assert the AC 7 retry-without-latching behaviour without depending on
- * live Rocket.Chat.
+ * FACTORY-369/FACTORY-609: a fake `EscalatorDeps.teamAdminNotify` transport —
+ * records every (room, text) posted, and can be told to reject the next
+ * `failNext` calls (simulating RC down / 403 / refused role) before
+ * succeeding, so a test can assert the AC 7 retry-without-latching
+ * behaviour without depending on live Rocket.Chat. `posts` stays a flat
+ * array of the TEXT only (most existing assertions check text content and
+ * never cared about the room) — `roomPosts` is the room alongside it, for
+ * the FACTORY-609 tests that do.
  */
 function fakeTeamAdmin(opts: { failNext?: number } = {}) {
   const posts: string[] = [];
+  const roomPosts: Array<{ room: string; text: string }> = [];
   let failuresLeft = opts.failNext ?? 0;
   return {
     posts,
+    roomPosts,
     setFailNext: (n: number) => { failuresLeft = n; },
-    notify: async (text: string): Promise<void> => {
+    notify: async (room: string, text: string): Promise<void> => {
       if (failuresLeft > 0) { failuresLeft--; throw new Error("Rocket.Chat post failed (simulated)"); }
       posts.push(text);
+      roomPosts.push({ room, text });
     },
   };
 }
 
-function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number; teamAdminNotify?: (text: string) => Promise<void> } = {}) {
+function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCaptureSink>["sink"]; unresponsiveMinutes?: number; ownChannelCommentsFail?: boolean; coverage?: CoverageRecorder; managedSessionOf?: (paneId: string) => Promise<ManagedSessionTarget | null>; readOverride?: (paneId: string) => Promise<string>; managedSessionCaptureTimeoutMs?: number; teamAdminNotify?: (room: string, text: string) => Promise<void>; managedEscalationRouting?: ManagedEscalationRouting } = {}) {
   const sent: Array<{ pane: string; text: string }> = [];
   const posted: Array<{ issue: string; text: string }> = [];
   const logs: string[] = [];
@@ -126,6 +133,7 @@ function harness(opts: { delayMs?: number; captures?: ReturnType<typeof fakeCapt
     ...(opts.managedSessionOf ? { managedSessionOf: opts.managedSessionOf } : {}),
     ...(opts.managedSessionCaptureTimeoutMs !== undefined ? { managedSessionCaptureTimeoutMs: opts.managedSessionCaptureTimeoutMs } : {}),
     ...(opts.teamAdminNotify ? { teamAdminNotify: opts.teamAdminNotify } : {}),
+    ...(opts.managedEscalationRouting ? { managedEscalationRouting: opts.managedEscalationRouting } : {}),
   });
 
   // A shared, auto-incrementing tick counter — one call to poll()/notBlocked()
@@ -611,7 +619,11 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     expect(h.sent).toEqual([]);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // once per (pane, fingerprint), not on every poll
+    // FACTORY-609 (PR #610 review, blocking finding 1): the mark line PLUS
+    // tier 1's own "due" line (unconditional, independent of whether a
+    // notifier is configured — the director's acceptance (g)) — once each
+    // per (pane, fingerprint), not on every poll.
+    expect(lines.length).toBe(2);
     expect(lines[0]).toContain(target.agentKey);
     expect(lines[0]).toContain(target.definitionPath);
     expect(lines[0]).toContain("p1");
@@ -634,7 +646,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     await h.poll("p1", null, prompt2);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(4); // 2 episodes x (mark line + tier-1-due line)
     expect(h.escalator.managedSessionEscalations()).toEqual([
       { agentKey: target.agentKey, definitionPath: target.definitionPath, paneId: "p1", fingerprint: fingerprint(prompt2), since: expect.any(String) },
     ]);
@@ -655,7 +667,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     // episode — it escalates (and logs) again, not silently adopted.
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && !l.includes("no longer blocked"));
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(4); // 2 episodes x (mark line + tier-1-due line)
   });
 
   test("overlapping polls for the same keyless pane never double-log (inFlight guard)", async () => {
@@ -669,7 +681,7 @@ describe("createEscalator — managed-session escalation (FACTORY-45)", () => {
     expect(calls.length).toBe(1); // the second overlapping call never even reaches managedSessionOf
     calls[0]!();
     await Promise.all([p1, p2]);
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line
     expect(h.logs.some((l) => /previous poll is still in flight/.test(l))).toBe(true);
   });
 });
@@ -686,7 +698,7 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
     await h.escalator.onDrovrUnknownDialog(escalation);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).toContain(target.agentKey);
     expect(lines[0]).toContain(target.definitionPath);
     expect(lines[0]).toContain(escalation.question);
@@ -705,7 +717,7 @@ describe("createEscalator — drovr's own escalation hook (FACTORY-45 Part B)", 
     const h = harness({ managedSessionOf: async () => target });
     await h.escalator.onDrovrUnknownDialog(escalation);
     await h.escalator.onDrovrUnknownDialog(escalation);
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1);
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line, still just once each
   });
 
   test("onDialogResolved clears the mark, and a later onUnknownDialog re-escalates", async () => {
@@ -897,12 +909,22 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       expect(ta.posts[0]).not.toContain("@director");
     });
 
-    test("@director for the admin-assembly self-reference case", async () => {
+    // FACTORY-609 (Part B) / FACTORY-607 comment 28784 item 3: a DELIBERATE
+    // BEHAVIOUR CHANGE from what FACTORY-369 shipped — the director's
+    // comment 28688 now routes admin-assembly's own pane to
+    // `@manager-factory` in `#team-engineering` for tiers 1-2 (tier 3 still
+    // goes to the director, same as every other managed session — see the
+    // "tier 3" test in the "FACTORY-609" describe block below). This test
+    // is UPDATED to the new intent per the ticket's own instruction, not
+    // deleted — the OLD assertion (`@director` in `#team-admin` for tiers
+    // 1-2) is exactly what this supersedes.
+    test("@manager-factory in #team-engineering for the admin-assembly self-reference case (tiers 1-2)", async () => {
       const ta = fakeTeamAdmin();
       const h = harness({ managedSessionOf: async () => adminAssemblyTarget, teamAdminNotify: ta.notify });
       await h.poll("p1", null, parsePrompt(REAL)!);
-      expect(ta.posts[0]).toContain("@director");
+      expect(ta.posts[0]).toContain("@manager-factory");
       expect(ta.posts[0]).not.toContain("@admin-assembly");
+      expect(ta.roomPosts[0]!.room).toBe("team-engineering");
     });
   });
 
@@ -1084,8 +1106,10 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       const prompt = parsePrompt(REAL)!;
       for (let i = 0; i < 5; i++) await expect(h.poll("p1", null, prompt)).resolves.toBeUndefined();
       expect(ta.posts.length).toBe(0);
-      // A journal line fired exactly once (the mark itself is unaffected by the RC outcome).
-      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt))).length).toBe(1);
+      // The mark line and tier 1's own "due" line each fired exactly once
+      // (both are unaffected by the RC outcome — only the retried POST
+      // itself, logged as a separate WARNING line, repeats).
+      expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes(fingerprint(prompt))).length).toBe(2);
     });
 
     test("a rejected clear-up post is logged and never throws", async () => {
@@ -2260,7 +2284,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).not.toContain("capture:");
   });
 
@@ -2282,7 +2306,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     expect(contents).toContain(fingerprint(prompt));
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     const path = `/fake-captures/${name}`;
     expect(lines[0]).toContain(path);
 
@@ -2334,7 +2358,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     const prompt = parsePrompt(REAL)!;
     await h.poll("p1", null, prompt);
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines.length).toBe(2); // mark line + tier-1-due line — still marked stalled and logged
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture failed"))).toBe(true);
   });
@@ -2351,7 +2375,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1); // still marked stalled and logged
+    expect(lines.length).toBe(2); // mark line + tier-1-due line — still marked stalled and logged
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
     expect(cap.files.size).toBe(0); // the read never even produced text to write
@@ -2374,7 +2398,7 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt);
 
     const lines = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(lines.length).toBe(1);
+    expect(lines.length).toBe(2); // mark line + tier-1-due line
     expect(lines[0]).not.toContain("capture:");
     expect(h.logs.some((l) => l.startsWith("WARNING: [managed-escalation] capture timed out"))).toBe(true);
 
@@ -2391,13 +2415,13 @@ describe("createEscalator — managed-session escalation captures the full pane 
     await h.poll("p1", null, prompt); // times out at 20ms — logs once, no capture path
 
     const linesAfterTimeout = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER));
-    expect(linesAfterTimeout.length).toBe(1);
+    expect(linesAfterTimeout.length).toBe(2); // mark line + tier-1-due line
     expect(linesAfterTimeout[0]).not.toContain("capture:");
 
     // Let the read finally resolve, well after the race was already lost.
     resolveRead!(REAL);
     await new Promise((r) => setTimeout(r, 30)); // give the late write a chance to land
-    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(1); // no second/late line
+    expect(h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER)).length).toBe(2); // mark line + tier-1-due line — no second/late line
   });
 
   test("evicts the oldest managed-session capture, by timestamp, once at the file cap — never touching the sibling issue-keyed shape", async () => {
@@ -2868,4 +2892,383 @@ describe("createEscalator wired to the REAL extracted createOwnChannelComments (
       expect(adoptLine).not.toContain(`from comment ${followupRow.id}`);
     });
   });
+});
+
+describe("createEscalator — FACTORY-607 comment 28781 (Part A): quoted-content neutralisation", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+
+  // The exact adversarial content comment 28781 names: @all/@here/@admin-
+  // assembly, a bare link and a markdown link, and a triple-backtick run
+  // immediately followed by @here (the fence-closing attempt).
+  const ADVERSARIAL_QUESTION = [
+    "@all please look at this @here and also @admin-assembly",
+    "a link: https://example.com/x",
+    "markdown: [click](https://example.com)",
+    "```",
+    "@here",
+  ].join("\n");
+  const ADVERSARIAL_OPTIONS = ["@all yes", "@here no"] as const;
+
+  function postedTextFor(prompt: ReturnType<typeof parsePrompt>) {
+    return async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      await h.poll("p1", null, prompt!);
+      return ta.posts[0]!;
+    };
+  }
+
+  test("no @all/@here/@admin-assembly mention survives outside the intended header mention", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. ${ADVERSARIAL_OPTIONS[0]}\n  2. ${ADVERSARIAL_OPTIONS[1]}\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    // The header's own intended mention is the ONLY plain "@word" substring
+    // allowed — strip it, then nothing else may contain an unneutralised @.
+    const headerMention = "@admin-assembly";
+    const withoutHeaderMention = text.replace(headerMention, "");
+    expect(withoutHeaderMention).not.toContain("@all");
+    expect(withoutHeaderMention).not.toContain("@here");
+    expect(withoutHeaderMention).not.toContain("@admin-assembly");
+    // The neutralised forms ARE present (zero-width space after every @),
+    // proving the content itself was quoted, not silently dropped.
+    expect(text).toContain("@​all");
+    expect(text).toContain("@​here");
+  });
+
+  test("a code-fence run in the content cannot close the quoting block early", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. ${ADVERSARIAL_OPTIONS[0]}\n  2. ${ADVERSARIAL_OPTIONS[1]}\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    // The message's own fence (surrounding the whole quoted block) must be
+    // STRICTLY LONGER than any backtick run the content itself contributes
+    // (here, a literal ``` from the adversarial question) — assert this
+    // structurally: find every backtick run in the text and confirm the
+    // block is delimited by the single longest one, appearing exactly twice
+    // (open/close), with every other run strictly shorter.
+    const runs = text.match(/`+/g)!;
+    const longest = Math.max(...runs.map((r) => r.length));
+    const longestRuns = runs.filter((r) => r.length === longest);
+    expect(longestRuns.length).toBe(2); // exactly the opening and closing fence
+    const contentRunLengths = runs.filter((r) => r.length !== longest).map((r) => r.length);
+    for (const len of contentRunLengths) expect(len).toBeLessThan(longest);
+  });
+
+  test("a long question is capped with an explicit truncation marker", async () => {
+    const longQuestion = "x".repeat(5000);
+    const prompt = parsePrompt(`${longQuestion}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).toMatch(/\.\.\. \[truncated \d+ chars\]/);
+    // The marker must actually have cut the content — not merely be present
+    // somewhere coincidentally.
+    expect(text).not.toContain("x".repeat(5000));
+  });
+
+  test("links are defanged — a bare URL and a markdown link both lose their '://' ", async () => {
+    const prompt = parsePrompt(`${ADVERSARIAL_QUESTION}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).not.toContain("https://example.com");
+    expect(text).toContain("https:​//example.com");
+  });
+
+  test("\\r and other control characters are stripped from quoted content", async () => {
+    const dirty = "line one\r\nline two\x07bell\x00null";
+    const prompt = parsePrompt(`${dirty}\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel`)!;
+    const text = await postedTextFor(prompt)();
+    expect(text).not.toContain("\r");
+    expect(text).not.toContain("\x07");
+    expect(text).not.toContain("\x00");
+  });
+
+  test("options beyond the stated cap are omitted, not silently truncated without saying so", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const manyOptions = Array.from({ length: 15 }, (_, i) => `option ${i + 1}`);
+    const prompt = { question: "pick one", options: manyOptions, current: 1 } as unknown as ReturnType<typeof parsePrompt>;
+    // Bypass parsePrompt (it does not support 15 real options in these
+    // fixtures' format) — markManagedSessionStalled only needs .question/.options.
+    await h.escalator.onBlocked("p1", null, prompt!, 1);
+    const text = ta.posts[0]!;
+    expect(text).toContain("option 10");
+    expect(text).not.toContain("option 11");
+    expect(text).toMatch(/\[\d+ more option\(s\) omitted\]/);
+  });
+
+  // Mutation-check results for the five tests above (each neutralisation
+  // step reverted in turn, production code genuinely edited, `bun test`
+  // run, then reverted) are reported in the PR description, not re-asserted
+  // here as a second, parallel "simulated" test — a simulated assertion
+  // proves nothing about whether the REAL production code's removal turns
+  // the REAL test red.
+});
+
+describe("createEscalator — FACTORY-609 (Part B): 0/10/20-minute tiers + routing config", () => {
+  const target: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+  };
+  const adminAssemblyTarget: ManagedSessionTarget = {
+    agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-assembly.json",
+    definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-assembly.json",
+  };
+
+  // (a) immediate escalation
+  test("(a) tier 1 fires immediately on the first mark", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    h.setClock(0);
+    await h.poll("p1", null, parsePrompt(REAL)!);
+    expect(ta.posts.length).toBe(1);
+    expect(ta.roomPosts[0]!.room).toBe("team-admin");
+    expect(ta.posts[0]).toContain("tier: 1");
+  });
+
+  // (b) 10-minute re-escalation
+  test("(b) tier 2 fires at 10 minutes, same fingerprint, same episode", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1);
+
+    h.setClock(9 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1); // not yet due
+
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2);
+    expect(ta.posts[1]).toContain("tier: 2");
+    expect(ta.roomPosts[1]!.room).toBe("team-admin");
+
+    // No duplicate tier-2 on a later poll within the same episode.
+    h.setClock(15 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2);
+  });
+
+  // (c) 20-minute director tier
+  test("(c) tier 3 fires at 20 minutes, to the director in #team-engineering", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    h.setClock(19 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(2); // tier 3 not yet due
+
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(3);
+    expect(ta.posts[2]).toContain("tier: 3");
+    expect(ta.posts[2]).toContain("@director");
+    expect(ta.roomPosts[2]!.room).toBe("team-engineering");
+
+    h.setClock(25 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(3); // no duplicate tier 3
+  });
+
+  // (d) assembly-pane routing variant
+  test("(d) admin-assembly's own pane: tiers 1-2 to @manager-factory in #team-engineering, tier 3 to @director in #team-engineering", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => adminAssemblyTarget, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+
+    expect(ta.posts.length).toBe(3);
+    expect(ta.roomPosts[0]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[0]).toContain("@manager-factory");
+    expect(ta.roomPosts[1]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[1]).toContain("@manager-factory");
+    expect(ta.roomPosts[2]).toEqual(expect.objectContaining({ room: "team-engineering" }));
+    expect(ta.posts[2]).toContain("@director");
+  });
+
+  // (e) nothing after clear
+  test("(e) nothing further after the pane clears — the episode's clear-up is a single post, no further tiers", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    h.setClock(5 * 60_000);
+    h.notBlocked([]);
+    await Bun.sleep(0);
+    const afterClear = ta.posts.length;
+    expect(afterClear).toBe(2); // tier 1 + the clear-up
+
+    // Even if the clock keeps advancing well past 10/20 minutes, nothing
+    // more is posted for the now-cleared episode.
+    h.setClock(30 * 60_000);
+    h.notBlocked([]);
+    await Bun.sleep(0);
+    expect(ta.posts.length).toBe(afterClear);
+  });
+
+  // (f) no duplicate within an episode
+  test("(f) a retried poll within the same tier window never double-posts that tier", async () => {
+    const ta = fakeTeamAdmin();
+    const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    for (let i = 0; i < 5; i++) await h.poll("p1", null, prompt);
+    expect(ta.posts.length).toBe(1);
+  });
+
+  // (g) no poster configured → journal lines only, including the new tier lines
+  // PR #610 review (blocking finding 1): rewritten — the director's
+  // acceptance (g) requires a COMPLETE journal line per TIER, "whether or
+  // not posting is configured", not merely "at least one line exists". The
+  // previous version of this test only asserted the latter (true even on
+  // the pre-fix code) and its own title overclaimed what it checked.
+  test("(g) with no poster configured, tiers 1-3 each produce their OWN journal line, exactly once, never a post", async () => {
+    const h = harness({ managedSessionOf: async () => target }); // no teamAdminNotify
+    const prompt = parsePrompt(REAL)!;
+    h.setClock(0);
+    await h.poll("p1", null, prompt);
+    const afterTier1 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 1 due"));
+    expect(afterTier1.length).toBe(1);
+    expect(afterTier1[0]).toContain("pane p1");
+    expect(afterTier1[0]).toContain(`fingerprint ${fingerprint(prompt)}`);
+    expect(afterTier1[0]).toContain("elapsed 0m");
+    expect(afterTier1[0]).toContain("@admin-assembly");
+    expect(afterTier1[0]).toContain("#team-admin");
+
+    // Not yet due — repeat polls before 10 minutes never log a tier-2 line.
+    h.setClock(9 * 60_000);
+    await h.poll("p1", null, prompt);
+    expect(h.logs.filter((l) => l.includes("tier 2 due")).length).toBe(0);
+
+    h.setClock(10 * 60_000);
+    await h.poll("p1", null, prompt);
+    const afterTier2 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 2 due"));
+    expect(afterTier2.length).toBe(1); // exactly once, not re-logged on the next repeat poll below
+    expect(afterTier2[0]).toContain("elapsed 10m");
+
+    h.setClock(15 * 60_000);
+    await h.poll("p1", null, prompt); // same episode, tier 2 already logged/due — must not duplicate
+    expect(h.logs.filter((l) => l.includes("tier 2 due")).length).toBe(1);
+    expect(h.logs.filter((l) => l.includes("tier 3 due")).length).toBe(0); // not yet due
+
+    h.setClock(20 * 60_000);
+    await h.poll("p1", null, prompt);
+    const afterTier3 = h.logs.filter((l) => l.startsWith(MANAGED_ESCALATION_MARKER) && l.includes("tier 3 due"));
+    expect(afterTier3.length).toBe(1);
+    expect(afterTier3[0]).toContain("elapsed 20m");
+    expect(afterTier3[0]).toContain("@director");
+    expect(afterTier3[0]).toContain("#team-engineering");
+
+    h.setClock(25 * 60_000);
+    await h.poll("p1", null, prompt); // same episode — no further duplication of any tier's line
+    expect(h.logs.filter((l) => l.includes("tier 3 due")).length).toBe(1);
+
+    // No poster configured at any point — nothing was ever posted.
+    expect(h.sent).toEqual([]);
+  });
+
+  // PR #610 review (blocking finding 2): the header's own sessionName must
+  // be neutralised too — it is derived from the definition FILENAME, which
+  // this module cannot assume is attacker-free.
+  test("a session name containing '@all' is neutralised in the header, not just inside the quoted block", async () => {
+    const ta = fakeTeamAdmin();
+    const adversarialTarget: ManagedSessionTarget = {
+      agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2F%40all.json",
+      definitionPath: "/home/butchr/.config/butchr/session-definitions/@all.json",
+    };
+    const h = harness({ managedSessionOf: async () => adversarialTarget, teamAdminNotify: ta.notify });
+    await h.poll("p1", null, parsePrompt(REAL)!);
+    const text = ta.posts[0]!;
+    // The only legitimate "@word" outside the quoted block is the real,
+    // intended answerer mention — strip it, then nothing else (including
+    // the session name in the header) may contain a live "@all".
+    const withoutIntendedMention = text.replace("@admin-assembly", "");
+    expect(withoutIntendedMention).not.toContain("@all");
+    expect(text).toContain("@​all"); // the neutralised form IS present — the name was quoted, not dropped
+  });
+
+  describe("config-driven routing — no literals buried in logic", () => {
+    test("a custom managedEscalationRouting dep changes rooms/mentions/delays without touching production code", async () => {
+      const ta = fakeTeamAdmin();
+      const customRouting: ManagedEscalationRouting = {
+        normalMention: "@custom-answerer", normalRoom: "custom-admin-room",
+        assemblyMention: "@custom-manager", assemblyRoom: "custom-eng-room",
+        directorMention: "@custom-director", directorRoom: "custom-director-room",
+        tier2Minutes: 2, tier3Minutes: 4,
+      };
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify, managedEscalationRouting: customRouting });
+      const prompt = parsePrompt(REAL)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt);
+      expect(ta.roomPosts[0]!.room).toBe("custom-admin-room");
+      expect(ta.posts[0]).toContain("@custom-answerer");
+
+      h.setClock(2 * 60_000);
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(2);
+
+      h.setClock(4 * 60_000);
+      await h.poll("p1", null, prompt);
+      expect(ta.posts.length).toBe(3);
+      expect(ta.posts[2]).toContain("@custom-director");
+      expect(ta.roomPosts[2]!.room).toBe("custom-director-room");
+    });
+  });
+
+  describe("CAP DECISION: tiers 2/3 are exempt from the per-pane hourly rate cap", () => {
+    test("one long episode's three tiers are never swallowed by the 3/hour cap", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt = parsePrompt(REAL)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt);
+      h.setClock(10 * 60_000);
+      await h.poll("p1", null, prompt);
+      h.setClock(20 * 60_000);
+      await h.poll("p1", null, prompt);
+      // All three tiers delivered — if tiers 2/3 consumed the SAME 3/hour
+      // cap as tier 1 (keyed per pane), this episode alone would already be
+      // AT the cap by tier 3, which is fine in isolation, but see the next
+      // test for why that would be wrong.
+      expect(ta.posts.length).toBe(3);
+    });
+
+    test("a second, later episode on the same pane within the hour still gets its own tier 1", async () => {
+      const ta = fakeTeamAdmin();
+      const h = harness({ managedSessionOf: async () => target, teamAdminNotify: ta.notify });
+      const prompt1 = parsePrompt(REAL)!;
+      const prompt2 = parsePrompt(TRUST)!;
+      h.setClock(0);
+      await h.poll("p1", null, prompt1);
+      h.setClock(10 * 60_000);
+      await h.poll("p1", null, prompt1);
+      h.setClock(20 * 60_000);
+      await h.poll("p1", null, prompt1); // episode 1: 3 posts, all within the hour
+      expect(ta.posts.length).toBe(3);
+
+      h.setClock(25 * 60_000);
+      await h.poll("p1", null, prompt2); // a NEW fingerprint — episode 2 starts
+      // If tiers 2/3 had consumed the cap, episode 2's tier 1 (a genuinely
+      // NEW mark, the 4th post this hour under the old accounting) would be
+      // silently dropped. Under this ticket's cap decision (tiers 2/3
+      // exempt — only NEW marks consult/consume the cap, so this is only
+      // episode 2's FIRST cap-consuming event, same as episode 1's was),
+      // it must still be delivered.
+      expect(ta.posts.length).toBe(4);
+    });
+  });
+
+  // Mutation-check results for tier 2 (test "(b)") and tier 3 (test "(c)")
+  // — each tier's production code genuinely deleted from
+  // markManagedSessionStalled, `bun test` run, the named test confirmed
+  // red, then reverted — are reported in the PR description.
 });

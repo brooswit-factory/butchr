@@ -1624,3 +1624,148 @@ reply is (there is no ticket to reply on). If the SAME definition keeps
 re-blocking on the SAME dialog shape, that is exactly the signal to file it
 against FACTORY-46 (or whatever succeeds it) for drovr to learn to
 recognize.
+
+### Reaching a human: tiered Rocket.Chat escalation (FACTORY-607/FACTORY-609)
+
+Everything above (the journal line, the `/health` mark, the pane-text
+capture) is observational — it tells an operator who already knows to look.
+FACTORY-369 added a Rocket.Chat post so a human doesn't have to be looking:
+on top of the journal line, a NEW, separate credential (never the account-
+management `rocketchat` config — see `Config.managedEscalationRocketChat`'s
+own doc comment in `src/config/config.ts` for why) posts a message
+mentioning whoever should answer. FACTORY-607/FACTORY-609 then added
+mention/markup neutralisation (a precondition for turning this on at all)
+and tiered re-escalation (0/10/20 minutes) on top of that single post.
+
+**Credential**: `BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL` / `_USER_ID` /
+`_TOKEN_FILE`, all-or-nothing — any one missing means the feature is
+entirely disabled and every managed-session escalation behaves exactly as
+the section above describes, PLUS the new tier journal lines (below).
+Never a crash, never a silent drop either way. The SAME credential posts to
+every room this feature uses — there is only one bot account, never one
+per room (`RocketChatPoster.postMessage(channel, text)`,
+`src/resources/rocketchat.ts`, already takes the room per call).
+
+**Mention/markup neutralisation (FACTORY-607 comment 28781).** Everything
+quoted from the pane — the dialog's question, every option, the
+fingerprint, the capture path, and the session/pane identifiers — is
+NEVER trusted and is neutralised before being posted:
+
+- Every quoted field goes inside ONE fenced code block per message. Only
+  the message's HEADER line (the real, intended `@mention` of whoever
+  should answer, and the session's display name) sits outside it — the
+  session name is itself derived from the managed session's DEFINITION
+  FILENAME, which this module cannot assume is attacker-free (a definition
+  named e.g. `@all.json`), so it is run through the SAME neutralisation
+  pipeline as every quoted field even though it sits outside the block.
+  Nothing else is allowed to sit outside the block, so a multi-line
+  question cannot inject a header-looking line or a bare `@mention` that
+  reads as a second, unintended ping.
+- Every `@` inside the block has a zero-width space (U+200B) inserted right
+  after it — `@all`, `@here`, `@admin-assembly`, or any other handle, can
+  never resolve as a real mention, while remaining visually identical to a
+  human skimming the post.
+- Every `://` inside the block is defanged the same way (a zero-width space
+  after the colon) — this breaks both a bare URL and a markdown
+  `[text](url)` link without visually mangling the text. (Choice: defang
+  `://` rather than attempt to prove Rocket.Chat won't autolink it — the
+  latter isn't something this repo's test suite can exercise without a live
+  Rocket.Chat instance.)
+- `\r` is stripped outright (never folded into `\n`); every other C0
+  control character and DEL is stripped too. `\n` itself is kept — a
+  genuinely multi-line question is real content — because confinement
+  inside the one fenced block is what neutralises a newline-based injection
+  attempt, not removing the newline.
+- The fence delimiting the block is always longer than the longest run of
+  backticks anywhere in the content (minimum 3) — content can never close
+  the block early, however many backticks it contains.
+- Each quoted field is capped at 2000 characters, with an explicit
+  `... [truncated N chars]` marker when it was cut. The options list is
+  separately capped at 10 options, with a `[N more option(s) omitted]`
+  marker when there were more.
+
+This applies to EVERY message this feature posts — the per-tier escalation
+below, and the clear-up follow-up once the dialog resolves.
+
+**Routing and tiers (FACTORY-609).** An episode (first mark until the pane
+clears or the fingerprint changes — the SAME episode concept the section
+above already tracks) can reach up to three tiers, each posted AT MOST ONCE
+per episode:
+
+| Tier | When | Ordinary managed session | admin-assembly's own pane |
+| --- | --- | --- | --- |
+| 1 | immediately, on the episode's first mark | `normalMention` in `normalRoom` | `assemblyMention` in `assemblyRoom` |
+| 2 | `tier2Minutes` after tier 1, same episode | `normalMention` in `normalRoom` | `assemblyMention` in `assemblyRoom` |
+| 3 | `tier3Minutes` after tier 1, same episode | `directorMention` in `directorRoom` | `directorMention` in `directorRoom` |
+
+All six values (two mentions, two rooms, two delays — `directorMention`/
+`directorRoom` apply to every session, so there are six distinct knobs, not
+eight) come from config, defaulting to the director's own routing
+(FACTORY-607 comment 28688; `MANAGED_ESCALATION_DEFAULTS`,
+`src/agents/escalation-helper.ts` — the single place these defaults are
+written down, read by both `src/config/config.ts`'s env-var parser and
+`src/agents/escalation-loop.ts`'s own fallback):
+
+| Env var | Default |
+| --- | --- |
+| `BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION` | `@admin-assembly` |
+| `BUTCHR_TEAM_ADMIN_ROOM` (shared with FACTORY-369's own room config) | `team-admin` |
+| `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION` | `@manager-factory` |
+| `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM` | `team-engineering` |
+| `BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION` | `@director` |
+| `BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM` | `team-engineering` |
+| `BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES` | `10` |
+| `BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES` | `20` |
+
+**DELIBERATE BEHAVIOUR CHANGE from what FACTORY-369 shipped**: admin-
+assembly's own pane used to route to `@director` in `#team-admin` for its
+one post. It now routes to `@manager-factory` in `#team-engineering` for
+tiers 1-2 (and to the director, same as any other session, for tier 3) —
+the director's comment 28688 reassigned this case. An operator who relied
+on the old `@director`/`#team-admin` behaviour for this one pane should
+watch `#team-engineering` instead, or override `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION`/`_ROOM`
+back to the old values if they genuinely need to keep it.
+
+**Rate cap interaction.** The existing per-pane hourly cap (3 posts/hour,
+`MANAGED_TEAM_ADMIN_MAX_PER_HOUR`) is consulted and consumed ONLY by a
+genuinely NEW episode's tier-1 mark — never by tier 2 or tier 3 of an
+already-marked episode, and never by a retry of a tier that already failed
+once. This is a deliberate decision, not an oversight: the cap's job is
+bounding how many DISTINCT episodes (e.g. a drifting dialog-recognizer
+racking up new "fingerprints" on the same pane) can post per pane per hour
+— exempting tiers 2/3 means one long episode's own three tiers can never
+exhaust a pane's entire budget and silently swallow a LATER, unrelated
+episode's tiers within the same hour.
+
+**Retry, never latch on failure.** Each tier's post is tracked
+independently (its own `tierNNotifiedAt` slot) — a transport failure for
+one tier is logged and retried on the next qualifying poll, and never
+blocks or is blocked by another tier's own attempt. The clear-up follow-up,
+once the dialog resolves, is replayed to every ROOM the episode actually
+reached (a normal episode that escalated past tier 2 into tier 3 reaches
+both `#team-admin` and `#team-engineering`, and gets its "no longer
+blocked" notice in both).
+
+**Not configured.** With the three credential env vars unset, this whole
+feature is off: no Rocket.Chat post at any tier, ever — but each tier STILL
+logs its own `[managed-escalation] tier <N> due for ... (elapsed <M>m) —
+intended <mention> in #<room>` journal line, exactly once per tier per
+episode, on top of the existing detector-mark line. This is deliberate
+(director's acceptance criterion (g)): a complete journal trail of what
+WOULD have been posted, and to where, must exist whether or not posting
+itself is configured — an operator reading the journal alone (not
+Rocket.Chat) can still see that a pane crossed the 10- and 20-minute
+thresholds and who would have been pinged.
+
+**Which path drives tier re-evaluation.** Elapsed time is only checked when
+something calls back into `markManagedSessionStalled` for an already-marked
+(pane, fingerprint) — Butchr's own poll (`handleManagedSessionBlocked`, via
+`onBlocked`) does this on every qualifying poll while the pane stays
+blocked, so for THAT detector tiers 2/3 fire on schedule regardless of
+anything else. Drovr's own hook (`onDrovrUnknownDialog`) is, by its own
+package's contract, called at most ONCE per (pane, fingerprint) episode —
+so if a dialog is recognized ONLY by drovr's detector and never by Butchr's
+own parser for the same pane, that episode's tier 2/3 re-evaluation depends
+on Butchr's own poll having ALSO marked it (which, per "Two detectors, one
+mark" above, happens whenever both detectors see the same episode) rather
+than on drovr re-calling its hook.
