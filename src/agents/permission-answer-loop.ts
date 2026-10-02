@@ -65,9 +65,10 @@
  */
 import { mkdir, appendFile } from "node:fs/promises";
 import { dirname, basename } from "node:path";
-import { autoAnswerPermissions, autoAnswerCodexApprovals, type AutoAnswerPermissionResult, type AutoAnswerCodexApprovalResult, type DrovrClient } from "@brooswit/drovr";
+import { autoAnswerPermissions, autoAnswerCodexApprovals, scanPendingPermissions, type AutoAnswerPermissionResult, type AutoAnswerCodexApprovalResult, type DrovrClient } from "@brooswit/drovr";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { Rule } from "../rules/rules.js";
+import { classifyFileExecutionRisk, type FileExecutionVerdict } from "./file-execution-veto.js";
 
 /**
  * FACTORY-145: which path caused a pane's prompt to be looked at THIS tick —
@@ -253,6 +254,26 @@ export interface PermissionAnswerLoopDeps {
   /** FACTORY-108: same test seam as `autoAnswer` above, for Codex. Defaults to `@brooswit/drovr`'s own `autoAnswerCodexApprovals`. */
   autoAnswerCodex?: typeof autoAnswerCodexApprovals;
   /**
+   * FACTORY-638 (FACTORY-636): test seam for the pre-scan this tick runs,
+   * over the eligible pane set only, BEFORE `autoAnswer` ever sees it —
+   * `@brooswit/drovr`'s own `scanPendingPermissions` by default. Scans
+   * Claude panes only (drovr's own `classifyPermissionPrompt` never matches
+   * a Codex screen, same as `autoAnswer` itself); see
+   * `classifyFileExecutionRiskDep`'s own doc comment for why the Codex pass
+   * (`autoAnswerCodex`) is left uncovered by this veto.
+   */
+  scanPendingForVeto?: typeof scanPendingPermissions;
+  /**
+   * FACTORY-638 (FACTORY-636): test seam for the per-pending-permission
+   * veto decision — `./file-execution-veto.js`'s own `classifyFileExecutionRisk`
+   * by default. Never stubbed in this module's own tests (the ticket's own
+   * instruction: fixtures are DATA read from a real, disposable temp
+   * directory — never a hostile string fed to a real shell), but exposed
+   * here the same way every other drovr pass above is, so a caller
+   * elsewhere can swap it without reaching into this module's internals.
+   */
+  classifyFileExecutionRisk?: (req: { request: string; cwd: string | undefined }) => Promise<FileExecutionVerdict>;
+  /**
    * FACTORY-100/FACTORY-103: called once per newly-answered pane, purely as
    * a side effect — see `src/agents/approval-sound.ts`'s own doc comment for
    * why the "sound plays on approval" hook lives here rather than tailing
@@ -350,8 +371,70 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
   const log = deps.log ?? (() => {});
   try {
     const { agents } = await deps.client.agent.list();
-    const labels = deps.eligiblePanes(agents.map((a) => ({ pane_id: a.pane_id, cwd: a.cwd })));
-    deps.onEligiblePaneIds?.([...labels.keys()]);
+    const rawLabels = deps.eligiblePanes(agents.map((a) => ({ pane_id: a.pane_id, cwd: a.cwd })));
+    deps.onEligiblePaneIds?.([...rawLabels.keys()]);
+    if (rawLabels.size === 0) return [];
+    const labels = new Map(rawLabels);
+    const preVetoEligible = agents.filter((a) => labels.has(a.pane_id));
+    const preVetoClient: PermissionAnswerClient = {
+      agent: {
+        list: async () => ({ type: "agent_list", agents: preVetoEligible }),
+        get: deps.client.agent.get,
+        read: deps.client.agent.read,
+        sendKeys: deps.client.agent.sendKeys,
+      },
+    };
+    // FACTORY-638 (FACTORY-636): the veto pre-scan — reads every ELIGIBLE
+    // pane's pending Claude tool-permission dialog BEFORE `autoAnswer` is
+    // ever handed this pane set, and drops a pane from `labels` the instant
+    // its pending request looks like a file-executing command whose
+    // destructive content isn't visible on screen (`./file-execution-veto.js`).
+    // This is the ENTIRE enforcement point, same shape as `eligiblePanes`
+    // itself: a pane dropped here is never scanned or pressed by
+    // `autoAnswer` below — no separate suppression step downstream, nothing
+    // to bypass. `scanPendingPermissions` only ever matches a Claude dialog
+    // (`classifyPermissionPrompt`), so a Codex pane's request is never
+    // reported here and is therefore never vetoed by this pass; see
+    // `PermissionAnswerLoopDeps.scanPendingForVeto`'s own doc comment for
+    // why the Codex pass is explicitly left uncovered rather than silently
+    // assumed safe.
+    try {
+      const { pending } = await (deps.scanPendingForVeto ?? scanPendingPermissions)(preVetoClient, deps.readTimeoutMs !== undefined ? { readTimeoutMs: deps.readTimeoutMs } : {});
+      for (const p of pending) {
+        const verdict = await (deps.classifyFileExecutionRisk ?? classifyFileExecutionRisk)({ request: p.request, cwd: p.cwd });
+        if (verdict.approve) continue;
+        labels.delete(p.paneId);
+        const key = `${p.paneId} veto:${verdict.reason}`;
+        if (deps.loggedSkips?.has(key)) continue;
+        deps.loggedSkips?.add(key);
+        const paneLabel = rawLabels.get(p.paneId) ?? p.paneId;
+        log(`[permission-answer] ${paneLabel} (${p.paneId}) VETOED, left for a human: ${verdict.reason}`);
+        const auditLine = JSON.stringify({
+          ts: new Date().toISOString(),
+          paneId: p.paneId,
+          label: paneLabel,
+          tool: p.tool,
+          request: p.request.slice(0, 500),
+          outcome: "vetoed",
+          reason: verdict.reason,
+          ...(verdict.file !== undefined ? { file: verdict.file } : {}),
+          ...(verdict.pattern !== undefined ? { pattern: verdict.pattern } : {}),
+        }) + "\n";
+        try {
+          await (deps.appendAudit ?? appendAuditLine)(deps.auditPath, auditLine);
+        } catch (e) {
+          log(`[permission-answer] veto audit write failed for ${p.paneId}: ${(e as Error)?.message ?? e}`);
+        }
+      }
+    } catch (e) {
+      // Fail CLOSED, not open: a pre-scan that itself failed means NOTHING
+      // this tick was verified safe to press, so nothing is pressed this
+      // tick — never fall back to the pre-veto `rawLabels` set, which would
+      // silently resurrect the exact blind-approval behaviour this ticket
+      // exists to remove. The next tick retries from scratch.
+      log(`[permission-answer] veto pre-scan failed, skipping this tick entirely: ${(e as Error)?.message ?? e}`);
+      return [];
+    }
     if (labels.size === 0) return [];
     const eligible = agents.filter((a) => labels.has(a.pane_id));
     const scopedClient: PermissionAnswerClient = {
