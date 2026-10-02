@@ -19,5 +19,22 @@
     "src",
     "test",
     "scripts"
+  ],
+  // FACTORY-614: the DOM-rendering dashboard-app component tests (JSX,
+  // `@testing-library/react`, `@happy-dom/global-registrator`) are
+  // type-checked instead by `dashboard-app/tsconfig.json`, which already
+  // carries the DOM lib + `jsx` option this program deliberately does not
+  // (mixing DOM lib globals with `bun-types`'s own fetch/Response/etc.
+  // declarations here would risk a conflict across the WHOLE backend, for
+  // a handful of files that don't need it) — `bun run typecheck:web`
+  // covers them. The plain-TS view-model tests for the same feature stay
+  // in this program unexcluded, same as every other `test/unit/*.test.ts`.
+  "exclude": [
+    "test/unit/dashboard-app-use-polling.test.tsx",
+    "test/unit/dashboard-app-use-dashboard.test.tsx",
+    "test/unit/dashboard-app-use-config-inventory.test.tsx",
+    "test/unit/dashboard-app-poll-status-view.test.tsx",
+    "test/unit/dashboard-app-app.test.tsx",
+    "test/unit/dashboard-app-routes.test.tsx"
   ]
 }

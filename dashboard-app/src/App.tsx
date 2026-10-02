@@ -1,10 +1,35 @@
 /**
- * FACTORY-613 (replays FACTORY-432 / PR #546): pipeline-proving placeholder
- * only — this app is not linked from the server-rendered dashboard
- * (src/web/view.ts) yet. It exists so the bundler/TypeScript/JSX config has
- * something real to build and type-check. A later Story in the epic
- * (FACTORY-427) replaces this with the actual dashboard UI.
+ * FACTORY-614 (task 2 of the LaunchPad switch, epic FACTORY-427): the app
+ * shell — a header with the LaunchPad `Heading` and navigation between the
+ * two client routes mounted under `/dashboard-app` (`main.tsx`'s
+ * `BrowserRouter basename`). Replaces FACTORY-613's pipeline-proving
+ * placeholder (`App.tsx` before this ticket) now that there is a real shell
+ * to prove instead.
  */
+import { NavLink, Route, Routes } from "react-router";
+import { Heading } from "@launchpad-ui/components";
+import { DashboardRoute } from "./routes/DashboardRoute.js";
+import { ConfigurationsRoute } from "./routes/ConfigurationsRoute.js";
+import "./App.css";
+
 export function App() {
-  return <div>butchr dashboard — React pipeline placeholder</div>;
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <Heading size="medium">butchr dashboard</Heading>
+        <nav className="app-nav" aria-label="primary">
+          <NavLink to="/" end>
+            Dashboard
+          </NavLink>
+          <NavLink to="/configurations">Configurations</NavLink>
+        </nav>
+      </header>
+      <main className="app-main">
+        <Routes>
+          <Route path="/" element={<DashboardRoute />} />
+          <Route path="/configurations" element={<ConfigurationsRoute />} />
+        </Routes>
+      </main>
+    </div>
+  );
 }

@@ -1,0 +1,33 @@
+.app-shell {
+  min-height: 100vh;
+  background: var(--lp-color-bg-ui-primary);
+  color: var(--lp-color-text-ui-primary-base);
+  font-family: var(--lp-font-family-base);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-spacing-5, 24px);
+  padding: var(--lp-spacing-3, 12px) var(--lp-spacing-4, 16px);
+  border-bottom: 1px solid var(--lp-color-border-ui-primary-subtle, currentColor);
+}
+
+.app-nav {
+  display: flex;
+  gap: var(--lp-spacing-3, 12px);
+}
+
+.app-nav a {
+  color: var(--lp-color-text-ui-primary-base);
+  text-decoration: none;
+}
+
+.app-nav a[aria-current="page"] {
+  font-weight: 600;
+  text-decoration: underline;
+}
+
+.app-main {
+  padding: var(--lp-spacing-4, 16px);
+}

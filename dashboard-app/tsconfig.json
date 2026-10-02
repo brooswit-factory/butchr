@@ -5,7 +5,7 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "jsx": "react-jsx",
-    "types": ["vite/client"],
+    "types": ["vite/client", "bun-types"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -14,5 +14,34 @@
     "noEmit": true,
     "isolatedModules": true
   },
-  "include": ["src", "vite-env.d.ts"]
+  // FACTORY-614: `src/hooks/use-dashboard.ts` and
+  // `src/view-model/*-availability.ts` type-only-import the real response
+  // shapes from `../src/agents/dashboard.ts` / `../src/agents/
+  // query-agent-inventory.ts` (no new server API — see those modules'
+  // own headers) rather than hand-duplicating them, so this program must
+  // also resolve (and therefore typecheck) everything those two files
+  // import. `../src/md.d.ts` is the one ambient declaration that closure
+  // reaches (`workspace.ts` imports `*.md` briefs) and would otherwise
+  // 404 as a module with no declaration — `bun-types` above covers every
+  // `Bun.*` global the rest of that closure uses. `bun run typecheck`
+  // (the root `tsconfig.json`, which already includes all of `src`) is
+  // the authority on whether the backend itself type-checks; this
+  // program re-checks the same files under DOM+vite's additional globals,
+  // which is additive, not a second, divergent ruleset.
+  "include": [
+    "src",
+    "vite-env.d.ts",
+    "../src/agents/dashboard.ts",
+    "../src/agents/query-agent-inventory.ts",
+    "../src/md.d.ts",
+    // FACTORY-614: the DOM-rendering component tests — see
+    // `../tsconfig.json`'s own comment for why these five live here
+    // instead of the root program.
+    "../test/unit/dashboard-app-use-polling.test.tsx",
+    "../test/unit/dashboard-app-use-dashboard.test.tsx",
+    "../test/unit/dashboard-app-use-config-inventory.test.tsx",
+    "../test/unit/dashboard-app-poll-status-view.test.tsx",
+    "../test/unit/dashboard-app-app.test.tsx",
+    "../test/unit/dashboard-app-routes.test.tsx"
+  ]
 }

@@ -42,7 +42,12 @@
     "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "20.14.5",
+    "@launchpad-ui/components": "0.25.0",
+    "@launchpad-ui/tokens": "0.19.0",
     "@rocket.chat/message-parser": "0.32.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
     "@types/bun": "^1.2.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
