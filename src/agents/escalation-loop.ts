@@ -1,5 +1,6 @@
+import { basename } from "node:path";
 import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
-import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
+import { fingerprint, escalationComment, parseDirective, freeTextOption, redact, MARKER, type Directive } from "./escalate.js";
 import type { CaptureSink } from "./session-limit-watch.js";
 import { findMarked, RateCap, HOUR_MS, MANAGED_ESCALATION_DEFAULTS, type ManagedEscalationRouting } from "./escalation-helper.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
@@ -570,15 +571,114 @@ async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: 
 // only") forbids touching that path regardless.
 // ===========================================================================
 
-/** A quoted field's character cap — stated here, not a magic number at each call site. Comment 28781 requires an EXPLICIT cap with a `... [truncated N chars]` marker; 2000 is generous for a dialog's question/option text (measured fixtures in this file's own tests are well under 200 chars) while still bounding a pathological pane's output. */
+/** A quoted field's character cap — stated here, not a magic number at each call site. Comment 28781 requires an EXPLICIT cap with a `... [truncated N chars]` marker; 2000 is generous for a dialog's question/option text (measured fixtures in this file's own tests are well under 200 chars) while still bounding a pathological pane's output. FACTORY-611: this is the PER-FIELD ceiling — the whole-message budget (`WHOLE_MESSAGE_BUDGET` below) can shrink it further for a single oversized post, but never raise it. */
 const QUOTE_FIELD_CHAR_CAP = 2000;
 
 /** Comment 28781's "a cap on the number of options quoted" — options beyond this are omitted with a count, never silently dropped without saying so. */
 const QUOTE_OPTIONS_CAP = 10;
 
-/** U+200B (zero-width space) immediately after every `@` — splits `@all`/`@here`/`@admin-assembly`/any other handle so NOTHING outside the intended header mention can ever resolve as a mention, in Rocket.Chat or any other reader, while staying visually identical to a human skimming the post. */
+/**
+ * FACTORY-611 item 1: Rocket.Chat 8.8's own parser
+ * (`@rocket.chat/message-parser` 0.32.0) recognizes ONLY a 3-backtick fence —
+ * `fenceFor`'s old "widen past the longest run" strategy is the bug comment
+ * 28784 item 1 found: RC never sees a widened fence as special, so a quoted
+ * run of 3+ backticks still closes (or entirely prevents) the ONE 3-backtick
+ * fence this module actually emits. The fence itself is therefore now fixed
+ * at exactly 3 backticks, and every run of 3 or more backticks INSIDE a
+ * quoted field is broken instead (see `breakBacktickRuns`) — the fence never
+ * changes shape, the content does, which is the opposite of what this
+ * function used to do.
+ */
+const FENCE = "```";
+
+/**
+ * FACTORY-611 item 1: break every run of 3+ backticks in quoted content by
+ * interleaving U+200B (zero-width space) between each backtick — a run of
+ * any length (3, 4, 50, …) stops being a run RC's parser could ever read as
+ * a fence, while staying visually identical to a human skimming the post
+ * (the same zero-width-space technique `neutralizeMentions`/`defangLinks`
+ * already use below). A run of 1-2 backticks is left untouched: RC's parser
+ * never treats those as a fence, and a lone trailing backtick is ordinary
+ * dialog content.
+ */
+function breakBacktickRuns(text: string): string {
+  return text.replace(/`{3,}/g, (run) => run.split("").join("​"));
+}
+
+/**
+ * FACTORY-611 item 1: bidi-control characters (U+202A-202E, U+2066-2069,
+ * U+200E, U+200F, U+061C) can visually reorder or hide text around them —
+ * including, in principle, making a forged field label or a neutralised
+ * `@`/`://` marker read differently than it actually is — so they are
+ * stripped from every quoted field, never merely neutralised. U+2028 (LINE
+ * SEPARATOR), U+2029 (PARAGRAPH SEPARATOR) and U+0085 (NEL) are stripped
+ * alongside them: all three are alternate line-break code points `\r`/`\n`
+ * handling above does not cover, and which could otherwise let quoted text
+ * open a new paragraph/line outside the fenced block the same way a bare
+ * `\r` could.
+ */
+const BIDI_AND_LINE_CONTROLS = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C\u2028\u2029\u0085]/g;
+
+/** Comment 28781's "control characters and `\r` stripped or neutralised": `\r` is dropped outright (never folded into `\n`) so a CRLF-style line can never reintroduce a line break Rocket.Chat's renderer might treat differently than a bare `\n`; every other C0 control character and DEL is stripped too — none of them are legitimate dialog content. FACTORY-611 item 1: bidi controls and the other Unicode line/paragraph separators (`BIDI_AND_LINE_CONTROLS`) are stripped here too, for the same reason. */
+function stripControlChars(text: string): string {
+  return text.replace(/\r/g, "").replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, "").replace(BIDI_AND_LINE_CONTROLS, "");
+}
+
+/**
+ * FACTORY-611 item 6(a): a quoted multi-line question/option must not be
+ * able to start a line that LOOKS like one of this message's own labelled
+ * fields (`fingerprint: ...`, `capture: ...`, …) to a human skimming the
+ * fenced block — forging one is otherwise as easy as putting
+ * `fingerprint: deadbeef` on its own line inside the dialog's real question.
+ * CHOICE (stated in the PR description): flatten every embedded newline to
+ * a single visible marker (` ⏎ `) rather than indenting continuation lines,
+ * so EVERY quoted field is unconditionally exactly one line — simpler than
+ * tracking which lines are "continuations" and just as legible. This
+ * supersedes `stripControlChars`'s former newline-preserving design (see
+ * git history): confinement inside the fenced block alone was sufficient
+ * against Rocket.Chat's OWN renderer (item 1's scope), but not against a
+ * human simply reading the block's labelled lines at face value.
+ */
+function flattenNewlines(text: string): string {
+  return text.replace(/\n/g, " ⏎ ");
+}
+
+/**
+ * FACTORY-611 item 6(b): `String.prototype.slice` cuts on UTF-16 code
+ * units, so a naive `text.slice(0, cap)` can land exactly between a
+ * surrogate pair's high and low half, producing a lone surrogate in the
+ * posted text (agentsafety measured this live). If `cap` would split a
+ * pair, the cut point backs up by one — losing at most one extra character,
+ * never producing an unpaired surrogate.
+ */
+function safeTruncateIndex(text: string, cap: number): number {
+  if (cap <= 0 || cap >= text.length) return Math.max(0, Math.min(cap, text.length));
+  const code = text.charCodeAt(cap - 1);
+  return code >= 0xd800 && code <= 0xdbff ? cap - 1 : cap;
+}
+
+/** Comment 28781's "a stated character cap with an explicit `... [truncated N chars]` marker" — surrogate-safe (FACTORY-611 item 6(b), see `safeTruncateIndex`). */
+function truncateField(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const i = safeTruncateIndex(text, cap);
+  return `${text.slice(0, i)}... [truncated ${text.length - i} chars]`;
+}
+
+/** U+200B (zero-width space) immediately after every `@` — splits `@all`/`@here`/`@admin-assembly`/any other handle so NOTHING outside the intended header mention can ever resolve as a mention, in Rocket.Chat or any other reader, while staying visually identical to a human skimming the post. FACTORY-611 item 6(c): kept as defence in depth even once the fence itself provably holds (item 1's own real-parser test) — a quoted field also appears in the header-adjacent text of `tierMessage`'s header line (the session name), which sits OUTSIDE the fenced block by design, so confinement alone does not cover every mention-shaped field. */
 function neutralizeMentions(text: string): string {
   return text.replace(/@/g, "@​");
+}
+
+/**
+ * FACTORY-611 item 6(d): the ONLY sanitiser applied to a plain `deps.log`
+ * line (never a quoted Rocket.Chat field — those go through the fuller
+ * `quoteField` pipeline above) that interpolates raw pane text — strips
+ * control characters and flattens embedded newlines to a visible marker so
+ * a newline or ESC byte in a dialog's question/options cannot forge an
+ * extra `[managed-escalation]`-looking journal line.
+ */
+function sanitizeForJournal(text: string): string {
+  return flattenNewlines(stripControlChars(text));
 }
 
 /** Comment 28781's "links and markup defanged": `://` is what turns a quoted `https://...` into a clickable link, and what markdown's `[text](url)` needs too — breaking it with the same zero-width-space technique neutralizes both without visually mangling the text (CHOICE, stated in the PR description: defang `://` rather than test for non-linking, since Rocket.Chat's own autolink behaviour is not something this test suite can exercise without a live instance). */
@@ -586,66 +686,107 @@ function defangLinks(text: string): string {
   return text.replace(/:\/\//g, ":​//");
 }
 
-/** Comment 28781's "control characters and `\r` stripped or neutralised": `\r` is dropped outright (never folded into `\n`) so a CRLF-style line can never reintroduce a line break Rocket.Chat's renderer might treat differently than a bare `\n`; every other C0 control character and DEL is stripped too — none of them are legitimate dialog content. `\n` itself is deliberately preserved (multi-line questions are real) — comment 28781's "newlines handled so a multi-line prompt cannot inject a header-looking line ... outside the block" is satisfied by confinement (every quoted field lives inside ONE fenced code block, see `quotedBlock`), not by stripping the newline itself. */
-function stripControlChars(text: string): string {
-  return text.replace(/\r/g, "").replace(/[\x00-\x09\x0B\x0C\x0E-\x1F\x7F]/g, "");
-}
-
-/** Comment 28781's "a stated character cap with an explicit `... [truncated N chars]` marker". */
-function truncateField(text: string, cap: number): string {
-  if (text.length <= cap) return text;
-  return `${text.slice(0, cap)}... [truncated ${text.length - cap} chars]`;
-}
-
 /**
  * The shared pipeline EVERY quoted field in a managed-session message goes
- * through before composition: strip control chars/`\r` first (so the cap
- * counts real content, not bytes about to be discarded), THEN cap length
- * (so the truncation marker itself is never mangled by a later pass), THEN
- * neutralise mentions and defang links (both are harmless to run after
- * truncation — neither can re-lengthen the text past the cap in a way that
- * matters, and running them last means a cut mid-`@`/mid-`://` can't produce
- * a half-neutralised artifact at the truncation boundary).
+ * through before composition: strip control/bidi/line-separator chars first
+ * (so the cap counts real content, not bytes about to be discarded), THEN
+ * — for a field that can carry PANE text (the dialog's question/options,
+ * FACTORY-611 item 2) — redact secret-shaped substrings BEFORE truncation,
+ * so a credential can never straddle the cut, THEN flatten embedded
+ * newlines to a single visible line (item 6(a)), THEN cap length
+ * surrogate-safely (item 6(b)), THEN break any 3+ backtick run (item 1),
+ * THEN neutralise mentions and defang links (both are harmless to run last
+ * — neither can re-lengthen the text past the cap in a way that matters,
+ * and running them after truncation/breaking means a cut mid-`@`/mid-`://`
+ * can't produce a half-neutralised artifact at the boundary).
  */
-function quoteField(raw: string, cap: number = QUOTE_FIELD_CHAR_CAP): string {
-  return defangLinks(neutralizeMentions(truncateField(stripControlChars(raw), cap)));
+function quoteField(raw: string, opts: { cap?: number | undefined; redactSecrets?: boolean } = {}): string {
+  const cap = opts.cap ?? QUOTE_FIELD_CHAR_CAP;
+  let s = stripControlChars(raw);
+  if (opts.redactSecrets) s = redact(s);
+  s = flattenNewlines(s);
+  s = truncateField(s, cap);
+  s = breakBacktickRuns(s);
+  s = neutralizeMentions(s);
+  s = defangLinks(s);
+  return s;
 }
 
-/** The options line, capped on COUNT (comment 28781's "a cap on options quoted"), each option individually neutralised via `quoteField`. */
-function quoteOptionsLine(options: readonly string[]): string {
+/** The options line, capped on COUNT (comment 28781's "a cap on options quoted"), each option individually redacted (FACTORY-611 item 2: options carry pane text exactly like the question does) and neutralised via `quoteField`. `cap`, when given, overrides `QUOTE_FIELD_CHAR_CAP` per option — the whole-message budget's own shrink (see `fitTierMessage`). */
+function quoteOptionsLine(options: readonly string[], cap?: number): string {
   if (!options.length) return "(none)";
   const capped = options.slice(0, QUOTE_OPTIONS_CAP);
-  const line = capped.map((o, i) => `${i + 1}. ${quoteField(o)}`).join(" | ");
+  const line = capped.map((o, i) => `${i + 1}. ${quoteField(o, { cap, redactSecrets: true })}`).join(" | ");
   const omitted = options.length - capped.length;
   return omitted > 0 ? `${line} ... [${omitted} more option(s) omitted]` : line;
 }
 
 /**
- * Comment 28781's "a fence longer than the longest backtick run in the
- * content" (CHOICE, stated in the PR description: a longer fence, never
- * replacing backtick runs in the content itself — this never alters the
- * quoted text, only how it's delimited). Minimum 3, matching ordinary
- * Markdown fence convention even when the content has no backticks at all.
- */
-function fenceFor(body: string): string {
-  const runs = body.match(/`+/g) ?? [];
-  const longest = runs.reduce((m, r) => Math.max(m, r.length), 0);
-  return "`".repeat(Math.max(3, longest + 1));
-}
-
-/**
  * Compose the labeled, already-neutralised quoted-field lines as ONE fenced
- * code block whose fence the content cannot close — everything pane-derived
- * lives inside it, never only individually escaped, which is what makes a
- * multi-line, adversarial field unable to inject a header-looking line or a
- * bare `@mention` outside the block (comment 28781's confinement
- * requirement — see `stripControlChars`'s own doc comment on why the
- * newline itself is kept, not stripped).
+ * code block at the FIXED 3-backtick fence (`FENCE`) — everything
+ * pane-derived lives inside it, never only individually escaped, which is
+ * what makes a multi-line, adversarial field unable to inject a
+ * header-looking line or a bare `@mention` outside the block (comment
+ * 28781's confinement requirement). Every line has already been through
+ * `breakBacktickRuns`, so the body itself can never contain an unbroken 3+
+ * backtick run that could close this fence early (FACTORY-611 item 1).
  */
 function quotedBlock(lines: readonly string[]): string {
   const body = lines.join("\n");
-  const fence = fenceFor(body);
-  return [fence, body, fence].join("\n");
+  return [FENCE, body, FENCE].join("\n");
+}
+
+/**
+ * FACTORY-611 item 5(a): Rocket.Chat 8.8's own `Message_MaxAllowedSize` is
+ * 5000 — this budgets the WHOLE composed message (header, fences and every
+ * labelled field included) to a smaller 4500, leaving headroom for routing
+ * quirks (an emoji's multi-code-unit length, etc.) this module cannot
+ * predict exactly. Only the question and options shrink — every other
+ * field (session/pane/fingerprint/capture) is already small in practice and
+ * shrinking THEM would make the post less legible for no real size benefit.
+ */
+const WHOLE_MESSAGE_BUDGET = 4500;
+
+/** Floors for the iterative shrink below — a field is never reduced to the point of being useless, even for a pathological worst case; see `fitWholeMessageBudget`'s own doc comment for why staying under budget is still guaranteed in practice despite these floors. */
+const WHOLE_MESSAGE_MIN_QUESTION_CAP = 50;
+const WHOLE_MESSAGE_MIN_OPTION_CAP = 20;
+
+/**
+ * FACTORY-611 item 5(a): shrink the question's and each option's own quote
+ * cap PROPORTIONALLY to how much each is actually over-contributing, so the
+ * whole composed message never exceeds `WHOLE_MESSAGE_BUDGET` — "shrink the
+ * question and options (proportionally, with the existing truncation
+ * markers)" per the director's spec. `build(qCap, oCap)` must compose the
+ * full message using `qCap` for the question's own `quoteField` cap and
+ * `oCap` for every option's (see `tierMessage`'s own `build` closure).
+ *
+ * Iterative, not closed-form: the truncation marker's own length
+ * (`... [truncated N chars]`) changes slightly as `N` changes, so an exact
+ * one-shot calculation would still need a correction pass. A handful of
+ * iterations converges well before the floors above are ever reached for
+ * every shape this ticket's own tests exercise (measured: the worst case —
+ * a 5,000-character question plus 12 x 5,000-character options — overshoots
+ * safely under budget after its very first shrink, since the fixed
+ * overhead this module emits is tiny next to that much raw content).
+ */
+function fitWholeMessageBudget(build: (qCap: number, oCap: number) => string, questionLen: number, optionLens: readonly number[]): string {
+  let qCap = QUOTE_FIELD_CHAR_CAP;
+  let oCap = QUOTE_FIELD_CHAR_CAP;
+  let msg = build(qCap, oCap);
+  for (let i = 0; i < 8 && msg.length > WHOLE_MESSAGE_BUDGET && (qCap > WHOLE_MESSAGE_MIN_QUESTION_CAP || oCap > WHOLE_MESSAGE_MIN_OPTION_CAP); i++) {
+    const over = msg.length - WHOLE_MESSAGE_BUDGET;
+    const qContent = Math.min(questionLen, qCap);
+    const oContent = optionLens.reduce((sum, l) => sum + Math.min(l, oCap), 0);
+    const totalContent = qContent + oContent || 1;
+    const qShrink = Math.max(1, Math.ceil(over * (qContent / totalContent)));
+    qCap = Math.max(WHOLE_MESSAGE_MIN_QUESTION_CAP, qCap - qShrink);
+    if (optionLens.length) {
+      const oShrinkTotal = Math.max(optionLens.length, over - qShrink);
+      oCap = Math.max(WHOLE_MESSAGE_MIN_OPTION_CAP, oCap - Math.ceil(oShrinkTotal / optionLens.length));
+    }
+    msg = build(qCap, oCap);
+  }
+  return msg;
 }
 
 /**
@@ -871,6 +1012,30 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
      * at all.
      */
     loggedTiers: Set<1 | 2 | 3>;
+    /**
+     * FACTORY-611 item 3: set true the moment this episode's OWN tier-1
+     * creation lost `managedTeamAdminCap` — once true, this episode never
+     * posts to Rocket.Chat at all (any tier), for its ENTIRE remaining
+     * lifetime, journal-only (see `markManagedSessionStalled`'s repeat-poll
+     * branch). This is what makes a capped episode's own later repeat polls
+     * safe: before this field existed, a repeat poll of the SAME
+     * fingerprint called `attemptTierNotify` unconditionally, which posted
+     * anyway because `tier1NotifiedAt` was still `undefined` (the cap denial
+     * never got to set it) — the cap bounded only the FIRST poll of a new
+     * episode, not any of its successors (measured: a fingerprint changing
+     * every 2nd poll produced 360 posts/hour, comment 28784 item 3).
+     */
+    capped: boolean;
+    /**
+     * FACTORY-611 item 5(b): wall-clock time of this episode's last ATTEMPT
+     * (not success) to post tier N, keyed by tier — `attemptTierNotify`
+     * refuses to retry a tier within `TIER_RETRY_BACKOFF_MS` of its own last
+     * attempt, whether that attempt failed or is merely in flight. Without
+     * this, a persistently refusing poster was retried (and its own WARNING
+     * logged) on every single qualifying poll — measured at 361 attempts and
+     * 361 warnings in 30 minutes at 5s polls, doubled by two tiers.
+     */
+    tierLastAttemptAt: Partial<Record<1 | 2 | 3, number>>;
   }
   const managedSessionStalled = new Map<string, ManagedSessionEntry>();
   // FACTORY-369: mirrors `inFlight`/`unresponsiveInFlight`'s own guard —
@@ -964,24 +1129,43 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
   ): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
     const tierLabel = tier === 1 ? "first escalation" : tier === 2 ? "re-escalation (10 min)" : "director escalation (20 min)";
-    // PR #610 review: sessionName is derived from the DEFINITION FILENAME,
-    // which this module cannot assume is attacker-free (comment 28781's own
-    // "session/pane fields if attacker-influenced") — a definition named
-    // e.g. `@all.json` would otherwise ping from the header, which sits
-    // OUTSIDE the quoted block by design (only the real, intended mention
-    // belongs there). Quoted here too, same pipeline as every other field.
-    const header = `${mention} managed session **${quoteField(sessionName)}** is blocked and cannot answer for itself (tier ${tier}: ${tierLabel}) — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
-    const block = quotedBlock([
-      `session: ${quoteField(sessionName)}`,
-      `pane: ${quoteField(paneId)}`,
-      `tier: ${tier}`,
-      `elapsed: ${elapsedMinutes}m`,
-      `question: ${quoteField(question)}`,
-      `options: ${quoteOptionsLine(options)}`,
-      `fingerprint: ${quoteField(fp)}`,
-      `capture: ${capturePath ? quoteField(capturePath) : "(none)"}`,
-    ]);
-    return [header, "", block].join("\n");
+    // FACTORY-611 item 2: the capture path embeds the OPERATOR'S home
+    // directory layout and the definition's own path — quoting only the
+    // basename (never the full path) still lets a human locate the file on
+    // the known capture directory without leaking either into a Rocket.Chat
+    // room (CHOICE, stated in the PR description: basename, not omission —
+    // the filename alone is still useful evidence and carries none of the
+    // path's own sensitivity).
+    const captureBase = capturePath ? basename(capturePath) : null;
+    const countedOptions = options.slice(0, QUOTE_OPTIONS_CAP);
+    const build = (qCap: number, oCap: number): string => {
+      // PR #610 review: sessionName is derived from the DEFINITION FILENAME,
+      // which this module cannot assume is attacker-free (comment 28781's
+      // own "session/pane fields if attacker-influenced") — a definition
+      // named e.g. `@all.json` would otherwise ping from the header, which
+      // sits OUTSIDE the quoted block by design (only the real, intended
+      // mention belongs there). Quoted here too, same pipeline as every
+      // other field.
+      const header = `${mention} managed session **${quoteField(sessionName)}** is blocked and cannot answer for itself (tier ${tier}: ${tierLabel}) — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
+      const block = quotedBlock([
+        `session: ${quoteField(sessionName)}`,
+        `pane: ${quoteField(paneId)}`,
+        `tier: ${tier}`,
+        `elapsed: ${elapsedMinutes}m`,
+        // FACTORY-611 item 2: redact() BEFORE truncation (quoteField's own
+        // pipeline order) so a secret straddling the cut is never half-posted.
+        `question: ${quoteField(question, { cap: qCap, redactSecrets: true })}`,
+        `options: ${quoteOptionsLine(options, oCap)}`,
+        `fingerprint: ${quoteField(fp)}`,
+        `capture: ${captureBase ? quoteField(captureBase) : "(none)"}`,
+      ]);
+      return [header, "", block].join("\n");
+    };
+    return fitWholeMessageBudget(
+      build,
+      question.length,
+      countedOptions.map((o) => o.length),
+    );
   }
 
   /** The clear-up follow-up — FACTORY-369 AC 5, posted once (per room this episode actually reached) when a dialog a notice was already sent about clears. */
@@ -993,6 +1177,18 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // be quoted here too.
     return [`managed session **${quoteField(sessionName)}** is no longer blocked — the dialog above has cleared.`, "", block].join("\n");
   }
+
+  /**
+   * FACTORY-611 item 5(b): "back off about 60 seconds per tier after a
+   * refusal" — a failed (or in-flight, or not-yet-attempted) tier is not
+   * retried more often than this, which also caps how often its own WARNING
+   * line can repeat (both gated by the same `tierLastAttemptAt` check in
+   * `attemptTierNotify`). Deliberately per TIER, not per episode: each
+   * tier's post is independent (own room/mention/retry per FACTORY-609), so
+   * a tier-2 due-check happening every 5s poll must not be throttled by
+   * tier 1's own backoff clock, and vice versa.
+   */
+  const TIER_RETRY_BACKOFF_MS = 60_000;
 
   /**
    * FACTORY-369/FACTORY-609: attempts ONE tier's post for `entry`'s CURRENT
@@ -1030,9 +1226,15 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const alreadyNotifiedAt = tier === 1 ? entry.tier1NotifiedAt : tier === 2 ? entry.tier2NotifiedAt : entry.tier3NotifiedAt;
     if (alreadyNotifiedAt !== undefined) return;
     if (!deps.teamAdminNotify) return;
+    // FACTORY-611 item 5(b): a tier that already failed recently is not
+    // retried (and does not re-warn) until the backoff elapses — see
+    // `TIER_RETRY_BACKOFF_MS`'s own doc comment on `ManagedSessionEntry`.
+    const lastAttemptAt = entry.tierLastAttemptAt[tier];
+    if (lastAttemptAt !== undefined && deps.now() - lastAttemptAt < TIER_RETRY_BACKOFF_MS) return;
     const inFlightKey = `${paneId}:${tier}`;
     if (teamAdminInFlight.has(inFlightKey)) return;
     teamAdminInFlight.add(inFlightKey);
+    entry.tierLastAttemptAt[tier] = deps.now();
     try {
       const text = tierMessage(tier, mention, entry.target, paneId, entry.question, entry.options, entry.fp, entry.capturePath, elapsedMinutes);
       await deps.teamAdminNotify(room, text);
@@ -1043,7 +1245,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       entry.notifiedRooms.add(room);
       deps.log(`${MANAGED_ESCALATION_MARKER} posted to #${room} (tier ${tier}) for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}`);
     } catch (e) {
-      deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #${room} post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (tier ${tier}) — will retry next qualifying poll: ${(e as Error)?.message ?? e}`);
+      deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #${room} post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (tier ${tier}) — will retry no sooner than ${Math.round(TIER_RETRY_BACKOFF_MS / 1000)}s from now: ${(e as Error)?.message ?? e}`);
     } finally {
       teamAdminInFlight.delete(inFlightKey);
     }
@@ -1078,18 +1280,48 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * that await, so an overlapping synchronous re-entry for the same fp
    * still short-circuits on the guard above and never double-captures.
    *
-   * FACTORY-609 (Part B): "episode = from the first mark until the pane
-   * clears or the fingerprint changes" is exactly what the map entry above
-   * already models — tier 2/3 due-ness is simply `deps.now() - entry.
-   * sinceMs` against `routing.tier2Minutes`/`tier3Minutes`, evaluated on
-   * EVERY call (not only a fresh mark), which is the "elapsed-time
-   * evaluation" the diagnosis (FACTORY-607 comment 28784 item 1) found
-   * entirely missing from this tracker before this ticket.
+   * FACTORY-611 item 4 (supersedes the FACTORY-609 paragraph this replaces):
+   * "episode" is no longer "from the first mark until the pane clears OR THE
+   * FINGERPRINT CHANGES" — it is now keyed to a `blocked-since` instant for
+   * the PANE, reset ONLY when the pane actually clears
+   * (`clearManagedSessionStalled`), never by a fingerprint/text change while
+   * still blocked. Before this fix, EVERY fingerprint change started a
+   * brand-new episode with a fresh `sinceMs` and fresh per-tier latches —
+   * measured live: a pane blocked 40 minutes on a dialog whose text flipped
+   * every minute produced 40 tier-1 posts and zero tier 2/3, because the
+   * tier clock was reset every single minute and never accumulated past
+   * tier 1's own 0-minute due-ness (FACTORY-607 comment 28784 item 4). A
+   * fingerprint change within an ALREADY-tracked pane now only updates the
+   * entry's own `fp`/`question`/`options` in place (logged once) — the
+   * `since`/`sinceMs`/tier latches are untouched, so tier 2/3 still become
+   * due at the ORIGINAL blocked-since instant regardless of how many times
+   * the quoted text itself changes in between.
+   *
+   * FACTORY-611 item 3: a NEW episode (pane not already tracked) that loses
+   * `managedTeamAdminCap` is marked `capped: true` and NEVER posts for its
+   * own lifetime (see `ManagedSessionEntry.capped`'s own doc comment for the
+   * bug this closes) — a journal line still fires unconditionally either
+   * way (AC 6), and the cap itself is consulted and recorded ONLY here, on
+   * a genuinely new episode's own creation (see `managedTeamAdminCap`'s
+   * doc comment on why tiers 2/3 of an ALLOWED episode stay uncapped, and
+   * why keying the cap on "new episode" rather than "new fingerprint" is
+   * now also what "bound NEW blocked episodes" in the director's own words
+   * actually means once item 4 stops a fingerprint change from creating a
+   * new episode at all).
    */
   async function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): Promise<void> {
     const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
     const prior = managedSessionStalled.get(paneId);
-    if (prior?.fp === fp) {
+    if (prior) {
+      if (prior.fp !== fp) {
+        deps.log(
+          `${MANAGED_ESCALATION_MARKER} ${target.agentKey} pane ${paneId} fingerprint changed (${prior.fp} -> ${fp}) while still blocked since ${prior.since} — updating quoted text in place, tier clock unchanged`,
+        );
+        prior.fp = fp;
+        prior.question = question;
+        prior.options = options;
+      }
+      if (prior.capped) return; // FACTORY-611 item 3: a capped episode never posts, for its whole lifetime
       const elapsedMinutes = Math.floor((deps.now() - prior.sinceMs) / 60_000);
       // Each tier is attempted independently and only once due-ness is
       // reached — tier 1 may still need a retry (AC 7) at the same time
@@ -1102,23 +1334,46 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const nowMs = deps.now();
     const since = new Date(nowMs).toISOString();
     const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
-    const entry: ManagedSessionEntry = { target, fp, since, sinceMs: nowMs, question, options, capturePath, notifiedRooms: new Set(), loggedTiers: new Set() };
+    const entry: ManagedSessionEntry = {
+      target,
+      fp,
+      since,
+      sinceMs: nowMs,
+      question,
+      options,
+      capturePath,
+      notifiedRooms: new Set(),
+      loggedTiers: new Set(),
+      capped: false,
+      tierLastAttemptAt: {},
+    };
     managedSessionStalled.set(paneId, entry);
-    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
+    // FACTORY-611 item 6(d): the dialog's raw question/options are
+    // interpolated into this ONE journal line verbatim — a newline or ESC
+    // in the pane text would otherwise be able to forge an extra
+    // `[managed-escalation]`-looking line in the journal. Sanitized here
+    // with `sanitizeForJournal` (strip control chars, flatten embedded
+    // newlines to a visible marker — same technique as `flattenNewlines`,
+    // kept separate because this is a plain log line, not a quoted field
+    // going through the full `quoteField` pipeline) rather than left raw.
+    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${sanitizeForJournal(o)}`).join(" | ") : "(none)";
     // AC 6: this line fires unconditionally, whether or not #team-admin
     // routing is configured — a loud, complete journal line is the
     // not-configured fallback, and a diagnostic record either way.
-    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
-    // AC 4 extension: the journal line above always fires (it's this
-    // ticket's not-configured fallback, AC 6) — only a NEW episode's tier-1
-    // POST is capped, and only per-PANE (see the cap decision on
-    // `managedTeamAdminCap`'s own doc comment above), so a genuinely stable
-    // fleet (one real dialog, one fingerprint) never comes near this and a
-    // drifting one is bounded rather than unbounded.
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${sanitizeForJournal(question)}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
+    // AC 4 extension / FACTORY-611 item 3: the journal line above always
+    // fires (it's this ticket's not-configured fallback, AC 6) — only a NEW
+    // episode's tier-1 POST is capped, and only per-PANE (see the cap
+    // decision on `managedTeamAdminCap`'s own doc comment above), so a
+    // genuinely stable fleet (one real dialog, one fingerprint) never comes
+    // near this and a drifting one is bounded rather than unbounded. A
+    // denied episode is flagged `capped` and stays journal-only for its
+    // entire lifetime (FACTORY-611 item 3) — see `ManagedSessionEntry.capped`.
     if (!managedTeamAdminCap.allow(paneId, deps.now())) {
+      entry.capped = true;
       if (!managedTeamAdminCappedLogged.has(paneId)) {
         managedTeamAdminCappedLogged.add(paneId);
-        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin rate cap reached (${MANAGED_TEAM_ADMIN_MAX_PER_HOUR}/hour) for pane ${paneId} — further managed-session dialogs on this pane are being logged only until the cap frees up`);
+        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin rate cap reached (${MANAGED_TEAM_ADMIN_MAX_PER_HOUR}/hour) for pane ${paneId} — this and further managed-session episodes on this pane are journal-only until the cap frees up`);
       }
       return;
     }
