@@ -19,7 +19,7 @@ concurrency:
   group: release-main
   cancel-in-progress: false   # never cancel a merge's release — that would strand its fragment unreleased, silently
 jobs:
-  publish:
+  release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

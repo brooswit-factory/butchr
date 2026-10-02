@@ -40,7 +40,7 @@ one Elysia process
 
 ## Install & run
 
-No npm package is published (see "Development" below for why) — clone and run from source on each machine:
+No npm package is published — Brooswit's decision: no npm publishing for now; clone and run from source on each machine:
 
 ```
 git clone https://github.com/brooswit-factory/butchr.git
