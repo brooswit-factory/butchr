@@ -16,18 +16,31 @@
  * unavoidable without a real sandbox), indirect execution via a package
  * script or Makefile, an unreadable file (fails safe — see below, it is
  * never treated as benign), a runner/interpreter not on the short list this
- * module recognises, and obfuscated or multi-level quoting this module's
- * cheap regexes don't unwrap.
+ * module recognises, obfuscated or multi-level quoting this module's cheap
+ * regexes don't unwrap, and — FACTORY-640 — a bare `bun test`/`bun run
+ * <script>` (see below): it is APPROVED without its suite/script-list
+ * content ever being read.
  *
  * Every verdict here is binary and fails CLOSED: `approve` only when this
  * module is confident nothing destructive is involved; `block` for
  * everything else, whether that is "destructive pattern matched" or "could
  * not verify" (unreadable, oversized, outside the workspace, no cwd to
- * resolve against, a dynamic/unknowable target like `xargs sh` or a `bun
- * test`/`bun run` with no explicit file argument). The caller never
- * distinguishes the two at the control-flow level — both leave the pane
- * unanswered — but `reason` always says which it was, for the audit trail
- * and the human who has to look.
+ * resolve against, a dynamic/unknowable target like `xargs sh`). The caller
+ * never distinguishes the two at the control-flow level — both leave the
+ * pane unanswered — but `reason` always says which it was, for the audit
+ * trail and the human who has to look.
+ *
+ * FACTORY-640 (round 2 of FACTORY-636's review): a bare `bun test`/`bun run
+ * <script>` — no explicit file argument — is deliberately APPROVED, not
+ * vetoed, despite running MORE unreviewed content than one named file, not
+ * less. FACTORY-625's fail-closed fallback clause is scoped to a path
+ * OUTSIDE the workspace; the workspace's own suite/scripts are never that.
+ * And there is no `[butchr:blocked]` ANSWER-protocol escalation for this
+ * dialog class (only the much slower `[butchr:unresponsive]` alarm), so
+ * vetoing the fleet's single most common command would convert this tripwire
+ * into routine frozen panes — the same incident class BUTCHR-124 exists to
+ * prevent, at larger scale. `dynamic` (fail-closed) stays reserved for a
+ * genuinely unknowable target like `xargs sh`.
  */
 import { readFile, stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
@@ -178,7 +191,17 @@ export function matchDestructivePattern(content: string): { name: string; excerp
   return null;
 }
 
-/** A heredoc body (`<<'EOF' ... EOF`, `<<-EOF ... EOF`, quoted or not) or a `sh -c`/`bash -c`/`zsh -c` quoted body — content already fully visible on the dialog's own screen, so reading nothing more is needed to inspect it. */
+/**
+ * A heredoc body (`<<'EOF' ... EOF`, `<<-EOF ... EOF`, quoted or not), a
+ * `sh -c`/`bash -c`/`zsh -c` quoted body, a `node -e`/`--eval`/`-p`/`--print`
+ * quoted body, or a `python`/`python3 -c` quoted body — content already
+ * fully visible on the dialog's own screen, so reading nothing more is
+ * needed to inspect it. FACTORY-640 (round 2 of FACTORY-636's review): these
+ * `node`/`python` inline forms previously blocked only BY ACCIDENT, because
+ * the flag token itself failed to `stat` as a file — routing them here
+ * means they are vetoed deliberately, for the inline-body reason, same as a
+ * here-doc.
+ */
 export function extractInlineBodies(command: string): string[] {
   const bodies: string[] = [];
   const heredocRe = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n([\s\S]*?)\n\s*\2\b/g;
@@ -186,17 +209,39 @@ export function extractInlineBodies(command: string): string[] {
   while ((m = heredocRe.exec(command))) bodies.push(m[3]!);
   const dashCRe = /\b(?:sh|bash|zsh)\s+-c\s+(['"])([\s\S]*?)\1/g;
   while ((m = dashCRe.exec(command))) bodies.push(m[2]!);
+  const nodeInlineRe = /\bnode\s+(?:-\S+\s+)*?(?:-e|--eval|-p|--print)\s+(['"])([\s\S]*?)\1/g;
+  while ((m = nodeInlineRe.exec(command))) bodies.push(m[2]!);
+  const pyInlineRe = /\bpython3?\s+(?:-\S+\s+)*?-c\s+(['"])([\s\S]*?)\1/g;
+  while ((m = pyInlineRe.exec(command))) bodies.push(m[2]!);
   return bodies;
 }
 
 export type RunnerFileTarget =
   | { kind: "file"; path: string }
-  /** A runner whose executed content cannot be pinned to a single static file (`xargs sh`, a bare `bun test`/`bun run` with no file argument — runs the whole tree/script list, a `-c` body already handled by `extractInlineBodies`) — never treated as benign; see this module's header. */
+  /** A runner whose executed content cannot be pinned to a single static file, and is genuinely unknowable rather than deliberately approved (`xargs sh`; a `-c`/`-e`/`-p` inline body is handled separately, by `extractInlineBodies`, and a bare `bun test`/`bun run` is handled separately too — see this module's header for why that one is APPROVED, not `dynamic`) — never treated as benign; see this module's header. */
   | { kind: "dynamic"; detail: string };
 
-/** A `bun test`/`bun run` argument token that actually looks like a path, not a bare word (a flag, or — FACTORY-638 review round 1 — a word from the NEXT line of a multi-line description bleeding in). Deliberately permissive (contains `.` or `/`, or starts with `~`): a cheap positive filter, not a path grammar. */
+/** A runner argument token that actually looks like a path, not a bare word (a flag, an option's own non-path value like a module/package name, or — FACTORY-638 review round 1 — a word from the NEXT line of a multi-line description bleeding in). Deliberately permissive (contains `.` or `/`, or starts with `~`): a cheap positive filter, not a path grammar. */
 function looksLikeFilePath(tok: string): boolean {
   return tok.includes("/") || tok.includes(".") || tok.startsWith("~");
+}
+
+/**
+ * FACTORY-640 (round 2 of FACTORY-636's review): the first non-flag,
+ * path-shaped token among `tokens` — every runner branch below (`bun
+ * test`/`run`, `node`, `python`, `sh|bash|zsh`, `source`) uses this SAME
+ * narrowing, so an option token (`--version`, `-v`, `-m`) is never mistaken
+ * for the file being executed. A flag's own non-path VALUE (`-m pytest`'s
+ * `pytest`) is never specially skipped — it simply never passes
+ * `looksLikeFilePath`, so it is skipped by the same filter, not a separate
+ * rule. Returns `undefined` when no such operand exists: the invocation is
+ * then either flag-only (`node --version`) or its content is already fully
+ * covered by `extractInlineBodies` (`node -e`, `python -c`, `sh -c`), which
+ * runs earlier in `classifyFileExecutionRisk` — never treat "no operand
+ * found here" as "nothing to inspect" on its own.
+ */
+function findPathShapedOperand(tokens: string[]): string | undefined {
+  return tokens.find((t) => !t.startsWith("-") && looksLikeFilePath(t));
 }
 
 /**
@@ -211,30 +256,72 @@ function looksLikeFilePath(tok: string): boolean {
 function extractSingleRunnerFileTarget(segment: string): RunnerFileTarget | undefined {
   if (/\bxargs\b[^|]*\b(sh|bash|zsh)\b/i.test(segment)) return { kind: "dynamic", detail: "xargs piping into a shell — executed content is not a single static file" };
 
+  // FACTORY-640: an option token (`bash -l deploy.sh`'s `-l`) is no longer
+  // mistaken for the file — `findPathShapedOperand` skips it and keeps
+  // looking, so `deploy.sh` is still found and still inspected.
   const shDashC = /\b(sh|bash|zsh)\s+-c\b/i.test(segment);
   if (!shDashC) {
-    const shMatch = /\b(sh|bash|zsh)\s+(\S+)/i.exec(segment);
-    if (shMatch) return { kind: "file", path: stripDelimiters(shMatch[2]!) };
+    const shMatch = /\b(sh|bash|zsh)\s+(.*)$/i.exec(segment);
+    if (shMatch) {
+      const tokens = shMatch[2]!.trim().split(/\s+/).filter(Boolean);
+      const fileTok = findPathShapedOperand(tokens);
+      if (fileTok) return { kind: "file", path: stripDelimiters(fileTok) };
+    }
   }
 
-  // FACTORY-638 review round 1: `bun test`/`bun run` with NO file argument
-  // at all (just flags, or nothing) runs the WHOLE test tree or the whole
-  // scripts list — that is strictly MORE dangerous to wave through
-  // uninspected than a single named file, never less, so it is treated as
-  // `dynamic` (escalate) rather than falling through to "no runner
-  // recognised" (which would have approved it outright).
+  // FACTORY-640 (round 2 of FACTORY-636's review): a bare `bun test`/`bun
+  // run <script>` — no explicit file argument — runs the workspace's OWN
+  // suite/script list, which FACTORY-625's fail-closed fallback clause
+  // (scoped to a path OUTSIDE the workspace) never authorized vetoing, and
+  // which freezes a pane with no `[butchr:blocked]` ANSWER escalation
+  // available for this dialog class. Approve it (fall through to "no
+  // target recognised" below) rather than returning `dynamic`; a bare `bun
+  // test`/`bun run` still cannot see what the suite/scripts contain — that
+  // uninspected-content gap is stated in this PR's limitations, not hidden
+  // here.
   const bunTestOrRun = /\bbun\s+(test|run)\b/i.exec(segment);
   if (bunTestOrRun) {
     const rest = segment.slice(bunTestOrRun.index + bunTestOrRun[0].length).trim();
     const tokens = rest.split(/\s+/).filter(Boolean);
-    const fileTok = tokens.find((t) => !t.startsWith("-") && looksLikeFilePath(t));
+    const fileTok = findPathShapedOperand(tokens);
     if (fileTok) return { kind: "file", path: stripDelimiters(fileTok) };
-    return { kind: "dynamic", detail: `bun ${bunTestOrRun[1]} with no explicit file argument runs the whole tree/script list, uninspected` };
+    return undefined;
   }
 
-  for (const re of [/\bnode\s+(?:--\S+\s+)*(\S+)/i, /\bpython3?\s+(?:-\S+\s+)*(\S+)/i, /\bsource\s+(\S+)/i]) {
-    const m = re.exec(segment);
-    if (m) return { kind: "file", path: stripDelimiters(m[1]!) };
+  // FACTORY-640: `node -e`/`--eval`/`-p`/`--print` and `python`/`python3
+  // -c` execute an INLINE body, not a file — that body is already routed
+  // through `extractInlineBodies` (run earlier in
+  // `classifyFileExecutionRisk`, straight off the visible command text), so
+  // reporting a "file target" here would be redundant at best and wrong at
+  // worst (there is no file to stat). Recognising the flag here only to
+  // skip it, rather than never recognising `node`/`python` at all, is what
+  // stops `node -e '<payload>'` from falling through to "no runner
+  // recognised" and being approved by accident — the exact trap named in
+  // FACTORY-636's review.
+  const nodeMatch = /\bnode\s+(.*)$/i.exec(segment);
+  if (nodeMatch) {
+    const tokens = nodeMatch[1]!.trim().split(/\s+/).filter(Boolean);
+    if (tokens.some((t) => t === "-e" || t === "--eval" || t === "-p" || t === "--print")) return undefined;
+    const fileTok = findPathShapedOperand(tokens);
+    if (fileTok) return { kind: "file", path: stripDelimiters(fileTok) };
+    return undefined;
+  }
+
+  const pyMatch = /\bpython3?\s+(.*)$/i.exec(segment);
+  if (pyMatch) {
+    const tokens = pyMatch[1]!.trim().split(/\s+/).filter(Boolean);
+    if (tokens.some((t) => t === "-c")) return undefined;
+    const fileTok = findPathShapedOperand(tokens);
+    if (fileTok) return { kind: "file", path: stripDelimiters(fileTok) };
+    return undefined;
+  }
+
+  const sourceMatch = /\bsource\s+(.*)$/i.exec(segment);
+  if (sourceMatch) {
+    const tokens = sourceMatch[1]!.trim().split(/\s+/).filter(Boolean);
+    const fileTok = findPathShapedOperand(tokens);
+    if (fileTok) return { kind: "file", path: stripDelimiters(fileTok) };
+    return undefined;
   }
 
   const dotSlash = /(^|\s)(\.\/\S+)/.exec(segment);
