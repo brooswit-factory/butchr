@@ -10,8 +10,13 @@ export function parseSections(raw: string): Partial<Record<Section, string[]>> {
   for (const line of raw.split("\n")) {
     const sec = /^### (\w+)\s*$/.exec(line);
     if (sec) { cur = (SECTIONS as readonly string[]).includes(sec[1]!) ? (sec[1] as Section) : null; continue; }
+    if (!cur) continue;
     const bullet = /^\s*[-*] (.+)$/.exec(line);
-    if (bullet && cur) (sections[cur] ??= []).push(bullet[1]!);
+    if (bullet) { (sections[cur] ??= []).push(bullet[1]!); continue; }
+    // A wrapped bullet: an indented non-bullet line continues the bullet above it.
+    const cont = /^\s+(\S.*)$/.exec(line);
+    const list = sections[cur];
+    if (cont && list?.length) list[list.length - 1] += ` ${cont[1]!.trimEnd()}`;
   }
   return sections;
 }

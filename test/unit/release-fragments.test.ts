@@ -18,6 +18,18 @@ describe("parseFragment", () => {
   });
 });
 
+describe("wrapped bullets", () => {
+  test("indented lines under a bullet join it instead of being dropped", () => {
+    const f = parseFragment("x.md", "bump: minor\n### Added\n- first line\n  second line\n  third line\n- next\n\n### Fixed\n- x\n");
+    expect(f.sections.Added).toEqual(["first line second line third line", "next"]);
+    expect(f.sections.Fixed).toEqual(["x"]);
+  });
+  test("a blank line or a new heading ends the continuation", () => {
+    const f = parseFragment("x.md", "### Added\n- a\n\n  stray\n");
+    expect(f.sections.Added).toEqual(["a stray"]);
+  });
+});
+
 describe("hasBreaking", () => {
   test("true only when the BREAKING section has bullets", () => {
     expect(hasBreaking(parseFragment("x.md", "bump: major\n### BREAKING\n- oops\n"))).toBe(true);
