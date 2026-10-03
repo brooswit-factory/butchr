@@ -7,11 +7,12 @@
  * destructive fixture is read back after the check and asserted byte-identical,
  * which is the positive proof that nothing ran it. `HOME` is a throwaway dir.
  */
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach } from "bun:test";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installFileExecutionVeto, vetoScriptText, HOOK_MARKER, HOOK_SCRIPT_BASENAME } from "../../src/agents/claude-hooks.js";
+import { installFileExecutionVeto, usablePython3, vetoScriptText, HOOK_MARKER, HOOK_SCRIPT_BASENAME, type PythonProbeDeps } from "../../src/agents/claude-hooks.js";
+import { writePreLaunchClaudeFiles, resetVetoUnavailableWarning } from "../../src/agents/workspace.js";
 
 const ws = () => mkdtempSync(join(tmpdir(), "f625-hook-"));
 const pathsFor = (root: string) => ({
@@ -123,6 +124,116 @@ describe("installFileExecutionVeto — merge semantics", () => {
   });
 });
 
+// ------------------------------------------------------------------ a python3 that cannot run
+
+describe("usablePython3 — a python3 that cannot run must not be mistaken for one that can", () => {
+  // Every dependency throws unless a test overrides it, so a test also proves
+  // what was NOT consulted: in particular, python itself is never run, because
+  // on a stock Mac that is what opens the Xcode install dialog.
+  const deps = (over: Partial<PythonProbeDeps> = {}): PythonProbeDeps => ({
+    which: () => "/usr/local/bin/python3",
+    platform: "linux",
+    xcodeSelectStatus: () => { throw new Error("xcode-select must not be consulted here"); },
+    ...over,
+  });
+
+  test("no python3 on PATH is unusable", () => {
+    const r = usablePython3(deps({ which: () => null }));
+    expect(r).toEqual({ ok: false, reason: expect.stringContaining("not found") });
+  });
+
+  test("a stock Mac: /usr/bin/python3 with no Command Line Tools is Apple's installer stub", () => {
+    const r = usablePython3(deps({ which: () => "/usr/bin/python3", platform: "darwin", xcodeSelectStatus: () => 2 }));
+    expect(r.ok).toBe(false);
+    const reason = (r as { reason: string }).reason;
+    expect(reason).toContain("/usr/bin/python3");
+    expect(reason).toContain("Command Line Tools");
+    expect(reason).toContain("xcode-select --install");
+  });
+
+  test("the same path with the Command Line Tools installed is a real python3", () => {
+    expect(usablePython3(deps({ which: () => "/usr/bin/python3", platform: "darwin", xcodeSelectStatus: () => 0 }))).toEqual({ ok: true });
+  });
+
+  test("if xcode-select cannot be run it says usable — protection is never switched off on a guess", () => {
+    expect(usablePython3(deps({ which: () => "/usr/bin/python3", platform: "darwin", xcodeSelectStatus: () => null }))).toEqual({ ok: true });
+  });
+
+  test("a real python3 on a Mac (not Apple's path) is usable without asking xcode-select", () => {
+    expect(usablePython3(deps({ which: () => "/Users/me/.local/bin/python3", platform: "darwin" }))).toEqual({ ok: true });
+  });
+
+  test("Linux /usr/bin/python3 is usable and xcode-select is never consulted", () => {
+    expect(usablePython3(deps({ which: () => "/usr/bin/python3", platform: "linux" }))).toEqual({ ok: true });
+  });
+});
+
+describe("writePreLaunchClaudeFiles — no working python3", () => {
+  const spec = { key: "T-1", issuetype: "Task", summary: "s", parent: null };
+  const mcpUrl = "http://localhost:7717/mcp";
+  const FOREIGN = { matcher: "Bash", hooks: [{ type: "command", command: "echo someone-elses-hook" }] };
+  const hooksIn = (dir: string): Array<{ hooks: Array<{ command: string }> }> => settingsOf(dir).hooks?.PreToolUse ?? [];
+  const ours = (dir: string) => hooksIn(dir).filter((e) => e.hooks.some((h) => h.command.includes(HOOK_MARKER)));
+
+  /** Captures what the daemon would write to stderr while `fn` runs. */
+  function capturingStderr(fn: () => void): string[] {
+    const lines: string[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+    try { fn(); } finally { console.error = original; }
+    return lines;
+  }
+
+  beforeEach(() => resetVetoUnavailableWarning());
+
+  test("with a working python3 the hook is installed and nothing is warned", () => {
+    const dir = ws(); const root = ws();
+    const warned = capturingStderr(() => writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: { ok: true } }));
+    expect(ours(dir)).toHaveLength(1);
+    expect(warned).toEqual([]);
+  });
+
+  test("without one the hook is skipped, the agent still gets its mcp.json, and foreign hooks are untouched", () => {
+    const dir = ws(); const root = ws();
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "settings.json"), JSON.stringify({ model: "opus", hooks: { PreToolUse: [FOREIGN] } }));
+    writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: { ok: false, reason: "no python" } });
+    expect(ours(dir)).toHaveLength(0);
+    expect(hooksIn(dir)).toEqual([FOREIGN]);
+    expect(settingsOf(dir).model).toBe("opus");
+    expect(existsSync(join(dir, "mcp.json"))).toBe(true);
+  });
+
+  test("a hook installed back when python3 worked is removed, so a stub is never fired on every Bash call", () => {
+    const dir = ws(); const root = ws();
+    writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: { ok: true } });
+    expect(ours(dir)).toHaveLength(1);
+    capturingStderr(() => writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: { ok: false, reason: "gone" } }));
+    expect(ours(dir)).toHaveLength(0);
+  });
+
+  test("it warns loudly, once per distinct reason, naming the consequence and the cause", () => {
+    const dir = ws(); const root = ws();
+    const none = { ok: false, reason: "reason one" } as const;
+    const warned = capturingStderr(() => {
+      writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: none });
+      writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: none });
+      writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, python: { ok: false, reason: "reason two" } });
+    });
+    expect(warned).toHaveLength(2);
+    expect(warned[0]).toContain("NOT installed");
+    expect(warned[0]).toContain("without the file-execution veto");
+    expect(warned[0]).toContain("reason one");
+    expect(warned[1]).toContain("reason two");
+  });
+
+  test("an operator who disabled the veto is not told it is missing", () => {
+    const dir = ws(); const root = ws();
+    const warned = capturingStderr(() => writePreLaunchClaudeFiles(dir, spec, mcpUrl, { root, vetoEnabled: false, python: { ok: false, reason: "no python" } }));
+    expect(warned).toEqual([]);
+  });
+});
+
 // ------------------------------------------------------------------ the checker
 
 const PY = "python3";
@@ -143,7 +254,12 @@ function fixture(dir: string, name: string, content: string): string {
   return p;
 }
 
-describe("file-execution-veto checker", () => {
+// These drive the real checker with `python3`, so they need a python3 that runs.
+// On a host without one (a stock Mac before the Command Line Tools are
+// installed) they are skipped rather than failed: the failure would be about
+// the host, and production skips the hook on such a host anyway (see
+// `usablePython3`). CI has Python, so they always run there.
+describe.skipIf(!usablePython3().ok)("file-execution-veto checker", () => {
   const setup = () => {
     const dir = ws();
     const home = ws();

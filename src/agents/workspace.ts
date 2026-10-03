@@ -2,7 +2,7 @@ import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirS
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
-import { installFileExecutionVeto, VETO_MODE_BASENAME, VETO_FAIL_OPEN_STATE_BASENAME } from "./claude-hooks.js";
+import { installFileExecutionVeto, usablePython3, VETO_MODE_BASENAME, VETO_FAIL_OPEN_STATE_BASENAME, type PythonCheck } from "./claude-hooks.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
 import CLAUDE_MD from "../../briefs/CLAUDE.md" with { type: "text" };
 import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
@@ -816,10 +816,28 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
  * `vetoEnabled: false` still runs the installer: it is what REMOVES a
  * previously installed hook (see `installFileExecutionVeto`), so turning the
  * veto off propagates on the next spawn rather than needing a hand-edit.
+ *
+ * A host with no working `python3` takes the same path as `vetoEnabled: false`
+ * (the hook cannot run there, and a hook that cannot run is a silent no-op that
+ * also fires Apple's installer stub on every Bash call), plus a loud warning,
+ * once per distinct reason: the agent still launches, as `installFileExecutionVeto`
+ * already requires, but nobody is left believing it is protected.
  */
-export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: string, opts: { auditPath?: string; root?: string; vetoEnabled?: boolean } = {}): void {
+let lastVetoUnavailableReason: string | undefined;
+export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: string, opts: { auditPath?: string; root?: string; vetoEnabled?: boolean; python?: PythonCheck } = {}): void {
   writeClaudeMcpJson(dir, spec, mcpUrl);
   const root = opts.root ?? workspaceRoot();
+  let vetoEnabled = opts.vetoEnabled ?? true;
+  if (vetoEnabled) {
+    const python = opts.python ?? usablePython3();
+    if (!python.ok) {
+      vetoEnabled = false;
+      if (lastVetoUnavailableReason !== python.reason) {
+        lastVetoUnavailableReason = python.reason;
+        console.error(`butchr: [veto-hook] NOT installed, agents on this host run without the file-execution veto: ${python.reason}`);
+      }
+    }
+  }
   installFileExecutionVeto(dir, {
     // Same env var and same default as `Config.permissionAuditPath`
     // (src/config/config.ts) — one audit file for every approval decision on
@@ -829,7 +847,12 @@ export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: 
     auditPath: opts.auditPath ?? (process.env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(root, ".permission-audit.jsonl")),
     modeFilePath: join(root, VETO_MODE_BASENAME),
     failOpenStatePath: join(root, VETO_FAIL_OPEN_STATE_BASENAME),
-  }, opts.vetoEnabled ?? true);
+  }, vetoEnabled);
+}
+
+/** Test seam: forget which unavailable-veto reason was already warned about. */
+export function resetVetoUnavailableWarning(): void {
+  lastVetoUnavailableReason = undefined;
 }
 
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {

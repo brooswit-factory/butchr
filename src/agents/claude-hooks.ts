@@ -68,6 +68,58 @@ export type VetoInstallOutcome =
   | { installed: true; backedUpTo?: string }
   | { installed: false; reason: string };
 
+export type PythonCheck = { ok: true } | { ok: false; reason: string };
+
+/** What `usablePython3` consults, injectable so a test needs neither a Mac nor a missing Python. */
+export interface PythonProbeDeps {
+  which: (cmd: string) => string | null;
+  platform: NodeJS.Platform;
+  /** Exit status of `xcode-select -p`, or null if it could not be run. */
+  xcodeSelectStatus: () => number | null;
+}
+
+const APPLE_PYTHON3_PATH = "/usr/bin/python3";
+
+const defaultProbeDeps = (): PythonProbeDeps => ({
+  which: (cmd) => Bun.which(cmd),
+  platform: process.platform,
+  xcodeSelectStatus: () => {
+    try { return Bun.spawnSync(["xcode-select", "-p"], { stdout: "ignore", stderr: "ignore" }).exitCode; }
+    catch { return null; }
+  },
+});
+
+/**
+ * Whether the `python3` the hook command names can actually run. The hook is
+ * `python3 <checker>` on every Bash call an agent makes, so a `python3` that
+ * cannot run turns the tripwire into a silent no-op (the call exits non-zero,
+ * which Claude treats as a non-blocking error and carries on).
+ *
+ * A stock Mac is the case that matters: `/usr/bin/python3` there is a stub that
+ * runs nothing until the Xcode Command Line Tools are installed. It exits 1
+ * and asks macOS to open the "install developer tools" dialog, so the stub is
+ * recognised WITHOUT being run: running it to find out would raise that dialog.
+ * `xcode-select -p` answers the same question and has no side effect.
+ *
+ * Deliberately not a run of `python3 --version`: that is exactly the call the
+ * stub turns into a dialog. And when this cannot tell (`xcode-select` could not
+ * be run), it says usable, so the protection is never switched off on a guess.
+ */
+export function usablePython3(deps: PythonProbeDeps = defaultProbeDeps()): PythonCheck {
+  const found = deps.which("python3");
+  if (!found) return { ok: false, reason: "python3 was not found on the daemon's PATH" };
+  if (deps.platform === "darwin" && found === APPLE_PYTHON3_PATH) {
+    const status = deps.xcodeSelectStatus();
+    if (status !== null && status !== 0) {
+      return {
+        ok: false,
+        reason: `python3 resolves to ${APPLE_PYTHON3_PATH}, which on this Mac is Apple's installer stub because the Xcode Command Line Tools are not installed; install them (xcode-select --install) or put a real python3 earlier on the daemon's PATH`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 /** The exact hook command line, with the marker. Quoted for paths containing spaces. */
 function hookCommandFor(scriptPath: string, paths: VetoHookPaths): string {
   return `python3 "${scriptPath}" --mode-file "${paths.modeFilePath}" --audit "${paths.auditPath}" --fail-open-state "${paths.failOpenStatePath}" # ${HOOK_MARKER}`;
