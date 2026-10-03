@@ -2811,7 +2811,16 @@ describe("resumeInPlace", () => {
    * entries (`ManagedHerdrLifecycle.resolveCurrent()`'s own idle check).
    */
   function fakeHerdrFullCycle(cwd: string) {
-    const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; foreground: "claude" | "shell" } = { agents: [], foreground: "shell" };
+    // FACTORY-622: `panes` is a SEPARATE registry from `agents`, and that
+    // separation is the whole point — real herdr can list a pane that has no
+    // agent on it (the bare shell a `/exit` leaves behind), and it can also
+    // stop listing a pane entirely (its workspace was closed). Before this,
+    // the fixture modelled only `agents`, so neither state was reachable and
+    // `pane.list` did not exist at all. Every pre-existing test keeps the
+    // behaviour it had: `workspace.create` registers the pane it returns and
+    // `pane.close` removes it, which is exactly what those tests already
+    // assumed implicitly.
+    const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; panes: string[]; foreground: "claude" | "shell" } = { agents: [], panes: [], foreground: "shell" };
     let paneCounter = 0;
     // FACTORY-470/472: the REAL argv the last successful `agent.start` was
     // called with — needed by `staleIssues()`'s own `isHerdrRestoredPane`
@@ -2822,6 +2831,7 @@ describe("resumeInPlace", () => {
     const started: any[] = []; const closed: string[] = []; const sent: any[] = []; const creates: any[] = [];
     let nameTakenNext = false;
     let otherErrorNext = false;
+    let keepForegroundAfterExit = false;
     const client = {
       agent: {
         list: async () => ({ agents: state.agents.map((a) => ({ ...a })) }),
@@ -2835,17 +2845,44 @@ describe("resumeInPlace", () => {
         },
       },
       pane: {
+        list: async () => ({ panes: state.panes.map((pane_id) => ({ pane_id, cwd })) }),
         processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
-        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); state.foreground = "shell"; },
-        close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); },
+        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); if (!keepForegroundAfterExit) state.foreground = "shell"; },
+        close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); state.panes = state.panes.filter((p) => p !== id); },
         read: async () => ({ read: { text: "" } }),
       },
-      workspace: { create: async (p: any) => { paneCounter++; creates.push(p); return { root_pane: { pane_id: `fresh-${paneCounter}` } }; } },
+      workspace: { create: async (p: any) => { paneCounter++; creates.push(p); const pane_id = `fresh-${paneCounter}`; state.panes = [...state.panes, pane_id]; return { root_pane: { pane_id } }; } },
     };
     return {
       client: client as any, started, closed, sent, creates, state,
       setNameTakenOnNextStart: () => { nameTakenNext = true; },
+      // FACTORY-622: keep `pane.processInfo` reporting claude in the
+      // foreground even after the `/exit` keystroke — the ONLY way to reach
+      // `resumeInPlaceExclusive`'s `"stuck"` outcome through this fixture,
+      // since that outcome is defined by the pane still being occupied when
+      // the exit deadline passes. The real pane then empties a moment later
+      // (`emptyPane` below), which is precisely the sequence measured on
+      // v0.19.0 for admin-brooswit-nexus.
+      keepForegroundAfterExit: () => { keepForegroundAfterExit = true; },
+      /**
+       * FACTORY-622: the pane's provider exits, WITHOUT butchr closing the
+       * pane. herdr keeps listing the pane (it is a live bare shell) and
+       * drops its agent entry, which is the state the director's own evidence
+       * describes as "the pane emptied".
+       */
+      emptyPane: () => { state.foreground = "shell"; state.agents = []; },
+      /**
+       * FACTORY-622: something OUTSIDE butchr closes the workspace — a direct
+       * herdr `workspace.close`, never butchr's own `stop()`. Both the pane
+       * and its agent vanish from herdr, and nothing tells
+       * `ManagedHerdrLifecycle` about it. Deliberately does NOT go through
+       * `pane.close` above: that is the path butchr itself uses, and routing
+       * this through it would not reproduce the defect (it would also be
+       * recorded in `closed`, hiding whether the production code closed
+       * anything of its own).
+       */
+      closeWorkspaceExternally: () => { state.panes = []; state.agents = []; state.foreground = "shell"; },
       // FACTORY-470/472: force the NEXT `agent.start` to throw a non-
       // agent_name_taken error — the second door PR #551's floor fix
       // covers (`postExitOutcome()` applies identically to both).
@@ -2997,6 +3034,233 @@ describe("resumeInPlace", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  });
+
+  /**
+   * FACTORY-622 — shared setup for this ticket's own tests, factored out of
+   * the two FACTORY-426 tests above (which keep their inline copies rather
+   * than being rewritten around this: their assertions are about a shipped
+   * fix and are not this ticket's to disturb).
+   *
+   * The `agent.start` wrapper is the same one those tests use, and it is
+   * needed for the same reason: `startProviders` runs
+   * `discoverClaudeSessionId` after a SUCCESSFUL launch, which only accepts a
+   * transcript written in a strictly later millisecond than the launch began
+   * (see `withResumableSession`'s own doc comment). Without it a successful
+   * spawn still succeeds but logs a WARNING, which would sit in the middle of
+   * the log assertions below.
+   */
+  async function withFullCycleHerd<T>(
+    resourceId: string,
+    fn: (ctx: { f: ReturnType<typeof fakeHerdrFullCycle>; herd: HerdrHerd; spec: { key: string; issuetype: string; summary: string; parent: null }; lines: string[]; cwd: string }) => Promise<T>,
+  ): Promise<T> {
+    return await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-622-"));
+      try {
+        const f = fakeHerdrFullCycle(cwd);
+        let sessionCounter = 0;
+        const rawStart = f.client.agent.start;
+        f.client.agent.start = async (p: any) => {
+          await rawStart(p);
+          sessionCounter++;
+          await new Promise((r) => setTimeout(r, 20));
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
+        };
+        const lines: string[] = [];
+        // A clock that advances a second per READ, not a fixed value: the
+        // post-`/exit` wait in `resumeInPlaceExclusive` is a
+        // `monotonicNow()`-bounded loop whose injected `wait` is `instant`
+        // here, so a frozen clock would spin it forever and a real clock
+        // would make the `"stuck"` test below sit through the full
+        // `RESUME_EXIT_TIMEOUT_MS` of real time.
+        let clock = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home), () => (clock += 1_000));
+        return await fn({ f, herd, spec, lines, cwd });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+
+  /**
+   * THE regression test for this ticket's originally reported cause. Verified
+   * to FAIL without `clearVanishedWorker` (src/agents/herd.ts): every spawn
+   * after the external close logs `waiting - handoff blocked` and
+   * `f.started` never leaves 1, which is the live-confirmed stall — the
+   * director and genius panes on 2026-10-02, recoverable only by restarting
+   * `butchr.service`.
+   *
+   * Deliberately calls NOTHING but `herd.spawn()` between the close and the
+   * recovery: no `herd.stop()` (that is FACTORY-426's route, and needing it
+   * here is the defect), no freeze/unfreeze (that is what admin-assembly had
+   * to do by hand on 2026-10-03), and no restart. The second `spawn()` is
+   * what the next ordinary reconcile poll would do.
+   */
+  test("FACTORY-622: a workspace closed directly in herdr (not via butchr stop) gets its stale worker state cleared, and the next spawn succeeds with no restart", async () => {
+    await withFullCycleHerd("FACTORY-920", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+
+      // Something external closes the workspace. butchr is told nothing, and
+      // still holds `originalPane` as its current worker.
+      f.closeWorkspaceExternally();
+
+      // The reconcile poll that follows: desired, not running, so it spawns.
+      // This one is still refused — the repair is state-only, by design.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      expect(lines.some((l) => l.includes("waiting - handoff blocked"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state") && l.includes(originalPane) && l.includes("closed outside butchr"))).toBe(true);
+      // The reason is retained non-destructively for the ops alert, and it is
+      // the SDK's own wording, not a string this test or the fix invented.
+      expect(herd.lastSpawnRefusal(spec.key)).toBe("Current worker disappeared; refusing implicit replacement");
+
+      // The next poll's spawn — the one that used to be refused forever.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+      expect(f.state.agents).toHaveLength(1);
+      expect(f.state.agents[0]!.pane_id).not.toBe(originalPane); // an honest fresh pane, not a phantom reuse
+      expect(herd.lastSpawnRefusal(spec.key)).toBeUndefined(); // cleared by the successful spawn
+      // Nothing was closed by butchr: the workspace was already gone, so
+      // there was nothing to close — only identity to forget.
+      expect(f.closed).toEqual([]);
+    });
+  });
+
+  /**
+   * The director's scope addition (2026-10-03): the same wedge via
+   * `resumeInPlace`, which FACTORY-426's fix does not reach because no
+   * `herd.stop()` ever runs for a `"stuck"` outcome. Measured on v0.19.0:
+   * admin-brooswit-nexus logged `"stuck"` at 05:41:44 after a 05:41:34
+   * `/exit`, the pane emptied, the cached identity was never cleared, and 26
+   * consecutive spawns were refused until admin-assembly cleared it by hand
+   * with `session freeze` + `unfreeze`.
+   *
+   * The acceptance criterion names the recovery exactly: respawn succeeds
+   * with NO freeze/unfreeze. Note the pane is still LISTED here — only its
+   * provider exited — so this is the branch that the pane-gone test above
+   * does not cover, and the one that proves the fix is keyed on evidence
+   * about the pane rather than on how the pane came to be empty.
+   */
+  test("FACTORY-622: a resume-in-place 'stuck' whose pane empties afterwards is cleared too, and the respawn succeeds with no freeze/unfreeze", async () => {
+    await withFullCycleHerd("FACTORY-921", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+
+      // The pane does not vacate before the exit deadline, so the resume
+      // returns "stuck" — a bare retry, with no stop/spawn behind it.
+      f.keepForegroundAfterExit();
+      expect(await herd.resumeInPlace(spec)).toBe("stuck");
+      expect(f.sent.some((s) => s.text === "/exit")).toBe(true);
+
+      // ...and then the pane empties anyway, a moment later. herdr still
+      // lists the pane; it just has no provider on it any more.
+      f.emptyPane();
+      expect(f.state.panes).toEqual([originalPane]);
+
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1); // still refused on this poll
+      expect(lines.some((l) => l.includes("cleared stale worker state") && l.includes("still listed but empty"))).toBe(true);
+      // The orphaned bare shell IS closed in this branch, unlike the
+      // closed-workspace one: the next spawn must not have to launch beside it.
+      expect(f.closed).toContain(originalPane);
+
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+      expect(f.state.agents).toHaveLength(1);
+      expect(f.state.agents[0]!.pane_id).not.toBe(originalPane);
+    });
+  });
+
+  /**
+   * The ticket's second requirement, as its own test: "Only clear when herdr
+   * positively reports the workspace/pane missing. A herdr error or timeout
+   * is NOT proof it is gone; do not clear on that."
+   *
+   * This is the test that would catch the dangerous version of this fix. If
+   * `clearVanishedWorker` treated a failed `pane.list()` as evidence, it
+   * would clear the identity of a worker that is in fact alive and herdr is
+   * merely unreachable about — and the next poll would launch a SECOND agent
+   * beside it, in the same workspace.
+   */
+  test("FACTORY-622: a pane.list() failure is not proof the pane is gone — the worker state is left exactly as it was", async () => {
+    await withFullCycleHerd("FACTORY-922", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      f.closeWorkspaceExternally();
+      f.client.pane.list = async () => { throw new Error("herdr RPC transport hiccup"); };
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("pane.list() failed so herdr confirmed nothing") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+
+      // Still wedged, deliberately: with no proof, the safe answer is to keep
+      // refusing. Once herdr answers again, the very next poll recovers.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      f.client.pane.list = async () => ({ panes: [] });
+      await herd.spawn(spec);
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+    });
+  });
+
+  /**
+   * The third case the ticket asks for: an intact worker is untouched. The
+   * pane is listed AND still running its provider; only herdr's `agent.list`
+   * bookkeeping has dropped the entry (the measured lag `staleIssues()`'s own
+   * comment describes). Clearing here would discard the identity of a live
+   * agent, so the fix must refuse to — a pane that exists but whose agent has
+   * died is FACTORY-426's stop-then-spawn case, not this one.
+   */
+  test("FACTORY-622: a blocked spawn whose held pane is still running a provider clears nothing", async () => {
+    await withFullCycleHerd("FACTORY-923", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+      // The agent entry is gone from herdr's bookkeeping; the pane and its
+      // claude process are both still there.
+      f.forgetAllAgents();
+      expect(f.state.panes).toEqual([originalPane]);
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("still running a provider") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+      expect(f.closed).toEqual([]); // the live pane is never closed
+      expect(f.started).toHaveLength(1);
+    });
+  });
+
+  /**
+   * The same guard one step further in: a `processInfo` that SUCCEEDS but
+   * reports no foreground data at all is `"unknown"`, not `"empty"`. A shell
+   * that is still starting reports exactly this, and so does a pane blocked
+   * on a dialog — absence of data is not absence of a process. Without this
+   * distinction `paneOccupancy` would be the same two-valued check
+   * `providerOfPane` already is, and this fix would clear on a herdr hiccup
+   * by a different door than the one the test above closes.
+   */
+  test("FACTORY-622: a processInfo that reports no foreground data is unknown, not empty — nothing is cleared", async () => {
+    await withFullCycleHerd("FACTORY-924", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      f.forgetAllAgents();
+      f.client.pane.processInfo = async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id } });
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("of unknown occupancy") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+      expect(f.started).toHaveLength(1);
     });
   });
 

@@ -1303,6 +1303,21 @@ const managedSessionCrashLoopDetector = createCrashLoopDetector({
   addComment: async (id, text) => { console.error(`  [managed-sessions:crash-loop] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
   comments: () => Promise.resolve([]),
   log: (line) => console.error(`  ${line}`),
+  // FACTORY-622: the two `addComment`/`comments` lines directly above are
+  // the whole defect this adds a channel for — they are correct, and they
+  // reach a journal on one host and nothing else. A managed session's crash
+  // loop was therefore invisible twice over: 2026-10-02 (director and
+  // genius, "nowhere to post") and 2026-10-03 (admin-brooswit-nexus, 26
+  // "refusing implicit replacement" refusals, "a crash-loop complaint that
+  // reached only the journal"). Wired ONLY here, never into
+  // `issueCrashLoopDetector` above, which already posts on the resource's
+  // own ticket — see `CrashLoopDetectorDeps.opsAlert`'s own doc comment for
+  // that reasoning and for why this is a thunk: `opsAlertRouter` is
+  // constructed several hundred lines below, after the Rocket.Chat
+  // credential it needs is loaded, so reading it by value here would be a
+  // temporal-dead-zone access.
+  opsAlert: () => opsAlertRouter,
+  refusalReason: (id) => herd.lastSpawnRefusal(id),
 });
 // FACTORY-501 (FACTORY-500 item 2, option b) — audible-only escalation for a
 // herdr-restored pane stuck "deferred"/"stuck" on `herd.resumeInPlace()`, so

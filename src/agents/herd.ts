@@ -624,12 +624,39 @@ export class HerdrHerd implements Herd {
   private readonly refused = new Map<string, { pane: string; provider: ManagedAgentProvider; refusal: SessionLimitRefusal }>();
   /** FACTORY-525: set by `resumeInPlaceExclusive` at each `"failed"` return point; see `lastResumeFailureDetail`'s own doc comment (`Herd` interface, above). */
   private readonly resumeFailureDetail = new Map<string, string>();
+  /** FACTORY-622: the reason the LAST `spawn()` attempt for this issue did not produce a running agent, or absent when the last attempt succeeded (or no-opped on an already-live agent). See `lastSpawnRefusal` for the contract. */
+  private readonly spawnRefusal = new Map<string, string>();
 
   /** See the `Herd.lastResumeFailureDetail` interface doc for the full contract. Read-once: cleared on read, same shape as `resumeInPlace`'s own outcome. */
   lastResumeFailureDetail(issue: string): string | undefined {
     const detail = this.resumeFailureDetail.get(issue);
     this.resumeFailureDetail.delete(issue);
     return detail;
+  }
+
+  /**
+   * FACTORY-622: why the LAST `spawn()` attempt for `issue` did not leave an
+   * agent running — the blocked/exhausted reason, verbatim from
+   * `ManagedHerdrResult`, or `undefined` when the last attempt succeeded, no-
+   * opped on an already-live agent, or threw before a result existed.
+   *
+   * NON-DESTRUCTIVE, deliberately unlike `lastResumeFailureDetail` directly
+   * above: its one consumer is the crash-loop detector (`./crash-loop.ts`,
+   * wired in src/daemon/index.ts), which reads this on EVERY poll that
+   * observes the loop in order to name the reason in its ops alert. A
+   * read-once accessor would hand the first such poll the reason and every
+   * later one `undefined`, so a deduplicated alert posted on a LATER poll
+   * (the dedup window, not the caller, decides which poll actually posts —
+   * see `OpsAlertRouter.raise`) would be the one that lost it. Cleared by a
+   * successful or no-op spawn instead, which is what makes a stale reason
+   * impossible without coupling clearing to who happened to read it.
+   *
+   * Deliberately NOT on the `Herd` interface: it is pure instrumentation
+   * with no caller inside the reconcile path, and every fake `Herd` in the
+   * suite would otherwise have to grow a field it never uses.
+   */
+  lastSpawnRefusal(issue: string): string | undefined {
+    return this.spawnRefusal.get(issue);
   }
 
   constructor(
@@ -1162,14 +1189,18 @@ export class HerdrHerd implements Herd {
       // outcomes are unchanged; only a REJECTING `byIssue()` now falls
       // through to the same `failed` line every other failure gets.
       if ((await this.byIssue()).has(issue)) {
+        this.spawnRefusal.delete(issue);
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
       const result = await this.startProviders(spec);
       if (result.status !== "success") {
+        this.spawnRefusal.set(issue, result.status === "blocked" ? result.reason : "providers exhausted");
         this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
+        if (result.status === "blocked") await this.clearVanishedWorker(issue, result.current?.paneId);
         return;
       }
+      this.spawnRefusal.delete(issue);
       // FACTORY-75 visibility requirement: the resolved (model, effort)
       // pair this spawn intended (`spec.agents`, whatever
       // `specForSessionDefinition`/`rule.agentPreferences` resolved via the
@@ -1182,6 +1213,147 @@ export class HerdrHerd implements Herd {
       this.log?.(`${SPAWN_TAG} ${issue} failed origin=${origin} — ${(e as Error)?.message ?? e}`);
       throw e;
     }
+  }
+
+  /**
+   * FACTORY-622 — the permanent-stall half of this ticket. When something
+   * OUTSIDE butchr closes a managed workspace (a direct herdr
+   * `workspace.close`, not butchr's own `stop()`), nothing tells
+   * `ManagedHerdrLifecycle` about it. That class keeps its own private
+   * "current worker" identity (`active`, pinned `@brooswit/drovr` source),
+   * and butchr caches one instance per issue for the daemon's whole lifetime
+   * (`this.lifecycles`). Its `start()` precondition — `!existing &&
+   * this.active` -> `HandoffBlocked: "Current worker disappeared; refusing
+   * implicit replacement"` — then refuses EVERY later ordinary spawn for that
+   * issue, forever, because the only things that clear `active` are
+   * `lifecycle.stop()` and losing the process. Confirmed live on 2026-10-02:
+   * the director and genius managed sessions wedged at ~11:45 PDT and only a
+   * `butchr.service` restart at 11:56 cleared it.
+   *
+   * FACTORY-426 closed the SAME wedge reached via `resumeInPlace` (see the
+   * long comment in `resumeInPlaceExclusive`), and it closed it by routing
+   * that path's empty-pane outcomes to `"failed"`, which `reconcileNow`
+   * already follows with `herd.stop()` before its next `herd.spawn()`. That
+   * fix cannot help here: this wedge is reached with no resume involved at
+   * all — `reconcileNow` sees an issue that is desired and not running, calls
+   * `herd.spawn()`, and `startProviders` returns `blocked` with nothing in
+   * the reconcile path that treats a blocked spawn as a reason to stop
+   * anything. So the clear has to happen here, at the blocked spawn itself.
+   *
+   * CAUSE-AGNOSTIC, BY DESIGN (the director's scope addition on this ticket,
+   * 2026-10-03: "clear the cached worker identity whenever the pane/workspace
+   * is gone, whatever the cause"). This is keyed on EVIDENCE ABOUT THE PANE,
+   * never on the blocked reason string and never on how the pane came to be
+   * empty: the SDK owns the wording of several distinct blocked reasons, and
+   * the only question that decides whether the held identity is stale is
+   * whether anything is actually there. So the same check covers an external
+   * `workspace.close` (the original report), a `resumeInPlace` `"stuck"`
+   * whose `/exit` emptied the pane afterwards (measured on v0.19.0:
+   * admin-brooswit-nexus, 26 consecutive refusals after a 05:41:44 `"stuck"`,
+   * cleared by hand with a freeze/unfreeze), and any later cause nobody has
+   * seen yet.
+   *
+   * ONLY ON POSITIVE PROOF — the ticket's own second requirement, and the
+   * reason this reads herdr twice instead of trusting one answer:
+   *
+   *   1. `pane.list()` is herdr ENUMERATING its panes, so the held pane being
+   *      absent from a SUCCESSFUL enumeration is real evidence it is gone.
+   *      That is the closed-workspace case.
+   *   2. A pane herdr still lists can nevertheless be EMPTY — the bare shell
+   *      a `/exit` leaves behind. `paneOccupancy` below answers that in three
+   *      values rather than two, because the existing `providerOfPane` helper
+   *      deliberately collapses "herdr hiccup" and "genuinely nothing there"
+   *      into one `undefined` (see its own comment) and so cannot be used as
+   *      proof of anything. Only its `"empty"` verdict clears.
+   *
+   * Every other outcome LEAVES THE STATE EXACTLY AS IT WAS and logs: a
+   * `pane.list()` rejection, a `processInfo` rejection, and a `processInfo`
+   * that simply reported no foreground data at all (a shell still starting
+   * reports none, so absence of data is not absence of a process). Clearing
+   * on any of those would discard a LIVE worker's identity and let the next
+   * poll launch a second agent beside it — the same unknown-is-not-vacant
+   * discipline `residency()`/`staleIssues()`/`paneVerdict()` already apply.
+   *
+   * THE EMPTY-BUT-LISTED CASE ALSO CLOSES THE PANE, the gone case does not:
+   * an orphaned bare shell at this issue's own workspace is what the next
+   * spawn would otherwise have to launch beside, and it is exactly what
+   * `resumeInPlace`'s own `"failed"` route already closes (via
+   * `closePaneDefensively`, reused here unchanged) before `reconcileNow`
+   * stops and respawns. A close FAILURE is logged and swallowed there and
+   * here for the same reason: the state repair below matters more than the
+   * tidy-up, and it must not be lost to it.
+   *
+   * `this.lifecycle(issue).stop()` directly, NOT `this.stop(issue)`: we are
+   * already inside `this.exclusive(issue, ...)` (via `spawn()`), and
+   * `this.stop()` re-enters that same per-issue queue, which would chain this
+   * call behind itself and deadlock. The lifecycle's own queue is keyed on
+   * the client+cwd and is free by now (`start()` has returned), and with
+   * nothing live at the pane its `stop()` closes nothing of its own —
+   * `resolveCurrent()` finds no match — so it only clears `active` and the
+   * native-session map, which is exactly and only what this needs.
+   *
+   * The next spawn is left to the next reconcile poll rather than retried
+   * inline: `reconcileNow` will see this issue desired and not running within
+   * one poll interval and call `spawn()` again, which now starts clean. That
+   * keeps this method a state repair with no launch behaviour of its own,
+   * and it is why the tests assert on a SECOND `spawn()` call succeeding
+   * rather than on this one.
+   */
+  private async clearVanishedWorker(issue: string, pane: string | undefined): Promise<void> {
+    if (!pane) return; // nothing was being held — a blocked result with no `current` is not this ticket's wedge
+    let panes: readonly results.PaneInfo[];
+    try {
+      ({ panes } = await this.herdr.pane.list());
+    } catch (e) {
+      this.log?.(`WARNING: ${SPAWN_TAG} ${issue} held worker pane ${pane} after a blocked spawn, but pane.list() failed so herdr confirmed nothing — worker state left untouched: ${(e as Error)?.message ?? e}`);
+      return;
+    }
+    let cause: string;
+    if (!panes.some((p) => p.pane_id === pane)) {
+      cause = `herdr no longer lists pane ${pane} (its workspace was closed outside butchr)`;
+    } else {
+      const occupancy = await this.paneOccupancy(pane);
+      if (occupancy !== "empty") {
+        this.log?.(`${SPAWN_TAG} ${issue} held worker pane ${pane} after a blocked spawn, but that pane is ${occupancy === "occupied" ? "still running a provider" : "of unknown occupancy"} — worker state left untouched`);
+        return;
+      }
+      cause = `pane ${pane} is still listed but empty (its provider exited without butchr closing it)`;
+      await this.closePaneDefensively(pane);
+    }
+    try {
+      await this.lifecycle(issue).stop();
+    } catch (e) {
+      this.log?.(`WARNING: ${SPAWN_TAG} ${issue} could not clear the worker state for vanished pane ${pane}; the next spawn may still be refused: ${(e as Error)?.message ?? e}`);
+      return;
+    }
+    this.log?.(`${SPAWN_TAG} ${issue} cleared stale worker state — ${cause}, so the next spawn starts clean instead of being refused as an implicit replacement`);
+  }
+
+  /**
+   * FACTORY-622: does `pane` currently have a managed-agent provider in its
+   * foreground? THREE values, not two — `"unknown"` is a first-class answer
+   * and the whole reason this exists alongside `providerOfPane`, which
+   * returns the same `undefined` for a herdr rejection as for a genuinely
+   * empty pane (deliberately, for its own callers — see its comment). Only
+   * `clearVanishedWorker` needs the distinction, because it is the only
+   * caller that DESTROYS state on the answer, and the ticket's own rule is
+   * that a herdr error or timeout is never proof a pane is gone.
+   *
+   * `"empty"` requires a SUCCESSFUL `processInfo` that actually reported a
+   * `foreground_processes` array with no provider in it. A missing or null
+   * array is `"unknown"`, not empty: a shell that is still starting reports
+   * none of this, and so does a pane blocked on a dialog.
+   */
+  private async paneOccupancy(pane: string): Promise<"occupied" | "empty" | "unknown"> {
+    let info: results.PaneProcessInfo | undefined;
+    try {
+      info = (await this.herdr.pane.processInfo({ pane_id: pane }) as { process_info?: results.PaneProcessInfo }).process_info;
+    } catch {
+      return "unknown"; // herdr hiccup — says nothing about the pane
+    }
+    const foreground = info?.foreground_processes;
+    if (!Array.isArray(foreground)) return "unknown"; // herdr reported no foreground data at all — absence of data is not absence of a process
+    return foreground.some((p) => managedAgentProviderOfProcess(p)) ? "occupied" : "empty";
   }
 
   /**
