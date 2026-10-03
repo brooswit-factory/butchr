@@ -25,6 +25,7 @@ import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
+import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
@@ -756,6 +757,12 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+// FACTORY-647: resolved ONCE — the real production resolution
+// (src/web/static-assets.ts), read both by the startup check right below and
+// by `/health`'s `dashboardApp` field (see `health` in `buildApp(...)`
+// below) — never two independent resolutions that could disagree.
+const dashboardAppRoot = resolveWebRoot();
+
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
 const { app, mcp } = buildApp({
   state: async () => {
@@ -787,7 +794,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot)),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -899,6 +906,17 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 // second derivation — so a journal window can be attributed to a BUILD, not
 // only a pid (journald's pid only bounds one daemon generation).
 console.error(`  ${describeBuild(toBuildReport(buildIdentity))}`);
+// FACTORY-647: "fail loudly at startup" — the journal half of this ticket's
+// fix, naming the exact missing path and remedy; `/health`'s `dashboardApp`
+// field (see `health` above) is the OTHER half, for an uptime checker. Never
+// fatal: the old server-rendered pages (`/`, `/configurations`) work fine
+// without this build, so the daemon starts either way.
+{
+  const startupDashboardAppStatus = dashboardAppStatus(dashboardAppRoot);
+  if (!startupDashboardAppStatus.built) {
+    console.error(`  [butchr:dashboard-app] web build missing at ${startupDashboardAppStatus.path} — run \`bun run build:web\` (or \`bun run build\`) and restart; GET /dashboard-app/* will 503 until then`);
+  }
+}
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 

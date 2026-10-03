@@ -194,6 +194,23 @@ export interface HealthStatus {
    * report" convention `managedSessionEscalations` above already uses.
    */
   codexUnrecognisedDialogSightings?: CodexDialogSighting[];
+  /**
+   * FACTORY-647: whether the dashboard-app's Vite build is actually present
+   * on disk (see `dashboardAppStatus`, src/web/static-assets.ts) — a SEVENTH
+   * sibling, same "additive, never flips `ok`" reasoning as `build`/
+   * `coverage`/`admission`/`currency`/`managedSessionEscalations`/
+   * `credentialDeathAlert` above: `ok` is the AND over liveness
+   * `components[]` on purpose, and a missing web build is a DEPLOY gap, not
+   * a liveness failure of this daemon's own poll loops — this daemon serves
+   * the old server-rendered pages (`/`, `/configurations`) just fine without
+   * it. This is the status SURFACE an operator or an uptime checker finds
+   * the gap on; the startup log's own `[butchr:dashboard-app]` line (see
+   * src/daemon/index.ts) is the other half of "fail loudly", for whoever is
+   * watching the journal instead of curling `/health`. Absent entirely when
+   * the caller doesn't pass one to `combineHealth` (e.g. every existing test
+   * fixture in this file's own test suite, unaffected by this addition).
+   */
+  dashboardApp?: { built: boolean; path: string };
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -257,6 +274,7 @@ export const combineHealth = (
   managedSessionEscalations?: readonly ManagedSessionEscalation[],
   credentialDeathAlert?: CredentialDeathAlert,
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
+  dashboardApp?: { built: boolean; path: string },
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -273,6 +291,7 @@ export const combineHealth = (
     ...(codexUnrecognisedDialogSightings && codexUnrecognisedDialogSightings.length
       ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
       : {}),
+    ...(dashboardApp ? { dashboardApp } : {}),
   };
 };
 

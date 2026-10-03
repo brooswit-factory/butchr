@@ -57,3 +57,23 @@ export async function serveStaticAsset(root: string, requestPath: string): Promi
   if (!(await file.exists())) return new Response("not found", { status: 404 });
   return new Response(file);
 }
+
+/** FACTORY-647: whether the dashboard-app's build is actually present at `root` — `index.html` existing is the one file every Vite build (SPA fallback included) always emits, so its presence is the single source of truth both the startup check and `/health`'s `dashboardApp` field read, never re-derived differently in two places. */
+export interface DashboardAppStatus {
+  built: boolean;
+  /** The exact `index.html` path checked — named so a human (or a `[butchr:dashboard-app]` log line) can go look. */
+  path: string;
+}
+
+export function dashboardAppStatus(root: string): DashboardAppStatus {
+  const path = join(root, "index.html");
+  return { built: existsSync(path), path };
+}
+
+/** FACTORY-647: `GET /dashboard-app*`'s response when the build is missing — a short, honest body naming the remedy, never a blank 404 indistinguishable from a single missing asset. 503 (not 404): the ROUTE exists, the deploy step that feeds it hasn't run yet. */
+export function dashboardAppMissingResponse(path: string): Response {
+  return new Response(
+    `dashboard-app build missing (expected ${path}) — run \`bun run build:web\` (or \`bun run build\`) and restart the daemon.`,
+    { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
+  );
+}
