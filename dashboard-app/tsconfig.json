@@ -34,6 +34,12 @@
     "../src/agents/dashboard.ts",
     "../src/agents/query-agent-inventory.ts",
     "../src/md.d.ts",
+    // FACTORY-625: the same reason as `md.d.ts` directly above, one file
+    // further along the same closure — `workspace.ts` imports
+    // `agents/claude-hooks.ts`, which embeds the veto checker as text
+    // (`*.py`). Without this, `bun run typecheck:web` fails to resolve that
+    // import even though `bun run typecheck` passes.
+    "../src/py.d.ts",
     // FACTORY-615: the real dashboard view-model (`src/view-model/dashboard-view.ts`)
     // additionally type-only-reads the per-daemon currency shape and
     // `/health`'s own response shape — same "type-only-import the real

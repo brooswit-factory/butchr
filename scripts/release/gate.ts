@@ -26,7 +26,11 @@ export interface Facts {
 export interface Verdict { ok: boolean; reason: string }
 export interface GateResult { required: boolean; bump: Bump | null; verdicts: Verdict[]; ok: boolean }
 
-const GATED = [/^src\//, /^schema\//, /^package\.json$/, /^briefs\//];
+// `hooks/` joins the gated paths for the same reason `briefs/` is here: its
+// contents are EMBEDDED into the built binary at build time (FACTORY-625,
+// src/agents/claude-hooks.ts imports hooks/file-execution-veto.py as text), so
+// a change to it ships real behaviour with no src/ diff to notice it by.
+const GATED = [/^src\//, /^schema\//, /^package\.json$/, /^briefs\//, /^hooks\//];
 export const requiresRelease = (files: string[]) => files.some((f) => GATED.some((r) => r.test(f)));
 
 /** Every changelog entry version in `changelog` that isn't already in `base` — i.e. a heading this branch added. */

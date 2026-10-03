@@ -2,7 +2,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, writeClaudeMcpJson, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -1710,7 +1710,13 @@ export class HerdrHerd implements Herd {
     // FAILED resume leaves it pointing at the NEW bindings, same as it would
     // once `buildWorkspace()` runs again on this workspace's next successful
     // spawn/resume anyway.
-    writeClaudeMcpJson(cwd, spec, this.mcpUrl);
+    // FACTORY-625: the shared pre-launch step, not `writeClaudeMcpJson`
+    // alone. The veto hook must be installed BEFORE the relaunch for the same
+    // reason mcp.json is: Claude reads both as real file content on its first
+    // post-resume turn, and `buildWorkspace` does not run until after the
+    // relaunch is verified — so installing it there would leave every resumed
+    // session unhooked for its whole first turn.
+    writePreLaunchClaudeFiles(cwd, spec, this.mcpUrl);
     const params = agentStartParams(spec, cwd, pane, nameFor(issue), selected, this.mcpUrl);
     try {
       await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });

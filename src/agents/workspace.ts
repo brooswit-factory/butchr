@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirS
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
+import { installFileExecutionVeto, VETO_MODE_BASENAME, VETO_FAIL_OPEN_STATE_BASENAME } from "./claude-hooks.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
 import CLAUDE_MD from "../../briefs/CLAUDE.md" with { type: "text" };
 import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
@@ -798,6 +799,39 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
   if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
 }
 
+/**
+ * FACTORY-625: the ONE pre-launch step for a Claude workspace — everything
+ * Claude reads as real file content on its first post-launch turn.
+ *
+ * This exists because there are TWO launch paths and they had drifted. A fresh
+ * spawn runs the whole of `buildWorkspace`; a RESUME (herd.ts) relaunches
+ * `--resume` into an existing workspace, writes only `mcp.json` before the
+ * relaunch, and calls `buildWorkspace` only AFTER the relaunch is verified. So
+ * anything written solely by `buildWorkspace` is absent for the entire first
+ * turn of every resumed session — which for a safety hook means a resumed
+ * agent runs UNHOOKED, silently, exactly the direction that must never fail.
+ * Both paths call this one function instead, so a file added here cannot be
+ * added to one path and forgotten in the other.
+ *
+ * `vetoEnabled: false` still runs the installer: it is what REMOVES a
+ * previously installed hook (see `installFileExecutionVeto`), so turning the
+ * veto off propagates on the next spawn rather than needing a hand-edit.
+ */
+export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: string, opts: { auditPath?: string; root?: string; vetoEnabled?: boolean } = {}): void {
+  writeClaudeMcpJson(dir, spec, mcpUrl);
+  const root = opts.root ?? workspaceRoot();
+  installFileExecutionVeto(dir, {
+    // Same env var and same default as `Config.permissionAuditPath`
+    // (src/config/config.ts) — one audit file for every approval decision on
+    // this host, so there is a single place to look rather than two. Read from
+    // the environment here rather than imported, to keep this module free of a
+    // dependency on config loading, which runs long before a workspace build.
+    auditPath: opts.auditPath ?? (process.env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(root, ".permission-audit.jsonl")),
+    modeFilePath: join(root, VETO_MODE_BASENAME),
+    failOpenStatePath: join(root, VETO_FAIL_OPEN_STATE_BASENAME),
+  }, opts.vetoEnabled ?? true);
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
@@ -898,7 +932,7 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeClaudeMcpJson(dir, spec, mcpUrl);
+  if (provider === "claude") writePreLaunchClaudeFiles(dir, spec, mcpUrl);
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
