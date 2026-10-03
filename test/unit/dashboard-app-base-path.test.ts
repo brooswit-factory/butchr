@@ -18,7 +18,7 @@ import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 const unused = () => { throw new Error("unused in this test"); };
 const noAdmissionView = { cap: 0, residency: null, sentinels: null, sources: [] };
 const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
-const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
+const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } });
 const deps = {
   state: unused, open: unused, openPane: unused,
   health: () => ({ ok: true, components: [] }),

@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveAssetPath, resolveWebRoot, serveStaticAsset } from "../../src/web/static-assets.js";
+import { resolveAssetPath, resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "../../src/web/static-assets.js";
 
 // FACTORY-613 (replays FACTORY-432 / PR #546): a real built-app shape
 // (index.html + a hashed asset under assets/), same layout
@@ -70,5 +70,29 @@ describe("resolveWebRoot", () => {
     } finally {
       rmSync(empty, { recursive: true, force: true });
     }
+  });
+});
+
+describe("FACTORY-647: dashboardAppStatus", () => {
+  test("built: true when index.html exists at root", () => {
+    expect(dashboardAppStatus(root)).toEqual({ built: true, path: join(root, "index.html") });
+  });
+  test("built: false when root has no index.html (never built, or wrong root)", () => {
+    const empty = mkdtempSync(join(tmpdir(), "butchr-unbuilt-"));
+    try {
+      expect(dashboardAppStatus(empty)).toEqual({ built: false, path: join(empty, "index.html") });
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("FACTORY-647: dashboardAppMissingResponse", () => {
+  test("503s with a body naming the missing path and the remedy, never a blank error", async () => {
+    const res = dashboardAppMissingResponse("/some/dist/web/index.html");
+    expect(res.status).toBe(503);
+    const body = await res.text();
+    expect(body).toContain("/some/dist/web/index.html");
+    expect(body).toContain("bun run build:web");
   });
 });

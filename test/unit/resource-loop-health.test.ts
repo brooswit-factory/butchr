@@ -60,4 +60,17 @@ describe("resource loop health", () => {
     expect("managedSessionEscalations" in combineHealth([poll])).toBe(false);
     poll.stop();
   });
+
+  test("FACTORY-647: dashboardApp rides beside the liveness components, absent when not passed, and never flips ok", () => {
+    let t = 0;
+    const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    t = 5_000; poll.recordSuccess();
+    const dashboardApp = { built: false, path: "/some/dist/web/index.html" };
+
+    const withDashboardApp = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardApp);
+    expect(withDashboardApp.dashboardApp).toEqual(dashboardApp);
+    expect(withDashboardApp.ok).toBe(true); // a missing web build is a deploy gap, never a liveness failure
+    expect("dashboardApp" in combineHealth([poll])).toBe(false);
+    poll.stop();
+  });
 });

@@ -2,6 +2,8 @@ import { execFileSync } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { currentSystemdInfo, type SystemdInfo } from "./ground-truth.js";
+import { commitsSince, latestVTag } from "../../scripts/release/git.js";
+import { fmt } from "../../scripts/release/semver.js";
 import pkg from "../../package.json" with { type: "json" };
 
 /**
@@ -101,14 +103,82 @@ export function realGitAtStart(dir: string): GitAtStart {
   return { sha, dirty };
 }
 
+/**
+ * FACTORY-627: where a running daemon's REPORTED version comes from.
+ * `package.json`'s own `version` field is frozen forever under the
+ * tag-based release design this replaces (FACTORY-627's `release.yml`
+ * never writes it) — reading it directly, as this module used to, means
+ * `/health` and the dashboard report a number that stops moving the moment
+ * the first tag-based release ships. "tag" is the live answer: the latest
+ * reachable `v*` tag, plus how many commits past it this build is.
+ * "package-json" is the fallback for when that can't be determined at all
+ * (no git, no tag, a shallow clone) — never a silent reuse of the stale
+ * number as if it were current; `unknownReason` on the `VersionResult`
+ * always says why.
+ */
+export type VersionProvenance = "tag" | "package-json";
+
+export interface VersionResult {
+  version: string;
+  provenance: VersionProvenance;
+  /** Set iff `provenance` is "package-json" — WHY no tag-derived version was used. Never silently blank. */
+  unknownReason: string | null;
+}
+
+/** One git-at-start version-resolution attempt's result, or why it failed. Kept as data so `resolveVersion` can stay pure over an injected function, same shape discipline as `GitAtStart`/`resolveSha` above. */
+export type GitVersionAtStart = { tag: string; version: string; distance: number } | { error: string };
+
+/**
+ * PURE given `pkgVersion` and an injected `gitVersionAtStart`. Unlike `sha`,
+ * there is no "baked at build time" path for version: FACTORY-627's release
+ * tags are created AFTER a build normally exists, so a value baked into
+ * `dist/` at build time would itself go stale the moment a later tag lands —
+ * the git-at-start read (done once, frozen for the process's lifetime, same
+ * as `sha`) is the only source that can ever be current, and "no tag
+ * reachable" (or "no git at all", e.g. an npm-installed `dist/` with no
+ * `.git` nearby) is handled by this same function's fallback, not a second
+ * baked value.
+ */
+export function resolveVersion(pkgVersion: string, gitVersionAtStart: () => GitVersionAtStart): VersionResult {
+  const g = gitVersionAtStart();
+  if ("error" in g) return { version: pkgVersion, provenance: "package-json", unknownReason: g.error };
+  const version = g.distance === 0 ? g.version : `${g.version}+${g.distance}`;
+  return { version, provenance: "tag", unknownReason: null };
+}
+
+/**
+ * The real (impure) git-at-start version reader — `dir` must be this SOURCE
+ * FILE'S OWN resolved location (`MODULE_DIR`), same rule `realGitAtStart`
+ * follows and for the same reason: never `process.cwd()`, which a systemd
+ * unit's `WorkingDirectory=` can point anywhere.
+ */
+export function realGitVersionAtStart(dir: string): GitVersionAtStart {
+  let tag: ReturnType<typeof latestVTag>;
+  try {
+    tag = latestVTag(dir, "HEAD");
+  } catch (e) {
+    return { error: `could not resolve a "v*" tag above ${dir}: ${(e as Error).message.split("\n")[0]}` };
+  }
+  if (!tag) return { error: `no "v*" tag (exactly vX.Y.Z) reachable from HEAD above ${dir}` };
+  let distance: number;
+  try {
+    distance = commitsSince(dir, tag.tag, "HEAD");
+  } catch (e) {
+    return { error: `could not count commits since ${tag.tag} above ${dir}: ${(e as Error).message.split("\n")[0]}` };
+  }
+  return { tag: tag.tag, version: fmt(tag.version), distance };
+}
+
 /** Everything a running daemon knows about its own build, captured once (see `buildIdentity`). */
 export interface BuildIdentity {
   sha: string | null;
   shaProvenance: ShaProvenance | null;
   shaDirty: boolean | null;
   shaUnknownReason: string | null;
-  /** From `package.json` at THIS SOURCE FILE'S own resolved location — a real ES import, resolved (and for the bundled path, inlined) relative to the file itself, never `process.cwd()`. */
+  /** The latest reachable `v*` git tag plus commits past it (`X.Y.Z` or `X.Y.Z+N`), falling back to `package.json`'s frozen number — see `VersionResult`'s own doc comment for why. */
   version: string;
+  versionProvenance: VersionProvenance;
+  versionUnknownReason: string | null;
   /** ISO timestamp, captured once at this module's first import (very early in daemon startup) — uptime is derived from this, never tracked separately. */
   startedAt: string;
   pid: number;
@@ -120,12 +190,16 @@ const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 function computeBuildIdentity(): BuildIdentity {
   // Literal `process.env.BUTCHR_BUILD_*` member expressions, on purpose — see resolveSha's doc comment.
   const sha = resolveSha(process.env.BUTCHR_BUILD_SHA, process.env.BUTCHR_BUILD_DIRTY, () => realGitAtStart(MODULE_DIR));
+  const pkgVersion = typeof pkg.version === "string" ? pkg.version : "unknown";
+  const ver = resolveVersion(pkgVersion, () => realGitVersionAtStart(MODULE_DIR));
   return {
     sha: sha.sha,
     shaProvenance: sha.provenance,
     shaDirty: sha.dirty,
     shaUnknownReason: sha.unknownReason,
-    version: typeof pkg.version === "string" ? pkg.version : "unknown",
+    version: ver.version,
+    versionProvenance: ver.provenance,
+    versionUnknownReason: ver.unknownReason,
     startedAt: new Date().toISOString(),
     pid: process.pid,
     systemd: currentSystemdInfo(),
@@ -148,6 +222,8 @@ export interface BuildReport {
   shaDirty: boolean | null;
   shaUnknownReason: string | null;
   version: string;
+  versionProvenance: VersionProvenance;
+  versionUnknownReason: string | null;
   startedAt: string;
   pid: number;
   unit: string;
@@ -161,6 +237,8 @@ export function toBuildReport(b: BuildIdentity): BuildReport {
     shaDirty: b.shaDirty,
     shaUnknownReason: b.shaUnknownReason,
     version: b.version,
+    versionProvenance: b.versionProvenance,
+    versionUnknownReason: b.versionUnknownReason,
     startedAt: b.startedAt,
     pid: b.pid,
     unit: b.systemd.kind === "none" ? "(none)" : b.systemd.unit,
@@ -183,5 +261,6 @@ export function describeBuild(b: BuildReport): string {
   const sha = b.sha
     ? `${b.sha.slice(0, 8)} (${b.shaProvenance}${b.shaDirty === true ? ", dirty" : b.shaDirty === false ? ", clean" : ""})`
     : `unknown (${b.shaUnknownReason ?? "no reason recorded"})`;
-  return `build ${sha} version=${b.version} pid=${b.pid} unit=${b.unit}`;
+  const version = b.versionProvenance === "tag" ? b.version : `${b.version} (package.json fallback: ${b.versionUnknownReason ?? "no reason recorded"})`;
+  return `build ${sha} version=${version} pid=${b.pid} unit=${b.unit}`;
 }

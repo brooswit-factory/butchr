@@ -100,6 +100,30 @@ export const MANAGED_ESCALATION_DEFAULTS = {
   tier3Minutes: 20,
 } as const;
 
+/**
+ * FACTORY-630: the ops-alert route's own routing defaults, kept HERE
+ * alongside `MANAGED_ESCALATION_DEFAULTS` and for the same reason — this
+ * module is dependency-free, so both `src/config/config.ts` (the env parser,
+ * which must apply these exact values as defaults) and any caller that falls
+ * back without a parsed config read ONE literal rather than two copies that
+ * could drift. Deliberately a SEPARATE constant from
+ * `MANAGED_ESCALATION_DEFAULTS` rather than more fields on it: an ops alert
+ * is a different condition class with a different audience, and collapsing
+ * them would make a future change to either one silently change the other.
+ *
+ * `room` is `#team-admin`, the director's own choice on FACTORY-630. The
+ * manager account can POST to that room but cannot READ it, which is why the
+ * composed post has to be useful entirely on its own — see
+ * `src/agents/ops-alert.ts`'s `OpsAlert`. `mention` is `@director` because
+ * every condition on this route is, by construction, one that no agent can
+ * fix or even acknowledge. `dedupMinutes` is the director's own 60.
+ */
+export const OPS_ALERT_DEFAULTS = {
+  room: "team-admin",
+  mention: "@director",
+  dedupMinutes: 60,
+} as const;
+
 export type ManagedEscalationRouting = {
   normalMention: string;
   normalRoom: string;

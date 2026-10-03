@@ -12,7 +12,7 @@ import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } 
 import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
-import { resolveWebRoot, serveStaticAsset } from "./static-assets.js";
+import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -34,6 +34,15 @@ export interface ViewDeps {
   openPane: (pane: string) => Promise<{ ok: boolean; error?: string }>;
   /** Current liveness snapshot (see src/daemon/health.ts) — `ok` stays a top-level field so existing callers still find it. */
   health: () => HealthStatus;
+  /**
+   * FACTORY-647: where `GET /dashboard-app*` looks for the built web app —
+   * optional, defaulting to `resolveWebRoot()` (the real production
+   * resolution, src/web/static-assets.ts). Exists so a test can point this
+   * at a temp-dir fixture through the REAL route code (`liveView`/`buildApp`)
+   * instead of a hand-rolled handler, never used by production wiring,
+   * which gets the default.
+   */
+  dashboardAppRoot?: string;
   /**
    * BUTCHR-269: one row per agent, five fields, per-row freshness — see
    * src/agents/dashboard.ts for the shape and the "could not check" contract.
@@ -205,8 +214,16 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // src/web/static-assets.ts. Plumbing only — nothing above links here
     // yet, and no page currently served by `/` or `/configurations` changes
     // behavior because of this route existing.
-    .get("/dashboard-app", () => serveStaticAsset(resolveWebRoot(), "/"))
-    .get("/dashboard-app/*", ({ params }) => serveStaticAsset(resolveWebRoot(), "/" + (params["*"] ?? "")))
+    .get("/dashboard-app", () => {
+      const root = deps.dashboardAppRoot ?? resolveWebRoot();
+      const status = dashboardAppStatus(root);
+      return status.built ? serveStaticAsset(root, "/") : dashboardAppMissingResponse(status.path);
+    })
+    .get("/dashboard-app/*", ({ params }) => {
+      const root = deps.dashboardAppRoot ?? resolveWebRoot();
+      const status = dashboardAppStatus(root);
+      return status.built ? serveStaticAsset(root, "/" + (params["*"] ?? "")) : dashboardAppMissingResponse(status.path);
+    })
     // 503 (not just a false `ok`) when unhealthy, so a `curl -f` or any dumb
     // uptime checker goes red too — an endpoint nobody curls doesn't satisfy
     // "loud" (BUTCHR-18/BUTCHR-6).

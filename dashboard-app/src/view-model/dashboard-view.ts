@@ -32,6 +32,10 @@ export interface DashboardBuildInfo {
   shaDirty: boolean | null;
   shaUnknownReason: string | null;
   version: string;
+  /** FACTORY-627: "tag" (the live, latest-v*-tag-derived number) vs "package-json" (the frozen fallback) — see `VersionResult` (src/agents/build-identity.ts) for why these can differ. */
+  versionProvenance: "tag" | "package-json";
+  /** Set iff `versionProvenance` is "package-json" — WHY no tag-derived version was available. */
+  versionUnknownReason: string | null;
 }
 
 /** Everything the page header needs — PER-DAEMON, never per-row. `currency` absent means this build carries no `currency` sibling on `/health` at all (an older build); present-but-`checkedAt: null` means it has the field but has never computed a verdict yet. */
@@ -250,8 +254,11 @@ export interface BuildHeaderViewModel {
  */
 export function buildHeaderView(header: DashboardHeaderInfo, now: number): BuildHeaderViewModel {
   const build = header.build;
+  const versionText = build
+    ? `${build.version}${build.versionProvenance === "package-json" ? ` (package.json fallback${build.versionUnknownReason ? `: ${build.versionUnknownReason}` : ""})` : ""}`
+    : "";
   const buildText = build?.sha
-    ? `build ${build.sha.slice(0, 8)}${build.shaDirty === true ? " (dirty)" : build.shaDirty === false ? " (clean)" : ""} · version ${build.version}`
+    ? `build ${build.sha.slice(0, 8)}${build.shaDirty === true ? " (dirty)" : build.shaDirty === false ? " (clean)" : ""} · version ${versionText}`
     : `build sha unknown${build?.shaUnknownReason ? ` (${build.shaUnknownReason})` : ""}`;
 
   if (header.currency === undefined) return { buildText, currencyText: null };

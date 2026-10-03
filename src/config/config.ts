@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import type { RestoredResumePolicy } from "../agents/argv.js";
-import { MANAGED_ESCALATION_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
+import { MANAGED_ESCALATION_DEFAULTS, OPS_ALERT_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
 
 /**
  * FACTORY-491 — the epic's own reading of an ambiguous director steer
@@ -137,6 +137,27 @@ export interface Config {
    * the director's default routing values are written down.
    */
   managedEscalationRouting: ManagedEscalationRouting;
+  /**
+   * FACTORY-630: routing for the generic OPS-ALERT path
+   * (`src/agents/ops-alert.ts`) — the push destination for a daemon
+   * condition no agent can fix or even be told about, of which
+   * `credential-dead` (`src/agents/login-expired-alert.ts`) is the first.
+   * ALWAYS present, for the same reason `managedEscalationRouting` above is:
+   * these values are needed for the `[butchr:ops-alert]` journal line
+   * regardless of whether a POSTING credential exists, so there is nothing
+   * to gate. The credential itself is deliberately NOT a new env group —
+   * the ops-alert route reuses `managedEscalationRocketChat`'s one, because
+   * there is no second Nexus grant to ask for, only a second CALLER of the
+   * same poster (`RocketChatPoster` already takes a channel per call).
+   */
+  opsAlert: {
+    /** Defaults to `team-admin` (the director's own choice on FACTORY-630) when BUTCHR_OPS_ALERT_ROOM is unset. */
+    room: string;
+    /** Prepended to every ops-alert post so a human is actually pinged — the whole defect FACTORY-630 closes is a correct alert that reached nobody. Defaults to `@director`, since these conditions are by construction unfixable by any agent. Set BUTCHR_OPS_ALERT_MENTION to a literal `none` to post with no mention at all. */
+    mention: string;
+    /** The dedup window: at most one post per condition per this many minutes (the director's figure is 60). Config, not a literal, so a flapping-credential incident can be tuned without a release. */
+    dedupMinutes: number;
+  };
   /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
@@ -529,6 +550,10 @@ export interface ConfigEnv {
   BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?: string | undefined;
   BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?: string | undefined;
   BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES?: string | undefined;
+  /** FACTORY-630: the ops-alert route's room/mention/dedup window — see `Config.opsAlert`. */
+  BUTCHR_OPS_ALERT_ROOM?: string | undefined;
+  BUTCHR_OPS_ALERT_MENTION?: string | undefined;
+  BUTCHR_OPS_ALERT_DEDUP_MINUTES?: string | undefined;
   BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
@@ -674,6 +699,23 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     tier3Minutes: managedEscalationTier3Minutes,
   };
 
+  // FACTORY-630: the ops-alert route's own routing — see `Config.opsAlert`'s
+  // doc comment for why it is always present and why it deliberately adds no
+  // new credential env group. `OPS_ALERT_DEFAULTS` (src/agents/ops-alert.ts
+  // has the route; the defaults live in escalation-helper.ts alongside
+  // MANAGED_ESCALATION_DEFAULTS) is the single place these literals are
+  // written down, so this parser and any caller that falls back cannot drift.
+  const opsAlertRoom = env.BUTCHR_OPS_ALERT_ROOM?.trim() || OPS_ALERT_DEFAULTS.room;
+  // A literal `none` means "post with no mention", distinct from UNSET
+  // (which takes the default mention): an operator who wants an unpinged
+  // room needs a way to say so that an empty env var cannot express, since
+  // an empty value is indistinguishable from unset after `?.trim() ||`.
+  const opsAlertMentionRaw = env.BUTCHR_OPS_ALERT_MENTION?.trim();
+  const opsAlertMention = opsAlertMentionRaw === undefined || opsAlertMentionRaw === "" ? OPS_ALERT_DEFAULTS.mention : opsAlertMentionRaw === "none" ? "" : opsAlertMentionRaw;
+  const opsAlertDedupMinutes = env.BUTCHR_OPS_ALERT_DEDUP_MINUTES ? Number(env.BUTCHR_OPS_ALERT_DEDUP_MINUTES) : OPS_ALERT_DEFAULTS.dedupMinutes;
+  if (!Number.isFinite(opsAlertDedupMinutes) || opsAlertDedupMinutes <= 0) throw new Error(`BUTCHR_OPS_ALERT_DEDUP_MINUTES is not a positive number: ${env.BUTCHR_OPS_ALERT_DEDUP_MINUTES}`);
+  const opsAlert = { room: opsAlertRoom, mention: opsAlertMention, dedupMinutes: opsAlertDedupMinutes };
+
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
@@ -757,6 +799,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(rocketchat ? { rocketchat } : {}),
     ...(managedEscalationRocketChat ? { managedEscalationRocketChat } : {}),
     managedEscalationRouting,
+    opsAlert,
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
@@ -890,6 +933,7 @@ export const describeConfig = (c: Config): string =>
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
+  `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
   `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +

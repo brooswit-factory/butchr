@@ -18,12 +18,14 @@ import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, join } from "node:path";
+import { hostname } from "node:os";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, cwdAgentResolvers, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
+import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
@@ -39,6 +41,7 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createOpsAlertRouter } from "../agents/ops-alert.js";
 import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
@@ -754,6 +757,12 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+// FACTORY-647: resolved ONCE — the real production resolution
+// (src/web/static-assets.ts), read both by the startup check right below and
+// by `/health`'s `dashboardApp` field (see `health` in `buildApp(...)`
+// below) — never two independent resolutions that could disagree.
+const dashboardAppRoot = resolveWebRoot();
+
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
 const { app, mcp } = buildApp({
   state: async () => {
@@ -785,7 +794,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot)),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -897,6 +906,17 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 // second derivation — so a journal window can be attributed to a BUILD, not
 // only a pid (journald's pid only bounds one daemon generation).
 console.error(`  ${describeBuild(toBuildReport(buildIdentity))}`);
+// FACTORY-647: "fail loudly at startup" — the journal half of this ticket's
+// fix, naming the exact missing path and remedy; `/health`'s `dashboardApp`
+// field (see `health` above) is the OTHER half, for an uptime checker. Never
+// fatal: the old server-rendered pages (`/`, `/configurations`) work fine
+// without this build, so the daemon starts either way.
+{
+  const startupDashboardAppStatus = dashboardAppStatus(dashboardAppRoot);
+  if (!startupDashboardAppStatus.built) {
+    console.error(`  [butchr:dashboard-app] web build missing at ${startupDashboardAppStatus.path} — run \`bun run build:web\` (or \`bun run build\`) and restart; GET /dashboard-app/* will 503 until then`);
+  }
+}
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
@@ -1940,7 +1960,26 @@ blockingEscalationTimer.unref?.();
 // host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
 // the full design and why its delivery (a journal line + a `/health` sibling
 // field, both below) survives a dead Claude credential.
-const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+// FACTORY-630: the PUSH destination for this alert, and for every later ops
+// condition that reuses the route. Built on the SAME `teamAdminNotify`
+// closure the managed-session escalator is wired behind above — one poster,
+// one credential, a second room per call, no second Rocket.Chat client. When
+// that credential is absent, `post` is undefined and the router degrades to
+// its own journal line, leaving this alert exactly as it behaved before this
+// ticket (the journal line and `/health` below are untouched by it).
+const opsAlertRouter = createOpsAlertRouter({
+  ...(teamAdminNotify ? { post: teamAdminNotify } : {}),
+  room: config.opsAlert.room,
+  mention: config.opsAlert.mention,
+  host: hostname(),
+  now: () => Date.now(),
+  log: (line) => console.log(line),
+  dedupWindowMs: config.opsAlert.dedupMinutes * 60_000,
+});
+if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
+else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
+
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now(), opsAlert: opsAlertRouter });
 const loginExpiredWatcher = createLoginExpiredWatcher({
   onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
   onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),

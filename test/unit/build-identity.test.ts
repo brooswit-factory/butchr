@@ -3,7 +3,11 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildIdentity, describeBuild, realGitAtStart, resolveSha, toBuildReport, type GitAtStart } from "../../src/agents/build-identity.js";
+import {
+  buildIdentity, describeBuild, realGitAtStart, realGitVersionAtStart, resolveSha, resolveVersion, toBuildReport,
+  type GitAtStart, type GitVersionAtStart,
+} from "../../src/agents/build-identity.js";
+import { latestVTag } from "../../scripts/release/git.js";
 import pkg from "../../package.json" with { type: "json" };
 
 describe("resolveSha — pure, given an injected gitAtStart", () => {
@@ -35,6 +39,104 @@ describe("resolveSha — pure, given an injected gitAtStart", () => {
   test("nothing baked, git-at-start fails: an honest unknown carrying the real reason — never a guessed sha", () => {
     const result = resolveSha(undefined, undefined, () => ({ error: "no readable git repository above /some/dir" }));
     expect(result).toEqual({ sha: null, provenance: null, dirty: null, unknownReason: "no readable git repository above /some/dir" });
+  });
+});
+
+describe("resolveVersion — pure, given an injected gitVersionAtStart (FACTORY-627)", () => {
+  test("git-at-start succeeds, HEAD exactly at the tag: version is X.Y.Z, provenance tag", () => {
+    const r = resolveVersion("0.15.5", (): GitVersionAtStart => ({ tag: "v1.2.3", version: "1.2.3", distance: 0 }));
+    expect(r).toEqual({ version: "1.2.3", provenance: "tag", unknownReason: null });
+  });
+
+  test("git-at-start succeeds, HEAD N commits past the tag: version is X.Y.Z+N", () => {
+    const r = resolveVersion("0.15.5", (): GitVersionAtStart => ({ tag: "v1.2.3", version: "1.2.3", distance: 3 }));
+    expect(r).toEqual({ version: "1.2.3+3", provenance: "tag", unknownReason: null });
+  });
+
+  test("git-at-start fails (no tag, no git, shallow clone — any reason): falls back to package.json's version with the stated reason, never silently", () => {
+    const r = resolveVersion("0.15.5", (): GitVersionAtStart => ({ error: "no \"v*\" tag reachable" }));
+    expect(r).toEqual({ version: "0.15.5", provenance: "package-json", unknownReason: "no \"v*\" tag reachable" });
+  });
+});
+
+// REAL git, in a real temp repo — not mocked — same discipline as
+// realGitAtStart's own suite below.
+describe("realGitVersionAtStart — real git, real temp repo, no mocking", () => {
+  function initRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-build-version-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+    git("init", "-q");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "test");
+    writeFileSync(join(dir, "f.txt"), "one\n");
+    git("add", "f.txt");
+    git("commit", "-q", "-m", "first");
+    return dir;
+  }
+  const git = (dir: string, ...args: string[]) => execFileSync("git", args, { cwd: dir, encoding: "utf8" });
+  const commit = (dir: string, msg: string) => {
+    writeFileSync(join(dir, "f.txt"), `${msg}\n`);
+    git(dir, "add", "f.txt");
+    git(dir, "commit", "-q", "-m", msg);
+  };
+
+  test("HEAD exactly at the tag: distance 0", () => {
+    const dir = initRepo();
+    try {
+      git(dir, "tag", "v1.0.0");
+      const r = realGitVersionAtStart(dir);
+      expect("tag" in r).toBe(true);
+      if ("tag" in r) { expect(r.tag).toBe("v1.0.0"); expect(r.version).toBe("1.0.0"); expect(r.distance).toBe(0); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("HEAD 3 commits past the tag: distance 3", () => {
+    const dir = initRepo();
+    try {
+      git(dir, "tag", "v1.0.0");
+      commit(dir, "c1"); commit(dir, "c2"); commit(dir, "c3");
+      const r = realGitVersionAtStart(dir);
+      if ("tag" in r) { expect(r.tag).toBe("v1.0.0"); expect(r.distance).toBe(3); }
+      else throw new Error("expected a tag result");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("a lower-semver tag created LATER never wins over a higher one made earlier", () => {
+    const dir = initRepo();
+    try {
+      git(dir, "tag", "v2.0.0"); // higher semver, created first
+      commit(dir, "c1");
+      git(dir, "tag", "v1.5.0"); // lower semver, created second (e.g. a backport tag)
+      const r = realGitVersionAtStart(dir);
+      if ("tag" in r) expect(r.tag).toBe("v2.0.0");
+      else throw new Error("expected a tag result");
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("a non-v tag is ignored entirely", () => {
+    const dir = initRepo();
+    try {
+      git(dir, "tag", "release-2026");
+      const r = realGitVersionAtStart(dir);
+      expect("error" in r).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("no tag at all: an honest error naming the reason, never a guessed version", () => {
+    const dir = initRepo();
+    try {
+      const r = realGitVersionAtStart(dir);
+      expect("error" in r).toBe(true);
+      if ("error" in r) expect(r.error).toMatch(/no "v\*" tag/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("not a git repository at all: an honest error, never a guessed version", () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-build-version-no-git-"));
+    try {
+      const r = realGitVersionAtStart(dir);
+      expect("error" in r).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -156,8 +258,18 @@ describe("buildIdentity — the module-singleton this daemon actually serves", (
     }
   });
 
-  test("version is read from this repo's own package.json, not a hardcoded literal", () => {
-    expect(buildIdentity.version).toBe(pkg.version);
+  test("version either comes from the latest reachable v* tag (this repo has real release tags) or explicitly falls back to package.json with a stated reason — never a silent mismatch", () => {
+    if (buildIdentity.versionProvenance === "tag") {
+      expect(buildIdentity.versionUnknownReason).toBeNull();
+      // Cross-check against the same live git read the module itself used — not a hardcoded tag,
+      // since this repo's own tags move as releases ship.
+      const tag = latestVTag(process.cwd(), "HEAD");
+      expect(tag).not.toBeNull();
+      expect(buildIdentity.version.startsWith(`${tag!.version.major}.${tag!.version.minor}.${tag!.version.patch}`)).toBe(true);
+    } else {
+      expect(buildIdentity.version).toBe(pkg.version);
+      expect(typeof buildIdentity.versionUnknownReason).toBe("string");
+    }
   });
 });
 
@@ -169,6 +281,8 @@ describe("toBuildReport", () => {
       shaDirty: false,
       shaUnknownReason: null,
       version: "1.2.3",
+      versionProvenance: "tag",
+      versionUnknownReason: null,
       startedAt: "2026-01-01T00:00:00.000Z",
       pid: 4242,
       systemd: { kind: "user", unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" },
@@ -179,6 +293,8 @@ describe("toBuildReport", () => {
       shaDirty: false,
       shaUnknownReason: null,
       version: "1.2.3",
+      versionProvenance: "tag",
+      versionUnknownReason: null,
       startedAt: "2026-01-01T00:00:00.000Z",
       pid: 4242,
       unit: "butchr.service",
@@ -197,6 +313,8 @@ describe("toBuildReport", () => {
       shaDirty: false,
       shaUnknownReason: null,
       version: "1.2.3",
+      versionProvenance: "tag",
+      versionUnknownReason: null,
       startedAt: "2026-01-01T00:00:00.000Z",
       pid: 4242,
       systemd: { kind: "windows-task", unit: "Butchr-Native", journalctl: 'Get-Content -Path "C:\\logs\\butchr.log" -Tail 200 -Wait' },
@@ -208,7 +326,8 @@ describe("toBuildReport", () => {
   test("not under systemd: honest (none) unit and an empty journalctl command, never a guess", () => {
     const report = toBuildReport({
       sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no git",
-      version: "1.2.3", startedAt: "2026-01-01T00:00:00.000Z", pid: 1,
+      version: "1.2.3", versionProvenance: "package-json", versionUnknownReason: "no \"v*\" tag",
+      startedAt: "2026-01-01T00:00:00.000Z", pid: 1,
       systemd: { kind: "none" },
     });
     expect(report.unit).toBe("(none)");
@@ -226,7 +345,8 @@ describe("describeBuild (BUTCHR-320 C) — reuses toBuildReport's own fields, ne
   test("a known sha: short sha, provenance, and dirty/clean are all named", () => {
     const line = describeBuild({
       sha: "0fa494297ff6d0d32a8c6e17b69f8bd2889edbf7", shaProvenance: "git-at-start", shaDirty: false, shaUnknownReason: null,
-      version: "0.15.5", startedAt: "2026-01-01T00:00:00.000Z", pid: 641076, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service",
+      version: "0.15.5", versionProvenance: "tag", versionUnknownReason: null,
+      startedAt: "2026-01-01T00:00:00.000Z", pid: 641076, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service",
     });
     expect(line).toBe("build 0fa49429 (git-at-start, clean) version=0.15.5 pid=641076 unit=butchr.service");
   });
@@ -234,7 +354,8 @@ describe("describeBuild (BUTCHR-320 C) — reuses toBuildReport's own fields, ne
   test("a dirty tree is named, not silently omitted", () => {
     const line = describeBuild({
       sha: "a".repeat(40), shaProvenance: "baked", shaDirty: true, shaUnknownReason: null,
-      version: "1.0.0", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
+      version: "1.0.0", versionProvenance: "tag", versionUnknownReason: null,
+      startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
     });
     expect(line).toContain("dirty");
   });
@@ -242,9 +363,19 @@ describe("describeBuild (BUTCHR-320 C) — reuses toBuildReport's own fields, ne
   test("an unknown sha states the reason, never a blank or guessed sha", () => {
     const line = describeBuild({
       sha: null, shaProvenance: null, shaDirty: null, shaUnknownReason: "no readable git repository above /x",
-      version: "1.0.0", startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
+      version: "1.0.0", versionProvenance: "tag", versionUnknownReason: null,
+      startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
     });
     expect(line).toContain("unknown (no readable git repository above /x)");
+  });
+
+  test("a package.json-fallback version states the reason, never silently presented as current", () => {
+    const line = describeBuild({
+      sha: "a".repeat(40), shaProvenance: "baked", shaDirty: false, shaUnknownReason: null,
+      version: "0.15.5", versionProvenance: "package-json", versionUnknownReason: "no \"v*\" tag reachable from HEAD",
+      startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "(none)", journalctl: "",
+    });
+    expect(line).toContain('version=0.15.5 (package.json fallback: no "v*" tag reachable from HEAD)');
   });
 
   test("reuses toBuildReport's OWN output — the same object /health's build field serves — not a second sha derivation", () => {
