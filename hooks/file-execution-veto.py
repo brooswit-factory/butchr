@@ -130,13 +130,43 @@ def _find_delete(content):
     return None
 
 
+_LEADING_SUDO_RE = re.compile(r"^\s*sudo\s+")
+
+
+def _command_verb(segment):
+    """The segment's own invoked command, skipping a leading `sudo`.
+
+    Needed so `mkfs`/`dd` are only flagged when they are the command being
+    RUN, not when they appear as plain text inside a quoted argument to
+    something else (a `grep -E 'mkfs|dd if'` pattern string, for example).
+    """
+    rest = _LEADING_SUDO_RE.sub("", segment.lstrip())
+    m = re.match(r"(\S+)", rest)
+    return m.group(1) if m else ""
+
+
 def _dd_target(content):
-    m = re.search(r"\bdd\b[^;\n]*\bof=(['\"]?)([^\s;'\"]+)\1", content, re.I)
-    if not m:
-        return None
-    target = strip_delimiters(m.group(2))
-    if re.match(r"^/dev/(sd|nvme|hd)", target) or re.match(r"^/(etc|boot)(/|$)", target):
-        return m.group(0)
+    for raw in shell_segments(content):
+        segment = raw.strip()
+        if not segment or _command_verb(segment).lower() != "dd":
+            continue
+        m = re.search(r"\bdd\b[^;\n]*\bof=(['\"]?)([^\s;'\"]+)\1", segment, re.I)
+        if not m:
+            continue
+        target = strip_delimiters(m.group(2))
+        if re.match(r"^/dev/(sd|nvme|hd)", target) or re.match(r"^/(etc|boot)(/|$)", target):
+            return m.group(0)
+    return None
+
+
+def _mkfs_command(content):
+    for raw in shell_segments(content):
+        segment = raw.strip()
+        if not segment:
+            continue
+        verb = _command_verb(segment)
+        if re.match(r"^mkfs(\.\w+)?$", verb, re.I):
+            return segment
     return None
 
 
@@ -146,31 +176,61 @@ SENSITIVE_REDIRECT_RE = re.compile(
     re.I,
 )
 
+# Appends (never an overwrite) to an agent's own memory file: allowed.
+MEMORY_MD_ALLOW_RE = re.compile(r"^(?:~|\$\{?HOME\}?)/\.claude/projects/[^/]+/memory/[^/]+\.md$", re.I)
+# Appends (never an overwrite) to the managed-sessions env file: allowed.
+MANAGED_SESSIONS_ALLOW_RE = re.compile(r"^(?:~|\$\{?HOME\}?)/\.config/butchr-new/managed-sessions\.env$", re.I)
+# A script allowed to append to one specific sensitive path, by its own basename —
+# never a general allowance for that path from any other command.
+SCRIPT_REDIRECT_ALLOWLIST = {
+    "add-rocketr-account.sh": re.compile(r"^(?:~|\$\{?HOME\}?)/\.config/rocketchat/secrets\.env$", re.I),
+}
+
+
+def _sensitive_redirect(content, script_allow_re=None):
+    for m in SENSITIVE_REDIRECT_RE.finditer(content):
+        operator, append_flag, _quote, target_raw = m.group(1), m.group(2), m.group(3), m.group(4)
+        target = strip_delimiters(target_raw)
+        is_append = operator == ">>" or (operator.lower() == "tee" and bool(append_flag))
+        if MEMORY_MD_ALLOW_RE.match(target) and is_append:
+            continue
+        if MANAGED_SESSIONS_ALLOW_RE.match(target) and is_append:
+            continue
+        if script_allow_re and script_allow_re.match(target) and is_append:
+            continue
+        return m.group(0)
+    return None
+
+
 DESTRUCTIVE_CHECKS = (
     ("rm -rf against $HOME/root/wildcard",
-     lambda c: _flagged_command(c, re.compile(r"\brm\b"), ["r", "f"], ["--recursive", "--force"])),
-    ("find on $HOME or / with -delete/-exec rm", _find_delete),
+     lambda c, _a: _flagged_command(c, re.compile(r"\brm\b"), ["r", "f"], ["--recursive", "--force"])),
+    ("find on $HOME or / with -delete/-exec rm", lambda c, _a: _find_delete(c)),
     ("chmod -R on $HOME or /",
-     lambda c: _flagged_command(c, re.compile(r"\bchmod\b"), ["R"], ["--recursive"])),
+     lambda c, _a: _flagged_command(c, re.compile(r"\bchmod\b"), ["R"], ["--recursive"])),
     ("chown -R on $HOME or /",
-     lambda c: _flagged_command(c, re.compile(r"\bchown\b"), ["R"], ["--recursive"])),
-    ("dd targeting a device/system path", _dd_target),
-    ("mkfs", lambda c: (re.search(r"\bmkfs(\.\w+)?\b[^;\n]*", c, re.I) or [None])
-     and (m.group(0) if (m := re.search(r"\bmkfs(\.\w+)?\b[^;\n]*", c, re.I)) else None)),
-    ("redirect/tee onto a sensitive path",
-     lambda c: (m.group(0) if (m := SENSITIVE_REDIRECT_RE.search(c)) else None)),
+     lambda c, _a: _flagged_command(c, re.compile(r"\bchown\b"), ["R"], ["--recursive"])),
+    ("dd targeting a device/system path", lambda c, _a: _dd_target(c)),
+    ("mkfs", lambda c, _a: _mkfs_command(c)),
+    ("redirect/tee onto a sensitive path", _sensitive_redirect),
     ("curl/wget piped into a shell",
-     lambda c: (m.group(0) if (m := re.search(
+     lambda c, _a: (m.group(0) if (m := re.search(
          r"\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(sh|bash|zsh)\b", c, re.I)) else None)),
-    ("fork bomb", lambda c: ":(){ ... }" if re.search(r":\s*\(\s*\)\s*\{", c) else None),
+    ("fork bomb", lambda c, _a: ":(){ ... }" if re.search(r":\s*\(\s*\)\s*\{", c) else None),
 )
 
 
-def match_destructive(content):
-    """First destructive pattern in `content`, as (name, excerpt), or None."""
+def match_destructive(content, context_path=None):
+    """First destructive pattern in `content`, as (name, excerpt), or None.
+
+    `context_path` is the resolved file this content came from, if any — it is
+    what lets a narrowly-scoped allowance (see `SCRIPT_REDIRECT_ALLOWLIST`)
+    key off the script's own basename rather than the command text.
+    """
     text = normalize(content)
+    script_allow_re = SCRIPT_REDIRECT_ALLOWLIST.get(os.path.basename(context_path)) if context_path else None
     for name, check in DESTRUCTIVE_CHECKS:
-        hit = check(text)
+        hit = check(text, script_allow_re)
         if hit:
             return name, str(hit)[:200]
     return None
@@ -340,7 +400,7 @@ def decide(command, cwd):
             # blocks, per the ticket: something is being executed and we are
             # structurally unable to look at it.
             return Verdict(True, "file exists but cannot be read: %s (%s)" % (path, e), "unreadable-file", path)
-        hit = match_destructive(content)
+        hit = match_destructive(content, context_path=path)
         if hit:
             return Verdict(True, "%s matches %s: %r" % (path, hit[0], hit[1]), hit[0], path)
     return Verdict(False)
@@ -371,7 +431,9 @@ def audit(path, record):
     if not path:
         return
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
     except OSError:
