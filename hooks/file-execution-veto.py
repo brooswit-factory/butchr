@@ -130,28 +130,49 @@ def _find_delete(content):
     return None
 
 
-_LEADING_SUDO_RE = re.compile(r"^\s*sudo\s+")
+def _quoted_spans(text):
+    """[start, end) ranges covered by a '...' or "..." literal, best-effort.
 
-
-def _command_verb(segment):
-    """The segment's own invoked command, skipping a leading `sudo`.
-
-    Needed so `mkfs`/`dd` are only flagged when they are the command being
-    RUN, not when they appear as plain text inside a quoted argument to
-    something else (a `grep -E 'mkfs|dd if'` pattern string, for example).
+    Not a shell parser (no nesting, `\\"` is only honoured inside double
+    quotes) — a cheap shape test, same spirit as `looks_like_path` below.
+    Good enough to tell "this text is a quoted argument" from "this text is
+    the command being run", which is all the callers below need it for.
     """
-    rest = _LEADING_SUDO_RE.sub("", segment.lstrip())
-    m = re.match(r"(\S+)", rest)
-    return m.group(1) if m else ""
+    spans = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n and text[j] != ch:
+                if ch == '"' and text[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                j += 1
+            spans.append((i, min(j, n)))
+            i = j + 1
+        else:
+            i += 1
+    return spans
+
+
+def _inside_quotes(pos, spans):
+    return any(start <= pos < end for start, end in spans)
 
 
 def _dd_target(content):
-    for raw in shell_segments(content):
-        segment = raw.strip()
-        if not segment or _command_verb(segment).lower() != "dd":
-            continue
-        m = re.search(r"\bdd\b[^;\n]*\bof=(['\"]?)([^\s;'\"]+)\1", segment, re.I)
-        if not m:
+    """`dd ... of=<dangerous-path>`, wherever `dd` is actually being run.
+
+    A plain substring search (not anchored to a verb, a segment start, or
+    any particular wrapper) so `sudo -n dd ...`, `nice dd ...`, `env X=1 dd
+    ...`, `/bin/dd ...`, `xargs dd ...`, `ls | dd of=...`, `(dd ...)` and
+    `if true; then dd ...; fi` all still match exactly as before. The ONLY
+    thing excluded is a match that falls inside a quoted string literal —
+    text handed to grep/rg/echo/etc as DATA, never a `dd` invocation.
+    """
+    spans = _quoted_spans(content)
+    for m in re.finditer(r"\bdd\b[^;\n]*\bof=(['\"]?)([^\s;'\"]+)\1", content, re.I):
+        if _inside_quotes(m.start(), spans):
             continue
         target = strip_delimiters(m.group(2))
         if re.match(r"^/dev/(sd|nvme|hd)", target) or re.match(r"^/(etc|boot)(/|$)", target):
@@ -160,13 +181,12 @@ def _dd_target(content):
 
 
 def _mkfs_command(content):
-    for raw in shell_segments(content):
-        segment = raw.strip()
-        if not segment:
+    """Same substring search as `_dd_target`, same quoted-literal exclusion."""
+    spans = _quoted_spans(content)
+    for m in re.finditer(r"\bmkfs(\.\w+)?\b[^;\n]*", content, re.I):
+        if _inside_quotes(m.start(), spans):
             continue
-        verb = _command_verb(segment)
-        if re.match(r"^mkfs(\.\w+)?$", verb, re.I):
-            return segment
+        return m.group(0)
     return None
 
 

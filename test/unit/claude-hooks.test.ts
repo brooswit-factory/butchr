@@ -468,6 +468,26 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker — FACTORY-65
       expect(check("mkfs.ext4 /dev/sda1", { cwd: dir, mode, home }).code).toBe(2);
       expect(check("dd if=/dev/zero of=/dev/sda", { cwd: dir, mode, home }).code).toBe(2);
     });
+
+    // Manager review on PR #638: the first fix anchored "command position" to
+    // a segment's own leading verb, which silently un-blocked every one of
+    // these real `dd`/`mkfs` invocations that don't start a segment. The
+    // allowance must come from "this text is a quoted argument", not from
+    // "this text is the FIRST word" — these all still block.
+    test.each([
+      "sudo -n dd if=/dev/zero of=/dev/sda",
+      "nice dd if=/dev/zero of=/dev/sda",
+      "env X=1 dd if=/dev/zero of=/dev/sda",
+      "/bin/dd if=/dev/zero of=/dev/sda",
+      "/sbin/mkfs.ext4 /dev/sda1",
+      "xargs dd if=/dev/zero of=/dev/sda",
+      "ls | dd of=/dev/sda",
+      "(dd if=/dev/zero of=/dev/sda)",
+      "if true; then dd if=/dev/zero of=/dev/sda; fi",
+    ])("negative: %p (a wrapper/pipe/subshell form) still blocks", (cmd) => {
+      const { dir, home, mode } = setup();
+      expect(check(cmd, { cwd: dir, mode, home }).code).toBe(2);
+    });
   });
 
   describe("group 2 — appends to an agent's own ~/.claude/projects/*/memory/*.md", () => {
