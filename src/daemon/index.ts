@@ -109,6 +109,7 @@ import { createAccountLifecycle } from "../agents/account-lifecycle.js";
 import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
+import { runRulesCli } from "../cli/rules-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
 import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
 import { createRoutingLinkStore } from "../resources/link-store-router.js";
@@ -131,6 +132,15 @@ if (process.argv[2] === "link") {
 // store), so this must run with no Jira credentials and no rules file.
 if (process.argv[2] === "session") {
   process.exit(await runSessionCli(process.argv.slice(3)));
+}
+
+// FACTORY-621: `butchr rules check [file]` — validates a rules file and
+// dry-runs its jira-work/jira-idea queries, read-only. Same precedent as
+// `link`/`session` immediately above: intercepted before config/rules
+// loading so a syntactically-broken rules file can be diagnosed with this
+// command even though it would make the daemon itself refuse to start.
+if (process.argv[2] === "rules") {
+  process.exit(await runRulesCli(process.argv.slice(3)));
 }
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
@@ -179,7 +189,7 @@ try {
   rules = loaded.rules;
   if (loaded.origin === "missing") missingRulesPath = loaded.path;
   const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
-  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
+  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
   else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
