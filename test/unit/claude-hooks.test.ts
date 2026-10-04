@@ -463,6 +463,32 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker — FACTORY-65
       expect(check(`cd ${dir} && bash sweep.sh | grep -E 'NEEDS HUMAN|Do you want'; echo done`, { cwd: dir, mode, home }).code).toBe(0);
     });
 
+    // Manager review round 3 on PR #638: the REAL sweep.sh's only match is
+    // not a direct grep argument — it's a variable assignment whose value is
+    // later used in a grep, same incident shape, different fixture.
+    test("a plain variable assignment holding the pattern string is allowed, by itself and in the real script", () => {
+      const { dir, home, mode } = setup();
+      const assign =
+        "DANGER='usage limit|usage credit|credits|rm |rm -|delete|drop |force|--hard|password|passwd|secret|token|credential|api[_-]?key|\\.ssh|\\.env|sudo|kill |chmod|chown|mkfs|dd if'";
+      expect(check(assign, { cwd: dir, mode, home }).code).toBe(0);
+
+      const sweep = fixture(
+        dir,
+        "sweep-assign.sh",
+        "#!/bin/bash\n" +
+          "set -e\n" +
+          assign +
+          "\n" +
+          'herdr pane read w8S:p1 2>&1 | tail -25 | grep -niE "$DANGER"\n',
+      );
+      expect(check(`bash ${sweep}`, { cwd: dir, mode, home }).code).toBe(0);
+    });
+
+    test("negative: a real dd after a harmless assignment on the same line still blocks", () => {
+      const { dir, home, mode } = setup();
+      expect(check("DANGER='x'; dd if=/dev/zero of=/dev/sda", { cwd: dir, mode, home }).code).toBe(2);
+    });
+
     test("negative: mkfs and dd-if AT COMMAND POSITION still block", () => {
       const { dir, home, mode } = setup();
       expect(check("mkfs.ext4 /dev/sda1", { cwd: dir, mode, home }).code).toBe(2);

@@ -143,9 +143,22 @@ _DATA_ARG_RE = re.compile(
     re.I,
 )
 
+# A quoted string on the right of a plain shell variable assignment is DATA
+# too — `DANGER='...|mkfs|...|dd if'` never runs mkfs/dd, it just stores
+# text a later `grep -E "$DANGER"` would use. Anchored to a segment start
+# (optionally after export/local/readonly) so this can't fire mid-line —
+# `DANGER='x'; dd if=/dev/zero of=/dev/sda` still has the real `dd` sitting
+# OUTSIDE the assignment's own span.
+_ASSIGN_RE = re.compile(
+    r"(?:^|[;&|]|\n)\s*(?:(?:export|local|readonly)\s+)?[A-Za-z_][A-Za-z0-9_]*=(['\"])((?:\\.|(?!\1).)*)\1",
+    re.M,
+)
+
 
 def _data_argument_spans(text):
-    return [(m.start(2), m.end(2)) for m in _DATA_ARG_RE.finditer(text)]
+    return [(m.start(2), m.end(2)) for m in _DATA_ARG_RE.finditer(text)] + [
+        (m.start(2), m.end(2)) for m in _ASSIGN_RE.finditer(text)
+    ]
 
 
 def _inside_data_argument(pos, spans):
