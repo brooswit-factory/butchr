@@ -130,33 +130,25 @@ def _find_delete(content):
     return None
 
 
-def _quoted_spans(text):
-    """[start, end) ranges covered by a '...' or "..." literal, best-effort.
-
-    Not a shell parser (no nesting, `\\"` is only honoured inside double
-    quotes) — a cheap shape test, same spirit as `looks_like_path` below.
-    Good enough to tell "this text is a quoted argument" from "this text is
-    the command being run", which is all the callers below need it for.
-    """
-    spans = []
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch in ("'", '"'):
-            j = i + 1
-            while j < n and text[j] != ch:
-                if ch == '"' and text[j] == "\\" and j + 1 < n:
-                    j += 2
-                    continue
-                j += 1
-            spans.append((i, min(j, n)))
-            i = j + 1
-        else:
-            i += 1
-    return spans
+# A quoted argument to one of these is DATA (a pattern/string), never a
+# command being run — unlike `eval "dd ..."` or `ssh host "dd ..."`, where
+# the quoted text genuinely is executed. Scoping the allowance to exactly
+# these verbs (rather than "inside any quotes") is deliberate: an unbalanced
+# quote earlier in the line (`it's dd if=... of=/dev/sda`) must never swallow
+# a real invocation into a false "this is quoted data" span, and `eval`/`ssh`
+# must still block — only a *fully-closed* quote right after one of these
+# verbs counts as data.
+_DATA_ARG_RE = re.compile(
+    r"\b(?:grep|egrep|fgrep|rg|echo)\b[^'\"\n;]*(['\"])((?:\\.|(?!\1).)*)\1",
+    re.I,
+)
 
 
-def _inside_quotes(pos, spans):
+def _data_argument_spans(text):
+    return [(m.start(2), m.end(2)) for m in _DATA_ARG_RE.finditer(text)]
+
+
+def _inside_data_argument(pos, spans):
     return any(start <= pos < end for start, end in spans)
 
 
@@ -165,14 +157,15 @@ def _dd_target(content):
 
     A plain substring search (not anchored to a verb, a segment start, or
     any particular wrapper) so `sudo -n dd ...`, `nice dd ...`, `env X=1 dd
-    ...`, `/bin/dd ...`, `xargs dd ...`, `ls | dd of=...`, `(dd ...)` and
-    `if true; then dd ...; fi` all still match exactly as before. The ONLY
-    thing excluded is a match that falls inside a quoted string literal —
-    text handed to grep/rg/echo/etc as DATA, never a `dd` invocation.
+    ...`, `/bin/dd ...`, `xargs dd ...`, `ls | dd of=...`, `(dd ...)`,
+    `if true; then dd ...; fi`, `eval "dd ..."` and `ssh host "dd ..."` all
+    still match exactly as before. The ONLY thing excluded is a match that
+    falls inside a quoted argument to grep/rg/echo — pattern-string DATA,
+    never a `dd` invocation.
     """
-    spans = _quoted_spans(content)
+    spans = _data_argument_spans(content)
     for m in re.finditer(r"\bdd\b[^;\n]*\bof=(['\"]?)([^\s;'\"]+)\1", content, re.I):
-        if _inside_quotes(m.start(), spans):
+        if _inside_data_argument(m.start(), spans):
             continue
         target = strip_delimiters(m.group(2))
         if re.match(r"^/dev/(sd|nvme|hd)", target) or re.match(r"^/(etc|boot)(/|$)", target):
@@ -181,10 +174,10 @@ def _dd_target(content):
 
 
 def _mkfs_command(content):
-    """Same substring search as `_dd_target`, same quoted-literal exclusion."""
-    spans = _quoted_spans(content)
+    """Same substring search as `_dd_target`, same data-argument exclusion."""
+    spans = _data_argument_spans(content)
     for m in re.finditer(r"\bmkfs(\.\w+)?\b[^;\n]*", content, re.I):
-        if _inside_quotes(m.start(), spans):
+        if _inside_data_argument(m.start(), spans):
             continue
         return m.group(0)
     return None

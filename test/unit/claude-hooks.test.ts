@@ -488,6 +488,21 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker — FACTORY-65
       const { dir, home, mode } = setup();
       expect(check(cmd, { cwd: dir, mode, home }).code).toBe(2);
     });
+
+    // Manager review round 2 on PR #638: the allowance must be scoped to a
+    // quoted argument of grep/rg/echo specifically (pattern-string DATA),
+    // never "inside any quotes" — an unterminated quote must never swallow
+    // a real invocation into a false "this is data" span, and a quoted
+    // string handed to something that actually EXECUTES it (eval, ssh)
+    // must still block.
+    test.each([
+      "it's dd if=/dev/zero of=/dev/sda",
+      'eval "dd if=/dev/zero of=/dev/sda"',
+      'ssh h "dd if=/dev/zero of=/dev/sda"',
+    ])("negative: %p (unterminated quote / eval / ssh) still blocks", (cmd) => {
+      const { dir, home, mode } = setup();
+      expect(check(cmd, { cwd: dir, mode, home }).code).toBe(2);
+    });
   });
 
   describe("group 2 — appends to an agent's own ~/.claude/projects/*/memory/*.md", () => {
