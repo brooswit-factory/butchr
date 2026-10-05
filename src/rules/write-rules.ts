@@ -377,6 +377,17 @@ export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io
 }
 
 /**
+ * The exact shape `uniqueBackupId` ever produces: the plain `utcStamp`
+ * (`YYYYMMDDTHHMMSSZ`), optionally followed by a `-N` same-second-collision
+ * suffix. Anchored on both ends — `restoreBackup` refuses anything else
+ * BEFORE building a path from it, since `backupId` is attacker-reachable
+ * (FACTORY-662's planned `POST /api/undo/:backupId`): a bare `/`, `\`, `..`,
+ * a NUL byte, an absolute path, or simply an overly long string must never
+ * reach `join()`.
+ */
+const BACKUP_ID_RE = /^\d{8}T\d{6}Z(?:-\d{1,6})?$/;
+
+/**
  * Restores the rules file to a previous backup's content, through the exact
  * same validated/atomic path as `writeRulesFile` (itself, in fact — this is
  * a thin wrapper, not a second write path): reads `<path>.bak-<backupId>`
@@ -386,15 +397,31 @@ export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io
  * it's restoring FROM, even within the same second), is written atomically,
  * and takes the same write lock, same as any other write. The restored
  * file's bytes are therefore byte-identical to the backup's own bytes
- * (`writeRulesFile` writes `text` verbatim). Exists for an UI "Undo" on a
- * change just made. Throws a clear error if the named backup does not
- * exist.
+ * (`writeRulesFile` writes `text` verbatim).
+ *
+ * `backupId` is validated against `BACKUP_ID_RE` BEFORE any path is built
+ * from it (review round 2 finding — `backupId` is planned to arrive straight
+ * from an HTTP path segment, `POST /api/undo/:backupId`, FACTORY-662), the
+ * resulting path's own directory is re-checked against `dir` as a second,
+ * belt-and-braces layer, and the backup file itself goes through the same
+ * `refuseEscapingSymlink` check `writeRulesFile` applies to the live rules
+ * file — a `.bak-<validId>` entry that is itself a symlink pointing outside
+ * `dir` is refused rather than silently followed. Exists for an UI "Undo" on
+ * a change just made. Throws a clear error if the named backup does not
+ * exist (or `backupId` is not in the one shape this module ever produces).
  */
 export function restoreBackup(backupId: string, env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): WriteRulesResult {
+  if (!BACKUP_ID_RE.test(backupId)) {
+    throw new Error(`invalid backup id ${JSON.stringify(backupId)} — expected the exact shape a backup id is ever produced in (e.g. "20261005T180000Z" or "20261005T180000Z-2")`);
+  }
   const path = rulesPath(env);
   const dir = dirname(path);
   const baseName = basename(path);
   const backupPath = join(dir, `${baseName}.bak-${backupId}`);
+  if (dirname(backupPath) !== dir) {
+    throw new Error(`backup path ${backupPath} does not resolve inside ${dir} — refusing`);
+  }
+  refuseEscapingSymlink(backupPath, dir, io);
   const text = io.readFile(backupPath);
   if (text === undefined) throw new Error(`no backup ${JSON.stringify(backupId)} found for ${path} (expected ${backupPath})`);
   return writeRulesFile(text, env, io);
