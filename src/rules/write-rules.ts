@@ -1,56 +1,89 @@
 /**
  * FACTORY-658 (FACTORY-643 slice 2, GH #616) — the one library function every
  * later rules.json writer (the web write path, FACTORY-663) goes through:
- * `writeRulesFile`. Validates `nextText` with the SAME parser `loadRules`
- * uses (`parseRules`, reused verbatim, never re-implemented) BEFORE touching
- * disk, backs up the current file, then writes atomically (temp file in the
- * same directory + fsync + rename). `restoreBackup` restores a previous
- * backup through this exact same validated/atomic path, for an UI "Undo".
- * No HTTP route or UI lives in THIS ticket — this module is a plain library
- * with no CLI of its own (a scope correction on FACTORY-658 removed the
- * `butchr rules enable|disable|add` commands this module originally grew
- * alongside; `butchr rules check` is unaffected and unrelated).
+ * `writeRulesFile`. Validates `nextText` through the SAME entry point the
+ * daemon's own startup uses (`loadRules`, fed `nextText` via an in-memory
+ * `ReadRulesFile` seam rather than disk — not a second validator) BEFORE
+ * touching disk, backs up the current file, then writes atomically (temp
+ * file in the same directory + fsync + rename, directory fsynced too).
+ * `restoreBackup` restores a previous backup through this exact same
+ * validated/atomic path, for an UI "Undo". No HTTP route or UI lives in
+ * THIS ticket — this module is a plain library with no CLI of its own (a
+ * scope correction on FACTORY-658 removed the `butchr rules enable|disable|
+ * add` commands this module originally grew alongside; `butchr rules check`
+ * is unaffected and unrelated).
  *
- * CONCURRENT WRITERS: each temp file name is unique per call (pid + hrtime +
- * random) and opened with O_EXCL (the `"wx"` flag), so two concurrent
- * writers never share one temp file or interleave bytes into it. The final
- * `rename` is a single atomic syscall, so a reader always sees either the
- * OLD complete file or a NEW complete file, never a mix of the two. This
- * does NOT serialize a read-modify-write race — the last writer to `rename`
- * wins and the other caller's change is simply lost (never merged, never
- * corrupted) — the same documented limitation `src/resources/link-store.ts`
- * already carries for its own atomic write. A real cross-process lock that
- * SERIALIZES updates is out of scope for this slice.
+ * SERIALIZATION (review round 2): an in-process reentrancy guard plus a
+ * cross-process `O_EXCL` lock file (`.rules.lock`, pid + mtime staleness
+ * detection) are held across the read-validate-backup-rename span, so two
+ * writers — in this process or another — never interleave: the second
+ * blocks (or fails fast on a live lock) until the first fully finishes. This
+ * still does not MERGE two concurrent edits — the second writer's call still
+ * simply fails if it holds a now-stale `ifMatch` etag (see below) — it only
+ * guarantees no corruption and a clear error instead of a silent lost
+ * update. `restoreBackup`'s own temp/backup files therefore can never
+ * collide with a concurrent `writeRulesFile` either, same lock.
+ *
+ * OPTIMISTIC CONCURRENCY: an optional `opts.ifMatch` (sha256 hex of the
+ * content the caller last read; sha256 of `""` for "I read no file yet")
+ * refuses the write untouched if the live file no longer matches — the
+ * lost-update guard a web PUT's `If-Match` header needs. Every successful
+ * write returns the new content's own `etag`; `rulesEtag` reads the CURRENT
+ * etag for a GET handler to hand back.
  *
  * SYMLINK REFUSAL: a rules file that is itself a symlink pointing outside
  * its own directory is refused before any read, backup, or write touches
  * it — otherwise `copyFileSync`/`readFileSync` would silently follow the
  * link and back up or report the mode of whatever it points to (e.g. a
- * crafted symlink pointing at an unrelated file elsewhere on disk).
+ * crafted symlink pointing at an unrelated file elsewhere on disk). The
+ * temp file's own open additionally passes `O_NOFOLLOW` where the platform
+ * defines it, opportunistic defense-in-depth against a symlink planted at
+ * the temp path between name generation and open (the name itself is
+ * unique per call — pid + hrtime + random — so this is belt-and-suspenders,
+ * not the primary defense).
  */
-import { closeSync, copyFileSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { parseRules, rulesPath, type ReadRulesFile, type Rule, type RulesEnv } from "./rules.js";
+import { loadRules, parseRules, rulesPath, type ReadRulesFile, type Rule, type RulesEnv } from "./rules.js";
 
 /** Kept 0600 (the ticket's own default) when the file does not exist yet; an EXISTING file's own mode always wins. */
 const DEFAULT_MODE = 0o600;
 const MAX_BACKUPS = 20;
+/** A lock file older than this, or whose recorded pid is no longer alive, is treated as abandoned (e.g. a crashed writer) rather than a live holder. */
+const LOCK_STALE_MS = 30_000;
 
 export interface WriteRulesResult {
   path: string;
   /** `null` only when the file did not exist before this write (nothing to back up). */
   backupPath: string | null;
-  /** The UTC timestamp suffix of `backupPath` (e.g. `20261005T180000Z`) — what `restoreBackup` takes. `null` exactly when `backupPath` is. */
+  /** The UTC timestamp suffix of `backupPath` (e.g. `20261005T180000Z`, possibly `-2`/`-3`/... suffixed on a same-second collision) — what `restoreBackup` takes. `null` exactly when `backupPath` is. */
   backupId: string | null;
   /** Rule ids added, removed, or whose content differs from the previous file. Every id when the previous file was absent or unreadable as rules (nothing to diff against). */
   changedIds: string[];
+  /** sha256 hex of `nextText` as written — pass to a later `writeRulesFile`'s `opts.ifMatch` to detect whether the file changed since. */
+  etag: string;
+}
+
+/** Optional behaviour for `writeRulesFile`, independent of the required `nextText`/`env`/`io` positional args. */
+export interface WriteRulesOptions {
+  /**
+   * sha256 hex of the content the caller last read (sha256 of `""` if the
+   * caller read "no file exists yet") — `rulesEtag` computes it the same
+   * way. When set, the write is refused with NO mutation at all if the live
+   * file's current etag does not match: the file changed since the caller
+   * read it. Absent (the default): no check, last-writer-wins, same as
+   * before this option existed.
+   */
+  ifMatch?: string;
 }
 
 /**
  * Every filesystem primitive this module touches, injectable for tests
  * (simulating a failed rename, a pre-seeded set of old backups, a fixed
- * clock for deterministic backup timestamps) exactly as `loadRules`'s own
- * `read: ReadRulesFile` seam already allows for reads.
+ * clock for deterministic backup timestamps, a held or stale lock file)
+ * exactly as `loadRules`'s own `read: ReadRulesFile` seam already allows
+ * for reads.
  */
 export interface WriteRulesIo {
   /** Same seam `loadRules` uses: the file's text, or `undefined` if absent. */
@@ -63,16 +96,67 @@ export interface WriteRulesIo {
   removeQuiet: (path: string) => void;
   /** An existing file's own mode (masked to permission bits), or `undefined` if absent. */
   modeOf: (path: string) => number | undefined;
+  /** Forces `path`'s mode; best-effort (e.g. a no-op where the platform has no POSIX mode bits). */
+  chmod: (path: string, mode: number) => void;
   /** Directory entries, or `[]` if the directory does not exist. */
   listDir: (dir: string) => string[];
   isSymlink: (path: string) => boolean;
   /** Resolves a path's real, symlink-free location. */
   realpath: (path: string) => string;
   mkdir: (dir: string) => void;
+  /** fsyncs the directory itself (durability for the rename/backup entries just created in it); best-effort — some platforms (Windows) cannot fsync a directory handle at all. */
+  fsyncDir: (dir: string) => void;
+  /** Acquires the cross-process write lock for `dir`, blocking-by-throwing (never sleeping) if another live writer holds it; returns a release function. Throws a clear error if the lock is held and not stale. */
+  acquireLock: (dir: string) => () => void;
   now: () => Date;
 }
 
-function defaultIo(): WriteRulesIo {
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * `O_EXCL` lock file named `.rules.lock` in the rules file's own directory,
+ * holding the locking process's pid. A second acquirer finding the lock
+ * present checks staleness (holder pid dead, or lock older than
+ * `LOCK_STALE_MS`) before concluding another writer is genuinely active —
+ * an abandoned lock from a crashed process must never wedge every future
+ * write permanently.
+ */
+function acquireLockDefault(dir: string): () => void {
+  const lockPath = join(dir, ".rules.lock");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try { writeSync(fd, String(process.pid)); } finally { closeSync(fd); }
+      return () => { try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ } };
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    }
+    let heldPid: number | null = null;
+    let ageMs = Infinity;
+    try {
+      heldPid = Number(readFileSync(lockPath, "utf8").trim()) || null;
+      ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      continue; // the lock vanished between our EEXIST and this read — just retry creating it
+    }
+    if (!(heldPid !== null && isPidAlive(heldPid)) || ageMs > LOCK_STALE_MS) {
+      try { unlinkSync(lockPath); } catch { /* another racer may have cleared it first; ignore */ }
+      continue;
+    }
+    throw new Error(`rules file is locked by another writer (pid ${heldPid}, held ${Math.round(ageMs / 1000)}s) at ${lockPath} — refusing to write concurrently`);
+  }
+  throw new Error(`could not acquire the rules write lock at ${lockPath} after clearing a stale lock — try again`);
+}
+
+/** The real filesystem implementation `writeRulesFile`/`restoreBackup`/`rulesEtag` default to. Exported for tests that need to override a single seam (e.g. `now`) while keeping every other operation real. */
+export function defaultIo(): WriteRulesIo {
   return {
     readFile: (path) => {
       try {
@@ -84,7 +168,9 @@ function defaultIo(): WriteRulesIo {
     },
     copyFile: (src, dest) => copyFileSync(src, dest),
     writeTempExclusive: (path, text, mode) => {
-      const fd = openSync(path, "wx", mode);
+      // O_NOFOLLOW is opportunistic defense-in-depth (see this file's header); fall back to 0 (no-op flag) where the platform doesn't define it.
+      const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
+      const fd = openSync(path, flags, mode);
       try {
         writeSync(fd, text);
         fsyncSync(fd);
@@ -99,6 +185,9 @@ function defaultIo(): WriteRulesIo {
     modeOf: (path) => {
       try { return statSync(path).mode & 0o777; } catch { return undefined; }
     },
+    chmod: (path, mode) => {
+      try { chmodSync(path, mode); } catch { /* best-effort — e.g. a platform with no POSIX mode bits */ }
+    },
     listDir: (dir) => {
       try { return readdirSync(dir); } catch { return []; }
     },
@@ -107,6 +196,16 @@ function defaultIo(): WriteRulesIo {
     },
     realpath: (path) => realpathSync(path),
     mkdir: (dir) => mkdirSync(dir, { recursive: true }),
+    fsyncDir: (dir) => {
+      try {
+        const fd = openSync(dir, "r");
+        try { fsyncSync(fd); } finally { closeSync(fd); }
+      } catch {
+        // Not every platform can open/fsync a directory handle (notably Windows) — durability
+        // of the rename across a host crash is then best-effort; never fail the write over it.
+      }
+    },
+    acquireLock: (dir) => acquireLockDefault(dir),
     now: () => new Date(),
   };
 }
@@ -114,6 +213,26 @@ function defaultIo(): WriteRulesIo {
 /** `rules.json.bak-20261005T180000Z` — the same naming the operator uses by hand (no milliseconds). */
 function utcStamp(now: Date): string {
   return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+/** sha256 hex — the one hash this module uses for both `etag`/`ifMatch` and, incidentally, nowhere else (changed-id diffing uses structural `JSON.stringify` equality instead, since it needs to name WHICH rule changed, not just whether anything did). */
+const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+
+/**
+ * A UTC-timestamp-based id, unique within `dir`: the plain timestamp, or
+ * (on a same-second collision with an existing backup) the first `-N` suffix
+ * not already taken. Two writes landing in the same wall-clock second — a
+ * realistic case, not a hypothetical one, since this is timer-resolution,
+ * not RNG — must never overwrite each other's backup.
+ */
+function uniqueBackupId(dir: string, baseName: string, io: WriteRulesIo): string {
+  const base = utcStamp(io.now());
+  const existing = new Set(io.listDir(dir));
+  if (!existing.has(`${baseName}.bak-${base}`)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`;
+    if (!existing.has(`${baseName}.bak-${candidate}`)) return candidate;
+  }
 }
 
 function refuseEscapingSymlink(path: string, dir: string, io: WriteRulesIo): void {
@@ -163,56 +282,98 @@ function changedRuleIds(currentText: string | undefined, nextRules: readonly Rul
   return [...changed];
 }
 
+/** Rules files currently being written BY THIS PROCESS — the in-process half of the reentrancy guard (see `withWriteLock`). */
+const activeWriters = new Set<string>();
+
 /**
- * Validates `nextText` with `parseRules` (same path `loadRules` uses) BEFORE
- * touching disk. On success: backs up the current file (if any) to
- * `<path>.bak-<UTC timestamp>`, pruning to the newest 20 backups, then writes
- * `nextText` atomically (temp file in the same directory, `O_EXCL`, fsync,
- * rename), preserving the current file's mode (0600 for a brand-new file).
- * On any validation problem, throws with every problem (same multi-line
- * `Error#message` shape `loadRules` throws) and writes NOTHING — no temp
- * file, no backup, no mutation of the existing file.
+ * Holds BOTH locks (in-process reentrancy guard, then the cross-process
+ * `.rules.lock` file) across `fn`, released in reverse order even if `fn`
+ * throws. A reentrant call on the SAME path from the SAME process (a bug —
+ * e.g. `restoreBackup` calling `writeRulesFile` recursively some other way
+ * than it does today) fails fast with a clear error instead of deadlocking
+ * on a lock file this same process already holds.
  */
-export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): WriteRulesResult {
+function withWriteLock<T>(path: string, dir: string, io: WriteRulesIo, fn: () => T): T {
+  if (activeWriters.has(path)) {
+    throw new Error(`${path}: already being written by this same process (reentrant writeRulesFile/restoreBackup call) — refusing`);
+  }
+  activeWriters.add(path);
+  io.mkdir(dir); // the lock file needs its directory to exist
+  const release = io.acquireLock(dir);
+  try {
+    return fn();
+  } finally {
+    release();
+    activeWriters.delete(path);
+  }
+}
+
+/**
+ * Validates `nextText` through the SAME entry point the daemon's own startup
+ * uses (`loadRules`, given `nextText` via an in-memory `ReadRulesFile` that
+ * returns it for this exact path — not a second parser) BEFORE touching
+ * disk or acquiring any lock, so a doomed-to-fail call never contends for
+ * the lock or creates the rules directory. On success: acquires the
+ * read-validate-backup-rename lock (in-process + cross-process, see this
+ * file's header), optionally refuses on an `opts.ifMatch` mismatch (no
+ * mutation at all), backs up the current file (if any) to
+ * `<path>.bak-<UTC timestamp>` (fsynced, pruned to the newest 20 backups),
+ * then writes `nextText` atomically (temp file in the same directory,
+ * `O_EXCL`, fsync, rename, directory fsync), preserving the current file's
+ * mode (0600 for a brand-new file). On any validation problem, throws with
+ * every problem (same multi-line `Error#message` shape `loadRules` throws)
+ * and writes NOTHING — no temp file, no backup, no mutation of the existing
+ * file, no lock ever taken.
+ */
+export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io: WriteRulesIo = defaultIo(), opts: WriteRulesOptions = {}): WriteRulesResult {
   const path = rulesPath(env);
   const dir = dirname(path);
   const baseName = basename(path);
 
-  let doc: unknown;
-  try {
-    doc = JSON.parse(nextText);
-  } catch (e) {
-    throw new Error(`${path}: invalid JSON: ${(e as Error).message}`);
-  }
-  const nextRules = parseRules(doc, path);
+  // Same entry point `src/daemon/index.ts` calls at startup — `nextText` stands in for the
+  // on-disk file via this one-shot `ReadRulesFile`, so `loadRules`'s own JSON.parse + `parseRules`
+  // run completely unmodified; this is not a parallel/second validator.
+  const fakeRead: ReadRulesFile = (p) => (p === path ? nextText : undefined);
+  const { rules: nextRules } = loadRules(env, fakeRead);
 
-  refuseEscapingSymlink(path, dir, io);
+  return withWriteLock(path, dir, io, () => {
+    refuseEscapingSymlink(path, dir, io);
 
-  const currentText = io.readFile(path);
-  const changedIds = changedRuleIds(currentText, nextRules, path);
+    const currentText = io.readFile(path);
+    if (opts.ifMatch !== undefined) {
+      const currentEtag = sha256(currentText ?? "");
+      if (opts.ifMatch !== currentEtag) {
+        throw new Error(`${path}: etag mismatch — expected ${opts.ifMatch}, found ${currentEtag}; the file changed since it was read, reload and retry`);
+      }
+    }
+    const changedIds = changedRuleIds(currentText, nextRules, path);
 
-  io.mkdir(dir);
+    let backupPath: string | null = null;
+    let backupId: string | null = null;
+    if (currentText !== undefined) {
+      backupId = uniqueBackupId(dir, baseName, io);
+      backupPath = join(dir, `${baseName}.bak-${backupId}`);
+      const existingMode = io.modeOf(path) ?? DEFAULT_MODE;
+      io.copyFile(path, backupPath);
+      io.chmod(backupPath, existingMode);
+      io.fsyncDir(dir);
+      pruneBackups(dir, baseName, io);
+    }
 
-  let backupPath: string | null = null;
-  let backupId: string | null = null;
-  if (currentText !== undefined) {
-    backupId = utcStamp(io.now());
-    backupPath = join(dir, `${baseName}.bak-${backupId}`);
-    io.copyFile(path, backupPath);
-    pruneBackups(dir, baseName, io);
-  }
+    const mode = io.modeOf(path) ?? DEFAULT_MODE;
+    const tmp = join(dir, `.${baseName}.tmp-${process.pid}-${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`);
+    try {
+      io.writeTempExclusive(tmp, nextText, mode);
+      io.chmod(tmp, mode); // belt-and-suspenders against umask narrowing the requested mode unexpectedly
+      io.rename(tmp, path);
+      io.fsyncDir(dir);
+    } catch (e) {
+      io.removeQuiet(tmp);
+      throw e;
+    }
 
-  const mode = io.modeOf(path) ?? DEFAULT_MODE;
-  const tmp = join(dir, `.${baseName}.tmp-${process.pid}-${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`);
-  try {
-    io.writeTempExclusive(tmp, nextText, mode);
-    io.rename(tmp, path);
-  } catch (e) {
-    io.removeQuiet(tmp);
-    throw e;
-  }
-
-  return { path, backupPath, backupId, changedIds };
+    return { path, backupPath, backupId, changedIds, etag: sha256(nextText) };
+  });
 }
 
 /**
@@ -220,9 +381,14 @@ export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io
  * same validated/atomic path as `writeRulesFile` (itself, in fact — this is
  * a thin wrapper, not a second write path): reads `<path>.bak-<backupId>`
  * and writes its text back via `writeRulesFile`, which means a restore is
- * validated, is itself backed up first, and is written atomically, same as
- * any other write. Exists for an UI "Undo" on a change just made. Throws a
- * clear error if the named backup does not exist.
+ * validated, is itself backed up first (under a freshly unique id — see
+ * `uniqueBackupId` — so it can never collide with or destroy the backup
+ * it's restoring FROM, even within the same second), is written atomically,
+ * and takes the same write lock, same as any other write. The restored
+ * file's bytes are therefore byte-identical to the backup's own bytes
+ * (`writeRulesFile` writes `text` verbatim). Exists for an UI "Undo" on a
+ * change just made. Throws a clear error if the named backup does not
+ * exist.
  */
 export function restoreBackup(backupId: string, env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): WriteRulesResult {
   const path = rulesPath(env);
@@ -232,6 +398,12 @@ export function restoreBackup(backupId: string, env: RulesEnv = process.env, io:
   const text = io.readFile(backupPath);
   if (text === undefined) throw new Error(`no backup ${JSON.stringify(backupId)} found for ${path} (expected ${backupPath})`);
   return writeRulesFile(text, env, io);
+}
+
+/** The CURRENT rules file's etag (sha256 hex; sha256 of `""` if the file does not exist) — what a GET handler hands back for a later `writeRulesFile`'s `opts.ifMatch`. */
+export function rulesEtag(env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): string {
+  const path = rulesPath(env);
+  return sha256(io.readFile(path) ?? "");
 }
 
 // ---------------------------------------------------------------------------
