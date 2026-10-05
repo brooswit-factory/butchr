@@ -15,12 +15,12 @@
  * `butchr rules check` is unaffected and unrelated).
  *
  * SERIALIZATION: an in-process reentrancy guard plus a cross-process
- * `O_EXCL`/rename-based lock file (`.rules.lock`) are held across the
+ * `O_EXCL` lock file (`.rules.lock`) are held across the
  * read-validate-backup-rename span, so two writers — in this process or
  * another — never interleave: the second fails fast with a clear error
  * (never corrupts, never silently loses the first writer's change) if it
- * contends with a LIVE holder. See `acquireRulesLock`'s own doc comment for
- * the stale-lock reclaim protocol (round-3 finding F6).
+ * contends with a LIVE holder. See `acquireRulesLock`'s own doc comment: a lock left
+ * by a dead holder is never reclaimed automatically (FACTORY-673).
  *
  * OPTIMISTIC CONCURRENCY / LOST UPDATES (round-3 finding F1): a plain
  * `writeRulesFile(nextText, ...)` call is still last-writer-wins UNLESS the
@@ -161,80 +161,56 @@ function lockHolderPid(content: string): number | null {
 }
 
 /**
- * `O_EXCL` lock file named `.rules.lock` in the rules file's own directory.
- * The common case — no contention — is a plain exclusive create, same as
- * before. Finding it already present, this:
+ * `O_EXCL` lock file named `.rules.lock` in the rules file's own directory,
+ * holding `<pid>:<token>`. The common case — no contention — is a plain
+ * exclusive create. Finding it already present, this ALWAYS REFUSES (FACTORY-673,
+ * replacing round 3's rename-based stale-lock reclaim, which two racing reclaimers
+ * could both win):
  *
- * 1. Refuses immediately if the recorded holder's pid is confirmed ALIVE,
- *    regardless of the lock's age — round-3 finding F6: the previous
- *    version additionally stole a lock purely for being "older than 30s,"
- *    which could and did steal it out from under a genuinely slow BUT STILL
- *    ACTIVE writer (a large file, a slow disk), leaving TWO processes
- *    believing they each exclusively hold it. Age is no longer a reason to
- *    reclaim from a live pid — only used in the resulting error's own
- *    message, for a human to judge "has this been stuck a while."
- * 2. FAILS CLOSED (throws) if the lock's content cannot be parsed into a
- *    pid at all — corrupt/truncated content means this process cannot
- *    verify ANYTHING about the current holder, and guessing "probably dead"
- *    is exactly the unsafe shortcut F6 flagged.
- * 3. Reclaims ONLY when the recorded pid is confirmed DEAD, and does so via
- *    an atomic rename of a freshly-created, uniquely-tokened claim file onto
- *    `.rules.lock`, followed by a read-back verification: `renameSync`
- *    always "succeeds" even when replacing an existing file (it has no
- *    `O_EXCL`-like exclusivity of its own), so two concurrent reclaimers can
- *    each have their own rename call return without error — but only ONE of
- *    their two distinct token contents can be the file's FINAL bytes.
- *    Reading the content back and comparing it to the exact token this call
- *    just wrote is how each reclaimer tells whether it actually ended up as
- *    the genuine final holder; the loser retries (and will typically then
- *    see the winner's lock as live and fail with the normal contention
- *    error). This is the same fencing-token pattern a distributed lock
- *    normally uses to make a "steal" safe.
+ * 1. recorded holder pid ALIVE: "locked by another writer" (age is only
+ *    reported, never a reason to take the lock — round-3 finding F6).
+ * 2. content unparseable: refuses, cannot verify anything about the holder.
+ * 3. recorded holder pid DEAD (a crashed writer): refuses with an actionable
+ *    message naming the lock file and when it is safe to remove it. There is
+ *    NO automatic cross-process reclaim: the daemon is the only writer, a
+ *    crashed holder is rare, and any reclaim protocol that lets two waiters
+ *    each "take over" can hand the lock to both. Failing closed is the
+ *    safe default; the operator removes the file once no writer runs.
+ *
+ * The release function only unlinks the lock if it still holds this call's own
+ * token, so it can never delete a lock someone else created after an operator
+ * removed ours.
  */
 export function acquireRulesLock(dir: string): () => void {
   const lockPath = join(dir, ".rules.lock");
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const token = `${process.pid}:${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`;
-    try {
-      const fd = openSync(lockPath, "wx");
-      try { writeSync(fd, token); } finally { closeSync(fd); }
-      return () => { try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ } };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-    }
-
-    let currentContent: string;
-    try {
-      currentContent = readFileSync(lockPath, "utf8");
-    } catch {
-      continue; // the lock vanished between our EEXIST and this read — just retry a fresh create
-    }
-    const heldPid = lockHolderPid(currentContent);
-    if (heldPid === null) {
-      throw new Error(`rules file lock at ${lockPath} has unreadable/corrupt content (${JSON.stringify(currentContent)}) — refusing to guess whether it is live or abandoned; remove it by hand once you've confirmed no writer holds it`);
-    }
-    if (isPidAlive(heldPid)) {
-      const ageMs = (() => { try { return Date.now() - statSync(lockPath).mtimeMs; } catch { return 0; } })();
-      throw new Error(`rules file is locked by another writer (pid ${heldPid}, held ${Math.round(ageMs / 1000)}s) at ${lockPath} — refusing to write concurrently`);
-    }
-
-    // The recorded holder is confirmed dead — reclaim via rename + read-back verification (see
-    // this function's own doc comment for why a plain unlink-then-create is NOT safe here).
-    const claim = join(dir, `.rules.lock.claim-${token.replace(/[^A-Za-z0-9_.-]/g, "_")}`);
-    const fd = openSync(claim, "wx");
+  const token = `${process.pid}:${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const fd = openSync(lockPath, "wx");
     try { writeSync(fd, token); } finally { closeSync(fd); }
-    try {
-      renameSync(claim, lockPath);
-    } catch (e) {
-      try { unlinkSync(claim); } catch { /* ignore */ }
-      throw e;
-    }
-    let verify: string | undefined;
-    try { verify = readFileSync(lockPath, "utf8"); } catch { /* vanished again; treat as a loss below */ }
-    if (verify !== token) continue; // a concurrent reclaimer's rename landed after ours — we lost this round, retry
-    return () => { try { unlinkSync(lockPath); } catch { /* best-effort cleanup */ } };
+    return () => {
+      try {
+        if (readFileSync(lockPath, "utf8") === token) unlinkSync(lockPath);
+      } catch { /* best-effort cleanup */ }
+    };
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
   }
-  throw new Error(`could not acquire the rules write lock at ${lockPath} after several attempts to reclaim a dead lock — try again`);
+
+  let currentContent: string;
+  try {
+    currentContent = readFileSync(lockPath, "utf8");
+  } catch {
+    throw new Error(`rules file lock at ${lockPath} changed while being inspected — another writer is active or just finished; try again`);
+  }
+  const heldPid = lockHolderPid(currentContent);
+  if (heldPid === null) {
+    throw new Error(`rules file lock at ${lockPath} has unreadable/corrupt content (${JSON.stringify(currentContent)}) — refusing to guess whether it is live or abandoned; remove it by hand once you've confirmed no writer holds it`);
+  }
+  if (isPidAlive(heldPid)) {
+    const ageMs = (() => { try { return Date.now() - statSync(lockPath).mtimeMs; } catch { return 0; } })();
+    throw new Error(`rules file is locked by another writer (pid ${heldPid}, held ${Math.round(ageMs / 1000)}s) at ${lockPath} — refusing to write concurrently`);
+  }
+  throw new Error(`rules file lock at ${lockPath} was left behind by pid ${heldPid}, which is no longer running (a crashed writer); butchr never reclaims a stale lock automatically. If no butchr daemon or other rules writer is running (check: systemctl --user is-active butchr.service), remove it with: rm ${lockPath} — then retry`);
 }
 
 /** The real filesystem implementation `writeRulesFile`/`updateRulesFile`/`restoreBackup`/`rulesEtag` default to. Exported for tests that need to override a single seam (e.g. `now`) while keeping every other operation real. */
@@ -466,12 +442,13 @@ function withWriteLock<T>(path: string, dir: string, io: WriteRulesIo, fn: () =>
     throw new Error(`${path}: already being written by this same process (reentrant writeRulesFile/updateRulesFile/restoreBackup call) — refusing`);
   }
   activeWriters.add(path);
-  io.mkdir(dir); // the lock file needs its directory to exist
-  const release = io.acquireLock(dir);
+  let release: (() => void) | undefined;
   try {
+    io.mkdir(dir); // the lock file needs its directory to exist
+    release = io.acquireLock(dir); // may throw (live/stale/corrupt lock): the guard entry must still be cleared below
     return fn();
   } finally {
-    release();
+    release?.();
     activeWriters.delete(path);
   }
 }
