@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { createRulesHolder, parseRules, type Rule } from "../../src/rules/rules.js";
 import { reloadRules } from "../../src/rules/reload.js";
 import { createFilesystemResourceType } from "../../src/rules/filesystem-type.js";
+import { createRuleResourceType } from "../../src/rules/resource-type.js";
 import { unitAgentKey } from "../../src/rules/execution.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
+import type { JiraIssue } from "../../src/atlassian/types.js";
 
 // Built through `parseRules` itself, never by hand — a hand-built `Rule`
 // literal omits the defaults `parseRules` fills in (`account: "none"`,
@@ -15,6 +17,10 @@ const [ruleA, ruleB]: Rule[] = parseRules({
     { id: "b", resourceProvider: "filesystem", query: JSON.stringify({ root: "/tmp/b", kind: "file" }), brief: "b" },
   ],
 }) as [Rule, Rule];
+
+const [jiraWorkRule]: Rule[] = parseRules({
+  rules: [{ id: "w", resourceProvider: "jira-work", query: "key = X-1", brief: "w" }],
+}) as [Rule];
 
 describe("reloadRules", () => {
   test("a valid file swaps the holder's rules and reports added/removed/changed", () => {
@@ -64,19 +70,52 @@ describe("reloadRules", () => {
     expect(holder.getRules()).toEqual([ruleA]);
   });
 
-  test("a missing default file is a VALID reload to zero rules, not an error", () => {
-    const holder = createRulesHolder([ruleA]);
+  test("a missing default file is a VALID reload to zero rules when the holder is ALREADY empty — nothing to wipe", () => {
+    const holder = createRulesHolder([]);
     const result = reloadRules(holder, { XDG_CONFIG_HOME: "/x" }, () => undefined);
     expect(result.ok).toBe(true);
-    expect(result.removed).toEqual(["a"]);
     expect(holder.getRules()).toEqual([]);
   });
 
-  test("an explicit BUTCHR_RULES_FILE that does not exist is reported as a failed reload, keeping the running rules", () => {
+  test("review round 1, BLOCKING finding 1: a missing file over a NON-EMPTY holder is REFUSED, never swapped in — a vanished/moved/bad-mount rules file must not wipe every running rule", () => {
+    const holder = createRulesHolder([ruleA]);
+    const result = reloadRules(holder, { XDG_CONFIG_HOME: "/x" }, () => undefined);
+    expect(result.ok).toBe(false);
+    expect(result.problems.join("\n")).toContain("missing");
+    expect(result.problems.join("\n")).toContain("keeping the running");
+    expect(holder.getRules()).toEqual([ruleA]); // untouched
+  });
+
+  test("an explicit BUTCHR_RULES_FILE that does not exist is reported as a failed reload, keeping the running rules — same refusal, an explicit path", () => {
     const holder = createRulesHolder([ruleA]);
     const result = reloadRules(holder, { BUTCHR_RULES_FILE: "/nope.json" }, () => undefined);
     expect(result.ok).toBe(false);
     expect(holder.getRules()).toEqual([ruleA]);
+  });
+
+  test("a PRESENT file that parses to zero rules IS accepted over a non-empty holder — an operator's deliberate 'disable everything' is distinguishable from a vanished file", () => {
+    const holder = createRulesHolder([ruleA]);
+    const result = reloadRules(holder, { BUTCHR_RULES_FILE: "/rules.json" }, () => JSON.stringify({ rules: [] }));
+    expect(result.ok).toBe(true);
+    expect(result.removed).toEqual(["a"]);
+    expect(holder.getRules()).toEqual([]);
+  });
+});
+
+describe("review round 1, finding 3: jira-work after a reload from an empty-but-present file", () => {
+  test("rules: [] reloading to one enabled jira-work rule is polled on the loop's very next search — no restart needed", async () => {
+    const holder = createRulesHolder([]);
+    const issue: JiraIssue = { key: "X-1", summary: "s", status: "To Do", issuetype: "Task", assignee: null, parent: null, updated: "", labels: [] };
+    const type = createRuleResourceType({ rules: holder.getRules(), search: async () => [issue] });
+    expect(await type.discovery.search()).toEqual([]);
+
+    const added = JSON.stringify({ rules: [{ ...jiraWorkRule, enabled: true }] });
+    const result = reloadRules(holder, { BUTCHR_RULES_FILE: "/rules.json" }, () => added);
+    expect(result.ok).toBe(true);
+    expect(result.added).toEqual(["w"]);
+
+    const after = await type.discovery.search();
+    expect(after.map((u) => unitAgentKey(u))).toEqual(["jira-work:w:X-1"]);
   });
 });
 

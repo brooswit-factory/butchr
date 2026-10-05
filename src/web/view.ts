@@ -13,6 +13,8 @@ import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
+import type { Rule } from "../rules/rules.js";
+import type { ReloadResult } from "../rules/reload.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -134,6 +136,25 @@ export interface ViewDeps {
     /** Poll interval, in ms — this daemon's own choice, not herdr's; see `docs/pty-attach.md`'s Config section. */
     pollMs: number;
   };
+  /**
+   * FACTORY-657: the daemon's own LIVE rules (`RulesHolder.getRules()`,
+   * src/rules/rules.ts) — the SAME array every poll already reads through,
+   * never a second load. No route reads this today (this ticket adds no
+   * HTTP endpoint, per its own scope correction); exists so FACTORY-660's
+   * `rulesFileState`/previewer can be rewired off the startup-only array it
+   * closes over today (PR #642's own `TODO(657)`) onto this live one
+   * instead, with no second wiring path to keep in sync.
+   */
+  getRules?: () => readonly Rule[];
+  /**
+   * FACTORY-657: re-reads `rules.json` in-process and swaps the daemon's
+   * live holder — literally `() => reloadRules(rulesHolder)`
+   * (src/rules/reload.ts), the EXACT same function `SIGHUP` already calls.
+   * No route calls this today; exists so FACTORY-663's web write path can
+   * call it directly after it writes the file itself, with no HTTP
+   * round-trip and no second reload code path to drift from SIGHUP's.
+   */
+  reloadRulesNow?: () => ReloadResult;
 }
 
 /** One open `/agents/:agentKey/pty` socket's server-side bookkeeping — keyed by `ElysiaWS.id`, since neither Elysia nor Bun hands the `open`/`message`/`close` callbacks a shared closure over each other by default. */

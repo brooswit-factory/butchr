@@ -55,6 +55,20 @@ export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRule
   } catch (e) {
     return { ok: false, path: rulesPath(env), added: [], removed: [], changed: [], problems: (e as Error).message.split("\n") };
   }
+  // A missing file is `loadRules`' own VALID "zero rules" case (see its doc
+  // comment) — fine for a fresh daemon that has never had a rules file, but
+  // on an established install with running rules a vanished file (a bad
+  // mount, an editor that writes via rename-then-delete mid-SIGHUP, a
+  // deleted/moved file) is almost certainly an accident, not an operator's
+  // "disable everything" — swapping it in would wipe every running rule and
+  // the next reconcile poll would stop every agent. Refuse instead: only
+  // accept `missing` when the holder is ALREADY empty (there is nothing it
+  // could wipe). A present-but-empty `rules: []` file stays a valid, loud
+  // reload below — that IS an operator's deliberate "disable everything",
+  // distinguishable from a vanished file by `loadRules` itself.
+  if (loaded.origin === "missing" && holder.getRules().length > 0) {
+    return { ok: false, path: loaded.path, added: [], removed: [], changed: [], problems: [`rules file missing at ${loaded.path}; keeping the running ${holder.getRules().length} rule(s)`] };
+  }
   const before = byId(holder.getRules());
   const after = byId(loaded.rules);
   const added = [...after.keys()].filter((id) => !before.has(id));

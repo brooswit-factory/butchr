@@ -787,6 +787,11 @@ const dashboardAppRoot = resolveWebRoot();
 
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
 const { app, mcp } = buildApp({
+  // FACTORY-657: not read by any route added in this PR (no HTTP endpoint,
+  // per this ticket's own scope correction) — see `ViewDeps`'s own doc
+  // comment (src/web/view.ts) for who these are for.
+  getRules,
+  reloadRulesNow: () => reloadRules(rulesHolder),
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -941,7 +946,31 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 // FACTORY-663 adds will call `reloadRules(rulesHolder)` in-process, right
 // after it writes rules.json itself, using this SAME function — SIGHUP is
 // the only trigger this daemon listens for on its own.
+//
+// Reload is per-poll, not instantaneous: every rule-reading site above
+// reads `getRules()` live, and several of them do so at more than one
+// `await` boundary within the SAME poll (e.g. a loop's `search()` reading
+// `deps.rules` once, then a later step reading it again). A SIGHUP landing
+// mid-poll can therefore be visible partway through that one poll's own
+// work; it is always fully applied by the NEXT poll. This mirrors the
+// existing restart behavior (the first poll after a restart already reads
+// whatever rules.json says then) and is not a new kind of tear — see
+// `test/unit/rules-reload.test.ts`'s own "does not tear" case for what IS
+// guaranteed: a single `discovery.search()` call's own result set never
+// mixes pre- and post-reload rules.
+//
+// Review round 1 (manager-factory): several startup-only computations do
+// NOT follow a reload, because they gate whether a provider's client/loop
+// exists AT ALL, not just which of its rules are enabled — `jiraProjectEnabled`,
+// `fsRules`, `githubStaffing.run`/`githubPrStaffingResult.run`,
+// `zendeskStaffing` (also re-reading its OAuth token file would be wrong -
+// credentials don't change via a rules reload), and `jiraIdeas`'s client
+// creation. A provider with ZERO enabled rules of its own kind at startup
+// has no running loop for SIGHUP to wake: bringing up that provider's very
+// first rule still needs a restart. `sweepStaleAgentLabels` similarly runs
+// once, at startup, and is unaffected either way.
 process.on("SIGHUP", () => {
+  const before = rulesHolder.getRules().length;
   const result = reloadRules(rulesHolder);
   if (!result.ok) {
     console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
@@ -949,7 +978,19 @@ process.on("SIGHUP", () => {
     return;
   }
   const enabled = rulesHolder.getRules().filter((r) => r.enabled).map((r) => r.id);
-  console.error(`butchr: rules reloaded from ${result.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : ""}`);
+  // Deliberately loud (not just "0 enabled") when a previously non-empty
+  // rules set reloads to zero: `reloadRules` above already refuses to swap
+  // in a MISSING file over a non-empty holder (that's the accident case),
+  // so reaching zero here means the file was present and parsed to
+  // genuinely zero enabled rules — an operator's real "disable everything"
+  // — but it is rare enough, and consequential enough (every rule-having
+  // agent stops on the next reconcile poll), to call out by name rather
+  // than let it read like any other reload.
+  console.error(
+    enabled.length === 0 && before > 0
+      ? `butchr: rules reloaded from ${result.path}: 0 enabled (was ${before}) — every rule-having agent will stop on the next reconcile poll`
+      : `butchr: rules reloaded from ${result.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : ""}`,
+  );
   if (result.added.length) console.error(`  added: ${result.added.join(", ")}`);
   if (result.removed.length) console.error(`  removed: ${result.removed.join(", ")}`);
   if (result.changed.length) console.error(`  changed: ${result.changed.join(", ")}`);
