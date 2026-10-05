@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setRuleEnabled, writeRulesFile, type WriteRulesResult } from "../../src/rules/write-rules.js";
+import { restoreBackup, setRuleEnabled, writeRulesFile, type WriteRulesResult } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 
 let dir: string;
@@ -52,10 +52,11 @@ describe("writeRulesFile: validation", () => {
 });
 
 describe("writeRulesFile: first write (no existing file)", () => {
-  test("creates the file, mode 0600, backupPath null, every rule id reported changed", () => {
+  test("creates the file, mode 0600, backupPath/backupId null, every rule id reported changed", () => {
     const result = writeRulesFile(doc([RULE_A, RULE_B]), env());
     expect(result.path).toBe(rulesFilePath());
     expect(result.backupPath).toBeNull();
+    expect(result.backupId).toBeNull();
     expect(result.changedIds.sort()).toEqual(["stories", "triage"]);
     expect(readFileSync(result.path, "utf8")).toBe(doc([RULE_A, RULE_B]));
     expect(statSync(result.path).mode & 0o777).toBe(0o600);
@@ -63,12 +64,14 @@ describe("writeRulesFile: first write (no existing file)", () => {
 });
 
 describe("writeRulesFile: backups", () => {
-  test("backs up the current file before overwriting, named rules.json.bak-<UTC timestamp>", () => {
+  test("backs up the current file before overwriting, named rules.json.bak-<UTC timestamp>, backupId is that timestamp", () => {
     writeRulesFile(doc([RULE_A]), env());
     const before = readFileSync(rulesFilePath(), "utf8");
     const result = writeRulesFile(doc([RULE_A, RULE_B]), env());
     expect(result.backupPath).not.toBeNull();
+    expect(result.backupId).not.toBeNull();
     expect(result.backupPath!).toMatch(/rules\.json\.bak-\d{8}T\d{6}Z$/);
+    expect(result.backupPath).toBe(join(dir, "butchr", `rules.json.bak-${result.backupId}`));
     expect(readFileSync(result.backupPath!, "utf8")).toBe(before);
     // the live file now holds the NEW content
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A, RULE_B]));
@@ -85,6 +88,36 @@ describe("writeRulesFile: backups", () => {
     writeRulesFile(doc([RULE_A, RULE_B]), env());
     const backups = readdirSync(rulesDir).filter((n) => n.startsWith("rules.json.bak-"));
     expect(backups.length).toBe(20);
+  });
+});
+
+describe("restoreBackup", () => {
+  test("restores a backup's content through the same validated, atomic, backed-up path", () => {
+    const first = writeRulesFile(doc([RULE_A]), env());
+    const second = writeRulesFile(doc([RULE_A, RULE_B]), env());
+    expect(second.backupId).not.toBeNull();
+
+    const result = restoreBackup(second.backupId!, env());
+    // the live file is back to the content as of the second write's backup (RULE_A alone)
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
+    // the restore is itself backed up (the pre-restore content, RULE_A+RULE_B) and atomic
+    expect(result.backupPath).not.toBeNull();
+    expect(readFileSync(result.backupPath!, "utf8")).toBe(doc([RULE_A, RULE_B]));
+    expect(result.changedIds).toEqual(["stories"]);
+  });
+
+  test("a restore that would fail validation throws and leaves the live file untouched", () => {
+    writeRulesFile(doc([RULE_A]), env());
+    const rulesDir = join(dir, "butchr");
+    writeFileSync(join(rulesDir, "rules.json.bak-20260101T000000Z"), "{not json");
+    const before = readFileSync(rulesFilePath(), "utf8");
+    expect(() => restoreBackup("20260101T000000Z", env())).toThrow(/invalid JSON/);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(before);
+  });
+
+  test("unknown backup id: throws clearly", () => {
+    writeRulesFile(doc([RULE_A]), env());
+    expect(() => restoreBackup("20260101T000000Z", env())).toThrow(/no backup "20260101T000000Z"/);
   });
 });
 

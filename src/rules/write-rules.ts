@@ -1,11 +1,15 @@
 /**
  * FACTORY-658 (FACTORY-643 slice 2, GH #616) — the one library function every
- * later rules.json writer (the CLI today, a web endpoint in slice 3) goes
- * through: `writeRulesFile`. Validates `nextText` with the SAME parser
- * `loadRules` uses (`parseRules`, reused verbatim, never re-implemented)
- * BEFORE touching disk, backs up the current file, then writes atomically
- * (temp file in the same directory + fsync + rename). No HTTP route reads
- * this in this slice — see the ticket for scope.
+ * later rules.json writer (the web write path, FACTORY-663) goes through:
+ * `writeRulesFile`. Validates `nextText` with the SAME parser `loadRules`
+ * uses (`parseRules`, reused verbatim, never re-implemented) BEFORE touching
+ * disk, backs up the current file, then writes atomically (temp file in the
+ * same directory + fsync + rename). `restoreBackup` restores a previous
+ * backup through this exact same validated/atomic path, for an UI "Undo".
+ * No HTTP route or UI lives in THIS ticket — this module is a plain library
+ * with no CLI of its own (a scope correction on FACTORY-658 removed the
+ * `butchr rules enable|disable|add` commands this module originally grew
+ * alongside; `butchr rules check` is unaffected and unrelated).
  *
  * CONCURRENT WRITERS: each temp file name is unique per call (pid + hrtime +
  * random) and opened with O_EXCL (the `"wx"` flag), so two concurrent
@@ -36,6 +40,8 @@ export interface WriteRulesResult {
   path: string;
   /** `null` only when the file did not exist before this write (nothing to back up). */
   backupPath: string | null;
+  /** The UTC timestamp suffix of `backupPath` (e.g. `20261005T180000Z`) — what `restoreBackup` takes. `null` exactly when `backupPath` is. */
+  backupId: string | null;
   /** Rule ids added, removed, or whose content differs from the previous file. Every id when the previous file was absent or unreadable as rules (nothing to diff against). */
   changedIds: string[];
 }
@@ -188,8 +194,10 @@ export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io
   io.mkdir(dir);
 
   let backupPath: string | null = null;
+  let backupId: string | null = null;
   if (currentText !== undefined) {
-    backupPath = join(dir, `${baseName}.bak-${utcStamp(io.now())}`);
+    backupId = utcStamp(io.now());
+    backupPath = join(dir, `${baseName}.bak-${backupId}`);
     io.copyFile(path, backupPath);
     pruneBackups(dir, baseName, io);
   }
@@ -204,7 +212,26 @@ export function writeRulesFile(nextText: string, env: RulesEnv = process.env, io
     throw e;
   }
 
-  return { path, backupPath, changedIds };
+  return { path, backupPath, backupId, changedIds };
+}
+
+/**
+ * Restores the rules file to a previous backup's content, through the exact
+ * same validated/atomic path as `writeRulesFile` (itself, in fact — this is
+ * a thin wrapper, not a second write path): reads `<path>.bak-<backupId>`
+ * and writes its text back via `writeRulesFile`, which means a restore is
+ * validated, is itself backed up first, and is written atomically, same as
+ * any other write. Exists for an UI "Undo" on a change just made. Throws a
+ * clear error if the named backup does not exist.
+ */
+export function restoreBackup(backupId: string, env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): WriteRulesResult {
+  const path = rulesPath(env);
+  const dir = dirname(path);
+  const baseName = basename(path);
+  const backupPath = join(dir, `${baseName}.bak-${backupId}`);
+  const text = io.readFile(backupPath);
+  if (text === undefined) throw new Error(`no backup ${JSON.stringify(backupId)} found for ${path} (expected ${backupPath})`);
+  return writeRulesFile(text, env, io);
 }
 
 // ---------------------------------------------------------------------------

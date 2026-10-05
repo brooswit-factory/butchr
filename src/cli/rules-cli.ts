@@ -44,28 +44,11 @@ import { loadConfig, type Config } from "../config/config.js";
 import { AtlassianClient, type FetchLike } from "../atlassian/client.js";
 import type { JiraIssue } from "../atlassian/types.js";
 import { loadRulesFileState, type RulesFileState } from "../agents/query-agent-inventory.js";
-import { rulesPath, type ReadRulesFile, type Rule, type RulesEnv } from "../rules/rules.js";
+import type { ReadRulesFile, Rule, RulesEnv } from "../rules/rules.js";
 import { searchRules } from "../rules/resource-type.js";
 import { searchJiraIdeaRules } from "../rules/jira-idea-type.js";
-import { setRuleEnabled, writeRulesFile } from "../rules/write-rules.js";
 
-const USAGE = `usage: butchr rules <subcommand>
-
-  check [file]          validate a rules file and dry-run its jira-work/jira-idea queries (read-only)
-  enable <id>            flip rule <id>'s "enabled" field to true
-  disable <id>           flip rule <id>'s "enabled" field to false
-  add --from <file.json> add ONE rule object read from <file.json>; its "id" must be new
-
-"enable"/"disable"/"add" all go through the same validated, atomic, backed-up
-write (src/rules/write-rules.ts) against the same path the daemon would read
-— BUTCHR_RULES_FILE, else $XDG_CONFIG_HOME/butchr/rules.json, else
-~/.config/butchr/rules.json. Rules are read once at startup: restart the
-daemon (or run "butchr rules reload" once FACTORY-643 slice 1 lands) to
-apply a change.
-
-Run "butchr rules <subcommand> --help" for a subcommand's own usage.`;
-
-const CHECK_USAGE = `usage: butchr rules check [file]
+const USAGE = `usage: butchr rules check [file]
 
 Validates a rules file (default: the same path the daemon would read —
 BUTCHR_RULES_FILE, else $XDG_CONFIG_HOME/butchr/rules.json, else
@@ -74,34 +57,6 @@ rule's JQL against this daemon's own configured Jira site.
 
 Read-only: starts nothing, posts nothing, writes nothing. Exits non-zero on
 a validation problem.`;
-
-const enableDisableUsage = (sub: "enable" | "disable"): string => `usage: butchr rules ${sub} <id>
-
-Flips rule <id>'s "enabled" field to ${sub === "enable" ? "true" : "false"} in
-the rules file (BUTCHR_RULES_FILE, else $XDG_CONFIG_HOME/butchr/rules.json,
-else ~/.config/butchr/rules.json), through the same validated, atomic,
-backed-up write every other rules-file writer uses. Every other rule, field,
-and byte of formatting is left untouched. Only "enabled" is ever changed —
-"brief", "mcpConfigFile", "permissionMode" and "lizardMode" cannot be
-touched this way.
-
-Prints the backup path and the diff summary, then reminds you to restart the
-daemon (or run "butchr rules reload" once FACTORY-643 slice 1 lands) to
-apply it. Exits non-zero if <id> does not exist or the resulting file fails
-validation.`;
-
-const ADD_USAGE = `usage: butchr rules add --from <file.json>
-
-Adds ONE rule object read from <file.json> to the rules file (same path as
-"enable"/"disable" above), through the same validated, atomic, backed-up
-write. <file.json>'s own "id" must not already exist in the rules file —
-any other field it sets is accepted as written, because the operator wrote
-the file.
-
-Prints the backup path and the diff summary, then reminds you to restart the
-daemon (or run "butchr rules reload" once FACTORY-643 slice 1 lands) to
-apply it. Exits non-zero if <file.json> is missing/invalid, its "id" is
-already taken, or the resulting file fails validation.`;
 
 /** The Jira capability this command needs — ONLY a read, never a write or spawn (see this file's own top comment). */
 export interface RulesCheckJiraEnv {
@@ -113,18 +68,11 @@ export interface RulesCliIo {
   env: RulesEnv;
   /** Injectable for tests against fixture text, exactly as `loadRulesFileState` itself allows. */
   readRulesFile?: ReadRulesFile;
-  /** Reads an arbitrary file as text (used by `rules add --from <file>`); defaults to a real `readFileSync`. Throws on failure, same as `readFileSync`. */
-  readFile?: (path: string) => string;
   /** May throw (e.g. missing Atlassian credentials) — reported as a clear message, never an uncaught crash. */
   loadJiraEnv: () => RulesCheckJiraEnv;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
-
-const defaultReadRulesFile: ReadRulesFile = (path) => {
-  try { return readFileSync(path, "utf8"); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
-};
 
 /**
  * Builds the one Jira capability this command ever uses, from the SAME
@@ -206,119 +154,24 @@ async function dryRunJiraRules(
   return total;
 }
 
-/** Reports a `writeRulesFile`/`setRuleEnabled` success the same way for every write subcommand. */
-function reportWrite(verb: string, result: { path: string; backupPath: string | null; changedIds: string[] }, stdout: (line: string) => void): void {
-  stdout(`${result.path}: ${verb}`);
-  stdout(`  backup: ${result.backupPath ?? "(none — file was newly created)"}`);
-  stdout(`  changed rule(s): ${result.changedIds.length ? result.changedIds.join(", ") : "(none)"}`);
-  stdout(`Restart the daemon (or run "butchr rules reload" once FACTORY-643 slice 1 lands) to apply it.`);
-}
+/** `argv` is everything AFTER `rules` (i.e. `process.argv.slice(3)` when `process.argv[2] === "rules"`). Returns the process exit code; never throws. */
+export async function runRulesCli(argv: string[], io: RulesCliIo = defaultIo()): Promise<number> {
+  const [sub, ...rest] = argv;
 
-/** Reports a thrown `Error` (validation problems, a missing file, an unknown id, ...) the same way for every write subcommand. */
-function reportWriteError(prefix: string, e: unknown, stderr: (line: string) => void): void {
-  const message = e instanceof Error ? e.message : String(e);
-  stderr(`${prefix}:`);
-  for (const line of message.split("\n")) stderr(`  ${line}`);
-}
-
-async function runEnableDisable(sub: "enable" | "disable", rest: string[], io: RulesCliIo): Promise<number> {
-  const usage = enableDisableUsage(sub);
-  if (rest[0] === "--help" || rest[0] === "-h") {
-    io.stdout(usage);
+  if (sub === "--help" || sub === "-h") {
+    io.stdout(USAGE);
     return 0;
   }
-  if (rest.length !== 1) {
-    io.stderr(`butchr rules ${sub}: expected exactly one argument (a rule id)\n\n${usage}`);
+  if (sub === undefined) {
+    io.stderr(USAGE);
     return 1;
   }
-  const id = rest[0]!; // rest.length === 1 checked above
-  const readRulesFile = io.readRulesFile ?? defaultReadRulesFile;
-  const path = rulesPath(io.env);
-  const currentText = readRulesFile(path);
-  if (currentText === undefined) {
-    io.stderr(`butchr rules ${sub}: ${path} does not exist`);
+  if (sub !== "check") {
+    io.stderr(`butchr rules: unknown subcommand ${JSON.stringify(sub)}\n\n${USAGE}`);
     return 1;
   }
-
-  let nextText: string;
-  try {
-    nextText = setRuleEnabled(currentText, id, sub === "enable");
-  } catch (e) {
-    reportWriteError(`butchr rules ${sub}`, e, io.stderr);
-    return 1;
-  }
-
-  try {
-    const result = writeRulesFile(nextText, io.env);
-    reportWrite(`rule ${JSON.stringify(id)} ${sub}d.`, result, io.stdout);
-    return 0;
-  } catch (e) {
-    reportWriteError(`butchr rules ${sub}`, e, io.stderr);
-    return 1;
-  }
-}
-
-async function runAdd(rest: string[], io: RulesCliIo): Promise<number> {
-  if (rest[0] === "--help" || rest[0] === "-h") {
-    io.stdout(ADD_USAGE);
-    return 0;
-  }
-  if (rest.length !== 2 || rest[0] !== "--from") {
-    io.stderr(`butchr rules add: expected "--from <file.json>"\n\n${ADD_USAGE}`);
-    return 1;
-  }
-  const fromFile = rest[1]!; // rest.length === 2 and rest[0] === "--from" checked above
-  const readFile = io.readFile ?? ((p: string) => readFileSync(p, "utf8"));
-
-  let raw: string;
-  try {
-    raw = readFile(fromFile);
-  } catch (e) {
-    io.stderr(`butchr rules add: could not read ${fromFile}: ${(e as Error).message}`);
-    return 1;
-  }
-  let newRule: unknown;
-  try {
-    newRule = JSON.parse(raw);
-  } catch (e) {
-    io.stderr(`butchr rules add: ${fromFile} is not valid JSON: ${(e as Error).message}`);
-    return 1;
-  }
-  if (!newRule || typeof newRule !== "object" || Array.isArray(newRule)) {
-    io.stderr(`butchr rules add: ${fromFile} must contain a single JSON object (one rule)`);
-    return 1;
-  }
-
-  const readRulesFile = io.readRulesFile ?? defaultReadRulesFile;
-  const path = rulesPath(io.env);
-  const currentText = readRulesFile(path);
-  let doc: unknown;
-  try {
-    doc = currentText === undefined ? { rules: [] } : JSON.parse(currentText);
-  } catch (e) {
-    io.stderr(`butchr rules add: ${path} is not valid JSON: ${(e as Error).message}`);
-    return 1;
-  }
-  if (!doc || typeof doc !== "object" || !Array.isArray((doc as Record<string, unknown>).rules)) {
-    io.stderr(`butchr rules add: ${path} must be an object with a "rules" array`);
-    return 1;
-  }
-  (doc as { rules: unknown[] }).rules = [...(doc as { rules: unknown[] }).rules, newRule];
-  const nextText = `${JSON.stringify(doc, null, 2)}\n`;
-
-  try {
-    const result = writeRulesFile(nextText, io.env);
-    reportWrite(`added rule from ${fromFile}.`, result, io.stdout);
-    return 0;
-  } catch (e) {
-    reportWriteError(`butchr rules add`, e, io.stderr);
-    return 1;
-  }
-}
-
-async function runCheck(rest: string[], io: RulesCliIo): Promise<number> {
   if (rest.length > 1) {
-    io.stderr(`butchr rules check: expected at most one argument (a rules file path)\n\n${CHECK_USAGE}`);
+    io.stderr(`butchr rules check: expected at most one argument (a rules file path)\n\n${USAGE}`);
     return 1;
   }
 
@@ -374,24 +227,4 @@ async function runCheck(rest: string[], io: RulesCliIo): Promise<number> {
     ? `>>> WOULD STAFF ${total} REAL TICKET(S) across ${jiraRules.length} jira-work/jira-idea rule(s) <<<`
     : `0 tickets matched across ${jiraRules.length} jira-work/jira-idea rule(s) — nothing would be staffed right now.`);
   return 0;
-}
-
-/** `argv` is everything AFTER `rules` (i.e. `process.argv.slice(3)` when `process.argv[2] === "rules"`). Returns the process exit code; never throws. */
-export async function runRulesCli(argv: string[], io: RulesCliIo = defaultIo()): Promise<number> {
-  const [sub, ...rest] = argv;
-
-  if (sub === "--help" || sub === "-h") {
-    io.stdout(USAGE);
-    return 0;
-  }
-  if (sub === undefined) {
-    io.stderr(USAGE);
-    return 1;
-  }
-  if (sub === "check") return runCheck(rest, io);
-  if (sub === "enable" || sub === "disable") return runEnableDisable(sub, rest, io);
-  if (sub === "add") return runAdd(rest, io);
-
-  io.stderr(`butchr rules: unknown subcommand ${JSON.stringify(sub)}\n\n${USAGE}`);
-  return 1;
 }
