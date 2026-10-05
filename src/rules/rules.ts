@@ -699,6 +699,41 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   return { path, origin: "file", rules: parseRules(doc, path) };
 }
 
+/**
+ * FACTORY-657: a live holder for the rules this daemon is currently
+ * running. `loadRules` itself stays a one-shot, pure read — this is the
+ * seam `src/daemon/index.ts` wires every consumer through instead of a
+ * `let rules` it reassigns, so a reload (`setRules`, driven by SIGHUP, or
+ * an in-process `reloadRules` call from FACTORY-663's future web write
+ * path) takes effect on each provider's very next poll, with no daemon
+ * restart.
+ *
+ * `getRules()` always returns the SAME array instance; `setRules` mutates
+ * its CONTENTS in place (`splice`, never a reassignment) rather than
+ * handing back a new array. That one property is load-bearing: most
+ * consumers in this codebase read `deps.rules` live, per poll, straight off
+ * the object they were constructed with (see e.g. `createRuleResourceType`'s
+ * own `discovery.search`, src/rules/resource-type.ts) — if `setRules`
+ * replaced the array instead of mutating it, every one of those
+ * already-constructed closures would keep the OLD array forever, and this
+ * holder would need to thread a getter *function* through every one of
+ * them instead. Mutating in place means a plain `rules: getRules()` at
+ * construction time is already reload-safe.
+ */
+export interface RulesHolder {
+  getRules(): readonly Rule[];
+  /** Replaces the held rules' CONTENTS in place — see this interface's own doc comment for why identity is preserved rather than reassigned. */
+  setRules(next: readonly Rule[]): void;
+}
+
+export function createRulesHolder(initial: readonly Rule[]): RulesHolder {
+  const live: Rule[] = [...initial];
+  return {
+    getRules: () => live,
+    setRules: (next) => { live.splice(0, live.length, ...next); },
+  };
+}
+
 /** One enabled jira-work rule's relationship field naming a rule id this daemon has no rule for. */
 export interface UnresolvedRelationship {
   ruleId: string;

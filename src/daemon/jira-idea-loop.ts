@@ -75,9 +75,14 @@ export const jiraIdeaRules = (rules: readonly Rule[]): Rule[] => rules.filter((r
  * with no tools and no loop to stop them.
  */
 export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
-  const rules = jiraIdeaRules(deps.rules);
+  // FACTORY-657: pass `deps.rules` straight through, never pre-filtered into
+  // a local — `createJiraIdeaResourceType`'s own `discovery.search`
+  // (src/rules/jira-idea-type.ts) already re-derives the enabled
+  // `jira-idea` subset on every poll from whatever it reads here, so
+  // filtering it ourselves, once, at loop-start would freeze a snapshot a
+  // rules reload (`RulesHolder.setRules`) could never update.
   const type = createJiraIdeaResourceType({
-    rules,
+    rules: deps.rules,
     search: deps.search,
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
