@@ -10,6 +10,7 @@ import { NavLink, Route, Routes } from "react-router";
 import { Heading } from "@launchpad-ui/components";
 import { DashboardRoute } from "./routes/DashboardRoute.js";
 import { ConfigurationsRoute } from "./routes/ConfigurationsRoute.js";
+import { RulesRoute } from "./routes/RulesRoute.js";
 import "./App.css";
 
 export function App() {
@@ -22,12 +23,14 @@ export function App() {
             Dashboard
           </NavLink>
           <NavLink to="/configurations">Configurations</NavLink>
+          <NavLink to="/rules">Rules</NavLink>
         </nav>
       </header>
       <main className="app-main">
         <Routes>
           <Route path="/" element={<DashboardRoute />} />
           <Route path="/configurations" element={<ConfigurationsRoute />} />
+          <Route path="/rules" element={<RulesRoute />} />
         </Routes>
       </main>
     </div>
