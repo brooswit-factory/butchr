@@ -613,14 +613,14 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ? restoredResumeRaw
     : new Set(restoredResumeRaw.split(",").map((name) => name.trim()).filter(Boolean));
   const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
+  validateAtlassianSiteShape(site);
   const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
   const token = env.ATLASSIAN_TOKEN_FILE
     ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
     : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
   if (!token) throw new Error("Atlassian token is empty");
 
-  const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
+  const port = parsePort(env);
 
   const githubToken = env.GITHUB_TOKEN_FILE ? readFile(env.GITHUB_TOKEN_FILE).trim() : undefined;
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
@@ -833,6 +833,55 @@ export function ignoredExtensionOriginsWarning(env: ConfigEnv): string | undefin
 function required(v: string | undefined, name: string): string {
   if (!v || !v.trim()) throw new Error(`Missing required config: ${name}`);
   return v.trim();
+}
+
+/**
+ * FACTORY-665 (PR-2), agentsafety A2's own finding: `ATLASSIAN_SITE` was
+ * read unvalidated (round-1, config.ts:615) — the client sends `Basic
+ * email:token` to WHATEVER host this names, so an operator typo or a
+ * malicious override here is a credential-exfiltration vector, not just a
+ * cosmetic one. Pinned to exactly `https://<name>.atlassian.net` (no path,
+ * no port, no query/fragment, no trailing content past the host) — called
+ * from `loadConfig` for the env-provided site AND from the setup-mode
+ * write route (`../web/setup-api.ts`) for an operator-provided one, so
+ * there is exactly one place this shape is defined.
+ */
+const ATLASSIAN_SITE_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.atlassian\.net$/i;
+
+export function validateAtlassianSiteShape(site: string): void {
+  if (!ATLASSIAN_SITE_RE.test(site)) {
+    throw new Error(`ATLASSIAN_SITE must look like https://<name>.atlassian.net (got ${JSON.stringify(site)})`);
+  }
+}
+
+/**
+ * FACTORY-665 (PR-2) — the daemon's own pre-`loadConfig` check: true iff
+ * every field `loadConfig` would otherwise require for the Atlassian
+ * section is present (same presence rule `required()`/the token branch
+ * above already enforce — mirrored here, not re-derived, so this can
+ * never drift into reporting "configured" for an env `loadConfig` would
+ * still reject). `src/daemon/index.ts` calls this BEFORE `loadConfig` to
+ * decide whether to start the real daemon or setup mode (`../daemon/setup-mode.ts`)
+ * — see that module's own header. Does NOT validate the site's shape or
+ * read the token file; only presence, to decide which path to take at all.
+ */
+/**
+ * FACTORY-665 (PR-2) — split out of `loadConfig` so `../daemon/setup-mode.ts`
+ * can resolve the SAME `BUTCHR_PORT` the real daemon would, without first
+ * needing a full `loadConfig` call (which requires Atlassian identity —
+ * exactly what setup mode exists to not require yet).
+ */
+export function parsePort(env: ConfigEnv): number {
+  const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
+  return port;
+}
+
+export function isAtlassianConfigured(env: ConfigEnv): boolean {
+  const hasSite = !!env.ATLASSIAN_SITE?.trim();
+  const hasEmail = !!env.ATLASSIAN_EMAIL?.trim();
+  const hasToken = !!env.ATLASSIAN_TOKEN?.trim() || !!env.ATLASSIAN_TOKEN_FILE?.trim();
+  return hasSite && hasEmail && hasToken;
 }
 
 /** AccountIds are not secrets; truncate them only for readability, never redact. */

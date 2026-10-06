@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { loadConfig, describeConfig, ignoredExtensionOriginsWarning } from "../../src/config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, validateAtlassianSiteShape } from "../../src/config/config.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
@@ -43,6 +43,12 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN: undefined }, noRead)).toThrow(/ATLASSIAN_TOKEN/);
     expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN_FILE: "/t" }, () => "  \n")).toThrow(/empty/);
     expect(() => loadConfig({ ...base, BUTCHR_PORT: "notaport" }, noRead)).toThrow(/BUTCHR_PORT/);
+  });
+  test("FACTORY-665: rejects an ATLASSIAN_SITE that isn't exactly https://<name>.atlassian.net", () => {
+    for (const bad of ["https://evil.example.com", "http://x.atlassian.net", "https://x.atlassian.net/extra", "https://x.atlassian.net:8443", "https://x.atlassian.net.evil.com", "https://.atlassian.net", "not-a-url"]) {
+      expect(() => loadConfig({ ...base, ATLASSIAN_SITE: bad }, noRead)).toThrow(/ATLASSIAN_SITE must look like/);
+    }
+    expect(() => loadConfig({ ...base, ATLASSIAN_SITE: "HTTPS://X.ATLASSIAN.NET" }, noRead)).not.toThrow();
   });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
@@ -523,5 +529,27 @@ describe("guard behavior with the real config (FACTORY-497/FACTORY-475)", () => 
     const c = loadConfig(base, noRead);
     const r = checkExtensionOrigin({ origin: null }, c.extensionAuth);
     expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {}, reason: "origin required" });
+  });
+});
+
+describe("FACTORY-665 (PR-2): isAtlassianConfigured / validateAtlassianSiteShape", () => {
+  test("isAtlassianConfigured is true only when site+email+(token or token file) are all present and non-blank", () => {
+    expect(isAtlassianConfigured(base)).toBe(true);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: "  " })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_EMAIL: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_TOKEN: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t" })).toBe(true);
+  });
+  test("isAtlassianConfigured never validates the site's shape — only presence (loadConfig/validateAtlassianSiteShape own that)", () => {
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: "not a url at all" })).toBe(true);
+  });
+  test("validateAtlassianSiteShape accepts exactly https://<name>.atlassian.net, case-insensitively, and rejects everything else", () => {
+    expect(() => validateAtlassianSiteShape("https://x.atlassian.net")).not.toThrow();
+    expect(() => validateAtlassianSiteShape("https://my-team.atlassian.net")).not.toThrow();
+    expect(() => validateAtlassianSiteShape("HTTPS://X.ATLASSIAN.NET")).not.toThrow();
+    for (const bad of ["https://evil.example.com", "http://x.atlassian.net", "https://x.atlassian.net/", "https://x.atlassian.net/path", "https://x.atlassian.net:443", "https://x.atlassian.net.evil.com", "https://.atlassian.net", "https://-x.atlassian.net", "ftp://x.atlassian.net", ""]) {
+      expect(() => validateAtlassianSiteShape(bad)).toThrow(/ATLASSIAN_SITE must look like/);
+    }
   });
 });
