@@ -378,15 +378,18 @@ describe("writeRulesFile: locking (review round 2)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
   });
 
-  test("a stale lock (dead pid) is cleared and the write proceeds", () => {
+  test("FACTORY-673: a stale lock (dead pid) is NOT reclaimed: the write fails closed with an actionable error and nothing is mutated", () => {
     writeRulesFile(doc([RULE_A]), env());
     const rulesDir = join(dir, "butchr");
     // a pid essentially guaranteed not to be a live process on any test runner
     writeFileSync(join(rulesDir, ".rules.lock"), "999999999");
-    const result = writeRulesFile(doc([RULE_A, RULE_B]), env());
-    expect(result.changedIds).toContain("stories");
-    // the lock file was cleaned up by the successful acquire+release
-    expect(readdirSync(rulesDir)).not.toContain(".rules.lock");
+    expect(() => writeRulesFile(doc([RULE_A, RULE_B]), env())).toThrow(/left behind by pid 999999999, which is no longer running[\s\S]*rm .*\.rules\.lock/);
+    // the lock file is untouched (never reclaimed) and the rules file was not mutated
+    expect(readdirSync(rulesDir)).toContain(".rules.lock");
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
+    // once the operator removes it (as the error says), the write proceeds
+    unlinkSync(join(rulesDir, ".rules.lock"));
+    expect(writeRulesFile(doc([RULE_A, RULE_B]), env()).changedIds).toContain("stories");
   });
 
   test("round 3, finding F6: age alone never reclaims a lock from a LIVE pid, however old", () => {
@@ -409,6 +412,18 @@ describe("writeRulesFile: locking (review round 2)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
   });
 
+  test("F9 (agentsafety): contention then success in ONE process — a refused write must not leave the path stuck as 'already being written'", () => {
+    writeRulesFile(doc([RULE_A]), env());
+    const rulesDir = join(dir, "butchr");
+    const lockPath = join(rulesDir, ".rules.lock");
+    writeFileSync(lockPath, String(process.pid)); // live holder: acquire throws
+    expect(() => writeRulesFile(doc([RULE_A, RULE_B]), env())).toThrow(/locked by another writer/);
+    expect(() => writeRulesFile(doc([RULE_A, RULE_B]), env())).toThrow(/locked by another writer/); // still the lock error, never the reentrancy one
+    unlinkSync(lockPath);
+    expect(writeRulesFile(doc([RULE_A, RULE_B]), env()).changedIds).toContain("stories");
+    expect(writeRulesFile(doc([RULE_A]), env()).changedIds).toContain("stories"); // and again: the guard entry was cleared every time
+  });
+
   test("an unreadable/corrupt lock fails closed rather than guessing it's abandoned", () => {
     writeRulesFile(doc([RULE_A]), env());
     const rulesDir = join(dir, "butchr");
@@ -417,39 +432,32 @@ describe("writeRulesFile: locking (review round 2)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
   });
 
-  test("round 3, finding F6: two waiters racing to reclaim the SAME dead lock — exactly one proceeds, never both simultaneously", async () => {
+  test("FACTORY-673: two real OS processes racing over the SAME dead lock — NEITHER proceeds, every time (200 rounds, no flake)", async () => {
     writeRulesFile(doc([RULE_A]), env());
     const rulesDir = join(dir, "butchr");
-    writeFileSync(join(rulesDir, ".rules.lock"), "999999999"); // a dead pid both workers will try to reclaim from
-
     const workerSrc = new URL("../../src/rules/write-rules.ts", import.meta.url).href;
     const worker = new URL("./fixtures/lock-race-worker.ts", import.meta.url).pathname;
     const logPath = join(dir, "race.log");
-    const holdMs = 300;
-
-    const [a, b] = await Promise.all([
-      Bun.spawn(["bun", "run", worker, workerSrc, rulesDir, logPath, String(holdMs)], { stdout: "pipe", stderr: "pipe" }).exited,
-      Bun.spawn(["bun", "run", worker, workerSrc, rulesDir, logPath, String(holdMs)], { stdout: "pipe", stderr: "pipe" }).exited,
-    ]);
-    void a; void b;
-
-    const lines = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { pid: number; start?: number; end?: number; error?: string });
-    const holders = lines.filter((l): l is { pid: number; start: number; end: number } => l.start !== undefined && l.end !== undefined);
-    const losers = lines.filter((l) => l.error !== undefined);
-
-    // every genuine holder actually held it (no error), and at least one of the two processes got in
-    expect(holders.length).toBeGreaterThan(0);
-    // no two holder intervals overlap — mutual exclusion held even while racing the SAME dead lock
-    for (let i = 0; i < holders.length; i++) {
-      for (let j = i + 1; j < holders.length; j++) {
-        const overlap = holders[i]!.start < holders[j]!.end && holders[j]!.start < holders[i]!.end;
-        expect(overlap).toBe(false);
-      }
+    // 200 rounds (FACTORY-674/FACTORY-675): the proof the rename-based reclaim
+    // race is gone. Fail condition: any iteration in which more than zero
+    // processes report having held the lock.
+    for (let round = 0; round < 200; round++) {
+      writeFileSync(join(rulesDir, ".rules.lock"), "999999999"); // a dead pid both workers find
+      rmSync(logPath, { force: true });
+      await Promise.all([
+        Bun.spawn(["bun", "run", worker, workerSrc, rulesDir, logPath, "0"], { stdout: "pipe", stderr: "pipe" }).exited,
+        Bun.spawn(["bun", "run", worker, workerSrc, rulesDir, logPath, "0"], { stdout: "pipe", stderr: "pipe" }).exited,
+      ]);
+      const lines = readFileSync(logPath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as { pid: number; start?: number; end?: number; error?: string });
+      const holders = lines.filter((l) => l.start !== undefined);
+      const losers = lines.filter((l) => l.error !== undefined);
+      expect(holders.length).toBe(0);
+      expect(losers.length).toBe(2);
+      for (const l of losers) expect(l.error).toMatch(/no longer running/);
+      // the dead lock is still there: nobody reclaimed or removed it
+      expect(readFileSync(join(rulesDir, ".rules.lock"), "utf8")).toBe("999999999");
     }
-    // a process that didn't hold it either failed with the expected "locked by another writer" / contention error, never silently nothing
-    for (const l of losers) expect(l.error).toMatch(/locked by another writer|could not acquire/);
-    expect(holders.length + losers.length).toBe(2);
-  });
+  }, 300_000);
 });
 
 describe("writeRulesFile: optimistic concurrency (ifMatch/etag, review round 2)", () => {

@@ -29,7 +29,8 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
@@ -182,26 +183,35 @@ const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.t
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
 // an absent file means zero rules (there are no built-in defaults), announced
 // so an idle daemon is never a mystery.
-let rules;
 let missingRulesPath: string | null = null;
-try {
-  const loaded = loadRules(process.env as Record<string, string | undefined>);
-  rules = loaded.rules;
-  if (loaded.origin === "missing") missingRulesPath = loaded.path;
-  const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
-  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
-  else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
-} catch (e) {
-  console.error(`butchr: ${(e as Error).message}`);
-  process.exit(1);
-}
+const rulesHolder = (() => {
+  try {
+    const loaded = loadRules(process.env as Record<string, string | undefined>);
+    if (loaded.origin === "missing") missingRulesPath = loaded.path;
+    const enabled = loaded.rules.filter((r) => r.enabled).map((r) => r.id);
+    if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
+    else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+    return createRulesHolder(loaded.rules, sourceEtagOf(loaded.text));
+  } catch (e) {
+    console.error(`butchr: ${(e as Error).message}`);
+    process.exit(1);
+  }
+})();
+// FACTORY-657: every consumer below reads through `getRules()` rather than
+// closing over a `rules` snapshot — see `RulesHolder`'s own doc comment
+// (src/rules/rules.ts) for why this makes a SIGHUP reload (or an
+// in-process `reloadRules` call, FACTORY-663) take effect without a
+// restart, and what still doesn't (a provider with
+// ZERO enabled rules — and so no client/loop at all — at startup still
+// needs one to ever begin staffing; see the SIGHUP handler below).
+const getRules = rulesHolder.getRules;
 // BUTCHR-398: log every sentinel rule at startup, one line each, so an
 // operator can see at a glance what is exempt from the fleet agent cap —
 // the epic decision's own ask ("log each sentinel rule at startup"). No
 // warning for an unflagged rule: `role` defaults to `"worker"`, and that
 // default needs no announcement (this task's own ticket: "deliberately NO
 // startup warning for rules without a role").
-for (const r of rules) {
+for (const r of getRules()) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
 }
 // BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
@@ -279,7 +289,7 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
     const manifestRole = managedSessionRoles.get(id);
     if (manifestRole) return manifestRole;
   }
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
 /**
@@ -297,7 +307,7 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  * every other rule-launched agent reads straight off its own `Rule`.
  */
 const ruleLizardModeOf = (id: string): boolean =>
-  sharedRuleLizardModeOf(id, { rules, isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
+  sharedRuleLizardModeOf(id, { rules: getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
 // BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
 // (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
 // agents are classified "sentinel" here (see src/agents/capacity-role.ts).
@@ -307,11 +317,13 @@ const ruleLizardModeOf = (id: string): boolean =>
 const roleOfAgent = (id: string): AgentCapacityRole =>
   capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
 
-// BUTCHR-405: logged once per unresolved reference, and the same list rides
-// on /health (see combineHealth call below) — both come from
-// unresolvedRelationships so they can never disagree.
-const unresolvedRuleRelationships = unresolvedRelationships(rules);
-for (const u of unresolvedRuleRelationships) console.error(`  ${formatUnresolvedRelationshipWarning(u)}`);
+// BUTCHR-405: logged once per unresolved reference at startup, from this
+// boot's own rules. /health (see combineHealth call below) recomputes this
+// fresh from `getRules()` on every request instead of reusing this one-time
+// list — FACTORY-657: a reload can fix (or introduce) an unresolved
+// relationship, and /health must never keep reporting this boot's stale
+// verdict after one.
+for (const u of unresolvedRelationships(getRules())) console.error(`  ${formatUnresolvedRelationshipWarning(u)}`);
 
 /**
  * BUTCHR-411 — `HerdrHerd.staleIssues()`'s own `mcpBindingsOf` seam (see that
@@ -325,7 +337,7 @@ for (const u of unresolvedRuleRelationships) console.error(`  ${formatUnresolved
 const mcpBindingsOf = (id: string) => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.mcpServers;
 };
 
@@ -351,7 +363,7 @@ const resolvedAgentOf = (id: string, provider: string): { model?: string; effort
   if (ownsManagedSessionAgent(id)) return managedSessionResolvedAgents.get(id);
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
   return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
@@ -377,7 +389,7 @@ const accountPolicyOf = (id: string): AccountPolicy => {
     const manifestPolicy = managedSessionAccountPolicies.get(id);
     if (manifestPolicy) return manifestPolicy;
   }
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.account ?? "none";
 };
 
@@ -414,7 +426,7 @@ const accountNameOf = (id: string): string | undefined =>
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
 // runs and nothing is spawned for one (announced by startGithubIssueLoop).
-const githubStaffing = githubIssueStaffing(rules, config.github);
+const githubStaffing = githubIssueStaffing(getRules(), config.github);
 const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -423,7 +435,7 @@ const githubIssues = githubStaffing.run && config.github
 // Config["github"]'s own doc comment) but are their own provider, staffing
 // gate, client and loop — a rules file with github-issue rules and no
 // github-pr rules stays unaffected, and vice versa.
-const githubPrStaffingResult = githubPrStaffing(rules, config.github);
+const githubPrStaffingResult = githubPrStaffing(getRules(), config.github);
 const githubPrs = githubPrStaffingResult.run && config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -432,19 +444,19 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
 // when an enabled zendesk-ticket rule exists.
-const zendeskStaffing = zendeskTicketStaffing(rules, process.env as Record<string, string | undefined>);
+const zendeskStaffing = zendeskTicketStaffing(getRules(), process.env as Record<string, string | undefined>);
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
 // filesystem rules need no external credential — every enabled one always
 // runs, reading the local disk directly (src/resources/filesystem.ts).
-const fsRules = filesystemRules(rules);
+const fsRules = filesystemRules(getRules());
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
-const ideaRules = jiraIdeaRules(rules);
+const ideaRules = jiraIdeaRules(getRules());
 const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
@@ -537,7 +549,7 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // it exists only so the admission census can report on this tier by name,
 // the same reason every other provider gets its own named source.
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
-const jiraProjectEnabled = rules.some((r) => r.enabled && r.resourceProvider === "jira-project");
+const jiraProjectEnabled = getRules().some((r) => r.enabled && r.resourceProvider === "jira-project");
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
 // BUTCHR-408: unlike every rule above, the managed-sessions query is built
 // into the daemon, never a user rules.json rule — it always runs (no
@@ -609,7 +621,7 @@ const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 const metaFor = (key: string): IssueMeta | undefined => {
   const query = decodeQueryAgentKey(key);
   if (!query) return issueMeta.get(resourceKeyOf(key));
-  const rule = rules.find((r) => r.id === query.ruleId && r.resourceProvider === query.resourceProvider);
+  const rule = getRules().find((r) => r.id === query.ruleId && r.resourceProvider === query.resourceProvider);
   return { summary: rule ? `${rule.id} (query agent)` : "(query agent — rule not found)", issuetype: "task" };
 };
 const dashboardFeed = createDashboardFeed({
@@ -775,6 +787,12 @@ const dashboardAppRoot = resolveWebRoot();
 
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
 const { app, mcp } = buildApp({
+  // FACTORY-657: not read by any route added in this PR (no HTTP endpoint,
+  // per this ticket's own scope correction) — see `ViewDeps`'s own doc
+  // comment (src/web/view.ts) for who these are for.
+  getRules,
+  getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
+  reloadRulesNow: () => reloadRules(rulesHolder),
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -804,7 +822,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot)),
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot)),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -818,7 +836,7 @@ const { app, mcp } = buildApp({
   // startup above), never a second load or a second staffing decision.
   configInventory: () =>
     buildQueryAgentInventory({
-      rulesFile: { path: rulesPath(), rules, error: null },
+      rulesFile: { path: rulesPath(), rules: getRules(), error: null },
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
@@ -911,6 +929,74 @@ const { app, mcp } = buildApp({
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
 console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${describeConfig(config)})`);
+
+// FACTORY-657 (FACTORY-643 slice 1, epic FACTORY-659): re-read rules.json
+// without a restart. `reloadRules` (src/rules/reload.ts) goes through the
+// exact same `loadRules` validation `butchr rules check` already dry-runs
+// — on a problem it leaves `rulesHolder` untouched (the running rules keep
+// running) and this logs the problem(s) once; on success it swaps the
+// holder's contents IN PLACE, which every provider's own per-poll read
+// (see `RulesHolder`'s own doc comment) picks up on its very next poll. A
+// rule a reload removes or disables does not kill its agent(s) mid-ticket:
+// the reconciler's ordinary stop/reap path ends them on a later poll,
+// exactly as a restart's first poll already does today (README's own
+// "Applying a change" section) — this changes nothing about that.
+//
+// No new HTTP route and no CLI subcommand here, per this ticket's own
+// scope correction (FACTORY-657 comment, 2026-10-05): the web write path
+// FACTORY-663 adds will call `reloadRules(rulesHolder)` in-process, right
+// after it writes rules.json itself, using this SAME function — SIGHUP is
+// the only trigger this daemon listens for on its own.
+//
+// Reload is per-poll, not instantaneous: every rule-reading site above
+// reads `getRules()` live, and several of them do so at more than one
+// `await` boundary within the SAME poll (e.g. a loop's `search()` reading
+// `deps.rules` once, then a later step reading it again). A SIGHUP landing
+// mid-poll can therefore be visible partway through that one poll's own
+// work; it is always fully applied by the NEXT poll. This mirrors the
+// existing restart behavior (the first poll after a restart already reads
+// whatever rules.json says then) and is not a new kind of tear — see
+// `test/unit/rules-reload.test.ts`'s own "does not tear" case for what IS
+// guaranteed: a single `discovery.search()` call's own result set never
+// mixes pre- and post-reload rules.
+//
+// Review round 1 (manager-factory): several startup-only computations do
+// NOT follow a reload, because they gate whether a provider's client/loop
+// exists AT ALL, not just which of its rules are enabled — `jiraProjectEnabled`,
+// `fsRules`, `githubStaffing.run`/`githubPrStaffingResult.run`,
+// `zendeskStaffing` (also re-reading its OAuth token file would be wrong -
+// credentials don't change via a rules reload), and `jiraIdeas`'s client
+// creation. A provider with ZERO enabled rules of its own kind at startup
+// has no running loop for SIGHUP to wake: bringing up that provider's very
+// first rule still needs a restart. `sweepStaleAgentLabels` similarly runs
+// once, at startup, and is unaffected either way.
+process.on("SIGHUP", () => {
+  const before = rulesHolder.getRules().length;
+  const result = reloadRules(rulesHolder);
+  if (!result.ok) {
+    console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
+    for (const line of result.problems) console.error(`  ${line}`);
+    return;
+  }
+  const enabled = rulesHolder.getRules().filter((r) => r.enabled).map((r) => r.id);
+  // Deliberately loud (not just "0 enabled") when a previously non-empty
+  // rules set reloads to zero: `reloadRules` above already refuses to swap
+  // in a MISSING file over a non-empty holder (that's the accident case),
+  // so reaching zero here means the file was present and parsed to
+  // genuinely zero enabled rules — an operator's real "disable everything"
+  // — but it is rare enough, and consequential enough (every rule-having
+  // agent stops on the next reconcile poll), to call out by name rather
+  // than let it read like any other reload.
+  console.error(
+    enabled.length === 0 && before > 0
+      ? `butchr: rules reloaded from ${result.path}: 0 enabled (was ${before}) — every rule-having agent will stop on the next reconcile poll`
+      : `butchr: rules reloaded from ${result.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : ""}`,
+  );
+  if (result.added.length) console.error(`  added: ${result.added.join(", ")}`);
+  if (result.removed.length) console.error(`  removed: ${result.removed.join(", ")}`);
+  if (result.changed.length) console.error(`  changed: ${result.changed.join(", ")}`);
+  if (!result.added.length && !result.removed.length && !result.changed.length) console.error(`  no change`);
+});
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
 // daemon's own /health `build` field serves (see `health` above) — never a
 // second derivation — so a journal window can be attributed to a BUILD, not
@@ -1215,7 +1301,7 @@ const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== n
 // (below) now always runs, a `.butchr-rc-accounts.json` read every 30
 // minutes, even on a daemon that will never provision anything.
 const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
-if (!rcAuth.ok && rules.some((r) => r.enabled && r.account !== "none")) {
+if (!rcAuth.ok && getRules().some((r) => r.enabled && r.account !== "none")) {
   console.error(`  WARNING: [account] enabled rule(s) request a Rocket.Chat account policy but Rocket.Chat is not usable (${rcAuth.reason}) — every ensureAccount call will refuse until this is fixed`);
 }
 const rcClient = rcAuth.ok
@@ -1476,7 +1562,7 @@ watchSessionLimits({
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
 // the 15s poll only ever sees active tickets, so nothing else ever revisits
 // this. Not a new polling timer — runs once, here, and never again.
-if (rules.some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
+if (getRules().some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
   jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
@@ -1521,7 +1607,7 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
 };
 
 const ruleResourceType = createRuleResourceType({
-  rules,
+  rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
   // leaving the query and stop their agents.
   search: async (jql) => {
@@ -1636,6 +1722,7 @@ let ideaMatches: readonly RuleMatch[] = [];
 startGithubIssueLoop({
   onMatches: (matches) => { githubMatches = matches; },
   staffing: githubStaffing,
+  rules: getRules(),
   client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
@@ -1659,6 +1746,7 @@ startGithubIssueLoop({
 if (githubPrs) console.error(`  github-pr rules: ${githubPrStaffingResult.rules.map((r) => r.id).join(", ")}`);
 startGithubPrLoop({
   staffing: githubPrStaffingResult,
+  rules: getRules(),
   client: githubPrs ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
@@ -1682,7 +1770,7 @@ startGithubPrLoop({
 if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
 if (!githubIssues && ideaRules.some((r) => r.relationships?.inwardConnectionRules?.length)) console.error("  WARNING: jira-idea rules list github-issue rules, but github-issue rules are not staffed; ideas hear no GitHub issues");
 startJiraIdeaLoop({
-  rules,
+  rules: getRules(),
   search: async (jql) => {
     const issues = await atlassian.searchAll(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
@@ -1716,6 +1804,7 @@ startJiraIdeaLoop({
 if (zendeskStaffing.run) console.error(`  zendesk-ticket rules: ${zendeskStaffing.rules.map((r) => r.id).join(", ")} (subdomain ${zendeskStaffing.subdomain})`);
 startZendeskTicketLoop({
   staffing: zendeskStaffing,
+  rules: getRules(),
   client: zendeskTickets ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
@@ -1739,7 +1828,7 @@ startZendeskTicketLoop({
 // (a file or directory) is never written to by butchr itself.
 if (fsRules.length) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
 startFilesystemLoop({
-  rules,
+  rules: getRules(),
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
@@ -2271,7 +2360,7 @@ watchPrompts({
 // every other rule provider. Always sentinels (src/agents/capacity-role.ts),
 // so admission never withholds one regardless of `config.maxAgents`.
 const projectType = createJiraProjectResourceType({
-  rules,
+  rules: getRules(),
   search: (q) => atlassian.searchProjects(q),
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
   prepare: (spec) => resourceConnections.prepare(spec),

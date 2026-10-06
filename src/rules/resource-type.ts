@@ -426,7 +426,19 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     async poll(prev: PollSnapshot<ExecutionUnit<RuleMatch>>, next: PollSnapshot<ExecutionUnit<RuleMatch>>): Promise<EventPoll> {
       const polls = new Map<string, EventPoll>();
       const changed: string[] = [];
-      for (const rule of deps.rules) {
+      // FACTORY-657, agentsafety review R1: snapshot BEFORE iterating — this
+      // loop awaits per rule (`innerFor(rule).poll`), and `deps.rules` is
+      // the daemon's own LIVE `RulesHolder` array, whose contents a
+      // concurrent SIGHUP's `setRules` splices IN PLACE between awaits. A
+      // bare `for (const rule of deps.rules)` reads index-by-index off that
+      // same mutating array, so a splice landing mid-loop can skip (or
+      // revisit) a rule — e.g. removing rule "a" while this loop sits on
+      // index 1 shifts rule "c" into index 1, and the loop's next step
+      // reads index 2, never visiting "c" this poll. Copying once, up
+      // front, means this poll's own rule list is fixed for its whole
+      // duration regardless of what lands mid-poll — exactly the "read
+      // once per poll" contract the rest of this file already documents.
+      for (const rule of [...deps.rules]) {
         const before = issuesFor(prev.primary, rule.id);
         const after = issuesFor(next.primary, rule.id);
         if (!before.length && !after.length && !inner.has(rule.id)) continue;

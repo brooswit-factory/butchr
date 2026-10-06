@@ -34,7 +34,7 @@ describe("loadRules", () => {
   test("absent default file is zero rules, marked missing, and nothing is written", () => {
     const writes: string[] = [];
     const r = loadRules({ XDG_CONFIG_HOME: "/x" }, (p) => { writes.push(p); return undefined; });
-    expect(r).toEqual({ path: "/x/butchr/rules.json", origin: "missing", rules: [] });
+    expect(r).toEqual({ path: "/x/butchr/rules.json", origin: "missing", rules: [], text: undefined });
     expect(writes).toEqual(["/x/butchr/rules.json"]);
   });
   test("an explicit BUTCHR_RULES_FILE that does not exist is an error, never zero rules", () => {
@@ -47,15 +47,16 @@ describe("loadRules", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   test("a present empty file is also zero rules", () => {
-    expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [] });
+    expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [], text: '{"rules":[]}' });
   });
   test("default reader: absent file is missing, present file parses, a directory throws", () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-rules-"));
     try {
-      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [] });
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [], text: undefined });
       mkdirSync(join(dir, "butchr"));
-      writeFileSync(join(dir, "butchr", "rules.json"), JSON.stringify({ rules: [minimal] }));
-      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none", role: "worker" } as never] });
+      const rulesText = JSON.stringify({ rules: [minimal] });
+      writeFileSync(join(dir, "butchr", "rules.json"), rulesText);
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none", role: "worker" } as never], text: rulesText });
       expect(() => loadRules({ BUTCHR_RULES_FILE: dir })).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
