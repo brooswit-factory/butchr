@@ -567,7 +567,19 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
       expect(statuses.slice(0, 5)).toEqual([200, 200, 200, 200, 200]);
       expect(statuses.slice(5)).toEqual(new Array(25).fill(429));
       expect(calls).toBe(5); // the write dep was never reached for the refused 25
-      for (const ra of retryAfters.slice(5)) expect(Number(ra)).toBeGreaterThan(0);
+      // N2 contract (FACTORY-663/PR #650 pinned this at its head 46d1494):
+      // `Retry-After` must be a bare non-negative INTEGER number of
+      // seconds — PR #650 parses it with `Number.parseInt(header, 10)`
+      // and silently drops the retry time (no error, no log) on anything
+      // else, including an HTTP-date or a fractional value. Assert the
+      // exact wire string, not just `Number(ra) > 0` — a value like
+      // `"6.5"` or a date string would pass that weaker check while
+      // breaking #650's parser.
+      for (const ra of retryAfters.slice(5)) {
+        expect(ra).not.toBeNull();
+        expect(ra).toMatch(/^[0-9]+$/);
+        expect(Number.parseInt(ra!, 10)).toBeGreaterThanOrEqual(0);
+      }
     } finally { await app.stop(true); }
   });
 
