@@ -140,3 +140,16 @@ describe("isModeTooOpen", () => {
   test("0640 is too open (group-readable)", () => expect(isModeTooOpen(0o640)).toBe(true));
   test("0777 is too open", () => expect(isModeTooOpen(0o777)).toBe(true));
 });
+
+describe("redactUrlUserinfo: a password that itself contains '@' leaves no remainder (manager-factory review of #660)", () => {
+  test("https://u:p@ss@host/x -> nothing of the password survives", () => {
+    const out = redactUrlUserinfo("https://user:p@ss-CANARY@chat.example.com/path?x=1");
+    expect(out).toBe("https://[redacted]@chat.example.com/path?x=1");
+    expect(out).not.toContain("CANARY");
+    expect(out).not.toContain("ss");
+  });
+  test("a plain URL without userinfo, and a path containing '@', are untouched", () => {
+    expect(redactUrlUserinfo("https://chat.example.com/a@b")).toBe("https://chat.example.com/a@b");
+    expect(redactUrlUserinfo("https://chat.example.com")).toBe("https://chat.example.com");
+  });
+});
