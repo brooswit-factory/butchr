@@ -46,6 +46,17 @@ import { isUiEditableRuleId, PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleF
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
+/**
+ * FACTORY-687 — `current` here is the RAW object out of `readRuleById`
+ * (`parseRulesDoc`'s own shape), not the `loadRules`-normalized rule, and
+ * `rules.ts` normalizes a missing `execution` to `"swarm"`. Comparing
+ * `current.execution === "swarm"` directly therefore misses a rule that
+ * simply omits the field — a swarm rule at runtime that neither gate below
+ * would catch. This mirrors that same default inline wherever the raw value
+ * is compared.
+ */
+const executionOf = (raw: unknown): string => (raw === undefined ? "swarm" : String(raw));
+
 export class WriteRefusedError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }
@@ -372,7 +383,7 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
       }
       // FACTORY-685 (item 2): ANY enable of a swarm rule needs an explicit
       // confirm — independent of, and checked before, the ceiling below.
-      if (current.execution === "swarm" && !confirm) {
+      if (executionOf(current.execution) === "swarm" && !confirm) {
         return { ok: false, status: 409, error: `enabling "${id}" will staff up to ${scopeLabel(scopeForHash)} ticket(s); resend with confirm: true to proceed` };
       }
       if (scopeForHash > ENABLE_SCOPE_CEILING && !confirm) {
@@ -608,7 +619,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   // only one above the ceiling — computed "raw" (independent of `confirm`)
   // so `confirmReason` can classify the gate even on a call that already
   // supplied `confirm: true`.
-  const rawSwarmEnable = counts.spawned > 0 && current.execution === "swarm";
+  const rawSwarmEnable = counts.spawned > 0 && executionOf(current.execution) === "swarm";
   const rawOverCeiling = scope !== null && scope > ENABLE_SCOPE_CEILING;
   const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
   const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm);
