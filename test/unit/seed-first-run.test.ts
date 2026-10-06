@@ -39,7 +39,12 @@ describe("seedFirstRunRules — true first run", () => {
     expect(rule.enabled).toBe(false);
     expect(rule.resourceProvider).toBe("jira-work");
     expect(rule.query).toBe("PLACEHOLDER_QUERY");
-    expect(rule.execution).toBe("singleton");
+    // FACTORY-685 (item 1, agentsafety F1): the template now seeds
+    // "swarm" — the shape its "@builtin:task" brief (per-ticket, one agent
+    // per matching ticket) is actually written for. The PREVIOUS seed wrote
+    // "singleton" here, a defect this test previously pinned; updated
+    // deliberately rather than deleted, per this ticket's own instruction.
+    expect(rule.execution).toBe("swarm");
     expect(rule.account).toBe("none");
     expect(rule.role).toBe("worker");
     expect(rule.permissionMode).toBe("default");
@@ -143,11 +148,16 @@ describe("seedFirstRunRules — prior state (.bak-*) means an established instal
     expect(existsSync(rulesFilePath())).toBe(false);
   });
 
-  test("a hand-made file that merely CONTAINS '.bak-' but doesn't match the backup shape does not count as prior state — still a true first run", () => {
+  test("a hand-made file that merely CONTAINS '.bak-' but doesn't match the backup shape does not count as PRIOR-BACKUP state — but FACTORY-685's L1 still blocks the seed, since the dir isn't EMPTY either", () => {
+    // Pre-FACTORY-685, this was a true first run (no rules.json, no entry
+    // matching the strict backup shape) and seeded. L1 (item 4) deliberately
+    // narrows that: an unrelated file sitting in the dir is OTHER STATE, so
+    // this now reports `config-dir-not-empty` instead — updated
+    // deliberately, not weakened, per this ticket's own instruction.
     mkdirSync(join(dir, "butchr"), { recursive: true });
     writeFileSync(join(dir, "butchr", "notes.bak-for-later.txt"), "hello");
     const outcome = seedFirstRunRules(env());
-    expect(outcome.kind).toBe("seeded");
+    expect(outcome.kind).toBe("config-dir-not-empty");
   });
 });
 
@@ -176,5 +186,124 @@ describe("runtime delete does not recreate — nothing but the one startup call 
     expect(result.ok).toBe(true);
     const { existsSync } = require("node:fs") as typeof import("node:fs");
     expect(existsSync(rulesFilePath())).toBe(false);
+  });
+});
+
+describe("seedFirstRunRules — L1 (FACTORY-685): absent-or-EMPTY config dir only — other state blocks the seed", () => {
+  test("GO-RED: a config dir holding unrelated state (session-definitions/, secrets/), but no rules.json, is NOT seeded", () => {
+    mkdirSync(join(dir, "butchr", "session-definitions"), { recursive: true });
+    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("config-dir-not-empty");
+    if (outcome.kind === "config-dir-not-empty") expect(outcome.path).toBe(rulesFilePath());
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+    expect(existsSync(rulesFilePath())).toBe(false);
+  });
+
+  test("an absent directory is still a true first run (the common case — must not regress)", () => {
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+  });
+
+  test("an EXISTING but genuinely empty directory is still a true first run", () => {
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+  });
+
+  test("a prior .bak-* entry still takes precedence over the generic 'other state' outcome (reports vanished-established-install, not config-dir-not-empty)", () => {
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    writeFileSync(join(dir, "butchr", "rules.json.bak-20261005T180000Z"), JSON.stringify({ rules: [] }));
+    writeFileSync(join(dir, "butchr", "secrets.txt"), "also other state");
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("vanished-established-install");
+  });
+});
+
+describe("seedFirstRunRules — L2 (FACTORY-685): never chmod an EXISTING rules directory, in either direction", () => {
+  test("GO-RED: a pre-existing dir at mode 0755 is NOT narrowed to 0700 (the pre-fix bug)", () => {
+    const { chmodSync, statSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    chmodSync(join(dir, "butchr"), 0o755);
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+    expect(statSync(join(dir, "butchr")).mode & 0o777).toBe(0o755);
+  });
+
+  test("a pre-existing dir at mode 0500 is NOT widened to 0700 either — the write then genuinely fails closed (no owner write bit), reported as seed-failed, never silently 'fixed' by widening", () => {
+    const { chmodSync, statSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    chmodSync(join(dir, "butchr"), 0o500);
+    const outcome = seedFirstRunRules(env());
+    // Pre-fix, the unconditional chmod would have widened this to 0700,
+    // letting the write silently succeed. Post-fix, the dir's own
+    // permissions are left exactly as found — which means a dir with no
+    // owner-write bit genuinely cannot accept the new file, and this
+    // reports `seed-failed` rather than lying about having seeded.
+    expect(outcome.kind).toBe("seed-failed");
+    expect(statSync(join(dir, "butchr")).mode & 0o777).toBe(0o500);
+  });
+
+  test("a genuinely absent dir is still created at mode 0700 (the ordinary case — must not regress)", () => {
+    const { statSync } = require("node:fs") as typeof import("node:fs");
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+    expect(statSync(join(dir, "butchr")).mode & 0o777).toBe(0o700);
+  });
+
+  test("a pre-existing dir wider than 0700 surfaces a dirPermissionsWarning on the outcome", () => {
+    const { chmodSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    chmodSync(join(dir, "butchr"), 0o755);
+    const wide = seedFirstRunRules(env());
+    expect(wide.kind).toBe("seeded");
+    if (wide.kind === "seeded") {
+      expect(wide.dirPermissionsWarning).toBeDefined();
+      expect(wide.dirPermissionsWarning).toMatch(/0700/);
+    }
+  });
+
+  test("a pre-existing dir AT (or narrower than) 0700 carries no dirPermissionsWarning", () => {
+    const { chmodSync } = require("node:fs") as typeof import("node:fs");
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    chmodSync(join(dir, "butchr"), 0o700);
+    const exact = seedFirstRunRules(env());
+    expect(exact.kind).toBe("seeded");
+    if (exact.kind === "seeded") expect(exact.dirPermissionsWarning).toBeUndefined();
+  });
+});
+
+describe("seedFirstRunRules — L3 (FACTORY-685): the WHOLE body is wrapped, not just the write", () => {
+  test("GO-RED: hasPriorBackup's own listDir throwing (e.g. EACCES on the directory) reports seed-failed, never propagates", () => {
+    const { defaultIo } = require("../../src/rules/write-rules.js") as typeof import("../../src/rules/write-rules.js");
+    const failingIo = { ...defaultIo(), listDir: () => { throw new Error("simulated EACCES listing the config dir"); } };
+    const outcome = seedFirstRunRules(env(), failingIo);
+    expect(outcome.kind).toBe("seed-failed");
+    if (outcome.kind === "seed-failed") expect(outcome.error).toMatch(/simulated EACCES/);
+  });
+
+  test("GO-RED: the somethingAtPath check's own readFile throwing a non-ENOENT error (e.g. EISDIR — a directory sitting at the rules path) reports seed-failed, never propagates", () => {
+    const { defaultIo } = require("../../src/rules/write-rules.js") as typeof import("../../src/rules/write-rules.js");
+    const failingIo = { ...defaultIo(), readFile: () => { throw new Error("simulated EISDIR: illegal operation on a directory"); } };
+    const outcome = seedFirstRunRules(env(), failingIo);
+    expect(outcome.kind).toBe("seed-failed");
+    if (outcome.kind === "seed-failed") expect(outcome.error).toMatch(/simulated EISDIR/);
+  });
+
+  test("GO-RED: isSymlink itself throwing reports seed-failed, never propagates", () => {
+    const { defaultIo } = require("../../src/rules/write-rules.js") as typeof import("../../src/rules/write-rules.js");
+    const failingIo = { ...defaultIo(), isSymlink: () => { throw new Error("simulated lstat failure"); } };
+    const outcome = seedFirstRunRules(env(), failingIo);
+    expect(outcome.kind).toBe("seed-failed");
+    if (outcome.kind === "seed-failed") expect(outcome.error).toMatch(/simulated lstat failure/);
+  });
+
+  test("a failure anywhere in the body leaves a subsequent loadRules seeing the ordinary missing-file state, same as a plain write failure", () => {
+    const { defaultIo } = require("../../src/rules/write-rules.js") as typeof import("../../src/rules/write-rules.js");
+    const failingIo = { ...defaultIo(), listDir: () => { throw new Error("simulated EACCES"); } };
+    seedFirstRunRules(env(), failingIo);
+    const { origin, rules } = loadRules(env());
+    expect(origin).toBe("missing");
+    expect(rules).toEqual([]);
   });
 });

@@ -206,9 +206,14 @@ let missingRulesPath: string | null = null;
 const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
 if (firstRunSeedOutcome.kind === "seeded") {
   console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); edit its query in the dashboard, then enable it (its brief is file-only — edit that in ${firstRunSeedOutcome.path} by hand if you want it)`);
+  if (firstRunSeedOutcome.dirPermissionsWarning) console.error(`WARNING: butchr: ${firstRunSeedOutcome.dirPermissionsWarning}`);
 } else if (firstRunSeedOutcome.kind === "vanished-established-install") {
   console.error(
     `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but a prior backup (.bak-*) exists in its directory — this looks like an established install whose rules file vanished, not a fresh one, so no template was seeded. Restore it (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
+  );
+} else if (firstRunSeedOutcome.kind === "config-dir-not-empty") {
+  console.error(
+    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but its directory already holds other state — this looks like an established install some other way, not a fresh one, so no template was seeded. Add a rules file (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
   );
 } else if (firstRunSeedOutcome.kind === "seed-failed") {
   console.error(`WARNING: butchr: first-run seed of ${firstRunSeedOutcome.path} failed, starting with no rules as if the file were simply absent: ${firstRunSeedOutcome.error}`);
@@ -889,6 +894,12 @@ const rulesWriteDeps = {
   env: process.env,
   reload: () => {
     const result = reloadRules(rulesHolder);
+    // FACTORY-685 (N4): every successful write already calls this via
+    // `toOutcome` — clearing the scope cache here, unconditionally, means a
+    // cached scope reading can never outlive the write (or SIGHUP, or the
+    // `reloadRulesNow` HTTP route below, which clear it the same way) that
+    // may have invalidated it.
+    scopeOf.clear();
     return { applied: result.ok, problems: result.problems };
   },
   // STALE-FILE REFUSAL (agentsafety second pass): the daemon's own
@@ -900,7 +911,11 @@ const rulesWriteDeps = {
 const { app, mcp } = buildApp({
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
-  reloadRulesNow: () => reloadRules(rulesHolder),
+  reloadRulesNow: () => {
+    const result = reloadRules(rulesHolder);
+    scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
+    return result;
+  },
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -1133,6 +1148,7 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 process.on("SIGHUP", () => {
   const before = rulesHolder.getRules().length;
   const result = reloadRules(rulesHolder);
+  scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
   if (!result.ok) {
     console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
     for (const line of result.problems) console.error(`  ${line}`);
@@ -2277,6 +2293,18 @@ if (firstRunSeedOutcome.kind === "seeded") {
     subject: `rules file ${firstRunSeedOutcome.path}`,
     reason: "the default rules file is absent but a prior .bak-* backup exists in its directory — an established install's rules file appears to have vanished, so no first-run template was seeded",
     remedy: "Restore the rules file (from a .bak-* backup, or by hand) and SIGHUP/restart the daemon; nothing is staffed until then.",
+    dedupWindowMs: 0,
+  });
+} else if (firstRunSeedOutcome.kind === "config-dir-not-empty") {
+  // FACTORY-685 (L1): same non-deduped discipline as the "vanished" case
+  // above — this is also "an established install some other way", never
+  // swallowed by the router's ordinary hourly dedup.
+  opsAlertRouter.raise({
+    key: `rules-config-dir-not-empty:${firstRunSeedOutcome.path}`,
+    condition: "rules-config-dir-not-empty",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: "the default rules file is absent and its directory holds no .bak-* backup, but the directory already holds other state — this looks like an established install some other way, so no first-run template was seeded",
+    remedy: "Add a rules file (from a backup, or by hand) and SIGHUP/restart the daemon; nothing is staffed until then.",
     dedupWindowMs: 0,
   });
 }
