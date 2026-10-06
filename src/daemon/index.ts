@@ -119,8 +119,9 @@ import { createRulesPreviewer } from "../web/rules-preview.js";
 import { isSameUidPeer } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
+import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite } from "../rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -808,6 +809,12 @@ const rulesPreviewer = createRulesPreviewer({ rules: getRules, search: (jql) => 
 // and never persisted (see `../web/csrf.ts`'s own header).
 const csrfIssuer = createCsrfTokenIssuer();
 
+// N2 (FACTORY-678): ONE shared per-client write-flood limiter instance —
+// same discipline as `rulesPreviewer`/`scopeOf` above — covering all four
+// write-shaped routes (`../web/view.ts` wires this same instance into
+// each), at its own real default window/cap (`../web/write-rate-limit.ts`).
+const writeRateLimit = createWriteRateLimiter();
+
 // FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
 // itself (same directory FACTORY-658's own backups live in) — every
 // accepted/rejected write appends one line here AND raises a non-deduped
@@ -844,11 +851,18 @@ const auditWrite = createAuditLogger({
 // previewer `GET /api/rules/:id/preview` already shares — never a second
 // Jira query mechanism — and fails safe (treats a failed/unavailable
 // preview as an unbounded scope, which forces the confirm gate rather than
-// silently skipping it).
-const scopeOf = async (id: string): Promise<number> => {
+// silently skipping it). N1 (FACTORY-678): wrapped in `createScopeCache`
+// (`../rules/rules-write.ts`) — ONE shared 10s-TTL cache, so `planRuleWrite`
+// and `writeRuleEnabled` calling this for the SAME rule id moments apart
+// (a UI's normal plan-then-apply flow) share one real previewer call
+// instead of the second one being refused by the previewer's own 2s
+// per-rule rate limit (which previously fell through to the
+// `Number.POSITIVE_INFINITY` fail-safe below, tripping the scope ceiling
+// on every back-to-back apply).
+const scopeOf = createScopeCache(async (id: string): Promise<number> => {
   const result = await rulesPreviewer(id);
   return result.ok ? result.total : Number.POSITIVE_INFINITY;
-};
+});
 const rulesWriteDeps = {
   env: process.env,
   reload: () => {
@@ -1017,6 +1031,7 @@ const { app, mcp } = buildApp({
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
   },
   auditWrite,
+  writeRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no

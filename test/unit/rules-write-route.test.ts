@@ -1,9 +1,16 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { McpHandle } from "@brooswit/thatch";
 import { liveView, type ViewDeps } from "../../src/web/view.js";
 import { createCsrfTokenIssuer } from "../../src/web/csrf.js";
 import { CSRF_HEADER, BODY_CAP_BYTES } from "../../src/web/write-guard.js";
-import type { RulesWriteOutcome, RulesPlanOutcome } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, planRuleWrite, type RulesWriteOutcome, type RulesPlanOutcome } from "../../src/rules/rules-write.js";
+import { rulesEtag } from "../../src/rules/write-rules.js";
+import type { RulesEnv } from "../../src/rules/rules.js";
+import { createWriteRateLimiter } from "../../src/web/write-rate-limit.js";
+import { createAuditLogger } from "../../src/web/audit-log.js";
 
 const fakeMcp = { connections: { list: () => [] } } as unknown as McpHandle;
 
@@ -520,5 +527,268 @@ describe("B1 — path-shape bypass is closed for every write route", () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/does-not-exist`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
       expect(res.status).toBe(403);
     } finally { await app.stop(true); }
+  });
+});
+
+describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retry-After", () => {
+  function buildDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, onEnabled: (...a: unknown[]) => Promise<RulesWriteOutcome>, writeRateLimit: NonNullable<ViewDeps["writeRateLimit"]>, audited: unknown[] = []) {
+    return {
+      csrf,
+      writeGuard: writeGuardDeps(csrf),
+      dashboardOriginGuard: { port: 0 },
+      peerUidCheck: () => true,
+      writeRateLimit,
+      rulesWrite: {
+        enabled: onEnabled as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (async () => ({ ok: true, planHash: "h", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "e", requiresConfirm: false })) as any,
+      },
+      auditWrite: (e: unknown) => { audited.push(e); },
+    };
+  }
+
+  test("30 requests inside the budget window to the same client: the first N are processed, the rest 429 with Retry-After, write never called for those", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let calls = 0;
+    const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 5 }); // real Date.now, but the whole burst below runs well within 10s
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => { calls++; return ACCEPTED; }, writeRateLimit));
+    try {
+      const statuses: number[] = [];
+      const retryAfters: (string | null)[] = [];
+      for (let i = 0; i < 30; i++) {
+        const res = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
+          method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
+        });
+        statuses.push(res.status);
+        retryAfters.push(res.headers.get("retry-after"));
+      }
+      expect(statuses.slice(0, 5)).toEqual([200, 200, 200, 200, 200]);
+      expect(statuses.slice(5)).toEqual(new Array(25).fill(429));
+      expect(calls).toBe(5); // the write dep was never reached for the refused 25
+      // N2 contract (FACTORY-663/PR #650 pinned this at its head 46d1494):
+      // `Retry-After` must be a bare non-negative INTEGER number of
+      // seconds — PR #650 parses it with `Number.parseInt(header, 10)`
+      // and silently drops the retry time (no error, no log) on anything
+      // else, including an HTTP-date or a fractional value. Assert the
+      // exact wire string, not just `Number(ra) > 0` — a value like
+      // `"6.5"` or a date string would pass that weaker check while
+      // breaking #650's parser.
+      for (const ra of retryAfters.slice(5)) {
+        expect(ra).not.toBeNull();
+        expect(ra).toMatch(/^[0-9]+$/);
+        expect(Number.parseInt(ra!, 10)).toBeGreaterThanOrEqual(0);
+      }
+    } finally { await app.stop(true); }
+  });
+
+  test("a 429'd write wrote NOTHING — the rules file is byte-identical, not merely a 429 status", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rules-write-route-"));
+    try {
+      const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
+      mkdirSync(join(dir, "butchr"), { recursive: true });
+      const rulesFilePath = join(dir, "butchr", "rules.json");
+      const originalText = JSON.stringify({ rules: [{ id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false }] }, null, 2) + "\n";
+      writeFileSync(rulesFilePath, originalText);
+      const writeDeps = { env: envDeps };
+      const scopeOf = async () => 0;
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, writeDeps);
+      if (!plan.ok) throw new Error("expected a successful plan");
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, writeRateLimit,
+        rulesWrite: {
+          enabled: ((id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, writeDeps)) as any,
+          fields: (() => { throw new Error("unused"); }) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+        },
+      });
+      try {
+        const body = JSON.stringify({ enabled: true, ifMatch: etag, planHash: plan.planHash });
+        const first = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+        expect(first.status).toBe(200); // consumes the budget (max: 1)
+        const second = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+        expect(second.status).toBe(429);
+        // The first write DID land (enabled: true); a SECOND identical
+        // attempt is refused by the limiter before `rulesWrite.enabled`
+        // ever runs again — the file must be exactly as the first write
+        // left it, not reverted, not double-written.
+        const afterFirstWrite = JSON.parse(readFileSync(rulesFilePath, "utf8"));
+        expect(afterFirstWrite.rules[0].enabled).toBe(true);
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("rejected (429) attempts are audited through the SAME rejected-write pipeline as any other refusal", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ACCEPTED, writeRateLimit, audited));
+    try {
+      const body = JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" });
+      await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+      await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+      expect(audited).toHaveLength(2);
+      expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
+      expect((audited[1] as { outcome: string; reason?: string }).outcome).toBe("rejected");
+      expect((audited[1] as { outcome: string; reason?: string }).reason).toMatch(/rate limited/);
+    } finally { await app.stop(true); }
+  });
+
+  test("ALERT COUNT STAYS BOUNDED across a rejected-write burst (B4's existing aggregation covers N2's new 429s too)", async () => {
+    let posted = 0;
+    // A generous window (not the module's own 10s default, but not so
+    // short a slow CI host's own scheduling jitter could make the burst
+    // below spill past it before the aggregation timer fires) — the test
+    // polls for the eventual count rather than sleeping a fixed amount,
+    // so it is not itself a source of flakiness either way.
+    const AGGREGATE_WINDOW_MS = 500;
+    const auditWrite = createAuditLogger({
+      append: () => {}, // skip the real file for this test
+      postAlert: async () => { posted++; },
+      host: "test-host",
+      log: () => {},
+      rejectAggregateWindowMs: AGGREGATE_WINDOW_MS,
+    });
+    const csrf = createCsrfTokenIssuer();
+    const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
+    const { app, origin, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, writeRateLimit, auditWrite,
+      rulesWrite: {
+        enabled: (async () => ACCEPTED) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (() => { throw new Error("unused"); }) as any,
+      },
+    });
+    try {
+      const body = JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" });
+      // One accepted (alerts immediately) + a burst of 10 rejected (429'd by the limiter) within the aggregation window.
+      for (let i = 0; i < 11; i++) {
+        await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+      }
+      expect(posted).toBe(1); // the single accepted write's own immediate alert; the 10 rejections haven't posted yet (still aggregating)
+      // Poll for the aggregation timer to fire, rather than a fixed sleep —
+      // bounded well under AGGREGATE_WINDOW_MS's own margin, so this is a
+      // deadline, not a race.
+      const deadline = Date.now() + AGGREGATE_WINDOW_MS * 4;
+      while (posted < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+      expect(posted).toBe(2); // exactly one more: the aggregated rejection alert, not 10
+    } finally { await app.stop(true); }
+  });
+
+  test("a plan-then-apply pair (N1's own happy path) is never itself rate-limited, even sharing ONE limiter instance across both routes", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const writeRateLimit = createWriteRateLimiter(); // real default budget (10/min)
+    const planResult: RulesPlanOutcome = { ok: true, planHash: "h1", spawned: 1, stopped: 0, restarted: 0, scope: 1, etag: "etag-1", requiresConfirm: false };
+    const { app, origin, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, writeRateLimit,
+      rulesWrite: {
+        enabled: (async () => ACCEPTED) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (async () => planResult) as any,
+      },
+    });
+    try {
+      const planRes = await fetch(`${origin}/api/rules/plan`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ id: "ui-first-rule", patch: { enabled: true } }),
+      });
+      expect(planRes.status).toBe(200);
+      const applyRes = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ enabled: true, ifMatch: "etag-1", planHash: planResult.planHash }),
+      });
+      expect(applyRes.status).toBe(200);
+    } finally { await app.stop(true); }
+  });
+});
+
+describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, with the absolute path and the rm hint", () => {
+  function realWriteDeps(dir: string) {
+    const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    const rulesFilePath = join(dir, "butchr", "rules.json");
+    writeFileSync(rulesFilePath, JSON.stringify({ rules: [{ id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "x", enabled: false }] }, null, 2) + "\n");
+    return { envDeps, rulesFilePath, lockPath: join(dir, "butchr", ".rules.lock") };
+  }
+
+  test("a dead-pid stale lock: the HTTP response body's error contains the absolute lock path and the rm hint, status 503", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-stale-lock-route-"));
+    try {
+      const { envDeps, lockPath } = realWriteDeps(dir);
+      writeFileSync(lockPath, "999999999"); // a pid nothing on this host runs as — "dead"
+      const writeDeps = { env: envDeps };
+      const scopeOf = async () => 0;
+      const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW" }, false, scopeOf, writeDeps);
+      if (!plan.ok) throw new Error("expected a successful plan even with the lock present — plan never takes the write lock");
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+        rulesWrite: {
+          enabled: (() => { throw new Error("unused"); }) as any,
+          fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
+            const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+          }) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+        },
+      });
+      try {
+        const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+          method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, planHash: plan.planHash, query: "project = NEW" }),
+        });
+        expect(res.status).toBe(503);
+        const responseBody = await res.json() as { error: string };
+        expect(responseBody.error).toContain(lockPath);
+        expect(responseBody.error).toContain(`rm ${lockPath}`);
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test("a LIVE-holder lock (held by a running process — this test's own pid): the HTTP response body's error contains the absolute lock path, status 503", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-stale-lock-route-"));
+    try {
+      const { envDeps, lockPath } = realWriteDeps(dir);
+      writeFileSync(lockPath, String(process.pid)); // THIS test process's own pid — unambiguously alive
+      const writeDeps = { env: envDeps };
+      const scopeOf = async () => 0;
+      const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW" }, false, scopeOf, writeDeps);
+      if (!plan.ok) throw new Error("expected a successful plan even with the lock present — plan never takes the write lock");
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+        rulesWrite: {
+          enabled: (() => { throw new Error("unused"); }) as any,
+          fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
+            const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+          }) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+        },
+      });
+      try {
+        const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+          method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, planHash: plan.planHash, query: "project = NEW" }),
+        });
+        expect(res.status).toBe(503);
+        const responseBody = await res.json() as { error: string };
+        expect(responseBody.error).toContain(lockPath);
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
