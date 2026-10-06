@@ -42,6 +42,8 @@ export interface WriteGuardDeps {
 export interface WriteGuardRequest {
   origin: string | null;
   host: string | null;
+  /** The caller's own HTTP method (e.g. `"POST"`, `"PUT"`) — passed through to `checkDashboardOrigin` explicitly; see that function's own doc comment for why a write route must never leave this implicit. */
+  method: string;
   contentType: string | null;
   csrfHeader: string | null;
   /** `undefined` when the real Bun `server` was unavailable to resolve it (e.g. `app.handle()` in a test with no listening server) — treated the same as "could not resolve", i.e. refused. */
@@ -49,7 +51,7 @@ export interface WriteGuardRequest {
 }
 
 export function checkWriteGuard(req: WriteGuardRequest, deps: WriteGuardDeps): WriteGuardOutcome {
-  const originGuard = checkDashboardOrigin({ origin: req.origin, host: req.host }, deps.dashboardOriginGuard);
+  const originGuard = checkDashboardOrigin({ origin: req.origin, host: req.host, method: req.method }, deps.dashboardOriginGuard);
   if (!originGuard.ok) return { ok: false, status: originGuard.status, body: originGuard.body, reason: originGuard.reason };
 
   if (req.clientPort === undefined || !deps.peerUidCheck(req.clientPort)) {

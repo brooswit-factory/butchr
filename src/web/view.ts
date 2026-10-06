@@ -334,7 +334,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!isSessionRoute && !isWriteRoute) return;
       if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const originHeader = request.headers.get("origin");
-      const originGuard = checkDashboardOrigin({ origin: originHeader, host: request.headers.get("host") }, deps.dashboardOriginGuard);
+      const originGuard = checkDashboardOrigin({ origin: originHeader, host: request.headers.get("host"), method }, deps.dashboardOriginGuard);
       if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
       if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const clientPort = server?.requestIP(request)?.port;

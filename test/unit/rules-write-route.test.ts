@@ -125,6 +125,20 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     } finally { await app.stop(true); }
   });
 
+  test("no Origin but Sec-Fetch-Site: same-origin: still 403, write never called — this guard has no GET-only fallback to leak into a write (manager-factory review, 2026-10-05)", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, host } = startApp(buildDeps(csrf, async () => { called = true; return ACCEPTED; }, []));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules/ui-first-rule/enabled`, {
+        method: "POST", headers: { host, "sec-fetch-site": "same-origin", "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
   test("missing CSRF header: 403, write never called", async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;

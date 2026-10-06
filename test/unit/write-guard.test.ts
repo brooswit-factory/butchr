@@ -7,7 +7,7 @@ const ORIGIN = `http://127.0.0.1:${PORT}`;
 const HOST = `127.0.0.1:${PORT}`;
 
 function baseReq(csrf: ReturnType<typeof createCsrfTokenIssuer>, overrides: Partial<Parameters<typeof checkWriteGuard>[0]> = {}) {
-  return { origin: ORIGIN, host: HOST, contentType: "application/json", csrfHeader: csrf.token, clientPort: 1234, ...overrides };
+  return { origin: ORIGIN, host: HOST, method: "POST", contentType: "application/json", csrfHeader: csrf.token, clientPort: 1234, ...overrides };
 }
 
 describe("checkWriteGuard", () => {
