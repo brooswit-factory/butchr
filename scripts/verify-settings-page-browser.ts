@@ -49,7 +49,7 @@ const stubSite = `http://127.0.0.1:${stub.port}`;
 const env = { ATLASSIAN_SITE: stubSite, ATLASSIAN_EMAIL: "butchr@example.com", ATLASSIAN_TOKEN: SECRET_SENTINEL, BUTCHR_PORT: "0", BUTCHR_MAX_AGENTS: "8" };
 
 const auditLines: unknown[] = [];
-const auditWrite = createAuditLogger({ append: () => {}, postAlert: undefined, host: "codey", log: () => {} });
+const auditWrite = createAuditLogger({ append: () => {}, host: "codey", log: () => {} });
 const csrf = createCsrfTokenIssuer();
 const guard = { port: 0 };
 const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: "127.0.0.1", port: guard.port } });

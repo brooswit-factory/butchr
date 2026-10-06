@@ -26,6 +26,9 @@ export interface JiraTestCredentials {
 
 const TIMEOUT_MS = 10_000;
 
+/** The narrow slice of `fetch` this module actually calls — not `typeof fetch` itself, so an injected test double doesn't also have to implement `fetch.preconnect`. */
+export type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
 function classify(status: number): HttpStatusClass {
   if (status >= 200 && status < 300) return "2xx";
   if (status === 401 || status === 403) return "401/403";
@@ -33,7 +36,7 @@ function classify(status: number): HttpStatusClass {
 }
 
 /** Injectable `fetch` for tests — production uses the global `fetch`. Never logs or returns the Authorization header or the response body. */
-export async function testJiraConnection(creds: JiraTestCredentials, fetchFn: typeof fetch = fetch): Promise<JiraTestResult> {
+export async function testJiraConnection(creds: JiraTestCredentials, fetchFn: FetchLike = fetch): Promise<JiraTestResult> {
   const url = `${creds.site.replace(/\/+$/, "")}/rest/api/3/myself`;
   const basic = Buffer.from(`${creds.email}:${creds.token}`).toString("base64");
   const controller = new AbortController();
