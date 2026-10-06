@@ -119,7 +119,7 @@ import { createRulesPreviewer } from "../web/rules-preview.js";
 import { isSameUidPeer } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
-import { recordAuditEvent, fileAuditAppend } from "../web/audit-log.js";
+import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite } from "../rules/rules-write.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
@@ -818,31 +818,48 @@ const csrfIssuer = createCsrfTokenIssuer();
 // `ptyAttach.read`'s own comment just below in this file for the identical,
 // already-established pattern.
 const auditLogPath = join(dirname(rulesPath()), "web-write-audit.jsonl");
-const auditWrite: (event: { route: string; action: string; ids: string[]; diffSummary: string; origin: string | null; uid: number | undefined; outcome: "accepted" | "rejected"; reason?: string }) => void = (event) => {
-  recordAuditEvent(
-    { ...event, time: new Date().toISOString() },
-    {
-      append: fileAuditAppend(auditLogPath),
-      ...(teamAdminNotify ? { postAlert: (text: string) => teamAdminNotify(config.opsAlert.room, text) } : {}),
-      host: hostname(),
-      log: (line) => console.error(line),
-    },
-  );
-};
+// B4 (agentsafety second pass): ONE logger instance, not rebuilt per call —
+// its rejected-write aggregation (`createAuditLogger`'s own header) only
+// works if the SAME instance sees every write.
+const auditWrite = createAuditLogger({
+  append: fileAuditAppend(auditLogPath),
+  // Deferred to CALL time (not evaluated here) — `teamAdminNotify` is
+  // declared further down this file; this closure isn't invoked until an
+  // actual write happens, well after it's initialized. Same pattern as
+  // `ptyAttach.read`'s own comment elsewhere in this file.
+  postAlert: (text: string) => (teamAdminNotify ? teamAdminNotify(config.opsAlert.room, text) : Promise.resolve()),
+  host: hostname(),
+  log: (line) => console.error(line),
+});
 
 // FACTORY-662's own rules-write orchestration (`../rules/rules-write.ts`),
-// bound to THIS daemon's env/config — `reload` is FACTORY-657's stub (see
-// `RulesWriteDeps.reload`'s own doc comment): FACTORY-657's PR (#645) is
-// open but not yet on `main`, so there is no live `reloadRulesNow()` to call
-// yet. `scopeOf` reuses the SAME previewer `GET /api/rules/:id/preview`
-// already shares — never a second Jira query mechanism — and fails safe
-// (treats a failed/unavailable preview as an unbounded scope, which forces
-// the confirm gate rather than silently skipping it).
+// bound to THIS daemon's env/config. `reload` calls the REAL
+// `reloadRules(rulesHolder)` (FACTORY-657, merged) — the SAME function
+// `SIGHUP` already calls below, so a web write's reload and a SIGHUP's
+// reload can never drift: every consumer reading through `getRules()`
+// (the whole daemon, after FACTORY-657) sees the swap on its very next
+// poll, no restart needed (B5a, agentsafety second pass: the previous
+// version left this a stub — a UI write reported `reload:{"applied":true}`
+// while the holder kept the OLD query). `scopeOf` reuses the SAME
+// previewer `GET /api/rules/:id/preview` already shares — never a second
+// Jira query mechanism — and fails safe (treats a failed/unavailable
+// preview as an unbounded scope, which forces the confirm gate rather than
+// silently skipping it).
 const scopeOf = async (id: string): Promise<number> => {
   const result = await rulesPreviewer(id);
   return result.ok ? result.total : Number.POSITIVE_INFINITY;
 };
-const rulesWriteDeps = { env: process.env };
+const rulesWriteDeps = {
+  env: process.env,
+  reload: () => {
+    const result = reloadRules(rulesHolder);
+    return { applied: result.ok, problems: result.problems };
+  },
+  // STALE-FILE REFUSAL (agentsafety second pass): the daemon's own
+  // currently-loaded rules etag — see `RulesWriteDeps.getSourceEtag`'s own
+  // doc comment (`../rules/rules-write.ts`) for the incident this closes.
+  getSourceEtag: () => rulesHolder.getSourceEtag(),
+};
 
 const { app, mcp } = buildApp({
   getRules,

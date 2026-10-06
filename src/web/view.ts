@@ -361,7 +361,12 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const isSessionRoute = method === "GET" && path === "/api/session";
       if (isSessionRoute) {
         if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-        const originGuard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), method }, deps.dashboardOriginGuard);
+        // S1 (agentsafety second pass, 2026-10-05): this is a GET, so the
+        // SAME no-Origin + `Sec-Fetch-Site: same-origin` fallback the other
+        // GET routes (`/api/rules`, `/api/rules/:id/preview`) already pass
+        // applies here too — omitting it blocked the dashboard's own
+        // same-origin `fetch("/api/session")` (no `Origin` header at all).
+        const originGuard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method }, deps.dashboardOriginGuard);
         if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
         if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
         const client = server?.requestIP(request) ?? undefined;
@@ -403,8 +408,18 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // field is `dashboard-page.ts`/`config-inventory-page.ts`'s own job
     // (pre-existing, unchanged by this ticket) — these headers are the
     // browser-side backstop if that ever lapsed.
-    .onAfterHandle(({ set }) => {
-      set.headers["content-security-policy"] = "default-src 'self'; frame-ancestors 'none'; script-src 'self'; object-src 'none'; base-uri 'none'";
+    .onAfterHandle(({ set, request }) => {
+      // Second-pass finding: `/` and `/configurations` (the pre-existing
+      // legacy pages, `dashboard-page.ts`/`config-inventory-page.ts`, both
+      // UNCHANGED by this ticket) render inline `<style>` blocks — a
+      // strict `style-src 'self'` blocks them in a real browser. Scoped to
+      // exactly those two paths; `script-src` stays `'self'` with NO
+      // `'unsafe-inline'` everywhere, including on these two pages — only
+      // style, never script, gets the relaxation, and only on these two
+      // routes.
+      const path = new URL(request.url).pathname;
+      const styleSrc = path === "/" || path === "/configurations" ? "style-src 'self' 'unsafe-inline';" : "style-src 'self';";
+      set.headers["content-security-policy"] = `default-src 'self'; frame-ancestors 'none'; script-src 'self'; ${styleSrc} object-src 'none'; base-uri 'none'`;
       set.headers["x-content-type-options"] = "nosniff";
       set.headers["x-frame-options"] = "DENY";
     })

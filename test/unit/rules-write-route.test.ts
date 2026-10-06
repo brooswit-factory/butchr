@@ -96,6 +96,32 @@ describe("GET /api/session", () => {
       expect(body.csrfToken).toBe(csrf.token);
     } finally { await app.stop(true); }
   });
+
+  // S1 (agentsafety second pass, 2026-10-05): the dashboard's own
+  // same-origin `fetch("/api/session")` carries NO `Origin` header at all
+  // (the Fetch spec only stamps `Origin` on a non-GET/cross-origin
+  // request) — the session route must accept the SAME no-Origin +
+  // `Sec-Fetch-Site: same-origin` fallback the other GET routes already
+  // do, or the dashboard can never even start a session.
+  test("S1: no Origin but Sec-Fetch-Site: same-origin and a matching Host: 200, hands out the token", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const { app, host } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/session`, { headers: { host, "sec-fetch-site": "same-origin" } });
+      expect(res.status).toBe(200);
+      const body = await res.json() as { csrfToken: string };
+      expect(body.csrfToken).toBe(csrf.token);
+    } finally { await app.stop(true); }
+  });
+
+  test("no Origin and NO Sec-Fetch-Site at all: still 403 (fail closed, not a blanket no-Origin pass)", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const { app, host } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/session`, { headers: { host } });
+      expect(res.status).toBe(403);
+    } finally { await app.stop(true); }
+  });
 });
 
 describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {

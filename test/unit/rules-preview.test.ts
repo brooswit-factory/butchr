@@ -150,4 +150,32 @@ describe("createRulesPreviewer", () => {
     const r = await preview("triage");
     expect(r).toEqual({ ok: false, status: 504, error: "preview timed out" });
   });
+
+  // B5c (agentsafety second pass, 2026-10-06): `searchRules`/
+  // `searchJiraIdeaRules` both filter to `rule.enabled` first, so a DISABLED
+  // rule (the seeded `ui-first-rule` template's own starting state)
+  // previously dry-ran to zero matches regardless of its real query,
+  // vacuously passing FACTORY-662's scope ceiling for a rule that would in
+  // fact match far more once actually enabled.
+  test("B5c: a DISABLED rule's preview still reports its real match count, not zero", async () => {
+    const issues = Array.from({ length: 40 }, (_, i) => issue(`F-${i}`));
+    let searchedJql: string | undefined;
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "ui-first-rule", enabled: false })],
+      search: async (jql) => { searchedJql = jql; return issues; },
+      maxAgents: 5,
+      cap: 50,
+    });
+    const r = await preview("ui-first-rule");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.total).toBe(40);
+    expect(searchedJql).toBe("project = FACTORY"); // the rule's own query, unchanged
+  });
+
+  test("B5c: the disabled rule's OWN object is never mutated by the dry run", async () => {
+    const theRule = rule({ id: "ui-first-rule", enabled: false });
+    const preview = createRulesPreviewer({ rules: () => [theRule], search: async () => [], maxAgents: 5 });
+    await preview("ui-first-rule");
+    expect(theRule.enabled).toBe(false);
+  });
 });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rulesEtag } from "../../src/rules/write-rules.js";
@@ -409,5 +409,122 @@ describe("planRuleWrite (report-only)", () => {
     expect(a.ok).toBe(true);
     expect(b.ok).toBe(true);
     if (a.ok && b.ok) expect(a.planHash).toBe(b.planHash);
+  });
+});
+
+describe("STALE-FILE REFUSAL (agentsafety second pass): daemon's loaded etag vs the file on disk", () => {
+  test("writeRuleEnabled refuses when getSourceEtag() differs from a fresh file read, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => "stale-sha-not-matching-the-real-file" };
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, false, "irrelevant-hash", noScope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) { expect(outcome.status).toBe(409); expect(outcome.error).toMatch(/reload first/); }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("writeRuleFields refuses when getSourceEtag() differs from a fresh file read, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => "stale-sha" };
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", { query: "project = NEW" }, etag, false, "irrelevant-hash", deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("planRuleWrite refuses when getSourceEtag() differs from a fresh file read", async () => {
+    seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => "stale-sha" };
+    const plan = await planRuleWrite("ui-first-rule", { query: "x" }, false, noScope, deps);
+    expect(plan.ok).toBe(false);
+    if (!plan.ok) expect(plan.status).toBe(409);
+  });
+
+  test("a matching getSourceEtag() (the daemon's view agrees with the file) proceeds normally", async () => {
+    seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => rulesEtag(env()) };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("getSourceEtag absent (not injected): the check is skipped, never a false refusal", async () => {
+    seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+});
+
+describe("B5a: reload is wired for real (not a stub) — see src/daemon/index.ts's own rulesWriteDeps.reload", () => {
+  test("a successful write's reload() result is surfaced verbatim in the outcome", async () => {
+    seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), reload: () => ({ applied: true, problems: [] }) };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.reload).toEqual({ applied: true, problems: [] });
+  });
+
+  test("a reload that reports problems still surfaces them (the write itself already succeeded)", async () => {
+    seed([UI_RULE]);
+    const deps: RulesWriteDeps = { env: env(), reload: () => ({ applied: false, problems: ["simulated reload failure"] }) };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.reload).toEqual({ applied: false, problems: ["simulated reload failure"] });
+  });
+});
+
+describe("B5c: scope ceiling is evaluated on an enabled COPY, even for a currently-disabled rule", () => {
+  test("planRuleWrite's scope lookup for enabling a DISABLED rule still calls scopeOf (the real previewer would force enabled:true itself)", async () => {
+    seed([UI_RULE]); // UI_RULE.enabled === false
+    let scopeOfCalledWith: string | undefined;
+    const scope = async (id: string) => { scopeOfCalledWith = id; return ENABLE_SCOPE_CEILING + 40; };
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) { expect(plan.scope).toBe(ENABLE_SCOPE_CEILING + 40); expect(plan.requiresConfirm).toBe(true); }
+    expect(scopeOfCalledWith).toBe("ui-first-rule");
+  });
+
+  test("writeRuleEnabled's own pre-lock scope check also fires for a currently-disabled rule being enabled", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const scope = async () => ENABLE_SCOPE_CEILING + 40;
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, false, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, false, planHash, scope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+  });
+});
+
+describe("STALE-LOCK ERROR is passed through verbatim, naming the lock file", () => {
+  test("a crashed writer's leftover .rules.lock refuses with the exact path and rm instruction, status 503", async () => {
+    seed([UI_RULE]);
+    const rulesDir = join(dir, "butchr");
+    const lockPath = join(rulesDir, ".rules.lock");
+    writeFileSync(lockPath, "999999999"); // a dead pid — nothing on this host runs as it
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(503);
+      expect(outcome.error).toContain(lockPath);
+      expect(outcome.error).toContain(`rm ${lockPath}`);
+    }
   });
 });

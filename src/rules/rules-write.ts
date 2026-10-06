@@ -69,6 +69,40 @@ export interface RulesWriteDeps {
   reload?: () => { applied: boolean; problems: string[] };
   /** B2 — see `LastUiWriteRef`'s own doc comment. Lazily created (and then reused in place) by `writeRuleEnabled`/`writeRuleFields` if the caller didn't supply one — but a caller that wants undo to work across SEPARATE calls (i.e. any real caller) must pass the SAME `RulesWriteDeps` object to every call, exactly as it already must for `env`/`io`. */
   lastUiWrite?: LastUiWriteRef;
+  /**
+   * STALE-FILE REFUSAL (agentsafety second pass, 2026-10-05): the
+   * daemon's own currently-LOADED rules etag (`RulesHolder.getSourceEtag()`
+   * — `src/daemon/index.ts` wires this to `() => rulesHolder.getSourceEtag()`).
+   * Every write and every plan refuses while this differs from a FRESH
+   * `rulesEtag()` read of the file on disk: the probed incident was an
+   * admin hand-editing the file (disabling `managers`) without a reload,
+   * then a UI write computing its plan/counts against the daemon's STALE
+   * in-memory view — the plan said `stopped=0` for a rule the write was
+   * about to make disappear from the next reload. Undefined (no holder to
+   * compare against) skips the check — same "absent means disabled
+   * check, never a false pass" discipline the rest of this slice follows;
+   * every REAL caller supplies this.
+   */
+  getSourceEtag?: () => string | undefined;
+}
+
+/**
+ * Throws `WriteRefusedError` (409) when the daemon's own loaded rules
+ * (`deps.getSourceEtag()`) are not the SAME text `currentText` (the file's
+ * own CURRENT content, as just read) was parsed from — see
+ * `RulesWriteDeps.getSourceEtag`'s own doc comment. A `currentText` of
+ * `undefined` (no file) hashes the same as the holder's own empty-rules
+ * etag (`sha256("")`, `RulesHolder`'s own convention — see
+ * `write-rules.ts`'s `rulesEtag`), so a fresh daemon with no file and no
+ * rules loaded is never flagged stale against itself.
+ */
+function assertNotStale(deps: RulesWriteDeps, currentText: string | undefined): void {
+  const sourceEtag = deps.getSourceEtag?.();
+  if (sourceEtag === undefined) return;
+  const fileEtag = sha256(currentText ?? "");
+  if (sourceEtag !== fileEtag) {
+    throw new WriteRefusedError(`rules file changed since the daemon loaded it (daemon is at ${sourceEtag}, file is at ${fileEtag}); reload first`, 409);
+  }
 }
 
 export type RulesWriteOutcome =
@@ -101,6 +135,12 @@ function refusalToOutcome(e: unknown): RulesWriteOutcome {
   // way, "refused" is the correct and safe answer.
   if (message.includes("is not in the allowed set")) return { ok: false, status: 403, error: message };
   if (message.includes("etag mismatch") || message.includes("already being written")) return { ok: false, status: 409, error: message };
+  // A crashed-writer's leftover `.rules.lock` (FACTORY-673's own message,
+  // which already names the lock PATH and the exact `rm <path>` to run) —
+  // passed through VERBATIM, never replaced with a generic one, so the UI
+  // can show a human exactly what to remove. 503: this is "this daemon
+  // cannot serve a write right now", not a problem with the request itself.
+  if (message.includes(".rules.lock") || message.includes("was left behind by pid")) return { ok: false, status: 503, error: message };
   return { ok: false, status: 400, error: message };
 }
 
@@ -197,6 +237,7 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
     const result = updateRulesFile(
       (currentText) => {
         checkIfMatch(currentText, ifMatch);
+        assertNotStale(deps, currentText);
         const rule = readRuleById(currentText, id);
         assertUiEditable(id);
         if (enabled && rule.query === PLACEHOLDER_QUERY) {
@@ -242,6 +283,7 @@ export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: stri
     const result = updateRulesFile(
       (currentText) => {
         checkIfMatch(currentText, ifMatch);
+        assertNotStale(deps, currentText);
         const rule = readRuleById(currentText, id); // throws if unknown
         assertUiEditable(id);
         const nextText = applyRuleFieldPatch(currentText, id, patch);
@@ -321,6 +363,12 @@ export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; er
 export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
   const env = deps.env ?? process.env;
   const currentText = readCurrentRulesText(env);
+  try {
+    assertNotStale(deps, currentText);
+  } catch (e) {
+    if (e instanceof WriteRefusedError) return { ok: false, status: e.status, error: e.message };
+    throw e;
+  }
   let current: Record<string, unknown>;
   let nextText: string;
   try {

@@ -61,12 +61,26 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-/** Dry-runs exactly one rule, through the SAME provider-specific matcher the daemon's own poll loop for that provider calls. */
+/**
+ * Dry-runs exactly one rule, through the SAME provider-specific matcher the
+ * daemon's own poll loop for that provider calls.
+ *
+ * B5c (agentsafety second pass, 2026-10-05): `searchRules`/
+ * `searchJiraIdeaRules` both filter to `rule.enabled` first — a DISABLED
+ * rule (the seeded `ui-first-rule` template's own starting state) always
+ * dry-runs to zero matches, vacuously passing FACTORY-662's scope ceiling
+ * for a rule that would in fact match far more once actually enabled. This
+ * is a DRY RUN: the question is always "what WOULD this match", never
+ * "does this currently match given its current enabled flag" — so the
+ * search runs against a COPY with `enabled: true` forced, regardless of
+ * the rule's real stored value. Never mutates the caller's own rule object.
+ */
 async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIssue[]>): Promise<JiraIssue[]> {
+  const asEnabled: Rule = { ...rule, enabled: true };
   if (rule.resourceProvider === "jira-work") {
-    return (await searchRules({ rules: [rule], search })).map((m) => m.issue);
+    return (await searchRules({ rules: [asEnabled], search })).map((m) => m.issue);
   }
-  return (await searchJiraIdeaRules({ rules: [rule], search })).map((m) => m.issue);
+  return (await searchJiraIdeaRules({ rules: [asEnabled], search })).map((m) => m.issue);
 }
 
 /**
