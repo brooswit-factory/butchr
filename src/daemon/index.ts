@@ -992,10 +992,10 @@ const { app, mcp } = buildApp({
   // `rulesWriteDeps`'s own declaration for why `reload` is a stub and
   // `scopeOf` reuses `rulesPreviewer`.
   csrf: csrfIssuer,
-  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (clientPort) => isSameUidPeer(clientPort, { serverPort: config.port }), csrf: csrfIssuer },
+  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (client) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }), csrf: csrfIssuer },
   rulesWrite: {
-    enabled: (id, enabled, ifMatch, confirm) => writeRuleEnabled(id, enabled, ifMatch, confirm, scopeOf, rulesWriteDeps),
-    fields: (id, patch, ifMatch) => writeRuleFields(id, patch, ifMatch, rulesWriteDeps),
+    enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
+    fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
   },

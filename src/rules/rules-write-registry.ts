@@ -102,7 +102,7 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     }
     patch.agentPreferences = b.agentPreferences as AgentPreferencePatch[];
   }
-  const allowedKeys = new Set(["enabled", "query", "agentPreferences", "ifMatch", "confirm"]);
+  const allowedKeys = new Set(["enabled", "query", "agentPreferences", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }

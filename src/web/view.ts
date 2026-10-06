@@ -14,7 +14,7 @@ import { checkDashboardOrigin, type DashboardOriginGuardDeps } from "./dashboard
 import { buildRulesApiResponse, type RulesApiResponse } from "./rules-api.js";
 import type { RulesFileState } from "../agents/query-agent-inventory.js";
 import type { RulesPreviewResult } from "./rules-preview.js";
-import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps } from "./write-guard.js";
+import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps, type WriteGuardRequest } from "./write-guard.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
@@ -247,8 +247,8 @@ export interface ViewDeps {
    * maps straight to a status + body, never re-deciding anything here.
    */
   rulesWrite?: {
-    enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean) => Promise<RulesWriteOutcome>;
-    fields: (id: string, patch: RuleFieldPatch, ifMatch: string) => RulesWriteOutcome;
+    enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
+    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => RulesWriteOutcome;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
@@ -310,46 +310,68 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
   // FACTORY-453: one entry per currently-open `/agents/:agentKey/pty` socket — see `PtySession`'s own doc comment for why this exists instead of closing over per-connection state directly.
   const ptySessions = new Map<string, PtySession>();
 
-  // FACTORY-662, item 1 (session handout) and items 1-3 (every write
-  // route): `GET /api/session` and every write route below share the SAME
-  // Origin/Host/peer-uid gate, checked in `onRequest` — BEFORE Elysia's own
-  // body parsing ever runs (see `./write-guard.ts`'s own header for why
-  // this ordering is load-bearing, not cosmetic). A refusal here returns a
-  // value, which Elysia's `mapEarlyResponse` turns into the actual response
-  // and skips `onParse`/the route handler entirely.
-  const WRITE_ROUTES: readonly { method: string; re: RegExp }[] = [
-    { method: "POST", re: /^\/api\/rules\/[^/]+\/enabled$/ },
-    { method: "PUT", re: /^\/api\/rules\/[^/]+$/ },
-    { method: "POST", re: /^\/api\/rules\/plan$/ },
-    { method: "POST", re: /^\/api\/undo\/[^/]+$/ },
-  ];
-  const isGuardedWriteRoute = (method: string, path: string): boolean => WRITE_ROUTES.some((w) => w.method === method && w.re.test(path));
+  // FACTORY-662 — `GET /api/session` and every write route share a guard
+  // checked in `onRequest`, BEFORE Elysia's own body parsing ever runs (see
+  // `./write-guard.ts`'s own header for why this ordering is load-bearing,
+  // not cosmetic). A refusal here returns a value, which Elysia's
+  // `mapEarlyResponse` turns into the actual response and skips
+  // `onParse`/the route handler entirely.
+  //
+  // AGENTSAFETY FIRST-PASS FINDING B1 (SHIP-BLOCKER, 2026-10-06): the
+  // previous version matched write routes with EXACT per-route regexes
+  // (`^/api/rules/plan$`, ...) — a trailing slash, a repeated slash, or any
+  // other path variant Elysia's own router still dispatches to the SAME
+  // handler matched none of them, so the guard silently never ran while
+  // the write still happened. Fixed with TWO independent layers, per the
+  // review's own "attach the guard to the routes themselves AND fail
+  // closed for every non-GET under /api/ regardless of path shape":
+  //   1. This `onRequest` hook now fails closed on PATH SHAPE, not path
+  //      MATCH: any method other than GET/HEAD/OPTIONS whose pathname
+  //      starts with `/api/` is refused unless it passes `checkWriteGuard`
+  //      — a plain `startsWith`, which (unlike a route-shaped regex) stays
+  //      true for a trailing slash, a repeated slash, or any other
+  //      variant, because none of those change the string's own prefix.
+  //   2. Every write route handler below ALSO calls `checkWriteGuard`
+  //      itself, as its own first lines — see each route's own comment.
+  //      That makes the guard a property of the HANDLER, never of a
+  //      separate path-matching mechanism that could drift from what
+  //      Elysia's router actually dispatches — so even a future route this
+  //      `onRequest` prefix check somehow failed to cover is still safe.
+  // `checkWriteGuard` (`./write-guard.ts`) is called directly here, not
+  // re-implemented inline — the SAME function both layers and every tests'
+  // own go-red cases exercise.
+  const API_PREFIX = "/api/";
+  const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+  function buildWriteGuardRequest(request: Request, server: { requestIP: (r: Request) => { address: string; port: number } | null } | null): WriteGuardRequest {
+    return {
+      origin: request.headers.get("origin"),
+      host: request.headers.get("host"),
+      method: request.method,
+      contentType: request.headers.get("content-type"),
+      csrfHeader: request.headers.get(CSRF_HEADER),
+      client: server?.requestIP(request) ?? undefined,
+    };
+  }
 
   return new Elysia()
     .onRequest(({ request, set, server }) => {
       const method = request.method;
       const path = new URL(request.url).pathname;
       const isSessionRoute = method === "GET" && path === "/api/session";
-      const isWriteRoute = isGuardedWriteRoute(method, path);
-      if (!isSessionRoute && !isWriteRoute) return;
-      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const originHeader = request.headers.get("origin");
-      const originGuard = checkDashboardOrigin({ origin: originHeader, host: request.headers.get("host"), method }, deps.dashboardOriginGuard);
-      if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
-      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const clientPort = server?.requestIP(request)?.port;
-      if (clientPort === undefined || !deps.peerUidCheck(clientPort)) { set.status = 403; return { error: "peer uid check failed" }; }
-      if (isSessionRoute) return; // no Content-Type/CSRF to check for the GET that hands the token out
-      if (!deps.csrf || !deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
-      if (contentType !== "application/json") {
-        set.status = 415;
-        return { error: "content-type must be application/json" };
+      if (isSessionRoute) {
+        if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+        const originGuard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), method }, deps.dashboardOriginGuard);
+        if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
+        if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+        const client = server?.requestIP(request) ?? undefined;
+        if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+        return;
       }
-      if (!deps.csrf.check(request.headers.get(CSRF_HEADER))) {
-        set.status = 403;
-        return { error: "csrf token missing or invalid" };
-      }
+      if (SAFE_METHODS.has(method) || !path.startsWith(API_PREFIX)) return; // not a write route this gate owns
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
     })
     // FACTORY-662 item 3: a capped, counted read (never a trust in
     // `Content-Length` alone) BEFORE `JSON.parse` — global, since every
@@ -541,34 +563,44 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     })
     // FACTORY-662 item 7: `POST /api/rules/:id/enabled` — the ONLY route
     // that may flip `enabled`, for exactly the "ui-" marked rules, gated by
-    // the scope ceiling (director's decision). `writeGuard`'s
-    // Origin/Host/peer-uid/Content-Type/CSRF already ran in `onRequest`;
-    // this handler only ever runs once every one of those passed.
-    .post("/api/rules/:id/enabled", async ({ params, body, set, request }) => {
+    // the scope ceiling (director's decision) and, since agentsafety's B3
+    // finding, a bound `planHash` + `confirm` for a stop. B1: this
+    // handler calls `checkWriteGuard` ITSELF, as its own first lines — see
+    // this file's `onRequest` hook's own header for why that is load-
+    // bearing (guard-by-construction), not merely redundant with it.
+    .post("/api/rules/:id/enabled", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
       const id = decodeURIComponent(params.id);
-      if (typeof b.enabled !== "boolean" || typeof b.ifMatch !== "string") {
+      if (typeof b.enabled !== "boolean" || typeof b.ifMatch !== "string" || typeof b.planHash !== "string") {
         set.status = 400;
-        return { error: "body must be { enabled: boolean, ifMatch: string, confirm?: boolean }" };
+        return { error: "body must be { enabled: boolean, ifMatch: string, planHash: string, confirm?: boolean }" };
       }
       const confirm = b.confirm === true;
-      const outcome = await deps.rulesWrite.enabled(id, b.enabled, b.ifMatch, confirm);
+      const outcome = await deps.rulesWrite.enabled(id, b.enabled, b.ifMatch, confirm, b.planHash);
       auditOutcome(deps, { route: "POST /api/rules/:id/enabled", action: `enabled=${b.enabled}`, ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
     // FACTORY-662 item 7: `PUT /api/rules/:id` — the nested allowlist edit
-    // (`query`, `agentPreferences[i].model/effort/modelPower/effortPower`).
-    .put("/api/rules/:id", async ({ params, body, set, request }) => {
+    // (`query`, `agentPreferences[i].model/effort/modelPower/effortPower`),
+    // bound to a `planHash` + `confirm` for a restart (B3). B1: own
+    // `checkWriteGuard` call, see the enable route's own comment above.
+    .put("/api/rules/:id", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const id = decodeURIComponent(params.id);
       const b = body as Record<string, unknown>;
-      if (typeof b.ifMatch !== "string") { set.status = 400; return { error: "body must include ifMatch: string" }; }
+      if (typeof b.ifMatch !== "string" || typeof b.planHash !== "string") { set.status = 400; return { error: "body must include ifMatch: string and planHash: string" }; }
       // Same refusal `writeRuleFields` itself enforces (defense in depth,
       // checked again at the HTTP boundary): the dedicated enable route
       // owns `enabled` — a PUT that also permitted it would silently
@@ -584,15 +616,22 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         set.status = 400;
         return { error: parsed.error };
       }
-      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch);
+      const confirm = b.confirm === true;
+      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
       auditOutcome(deps, { route: "PUT /api/rules/:id", action: `edit ${Object.keys(parsed.patch).join(",")}`, ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
     // FACTORY-662 item 5 (DECISION ADDED): `POST /api/rules/plan` —
     // REPORT-ONLY, never writes. Same body shape as the write routes
-    // (minus `ifMatch`, which a dry-run has no use for) plus `confirm`.
-    .post("/api/rules/plan", async ({ body, set, request }) => {
+    // (minus `ifMatch`, which a dry-run has no use for) plus `confirm`. B1:
+    // own `checkWriteGuard` call — this route never writes, but it still
+    // only hands out a `planHash` to a caller who already proved every
+    // guard, same as any other write-shaped route.
+    .post("/api/rules/plan", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
@@ -603,15 +642,20 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!parsed.ok) { set.status = 400; return { error: parsed.error }; }
       const confirm = b.confirm === true;
       const outcome = await deps.rulesWrite.plan(b.id, parsed.patch, confirm);
-      void request;
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       set.headers["cache-control"] = "no-store";
       return outcome;
     })
     // FACTORY-662 item 5: `POST /api/undo/:backupId` — restores a previous
     // backup through the same guard and the same validated/atomic write
-    // path every other write uses (`restoreBackup`, FACTORY-658).
-    .post("/api/undo/:backupId", async ({ params, set, request }) => {
+    // path every other write uses (`restoreBackup`, FACTORY-658), scoped
+    // (B2) to the SAME process's own most recent UI write's own backup, at
+    // its own resulting etag — see `rules-write.ts`'s own header. B1: own
+    // `checkWriteGuard` call, see the enable route's own comment above.
+    .post("/api/undo/:backupId", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const backupId = decodeURIComponent(params.backupId);
       const outcome = deps.rulesWrite.undo(backupId);

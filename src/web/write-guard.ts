@@ -32,10 +32,15 @@ export type WriteGuardOutcome =
   | { ok: true }
   | { ok: false; status: number; body: { error: string }; reason: WriteGuardRejectReason };
 
+export interface SocketEndpoint {
+  address: string;
+  port: number;
+}
+
 export interface WriteGuardDeps {
   dashboardOriginGuard: DashboardOriginGuardDeps;
-  /** `null` fails closed (as `isSameUidPeer` itself does on anything unresolvable) — see `ViewDeps.peerUidCheck`'s own doc comment for why this is a function of the client port, not a fixed value. */
-  peerUidCheck: (clientPort: number) => boolean;
+  /** `null`/`undefined` fails closed (as `isSameUidPeer` itself does on anything unresolvable) — see `ViewDeps.peerUidCheck`'s own doc comment for why this is a function of the client's own socket endpoint, not a fixed value. */
+  peerUidCheck: (client: SocketEndpoint) => boolean;
   csrf: CsrfTokenIssuer;
 }
 
@@ -46,15 +51,15 @@ export interface WriteGuardRequest {
   method: string;
   contentType: string | null;
   csrfHeader: string | null;
-  /** `undefined` when the real Bun `server` was unavailable to resolve it (e.g. `app.handle()` in a test with no listening server) — treated the same as "could not resolve", i.e. refused. */
-  clientPort: number | undefined;
+  /** `undefined` when the real Bun `server` was unavailable to resolve it (e.g. `app.handle()` in a test with no listening server), or `server.requestIP(request)` itself returned `null` — both treated the same as "could not resolve", i.e. refused. */
+  client: SocketEndpoint | undefined;
 }
 
 export function checkWriteGuard(req: WriteGuardRequest, deps: WriteGuardDeps): WriteGuardOutcome {
   const originGuard = checkDashboardOrigin({ origin: req.origin, host: req.host, method: req.method }, deps.dashboardOriginGuard);
   if (!originGuard.ok) return { ok: false, status: originGuard.status, body: originGuard.body, reason: originGuard.reason };
 
-  if (req.clientPort === undefined || !deps.peerUidCheck(req.clientPort)) {
+  if (req.client === undefined || !deps.peerUidCheck(req.client)) {
     return { ok: false, status: 403, body: { error: "peer uid check failed" }, reason: "peer uid check failed" };
   }
 

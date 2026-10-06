@@ -6,8 +6,10 @@ const PORT = 7718;
 const ORIGIN = `http://127.0.0.1:${PORT}`;
 const HOST = `127.0.0.1:${PORT}`;
 
+const CLIENT = { address: "127.0.0.1", port: 54321 };
+
 function baseReq(csrf: ReturnType<typeof createCsrfTokenIssuer>, overrides: Partial<Parameters<typeof checkWriteGuard>[0]> = {}) {
-  return { origin: ORIGIN, host: HOST, method: "POST", contentType: "application/json", csrfHeader: csrf.token, clientPort: 1234, ...overrides };
+  return { origin: ORIGIN, host: HOST, method: "POST", contentType: "application/json", csrfHeader: csrf.token, client: CLIENT, ...overrides };
 }
 
 describe("checkWriteGuard", () => {
@@ -33,10 +35,10 @@ describe("checkWriteGuard", () => {
     if (!outcome.ok) { expect(outcome.status).toBe(403); expect(outcome.reason).toBe("peer uid check failed"); }
   });
 
-  test("clientPort undefined (could not resolve the real server): refused, same as a failed peer-uid check", () => {
+  test("client undefined (could not resolve the real server): refused, same as a failed peer-uid check", () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
-    const outcome = checkWriteGuard(baseReq(csrf, { clientPort: undefined }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { called = true; return true; }, csrf });
+    const outcome = checkWriteGuard(baseReq(csrf, { client: undefined }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { called = true; return true; }, csrf });
     expect(outcome.ok).toBe(false);
     expect(called).toBe(false);
   });

@@ -30,6 +30,7 @@ function startApp(deps: Partial<ViewDeps>) {
   app.listen(0);
   const port = app.server!.port!;
   if (deps.dashboardOriginGuard) deps.dashboardOriginGuard.port = port;
+  if (deps.writeGuard) deps.writeGuard.dashboardOriginGuard.port = port; // a SEPARATE object from the one above in most call sites here — see `writeGuardDeps`'s own literal
   return { app, port, origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` };
 }
 
@@ -117,7 +118,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { origin: "http://evil.example", host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(403);
       expect(called).toBe(false);
@@ -132,7 +133,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { host, "sec-fetch-site": "same-origin", "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(403);
       expect(called).toBe(false);
@@ -146,7 +147,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { origin, host, "content-type": "application/json" },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(403);
       expect(called).toBe(false);
@@ -160,7 +161,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: "0".repeat(csrf.token.length) },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(403);
       expect(called).toBe(false);
@@ -174,7 +175,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { origin, host, "content-type": "text/plain", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(415);
       expect(called).toBe(false);
@@ -233,11 +234,11 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule/enabled`, {
         method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ enabled: true, ifMatch: "etag-1", confirm: true }),
+        body: JSON.stringify({ enabled: true, ifMatch: "etag-1", confirm: true, planHash: "hash-1" }),
       });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual(ACCEPTED);
-      expect(receivedArgs).toEqual(["ui-first-rule", true, "etag-1", true]);
+      expect(receivedArgs).toEqual(["ui-first-rule", true, "etag-1", true, "hash-1"]);
       expect(audited).toHaveLength(1);
       expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
     } finally { await app.stop(true); }
@@ -251,7 +252,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     try {
       const res = await fetch(`${origin}/api/rules/managers/enabled`, {
         method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ enabled: true, ifMatch: "x" }),
+        body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
       });
       expect(res.status).toBe(403);
       expect(await res.json()).toEqual({ error: refusal.error });
@@ -294,7 +295,7 @@ describe("PUT /api/rules/:id", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
         method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ ifMatch: "x", harness: "claude" }),
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", harness: "claude" }),
       });
       expect(res.status).toBe(400);
       expect(called).toBe(false);
@@ -308,7 +309,7 @@ describe("PUT /api/rules/:id", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
         method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ ifMatch: "x", enabled: true }),
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", enabled: true }),
       });
       expect(res.status).toBe(400);
       expect(called).toBe(false);
@@ -322,10 +323,10 @@ describe("PUT /api/rules/:id", () => {
     try {
       const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
         method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ ifMatch: "etag-1", query: "project = X" }),
+        body: JSON.stringify({ ifMatch: "etag-1", planHash: "hash-1", query: "project = X" }),
       });
       expect(res.status).toBe(200);
-      expect(receivedArgs).toEqual(["ui-first-rule", { query: "project = X" }, "etag-1"]);
+      expect(receivedArgs).toEqual(["ui-first-rule", { query: "project = X" }, "etag-1", false, "hash-1"]);
     } finally { await app.stop(true); }
   });
 });
@@ -394,6 +395,104 @@ describe("POST /api/rules/plan — report-only", () => {
       });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual(planResult);
+    } finally { await app.stop(true); }
+  });
+});
+
+// AGENTSAFETY FIRST-PASS FINDING B1 (SHIP-BLOCKER, 2026-10-06): a trailing
+// slash (or other path variant) on a write route previously bypassed the
+// guard entirely and returned 200 with NO Origin, CSRF, or peer check —
+// `onRequest`'s own exact-regex path match never fired, but Elysia's
+// router still dispatched the request to the real handler. These tests
+// send every variant WITHOUT any credentials at all; each must come back
+// refused (403/404/415/400 — never 200, and the underlying write dep must
+// never be called), proving both of the fix's layers hold: the broad
+// `startsWith("/api/")` net in `onRequest`, AND each route handler's own
+// `checkWriteGuard` call.
+describe("B1 — path-shape bypass is closed for every write route", () => {
+  const PATH_VARIANTS = (base: string) => [
+    `${base}/`, // trailing slash
+    base.replace(/\//g, "//"), // repeated slash
+    `${base}/.`, // dot segment
+    `${base}%2f`, // encoded slash appended
+  ];
+
+  function buildRefusingDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, called: { enabled: boolean; fields: boolean; undo: boolean }) {
+    return {
+      csrf,
+      writeGuard: writeGuardDeps(csrf),
+      dashboardOriginGuard: { port: 0 },
+      peerUidCheck: () => true,
+      rulesWrite: {
+        enabled: (async () => { called.enabled = true; return ACCEPTED; }) as any,
+        fields: (() => { called.fields = true; return ACCEPTED; }) as any,
+        undo: (() => { called.undo = true; return ACCEPTED; }) as any,
+        plan: (async () => ({ ok: true, planHash: "h", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "e", requiresConfirm: false })) as any,
+      },
+    };
+  }
+
+  test("POST /api/rules/:id/enabled path variants, with NO Origin/CSRF at all: never 200, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const called = { enabled: false, fields: false, undo: false };
+    const { app, port } = startApp(buildRefusingDeps(csrf, called));
+    try {
+      for (const path of PATH_VARIANTS("/api/rules/ui-first-rule/enabled")) {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" }),
+        });
+        expect(res.status).not.toBe(200);
+      }
+      expect(called.enabled).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("PUT /api/rules/:id path variants, with NO Origin/CSRF at all: never 200, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const called = { enabled: false, fields: false, undo: false };
+    const { app, port } = startApp(buildRefusingDeps(csrf, called));
+    try {
+      for (const path of PATH_VARIANTS("/api/rules/ui-first-rule")) {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ifMatch: "x", planHash: "h", query: "x" }),
+        });
+        expect(res.status).not.toBe(200);
+      }
+      expect(called.fields).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("POST /api/undo/:backupId path variants, with NO Origin/CSRF at all: never 200, undo never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const called = { enabled: false, fields: false, undo: false };
+    const { app, port } = startApp(buildRefusingDeps(csrf, called));
+    try {
+      for (const path of PATH_VARIANTS("/api/undo/20261005T000000Z")) {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+        expect(res.status).not.toBe(200);
+      }
+      expect(called.undo).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("POST /api/rules/plan path variants, with NO Origin/CSRF at all: never 200", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const called = { enabled: false, fields: false, undo: false };
+    const { app, port } = startApp(buildRefusingDeps(csrf, called));
+    try {
+      for (const path of PATH_VARIANTS("/api/rules/plan")) {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: "ui-first-rule", patch: {} }) });
+        expect(res.status).not.toBe(200);
+      }
+    } finally { await app.stop(true); }
+  });
+
+  test("a totally unmapped non-GET path under /api/ is still refused (403), not a bare 404 that would reveal route existence", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const { app, port } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/does-not-exist`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      expect(res.status).toBe(403);
     } finally { await app.stop(true); }
   });
 });
