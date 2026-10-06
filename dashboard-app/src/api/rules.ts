@@ -376,20 +376,35 @@ export const realRulesApi: RulesApi = {
   listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
   previewRule: (ruleId, signal) => request<RulePreviewResponse>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal }),
   planRule: async (ruleId, patch, confirm, signal) => {
-    const raw = await request<RulePlanResponse & { scope?: number }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, signal });
-    // `scopeCount` per the ticket's own named contract; PR #647's in-flight
-    // implementation at the time this was written calls the same value
-    // `scope` — read either key so a late rename on that PR doesn't break
-    // this slice (see `RulePlanResponse.scopeCount`'s own doc comment).
+    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, signal });
+    // `scopeCount` per the ticket's own named contract. The real merged
+    // server (PR #647, `src/rules/rules-write.ts`'s `planRuleWrite`) names
+    // this field `scope`, typed `number | null` (`null` whenever the patch
+    // wouldn't newly enable the rule) — NOT `scopeCount`, and NOT always a
+    // `number`. Read either key defensively, but normalize `null`/`0`/
+    // absent all the same way: only a POSITIVE number ever becomes
+    // `scopeCount` here, so a caller's `!== undefined` check (this file's
+    // own `RulePlanResponse.scopeCount` doc comment, and
+    // `FirstRuleSetup.tsx`'s `overCeiling`/display logic) never sees a
+    // `null` masquerading as "defined".
     const { scope, ...rest } = raw;
-    const scopeCount = rest.scopeCount ?? scope;
+    const candidate = rest.scopeCount ?? scope;
+    const scopeCount = typeof candidate === "number" ? candidate : undefined;
     return scopeCount === undefined ? rest : { ...rest, scopeCount };
   },
   setEnabled: (ruleId, enabled, ifMatch, planHash, confirm, signal) =>
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}/enabled`, { method: "POST", body: { enabled, ifMatch, planHash, confirm }, csrf: true, signal }),
   updateFields: (ruleId, patch, ifMatch, planHash, confirm, signal) =>
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "PUT", body: { ...patch, ifMatch, planHash, confirm }, csrf: true, signal }),
-  undo: (backupId, signal) => request<RuleWriteResult>(`/api/undo/${encodeURIComponent(backupId)}`, { method: "POST", csrf: true, signal }),
+  // `body: {}` is REQUIRED here, not cosmetic: the real merged guard
+  // (`src/web/view.ts`'s `onRequest` hook, `./write-guard.ts`'s
+  // `checkWriteGuard`) demands `content-type: application/json` on EVERY
+  // non-safe method under `/api/`, unconditionally — including this route,
+  // which otherwise has no body of its own. `request()` only attaches that
+  // header when `opts.body !== undefined`; omitting this would 415 every
+  // real undo call. Confirmed against `test/unit/rules-write-route.test.ts`
+  // on `main`, which sends the same `content-type` + `body: "{}"` here.
+  undo: (backupId, signal) => request<RuleWriteResult>(`/api/undo/${encodeURIComponent(backupId)}`, { method: "POST", body: {}, csrf: true, signal }),
   async refreshCapabilities(signal) {
     try {
       await fetchCsrfToken(signal);
