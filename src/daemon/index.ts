@@ -5,7 +5,11 @@ import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
-import { loadConfig, describeConfig, ignoredExtensionOriginsWarning } from "../config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
+import { runSetupModeDaemon } from "./setup-mode.js";
+import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
+import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
+import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
@@ -183,6 +187,17 @@ installLogSink();
 const settingsFileResult = loadSettingsFile(process.env);
 for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
 const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
+// FACTORY-665 (PR-2) — a fresh install with no Atlassian identity yet must
+// not crash at startup: it starts in SETUP MODE instead (serving only
+// `/health`, the dashboard shell, and the setup API — see
+// `./setup-mode.ts`'s own header) until an operator configures it through
+// the dashboard. Checked BEFORE `loadConfig` itself, which still throws for
+// every OTHER kind of misconfiguration exactly as before — this is not a
+// general "never crash" change, only the one case setup mode exists for.
+if (!isAtlassianConfigured(process.env as Record<string, string | undefined>)) {
+  await runSetupModeDaemon();
+  process.exit(1); // unreachable in practice: runSetupModeDaemon only returns on a startup failure of its own (e.g. a bad BUTCHR_PORT), already logged by `loadConfig`-style callers elsewhere; listen() itself runs forever.
+}
 
 let config;
 try {
@@ -876,6 +891,19 @@ const jiraTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
 // to track separately.
 const daemonRestartRateLimitInstance = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 1 });
 const daemonRestartRateLimit = () => daemonRestartRateLimitInstance("daemon-restart");
+// FACTORY-665 (PR-2): `PUT /api/settings/jira/token` (rotation) gets its own
+// setup-code manager — this daemon is already configured, so no code is
+// minted at startup (there is nothing to onboard); an operator mints one
+// on demand via `SIGUSR2` whenever they actually want to rotate the token
+// (same handler setup mode installs — see `../setup/setup-code.ts`'s own
+// header for why this exists in BOTH modes, not just the unconfigured one).
+const jiraTokenRotateCodeManager = createSetupCodeManager();
+installSetupCodeSigusr2Handler(jiraTokenRotateCodeManager, (line) => console.error(line));
+// Same two-budget shape setup mode uses for the identical reason — see
+// `ViewDeps.jiraTokenTestRateLimit`/`jiraTokenWriteRateLimit`'s own doc
+// comments (`../web/view.ts`).
+const jiraTokenTestRateLimit = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 5 });
+const jiraTokenWriteRateLimit = createWriteRateLimiter({ windowMs: 60 * 60_000, max: 3 });
 
 // FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
 // itself (same directory FACTORY-658's own backups live in) — every
@@ -1138,6 +1166,25 @@ const { app, mcp } = buildApp({
   // under that unit (see `../web/daemon-restart.ts`'s own header).
   daemonRestart: () => restartDaemon(),
   daemonRestartRateLimit,
+  // FACTORY-665 (PR-2): this daemon is already configured, so `GET
+  // /api/setup/status` always reports `configured: true` here — the
+  // dashboard's Setup page never shows once this is wired (setup mode,
+  // `./setup-mode.ts`, is the only place `configured: false` is ever
+  // returned).
+  setupStatus: () => ({ configured: true }),
+  // `PUT /api/settings/jira/token` — ROTATION only: site/email are this
+  // daemon's own already-loaded `config.atlassian` values (never settable
+  // from the request body here — see `ViewDeps.jiraTokenRotate`'s own doc
+  // comment), and `requireEnvCheck: true` means an env-provided token
+  // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 before
+  // the setup code is even checked.
+  jiraTokenRotate: (input) => handleJiraTokenWrite(
+    { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
+    { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
+    { requireEnvCheck: true },
+  ),
+  jiraTokenTestRateLimit,
+  jiraTokenWriteRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no

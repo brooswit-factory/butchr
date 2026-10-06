@@ -38,7 +38,7 @@ describe("provider selection", () => {
     expect(checkArgv(args, args.slice(0, -2)).ok).toBe(false);
   });
   test("config preserves defaults, selects either provider and rejects invalid input", () => {
-    const env = { ATLASSIAN_SITE: "https://example.invalid", ATLASSIAN_EMAIL: "test", ATLASSIAN_TOKEN: "fake" };
+    const env = { ATLASSIAN_SITE: "https://example.atlassian.net", ATLASSIAN_EMAIL: "test", ATLASSIAN_TOKEN: "fake" };
     // FACTORY-491: BUTCHR_RESTORED_RESUME unset defaults to {buddy, genius} —
     // see DEFAULT_RESTORED_RESUME_AGENTS' own doc comment (src/config/config.ts).
     expect(loadConfig(env, () => "").agent).toEqual({ provider: "claude", restoredResume: new Set(["buddy", "genius"]) });

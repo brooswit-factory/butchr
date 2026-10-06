@@ -232,7 +232,7 @@ describe("no-write guarantee (mutation check)", () => {
 describe("createJiraEnv", () => {
   test("wires maxAgents and search from the real config/client", async () => {
     const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ issues: [{ key: "K-1", fields: {} }] }), { status: 200 });
-    const jira = createJiraEnv({ ATLASSIAN_SITE: "https://x", ATLASSIAN_EMAIL: "a", ATLASSIAN_TOKEN: "t", BUTCHR_MAX_AGENTS: "3" }, fetchImpl);
+    const jira = createJiraEnv({ ATLASSIAN_SITE: "https://x.atlassian.net", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "t", BUTCHR_MAX_AGENTS: "3" }, fetchImpl);
     expect(jira.maxAgents).toBe(3);
     expect((await jira.search("x")).map((i) => i.key)).toEqual(["K-1"]);
   });

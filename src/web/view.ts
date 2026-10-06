@@ -27,6 +27,7 @@ import type { ReloadResult } from "../rules/reload.js";
 import type { SettingsApiResponse } from "./settings-api.js";
 import type { JiraTestResult } from "./jira-connection-test.js";
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
+import type { SetupStatusResponse, JiraWriteRequestOutcome } from "./setup-api.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -339,6 +340,56 @@ export interface ViewDeps {
    * never a reason to refuse a restart that would otherwise be allowed.
    */
   daemonRestartRateLimit?: () => WriteRateLimitOutcome;
+  /**
+   * FACTORY-665 (PR-2) — `GET /api/setup/status`'s own data: whether the
+   * daemon is fully configured (Atlassian identity present) or running in
+   * setup mode. Synchronous, no I/O (reads a boolean this daemon's own
+   * startup already decided — see `../config/config.ts`'s
+   * `isAtlassianConfigured`). Optional: an omitted value makes the route
+   * unreachable (503), never open.
+   */
+  setupStatus?: () => SetupStatusResponse;
+  /**
+   * FACTORY-665 (PR-2) — `POST /api/setup/jira`'s own logic (setup mode
+   * ONLY — this daemon's setup-mode startup, `../daemon/setup-mode.ts`,
+   * binds this with `requireEnvCheck: false` baked in, since setup mode by
+   * definition means no env-provided token exists yet). Site/email come
+   * from the request body here (this is the ONE time they are ever
+   * settable other than by hand/shell — see the ticket's own "shell-only
+   * after setup" rule). Optional: an omitted value makes the route
+   * unreachable (503).
+   */
+  setupJiraWrite?: (input: { site: string; email: string; token: string; setupCode: string }) => Promise<JiraWriteRequestOutcome>;
+  /**
+   * FACTORY-665 (PR-2) — `PUT /api/settings/jira/token`'s own logic
+   * (configured mode — ROTATION only, never settable site/email here: this
+   * daemon's own already-loaded `config.atlassian.site`/`.email` are
+   * reused by the closure `../daemon/index.ts` binds, with
+   * `requireEnvCheck: true` baked in). Optional: an omitted value makes
+   * the route unreachable (503).
+   */
+  jiraTokenRotate?: (input: { token: string; setupCode: string }) => Promise<JiraWriteRequestOutcome>;
+  /**
+   * FACTORY-665 (PR-2) — shared by BOTH `POST /api/setup/jira` and `PUT
+   * /api/settings/jira/token`: 5 attempts per 10 minutes per the ticket's
+   * own spec (every call makes a real outbound credentialed test, same
+   * reasoning as `jiraTestRateLimit` above, just a tighter budget since a
+   * successful call here also WRITES a secret). Counts every attempt,
+   * accepted or refused — same "no free re-tries" discipline `writeRateLimit`
+   * documents. Optional: absent means no flood protection, never a reason
+   * to refuse.
+   */
+  jiraTokenTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /**
+   * FACTORY-665 (PR-2) — a SEPARATE, much tighter budget on top of
+   * `jiraTokenTestRateLimit`: 3 SUCCESSFUL writes per hour, per the
+   * ticket's own spec. Checked immediately alongside the test limiter
+   * (before any network call), not only after a write succeeds — see
+   * `./view.ts`'s own route comment for why checking it up-front, even
+   * though it is a "successful write" budget, is the conservative and
+   * simple choice here. Optional: absent means no flood protection.
+   */
+  jiraTokenWriteRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
 }
 
 /** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
@@ -711,6 +762,117 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const result = await deps.jiraTest();
       auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
       return result;
+    })
+    // FACTORY-665 (PR-2) — `GET /api/setup/status`. Same guard discipline as
+    // `GET /api/settings` immediately above (dashboard-origin + peer-uid) —
+    // deliberately NOT gated on this daemon being configured, since the
+    // dashboard's own Setup page polls this route BEFORE configuration
+    // exists at all.
+    .get("/api/setup/status", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.setupStatus) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return deps.setupStatus();
+    })
+    // FACTORY-665 (PR-2) — `POST /api/setup/jira` (setup mode only — see
+    // `../daemon/setup-mode.ts`, which is the only place this dep is ever
+    // bound). Full write guard chain, THEN both the test and write rate
+    // limiters (checked up front, before any network call — see
+    // `ViewDeps.jiraTokenWriteRateLimit`'s own doc comment), THEN the
+    // route hands the body straight to `deps.setupJiraWrite`, which owns
+    // the setup-code check, site-shape validation, and the token test +
+    // write themselves. This route NEVER logs or audits the request body's
+    // own `token`/`setupCode` fields — `ids`/`diffSummary` below name only
+    // the route and a fixed action string.
+    .post("/api/setup/jira", async ({ set, request, server, body }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.setupJiraWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const clientKey = server?.requestIP(request)?.address ?? "unresolved";
+      if (deps.jiraTokenTestRateLimit) {
+        const result = deps.jiraTokenTestRateLimit(clientKey);
+        if (!result.ok) {
+          const error = `rate limited: too many setup attempts — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      if (deps.jiraTokenWriteRateLimit) {
+        const result = deps.jiraTokenWriteRateLimit(clientKey);
+        if (!result.ok) {
+          const error = `rate limited: too many setup writes this hour — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.site !== "string" || typeof b.email !== "string" || typeof b.token !== "string" || typeof b.setupCode !== "string") {
+        set.status = 400;
+        return { error: "body must be { site: string, email: string, token: string, setupCode: string }" };
+      }
+      const result = await deps.setupJiraWrite({ site: b.site, email: b.email, token: b.token, setupCode: b.setupCode });
+      auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
+      set.status = result.status;
+      return result.body;
+    })
+    // FACTORY-665 (PR-2) — `PUT /api/settings/jira/token` (configured mode
+    // — ROTATION only; see `src/daemon/index.ts`, which binds
+    // `jiraTokenRotate` with `requireEnvCheck: true` and this daemon's own
+    // already-loaded site/email). Same guard/rate-limit/audit discipline as
+    // `POST /api/setup/jira` immediately above.
+    .put("/api/settings/jira/token", async ({ set, request, server, body }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.jiraTokenRotate) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const clientKey = server?.requestIP(request)?.address ?? "unresolved";
+      if (deps.jiraTokenTestRateLimit) {
+        const result = deps.jiraTokenTestRateLimit(clientKey);
+        if (!result.ok) {
+          const error = `rate limited: too many token tests — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      if (deps.jiraTokenWriteRateLimit) {
+        const result = deps.jiraTokenWriteRateLimit(clientKey);
+        if (!result.ok) {
+          const error = `rate limited: too many token rotations this hour — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+        set.status = 400;
+        return { error: "body must be { token: string, setupCode: string }" };
+      }
+      const result = await deps.jiraTokenRotate({ token: b.token, setupCode: b.setupCode });
+      auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
+      set.status = result.status;
+      return result.body;
     })
     // FACTORY-662 item 1: `GET /api/session` — mints/hands out this
     // process's one CSRF token. The Origin/Host/peer-uid guard already ran
