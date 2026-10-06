@@ -412,6 +412,18 @@ describe("writeRulesFile: locking (review round 2)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
   });
 
+  test("F9 (agentsafety): contention then success in ONE process — a refused write must not leave the path stuck as 'already being written'", () => {
+    writeRulesFile(doc([RULE_A]), env());
+    const rulesDir = join(dir, "butchr");
+    const lockPath = join(rulesDir, ".rules.lock");
+    writeFileSync(lockPath, String(process.pid)); // live holder: acquire throws
+    expect(() => writeRulesFile(doc([RULE_A, RULE_B]), env())).toThrow(/locked by another writer/);
+    expect(() => writeRulesFile(doc([RULE_A, RULE_B]), env())).toThrow(/locked by another writer/); // still the lock error, never the reentrancy one
+    unlinkSync(lockPath);
+    expect(writeRulesFile(doc([RULE_A, RULE_B]), env()).changedIds).toContain("stories");
+    expect(writeRulesFile(doc([RULE_A]), env()).changedIds).toContain("stories"); // and again: the guard entry was cleared every time
+  });
+
   test("an unreadable/corrupt lock fails closed rather than guessing it's abandoned", () => {
     writeRulesFile(doc([RULE_A]), env());
     const rulesDir = join(dir, "butchr");
