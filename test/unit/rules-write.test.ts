@@ -19,7 +19,15 @@ function env(): RulesEnv { return { XDG_CONFIG_HOME: dir }; }
 function rulesFilePath(): string { return join(dir, "butchr", "rules.json"); }
 const doc = (rules: unknown[]): string => JSON.stringify({ rules }, null, 2) + "\n";
 
-const UI_RULE = { id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false, agentPreferences: [{ harness: "claude", model: "sonnet" }] };
+// FACTORY-685 (item 2): `execution` defaults to `"swarm"` when omitted, which
+// would now make EVERY enable in this file subject to the new "any swarm
+// enable needs confirm" gate — orthogonal to what these fixtures exist to
+// test (stale etags, placeholders, allowlist scoping, N1 caching, etc., not
+// item 2 itself). Pinned to `"singleton"` explicitly so this file's many
+// pre-existing enable/disable scenarios keep testing what they always tested;
+// item 2's own dedicated coverage below builds its own explicitly-`"swarm"`
+// fixtures.
+const UI_RULE = { id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false, execution: "singleton", agentPreferences: [{ harness: "claude", model: "sonnet" }] };
 const MANAGERS_RULE = { id: "managers", resourceProvider: "jira-work", query: "project = BUTCHR AND role = manager", brief: "manage it", enabled: true };
 
 function seed(rules: unknown[]): string {
@@ -512,6 +520,133 @@ describe("B5c: scope ceiling is evaluated on an enabled COPY, even for a current
   });
 });
 
+describe("FACTORY-685 (item 2, agentsafety F1): confirm on ANY enable of a swarm rule, not only above the ceiling", () => {
+  const SWARM_RULE = { id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false, execution: "swarm" };
+
+  test("GO-RED: enabling a swarm rule at a tiny scope (well under the 25-ticket ceiling), with no confirm, is refused 409 — writes nothing", async () => {
+    const text = seed([SWARM_RULE]);
+    const deps = { env: env() };
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, false, async () => 3, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, false, planHash, async () => 3, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toMatch(/staff up to 3 ticket/);
+      expect(outcome.error).toMatch(/confirm/);
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("the SAME enable, WITH confirm: true and a fresh planHash, succeeds", async () => {
+    seed([SWARM_RULE]);
+    const deps = { env: env() };
+    const scope = async () => 3;
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, true, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, true, planHash, scope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].enabled).toBe(true);
+  });
+
+  test("a SINGLETON rule's enable at the same tiny scope needs NO confirm — this gate is swarm-specific", async () => {
+    seed([{ ...SWARM_RULE, execution: "singleton" }]);
+    const deps = { env: env() };
+    const scope = async () => 3;
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, false, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, false, planHash, scope, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("disabling a swarm rule is unaffected by this gate (it only applies to ENABLING)", async () => {
+    seed([{ ...SWARM_RULE, enabled: true }]);
+    const deps = { env: env() };
+    const planHash = await planHashFor("ui-first-rule", { enabled: false }, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", false, etag, false, planHash, noScope, deps);
+    // disabling still needs confirm for its OWN reason (B3, stop > 0) — the point here is just that this is the stop-restart gate, not a second swarm-enable refusal double-counted.
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.error).not.toMatch(/staff up to/);
+  });
+
+  test("the unmeasurable-scope guard still fires FIRST, unconditionally — a swarm enable with no real scope number refuses 503, not 409, even with confirm: true", async () => {
+    seed([SWARM_RULE]);
+    const deps = { env: env() };
+    const unmeasurable = async () => Number.POSITIVE_INFINITY;
+    const outcome = await writeRuleEnabled("ui-first-rule", true, "irrelevant-etag", true, "irrelevant-hash", unmeasurable, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(503);
+      expect(outcome.error).toMatch(/previewer is unavailable/);
+    }
+  });
+
+  describe("planRuleWrite reports requiresConfirm + confirmReason for a swarm enable", () => {
+    test("a swarm enable under the ceiling: requiresConfirm true, confirmReason 'swarm-enable'", async () => {
+      seed([SWARM_RULE]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => 3, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.scope).toBe(3);
+        expect(plan.requiresConfirm).toBe(true);
+        expect(plan.confirmReason).toBe("swarm-enable");
+      }
+    });
+
+    test("a swarm enable OVER the ceiling: confirmReason is the more specific 'scope-ceiling', not 'swarm-enable'", async () => {
+      seed([SWARM_RULE]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => ENABLE_SCOPE_CEILING + 1, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.requiresConfirm).toBe(true);
+        expect(plan.confirmReason).toBe("scope-ceiling");
+      }
+    });
+
+    test("confirm: true already supplied: requiresConfirm is false, and confirmReason is absent", async () => {
+      seed([SWARM_RULE]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, true, async () => 3, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.requiresConfirm).toBe(false);
+        expect(plan.confirmReason).toBeUndefined();
+      }
+    });
+
+    test("a singleton enable at the same scope: no confirm needed, no confirmReason", async () => {
+      seed([{ ...SWARM_RULE, execution: "singleton" }]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => 3, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.requiresConfirm).toBe(false);
+        expect(plan.confirmReason).toBeUndefined();
+      }
+    });
+
+    test("an unmeasurable scope on a swarm enable: confirmReason is 'unmeasurable-scope', not 'swarm-enable'", async () => {
+      seed([SWARM_RULE]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => Number.POSITIVE_INFINITY, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.requiresConfirm).toBe(true);
+        expect(plan.confirmReason).toBe("unmeasurable-scope");
+      }
+    });
+
+    test("a disable needing confirm (stop-restart): confirmReason is 'stop-restart'", async () => {
+      seed([{ ...SWARM_RULE, enabled: true }]);
+      const plan = await planRuleWrite("ui-first-rule", { enabled: false }, false, noScope, { env: env() });
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(plan.requiresConfirm).toBe(true);
+        expect(plan.confirmReason).toBe("stop-restart");
+      }
+    });
+  });
+});
+
 describe("STALE-LOCK ERROR is passed through verbatim, naming the lock file", () => {
   test("a crashed writer's leftover .rules.lock refuses with the exact path and rm instruction, status 503", async () => {
     seed([UI_RULE]);
@@ -603,13 +738,17 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     seed([rule]);
     const deps = { env: env() };
     const scopeOf = realScopeOf(rule, [issue("F-1")]);
-    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+    // confirm: true throughout — `rule` (`previewRule()`) is execution:
+    // "swarm", so FACTORY-685 (item 2) now requires it on ANY enable,
+    // independent of this test's own subject (the scope cache, not item 2's
+    // gate — see that describe block below for item 2's own coverage).
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, true, scopeOf, deps);
     expect(plan.ok).toBe(true);
     if (!plan.ok) throw new Error("expected a successful plan");
     expect(plan.scope).toBe(1);
-    expect(plan.requiresConfirm).toBe(false);
+    expect(plan.requiresConfirm).toBe(false); // confirm: true already satisfies every gate that would otherwise apply
     const etag = rulesEtag(env());
-    const apply = await writeRuleEnabled("ui-first-rule", true, etag, false, plan.planHash, scopeOf, deps);
+    const apply = await writeRuleEnabled("ui-first-rule", true, etag, true, plan.planHash, scopeOf, deps);
     expect(apply.ok).toBe(true);
     if (apply.ok) expect(apply.changedIds).toEqual(["ui-first-rule"]);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
@@ -736,12 +875,12 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     let calls = 0;
     const underlying = async (_id: string): Promise<number> => { calls++; return calls; };
     const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
-    expect(await cached("ui-first-rule")).toBe(1);
+    expect(await cached("ui-first-rule", "project = BUTCHR")).toBe(1);
     now += 5_000; // within TTL
-    expect(await cached("ui-first-rule")).toBe(1); // cache hit, no new call
+    expect(await cached("ui-first-rule", "project = BUTCHR")).toBe(1); // cache hit, no new call
     expect(calls).toBe(1);
     now += 6_000; // now 11s since the first call — TTL elapsed
-    expect(await cached("ui-first-rule")).toBe(2);
+    expect(await cached("ui-first-rule", "project = BUTCHR")).toBe(2);
     expect(calls).toBe(2);
   });
 
@@ -749,7 +888,95 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     let now = 0;
     const underlying = async (id: string): Promise<number> => (id === "a" ? 1 : 2);
     const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
-    expect(await cached("a")).toBe(1);
-    expect(await cached("b")).toBe(2);
+    expect(await cached("a", "query a")).toBe(1);
+    expect(await cached("b", "query b")).toBe(2);
+  });
+
+  describe("N4 (FACTORY-685, agentsafety audit #50): keyed by rule id + query hash, invalidated on write/reload", () => {
+    test("GO-RED CONTROL: keyed by id alone, a widened query within the TTL still answers with the STALE scope — proves the mechanism the fix closes", async () => {
+      // The OLD (pre-fix) shape: a cache keyed by id alone, ignoring the query entirely.
+      let now = 0;
+      let answer = 3;
+      const oldStyleCache = new Map<string, { scope: number; at: number }>();
+      const oldStyleCachedScopeOf = async (id: string): Promise<number> => {
+        const cached = oldStyleCache.get(id);
+        if (cached !== undefined && now - cached.at < 10_000) return cached.scope;
+        const scope = answer;
+        oldStyleCache.set(id, { scope, at: now });
+        return scope;
+      };
+      expect(await oldStyleCachedScopeOf("ui-first-rule")).toBe(3);
+      answer = 40; // the query widened
+      now += 2_300; // well within the 10s TTL
+      expect(await oldStyleCachedScopeOf("ui-first-rule")).toBe(3); // STALE — the bug
+    });
+
+    test("a widened query within the TTL gets its OWN cache entry — never the stale scope from the old query", async () => {
+      let now = 0;
+      const scopeByQuery = new Map<string, number>([["project = A", 3], ["project = B", 40]]);
+      let calls = 0;
+      const underlying = async (_id: string): Promise<number> => { throw new Error("underlying must never be called directly by this test — use cached()"); };
+      const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
+      // Build the cache the same way `planRuleWrite`/`writeRuleEnabled` do:
+      // `scopeOf` itself only ever sees `id` (the real previewer re-reads
+      // the CURRENT query from the live file) — but since this test's
+      // `underlying` always throws, wire a real-shaped one instead that
+      // reads from `scopeByQuery` keyed by whichever query the test cares
+      // about at call time via a mutable ref, proving the CACHE key (not
+      // the underlying call) is what changed.
+      const liveQuery = { current: "project = A" };
+      const realUnderlying = async (_id: string): Promise<number> => { calls++; return scopeByQuery.get(liveQuery.current)!; };
+      const realCached = createScopeCache(realUnderlying, { ttlMs: 10_000, now: () => now });
+      expect(await realCached("ui-first-rule", liveQuery.current)).toBe(3);
+      expect(calls).toBe(1);
+      now += 2_300; // within TTL
+      liveQuery.current = "project = B"; // the query widened — this is the repro
+      expect(await realCached("ui-first-rule", liveQuery.current)).toBe(40); // fresh call, NOT the stale 3
+      expect(calls).toBe(2);
+      // The ORIGINAL query, still within ITS OWN TTL window, still answers from its own cache entry.
+      expect(await realCached("ui-first-rule", "project = A")).toBe(3);
+      expect(calls).toBe(2); // no third underlying call — the original entry is still live
+    });
+
+    test("end-to-end repro (the ticket's own acceptance test): plan on a 3-ticket query, widen to 40, plan again WITHIN the TTL — scope is 40, and ceiling/confirm logic applies to 40", async () => {
+      const rule = { id: "ui-first-rule", enabled: false, resourceProvider: "jira-work" as const, query: "project = A", brief: "do the thing", execution: "swarm" as const, account: "none" as const, role: "worker" as const };
+      seed([rule]);
+      const deps = { env: env() };
+      let now = 0;
+      const previewer = async (_id: string): Promise<number> => { const { readFileSync: rfs } = require("node:fs") as typeof import("node:fs"); const text = rfs(rulesFilePath(), "utf8"); const q = JSON.parse(text).rules[0].query as string; return q === "project = A" ? 3 : 40; };
+      const scopeOf = createScopeCache(previewer, { ttlMs: 10_000, now: () => now });
+
+      const plan1 = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+      expect(plan1.ok).toBe(true);
+      if (plan1.ok) { expect(plan1.scope).toBe(3); expect(plan1.requiresConfirm).toBe(true); } // swarm-enable gate, even at scope 3
+
+      // Widen the query — a real write (through writeRuleFields would also
+      // call `scopeOf.clear()` via `deps.reload`; here the query changes
+      // WITHOUT any write at all, proving the fix is the cache KEY, not
+      // just the invalidation-on-write belt-and-suspenders).
+      const { writeFileSync: wfs } = require("node:fs") as typeof import("node:fs");
+      wfs(rulesFilePath(), JSON.stringify({ rules: [{ ...rule, query: "project = B" }] }, null, 2) + "\n");
+
+      now += 2_300; // well within the cache's 10s TTL
+      const plan2 = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+      expect(plan2.ok).toBe(true);
+      if (plan2.ok) {
+        expect(plan2.scope).toBe(40); // NOT the stale 3
+        expect(plan2.requiresConfirm).toBe(true);
+        expect(plan2.confirmReason).toBe("scope-ceiling"); // 40 > ENABLE_SCOPE_CEILING now applies too
+      }
+    });
+
+    test("clear() drops every cached entry — the daemon wires this into every reload/write path (src/daemon/index.ts)", async () => {
+      let now = 0;
+      let calls = 0;
+      const underlying = async (_id: string): Promise<number> => { calls++; return calls; };
+      const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
+      expect(await cached("ui-first-rule", "project = A")).toBe(1);
+      expect(calls).toBe(1);
+      cached.clear();
+      expect(await cached("ui-first-rule", "project = A")).toBe(2); // fresh call despite being well within the TTL
+      expect(calls).toBe(2);
+    });
   });
 });

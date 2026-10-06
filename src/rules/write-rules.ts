@@ -640,9 +640,21 @@ export function rulesEtag(env: RulesEnv = process.env, io: WriteRulesIo = defaul
  * daemon's own startup and `writeRulesFile` both use — BEFORE anything
  * touches disk, with an empty `RulesEnv` (`path` is irrelevant to that
  * validation; only the document's own content is being checked). `path`'s
- * directory is created at mode 0700 if absent; the published file is mode
- * 0600; both are fsynced, same discipline every other write in this module
- * follows.
+ * directory is created at mode 0700 ONLY when this call itself creates it
+ * (FACTORY-685, L2) — an EXISTING directory's permissions are never
+ * touched, in either direction: a pre-existing `0755` dir is never silently
+ * narrowed to `0700` (the bug this fixes — the previous unconditional
+ * `io.chmod(dir, 0o700)` did exactly that), and a pre-existing `0500` dir is
+ * never widened to `0700` either. When an existing dir is already wider
+ * than `0700` (carries any permission bit outside it — group/other
+ * read/write/execute), `onWarn` (when given) is called with a message
+ * naming the dir and its mode; this function still proceeds (the seed
+ * itself is not refused over a pre-existing dir's own permissions, which
+ * predate and are outside this call's control) — logging/alerting on that
+ * warning is the caller's job, same discipline `seed-first-run.ts`'s own
+ * header documents for its typed outcomes. The published file is mode
+ * 0600; both the file and (when created) the directory are fsynced, same
+ * discipline every other write in this module follows.
  *
  * Deliberately does NOT take `.rules.lock`: that lock protects concurrent
  * WRITES to an already-established file, a different hazard from this
@@ -651,12 +663,17 @@ export function rulesEtag(env: RulesEnv = process.env, io: WriteRulesIo = defaul
  * on invalid input, an existing/symlinked destination, or any filesystem
  * failure; the temp file is always cleaned up.
  */
-export function createRulesFileExclusive(path: string, text: string, io: WriteRulesIo = defaultIo()): void {
+export function createRulesFileExclusive(path: string, text: string, io: WriteRulesIo = defaultIo(), opts: { onWarn?: (message: string) => void } = {}): void {
   loadRules({}, () => text); // throws on invalid input; nothing below runs
 
   const dir = dirname(path);
+  const dirModeBefore = io.modeOf(dir);
   io.mkdir(dir);
-  io.chmod(dir, 0o700);
+  if (dirModeBefore === undefined) {
+    io.chmod(dir, 0o700);
+  } else if ((dirModeBefore & ~0o700) !== 0) {
+    opts.onWarn?.(`${dir} already existed at mode ${(dirModeBefore & 0o777).toString(8)}, wider than 0700 — the first-run seed never narrows an existing directory's permissions, left as-is`);
+  }
 
   if (io.isSymlink(path) || io.readFile(path) !== undefined) {
     throw new Error(`${path} already exists — refusing to replace it (first-run seed is no-clobber)`);

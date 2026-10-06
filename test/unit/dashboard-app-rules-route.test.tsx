@@ -107,7 +107,7 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "ui-triage", enabled: true })] }),
       latencyMs: 0,
-      plans: { "ui-triage": { planHash: "h1", spawned: 0, stopped: 3, restarted: 1, etag: "e1" } },
+      plans: { "ui-triage": { planHash: "h1", spawned: 0, stopped: 3, restarted: 1, etag: "e1", requiresConfirm: true, confirmReason: "stop-restart" } },
     });
     const { findAllByTestId, getByRole, findByTestId, getByText } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -132,7 +132,7 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "ui-triage", enabled: true })] }),
       latencyMs: 0,
-      plans: { "ui-triage": { planHash: "h1", spawned: 0, stopped: 1, restarted: 0, etag: "e1" } },
+      plans: { "ui-triage": { planHash: "h1", spawned: 0, stopped: 1, restarted: 0, etag: "e1", requiresConfirm: true, confirmReason: "stop-restart" } },
     });
     const { findAllByTestId, getByRole, findByTestId, queryByTestId } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -144,11 +144,16 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     expect(after.rules[0]!.enabled).toBe(true);
   });
 
-  test("a toggle whose plan reports zero stopped/restarted applies immediately, with no confirm dialog", async () => {
+  test("a toggle whose plan reports zero stopped/restarted and requiresConfirm:false applies immediately, with no confirm dialog", async () => {
+    // execution: "singleton" — FACTORY-685 (item 2/3) now requires a
+    // confirm dialog on ANY swarm enable regardless of blast radius; this
+    // test's own point (a truly zero-blast-radius change applies with no
+    // dialog, trusting the server's own requiresConfirm) needs a rule the
+    // new gate does not apply to.
     const api = createFixturesRulesApi({
-      initial: response({ rules: [rule({ id: "ui-triage", enabled: false })] }),
+      initial: response({ rules: [rule({ id: "ui-triage", enabled: false, execution: "singleton" })] }),
       latencyMs: 0,
-      plans: { "ui-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1" } },
+      plans: { "ui-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
     });
     const { findAllByTestId, queryByTestId } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -164,7 +169,7 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
       latencyMs: 0,
-      plans: { "factory-triage": { planHash: "h1", spawned: 0, stopped: 0, restarted: 0, etag: "e1" } },
+      plans: { "factory-triage": { planHash: "h1", spawned: 0, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
     });
     const { findAllByTestId, findByTestId, container } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -192,10 +197,14 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
   });
 
   test("the toggle stays enabled and clickable for ui-first-rule (and other ui- ids) once writes are enabled", async () => {
+    // execution: "singleton" — this test's own point is the toggle's
+    // enabled/disabled state and that a click applies, not the FACTORY-685
+    // swarm-confirm gate (covered separately above and in its own describe
+    // block).
     const api = createFixturesRulesApi({
-      initial: response({ rules: [rule({ id: "ui-triage", enabled: false })] }),
+      initial: response({ rules: [rule({ id: "ui-triage", enabled: false, execution: "singleton" })] }),
       latencyMs: 0,
-      plans: { "ui-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1" } },
+      plans: { "ui-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
     });
     const { findAllByTestId, container } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -208,6 +217,43 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     await waitFor(async () => {
       const after = await api.listRules();
       expect(after.rules[0]!.enabled).toBe(true);
+    });
+  });
+
+  describe("FACTORY-685 (item 2/3): confirm dialog on ANY swarm enable, naming the ticket keys", () => {
+    test("GO-RED: enabling a disabled SWARM rule at a tiny scope (well under the ceiling) still shows the confirm dialog, naming 'This will staff up to N tickets' and the actual keys", async () => {
+      const api = createFixturesRulesApi({
+        initial: response({ rules: [rule({ id: "ui-triage", enabled: false, execution: "swarm" })] }),
+        latencyMs: 0,
+        previews: { "ui-triage": { ruleId: "ui-triage", total: 2, tickets: [{ key: "FACTORY-1" }, { key: "FACTORY-2" }] } },
+        // No `plans` override — the fixture computes requiresConfirm/confirmReason itself (FACTORY-685's own swarm-enable gate), same as the real server would.
+      });
+      const { findAllByTestId, findByTestId } = render(<RulesRoute api={api} />);
+      await findAllByTestId("rule-row");
+      fireEvent.click(document.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement);
+
+      const dialog = await findByTestId("rule-toggle-confirm-dialog");
+      expect(dialog.textContent).toContain("This will staff up to 2 tickets: FACTORY-1, FACTORY-2");
+
+      // Still unapplied until confirmed.
+      const stillDisabled = await api.listRules();
+      expect(stillDisabled.rules[0]!.enabled).toBe(false);
+    });
+
+    test("a SINGLETON rule's enable at the same scope shows NO confirm dialog — this gate is swarm-specific", async () => {
+      const api = createFixturesRulesApi({
+        initial: response({ rules: [rule({ id: "ui-triage", enabled: false, execution: "singleton" })] }),
+        latencyMs: 0,
+        previews: { "ui-triage": { ruleId: "ui-triage", total: 2, tickets: [{ key: "FACTORY-1" }, { key: "FACTORY-2" }] } },
+      });
+      const { findAllByTestId, queryByTestId } = render(<RulesRoute api={api} />);
+      await findAllByTestId("rule-row");
+      fireEvent.click(document.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement);
+      await waitFor(async () => {
+        const after = await api.listRules();
+        expect(after.rules[0]!.enabled).toBe(true);
+      });
+      expect(queryByTestId("rule-toggle-confirm-dialog")).toBeNull();
     });
   });
 });
@@ -274,13 +320,39 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     const api = createFixturesRulesApi({
       initial: seeded,
       latencyMs: 0,
-      plans: { [FIRST_RULE_ID]: { planHash: "plan-1", spawned: 1, stopped: 0, restarted: 0, etag: "e", scopeCount: ENABLE_SCOPE_CEILING + 5 } },
+      plans: { [FIRST_RULE_ID]: { planHash: "plan-1", spawned: 1, stopped: 0, restarted: 0, etag: "e", scopeCount: ENABLE_SCOPE_CEILING + 5, requiresConfirm: true, confirmReason: "scope-ceiling" } },
     });
     const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
     await findByTestId("first-rule-setup");
     fireEvent.click(getByRole("button", { name: "Enable" }));
     const confirm = await findByTestId("first-rule-confirm");
     expect(confirm.textContent).toContain(`scope ${ENABLE_SCOPE_CEILING + 5} tickets`);
+
+    const stillDisabled = await api.listRules();
+    expect(stillDisabled.rules.find((r) => r.id === FIRST_RULE_ID)!.enabled).toBe(false);
+
+    fireEvent.click(getByRole("button", { name: "confirm" }));
+    await waitFor(async () => {
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.enabled).toBe(true);
+    });
+  });
+
+  test("GO-RED (FACTORY-685, item 2/3): enabling ui-first-rule at a tiny scope (well under the ceiling) STILL shows a confirm step, naming 'This will staff up to N tickets' and the actual keys — not an immediate apply", async () => {
+    const seeded = defaultRulesFixture();
+    const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
+    seeded.rules[idx] = { ...seeded.rules[idx]!, query: "project = FACTORY" }; // past the placeholder; execution stays "swarm" (the seeded default)
+    const api = createFixturesRulesApi({
+      initial: seeded,
+      latencyMs: 0,
+      previews: { [FIRST_RULE_ID]: { ruleId: FIRST_RULE_ID, total: 2, tickets: [{ key: "FACTORY-10" }, { key: "FACTORY-11" }] } },
+      // No `plans` override — the fixture computes requiresConfirm/confirmReason ("swarm-enable") itself, exactly as the real server now would.
+    });
+    const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
+    await findByTestId("first-rule-setup");
+    fireEvent.click(getByRole("button", { name: "Enable" }));
+    const confirm = await findByTestId("first-rule-confirm");
+    expect(confirm.textContent).toContain("This will staff up to 2 tickets: FACTORY-10, FACTORY-11");
 
     const stillDisabled = await api.listRules();
     expect(stillDisabled.rules.find((r) => r.id === FIRST_RULE_ID)!.enabled).toBe(false);

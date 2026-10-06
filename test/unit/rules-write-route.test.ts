@@ -589,7 +589,10 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
       const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
       mkdirSync(join(dir, "butchr"), { recursive: true });
       const rulesFilePath = join(dir, "butchr", "rules.json");
-      const originalText = JSON.stringify({ rules: [{ id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false }] }, null, 2) + "\n";
+      // execution: "singleton" — FACTORY-685 (item 2) now requires confirm
+      // on ANY swarm enable; this test is about write-rate-limiting, not
+      // that gate, so it pins a non-swarm execution explicitly.
+      const originalText = JSON.stringify({ rules: [{ id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false, execution: "singleton" }] }, null, 2) + "\n";
       writeFileSync(rulesFilePath, originalText);
       const writeDeps = { env: envDeps };
       const scopeOf = async () => 0;
