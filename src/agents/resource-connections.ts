@@ -1,12 +1,23 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InboxRelay, startMcpChannelProxy, mcpServersFromMcpJson, CHANNEL_NOTIFICATION,
   inboxMessageFromNotification, type ChannelSourceOptions } from '@brooswit/drovr-events';
-import { ensureWorkspaceDir, resourceOfSpec, type SpawnSpec } from './workspace.js';
+import { ensureWorkspaceDir, resourceOfSpec, workspaceDirFor, type SpawnSpec } from './workspace.js';
+import { decodeAnyAgentKey } from '../rules/agent-key.js';
 import type { Herd } from './herd.js';
+
+/** Byte-length-safe `===`: equal-length buffers compared via `timingSafeEqual`, never a plain string `!==` (BUTCHR/FACTORY-689/691). */
+function constantTimeEqual(a: string | null | undefined, b: string): boolean {
+  if (a == null) return false;
+  const bufA = Buffer.from(a), bufB = Buffer.from(b);
+  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB);
+}
+
+/** Identical for EVERY case-(c) sub-case — wrong/missing bearer, unknown agent, unknown name, no token file, or a ready gateway's absent connection — so none of them can be told apart by status, headers, or body. */
+const UNAUTHORIZED = () => new Response('Unauthorized', { status: 401 });
 
 type Proxy = Awaited<ReturnType<typeof startMcpChannelProxy>>;
 interface Connection { proxy: Proxy; token: string; relay: InboxRelay; agent: string; }
@@ -15,10 +26,29 @@ interface Connection { proxy: Proxy; token: string; relay: InboxRelay; agent: st
 export class ResourceConnections {
   private connections = new Map<string, Connection>();
   private prepared = new Map<string, {file:string; servers:NonNullable<SpawnSpec['externalMcpServers']>}>();
+  /**
+   * Agents whose FIRST `prepare()` round has completed (success or failure),
+   * for exactly ONE `ResourceConnections` instance's lifetime — never
+   * cleared by `retain()`, unlike `prepared` above, so a legitimately
+   * retired agent (closed via `retain()`, token file left on disk) stays
+   * `ready` and `handle()` keeps answering it 401, not 503 forever
+   * (FACTORY-688/689/691 — the `retain(new Set())` -> 401 assertion this
+   * must never break). A brand-new instance (a daemon restart) starts with
+   * this empty, which is the whole 503-during-startup window `handle()`
+   * gates on below.
+   */
+  private readyAgents = new Set<string>();
   constructor(private readonly baseUrl:string, private readonly herd:Pick<Herd,'paneFor'|'nudge'>, private readonly log:(line:string)=>void) {}
   async prepare(spec:SpawnSpec):Promise<SpawnSpec> {
-    if (!spec.mcpConfigFile) return spec;
-    const file=spec.mcpConfigFile.replaceAll('{{KEY}}',resourceOfSpec(spec));
+    if (!spec.mcpConfigFile) { this.readyAgents.add(spec.key); return spec; }
+    try {
+      return await this.prepareExternal(spec);
+    } finally {
+      this.readyAgents.add(spec.key);
+    }
+  }
+  private async prepareExternal(spec:SpawnSpec):Promise<SpawnSpec> {
+    const file=spec.mcpConfigFile!.replaceAll('{{KEY}}',resourceOfSpec(spec));
     const prior=this.prepared.get(spec.key);
     if (prior) {
       if (prior.file!==file) throw new Error('MCP connection configuration changed; restart butchr to reload');
@@ -71,12 +101,60 @@ export class ResourceConnections {
       this.prepared.set(spec.key,{file,servers});return {...spec,externalMcpServers:servers};
     } catch(e) {for(const key of created)await this.closeConnection(key);throw e;}
   }
-  /** Stable local endpoint survives daemon restarts; tokens never reach the upstream service. */
+  /**
+   * Stable local endpoint survives daemon restarts; tokens never reach the
+   * upstream service. Three outcomes (FACTORY-688/689/691):
+   *  (a) bearer valid for a connection IN the registry -> forward, exactly as before.
+   *  (b) absent from the registry, this agent's first `prepare()` round has
+   *      NOT yet completed, and the bearer matches the token PERSISTED for
+   *      this agent/name -> 503 + `Retry-After`, telling a client reconnecting
+   *      right after a restart to retry rather than treating this as a bad
+   *      credential.
+   *  (c) anything else — wrong/missing bearer, unknown agent, unknown name,
+   *      no token file, or a READY gateway's absent connection (e.g. a
+   *      retired agent — `retain()` closes the connection but leaves the
+   *      token file) -> 401, byte-identical to today, revealing nothing
+   *      about whether `agent`/`name` exist.
+   */
   async handle(request:Request,agent:string,name:string):Promise<Response> {
     const c=this.connections.get(agent+'/'+name);
-    if(!c||request.headers.get('authorization')!==`Bearer ${c.token}`)return new Response('Unauthorized',{status:401});
-    const headers=new Headers(request.headers);headers.delete('host');headers.set('authorization',c.proxy.headers.Authorization);
-    return fetch(c.proxy.url,{method:request.method,headers,...(!['GET','HEAD'].includes(request.method)?{body:await request.arrayBuffer()}:{}),signal:request.signal});
+    if(c) {
+      if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${c.token}`))return UNAUTHORIZED();
+      const headers=new Headers(request.headers);headers.delete('host');headers.set('authorization',c.proxy.headers.Authorization);
+      return fetch(c.proxy.url,{method:request.method,headers,...(!['GET','HEAD'].includes(request.method)?{body:await request.arrayBuffer()}:{}),signal:request.signal});
+    }
+    if(!this.readyAgents.has(agent)) {
+      const token=await this.persistedToken(agent,name);
+      if(token!==null&&constantTimeEqual(request.headers.get('authorization'),`Bearer ${token}`)) {
+        return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
+      }
+    }
+    return UNAUTHORIZED();
+  }
+  /**
+   * The token persisted on disk for `agent`/`name`, or `null` for anything
+   * that is not a legitimately-shaped request — including a traversal or
+   * reserved-name attempt, which must be INDISTINGUISHABLE from any other
+   * (c) outcome. `agent`/`name` are URL-derived and this is an
+   * UNAUTHENTICATED code path (FACTORY-689/691 security note), so both are
+   * validated BEFORE any path is built:
+   *  - `name`: same shape `prepare()` already requires (`^[a-zA-Z0-9_-]+$`,
+   *    never the reserved `butchr`).
+   *  - `agent`: must decode as a real agent key (`decodeAnyAgentKey`) — the
+   *    same codec `encodeAgentKey` produces every real key with, so a `..`,
+   *    a path separator, an absolute path, or a NUL byte never decodes and
+   *    is rejected here, before `workspaceDirFor` ever sees it.
+   * Uses `workspaceDirFor`, NEVER `ensureWorkspaceDir` — this is a read on
+   * an unauthenticated path and must claim/create nothing.
+   */
+  private async persistedToken(agent:string,name:string):Promise<string|null> {
+    if(!/^[a-zA-Z0-9_-]+$/.test(name)||name==='butchr')return null;
+    if(!decodeAnyAgentKey(agent))return null;
+    try {
+      const dir=workspaceDirFor(agent);
+      const token=(await readFile(join(dir,`.butchr-mcp-${name}.token`),'utf8')).trim();
+      return /^[a-f0-9]{64}$/.test(token) ? token : null;
+    } catch { return null; }
   }
   private async closeConnection(key:string) {const c=this.connections.get(key);this.connections.delete(key);if(c){c.relay.stop();await c.proxy.close();}}
   async retain(ids:ReadonlySet<string>) {for(const [key,c] of this.connections)if(!ids.has(c.agent))await this.closeConnection(key);for(const id of this.prepared.keys())if(!ids.has(id))this.prepared.delete(id);}
