@@ -30,6 +30,8 @@ import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
+import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
 import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -191,6 +193,26 @@ const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.t
 // an absent file means zero rules (there are no built-in defaults), announced
 // so an idle daemon is never a mystery.
 let missingRulesPath: string | null = null;
+// FACTORY-669: at TRUE first run only (see `../rules/seed-first-run.ts`'s own
+// doc comment for the exact conditions), seed ONE disabled template rule
+// before `loadRules` below ever runs for real, so a fresh install's
+// dashboard (FACTORY-663) has something to edit/enable with no hand-edited
+// JSON and no restart. Captured here rather than acted on immediately: the
+// ops-alert router this seed's own "seeded"/"vanished" outcomes need to post
+// through (agentsafety constraint 4) is constructed much later in this same
+// file's startup sequence, after the Rocket.Chat credential is resolved —
+// the raise happens there, right after that router exists (search
+// `firstRunSeedOutcome` below).
+const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
+if (firstRunSeedOutcome.kind === "seeded") {
+  console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); open the dashboard, edit its query, then enable it`);
+} else if (firstRunSeedOutcome.kind === "vanished-established-install") {
+  console.error(
+    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but a prior backup (.bak-*) exists in its directory — this looks like an established install whose rules file vanished, not a fresh one, so no template was seeded. Restore it (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
+  );
+} else if (firstRunSeedOutcome.kind === "seed-failed") {
+  console.error(`WARNING: butchr: first-run seed of ${firstRunSeedOutcome.path} failed, starting with no rules as if the file were simply absent: ${firstRunSeedOutcome.error}`);
+}
 const rulesHolder = (() => {
   try {
     const loaded = loadRules(process.env as Record<string, string | undefined>);
@@ -2230,6 +2252,34 @@ const opsAlertRouter = createOpsAlertRouter({
 });
 if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
 else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
+
+// FACTORY-669, agentsafety constraint 4: one alert, raised here rather than
+// at the seed's own call site (far above, before `opsAlertRouter` existed —
+// see `firstRunSeedOutcome`'s own comment there). The "vanished" case passes
+// `dedupWindowMs: 0` so it is never swallowed by the router's ordinary
+// hourly dedup (agentsafety: "a vanished rules file on an established
+// install must be noticed") — moot for THIS call alone (seeding runs once
+// per process, so the router's in-memory dedup state can never have seen
+// this key before), but it makes the non-deduped intent explicit rather
+// than relying on that coincidence.
+if (firstRunSeedOutcome.kind === "seeded") {
+  opsAlertRouter.raise({
+    key: "first-run-seed",
+    condition: "first-run-seed",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: `seeded one disabled template rule (${FIRST_RULE_ID}) at true first run`,
+    remedy: "Open the dashboard, edit the template rule's query, then enable it.",
+  });
+} else if (firstRunSeedOutcome.kind === "vanished-established-install") {
+  opsAlertRouter.raise({
+    key: `rules-file-vanished:${firstRunSeedOutcome.path}`,
+    condition: "rules-file-vanished",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: "the default rules file is absent but a prior .bak-* backup exists in its directory — an established install's rules file appears to have vanished, so no first-run template was seeded",
+    remedy: "Restore the rules file (from a .bak-* backup, or by hand) and SIGHUP/restart the daemon; nothing is staffed until then.",
+    dedupWindowMs: 0,
+  });
+}
 
 const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now(), opsAlert: opsAlertRouter });
 const loginExpiredWatcher = createLoginExpiredWatcher({

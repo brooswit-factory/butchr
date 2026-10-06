@@ -37,6 +37,9 @@ export function isUiEditableRuleId(id: string): boolean {
   return id.startsWith(UI_EDITABLE_ID_PREFIX);
 }
 
+/** The id FACTORY-669's daemon-startup seed writes its one template rule under — see `../rules/seed-first-run.ts`. Carries the reserved `ui-` prefix above, so the web write path may edit and enable it like any other `ui-` rule. */
+export const FIRST_RULE_ID = "ui-first-rule";
+
 /**
  * The editable LEAVES of one `agentPreferences` element — never `harness`
  * (a prefix match on the bare `agentPreferences.<m>` path would also let
@@ -49,13 +52,15 @@ export function isUiEditableRuleId(id: string): boolean {
 export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["model", "effort", "modelPower", "effortPower"];
 
 /**
- * The placeholder query FACTORY-669's `rules.ts` is PLANNED to export (not
- * yet landed — see this ticket's "DECISION ADDED" comment, item 3). Kept as
- * a local constant, TODO-import once FACTORY-669 lands: `ui-first-rule` is
- * seeded with this exact query so a careless enable can never silently
- * stage every ticket in the project.
+ * FACTORY-669: re-exported from `./rules.ts`, which owns the canonical
+ * definition (`./seed-first-run.ts`, the actual seeder, needs it too and
+ * must not depend on this write-only module — see that constant's own doc
+ * comment). Kept re-exported here, under this module's own name, so every
+ * existing importer of `PLACEHOLDER_QUERY` from `rules-write-registry.js`
+ * (this module's own consumers, `./rules-write.ts` among them) needs no
+ * change.
  */
-export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
+export { PLACEHOLDER_QUERY } from "./rules.js";
 
 /** Enabling a rule whose dry-run scope exceeds this many tickets is refused unless the caller passes an explicit confirm flag. One constant, one place (director's decision). */
 export const ENABLE_SCOPE_CEILING = 25;

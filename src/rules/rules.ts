@@ -15,10 +15,18 @@
  * Rules live in a JSON file OUTSIDE the repo: `BUTCHR_RULES_FILE` when set,
  * else `$XDG_CONFIG_HOME/butchr/rules.json`, else
  * `~/.config/butchr/rules.json`. When the DEFAULT file is absent there are
- * ZERO rules and nothing is staffed; nothing is written. An explicit
- * `BUTCHR_RULES_FILE` that does not exist is an error: a typo must never
- * read as "no rules" and stop every rule agent. There are no built-in
- * rules or templates — a present file is the only source of rules.
+ * ZERO rules and nothing is staffed. An explicit `BUTCHR_RULES_FILE` that
+ * does not exist is an error: a typo must never read as "no rules" and stop
+ * every rule agent. There are no built-in rules — `loadRules` itself never
+ * invents one — but FACTORY-669 is a single, narrow exception to "nothing is
+ * written": at TRUE first run only (the default path absent, no
+ * `BUTCHR_RULES_FILE` override, no prior `.bak-*` state —
+ * `../rules/seed-first-run.ts`'s own doc comment has the exact conditions),
+ * `src/daemon/index.ts`'s startup seeds exactly one DISABLED template rule
+ * (`ui-first-rule`, the reserved `ui-` prefix FACTORY-662's web write path
+ * alone may touch) before this function is ever called for real, through
+ * `./write-rules.ts`'s `createRulesFileExclusive` — never from HTTP, MCP, a
+ * reload, or a file watcher, and never again once the daemon has started.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -34,6 +42,19 @@ import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
+/**
+ * FACTORY-669: the exact placeholder string the first-run template seeds
+ * `ui-first-rule.query` with — a sentinel the write path (FACTORY-662's
+ * `./rules-write-registry.ts`, re-exporting this same constant) recognizes
+ * to refuse enabling the template before its query has been edited to
+ * something real, so a careless enable can never silently stage every
+ * ticket in the project. Lives here (rather than in the write-registry,
+ * which only CONSUMES it) because `./seed-first-run.ts` needs it and must
+ * not import from `./rules-write-registry.ts` — that module already imports
+ * FROM `rules.ts` (`isRuleId` etc.), and the write path is a later, web-only
+ * concern this plain data constant has no need to depend on.
+ */
+export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
 /** Agent harnesses Drovr can launch. */
 export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];

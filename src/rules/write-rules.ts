@@ -59,7 +59,7 @@
  * pid + hrtime + random — so this is belt-and-suspenders, not the primary
  * defense).
  */
-import { chmodSync, closeSync, constants as fsConstants, copyFileSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { loadRules, parseRules, rulesPath, type ReadRulesFile, type Rule, type RulesEnv } from "./rules.js";
@@ -119,6 +119,14 @@ export interface WriteRulesIo {
   /** Opens `path` EXCLUSIVELY (fails if it already exists), writes `text`, fsyncs, and closes it. */
   writeTempExclusive: (path: string, text: string, mode: number) => void;
   rename: (tempPath: string, path: string) => void;
+  /**
+   * FACTORY-669: hard-links `existingPath` (a just-written, fully-fsynced
+   * temp file) onto `newPath`. Throws `EEXIST` if `newPath` already exists —
+   * unlike `rename`, which would silently REPLACE it — the no-clobber
+   * primitive `createRulesFileExclusive` below uses instead of `rename` for
+   * exactly that reason.
+   */
+  link: (existingPath: string, newPath: string) => void;
   /** Best-effort cleanup of a leftover temp file; never throws. */
   removeQuiet: (path: string) => void;
   /** An existing file's own mode (masked to permission bits), or `undefined` if absent. */
@@ -237,6 +245,7 @@ export function defaultIo(): WriteRulesIo {
       }
     },
     rename: (tempPath, path) => renameSync(tempPath, path),
+    link: (existingPath, newPath) => linkSync(existingPath, newPath),
     removeQuiet: (path) => {
       try { unlinkSync(path); } catch { /* best-effort cleanup */ }
     },
@@ -607,6 +616,68 @@ export function restoreBackup(backupId: string, env: RulesEnv = process.env, io:
 export function rulesEtag(env: RulesEnv = process.env, io: WriteRulesIo = defaultIo()): string {
   const path = rulesPath(env);
   return sha256(io.readFile(path) ?? "");
+}
+
+/**
+ * FACTORY-669 — true no-clobber publish of a BRAND-NEW rules file, for
+ * `../rules/seed-first-run.ts`'s daemon-startup seed and nothing else.
+ *
+ * `writeRulesFile`/`commitWrite` above publish via `rename`, which is safe
+ * there only because the cross-process `.rules.lock` already serializes
+ * every OTHER writer of this module — nothing else can place a file at
+ * `path` between that call's own `readFile` and its `rename`. This function
+ * runs at daemon startup, OUTSIDE that lock, specifically to create a file
+ * that is NOT supposed to exist yet, so its no-clobber guarantee has to come
+ * from the filesystem itself rather than from serialization: `io.link`
+ * hard-links a fully-written, fsynced temp file onto `path` and fails
+ * atomically with `EEXIST` if anything is already there (a real file, an
+ * empty one, an invalid one — `link` does not care what, only that an entry
+ * exists), so there is no window, however narrow, in which this could
+ * overwrite one. A pre-existing symlink at `path` is refused outright before
+ * any of that (round-3 finding F4's same rule, reused here).
+ *
+ * `text` is validated through `loadRules` — the exact entry point the
+ * daemon's own startup and `writeRulesFile` both use — BEFORE anything
+ * touches disk, with an empty `RulesEnv` (`path` is irrelevant to that
+ * validation; only the document's own content is being checked). `path`'s
+ * directory is created at mode 0700 if absent; the published file is mode
+ * 0600; both are fsynced, same discipline every other write in this module
+ * follows.
+ *
+ * Deliberately does NOT take `.rules.lock`: that lock protects concurrent
+ * WRITES to an already-established file, a different hazard from this
+ * function's own "does anything already exist here" race, which `link`'s
+ * own atomicity already closes without it. Throws (never partially writes)
+ * on invalid input, an existing/symlinked destination, or any filesystem
+ * failure; the temp file is always cleaned up.
+ */
+export function createRulesFileExclusive(path: string, text: string, io: WriteRulesIo = defaultIo()): void {
+  loadRules({}, () => text); // throws on invalid input; nothing below runs
+
+  const dir = dirname(path);
+  io.mkdir(dir);
+  io.chmod(dir, 0o700);
+
+  if (io.isSymlink(path) || io.readFile(path) !== undefined) {
+    throw new Error(`${path} already exists — refusing to replace it (first-run seed is no-clobber)`);
+  }
+
+  const tmp = join(dir, `.${basename(path)}.seed-tmp-${process.pid}-${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`);
+  try {
+    io.writeTempExclusive(tmp, text, 0o600);
+    io.chmod(tmp, 0o600); // belt-and-suspenders against umask narrowing the requested mode, same as commitWrite's own tmp chmod
+    try {
+      io.link(tmp, path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`${path} was created concurrently — refusing to replace it (first-run seed is no-clobber)`);
+      }
+      throw e;
+    }
+  } finally {
+    io.removeQuiet(tmp);
+  }
+  io.fsyncDir(dir);
 }
 
 // ---------------------------------------------------------------------------

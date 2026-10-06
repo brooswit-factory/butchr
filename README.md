@@ -16,6 +16,8 @@ Change detection is [`@brooswit/sundry`](https://www.npmjs.com/package/@brooswit
 
 ## First run
 
+The very first time the daemon starts with no rules file at all (the default path absent, no `BUTCHR_RULES_FILE` override, and no prior `.bak-*` backup in that directory — see `src/rules/seed-first-run.ts`), it seeds one `ui-first-rule` template rule itself: **disabled**, with a placeholder query enabling is refused against until it's edited. Open the dashboard, edit that rule's query, then enable it — no hand-edited JSON and no restart needed for this one rule (FACTORY-663's web write path covers any `ui-`-prefixed rule, this one included). This happens only once, at true first run; it never recreates the file if you delete it, and an established install whose rules file has simply vanished gets a warning and an alert instead of a fresh template.
+
 A new rules file is risky to just restart the daemon with: [`docs/rules.example.json`](docs/rules.example.json)'s convention is `assignee = currentUser()`, so a typo-free but overly broad rule can staff up to `BUTCHR_MAX_AGENTS` **real tickets on your own account** the very first poll, with no preview beforehand. Do this instead:
 
 1. **Write one rule first**, scoped to a single ticket you own, before trying anything broader — e.g. `"query": "key = XYZ-1"` (swap in a real ticket key). This proves the whole pipeline — file location, JSON syntax, field names, brief — against exactly one match before any query is allowed to touch more.

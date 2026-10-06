@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertOnlyChanged, defaultIo, restoreBackup, rulesEtag, setRuleEnabled, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
+import { assertOnlyChanged, createRulesFileExclusive, defaultIo, restoreBackup, rulesEtag, setRuleEnabled, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 
 let dir: string;
@@ -214,6 +214,7 @@ describe("writeRulesFile: atomicity", () => {
       copyFile: (src: string, dest: string) => writeFileSync(dest, readFileSync(src)),
       writeTempExclusive: (p: string, text: string) => writeFileSync(p, text, { flag: "wx" }),
       rename: () => { throw new Error("simulated rename failure"); },
+      link: () => { throw new Error("not used by this test"); },
       removeQuiet: (p: string) => { try { unlinkSync(p); } catch { /* ignore */ } },
       modeOf: (p: string) => { try { return statSync(p).mode & 0o777; } catch { return undefined; } },
       chmod: (p: string, mode: number) => { try { chmodSync(p, mode); } catch { /* ignore */ } },
@@ -592,6 +593,37 @@ describe("assertOnlyChanged (round 3, finding F2)", () => {
 describe("fsyncDir error handling (round 3, finding F5: swallow only EINVAL/ENOTSUP)", () => {
   test("the default io's fsyncDir propagates a non-whitelisted error (e.g. ENOENT) rather than swallowing it", () => {
     expect(() => defaultIo().fsyncDir(join(dir, "this-directory-does-not-exist"))).toThrow();
+  });
+});
+
+describe("createRulesFileExclusive (FACTORY-669 — true no-clobber publish for the first-run seed)", () => {
+  test("rejects invalid input before touching disk at all", () => {
+    const rulesPath = rulesFilePath();
+    expect(() => createRulesFileExclusive(rulesPath, "{ not json")).toThrow();
+    expect(() => statSync(join(dir, "butchr"))).toThrow(); // directory was never even created
+  });
+
+  test("a concurrent create between the pre-check and the link call is refused, not silently overwritten (the race `link`'s own atomicity closes)", () => {
+    const rulesPath = rulesFilePath();
+    const text = doc([RULE_A]);
+    const racyIo: WriteRulesIo = {
+      ...defaultIo(),
+      link: (existingPath: string, newPath: string) => {
+        // simulate another writer creating the destination in the gap between this function's own pre-check and the link call
+        writeFileSync(newPath, "someone else got here first");
+        defaultIo().link(existingPath, newPath);
+      },
+    };
+    expect(() => createRulesFileExclusive(rulesPath, text, racyIo)).toThrow(/concurrently/);
+    expect(readFileSync(rulesPath, "utf8")).toBe("someone else got here first");
+  });
+
+  test("leaves no temp file behind on failure", () => {
+    const rulesPath = rulesFilePath();
+    const failingIo: WriteRulesIo = { ...defaultIo(), link: () => { throw new Error("simulated link failure"); } };
+    expect(() => createRulesFileExclusive(rulesPath, doc([RULE_A]), failingIo)).toThrow(/simulated link failure/);
+    const entries = readdirSync(join(dir, "butchr"));
+    expect(entries.some((n) => n.includes(".seed-tmp-"))).toBe(false);
   });
 });
 
