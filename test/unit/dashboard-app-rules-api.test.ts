@@ -12,14 +12,24 @@ import {
   type RulesListResponse,
 } from "../../dashboard-app/src/api/rules.js";
 
-/** A second `ui-`-prefixed rule (NOT the placeholder template) for write-flow tests that need a writable rule with an already-real query — `stale-github-prs`/`factory-triage`/`vip-zendesk` are deliberately NOT `ui-`-prefixed (used instead to prove the 403 refusal). */
+/**
+ * A second `ui-`-prefixed rule (NOT the placeholder template) for write-flow
+ * tests that need a writable rule with an already-real query —
+ * `stale-github-prs`/`factory-triage`/`vip-zendesk` are deliberately NOT
+ * `ui-`-prefixed (used instead to prove the 403 refusal).
+ *
+ * `execution: "singleton"` — FACTORY-685 (item 2) now requires confirm on
+ * ANY enable of a `"swarm"` rule; these write-flow tests exist to exercise
+ * OTHER gates (etag mismatch, stop/restart confirm, rate limiting, undo
+ * scoping), not that one, which gets its own dedicated coverage.
+ */
 function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
   return {
     id: "ui-demo",
     resourceProvider: "jira-work",
     query: "project = FACTORY",
     enabled: false,
-    execution: "swarm",
+    execution: "singleton",
     account: "none",
     role: "worker",
     agentPreferences: [],
@@ -134,11 +144,22 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       await expect(api.setEnabled("factory-triage", false, before.sourceEtag, "h", false)).rejects.toThrow(/does not carry the "ui-" prefix/);
     });
 
-    test("setEnabled refuses enabling ui-first-rule while its query is still the placeholder, matching the server's exact message", async () => {
+    test("planRule itself refuses enabling ui-first-rule while its query is still the placeholder, matching the real server's own check order (planRuleWrite refuses before any confirm/scope logic)", async () => {
+      // FACTORY-685: the fixture now mirrors the real server's own
+      // `planRuleWrite`, which refuses this BEFORE computing confirm/scope
+      // at all — updated deliberately (this used to only throw from
+      // `setEnabled`, which was itself a gap against the real server's
+      // actual behavior, not a faithful simulation of it).
+      const api = createFixturesRulesApi({ latencyMs: 0 });
+      await expect(api.planRule(FIRST_RULE_ID, { enabled: true }, false)).rejects.toThrow(
+        `rule "${FIRST_RULE_ID}" cannot be enabled while its query is still the placeholder — edit the query first`,
+      );
+    });
+
+    test("setEnabled ALSO refuses enabling ui-first-rule while its query is still the placeholder (the authoritative, locked recheck), given a hand-built planHash", async () => {
       const api = createFixturesRulesApi({ latencyMs: 0 });
       const before = await api.listRules();
-      const plan = await api.planRule(FIRST_RULE_ID, { enabled: true }, false);
-      await expect(api.setEnabled(FIRST_RULE_ID, true, before.sourceEtag, plan.planHash, false)).rejects.toThrow(
+      await expect(api.setEnabled(FIRST_RULE_ID, true, before.sourceEtag, "irrelevant-hash", false)).rejects.toThrow(
         `rule "${FIRST_RULE_ID}" cannot be enabled while its query is still the placeholder — edit the query first`,
       );
     });
@@ -163,11 +184,16 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
     test("enabling over the scope ceiling without confirm is refused with the server's own wording; confirm:true succeeds", async () => {
       const seeded = defaultRulesFixture();
       const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
-      seeded.rules[idx] = { ...seeded.rules[idx]!, query: "project = FACTORY" }; // past the placeholder, so only the ceiling refusal is under test
+      // past the placeholder AND execution: "singleton" — isolates the
+      // ceiling gate from FACTORY-685's own swarm-enable gate (which, for a
+      // swarm rule, fires first and unconditionally on ANY enable without
+      // confirm — see that item's own dedicated coverage), so this test's
+      // original point (the ceiling refusal specifically) still holds.
+      seeded.rules[idx] = { ...seeded.rules[idx]!, query: "project = FACTORY", execution: "singleton" };
       const api = createFixturesRulesApi({
         initial: seeded,
         latencyMs: 0,
-        plans: { [FIRST_RULE_ID]: { planHash: "plan-1", spawned: 1, stopped: 0, restarted: 0, etag: "e", scopeCount: ENABLE_SCOPE_CEILING + 5 } },
+        plans: { [FIRST_RULE_ID]: { planHash: "plan-1", spawned: 1, stopped: 0, restarted: 0, etag: "e", scopeCount: ENABLE_SCOPE_CEILING + 5, requiresConfirm: true, confirmReason: "scope-ceiling" } },
       });
       const before = await api.listRules();
       const plan = await api.planRule(FIRST_RULE_ID, { enabled: true }, false);

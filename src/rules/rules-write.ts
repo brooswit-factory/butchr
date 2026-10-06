@@ -241,18 +241,48 @@ export interface ScopeCacheDeps {
   now?: () => number;
 }
 
-export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps: ScopeCacheDeps = {}): (id: string) => Promise<number> {
+/** `createScopeCache`'s own return type: callable exactly like the old bare function (`scopeOf(id, queryText)`), plus `clear()` — see that function's own doc comment for why both exist. */
+export interface ScopeOf {
+  (id: string, queryText: string): Promise<number>;
+  /** FACTORY-685 (N4): drops every cached entry — wired at every reload/write call site in `src/daemon/index.ts` so a stale scope reading can never outlive the write (or SIGHUP) that invalidated it. */
+  clear(): void;
+}
+
+/**
+ * FACTORY-685 (N4, agentsafety audit #50): the N1 cache above was keyed by
+ * rule id ALONE — a plan on a 3-ticket query, then a widened-to-40-tickets
+ * query planned again within the same 10s TTL, still answered "3", because
+ * the query text never reached the cache key at all. Keyed by `id` PLUS a
+ * hash of the CURRENT query text instead: a changed query is a changed key,
+ * so it can never reuse a stale entry regardless of the TTL. `queryText` is
+ * supplied by the caller (`planRuleWrite`/`writeRuleEnabled`, which already
+ * `readRuleById` before calling this) — `scopeOf` itself (the real
+ * previewer) still takes only `id`, since the previewer re-reads the rule's
+ * CURRENT query from the live file itself; the query text here exists
+ * purely to key the cache, never passed through to `scopeOf`.
+ *
+ * `clear()` (new) drops every entry — belt-and-suspenders alongside the
+ * query-hash keying: `src/daemon/index.ts` calls it from every reload path
+ * (a web write's own reload, SIGHUP, the `reloadRulesNow` HTTP route), so a
+ * cached reading can never survive whatever caused the reload, even for a
+ * rule whose query text happens not to have changed (e.g. the underlying
+ * Jira data shifted instead).
+ */
+export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps: ScopeCacheDeps = {}): ScopeOf {
   const ttlMs = deps.ttlMs ?? 10_000;
   const now = deps.now ?? (() => Date.now());
   const cache = new Map<string, { scope: number; at: number }>();
-  return async function cachedScopeOf(id: string): Promise<number> {
+  const cachedScopeOf = (async (id: string, queryText: string): Promise<number> => {
+    const key = `${id}:${sha256(queryText)}`;
     const t = now();
-    const cached = cache.get(id);
+    const cached = cache.get(key);
     if (cached !== undefined && t - cached.at < ttlMs) return cached.scope;
     const scope = await scopeOf(id);
-    cache.set(id, { scope, at: t });
+    cache.set(key, { scope, at: t });
     return scope;
-  };
+  }) as ScopeOf;
+  cachedScopeOf.clear = () => cache.clear();
+  return cachedScopeOf;
 }
 
 function requireConfirmForBlastRadius(counts: { spawned: number; stopped: number; restarted: number }, confirm: boolean): void {
@@ -291,8 +321,16 @@ function recordLastUiWrite(deps: RulesWriteDeps, backupId: string | null, result
  * succeed) and again inside the lock immediately before the write
  * (authoritative; a race in between can only cause an extra rejected
  * attempt, never an unsafe accepted one).
+ *
+ * FACTORY-685 (item 2, agentsafety F1): a swarm rule's enable is ALSO
+ * refused (409) without `confirm: true`, independent of the ceiling — one
+ * agent per matching ticket is a real staffing decision at ANY scope, not
+ * only above `ENABLE_SCOPE_CEILING`. Checked only after `scopeForHash` is
+ * confirmed finite (the unmeasurable-scope guard above stays the first and
+ * unconditional gate — there is no real number to name in this gate's own
+ * message otherwise).
  */
-export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string, scopeOf: (id: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
+export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
   const env = deps.env ?? process.env;
 
   // N1 (FACTORY-678): computed OUTSIDE the lock (the mutator passed to
@@ -320,7 +358,7 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
       return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder — edit the query first` };
     }
     if (current.enabled !== true) {
-      scopeForHash = await scopeOf(id);
+      scopeForHash = await scopeOf(id, String(current.query ?? ""));
       // Review round 1 (PR #651) finding 1 — this check must NOT be
       // gated on `!confirm` like the ceiling check below: the ceiling
       // check's whole premise is "the human saw a real number and
@@ -331,6 +369,11 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
       // extended to hold even when the caller passes `confirm: true`.
       if (!Number.isFinite(scopeForHash)) {
         return { ok: false, status: 503, error: `could not evaluate the scope for "${id}" — the previewer is unavailable; this write is refused closed (even with confirm: true) until scope can be measured — try again` };
+      }
+      // FACTORY-685 (item 2): ANY enable of a swarm rule needs an explicit
+      // confirm — independent of, and checked before, the ceiling below.
+      if (current.execution === "swarm" && !confirm) {
+        return { ok: false, status: 409, error: `enabling "${id}" will staff up to ${scopeLabel(scopeForHash)} ticket(s); resend with confirm: true to proceed` };
       }
       if (scopeForHash > ENABLE_SCOPE_CEILING && !confirm) {
         return { ok: false, status: 409, error: `enabling "${id}" would stage ${scopeLabel(scopeForHash)} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed` };
@@ -481,6 +524,25 @@ export interface RulesPlanResult {
   scopeUnmeasurable?: boolean;
   etag: string;
   requiresConfirm: boolean;
+  /**
+   * FACTORY-685 (item 2): which gate is why `requiresConfirm` is `true` on
+   * THIS call — a display discriminator for the dashboard's confirm
+   * dialog. Present if and only if `requiresConfirm` is `true`: a call that
+   * already passed `confirm: true` sees `requiresConfirm: false` and no
+   * `confirmReason`, even if some gate would otherwise have applied —
+   * there is nothing left to name a reason FOR. Priority when more than one
+   * condition applies, most-specific first: `"unmeasurable-scope"` (no real
+   * number exists to confirm — always wins), `"scope-ceiling"` (a real,
+   * over-25 number — more informative than the generic swarm-enable
+   * reason), `"swarm-enable"` (any other swarm enable), `"stop-restart"`.
+   *
+   * DELIBERATE DEVIATION from the ticket's literal `confirmRequired` +
+   * `reason` field names (stated here and in the PR body per this ticket's
+   * own instruction): `requiresConfirm` already ships and the dashboard
+   * already reads it — renaming it is a breaking change to a live client
+   * for no behavioral gain, so this field is additive instead.
+   */
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart";
 }
 export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; error: string };
 
@@ -498,7 +560,7 @@ export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; er
  * the fleet-wide admission picture should read `/api/rules/:id/preview`'s
  * own `warning` field too.
  */
-export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
+export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
   const env = deps.env ?? process.env;
   const currentText = readCurrentRulesText(env);
   try {
@@ -529,7 +591,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   let scope: number | null = null;
   let scopeUnmeasurable = false;
   if (counts.spawned > 0) {
-    const rawScope = await scopeOf(id);
+    const rawScope = await scopeOf(id, String(current.query ?? ""));
     if (Number.isFinite(rawScope)) {
       scope = rawScope;
     } else {
@@ -542,8 +604,40 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
       scopeUnmeasurable = true;
     }
   }
-  const requiresConfirm = scopeUnmeasurable || (scope !== null && scope > ENABLE_SCOPE_CEILING && !confirm) || ((counts.stopped > 0 || counts.restarted > 0) && !confirm);
+  // FACTORY-685 (item 2): ANY enable of a swarm rule needs confirm, not
+  // only one above the ceiling — computed "raw" (independent of `confirm`)
+  // so `confirmReason` can classify the gate even on a call that already
+  // supplied `confirm: true`.
+  const rawSwarmEnable = counts.spawned > 0 && current.execution === "swarm";
+  const rawOverCeiling = scope !== null && scope > ENABLE_SCOPE_CEILING;
+  const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
+  const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm);
+  // `confirmReason` names which gate is why `requiresConfirm` is `true` —
+  // absent exactly when `requiresConfirm` is `false` (whether because no
+  // gate applies at all, or because `confirm: true` already satisfies every
+  // gate that WOULD otherwise apply), never a reason for a gate that isn't
+  // actually requiring anything on THIS call.
+  const confirmReason: RulesPlanResult["confirmReason"] = !requiresConfirm
+    ? undefined
+    : scopeUnmeasurable
+      ? "unmeasurable-scope"
+      : rawOverCeiling
+        ? "scope-ceiling"
+        : rawSwarmEnable
+          ? "swarm-enable"
+          : "stop-restart";
 
   const planHash = buildPlanHash(nextText, counts, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
-  return { ok: true, planHash, spawned: counts.spawned, stopped: counts.stopped, restarted: counts.restarted, scope, ...(scopeUnmeasurable ? { scopeUnmeasurable: true } : {}), etag, requiresConfirm };
+  return {
+    ok: true,
+    planHash,
+    spawned: counts.spawned,
+    stopped: counts.stopped,
+    restarted: counts.restarted,
+    scope,
+    ...(scopeUnmeasurable ? { scopeUnmeasurable: true } : {}),
+    etag,
+    requiresConfirm,
+    ...(confirmReason ? { confirmReason } : {}),
+  };
 }

@@ -29,7 +29,6 @@ import { useState } from "react";
 import { Alert, AlertText, Button, Text } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
 import {
-  ENABLE_SCOPE_CEILING,
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
   RateLimitError,
@@ -90,6 +89,8 @@ interface PendingAction {
   label: string;
   plan: RulePlanResponse;
   commit: (planHash: string, confirm: boolean) => Promise<RuleWriteResult>;
+  /** FACTORY-685 (item 3): first page of ticket keys this action would staff — only populated for an enable whose `confirmReason` is `"swarm-enable"`/`"scope-ceiling"`. */
+  ticketKeys?: string[];
 }
 
 /**
@@ -124,11 +125,23 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
     setError(null);
     api
       .planRule(rule.id, patch, false)
-      .then((plan) => {
-        const overCeiling = patch.enabled === true && plan.scopeCount !== undefined && plan.scopeCount > ENABLE_SCOPE_CEILING;
-        const needsConfirm = plan.stopped > 0 || plan.restarted > 0 || overCeiling;
-        if (needsConfirm) {
-          setPendingAction({ label, plan, commit });
+      .then(async (plan) => {
+        // FACTORY-685 (item 2/3): trust the server's own `requiresConfirm`
+        // verdict — it already folds in every gate (the scope ceiling, a
+        // stop/restart, an unmeasurable scope, and now ANY swarm enable),
+        // rather than re-deriving it here from `stopped`/`restarted`/
+        // `scopeCount` and risking drift from a gate added server-side.
+        if (plan.requiresConfirm) {
+          let ticketKeys: string[] | undefined;
+          if (patch.enabled === true && (plan.confirmReason === "swarm-enable" || plan.confirmReason === "scope-ceiling")) {
+            try {
+              const preview = await api.previewRule(rule.id);
+              ticketKeys = preview.tickets.slice(0, 10).map((t) => t.key);
+            } catch {
+              ticketKeys = undefined;
+            }
+          }
+          setPendingAction({ label, plan, commit, ...(ticketKeys ? { ticketKeys } : {}) });
           setBusy(false);
           return;
         }
@@ -344,6 +357,15 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
             this would start {pendingAction.plan.spawned} agent{pendingAction.plan.spawned === 1 ? "" : "s"}
             {pendingAction.plan.scopeCount !== undefined ? `, scope ${pendingAction.plan.scopeCount} ticket${pendingAction.plan.scopeCount === 1 ? "" : "s"}` : ""}, stop{" "}
             {pendingAction.plan.stopped}, and restart {pendingAction.plan.restarted} — confirm {pendingAction.label}?
+            {/* FACTORY-685 (item 3): "This will staff up to N tickets: <first 10 keys>" for a swarm enable/over-ceiling enable specifically. */}
+            {(pendingAction.plan.confirmReason === "swarm-enable" || pendingAction.plan.confirmReason === "scope-ceiling") && (
+              <span data-testid="first-rule-confirm-tickets">
+                {" "}
+                This will staff up to {pendingAction.plan.scopeCount ?? pendingAction.plan.spawned} ticket{(pendingAction.plan.scopeCount ?? pendingAction.plan.spawned) === 1 ? "" : "s"}
+                {pendingAction.ticketKeys && pendingAction.ticketKeys.length > 0 ? `: ${pendingAction.ticketKeys.join(", ")}` : ""}
+                {pendingAction.ticketKeys && pendingAction.ticketKeys.length === 10 ? ", ..." : ""}
+              </span>
+            )}
           </AlertText>
           <div className="rules-view__dialog-actions">
             <Button variant="default" onPress={() => setPendingAction(null)}>

@@ -32,6 +32,8 @@ interface PendingToggle {
   rule: RuleDto;
   nextEnabled: boolean;
   plan: RulePlanResponse;
+  /** FACTORY-685 (item 3): the first page of ticket keys this enable would staff, when known — only ever fetched/shown for a `confirmReason` naming a swarm enable or the scope ceiling (both staff real tickets); `undefined` otherwise, or if the preview call itself failed (the dialog still shows, just without the key list). */
+  ticketKeys?: string[];
 }
 
 export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
@@ -72,8 +74,27 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
     const nextEnabled = !row.rule.enabled;
     try {
       const plan = await api.planRule(row.rule.id, { enabled: nextEnabled }, false);
-      if (plan.stopped > 0 || plan.restarted > 0) {
-        setPendingToggle({ rule: row.rule, nextEnabled, plan });
+      // FACTORY-685 (item 2/3): trust the server's own `requiresConfirm`
+      // verdict rather than re-deriving it from `stopped`/`restarted` —
+      // it already folds in every gate the server enforces (the scope
+      // ceiling, a stop/restart, an unmeasurable scope, and now ANY swarm
+      // enable), so this client never drifts from a gate added server-side.
+      if (plan.requiresConfirm) {
+        let ticketKeys: string[] | undefined;
+        // FACTORY-685 (item 3): "This will staff up to N tickets: <first 10
+        // keys>" needs the actual keys, which `planRule` itself never
+        // returns (only a count) — fetch the SAME dry-run preview the
+        // Preview button already uses. Best-effort: a failed preview still
+        // shows the confirm dialog, just without the key list.
+        if (nextEnabled && (plan.confirmReason === "swarm-enable" || plan.confirmReason === "scope-ceiling")) {
+          try {
+            const preview = await api.previewRule(row.rule.id);
+            ticketKeys = preview.tickets.slice(0, 10).map((t) => t.key);
+          } catch {
+            ticketKeys = undefined;
+          }
+        }
+        setPendingToggle({ rule: row.rule, nextEnabled, plan, ...(ticketKeys ? { ticketKeys } : {}) });
       } else {
         await api.setEnabled(row.rule.id, nextEnabled, currentSourceEtag, plan.planHash, false);
       }
@@ -172,6 +193,7 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
           ruleId={pendingToggle.rule.id}
           nextEnabled={pendingToggle.nextEnabled}
           plan={pendingToggle.plan}
+          {...(pendingToggle.ticketKeys ? { ticketKeys: pendingToggle.ticketKeys } : {})}
           onConfirm={confirmToggle}
           onCancel={() => setPendingToggle(null)}
         />

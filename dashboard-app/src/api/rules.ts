@@ -167,6 +167,21 @@ export interface RulePlanResponse {
   restarted: number;
   etag: string;
   scopeCount?: number;
+  /**
+   * FACTORY-685 (item 2/3): the server's own authoritative verdict on
+   * whether this exact patch (with whatever `confirm` the caller already
+   * passed) needs an explicit confirm before it would be accepted — folds
+   * in EVERY gate the server enforces (the scope ceiling, ANY swarm enable,
+   * a stop/restart, an unmeasurable scope), so the UI never re-derives this
+   * from `spawned`/`stopped`/`restarted`/`scopeCount` itself and risks
+   * missing a gate the server adds later. `src/rules/rules-write.ts`'s own
+   * `RulesPlanResult.requiresConfirm` — read verbatim off the real server's
+   * response; `fixturesRulesApi` computes the same verdict locally so a
+   * component test can exercise this without a real daemon.
+   */
+  requiresConfirm: boolean;
+  /** Mirrors `src/rules/rules-write.ts`'s own `RulesPlanResult.confirmReason` — present iff `requiresConfirm` is `true`. Display-only: which gate is why. */
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart";
 }
 
 /** The success shape every real write route (`enabled`, `PUT`, `undo`) returns — `RulesWriteOutcome`'s `ok: true` branch, PR #647's `src/rules/rules-write.ts`, minus the `reload` field (an internal daemon detail this UI has no use for). */
@@ -402,6 +417,11 @@ export const realRulesApi: RulesApi = {
     // handler (which itself calls `checkWriteGuard` again) is ever
     // reached. Omitting this would 403 every real plan call.
     const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, csrf: true, signal });
+    // `requiresConfirm`/`confirmReason` are read straight off the server's
+    // own response — same field names on both sides (FACTORY-685, item 2's
+    // own deliberate deviation: no rename to the ticket's literal
+    // `confirmRequired`/`reason`), unlike `scope`/`scopeCount` below, which
+    // DOES still need translating.
     // `scopeCount` per the ticket's own named contract. The real merged
     // server (PR #647, `src/rules/rules-write.ts`'s `planRuleWrite`) names
     // this field `scope`, typed `number | null` (`null` whenever the patch
@@ -644,15 +664,39 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       if (opts.plans?.[ruleId]) return opts.plans[ruleId]!;
       const rule = findRule(ruleId);
+      // Mirrors the real server's own check order (`planRuleWrite`): the
+      // placeholder-query refusal happens BEFORE any confirm/scope logic is
+      // even computed, so a still-placeholder enable refuses plainly rather
+      // than showing a confirm dialog for a write that can never succeed.
+      if (patch.enabled === true && !rule.enabled && rule.query === PLACEHOLDER_QUERY) {
+        throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
+      }
       const counts = computeLocalPlanCounts(rule.enabled, patch);
+      const scopeCount = counts.spawned > 0 ? opts.previews?.[ruleId]?.total ?? 0 : undefined;
+      // Mirrors `src/rules/rules-write.ts`'s own `planRuleWrite` gate order
+      // (FACTORY-685, item 2): a swarm enable needs confirm at ANY scope,
+      // not only above the ceiling.
+      const rawSwarmEnable = counts.spawned > 0 && rule.execution === "swarm";
+      const rawOverCeiling = scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
+      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm);
+      const confirmReason: RulePlanResponse["confirmReason"] = !requiresConfirm
+        ? undefined
+        : rawOverCeiling
+          ? "scope-ceiling"
+          : rawSwarmEnable
+            ? "swarm-enable"
+            : "stop-restart";
       const base: RulePlanResponse = {
         planHash: `${ruleId}:${JSON.stringify(patch)}:${confirm}:${state.sourceEtag}`,
         spawned: counts.spawned,
         stopped: counts.stopped,
         restarted: counts.restarted,
         etag: state.sourceEtag,
+        requiresConfirm,
+        ...(confirmReason ? { confirmReason } : {}),
       };
-      return counts.spawned > 0 ? { ...base, scopeCount: opts.previews?.[ruleId]?.total ?? 0 } : base;
+      return scopeCount !== undefined ? { ...base, scopeCount } : base;
     },
     async setEnabled(ruleId, enabled, ifMatch, planHash, confirm) {
       await delay();
@@ -667,6 +711,12 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       }
       const counts = computeLocalPlanCounts(rule.enabled, { enabled });
       const plan = opts.plans?.[ruleId];
+      // FACTORY-685 (item 2): ANY swarm enable needs confirm, mirrored here
+      // so a component test exercising setEnabled directly (not just the
+      // plan step) sees the same gate the real server enforces.
+      if (enabled && counts.spawned > 0 && rule.execution === "swarm" && !confirm) {
+        throw new Error(`enabling "${ruleId}" will staff up to ${plan?.scopeCount ?? opts.previews?.[ruleId]?.total ?? 0} ticket(s); resend with confirm: true to proceed`);
+      }
       if (enabled && plan?.scopeCount !== undefined && plan.scopeCount > ENABLE_SCOPE_CEILING && !confirm) {
         throw new Error(`enabling "${ruleId}" would stage ${plan.scopeCount} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed`);
       }
