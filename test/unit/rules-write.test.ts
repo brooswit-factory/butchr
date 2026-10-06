@@ -560,7 +560,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     }, cacheDeps);
   }
 
-  test("GO-RED CONTROL: without the cache, the previewer's own rate limit fails the back-to-back apply with the Infinity-ticket 409 — proves the mechanism, not a harness bug", async () => {
+  test("GO-RED CONTROL: without the cache, the previewer's own rate limit fails the back-to-back apply — proves the mechanism, not a harness bug", async () => {
     const rule = previewRule();
     seed([rule]);
     const deps = { env: env() };
@@ -581,14 +581,20 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     const apply = await writeRuleEnabled("ui-first-rule", true, etag, false, plan.planHash, uncachedScopeOf, deps);
     expect(apply.ok).toBe(false);
     if (!apply.ok) {
-      expect(apply.status).toBe(409);
-      // This repo's own fix for the "Infinity ticket(s)" literal (part of
-      // this same change) already keeps the word out of the message —
-      // the mechanism this test exists to prove is the 409 itself (the
-      // uncached second call hitting the previewer's own rate limit and
-      // failing safe to an unbounded scope), not this exact wording.
+      // Review round 1 (PR #651) finding 1 hardened the unmeasurable-scope
+      // guard to fire BEFORE the ceiling check and unconditionally (not
+      // just when `!confirm`) — so the uncached second call hitting the
+      // previewer's own rate limit and failing safe to an unbounded scope
+      // is now refused 503 "previewer is unavailable", not 409 "above the
+      // ceiling". The mechanism this test exists to prove (the uncached
+      // second call racing the previewer's own rate limit, and the write
+      // being refused rather than silently landing) still holds — only the
+      // specific status/message changed, because a stronger guard now
+      // catches it first.
+      expect(apply.status).toBe(503);
       expect(apply.error).not.toContain("Infinity");
-      expect(apply.error).toMatch(/above the 25-ticket confirm ceiling/);
+      expect(apply.error).not.toContain("NaN");
+      expect(apply.error).toMatch(/previewer is unavailable/);
     }
   });
 
@@ -661,10 +667,49 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     });
     const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
     expect(plan.ok).toBe(true);
-    if (plan.ok) expect(plan.requiresConfirm).toBe(true); // Infinity > ceiling
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      // Review round 1 (PR #651) finding 1: an unmeasurable scope must
+      // NOT collapse into the same `scope: null` the "no spawn evaluated"
+      // case already uses — assert on the PARSED SERIALIZED body (what a
+      // real HTTP client, e.g. PR #650, actually receives), not the
+      // in-process object.
+      const wire = JSON.parse(JSON.stringify(plan));
+      expect(wire.scope).toBeNull();
+      expect(wire.scopeUnmeasurable).toBe(true);
+    }
     // ...and the serialized response body never contains the literal "Infinity"
     expect(JSON.stringify(plan)).not.toContain("Infinity");
     expect(JSON.stringify(plan)).not.toContain("NaN");
+  });
+
+  test("REGRESSION (review round 1, PR #651 finding 1): confirm: true cannot land a write whose scope was UNMEASURABLE — fails closed unconditionally, not just when !confirm", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const scopeOf = createScopeCache(async (id: string): Promise<number> => {
+      const r = await previewer(id);
+      return r.ok ? r.total : Number.POSITIVE_INFINITY;
+    });
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error("expected a successful plan");
+    const etag = rulesEtag(env());
+    // The old (pre-fix) shape: `if (scope > CEILING && !confirm)` would
+    // have let `confirm: true` bypass the only check standing between an
+    // unmeasurable scope and an accepted write. Assert it is refused
+    // EVEN WITH `confirm: true`.
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, true, plan.planHash, scopeOf, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(503);
+      expect(outcome.error).toMatch(/previewer is unavailable/);
+      expect(outcome.error).not.toContain("Infinity");
+      expect(outcome.error).not.toContain("NaN");
+    }
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].enabled).toBe(false); // nothing written
   });
 
   test("no Infinity/NaN ever appears in a SERIALIZED error body (Infinity does not survive JSON.stringify — assert on the wire format, not the in-process object)", async () => {

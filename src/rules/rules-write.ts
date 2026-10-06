@@ -175,19 +175,45 @@ export function computeLocalPlanCounts(wasEnabled: boolean, patch: RuleFieldPatc
 }
 
 /**
+ * Review round 1 (PR #651) finding 1 — `JSON.stringify` turns
+ * `Number.POSITIVE_INFINITY`/`NaN` into `null`, which is EXACTLY the wire
+ * value `scope: null` already means for "no previewer call was ever made
+ * for this patch" (`counts.spawned === 0`). Hashing the raw `scope` number
+ * directly would make an UNMEASURABLE scope (previewer genuinely
+ * unavailable) hash identically to a NOT-EVALUATED scope — a plan/apply
+ * pair that both see a down previewer would then produce a planHash that
+ * matches a hash built with `scope: null` for an entirely different
+ * (spawn-free) patch, and — worse — would let `confirm: true` sail through
+ * `writeRuleEnabled`'s hash check with a scope that was never actually
+ * measured. Tagging the unmeasurable case as the STRING `"unmeasurable"`
+ * (never a bare number, never `null`) makes it hash differently from both
+ * a real finite scope and a true "not evaluated" `null` — see
+ * `writeRuleEnabled`'s own hard fail-closed check just below for the other
+ * half of this fix (it refuses an unmeasurable scope outright, before the
+ * hash is even built, so this tagging is defense in depth, not the only
+ * guard).
+ */
+function scopeHashValue(scope: number | null): string | number | null {
+  if (scope === null) return null;
+  return Number.isFinite(scope) ? scope : "unmeasurable";
+}
+
+/**
  * B3's own plan hash: binds the EXACT next document text to the counts
  * computed for it, AND (N1, FACTORY-678) the evaluated `scope` — `null`
  * whenever `counts.spawned === 0` (no previewer call was ever made for
  * this patch, same as `planRuleWrite`'s own gate), otherwise the real
- * ticket count the previewer reported. `planRuleWrite` and the real write
- * functions both call this over the SAME `nextText` (built by
- * `applyRuleFieldPatch`) and the SAME scope value, so a plan computed
- * against one file state (or one scope reading) can never be echoed
- * successfully against a different one — in particular, `confirm: true`
- * can no longer land a write whose scope was never bound into this hash.
+ * ticket count the previewer reported (or the `"unmeasurable"` tag — see
+ * `scopeHashValue` above — when the previewer genuinely failed). `planRuleWrite`
+ * and the real write functions both call this over the SAME `nextText`
+ * (built by `applyRuleFieldPatch`) and the SAME scope value, so a plan
+ * computed against one file state (or one scope reading) can never be
+ * echoed successfully against a different one — in particular, `confirm:
+ * true` can no longer land a write whose scope was never bound into this
+ * hash.
  */
 export function buildPlanHash(nextText: string, counts: { spawned: number; stopped: number; restarted: number }, scope: number | null): string {
-  return sha256(JSON.stringify({ nextText, ...counts, scope }));
+  return sha256(JSON.stringify({ nextText, ...counts, scope: scopeHashValue(scope) }));
 }
 
 /**
@@ -295,6 +321,17 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
     }
     if (current.enabled !== true) {
       scopeForHash = await scopeOf(id);
+      // Review round 1 (PR #651) finding 1 — this check must NOT be
+      // gated on `!confirm` like the ceiling check below: the ceiling
+      // check's whole premise is "the human saw a real number and
+      // confirmed THAT number"; an unmeasurable scope means no real
+      // number was ever seen, so there is nothing a `confirm: true` could
+      // possibly be confirming. Fails closed UNCONDITIONALLY — this is
+      // the "genuinely unavailable previewer still fails closed" guarantee
+      // extended to hold even when the caller passes `confirm: true`.
+      if (!Number.isFinite(scopeForHash)) {
+        return { ok: false, status: 503, error: `could not evaluate the scope for "${id}" — the previewer is unavailable; this write is refused closed (even with confirm: true) until scope can be measured — try again` };
+      }
       if (scopeForHash > ENABLE_SCOPE_CEILING && !confirm) {
         return { ok: false, status: 409, error: `enabling "${id}" would stage ${scopeLabel(scopeForHash)} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed` };
       }
@@ -428,6 +465,20 @@ export interface RulesPlanResult {
   stopped: number;
   restarted: number;
   scope: number | null;
+  /**
+   * Review round 1 (PR #651) finding 1 — `scope: null` already means "no
+   * previewer call was ever made for this patch" (`spawned === 0`).
+   * Without this field, a previewer that genuinely failed (Jira down,
+   * timeout) ALSO serializes as `scope: null` (`JSON.stringify` turns
+   * `Number.POSITIVE_INFINITY`/`NaN` into `null`), making the two cases
+   * indistinguishable on the wire. `true` only when a spawn WAS evaluated
+   * (`spawned > 0`) but the previewer could not produce a finite reading
+   * — in that case `scope` is still `null` (never a fake number) and
+   * `requiresConfirm` is always `true`. Absent/`false`/omitted in every
+   * other case — a NEW, OPTIONAL field, so an existing reader (e.g. PR
+   * #650) that doesn't know about it sees unchanged behavior.
+   */
+  scopeUnmeasurable?: boolean;
   etag: string;
   requiresConfirm: boolean;
 }
@@ -476,9 +527,23 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
 
   const counts = computeLocalPlanCounts(wasEnabled, patch);
   let scope: number | null = null;
-  if (counts.spawned > 0) scope = await scopeOf(id);
-  const requiresConfirm = (scope !== null && scope > ENABLE_SCOPE_CEILING && !confirm) || ((counts.stopped > 0 || counts.restarted > 0) && !confirm);
+  let scopeUnmeasurable = false;
+  if (counts.spawned > 0) {
+    const rawScope = await scopeOf(id);
+    if (Number.isFinite(rawScope)) {
+      scope = rawScope;
+    } else {
+      // Review round 1 (PR #651) finding 1 — never let an unmeasurable
+      // (Infinity/NaN) scope reach `scope` itself (it would serialize to
+      // `null` and be indistinguishable from "not evaluated"); report it
+      // through the dedicated `scopeUnmeasurable` flag instead, and force
+      // `requiresConfirm` below regardless of `confirm` — there is no
+      // real number for a caller to have confirmed.
+      scopeUnmeasurable = true;
+    }
+  }
+  const requiresConfirm = scopeUnmeasurable || (scope !== null && scope > ENABLE_SCOPE_CEILING && !confirm) || ((counts.stopped > 0 || counts.restarted > 0) && !confirm);
 
-  const planHash = buildPlanHash(nextText, counts, scope);
-  return { ok: true, planHash, spawned: counts.spawned, stopped: counts.stopped, restarted: counts.restarted, scope, etag, requiresConfirm };
+  const planHash = buildPlanHash(nextText, counts, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
+  return { ok: true, planHash, spawned: counts.spawned, stopped: counts.stopped, restarted: counts.restarted, scope, ...(scopeUnmeasurable ? { scopeUnmeasurable: true } : {}), etag, requiresConfirm };
 }
