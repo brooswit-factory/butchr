@@ -115,6 +115,9 @@ import { resourceLinkTools } from "../tools/resource-links.js";
 import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
 import { createRoutingLinkStore } from "../resources/link-store-router.js";
 import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
+import { createRulesPreviewer } from "../web/rules-preview.js";
+import { isSameUidPeer } from "../web/peer-uid.js";
+import { rulesEtag } from "../rules/write-rules.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -786,10 +789,18 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
 const dashboardAppRoot = resolveWebRoot();
 
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
+
+// FACTORY-660: `GET /api/rules/:id/preview`'s own dry-run — one shared
+// instance (not rebuilt per request) so its per-rule rate-limit map
+// actually accumulates across requests. Reuses THIS daemon's own LIVE
+// `getRules` (review round 2, R2: a function, read fresh every call — see
+// `RulesPreviewDeps.rules`'s own doc comment — never a startup snapshot, so
+// a reload takes effect on the very next preview) and the SAME
+// `atlassian.searchAll` capability the poll loops themselves call — the
+// ONLY Jira capability it is ever given.
+const rulesPreviewer = createRulesPreviewer({ rules: getRules, search: (jql) => atlassian.searchAll(jql), maxAgents: config.maxAgents });
+
 const { app, mcp } = buildApp({
-  // FACTORY-657: not read by any route added in this PR (no HTTP endpoint,
-  // per this ticket's own scope correction) — see `ViewDeps`'s own doc
-  // comment (src/web/view.ts) for who these are for.
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
   reloadRulesNow: () => reloadRules(rulesHolder),
@@ -894,6 +905,45 @@ const { app, mcp } = buildApp({
     send: (pane, text) => sendPane(pane, text),
     pollMs: 250,
   },
+  // FACTORY-660: the rules page's own Origin/Host guard — this daemon's own
+  // loopback origin at its own port, never a configurable allowlist (see
+  // src/web/dashboard-origin-guard.ts's own header).
+  dashboardOriginGuard: { port: config.port },
+  // FACTORY-660 (SPEC CHANGE (c); PR #642 review round 2, G2/G3): same-UID
+  // peer check for BOTH `GET /api/rules` and `GET /api/rules/:id/preview`
+  // — `client` (address+port) is read in src/web/view.ts from
+  // `server.requestIP(request)`; this daemon's own listening address+port
+  // (`DAEMON_HOSTNAME`/`config.port`) is the other half of the FULL socket
+  // 4-tuple `peer-uid.ts` looks up in `/proc/net/tcp`(6) (G3: matching on
+  // port alone is not a unique socket identity). FACTORY-662 (write path)
+  // builds its own equivalent closure from the SAME `isSameUidPeer` helper,
+  // over the SAME `{ address: DAEMON_HOSTNAME, port: config.port }`.
+  peerUidCheck: (client) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }),
+  // FACTORY-660: `GET /api/rules`' own data — SAME discipline as
+  // `configInventory` above: `rules: getRules()`/`error: null` are this
+  // daemon's own already-loaded, already-validated LIVE values (review
+  // round 2, R2 — read fresh, through the holder, never a startup-only
+  // array; an invalid file would have kept this daemon from starting at
+  // all, so `error` here is always `null`), never a second parse. `mtime`
+  // and `fileEtag` (review round 1, note (b); review round 2, G1:
+  // `rulesEtag()`, FACTORY-658, FACTORY-662's F7 requirement) are the real
+  // per-request I/O this route needs (the file's own current bytes/mtime),
+  // accepted for the same reason `configInventory` above accepts its own
+  // session-definition-listing I/O: a distinct, infrequently-hit route,
+  // never on `/`'s or `/dashboard`'s own request path. `getRulesSourceEtag()`
+  // (passed to `buildApp` above) is read fresh too, by this route itself —
+  // that gap between it and this call's own `fileEtag` is exactly what
+  // `stale` reports.
+  rulesFileState: async () => {
+    let mtime: string | null = null;
+    try {
+      mtime = (await stat(rulesPath())).mtime.toISOString();
+    } catch {
+      mtime = null;
+    }
+    return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
+  },
+  rulesPreview: (id) => rulesPreviewer(id),
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no

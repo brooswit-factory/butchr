@@ -1,0 +1,56 @@
+{
+  "path": "/home/example/.config/butchr/rules.json",
+  "mtime": "2026-10-05T12:00:00.000Z",
+  "sourceEtag": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "fileEtag": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "stale": false,
+  "valid": true,
+  "problems": [],
+  "rules": [
+    {
+      "id": "triage",
+      "resourceProvider": "jira-work",
+      "query": "project = FACTORY AND status = \"To Do\" AND assignee = currentUser()",
+      "enabled": true,
+      "execution": "swarm",
+      "account": "none",
+      "role": "worker",
+      "agentPreferences": [{ "harness": "claude", "model": "claude-sonnet-5" }],
+      "linkedEventing": false,
+      "mcpServerNames": [],
+      "briefExcerpt": "Pick up any newly assigned FACTORY ticket and get it to a reviewable PR.",
+      "staffed": true,
+      "whyUnstaffed": null
+    },
+    {
+      "id": "triage-director",
+      "resourceProvider": "jira-work",
+      "query": "project = FACTORY AND issuetype = Epic AND status != Done",
+      "enabled": true,
+      "execution": "persistent",
+      "account": "none",
+      "role": "sentinel",
+      "agentPreferences": [],
+      "linkedEventing": false,
+      "mcpServerNames": [],
+      "briefExcerpt": "Watch open epics and keep their task breakdown current.",
+      "staffed": false,
+      "whyUnstaffed": "no live agent observed for this rule this poll"
+    },
+    {
+      "id": "disabled-example",
+      "resourceProvider": "jira-idea",
+      "query": "project = IDEAS AND status = \"Needs triage\"",
+      "enabled": false,
+      "execution": "swarm",
+      "account": "none",
+      "role": "worker",
+      "agentPreferences": [],
+      "linkedEventing": false,
+      "mcpServerNames": [],
+      "briefExcerpt": "Triage a newly submitted product idea.",
+      "staffed": false,
+      "whyUnstaffed": "disabled"
+    }
+  ]
+}

@@ -10,6 +10,10 @@ import { agentRowAnchorId } from "../agents/config-inventory-links.js";
 import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } from "./origin-guard.js";
 import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
+import { checkDashboardOrigin, type DashboardOriginGuardDeps } from "./dashboard-origin-guard.js";
+import { buildRulesApiResponse, type RulesApiResponse } from "./rules-api.js";
+import type { RulesFileState } from "../agents/query-agent-inventory.js";
+import type { RulesPreviewResult } from "./rules-preview.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -139,22 +143,21 @@ export interface ViewDeps {
   /**
    * FACTORY-657: the daemon's own LIVE rules (`RulesHolder.getRules()`,
    * src/rules/rules.ts) — the SAME array every poll already reads through,
-   * never a second load. No route reads this today (this ticket adds no
-   * HTTP endpoint, per its own scope correction); exists so FACTORY-660's
-   * `rulesFileState`/previewer can be rewired off the startup-only array it
-   * closes over today (PR #642's own `TODO(657)`) onto this live one
-   * instead, with no second wiring path to keep in sync.
+   * never a second load. FACTORY-660's `rulesFileState`/previewer below are
+   * rewired off this (review round 2, R2) rather than a startup-only array,
+   * so a live reload is reflected without a daemon restart.
    */
   getRules?: () => readonly Rule[];
   /**
    * FACTORY-657, agentsafety review R2: sha256 hex of the exact text the
    * CURRENTLY held rules were parsed from (`RulesHolder.getSourceEtag()`)
    * — the same `sha256(text ?? "")` convention `src/rules/write-rules.ts`'s
-   * `rulesEtag` uses. FACTORY-660/662's stale-file flag compares this
-   * against a FRESH `rulesEtag()` read to tell "the file changed since
-   * this daemon last loaded it" apart from "nothing changed" — `getRules()`
-   * alone can't make that distinction (an edit that reorders but doesn't
-   * change any enabled rule's effective content would look identical).
+   * `rulesEtag` uses. FACTORY-660's `GET /api/rules` `stale` flag (review
+   * round 2, G1) compares this against a FRESH `rulesEtag()` read to tell
+   * "the file changed since this daemon last loaded it" apart from
+   * "nothing changed" — `getRules()` alone can't make that distinction (an
+   * edit that reorders but doesn't change any enabled rule's effective
+   * content would look identical).
    */
   getRulesSourceEtag?: () => string | undefined;
   /**
@@ -170,6 +173,52 @@ export interface ViewDeps {
    * where the two could observe a different reload.
    */
   reloadRulesNow?: () => ReloadResult;
+  /**
+   * FACTORY-660: the Origin/Host guard for `GET /api/rules` and
+   * `GET /api/rules/:id/preview` — see `./dashboard-origin-guard.ts`'s own
+   * header for why this is a SEPARATE mechanism from `extensionAuth` above
+   * (this dashboard's own first-party origin, never an extension
+   * allowlist). Optional, same "absent means disabled" discipline as
+   * `resourcesForUrl`/`extensionAuth`: an omitted guard makes both routes
+   * unreachable (503) rather than open.
+   */
+  dashboardOriginGuard?: DashboardOriginGuardDeps;
+  /**
+   * FACTORY-660 (SPEC CHANGE (c); PR #642 review round 2, G2): the same-UID
+   * peer check (`./peer-uid.ts`) BOTH `GET /api/rules` and `GET
+   * /api/rules/:id/preview` require — `/api/rules` reads this process's own
+   * already-loaded config (no outbound Jira call), but still reveals rule
+   * shapes/queries to any local user who can reach loopback, so G2 put the
+   * same fail-closed check on it. Takes the CLIENT's own address+port
+   * (`server.requestIP(request)`, read in this file — this dep has no
+   * Elysia/Bun dependency of its own) and answers whether that socket
+   * belongs to this daemon's own uid. Optional, same discipline as
+   * `dashboardOriginGuard` above: absent means the route is unreachable,
+   * never open.
+   */
+  peerUidCheck?: (client: { address: string; port: number }) => boolean;
+  /**
+   * FACTORY-660: `GET /api/rules`' own data — the validated rules file
+   * state (reusing `loadRulesFileState`, `../agents/query-agent-
+   * inventory.js`) plus its on-disk mtime and `fileEtag` (`rulesEtag()`,
+   * `../rules/write-rules.js`, FACTORY-658 — FACTORY-662's F7 requirement),
+   * read FRESH every request. Deliberately separate from `configInventory`
+   * above (which this route ALSO calls, for the SAME per-rule staffing
+   * computation `/configurations` already does) because `configInventory`'s
+   * `RuleInventoryEntry` carries no `brief` field at all (see
+   * `../web/rules-api.ts`'s own header) — this is where the raw `Rule` list
+   * (and so `Rule.brief`, excerpted there) comes from. Review round 2, R2:
+   * the daemon's own production implementation reads `rules` through
+   * `getRules()` above, never a startup-only array.
+   */
+  rulesFileState?: () => Promise<RulesFileState & { mtime: string | null; fileEtag: string }>;
+  /**
+   * FACTORY-660: `GET /api/rules/:id/preview`'s own dry-run
+   * (`./rules-preview.ts`'s `createRulesPreviewer`, built once by the
+   * caller so its per-rule rate-limit state persists across requests —
+   * never rebuilt per request here).
+   */
+  rulesPreview?: (id: string) => Promise<RulesPreviewResult>;
 }
 
 /** One open `/agents/:agentKey/pty` socket's server-side bookkeeping — keyed by `ElysiaWS.id`, since neither Elysia nor Bun hands the `open`/`message`/`close` callbacks a shared closure over each other by default. */
@@ -276,6 +325,67 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // FACTORY-72: read-only, same discipline as `/dashboard` — a VIEW over
     // every configured rule and managed-session definition, staffed or not.
     .get("/config-inventory", () => deps.configInventory())
+    // FACTORY-660 (slice R1, read-only) — the rules page's data route.
+    // GUARDS RUN BEFORE ANY WORK (SPEC CHANGE (e)): the dashboard-origin
+    // guard, the same-UID peer check (PR #642 review round 2, G2 — this
+    // route reveals rule shapes/queries, so it gets the SAME fail-closed
+    // check `/api/rules/:id/preview` always had, even with no outbound Jira
+    // call of its own), and both remaining dep presences are all checked
+    // before either `rulesFileState()` (local disk I/O) or
+    // `configInventory()` runs. `Cache-Control: no-store` per the ticket —
+    // this reflects live, possibly-sensitive-feeling configuration state,
+    // never cached by an intermediary or the browser.
+    .get("/api/rules", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.rulesFileState || !deps.getRulesSourceEtag) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      // FACTORY-657/review round 2, R2: `getRulesSourceEtag()` reads this
+      // daemon's LIVE holder — the SAME value `getRules()` (fed through
+      // `rulesFileState()`'s own production implementation) is current
+      // for — never a startup-only snapshot. `undefined` only for a holder
+      // that has never loaded any file at all (`RulesHolder.getSourceEtag`'s
+      // own doc comment); this route's data is meaningless without it.
+      const sourceEtag = deps.getRulesSourceEtag();
+      if (sourceEtag === undefined) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      const [rulesFile, inventory] = await Promise.all([deps.rulesFileState(), deps.configInventory()]);
+      const response: RulesApiResponse = buildRulesApiResponse({ rulesFile, mtime: rulesFile.mtime, sourceEtag, fileEtag: rulesFile.fileEtag, ruleInventory: inventory.rules });
+      return response;
+    })
+    // FACTORY-660 — the rules page's read-only dry-run preview. A GET that
+    // DOES do outbound Jira reads (SPEC CHANGE (b): counts and ticket keys
+    // only, never Jira's own error body), so it carries BOTH guards: the
+    // dashboard-origin guard above, AND the same-UID peer check (SPEC
+    // CHANGE (c)) — both run, in that order, before `rulesPreview()` (and
+    // so before the Jira call) ever executes. PR #642 review round 2 (G4):
+    // `params.id` is caller-controlled URL-encoded text — a malformed `%`
+    // escape makes `decodeURIComponent` THROW, which must become a 400 JSON
+    // error, never an uncaught 500.
+    .get("/api/rules/:id/preview", async ({ params, request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.rulesPreview) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let id: string;
+      try {
+        id = decodeURIComponent(params.id);
+      } catch {
+        set.status = 400;
+        return { error: "malformed rule id" };
+      }
+      set.headers["cache-control"] = "no-store";
+      const result = await deps.rulesPreview(id);
+      if (!result.ok) { set.status = result.status; return { error: result.error }; }
+      const { ok, ...body } = result;
+      return body;
+    })
     .get("/agents", () => mcp.connections.list().map((c) => ({ id: c.id, issue: c.headers["x-issue"] ?? null, connectedAt: c.connectedAt })))
     .post("/agents/:issue/open", async ({ params, set }) => {
       const r = await deps.open(decodeURIComponent(params.issue));
