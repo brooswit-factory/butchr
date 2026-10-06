@@ -12,7 +12,7 @@
  * stubbing `globalThis.fetch` — the default is `rulesApi`, the real
  * dev/build-flag-selected singleton (`api/rules.ts`'s own doc comment).
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Alert, AlertText, Button, EmptyState, Heading, Text } from "@launchpad-ui/components";
 import { rulesApi, type RuleDto, type RulePlanResponse, type RulesApi } from "../api/rules.js";
 import { useRules } from "../hooks/use-rules.js";
@@ -20,6 +20,7 @@ import { PollStatusView } from "../components/PollStatusView.js";
 import { RulesTable } from "../components/RulesTable.js";
 import { RulePreviewDialog } from "../components/RulePreviewDialog.js";
 import { RuleToggleConfirmDialog } from "../components/RuleToggleConfirmDialog.js";
+import { FirstRuleSetup } from "../components/FirstRuleSetup.js";
 import { buildRulesViewModel, type RuleRowView } from "../view-model/rules-view.js";
 import "../components/RulesView.css";
 
@@ -39,16 +40,42 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
   const [previewProvider, setPreviewProvider] = useState<string | null>(null);
   const [pendingToggle, setPendingToggle] = useState<PendingToggle | null>(null);
   const [toggleError, setToggleError] = useState<string | null>(null);
+  // FACTORY-663: the real `realRulesApi` starts with `capabilities.write ===
+  // false` (no network call has happened yet) — probing `GET /api/session`
+  // once on mount is what flips it `true` against a daemon that actually
+  // has PR #647 merged, while leaving it `false` (writes stay disabled) on
+  // today's main, where that route 404s. Re-rendered via this counter
+  // rather than reading `api.capabilities.write` directly in the JSX below,
+  // since mutating a field on an existing object doesn't itself trigger React
+  // to re-render.
+  const [, forceRerenderAfterCapabilityCheck] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    void api.refreshCapabilities().then(() => {
+      if (!cancelled) forceRerenderAfterCapabilityCheck((n) => n + 1);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+
+  // The ONLY value any write's `ifMatch` may ever carry — `sourceEtag`,
+  // never `fileEtag` (ticket item 5) — read off the LAST SUCCESSFULLY
+  // POLLED data regardless of whether this very poll tick is `loaded` or
+  // `stale` (a `stale` transport state still carries the last good data;
+  // see `poll-state.ts`'s own doc comment). Empty only before the first
+  // poll resolves, which every write control is disabled until anyway.
+  const currentSourceEtag = state.kind === "loaded" || state.kind === "stale" ? state.data.sourceEtag : "";
 
   async function startToggle(row: RuleRowView) {
     setToggleError(null);
     const nextEnabled = !row.rule.enabled;
     try {
-      const plan = await api.planToggle(row.rule.id, nextEnabled);
+      const plan = await api.planRule(row.rule.id, { enabled: nextEnabled }, false);
       if (plan.stopped > 0 || plan.restarted > 0) {
         setPendingToggle({ rule: row.rule, nextEnabled, plan });
       } else {
-        await api.applyToggle(row.rule.id, nextEnabled, plan);
+        await api.setEnabled(row.rule.id, nextEnabled, currentSourceEtag, plan.planHash, false);
       }
     } catch (e) {
       setToggleError(e instanceof Error ? e.message : String(e));
@@ -60,7 +87,7 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
     const { rule, nextEnabled, plan } = pendingToggle;
     setPendingToggle(null);
     try {
-      await api.applyToggle(rule.id, nextEnabled, plan);
+      await api.setEnabled(rule.id, nextEnabled, currentSourceEtag, plan.planHash, true);
     } catch (e) {
       setToggleError(e instanceof Error ? e.message : String(e));
     }
@@ -92,6 +119,17 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
                   </AlertText>
                 </Alert>
               )}
+              {/* FACTORY-663: the "Set up your first rule" flow — always
+                  shown (whether or not the template has been seeded yet),
+                  independent of `emptyState`/the generic table below, which
+                  this ticket never repurposes into a create-a-rule UI.
+                  `onChanged` is a no-op: `useRules`'s own poll (every
+                  `DASHBOARD_POLL_INTERVAL_MS`) picks up a successful
+                  write's new `enabled`/`query`/`sourceEtag` on its own next
+                  tick, same as the table's own toggle already relies on —
+                  there is no separate manual-refetch escape hatch on
+                  `usePolling` to call instead. */}
+              <FirstRuleSetup api={api} rule={vm.firstRule} sourceEtag={vm.sourceEtag} stale={vm.stale} canWrite={api.capabilities.write} onChanged={() => undefined} />
               {vm.emptyState ? (
                 <EmptyState className="rules-view__empty" data-testid="rules-empty-state">
                   <Heading size="small">No rules file yet</Heading>
@@ -105,7 +143,7 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
               ) : (
                 <RulesTable
                   rows={vm.rows}
-                  canWrite={api.capabilities.write}
+                  canWrite={api.capabilities.write && !vm.stale}
                   onPreview={(ruleId) => {
                     const row = vm.rows.find((r) => r.rule.id === ruleId);
                     setPreviewProvider(row ? row.rule.resourceProvider : null);

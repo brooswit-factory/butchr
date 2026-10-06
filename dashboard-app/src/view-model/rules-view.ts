@@ -4,7 +4,7 @@
  * follows: every rendering DECISION lives here, so `RulesTable.tsx` only
  * arranges already-settled values.
  */
-import type { RuleDto, RulesFileError, RulesListResponse } from "../api/rules.js";
+import { FIRST_RULE_ID, type RuleDto, type RulesFileError, type RulesListResponse } from "../api/rules.js";
 
 export interface StaffedView {
   text: string;
@@ -38,6 +38,12 @@ export interface RulesPageViewModel {
   fileErrors: RulesFileError[];
   /** No rules file (or an empty, valid one — indistinguishable from this response alone) and no load errors. */
   emptyState: boolean;
+  /** FACTORY-663: passed through verbatim from `RulesListResponse.sourceEtag` — the ONLY value any write's `ifMatch` may ever carry. */
+  sourceEtag: string;
+  /** FACTORY-663: passed through verbatim from `RulesListResponse.stale` — true means "reload pending": every write control is disabled (ticket item 5). */
+  stale: boolean;
+  /** FACTORY-663: the seeded `ui-first-rule` template row, if present — `undefined` means the template is missing (the "Set up your first rule" flow then shows how to add it instead of a form). */
+  firstRule: RuleDto | undefined;
 }
 
 /** One preference, labeled by its resolved value — same wording convention as `config-inventory-page.ts`'s own per-preference label. */
@@ -58,6 +64,9 @@ export function buildRulesViewModel(data: RulesListResponse): RulesPageViewModel
     rows,
     fileErrors: data.errors,
     emptyState: data.rules.length === 0 && data.errors.length === 0,
+    sourceEtag: data.sourceEtag,
+    stale: data.stale,
+    firstRule: data.rules.find((r) => r.id === FIRST_RULE_ID),
   };
 }
 

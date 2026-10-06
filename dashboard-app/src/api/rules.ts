@@ -1,30 +1,46 @@
 /**
- * FACTORY-661 (epic FACTORY-659, slice U1) — the ONE client module the Rules
- * page talks to. Every field/value shape below is typed against what the
- * FACTORY R1 slice (`GET /api/rules`, `GET /api/rules/:id/preview`) and
- * FACTORY-662 (`POST /api/rules/plan`) are EXPECTED to serve; none of this
- * is a guess about wire format invented here — the tri-state
- * `staffed`/`reason` pair is reused verbatim from the Configurations view's
- * own `RuleInventoryEntry` contract (`../../../src/agents/
- * query-agent-inventory.ts`, type-only import — safe at runtime, see that
- * file's own discipline and `view-model/config-inventory-availability.ts`
- * for the precedent), and `RulePlanResponse` matches FACTORY-662's own
- * `{planHash, spawned, stopped, restarted, etag}` shape named on the
- * ticket.
+ * FACTORY-661 (epic FACTORY-659, slice U1) / FACTORY-663 (slice U2, the
+ * write path) — the ONE client module the Rules page talks to.
+ *
+ * FACTORY-663 extends this module's contract to match PR #647 (FACTORY-662,
+ * head 4d5b2de at the time this was written — "may shift slightly with the
+ * fixes" per the director's own "START NOW" comment): `GET /api/session`
+ * (CSRF), `GET /api/rules`'s `sourceEtag`/`fileEtag`/`stale`,
+ * `POST /api/rules/plan` (report-only), `POST /api/rules/:id/enabled`,
+ * `PUT /api/rules/:id`, `POST /api/undo/:backupId`. None of this is a guess
+ * at wire format: every shape below is read off PR #647's own
+ * `src/web/view.ts` / `src/rules/rules-write.ts` / `src/rules/
+ * rules-write-registry.ts` / `src/web/csrf.ts` in the read-only reference
+ * worktree this ticket names, never invented. Writes only ever reach
+ * `ui-`-prefixed rule ids (`UI_EDITABLE_ID_PREFIX`) — in practice the one
+ * seeded template, `FIRST_RULE_ID` (FACTORY-669) — never a generic
+ * create-a-rule capability, which this slice deliberately does not build.
+ *
+ * READ-SIDE SHAPE IS DELIBERATELY KEPT STABLE: the real `GET /api/rules`
+ * response (`RulesApiResponse` on the server) carries `path`/`valid`/
+ * `problems`/`whyUnstaffed` — this module's own `RulesListResponse`/`RuleDto`
+ * keep FACTORY-661's original `errors`/`reason` field names (every existing
+ * view-model/component/test built against those untouched) and
+ * `realRulesApi.listRules` maps one shape onto the other at the edge
+ * (`mapServerRulesResponse` below) — the ONLY place that translation
+ * happens. `sourceEtag`/`fileEtag`/`stale` are NEW fields this ticket adds
+ * to the client shape (the write flow's whole reason for being); nothing
+ * else about the read contract changes.
  *
  * TWO IMPLEMENTATIONS, same `RulesApi` interface:
  *   - `fixturesRulesApi` (built by `createFixturesRulesApi`): in-memory,
  *     simulates latency and lets a caller force failures — `capabilities.write
- *     === true`, so the Rules page's toggle/preview/plan flows are all
- *     actually exercisable against it (dev server, component tests).
- *   - `realRulesApi`: `listRules`/`previewRule` fetch the two real R1-slice
- *     GET endpoints; `planToggle` posts to FACTORY-662's own named
- *     endpoint. `capabilities.write` is hardcoded `false` — there is no
- *     real write endpoint for `applyToggle` yet ("a write endpoint from
- *     the write-path slice", not named by any ticket), so the Rules page
- *     renders the toggle disabled with a "needs the write API" tooltip
- *     whenever this is `false`, and `applyToggle` itself refuses rather
- *     than guessing a path (see its own doc comment).
+ *     === true` by default, so the Rules page's whole flow (toggle, preview,
+ *     plan, edit, enable, undo) is actually exercisable against it (dev
+ *     server, component tests) with no real daemon, per this ticket's own
+ *     isolation rule (never a daemon against the shared herdr in tests).
+ *   - `realRulesApi`: hits the real endpoints named above. `capabilities.write`
+ *     starts `false` and is flipped only by a caller-driven `refreshCapabilities()`
+ *     call that succeeds against a real `GET /api/session` — so the Rules
+ *     page still renders (reads work, writes stay disabled) against
+ *     TODAY'S main, where none of PR #647 has merged yet and `/api/session`
+ *     404s. This is deliberate, not a bug: this slice must ship green
+ *     without depending on #647 merging first.
  *
  * `rulesApi` picks between them on Vite's own dev/build distinction
  * (`import.meta.env.DEV`) — true under `vite dev`, false in a production
@@ -34,6 +50,22 @@
  * flag-selected default: a test must never depend on which bundler ran it.
  */
 import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, ResourceProvider } from "../../../src/rules/rules.js";
+
+/** The reserved id prefix FACTORY-669 seeds its one template rule under — see `src/rules/rules-write-registry.ts`'s own `UI_EDITABLE_ID_PREFIX` (PR #647). Only a rule whose id starts with this may ever be written by this module. */
+export const UI_EDITABLE_ID_PREFIX = "ui-";
+
+/** The one seeded template id this whole write slice ever targets (FACTORY-669). This module builds no "create a new rule" capability — see this file's own top comment. */
+export const FIRST_RULE_ID = "ui-first-rule";
+
+/** The exact placeholder string FACTORY-669 seeds `ui-first-rule.query` with — `src/rules/rules-write-registry.ts`'s own `PLACEHOLDER_QUERY` (PR #647). The server refuses to enable a rule whose query still equals this; this constant lets the UI recognize that state without guessing. */
+export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
+
+/** Mirrors `src/rules/rules-write-registry.ts`'s own `ENABLE_SCOPE_CEILING` (PR #647) for DISPLAY purposes only (e.g. "above the 25-ticket limit") — the SERVER is the authority on whether a write actually requires `confirm`; this module never enforces the ceiling itself, only echoes the server's own refusal message verbatim when it refuses one. */
+export const ENABLE_SCOPE_CEILING = 25;
+
+export function isUiEditableRuleId(id: string): boolean {
+  return id.startsWith(UI_EDITABLE_ID_PREFIX);
+}
 
 export interface RuleAgentPreferenceDto {
   harness: AgentHarness;
@@ -62,7 +94,7 @@ export interface RuleDto {
    * "not staffed" (see `rules-view.ts`'s `renderStaffed`).
    */
   staffed: boolean | null;
-  /** Why not staffed, or why that could not be determined; `null` iff `staffed === true`. */
+  /** Why not staffed, or why that could not be determined; `null` iff `staffed === true`. Server-side this is named `whyUnstaffed` (`RulesApiRuleEntry`) — renamed here only, at the `mapServerRulesResponse` edge, to keep every pre-existing reader of this field unchanged. */
   reason: string | null;
 }
 
@@ -75,6 +107,17 @@ export interface RulesListResponse {
   rules: RuleDto[];
   /** Every rules-file load/parse error — same shape as `QueryAgentInventory.errors`. Non-empty means the validation-problems banner renders, independent of whether `rules` is also empty. */
   errors: RulesFileError[];
+  /**
+   * FACTORY-663: sha256 of the text this process's currently-LOADED rules
+   * came from (`RulesApiResponse.sourceEtag`, PR #647) — the ONLY value any
+   * write's `ifMatch` body field may ever carry (never `fileEtag`, even
+   * when the two differ — see `stale` below).
+   */
+  sourceEtag: string;
+  /** FACTORY-663: sha256 of the file's CURRENT on-disk bytes, read fresh this request (`RulesApiResponse.fileEtag`). Shown for diagnostics only; never sent as `ifMatch`. */
+  fileEtag: string;
+  /** FACTORY-663: `sourceEtag !== fileEtag` — the file changed on disk since this process last loaded it. The Rules page shows "reload pending" and disables every write control while this is true (ticket item 5); it is never computed client-side, only read off this field. */
+  stale: boolean;
 }
 
 export interface RulePreviewTicket {
@@ -88,12 +131,34 @@ export interface RulePreviewResponse {
   tickets: RulePreviewTicket[];
 }
 
+/** The only shape a PUT body's `agentPreferences` element may take, per `src/rules/rules-write-registry.ts`'s own `AgentPreferencePatch` (PR #647) — never `harness`, never the whole element. */
+export interface RuleAgentPreferencePatch {
+  model?: string;
+  effort?: AgentEffort;
+  modelPower?: number;
+  effortPower?: number;
+}
+
+/** `PUT /api/rules/:id`'s own editable allowlist — `query` and/or `agentPreferences[i].model/effort/modelPower/effortPower` ONLY. No `title`/`maxAgents`/`brief`/`mcpServers`/`account`/`role`/`relationships`/`linked*`/`harness`/`mcpConfigFile`/`permissionMode`/`lizardMode`/`resourceProvider`/`id` field exists here — those stay file-only, per this ticket's own scope discipline. */
+export interface RuleFieldPatch {
+  query?: string;
+  agentPreferences?: RuleAgentPreferencePatch[];
+}
+
+/** `POST /api/rules/plan`'s own patch shape — the SAME `RuleFieldPatch` plus the one extra field only the dedicated enable route (and this report-only plan) ever considers. */
+export interface RulePlanPatch extends RuleFieldPatch {
+  enabled?: boolean;
+}
+
 /**
- * FACTORY-662's own plan contract, named on this ticket: `POST
- * /api/rules/plan` returns `{planHash, spawned, stopped, restarted, etag}`.
- * Report-only — computing one never changes anything. The Rules page
- * requires an explicit confirm before `applyToggle` whenever `stopped > 0
- * || restarted > 0` (agentsafety review 2026-10-05, item c).
+ * `POST /api/rules/plan`'s response, named on the ticket:
+ * `{planHash, spawned, stopped, restarted, etag, scopeCount?}`.
+ * Report-only — computing one never changes anything. `scopeCount` is
+ * present only for a patch that would newly enable the rule (a dry-run Jira
+ * ticket count); PR #647's own in-flight implementation at the time this was
+ * written names this field `scope`, not `scopeCount` — `planRule` below
+ * reads either key defensively (see its own comment) so a late rename on
+ * that PR doesn't break this slice either way.
  */
 export interface RulePlanResponse {
   planHash: string;
@@ -101,17 +166,26 @@ export interface RulePlanResponse {
   stopped: number;
   restarted: number;
   etag: string;
+  scopeCount?: number;
+}
+
+/** The success shape every real write route (`enabled`, `PUT`, `undo`) returns — `RulesWriteOutcome`'s `ok: true` branch, PR #647's `src/rules/rules-write.ts`, minus the `reload` field (an internal daemon detail this UI has no use for). */
+export interface RuleWriteResult {
+  backupId: string | null;
+  etag: string;
+  changedIds: string[];
 }
 
 export interface RulesApiCapabilities {
   /**
-   * `true` only for `fixturesRulesApi`. `realRulesApi` has no write
-   * endpoint to call yet — the Rules page reads this to render the
-   * enable/disable toggle DISABLED with a "needs the write API" tooltip,
-   * never by guessing at whether FACTORY R1/the write-path slice has
-   * merged.
+   * `fixturesRulesApi` defaults this `true`. `realRulesApi` starts `false`
+   * and is flipped only by a successful `refreshCapabilities()` call (a real
+   * `GET /api/session`) — so this module never guesses whether PR #647 has
+   * merged; it only ever reports what it has actually observed. The Rules
+   * page reads this to render every write control disabled, with a "needs
+   * the write API" tooltip, whenever it's `false`.
    */
-  readonly write: boolean;
+  write: boolean;
 }
 
 export interface RulesApi {
@@ -119,39 +193,42 @@ export interface RulesApi {
   listRules(signal?: AbortSignal): Promise<RulesListResponse>;
   previewRule(ruleId: string, signal?: AbortSignal): Promise<RulePreviewResponse>;
   /** Report-only: never applies anything. */
-  planToggle(ruleId: string, nextEnabled: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
+  planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
+  /** `POST /api/rules/:id/enabled` — the ONLY call that may flip `enabled`. `ifMatch` must be the rule list's own `sourceEtag` (never `fileEtag`); `planHash` must be the SAME plan just returned by `planRule` for this exact patch. */
+  setEnabled(ruleId: string, enabled: boolean, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
+  /** `PUT /api/rules/:id` — the nested allowlist edit. Same `ifMatch`/`planHash` discipline as `setEnabled`. */
+  updateFields(ruleId: string, patch: RuleFieldPatch, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
+  /** `POST /api/undo/:backupId` — only ever the backup id a write JUST returned; the server scopes this further (this SAME process's most recent UI write only). */
+  undo(backupId: string, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
-   * The actual write. `plan` must be the SAME `RulePlanResponse` just
-   * returned by `planToggle` for this `ruleId` — its `etag` travels as
-   * `If-Match` (see `request()`'s own doc comment for why only this
-   * module ever attaches that header, per agentsafety review 2026-10-05
-   * item (e)).
+   * Probes `GET /api/session` and updates `capabilities.write` IN PLACE
+   * (mutating the SAME object `capabilities` already points at, never
+   * reassigning it) before resolving with it. `realRulesApi`: `true` only on
+   * a response that actually succeeds — a 404 (today's main, #647 not
+   * merged) or any other failure leaves/sets it `false`, never guessed any
+   * other way. `fixturesRulesApi`: resolves the fixture's own configured
+   * capability (`FixturesRulesApiOptions.sessionOk`, default `true`) —
+   * exists on fixtures too so a test can exercise the Rules page's own
+   * "writes disabled until the session check resolves" render path without
+   * needing `realRulesApi` at all.
    */
-  applyToggle(ruleId: string, nextEnabled: boolean, plan: RulePlanResponse, signal?: AbortSignal): Promise<RuleDto>;
+  refreshCapabilities(signal?: AbortSignal): Promise<RulesApiCapabilities>;
 }
 
 interface RequestOpts {
   method?: string;
   body?: unknown;
-  /** Sent as `If-Match` — never guessed, always the etag a `RulePlanResponse` just carried. */
-  etag?: string;
-  /** Attach a CSRF token (via `fetchCsrfToken` below) — only ever `true` for a write call. */
+  /** Attach the CSRF header (via `fetchCsrfToken` below) — only ever `true` for a write call. */
   csrf?: boolean;
   signal?: AbortSignal | undefined;
 }
 
 /**
- * TODO SEAM (write-path slice, agentsafety review 2026-10-05 item (e)):
- * `GET /api/session` does not exist yet. Real CSRF resolution MUST go
- * through this function alone once it does — never a guessed header name,
- * never a second hand-rolled fetch beside `request()` below. Typed against
- * the shape the write-path slice is expected to serve. Not reachable from
- * today's UI: `realRulesApi.applyToggle` refuses before any write is
- * attempted (see its own doc comment), and `planToggle` is a GET-shaped
- * report-only POST the write-path slice itself does not gate behind CSRF
- * per FACTORY-662 — so this seam exists typed and tested
- * (`dashboard-app-rules-api.test.ts`) without being exercised by a real
- * network call anywhere in this slice.
+ * `GET /api/session` — mints/hands out this process's one CSRF token
+ * (`src/web/csrf.ts`, PR #647). Real CSRF resolution goes through this
+ * function alone, never a second hand-rolled fetch. Also doubles as
+ * `refreshCapabilities`'s own liveness probe: a success here IS "the
+ * write-path slice is live", by construction — no separate check exists.
  */
 async function fetchCsrfToken(signal?: AbortSignal): Promise<string> {
   const res = await fetch("/api/session", signal ? { signal } : {});
@@ -161,75 +238,180 @@ async function fetchCsrfToken(signal?: AbortSignal): Promise<string> {
 }
 
 /**
- * The ONLY place `realRulesApi` attaches headers (agentsafety review
- * 2026-10-05 item (e)): `If-Match` for a caller-supplied etag, and a CSRF
- * token (via `fetchCsrfToken` above) for a `csrf: true` call. Every real
- * method below goes through this instead of calling `fetch` directly.
+ * The exact header name `GET /api/session`'s token must be echoed back on
+ * (`src/web/csrf.ts`'s own `CSRF_HEADER` constant, PR #647) —
+ * `"x-butchr-csrf"`, NOT a guessed `x-csrf-token`. Named here, once, so a
+ * future rename of that server constant has exactly one client-side call
+ * site to update.
+ */
+const CSRF_HEADER = "x-butchr-csrf";
+
+/**
+ * The ONLY place `realRulesApi` attaches headers: `content-type` for a body,
+ * and the CSRF header (via `fetchCsrfToken` above) for a `csrf: true` call.
+ * Every real method below goes through this instead of calling `fetch`
+ * directly. Errors are JSON `{error}` (this ticket's own instruction: "show
+ * them verbatim") — read off the body and thrown as the Error's own message
+ * whenever the response is JSON and shaped that way; a non-JSON or
+ * differently-shaped error body falls back to a generic `HTTP <status>`
+ * message, never a thrown parse error.
  */
 async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
   const headers: Record<string, string> = {};
   if (opts.body !== undefined) headers["content-type"] = "application/json";
-  if (opts.etag !== undefined) headers["if-match"] = opts.etag;
-  if (opts.csrf) headers["x-csrf-token"] = await fetchCsrfToken(opts.signal);
+  if (opts.csrf) headers[CSRF_HEADER] = await fetchCsrfToken(opts.signal);
   const res = await fetch(path, {
     method: opts.method ?? "GET",
     headers,
     ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
     ...(opts.signal ? { signal: opts.signal } : {}),
   });
-  if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+  if (!res.ok) {
+    let message = `${path}: HTTP ${res.status}`;
+    try {
+      const body: unknown = await res.json();
+      if (body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string") {
+        message = (body as { error: string }).error;
+      }
+    } catch {
+      // Non-JSON (or unparseable) error body — keep the generic HTTP message.
+    }
+    throw new Error(message);
+  }
   return (await res.json()) as T;
 }
 
-/**
- * `GET /api/rules` / `GET /api/rules/:id/preview` (FACTORY R1 slice) and
- * `POST /api/rules/plan` (FACTORY-662) — real endpoints, named on tickets,
- * never invented. `applyToggle` is the one method with no named endpoint
- * to call: "a write endpoint from the write-path slice" is deliberately
- * unnamed by FACTORY-661's own ticket text ("do not invent endpoints"), so
- * it refuses rather than guessing a path. `capabilities.write` stays
- * `false` until that slice lands and this object is updated alongside it.
- */
-export const realRulesApi: RulesApi = {
-  capabilities: { write: false },
-  listRules: (signal) => request<RulesListResponse>("/api/rules", { signal }),
-  previewRule: (ruleId, signal) => request<RulePreviewResponse>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal }),
-  planToggle: (ruleId, nextEnabled, signal) =>
-    request<RulePlanResponse>("/api/rules/plan", { method: "POST", body: { ruleId, enabled: nextEnabled }, signal }),
-  async applyToggle() {
-    throw new Error('rules write endpoint is not available yet — needs the write-path slice (epic FACTORY-659); the Rules page keeps the toggle disabled ("needs the write API") so this should be unreachable from the UI');
-  },
-};
-
-export interface FixturesRulesApiOptions {
-  initial?: RulesListResponse;
-  /** Simulated network latency per call, ms. Defaults to 150. Component tests pass 0. */
-  latencyMs?: number;
-  /** Keyed by rule id; falls back to a trivial empty preview when absent. */
-  previews?: Record<string, RulePreviewResponse>;
-  /** Keyed by rule id; falls back to a plan with `spawned/stopped/restarted` derived from `nextEnabled` (disabling "stops" one, enabling "spawns" one) when absent. */
-  plans?: Record<string, RulePlanResponse>;
-  /** When set, every call rejects with this message — simulates a fixtures-mode backend error. */
-  failWith?: string;
+/** The server's own `GET /api/rules` response shape (`RulesApiResponse`, `src/web/rules-api.ts`) — kept as a private, server-side-only type; `mapServerRulesResponse` is the one place anything reads it. */
+interface ServerRulesApiResponse {
+  path: string;
+  mtime: string | null;
+  sourceEtag: string;
+  fileEtag: string;
+  stale: boolean;
+  valid: boolean;
+  problems: string[];
+  rules: ServerRuleEntry[];
+}
+interface ServerRuleEntry {
+  id: string;
+  resourceProvider: ResourceProvider;
+  query: string;
+  enabled: boolean;
+  execution: ExecutionMode;
+  account: AccountPolicy;
+  role: AgentRole;
+  agentPreferences: RuleAgentPreferenceDto[];
+  staffed: boolean | null;
+  whyUnstaffed: string | null;
 }
 
-function defaultPlanFor(ruleId: string, nextEnabled: boolean): RulePlanResponse {
+/** The ONE place the server's `RulesApiResponse` shape is translated onto this module's own stable `RulesListResponse` — see this file's top comment for why the two deliberately differ. */
+function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse {
   return {
-    planHash: `${ruleId}:${nextEnabled}:1`,
-    spawned: nextEnabled ? 1 : 0,
-    stopped: nextEnabled ? 0 : 1,
-    restarted: 0,
-    etag: `fixture-etag-${ruleId}-1`,
+    sourceEtag: data.sourceEtag,
+    fileEtag: data.fileEtag,
+    stale: data.stale,
+    rules: data.rules.map((r) => ({
+      id: r.id,
+      resourceProvider: r.resourceProvider,
+      query: r.query,
+      enabled: r.enabled,
+      execution: r.execution,
+      account: r.account,
+      role: r.role,
+      agentPreferences: r.agentPreferences,
+      staffed: r.staffed,
+      reason: r.whyUnstaffed,
+    })),
+    errors: data.valid ? [] : data.problems.map((message) => ({ path: data.path, message })),
   };
 }
 
 /**
+ * Real endpoints only, every shape read off PR #647's own source, never
+ * invented. `capabilities.write` starts `false` (unreachable write controls
+ * against today's main, where none of this has merged) and is flipped only
+ * by `refreshCapabilities()` — see that method's own doc comment and this
+ * file's top comment for why that is deliberate, not a bug.
+ */
+export const realRulesApi: RulesApi = {
+  capabilities: { write: false },
+  listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
+  previewRule: (ruleId, signal) => request<RulePreviewResponse>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal }),
+  planRule: async (ruleId, patch, confirm, signal) => {
+    const raw = await request<RulePlanResponse & { scope?: number }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, signal });
+    // `scopeCount` per the ticket's own named contract; PR #647's in-flight
+    // implementation at the time this was written calls the same value
+    // `scope` — read either key so a late rename on that PR doesn't break
+    // this slice (see `RulePlanResponse.scopeCount`'s own doc comment).
+    const { scope, ...rest } = raw;
+    const scopeCount = rest.scopeCount ?? scope;
+    return scopeCount === undefined ? rest : { ...rest, scopeCount };
+  },
+  setEnabled: (ruleId, enabled, ifMatch, planHash, confirm, signal) =>
+    request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}/enabled`, { method: "POST", body: { enabled, ifMatch, planHash, confirm }, csrf: true, signal }),
+  updateFields: (ruleId, patch, ifMatch, planHash, confirm, signal) =>
+    request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "PUT", body: { ...patch, ifMatch, planHash, confirm }, csrf: true, signal }),
+  undo: (backupId, signal) => request<RuleWriteResult>(`/api/undo/${encodeURIComponent(backupId)}`, { method: "POST", csrf: true, signal }),
+  async refreshCapabilities(signal) {
+    try {
+      await fetchCsrfToken(signal);
+      this.capabilities.write = true;
+    } catch {
+      this.capabilities.write = false;
+    }
+    return this.capabilities;
+  },
+};
+
+export interface FixturesRulesApiOptions {
+  /** `rules`/`errors` required (FACTORY-661's original shape); `sourceEtag`/`fileEtag`/`stale` default to a fixed fixture etag / `false` when omitted, so every pre-FACTORY-663 test literal keeps compiling and behaving unchanged. */
+  initial?: Pick<RulesListResponse, "rules" | "errors"> & Partial<Pick<RulesListResponse, "sourceEtag" | "fileEtag" | "stale">>;
+  /** Simulated network latency per call, ms. Defaults to 150. Component tests pass 0. */
+  latencyMs?: number;
+  /** Keyed by rule id; falls back to a trivial empty preview when absent. */
+  previews?: Record<string, RulePreviewResponse>;
+  /** Keyed by rule id; falls back to a plan computed from the SAME blast-radius logic the real server uses (`computeLocalPlanCounts` below) when absent. */
+  plans?: Record<string, RulePlanResponse>;
+  /** When set, every call rejects with this message — simulates a fixtures-mode backend error. */
+  failWith?: string;
+  /** `refreshCapabilities()`'s own answer — defaults `true`. Set `false` to rehearse the Rules page's "session check failed, writes stay disabled" render path without touching `realRulesApi`. */
+  sessionOk?: boolean;
+  /**
+   * One-shot refusal consumed by the very next `setEnabled`/`updateFields`/
+   * `undo` call, then cleared — simulates a write-time-only failure (e.g.
+   * PR #647's own "stale file / stale lock" 409, naming the file to remove)
+   * that a plan/preview call must NOT see. The exact string is echoed
+   * verbatim as the thrown error's message, same as `request()` does for a
+   * real `{error}` body.
+   */
+  nextWriteError?: string;
+}
+
+const DEFAULT_FIXTURE_ETAG = "fixture-etag-0";
+
+/** Mirrors `src/rules/rules-write.ts`'s own `computeLocalPlanCounts` (PR #647) — the SAME blast-radius decision, so a fixture's default plan/refusal behavior matches what the real server would actually do for the same patch. */
+function computeLocalPlanCounts(wasEnabled: boolean, patch: RulePlanPatch): { spawned: number; stopped: number; restarted: number } {
+  if (patch.enabled !== undefined && patch.enabled !== wasEnabled) {
+    return patch.enabled ? { spawned: 1, stopped: 0, restarted: 0 } : { spawned: 0, stopped: 1, restarted: 0 };
+  }
+  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined;
+  return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
+}
+
+/**
  * Demo dataset for `bun run dev:web` — every tri-state `staffed` value, a
- * disabled rule, and more than one `resourceProvider`, so the Rules page has
- * something real to render without a live daemon.
+ * disabled rule, more than one `resourceProvider`, and the seeded
+ * `ui-first-rule` template (still carrying its placeholder query, so the
+ * dev server shows the exact "set up your first rule" state a fresh install
+ * would), so the Rules page has something real to render without a live
+ * daemon.
  */
 export function defaultRulesFixture(): RulesListResponse {
   return {
+    sourceEtag: DEFAULT_FIXTURE_ETAG,
+    fileEtag: DEFAULT_FIXTURE_ETAG,
+    stale: false,
     rules: [
       {
         id: "factory-triage",
@@ -267,6 +449,18 @@ export function defaultRulesFixture(): RulesListResponse {
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
+      {
+        id: FIRST_RULE_ID,
+        resourceProvider: "jira-work",
+        query: PLACEHOLDER_QUERY,
+        enabled: false,
+        execution: "swarm",
+        account: "none",
+        role: "worker",
+        agentPreferences: [],
+        staffed: false,
+        reason: "disabled: not yet configured (query is still the placeholder)",
+      },
     ],
     errors: [],
   };
@@ -275,15 +469,68 @@ export function defaultRulesFixture(): RulesListResponse {
 /**
  * Builds a fresh, independent in-memory `RulesApi` — a factory, not a
  * singleton, so each test/dev-server instance owns its own mutable state
- * (`applyToggle` below mutates `state.rules`, never the input `initial`
- * array in place).
+ * (every write below mutates `state`, never the input `initial` object in
+ * place). Replays the SAME refusal wording the real server would (etag
+ * mismatch, non-`ui-` id, placeholder query, over-ceiling, stop/restart
+ * without confirm, undo scoping) so a component test asserting on an error
+ * message is asserting on real server text, not an invented fixture-only
+ * string.
  */
 export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): RulesApi {
   const latencyMs = opts.latencyMs ?? 150;
-  let state: RulesListResponse = opts.initial ?? defaultRulesFixture();
+  let state: RulesListResponse = opts.initial
+    ? {
+        rules: opts.initial.rules,
+        errors: opts.initial.errors,
+        sourceEtag: opts.initial.sourceEtag ?? DEFAULT_FIXTURE_ETAG,
+        fileEtag: opts.initial.fileEtag ?? opts.initial.sourceEtag ?? DEFAULT_FIXTURE_ETAG,
+        stale: opts.initial.stale ?? false,
+      }
+    : defaultRulesFixture();
+  let lastUiWrite: { backupId: string; resultingEtag: string } | null = null;
+  let nextWriteError = opts.nextWriteError;
+  let backupCounter = 0;
+  const backups = new Map<string, RulesListResponse>();
+
   const delay = () => (latencyMs > 0 ? new Promise<void>((resolve) => setTimeout(resolve, latencyMs)) : Promise.resolve());
   const maybeFail = () => {
     if (opts.failWith) throw new Error(opts.failWith);
+  };
+  const maybeFailWriteOnce = () => {
+    if (nextWriteError !== undefined) {
+      const message = nextWriteError;
+      nextWriteError = undefined;
+      throw new Error(message);
+    }
+  };
+  const findRule = (id: string): RuleDto => {
+    const rule = state.rules.find((r) => r.id === id);
+    if (!rule) throw new Error(`unknown rule "${id}"`);
+    return rule;
+  };
+  const checkIfMatch = (ifMatch: string) => {
+    if (ifMatch !== state.sourceEtag) {
+      throw new Error(`etag mismatch — expected ${ifMatch}, the rules file is currently at ${state.sourceEtag}; reload and retry`);
+    }
+  };
+  const assertUiEditable = (id: string) => {
+    if (!isUiEditableRuleId(id)) {
+      throw new Error(`rule "${id}" does not carry the "ui-" prefix — only web-UI-marked rules may be written by this route`);
+    }
+  };
+  const requireConfirmForBlastRadius = (counts: { spawned: number; stopped: number; restarted: number }, confirm: boolean) => {
+    if ((counts.stopped > 0 || counts.restarted > 0) && !confirm) {
+      throw new Error(`this change would stop ${counts.stopped} and restart ${counts.restarted} running agent(s) — retry with confirm: true to proceed`);
+    }
+  };
+  const commitWrite = (nextRules: RuleDto[], changedIds: string[]): RuleWriteResult => {
+    const n = ++backupCounter;
+    const backupId = `fixture-backup-${n}`;
+    backups.set(backupId, state);
+    const etag = `fixture-etag-${n}`;
+    state = { ...state, rules: nextRules, sourceEtag: etag, fileEtag: etag, stale: false };
+    lastUiWrite = { backupId, resultingEtag: etag };
+    return { backupId, etag, changedIds };
   };
 
   return {
@@ -298,19 +545,81 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       return opts.previews?.[ruleId] ?? { ruleId, total: 0, tickets: [] };
     },
-    async planToggle(ruleId, nextEnabled) {
+    async planRule(ruleId, patch, confirm) {
       await delay();
       maybeFail();
-      return opts.plans?.[ruleId] ?? defaultPlanFor(ruleId, nextEnabled);
+      if (opts.plans?.[ruleId]) return opts.plans[ruleId]!;
+      const rule = findRule(ruleId);
+      const counts = computeLocalPlanCounts(rule.enabled, patch);
+      const base: RulePlanResponse = {
+        planHash: `${ruleId}:${JSON.stringify(patch)}:${confirm}:${state.sourceEtag}`,
+        spawned: counts.spawned,
+        stopped: counts.stopped,
+        restarted: counts.restarted,
+        etag: state.sourceEtag,
+      };
+      return counts.spawned > 0 ? { ...base, scopeCount: opts.previews?.[ruleId]?.total ?? 0 } : base;
     },
-    async applyToggle(ruleId, nextEnabled) {
+    async setEnabled(ruleId, enabled, ifMatch, planHash, confirm) {
       await delay();
       maybeFail();
-      const rule = state.rules.find((r) => r.id === ruleId);
-      if (!rule) throw new Error(`unknown rule "${ruleId}"`);
-      const updated: RuleDto = { ...rule, enabled: nextEnabled };
-      state = { ...state, rules: state.rules.map((r) => (r.id === ruleId ? updated : r)) };
-      return updated;
+      maybeFailWriteOnce();
+      const rule = findRule(ruleId);
+      assertUiEditable(ruleId);
+      checkIfMatch(ifMatch);
+      if (!planHash) throw new Error("planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again");
+      if (enabled && rule.query === PLACEHOLDER_QUERY) {
+        throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
+      }
+      const counts = computeLocalPlanCounts(rule.enabled, { enabled });
+      const plan = opts.plans?.[ruleId];
+      if (enabled && plan?.scopeCount !== undefined && plan.scopeCount > ENABLE_SCOPE_CEILING && !confirm) {
+        throw new Error(`enabling "${ruleId}" would stage ${plan.scopeCount} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed`);
+      }
+      requireConfirmForBlastRadius(counts, confirm);
+      const updated: RuleDto = { ...rule, enabled };
+      return commitWrite(state.rules.map((r) => (r.id === ruleId ? updated : r)), [ruleId]);
+    },
+    async updateFields(ruleId, patch, ifMatch, planHash, confirm) {
+      await delay();
+      maybeFail();
+      maybeFailWriteOnce();
+      const rule = findRule(ruleId);
+      assertUiEditable(ruleId);
+      checkIfMatch(ifMatch);
+      if (!planHash) throw new Error("planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again");
+      const counts = computeLocalPlanCounts(rule.enabled, patch);
+      requireConfirmForBlastRadius(counts, confirm);
+      const updated: RuleDto = {
+        ...rule,
+        query: patch.query ?? rule.query,
+        agentPreferences:
+          patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
+      };
+      return commitWrite(state.rules.map((r) => (r.id === ruleId ? updated : r)), [ruleId]);
+    },
+    async undo(backupId) {
+      await delay();
+      maybeFail();
+      maybeFailWriteOnce();
+      if (!lastUiWrite || lastUiWrite.backupId !== backupId) {
+        throw new Error(`undo is only permitted for the most recent web-UI write's own backup — "${backupId}" is not it (or no UI write has happened yet this process)`);
+      }
+      if (state.sourceEtag !== lastUiWrite.resultingEtag) {
+        throw new Error(`the rules file has changed since that write (expected etag ${lastUiWrite.resultingEtag}, found ${state.sourceEtag}) — undo refused rather than reverting a change it did not make`);
+      }
+      const prior = backups.get(backupId);
+      if (!prior) throw new Error(`no backup found for "${backupId}"`);
+      const n = ++backupCounter;
+      const restoredEtag = `fixture-etag-${n}`;
+      state = { ...prior, sourceEtag: restoredEtag, fileEtag: restoredEtag };
+      lastUiWrite = null;
+      return { backupId, etag: restoredEtag, changedIds: [] };
+    },
+    async refreshCapabilities() {
+      await delay();
+      this.capabilities.write = opts.sessionOk ?? true;
+      return this.capabilities;
     },
   };
 }

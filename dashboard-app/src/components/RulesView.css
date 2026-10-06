@@ -79,3 +79,28 @@
 .rules-view__empty {
   padding: var(--lp-spacing-400) 0;
 }
+
+.rules-view__first-rule {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-spacing-200);
+  padding: var(--lp-spacing-400);
+  margin-bottom: var(--lp-spacing-400);
+  border: var(--lp-border-width-100) solid var(--lp-color-border-ui-secondary);
+  border-radius: var(--lp-border-radius-medium);
+}
+
+.rules-view__snippet {
+  font-family: var(--lp-font-family-code, monospace);
+  background: var(--lp-color-background-ui-secondary, rgba(128, 128, 128, 0.08));
+  padding: var(--lp-spacing-300);
+  border-radius: var(--lp-border-radius-small);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.rules-view__starter-queries {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--lp-spacing-150);
+}

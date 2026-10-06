@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { buildRulesViewModel, encodeResourceKey, renderStaffed } from "../../dashboard-app/src/view-model/rules-view.js";
-import type { RuleDto, RulesListResponse } from "../../dashboard-app/src/api/rules.js";
+import { FIRST_RULE_ID, PLACEHOLDER_QUERY, type RuleDto, type RulesListResponse } from "../../dashboard-app/src/api/rules.js";
 
 function rule(overrides: Partial<RuleDto> = {}): RuleDto {
   return {
@@ -16,6 +16,10 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     reason: null,
     ...overrides,
   };
+}
+
+function response(overrides: Partial<RulesListResponse> = {}): RulesListResponse {
+  return { rules: [], errors: [], sourceEtag: "e1", fileEtag: "e1", stale: false, ...overrides };
 }
 
 describe("renderStaffed — FACTORY-661 (reused tri-state wording, config-inventory-page.ts's own renderStaffed)", () => {
@@ -38,34 +42,50 @@ describe("renderStaffed — FACTORY-661 (reused tri-state wording, config-invent
   });
 });
 
-describe("buildRulesViewModel — FACTORY-661", () => {
+describe("buildRulesViewModel — FACTORY-661/FACTORY-663", () => {
   test("emptyState is true only when there are zero rules AND zero file errors", () => {
-    expect(buildRulesViewModel({ rules: [], errors: [] }).emptyState).toBe(true);
-    expect(buildRulesViewModel({ rules: [rule()], errors: [] }).emptyState).toBe(false);
-    expect(buildRulesViewModel({ rules: [], errors: [{ path: "p", message: "m" }] }).emptyState).toBe(false);
+    expect(buildRulesViewModel(response()).emptyState).toBe(true);
+    expect(buildRulesViewModel(response({ rules: [rule()] })).emptyState).toBe(false);
+    expect(buildRulesViewModel(response({ errors: [{ path: "p", message: "m" }] })).emptyState).toBe(false);
   });
 
   test("fileErrors passes the errors array through unchanged — the validation-problems banner's own data", () => {
-    const data: RulesListResponse = { rules: [], errors: [{ path: "/a/rules.json", message: "rules[0].id must be a lowercase slug" }] };
+    const data = response({ errors: [{ path: "/a/rules.json", message: "rules[0].id must be a lowercase slug" }] });
     expect(buildRulesViewModel(data).fileErrors).toEqual(data.errors);
   });
 
   test("preferencesText reads butchr's global agent config wording when agentPreferences is empty", () => {
-    const vm = buildRulesViewModel({ rules: [rule({ agentPreferences: [] })], errors: [] });
+    const vm = buildRulesViewModel(response({ rules: [rule({ agentPreferences: [] })] }));
     expect(vm.rows[0]!.preferencesText).toBe("butchr's global agent config");
   });
 
   test("preferencesText joins harness/model/effort per preference, comma-separated across multiple preferences", () => {
-    const vm = buildRulesViewModel({
-      rules: [rule({ agentPreferences: [{ harness: "claude", model: "claude-opus-5" }, { harness: "codex", effort: "high" }] })],
-      errors: [],
-    });
+    const vm = buildRulesViewModel(
+      response({ rules: [rule({ agentPreferences: [{ harness: "claude", model: "claude-opus-5" }, { harness: "codex", effort: "high" }] })] }),
+    );
     expect(vm.rows[0]!.preferencesText).toBe("claude/claude-opus-5, codex/high");
   });
 
   test("each row carries the rule's own staffed rendering", () => {
-    const vm = buildRulesViewModel({ rules: [rule({ staffed: false, reason: "disabled" })], errors: [] });
+    const vm = buildRulesViewModel(response({ rules: [rule({ staffed: false, reason: "disabled" })] }));
     expect(vm.rows[0]!.staffed).toEqual({ text: "UNSTAFFED: disabled", cls: "cnc" });
+  });
+
+  test("sourceEtag and stale pass through verbatim — the ONLY values a write's ifMatch/disabled-state ever read", () => {
+    const vm = buildRulesViewModel(response({ sourceEtag: "abc123", fileEtag: "def456", stale: true }));
+    expect(vm.sourceEtag).toBe("abc123");
+    expect(vm.stale).toBe(true);
+  });
+
+  test("firstRule is undefined when no ui-first-rule template is present", () => {
+    const vm = buildRulesViewModel(response({ rules: [rule({ id: "some-other-rule" })] }));
+    expect(vm.firstRule).toBeUndefined();
+  });
+
+  test("firstRule finds the ui-first-rule template by id, regardless of position", () => {
+    const firstRule = rule({ id: FIRST_RULE_ID, query: PLACEHOLDER_QUERY, enabled: false });
+    const vm = buildRulesViewModel(response({ rules: [rule({ id: "other" }), firstRule] }));
+    expect(vm.firstRule).toEqual(firstRule);
   });
 });
 
