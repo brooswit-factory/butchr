@@ -127,6 +127,9 @@ import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScop
 import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { readUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
+import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
+import { writeSetting } from "../settings/write-settings.js";
+import { restartDaemon } from "../web/daemon-restart.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -165,9 +168,25 @@ if (process.argv[2] === "rules") {
 // installed here rather than at any individual call site.
 installLogSink();
 
+// FACTORY-665 (epic FACTORY-659, slice S2): `settings.json` is a layer of
+// NON-SECRET defaults strictly UNDER the environment for a small allowlist
+// of keys (fleet cap, provider order, default model, poll-staleness
+// tolerance) — `effectiveSettingsEnv` returns `process.env` unchanged for
+// every key an env var already sets, and fills in the settings.json value
+// only where the environment left a gap. `settingsFileResult.problems`
+// (invalid JSON, wrong owner, a symlink, too-wide a mode, a non-
+// allowlisted key, an out-of-range value) is reported LOUDLY — one journal
+// line per problem, right here at startup, BEFORE `loadConfig` ever runs —
+// and, once `teamAdminNotify` exists further down this file, also raised
+// as an ops alert (see that section's own comment for why this can't post
+// immediately: the poster isn't built yet this early in the file).
+const settingsFileResult = loadSettingsFile(process.env);
+for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
+const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
+
 let config;
 try {
-  config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  config = loadConfig(effectiveEnv, (p) => readFileSync(p, "utf8"));
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   console.error("See .env.example for the required configuration.");
@@ -850,6 +869,14 @@ const writeRateLimit = createWriteRateLimiter();
 // credentialed call, so it does not share the generic write budget above.
 const jiraTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
 
+// FACTORY-665: `POST /api/daemon/restart`'s own limiter — 1 per 10 minutes,
+// per the ticket's own spec. Keyed by a single fixed string (not per-client
+// like `writeRateLimit`/`jiraTestRateLimit` above): restarting butchr once
+// already affects every client, so there is no meaningful per-client budget
+// to track separately.
+const daemonRestartRateLimitInstance = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 1 });
+const daemonRestartRateLimit = () => daemonRestartRateLimitInstance("daemon-restart");
+
 // FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
 // itself (same directory FACTORY-658's own backups live in) — every
 // accepted/rejected write appends one line here AND raises a non-deduped
@@ -1081,12 +1108,36 @@ const { app, mcp } = buildApp({
   // own data — read fresh every request (one `fs.stat` plus a best-effort
   // `systemctl --user show` call), never a startup snapshot, same discipline
   // as `rulesFileState` above.
-  settings: () => buildSettingsApiResponse(process.env, { unitHint: () => readUnitHint() }),
+  // FACTORY-665: `effectiveEnv` (settings.json layered under `process.env`,
+  // computed once at startup above) is what this daemon ACTUALLY runs
+  // with; `process.env` itself (unmerged) and the settings.json values it
+  // was built from are passed through too, so `buildSettingEntries` can
+  // report `source: "environment" | "file" | "default"` correctly for
+  // every allowlisted key — see that function's own doc comment.
+  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
   // daemon's own already-loaded credentials, never anything from the
   // request itself.
   jiraTest: () => testJiraConnection(config.atlassian),
   jiraTestRateLimit,
+  // FACTORY-665: `PUT /api/settings/:key` — writes through
+  // `writeSetting` (`../settings/write-settings.ts`), then re-reads the
+  // SAME effective response `GET /api/settings` would serve (process.env
+  // itself is unaffected by a settings.json write — only a restart picks
+  // up the new value, hence `restartNeeded: true` on every allowlisted
+  // key — but the just-written settings.json value is still worth
+  // reflecting back immediately as `source: "file"`, so the UI's "restart
+  // needed" badge has an accurate current/pending value to show it against).
+  settingsWrite: async (key, value, confirm) => {
+    writeSetting(key, value, confirm);
+    const fresh = loadSettingsFile(process.env);
+    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
+  },
+  // FACTORY-665: `POST /api/daemon/restart` — fixed-argv `systemctl --user
+  // restart butchr.service`, ONLY when this daemon is actually running
+  // under that unit (see `../web/daemon-restart.ts`'s own header).
+  daemonRestart: () => restartDaemon(),
+  daemonRestartRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -2286,6 +2337,16 @@ const opsAlertRouter = createOpsAlertRouter({
 });
 if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
 else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
+
+// FACTORY-665: the settings.json problems already logged to the journal
+// above (before `opsAlertRouter` existed this early in the file) ALSO get
+// an ops alert, one per problem, `dedupWindowMs: 0` (non-deduped — same
+// "never swallowed by the router's own hourly dedup" reasoning as the
+// first-run-seed alert just below), since these are the "refuse LOUDLY"
+// cases the ticket's own design constraint calls out by name.
+for (const problem of settingsFileResult.problems) {
+  opsAlertRouter.raise({ key: `settings-file-problem:${problem}`, condition: "settings-file-problem", subject: settingsFilePath(), reason: problem, dedupWindowMs: 0 });
+}
 
 // FACTORY-669, agentsafety constraint 4: one alert, raised here rather than
 // at the seed's own call site (far above, before `opsAlertRouter` existed —

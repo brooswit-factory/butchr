@@ -8,13 +8,16 @@
  */
 import { Text } from "@launchpad-ui/components";
 import type { SettingRowView } from "../view-model/settings-view.js";
+import { SettingsEditControl } from "./SettingsEditControl.js";
 import "./SettingsView.css";
 
 export interface SettingsTableProps {
   rows: SettingRowView[];
+  /** FACTORY-665: called by an editable row's own `SettingsEditControl` — omitted means every row renders read-only (e.g. a dashboard build with no write path configured). */
+  onSaveSetting?: (key: string, value: string, confirm: boolean) => Promise<void>;
 }
 
-export function SettingsTable({ rows }: SettingsTableProps) {
+export function SettingsTable({ rows, onSaveSetting }: SettingsTableProps) {
   return (
     <div className="settings-table" role="table" aria-label="settings" data-testid="settings-table">
       {rows.map((row) => (
@@ -26,7 +29,7 @@ export function SettingsTable({ rows }: SettingsTableProps) {
             {row.displayValue}
           </Text>
           <Text elementType="span" size="small" role="cell" className="settings-table__cell">
-            {row.source}
+            {row.source === "environment" && row.editable ? "environment (overrides settings.json)" : row.source}
           </Text>
           <span role="cell" className="settings-table__cell">
             {row.restartNeeded && (
@@ -38,6 +41,11 @@ export function SettingsTable({ rows }: SettingsTableProps) {
           <Text elementType="span" size="small" role="cell" className="settings-table__cell">
             {row.description}
           </Text>
+          <span role="cell" className="settings-table__cell">
+            {row.editable && onSaveSetting && row.rawValue !== null && (
+              <SettingsEditControl settingKey={row.key} initialValue={row.rawValue} onSave={onSaveSetting} />
+            )}
+          </span>
         </div>
       ))}
     </div>

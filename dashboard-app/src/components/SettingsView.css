@@ -6,7 +6,7 @@
 }
 .settings-table__row {
   display: grid;
-  grid-template-columns: 1fr 1fr 140px 110px 2fr;
+  grid-template-columns: 1fr 1fr 140px 110px 2fr auto;
   gap: 0.5rem;
   padding: 0.4rem 0;
   border-bottom: 1px solid var(--lp-border-color, #e2e2e2);
@@ -33,4 +33,19 @@
 }
 .settings-jira-card__warning {
   color: var(--lp-color-danger, #b00020);
+}
+.settings-edit-control {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.settings-edit-control input {
+  width: 8rem;
+}
+.settings-restart-control {
+  margin-top: 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }

@@ -26,6 +26,7 @@ import type { Rule } from "../rules/rules.js";
 import type { ReloadResult } from "../rules/reload.js";
 import type { SettingsApiResponse } from "./settings-api.js";
 import type { JiraTestResult } from "./jira-connection-test.js";
+import type { DaemonRestartOutcome } from "./daemon-restart.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -308,6 +309,36 @@ export interface ViewDeps {
    * refuse" discipline as `writeRateLimit`.
    */
   jiraTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /**
+   * FACTORY-665 — `PUT /api/settings/:key`'s own write logic
+   * (`../settings/write-settings.ts`'s `writeSetting`), already bound to
+   * this daemon's own `SettingsFileEnv`. Returns the new effective
+   * `SettingsApiResponse` (same shape `GET /api/settings` serves) so the
+   * UI can update in place without a second round-trip. Throws
+   * `SettingsWriteRefusedError` (not a route-shaped outcome object, unlike
+   * `rulesWrite.*` above) on any validation/range/lock failure — the route
+   * catches it, same pattern `jiraTest`'s own error handling would use if
+   * it threw. Optional: an omitted value makes the route unreachable
+   * (503), never open.
+   */
+  settingsWrite?: (key: string, value: string, confirm: boolean) => Promise<SettingsApiResponse>;
+  /**
+   * FACTORY-665 — `POST /api/daemon/restart`'s own logic
+   * (`./daemon-restart.ts`'s `restartDaemon`): fires `systemctl --user
+   * restart butchr.service` (fixed argv) ONLY when this daemon is actually
+   * running under that unit, else returns the 409 refusal verbatim.
+   * Optional: an omitted value makes the route unreachable (503).
+   */
+  daemonRestart?: () => Promise<DaemonRestartOutcome>;
+  /**
+   * FACTORY-665 — a SEPARATE, much tighter rate limiter from
+   * `writeRateLimit` above: restart is rate-limited to 1 per 10 minutes
+   * PER THE TICKET'S OWN SPEC (not the generic write-flood budget, and not
+   * per-client — restarting butchr once already affects every client).
+   * Optional: an omitted value means no flood protection on this route,
+   * never a reason to refuse a restart that would otherwise be allowed.
+   */
+  daemonRestartRateLimit?: () => WriteRateLimitOutcome;
 }
 
 /** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
@@ -805,6 +836,83 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = deps.rulesWrite.undo(backupId);
       auditOutcome(deps, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-665 — `PUT /api/settings/:key`: the ONE route that may change
+    // an allowlisted settings.json value. Full write guard chain (own
+    // `checkWriteGuard` call, same discipline as every other write route in
+    // this file) + the generic write-flood limiter (shared with the rules
+    // write routes — this is the same "local operator, same budget"
+    // trust model). `confirm` is the escape hatch for a ceiling/floor
+    // crossing (e.g. raising BUTCHR_MAX_AGENTS past its confirm ceiling —
+    // see `../settings/settings-file.ts`'s `MAX_AGENTS_CEILING`); every
+    // other refusal (malformed value, non-allowlisted key, lock
+    // contention) is a plain 400, never offering a confirm bypass that
+    // can't fix it.
+    .put("/api/settings/:key", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.settingsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const key = decodeURIComponent(params.key);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "PUT /api/settings/:key", action: "edit", ids: [key], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.value !== "string") {
+        set.status = 400;
+        return { error: "body must be { value: string, confirm?: boolean }" };
+      }
+      const confirm = b.confirm === true;
+      try {
+        const response = await deps.settingsWrite(key, b.value, confirm);
+        auditOutcome(deps, { route: "PUT /api/settings/:key", action: `set ${key}`, ids: [key], origin: request.headers.get("origin") }, { ok: true });
+        set.headers["cache-control"] = "no-store";
+        return response;
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        auditOutcome(deps, { route: "PUT /api/settings/:key", action: `set ${key}`, ids: [key], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+    })
+    // FACTORY-665 — `POST /api/daemon/restart`: full write guard chain +
+    // explicit `confirm: true` body field + its OWN rate limit (1 per 10
+    // minutes — a global budget, not per-client, since one restart already
+    // affects every client). Expect the connection to drop; the dashboard's
+    // own retry/reconnect loop is a client-side concern, not this route's.
+    .post("/api/daemon/restart", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.daemonRestart) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (b.confirm !== true) {
+        const error = "restart requires confirm: true";
+        auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      if (deps.daemonRestartRateLimit) {
+        const result = deps.daemonRestartRateLimit();
+        if (!result.ok) {
+          const error = `rate limited: at most one restart per 10 minutes — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429;
+          set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const outcome = await deps.daemonRestart();
+      auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, outcome.ok ? { ok: true } : { ok: false, error: outcome.error });
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
