@@ -17,7 +17,7 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { hostname } from "node:os";
 import { StatusFloorTracker } from "../agents/status-floor.js";
 import { createDashboardFeed, cwdAgentResolvers, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
@@ -118,6 +118,9 @@ import { createJiraProjectLinkStore } from "../resources/jira-project-link-store
 import { createRulesPreviewer } from "../web/rules-preview.js";
 import { isSameUidPeer } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
+import { createCsrfTokenIssuer } from "../web/csrf.js";
+import { recordAuditEvent, fileAuditAppend } from "../web/audit-log.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite } from "../rules/rules-write.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -800,6 +803,47 @@ const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.p
 // ONLY Jira capability it is ever given.
 const rulesPreviewer = createRulesPreviewer({ rules: getRules, search: (jql) => atlassian.searchAll(jql), maxAgents: config.maxAgents });
 
+// FACTORY-662: this process's one CSRF token (`GET /api/session` hands it
+// out; every write route checks it) — minted once, here, never per-request
+// and never persisted (see `../web/csrf.ts`'s own header).
+const csrfIssuer = createCsrfTokenIssuer();
+
+// FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
+// itself (same directory FACTORY-658's own backups live in) — every
+// accepted/rejected write appends one line here AND raises a non-deduped
+// alert through the SAME Rocket.Chat poster the managed-session escalator
+// and ops-alert router already share (`teamAdminNotify`, defined further
+// down this file) — referenced here only inside a closure not called until
+// an actual write happens, well after `teamAdminNotify` is initialized; see
+// `ptyAttach.read`'s own comment just below in this file for the identical,
+// already-established pattern.
+const auditLogPath = join(dirname(rulesPath()), "web-write-audit.jsonl");
+const auditWrite: (event: { route: string; action: string; ids: string[]; diffSummary: string; origin: string | null; uid: number | undefined; outcome: "accepted" | "rejected"; reason?: string }) => void = (event) => {
+  recordAuditEvent(
+    { ...event, time: new Date().toISOString() },
+    {
+      append: fileAuditAppend(auditLogPath),
+      ...(teamAdminNotify ? { postAlert: (text: string) => teamAdminNotify(config.opsAlert.room, text) } : {}),
+      host: hostname(),
+      log: (line) => console.error(line),
+    },
+  );
+};
+
+// FACTORY-662's own rules-write orchestration (`../rules/rules-write.ts`),
+// bound to THIS daemon's env/config — `reload` is FACTORY-657's stub (see
+// `RulesWriteDeps.reload`'s own doc comment): FACTORY-657's PR (#645) is
+// open but not yet on `main`, so there is no live `reloadRulesNow()` to call
+// yet. `scopeOf` reuses the SAME previewer `GET /api/rules/:id/preview`
+// already shares — never a second Jira query mechanism — and fails safe
+// (treats a failed/unavailable preview as an unbounded scope, which forces
+// the confirm gate rather than silently skipping it).
+const scopeOf = async (id: string): Promise<number> => {
+  const result = await rulesPreviewer(id);
+  return result.ok ? result.total : Number.POSITIVE_INFINITY;
+};
+const rulesWriteDeps = { env: process.env };
+
 const { app, mcp } = buildApp({
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
@@ -944,6 +988,18 @@ const { app, mcp } = buildApp({
     return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
   },
   rulesPreview: (id) => rulesPreviewer(id),
+  // FACTORY-662: the write path's own deps — see the comments just above
+  // `rulesWriteDeps`'s own declaration for why `reload` is a stub and
+  // `scopeOf` reuses `rulesPreviewer`.
+  csrf: csrfIssuer,
+  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (clientPort) => isSameUidPeer(clientPort, { serverPort: config.port }), csrf: csrfIssuer },
+  rulesWrite: {
+    enabled: (id, enabled, ifMatch, confirm) => writeRuleEnabled(id, enabled, ifMatch, confirm, scopeOf, rulesWriteDeps),
+    fields: (id, patch, ifMatch) => writeRuleFields(id, patch, ifMatch, rulesWriteDeps),
+    undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
+    plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+  },
+  auditWrite,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no

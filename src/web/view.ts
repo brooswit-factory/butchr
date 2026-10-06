@@ -14,6 +14,10 @@ import { checkDashboardOrigin, type DashboardOriginGuardDeps } from "./dashboard
 import { buildRulesApiResponse, type RulesApiResponse } from "./rules-api.js";
 import type { RulesFileState } from "../agents/query-agent-inventory.js";
 import type { RulesPreviewResult } from "./rules-preview.js";
+import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps } from "./write-guard.js";
+import type { CsrfTokenIssuer } from "./csrf.js";
+import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
+import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -219,6 +223,69 @@ export interface ViewDeps {
    * never rebuilt per request here).
    */
   rulesPreview?: (id: string) => Promise<RulesPreviewResult>;
+  /**
+   * FACTORY-662 — this process's one CSRF token issuer (`./csrf.ts`),
+   * handed out by `GET /api/session` and checked by every write route's
+   * `writeGuard` below. Optional, same "absent means disabled" discipline
+   * as every other guard dep in this file: an omitted issuer makes
+   * `GET /api/session` and every write route unreachable (503), never
+   * open.
+   */
+  csrf?: CsrfTokenIssuer;
+  /**
+   * FACTORY-662 — the combined Origin/Host/peer-uid/Content-Type/CSRF
+   * guard every write route runs through (`./write-guard.ts`). Reuses the
+   * SAME `dashboardOriginGuard`/`peerUidCheck` deps above rather than a
+   * second pair — a write route is never guarded more loosely than the
+   * read-only rules routes are.
+   */
+  writeGuard?: WriteGuardDeps;
+  /**
+   * FACTORY-662 — the rules write orchestration (`../rules/rules-write.ts`).
+   * One function per route; each already does its own ui-prefix/etag/
+   * placeholder/allowlist checks and returns a tagged outcome this file
+   * maps straight to a status + body, never re-deciding anything here.
+   */
+  rulesWrite?: {
+    enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean) => Promise<RulesWriteOutcome>;
+    fields: (id: string, patch: RuleFieldPatch, ifMatch: string) => RulesWriteOutcome;
+    undo: (backupId: string) => RulesWriteOutcome;
+    plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
+  };
+  /**
+   * FACTORY-662 — records one audit line (accepted or rejected) for every
+   * write attempt that got far enough to be route-specific logic (i.e.
+   * passed `writeGuard`) — see `../web/audit-log.ts`. Optional: an omitted
+   * value means writes are still refused/accepted exactly the same, just
+   * unaudited — never a reason to open a route that would otherwise be
+   * closed.
+   */
+  auditWrite?: (event: { route: string; action: string; ids: string[]; diffSummary: string; origin: string | null; uid: number | undefined; outcome: "accepted" | "rejected"; reason?: string }) => void;
+}
+
+/** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
+function bodyProblem(body: unknown): { status: number; error: string } | null {
+  if (body && typeof body === "object") {
+    if ((body as Record<string, unknown>).__bodyTooLarge) return { status: 413, error: `request body exceeds the ${BODY_CAP_BYTES} byte cap` };
+    if ((body as Record<string, unknown>).__invalidJson) return { status: 400, error: "invalid JSON body" };
+  }
+  return null;
+}
+
+/**
+ * FACTORY-662 item 4: records one audit line for a write ROUTE's outcome
+ * (accepted or rejected) — `deps.auditWrite` is optional (absent means
+ * unaudited, never a reason to refuse or allow anything differently, see
+ * `ViewDeps.auditWrite`'s own doc comment). `uid` is `process.getuid?.()`,
+ * not a value read off the request: by the time a write route's handler
+ * runs, `onRequest`'s `peerUidCheck` has ALREADY proven the caller's own
+ * uid equals this process's — so this process's own uid IS the caller's,
+ * by construction, with no second lookup needed.
+ */
+function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null }, outcome: { ok: boolean; error?: string }): void {
+  if (!deps.auditWrite) return;
+  const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.() };
+  deps.auditWrite(outcome.ok ? { ...base, outcome: "accepted" } : { ...base, outcome: "rejected", reason: outcome.error ?? "rejected" });
 }
 
 /** One open `/agents/:agentKey/pty` socket's server-side bookkeeping — keyed by `ElysiaWS.id`, since neither Elysia nor Bun hands the `open`/`message`/`close` callbacks a shared closure over each other by default. */
@@ -242,7 +309,83 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
   const originGuardLog: OriginGuardLogger = deps.originGuardLog ?? createOriginGuardLogger();
   // FACTORY-453: one entry per currently-open `/agents/:agentKey/pty` socket — see `PtySession`'s own doc comment for why this exists instead of closing over per-connection state directly.
   const ptySessions = new Map<string, PtySession>();
+
+  // FACTORY-662, item 1 (session handout) and items 1-3 (every write
+  // route): `GET /api/session` and every write route below share the SAME
+  // Origin/Host/peer-uid gate, checked in `onRequest` — BEFORE Elysia's own
+  // body parsing ever runs (see `./write-guard.ts`'s own header for why
+  // this ordering is load-bearing, not cosmetic). A refusal here returns a
+  // value, which Elysia's `mapEarlyResponse` turns into the actual response
+  // and skips `onParse`/the route handler entirely.
+  const WRITE_ROUTES: readonly { method: string; re: RegExp }[] = [
+    { method: "POST", re: /^\/api\/rules\/[^/]+\/enabled$/ },
+    { method: "PUT", re: /^\/api\/rules\/[^/]+$/ },
+    { method: "POST", re: /^\/api\/rules\/plan$/ },
+    { method: "POST", re: /^\/api\/undo\/[^/]+$/ },
+  ];
+  const isGuardedWriteRoute = (method: string, path: string): boolean => WRITE_ROUTES.some((w) => w.method === method && w.re.test(path));
+
   return new Elysia()
+    .onRequest(({ request, set, server }) => {
+      const method = request.method;
+      const path = new URL(request.url).pathname;
+      const isSessionRoute = method === "GET" && path === "/api/session";
+      const isWriteRoute = isGuardedWriteRoute(method, path);
+      if (!isSessionRoute && !isWriteRoute) return;
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const originHeader = request.headers.get("origin");
+      const originGuard = checkDashboardOrigin({ origin: originHeader, host: request.headers.get("host") }, deps.dashboardOriginGuard);
+      if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const clientPort = server?.requestIP(request)?.port;
+      if (clientPort === undefined || !deps.peerUidCheck(clientPort)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (isSessionRoute) return; // no Content-Type/CSRF to check for the GET that hands the token out
+      if (!deps.csrf || !deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const contentType = (request.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
+      if (contentType !== "application/json") {
+        set.status = 415;
+        return { error: "content-type must be application/json" };
+      }
+      if (!deps.csrf.check(request.headers.get(CSRF_HEADER))) {
+        set.status = 403;
+        return { error: "csrf token missing or invalid" };
+      }
+    })
+    // FACTORY-662 item 3: a capped, counted read (never a trust in
+    // `Content-Length` alone) BEFORE `JSON.parse` — global, since every
+    // write route in this daemon is small JSON and `/resources/for-url`'s
+    // existing POST body is a single URL string, well under the cap too.
+    // Runs AFTER `onRequest` above, so a request already refused there
+    // (forbidden Origin, bad CSRF, etc.) never reaches this read at all —
+    // oversize is tested from an ALLOWED origin for exactly this reason.
+    .onParse(async ({ request, set }, contentType) => {
+      if (!contentType.startsWith("application/json")) return undefined;
+      const result = await cappedReadText(request, BODY_CAP_BYTES);
+      if (!result.ok) {
+        set.status = 413;
+        return { __bodyTooLarge: true };
+      }
+      if (result.text.length === 0) return {};
+      try {
+        return JSON.parse(result.text);
+      } catch {
+        set.status = 400;
+        return { __invalidJson: true };
+      }
+    })
+    // FACTORY-662 item 8: dashboard hardening headers, on EVERY response
+    // this app serves — `default-src 'self'` with no inline script (every
+    // script this daemon serves is an external file, per `static-assets.ts`),
+    // `frame-ancestors 'none'` (this dashboard is never meant to be framed),
+    // and `X-Content-Type-Options: nosniff`. `esc()`-ing every rendered
+    // field is `dashboard-page.ts`/`config-inventory-page.ts`'s own job
+    // (pre-existing, unchanged by this ticket) — these headers are the
+    // browser-side backstop if that ever lapsed.
+    .onAfterHandle(({ set }) => {
+      set.headers["content-security-policy"] = "default-src 'self'; frame-ancestors 'none'; script-src 'self'; object-src 'none'; base-uri 'none'";
+      set.headers["x-content-type-options"] = "nosniff";
+      set.headers["x-frame-options"] = "DENY";
+    })
     // BUTCHR-339: the dashboard page itself — a pure, synchronous render
     // (src/web/dashboard-page.ts) of the SAME snapshot `/dashboard` serves,
     // plus the SAME synchronous header info `/health`'s `build`/`currency`
@@ -385,6 +528,96 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!result.ok) { set.status = result.status; return { error: result.error }; }
       const { ok, ...body } = result;
       return body;
+    })
+    // FACTORY-662 item 1: `GET /api/session` — mints/hands out this
+    // process's one CSRF token. The Origin/Host/peer-uid guard already ran
+    // in `onRequest` above; by the time this handler runs, the caller has
+    // already proven it IS this daemon's own dashboard, on this same
+    // machine, as this same uid.
+    .get("/api/session", ({ set }) => {
+      if (!deps.csrf) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return { csrfToken: deps.csrf.token };
+    })
+    // FACTORY-662 item 7: `POST /api/rules/:id/enabled` — the ONLY route
+    // that may flip `enabled`, for exactly the "ui-" marked rules, gated by
+    // the scope ceiling (director's decision). `writeGuard`'s
+    // Origin/Host/peer-uid/Content-Type/CSRF already ran in `onRequest`;
+    // this handler only ever runs once every one of those passed.
+    .post("/api/rules/:id/enabled", async ({ params, body, set, request }) => {
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      const id = decodeURIComponent(params.id);
+      if (typeof b.enabled !== "boolean" || typeof b.ifMatch !== "string") {
+        set.status = 400;
+        return { error: "body must be { enabled: boolean, ifMatch: string, confirm?: boolean }" };
+      }
+      const confirm = b.confirm === true;
+      const outcome = await deps.rulesWrite.enabled(id, b.enabled, b.ifMatch, confirm);
+      auditOutcome(deps, { route: "POST /api/rules/:id/enabled", action: `enabled=${b.enabled}`, ids: [id], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-662 item 7: `PUT /api/rules/:id` — the nested allowlist edit
+    // (`query`, `agentPreferences[i].model/effort/modelPower/effortPower`).
+    .put("/api/rules/:id", async ({ params, body, set, request }) => {
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const id = decodeURIComponent(params.id);
+      const b = body as Record<string, unknown>;
+      if (typeof b.ifMatch !== "string") { set.status = 400; return { error: "body must include ifMatch: string" }; }
+      // Same refusal `writeRuleFields` itself enforces (defense in depth,
+      // checked again at the HTTP boundary): the dedicated enable route
+      // owns `enabled` — a PUT that also permitted it would silently
+      // bypass that route's scope-ceiling/placeholder gates.
+      if ("enabled" in b) {
+        auditOutcome(deps, { route: "PUT /api/rules/:id", action: "edit", ids: [id], origin: request.headers.get("origin") }, { ok: false, error: `PUT /api/rules/:id does not accept "enabled" — use POST /api/rules/:id/enabled` });
+        set.status = 400;
+        return { error: `PUT /api/rules/:id does not accept "enabled" — use POST /api/rules/:id/enabled` };
+      }
+      const parsed = validateRuleFieldPatch(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "PUT /api/rules/:id", action: "edit", ids: [id], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch);
+      auditOutcome(deps, { route: "PUT /api/rules/:id", action: `edit ${Object.keys(parsed.patch).join(",")}`, ids: [id], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-662 item 5 (DECISION ADDED): `POST /api/rules/plan` —
+    // REPORT-ONLY, never writes. Same body shape as the write routes
+    // (minus `ifMatch`, which a dry-run has no use for) plus `confirm`.
+    .post("/api/rules/plan", async ({ body, set, request }) => {
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.id !== "string" || b.id.length === 0) { set.status = 400; return { error: "body must include id: string" }; }
+      const patchSource = typeof b.patch === "object" && b.patch !== null ? b.patch : {};
+      const parsed = validateRuleFieldPatch(patchSource);
+      if (!parsed.ok) { set.status = 400; return { error: parsed.error }; }
+      const confirm = b.confirm === true;
+      const outcome = await deps.rulesWrite.plan(b.id, parsed.patch, confirm);
+      void request;
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      set.headers["cache-control"] = "no-store";
+      return outcome;
+    })
+    // FACTORY-662 item 5: `POST /api/undo/:backupId` — restores a previous
+    // backup through the same guard and the same validated/atomic write
+    // path every other write uses (`restoreBackup`, FACTORY-658).
+    .post("/api/undo/:backupId", async ({ params, set, request }) => {
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const backupId = decodeURIComponent(params.backupId);
+      const outcome = deps.rulesWrite.undo(backupId);
+      auditOutcome(deps, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
     })
     .get("/agents", () => mcp.connections.list().map((c) => ({ id: c.id, issue: c.headers["x-issue"] ?? null, connectedAt: c.connectedAt })))
     .post("/agents/:issue/open", async ({ params, set }) => {

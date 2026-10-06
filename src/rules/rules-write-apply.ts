@@ -1,0 +1,117 @@
+/**
+ * FACTORY-662 — builds the NEXT rules-document text for a web-UI edit, from
+ * the CURRENT text plus a validated `RuleFieldPatch` (`./rules-write-
+ * registry.ts`). Deliberately a full `JSON.parse` / rebuild / `JSON.stringify`
+ * round-trip rather than a text splice (contrast `write-rules.ts`'s own
+ * `setRuleEnabled`, which preserves exact byte formatting because it edits a
+ * file a human may also hand-edit): this ticket's own "rebuild objects, no
+ * deep merge" instruction is about the RULE OBJECT's shape, not the file's
+ * bytes, and `assertOnlyChanged` (the gate that actually matters for safety)
+ * diffs PARSED values, never text — a reformatted-but-semantically-identical
+ * document reports zero diffs there regardless.
+ *
+ * Only the TARGET rule's own object is ever touched; every other rule in
+ * the array survives a plain value copy, untouched — which is also what
+ * keeps `assertOnlyChanged`'s allowlist (scoped to "any rule", in the
+ * abstract) from actually reaching any rule but this one in practice.
+ */
+import { EDITABLE_AGENT_PREFERENCE_LEAVES, type RuleFieldPatch } from "./rules-write-registry.js";
+
+export class RuleWriteApplyError extends Error {}
+
+function findRuleIndex(rules: unknown[], id: string): number {
+  return rules.findIndex((r) => r !== null && typeof r === "object" && (r as Record<string, unknown>).id === id);
+}
+
+function parseRulesDoc(currentText: string | undefined): { doc: unknown; rules: unknown[] } {
+  const doc: unknown = JSON.parse(currentText && currentText.length > 0 ? currentText : '{"rules":[]}');
+  if (!doc || typeof doc !== "object" || !Array.isArray((doc as Record<string, unknown>).rules)) {
+    throw new RuleWriteApplyError(`expected an object with a "rules" array`);
+  }
+  return { doc, rules: (doc as { rules: unknown[] }).rules };
+}
+
+/**
+ * The target rule's own ARRAY INDEX in `currentText`'s `rules` array — the
+ * agentsafety re-check's own finding (2026-10-05 17:0x PDT comment on
+ * FACTORY-662): `assertOnlyChanged`'s allowlist patterns are ARRAY-INDEX
+ * based, and `*` matches ANY index — so an allowlist built once, statically,
+ * as `"rules.*.enabled"` permits a write to ANY rule's `enabled`, not just
+ * the one this route is checking `isUiEditableRuleId` against. The fix is
+ * this function: read the index fresh, from the SAME locked `currentText`
+ * the mutator already has in hand, and build an allowlist that names that
+ * literal index — never a wildcard. Throws if `id` is not found.
+ */
+export function ruleIndexById(currentText: string | undefined, id: string): number {
+  const { rules } = parseRulesDoc(currentText);
+  const idx = findRuleIndex(rules, id);
+  if (idx === -1) throw new RuleWriteApplyError(`no rule with id ${JSON.stringify(id)}`);
+  return idx;
+}
+
+/** `rules.<idx>.enabled` for the ONE rule `id` resolves to, by its CURRENT index — fed to `assertOnlyChanged` for `POST /api/rules/:id/enabled`. */
+export function buildEnabledAllowedPaths(currentText: string | undefined, id: string): string[] {
+  return [`rules.${ruleIndexById(currentText, id)}.enabled`];
+}
+
+/**
+ * The allowed paths for a `PUT /api/rules/:id` patch, scoped to this ONE
+ * rule's CURRENT index and (for `agentPreferences`) its CURRENT per-element
+ * indices — never a wildcard, and never the array's own path (so an
+ * element COUNT change, which `diffPaths` reports at the array's own path,
+ * matches no pattern here and is refused exactly as `rules-write-
+ * registry.ts`'s own header already documents). LEAF paths only
+ * (`.model`/`.effort`/`.modelPower`/`.effortPower`), never
+ * `rules.<idx>.agentPreferences.<m>` bare — a PREFIX match on that bare
+ * path would also permit `harness` (agentsafety's finding (ii)).
+ */
+export function buildFieldsAllowedPaths(currentText: string | undefined, id: string, patch: RuleFieldPatch): string[] {
+  const idx = ruleIndexById(currentText, id);
+  const paths: string[] = [];
+  if (patch.query !== undefined) paths.push(`rules.${idx}.query`);
+  if (patch.agentPreferences !== undefined) {
+    const rule = readRuleById(currentText, id);
+    const currentPrefs = Array.isArray(rule.agentPreferences) ? rule.agentPreferences : [];
+    for (let m = 0; m < currentPrefs.length; m++) {
+      for (const leaf of EDITABLE_AGENT_PREFERENCE_LEAVES) paths.push(`rules.${idx}.agentPreferences.${m}.${leaf}`);
+    }
+  }
+  return paths;
+}
+
+/** Reads the current rules document and returns the target rule's own raw parsed object (never a copy) — for building a plan/diff preview without writing anything. Throws if the document is malformed or the id is not found. */
+export function readRuleById(currentText: string | undefined, id: string): Record<string, unknown> {
+  const { rules } = parseRulesDoc(currentText);
+  const idx = findRuleIndex(rules, id);
+  if (idx === -1) throw new RuleWriteApplyError(`no rule with id ${JSON.stringify(id)}`);
+  return rules[idx] as Record<string, unknown>;
+}
+
+/**
+ * Applies `patch` to rule `id` in `currentText`, returning the whole next
+ * document's text. Throws `RuleWriteApplyError` (never a generic `Error`,
+ * so callers can map it to a 400 without guessing) on: malformed current
+ * document, unknown id, or an `agentPreferences` patch whose length does
+ * not match the rule's CURRENT `agentPreferences` length (no addition or
+ * removal is ever permitted — see `rules-write-registry.ts`'s own header).
+ */
+export function applyRuleFieldPatch(currentText: string | undefined, id: string, patch: RuleFieldPatch): string {
+  const { doc, rules } = parseRulesDoc(currentText);
+  const idx = findRuleIndex(rules, id);
+  if (idx === -1) throw new RuleWriteApplyError(`no rule with id ${JSON.stringify(id)}`);
+  const current = rules[idx] as Record<string, unknown>;
+  const next: Record<string, unknown> = { ...current };
+
+  if (patch.enabled !== undefined) next.enabled = patch.enabled;
+  if (patch.query !== undefined) next.query = patch.query;
+  if (patch.agentPreferences !== undefined) {
+    const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
+    if (patch.agentPreferences.length !== currentPrefs.length) {
+      throw new RuleWriteApplyError(`agentPreferences must have exactly ${currentPrefs.length} entries (adding or removing a preference is not permitted in this slice), got ${patch.agentPreferences.length}`);
+    }
+    next.agentPreferences = currentPrefs.map((cur, i) => ({ ...cur, ...patch.agentPreferences![i] }));
+  }
+
+  rules[idx] = next;
+  return JSON.stringify(doc, null, 2) + "\n";
+}
