@@ -647,6 +647,50 @@ describe("FACTORY-685 (item 2, agentsafety F1): confirm on ANY enable of a swarm
   });
 });
 
+describe("FACTORY-687: a rule that OMITS `execution` is still a swarm rule for the item-2 gate (absent = swarm, matching loadRules)", () => {
+  // Deliberately omits `execution` entirely — unlike SWARM_RULE above, which sets it explicitly.
+  // Every rule in docs/rules.example.json has this exact shape.
+  const NO_EXECUTION_RULE = { id: "ui-first-rule", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "do the thing", enabled: false };
+
+  test("GO-RED: enabling with no confirm is refused 409 — writes nothing — even though `execution` is absent, not literally \"swarm\"", async () => {
+    const text = seed([NO_EXECUTION_RULE]);
+    const deps = { env: env() };
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, false, async () => 3, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, false, planHash, async () => 3, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toMatch(/staff up to 3 ticket/);
+      expect(outcome.error).toMatch(/confirm/);
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("the SAME enable, WITH confirm: true and a fresh planHash, succeeds", async () => {
+    seed([NO_EXECUTION_RULE]);
+    const deps = { env: env() };
+    const scope = async () => 3;
+    const planHash = await planHashFor("ui-first-rule", { enabled: true }, true, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, true, planHash, scope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].enabled).toBe(true);
+  });
+
+  test("planRuleWrite reports requiresConfirm:true, confirmReason 'swarm-enable' for a rule that omits `execution`", async () => {
+    seed([NO_EXECUTION_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => 3, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.scope).toBe(3);
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("swarm-enable");
+    }
+  });
+});
+
 describe("STALE-LOCK ERROR is passed through verbatim, naming the lock file", () => {
   test("a crashed writer's leftover .rules.lock refuses with the exact path and rm instruction, status 503", async () => {
     seed([UI_RULE]);
@@ -915,15 +959,6 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
       let now = 0;
       const scopeByQuery = new Map<string, number>([["project = A", 3], ["project = B", 40]]);
       let calls = 0;
-      const underlying = async (_id: string): Promise<number> => { throw new Error("underlying must never be called directly by this test — use cached()"); };
-      const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
-      // Build the cache the same way `planRuleWrite`/`writeRuleEnabled` do:
-      // `scopeOf` itself only ever sees `id` (the real previewer re-reads
-      // the CURRENT query from the live file) — but since this test's
-      // `underlying` always throws, wire a real-shaped one instead that
-      // reads from `scopeByQuery` keyed by whichever query the test cares
-      // about at call time via a mutable ref, proving the CACHE key (not
-      // the underlying call) is what changed.
       const liveQuery = { current: "project = A" };
       const realUnderlying = async (_id: string): Promise<number> => { calls++; return scopeByQuery.get(liveQuery.current)!; };
       const realCached = createScopeCache(realUnderlying, { ttlMs: 10_000, now: () => now });
