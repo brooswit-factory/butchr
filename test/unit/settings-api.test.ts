@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
+import { buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
 
 describe("buildSettingEntries", () => {
   test("every definition is reported exactly once, in order", () => {
@@ -45,6 +45,31 @@ describe("buildSettingEntries", () => {
     expect(entries.some((e) => e.key === "ATLASSIAN_TOKEN_FILE")).toBe(false);
   });
 
+  test("a canary URL with embedded userinfo (scheme://user:pass@host) in a non-secret value is redacted, not returned verbatim", () => {
+    const canaryUserinfo = "canary-user:canary-pass-should-never-leak";
+    const entries = buildSettingEntries({ ROCKETCHAT_URL: `https://${canaryUserinfo}@chat.example.com/path?x=1` });
+    const rc = entries.find((e) => e.key === "ROCKETCHAT_URL")!;
+    expect(rc.secret).toBe(false);
+    if (!rc.secret) {
+      expect(rc.value).not.toContain(canaryUserinfo);
+      expect(rc.value).not.toContain("canary-pass");
+      expect(rc.value).toBe("https://[redacted]@chat.example.com/path?x=1");
+    }
+    expect(JSON.stringify(entries)).not.toContain(canaryUserinfo);
+  });
+
+  test("the same userinfo redaction applies to ANY non-secret value, not only ROCKETCHAT_URL by name", () => {
+    const entries = buildSettingEntries({ ATLASSIAN_SITE: "https://evil-canary-secret@example.atlassian.net" });
+    const site = entries.find((e) => e.key === "ATLASSIAN_SITE")!;
+    if (!site.secret) expect(site.value).toBe("https://[redacted]@example.atlassian.net");
+  });
+
+  test("a value with no userinfo is passed through unchanged", () => {
+    const entries = buildSettingEntries({ ATLASSIAN_SITE: "https://example.atlassian.net" });
+    const site = entries.find((e) => e.key === "ATLASSIAN_SITE")!;
+    if (!site.secret) expect(site.value).toBe("https://example.atlassian.net");
+  });
+
   test("SECRET_KEY_RE matches every env var this ticket's spec names as secret-like", () => {
     for (const name of ["ATLASSIAN_TOKEN", "GITHUB_TOKEN_FILE", "ROCKETCHAT_ADMIN_TOKEN_FILE", "BUTCHR_ASSIGNEE_STORY"]) {
       if (name === "BUTCHR_ASSIGNEE_STORY") { expect(SECRET_KEY_RE.test(name)).toBe(false); continue; }
@@ -87,6 +112,24 @@ describe("buildAtlassianTokenFileStatus", () => {
     expect(status.exists).toBe(false);
     expect(status.mode).toBeNull();
     expect(status.tooOpen).toBeNull();
+  });
+});
+
+describe("redactUrlUserinfo", () => {
+  test("redacts user:pass@ in a URL", () => {
+    expect(redactUrlUserinfo("https://user:pass@host.example.com")).toBe("https://[redacted]@host.example.com");
+  });
+  test("redacts a bare user@ (no password) too", () => {
+    expect(redactUrlUserinfo("https://user@host.example.com")).toBe("https://[redacted]@host.example.com");
+  });
+  test("leaves a value with no userinfo untouched", () => {
+    expect(redactUrlUserinfo("https://host.example.com/path")).toBe("https://host.example.com/path");
+  });
+  test("leaves a non-URL value untouched", () => {
+    expect(redactUrlUserinfo("just-a-plain-string")).toBe("just-a-plain-string");
+  });
+  test("redacts every occurrence when more than one URL-with-userinfo appears in one value", () => {
+    expect(redactUrlUserinfo("a=https://u1:p1@h1.example, b=https://u2:p2@h2.example")).toBe("a=https://[redacted]@h1.example, b=https://[redacted]@h2.example");
   });
 });
 
