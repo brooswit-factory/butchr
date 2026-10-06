@@ -137,6 +137,23 @@ function sourceOf(raw: string | undefined): "environment" | "default" {
   return raw !== undefined && raw.trim() !== "" ? "environment" : "default";
 }
 
+/**
+ * A non-secret setting's value can still be a URL carrying embedded
+ * credentials (`scheme://user:pass@host`, e.g. `ROCKETCHAT_URL`) — those
+ * are a secret in disguise, not covered by `SECRET_KEY_RE` (which matches
+ * on the ENV VAR NAME, not the value's own shape). Applied to every
+ * non-secret value this module ever returns, regardless of which key it
+ * came from — never only `ROCKETCHAT_URL` by name, since the shape, not
+ * the name, is the thing that leaks. Matches any `scheme://user:pass@`
+ * (or `scheme://user@`) prefix, case-insensitively, and replaces the
+ * userinfo with `[redacted]` — the host/path/query after `@` is untouched.
+ */
+const URL_USERINFO_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/?#@]+@/g;
+
+export function redactUrlUserinfo(value: string): string {
+  return value.replace(URL_USERINFO_RE, "$1[redacted]@");
+}
+
 /** Pure: builds every entry in `SETTINGS_DEFINITIONS` from an env snapshot — no I/O. `ATLASSIAN_TOKEN_FILE` is handled by `buildAtlassianTokenFileStatus` instead, never duplicated here. */
 export function buildSettingEntries(env: Readonly<Record<string, string | undefined>>): SettingEntry[] {
   return SETTINGS_DEFINITIONS.map(({ key, description }) => {
@@ -145,7 +162,8 @@ export function buildSettingEntries(env: Readonly<Record<string, string | undefi
     if (isSecretKey(key)) {
       return { key, set: raw !== undefined && raw.trim() !== "", source, restartNeeded: true as const, secret: true as const, description };
     }
-    return { key, value: raw !== undefined && raw.trim() !== "" ? raw : null, source, restartNeeded: true as const, secret: false as const, description };
+    const value = raw !== undefined && raw.trim() !== "" ? redactUrlUserinfo(raw) : null;
+    return { key, value, source, restartNeeded: true as const, secret: false as const, description };
   });
 }
 
