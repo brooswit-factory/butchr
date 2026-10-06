@@ -170,7 +170,7 @@ function sourceOf(rawEnvValue: string | undefined, fileHasKey: boolean): "enviro
  * (or `scheme://user@`) prefix, case-insensitively, and replaces the
  * userinfo with `[redacted]` — the host/path/query after `@` is untouched.
  */
-const URL_USERINFO_RE = /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/?#]*@/g; // greedy up to the LAST "@" of the authority: a password containing "@" (https://u:p@ss@host) must not leave "ss" visible
+const URL_USERINFO_RE = /(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/?#]*@/g; // greedy up to the LAST "@" of the authority: a password containing "@" (https://u:p@ss@host) must not leave "ss" visible
 
 export function redactUrlUserinfo(value: string): string {
   return value.replace(URL_USERINFO_RE, "$1[redacted]@");

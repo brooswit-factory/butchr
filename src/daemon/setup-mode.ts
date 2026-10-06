@@ -27,6 +27,7 @@
  * `fetchFn` while the SITE VALUE recorded/persisted stays a real-looking
  * hostname — production never passes this (defaults to the global `fetch`).
  */
+import type { HealthStatus } from "./health.js";
 import { buildApp } from "./app.js";
 import type { ViewDeps } from "../web/view.js";
 import { listenOptions, DAEMON_HOSTNAME } from "./listen.js";
@@ -84,7 +85,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     state: async () => [],
     open: unused,
     openPane: unused,
-    health: () => ({ ok: true, components: [] }),
+    health: () => ({ ok: false, components: [], setupMode: true } as HealthStatus & { setupMode: true }), // 503 on purpose: not a working daemon yet
     dashboard: async () => ({ checked: false, declinedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
     header: () => ({ build: null }),
     resourceLink: async () => ({ ok: false, error: "not configured (setup mode)" }),

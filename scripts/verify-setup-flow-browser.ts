@@ -81,7 +81,7 @@ log(`butchr: setup code (10 min, single-use, 5 attempts): ${setupCode}`);
 // operator would.
 const codeFromJournal = (() => {
   const line = journal.find((l) => l.includes("setup code"));
-  const m = line ? /:\s*([A-Z0-9]{12})$/.exec(line.trim()) : null;
+  const m = line ? /:\s*([A-Z0-9]{13})$/.exec(line.trim()) : null;
   return m?.[1] ?? null;
 })();
 

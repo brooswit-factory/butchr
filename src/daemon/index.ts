@@ -203,8 +203,16 @@ const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string |
 // one case setup mode exists for.
 const effectiveJiraEnv = resolveEffectiveJiraEnv(effectiveEnv, { onWarn: (line) => console.error(`butchr: ${line}`) });
 if (!isAtlassianConfigured(effectiveJiraEnv)) {
+  // Setup mode ONLY for a truly fresh install (no site, email, token, identity file or managed token file at all).
+  // Any PARTIAL state is a misconfiguration: exit 1 loudly, exactly as before, instead of serving a quiet setup page with nothing polling (agentsafety A2 review item 3).
+  const partial = [effectiveJiraEnv.ATLASSIAN_SITE, effectiveJiraEnv.ATLASSIAN_EMAIL, effectiveJiraEnv.ATLASSIAN_TOKEN, effectiveJiraEnv.ATLASSIAN_TOKEN_FILE].some((v) => !!v?.trim());
+  if (partial) {
+    console.error("butchr: Missing required config: ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE) must all be set (partial Atlassian configuration is not setup mode)");
+    process.exit(1);
+  }
   await runSetupModeDaemon();
-  process.exit(1); // unreachable in practice: runSetupModeDaemon only returns on a startup failure of its own (e.g. a bad BUTCHR_PORT), already logged by `loadConfig`-style callers elsewhere; listen() itself runs forever.
+  // runSetupModeDaemon returns once app.listen() is called; the listening server keeps the process alive, so park here instead of falling through to the real daemon (or exiting).
+  await new Promise<never>(() => {});
 }
 
 let config;

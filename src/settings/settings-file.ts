@@ -42,6 +42,8 @@ export function settingsFilePath(env: SettingsFileEnv = process.env): string {
   return join(xdg, "butchr", "settings.json");
 }
 
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,63}$/;
+
 export type AllowlistKind = "provider" | "providerOrder" | "model" | "positiveIntWithCeiling" | "positiveMsWithFloor";
 
 export interface AllowlistKeyDef {
@@ -117,6 +119,8 @@ export function validateSettingValue(key: string, rawValue: string, confirm = fa
     case "providerOrder":
       return validateProviderOrder(value, key);
     case "model":
+      // Bounded and flag-shaped values refused: the value reaches the agent CLI as one argv element (agentsafety A2 review item 2).
+      if (!MODEL_RE.test(value)) return { ok: false, error: `${key} must be 1-64 characters: letters, digits and ._:/@- only, starting with a letter or digit` };
       return { ok: true, normalized: value };
     case "positiveIntWithCeiling": {
       const n = Number(value);
