@@ -147,12 +147,27 @@ export interface ViewDeps {
    */
   getRules?: () => readonly Rule[];
   /**
+   * FACTORY-657, agentsafety review R2: sha256 hex of the exact text the
+   * CURRENTLY held rules were parsed from (`RulesHolder.getSourceEtag()`)
+   * — the same `sha256(text ?? "")` convention `src/rules/write-rules.ts`'s
+   * `rulesEtag` uses. FACTORY-660/662's stale-file flag compares this
+   * against a FRESH `rulesEtag()` read to tell "the file changed since
+   * this daemon last loaded it" apart from "nothing changed" — `getRules()`
+   * alone can't make that distinction (an edit that reorders but doesn't
+   * change any enabled rule's effective content would look identical).
+   */
+  getRulesSourceEtag?: () => string | undefined;
+  /**
    * FACTORY-657: re-reads `rules.json` in-process and swaps the daemon's
    * live holder — literally `() => reloadRules(rulesHolder)`
    * (src/rules/reload.ts), the EXACT same function `SIGHUP` already calls.
    * No route calls this today; exists so FACTORY-663's web write path can
    * call it directly after it writes the file itself, with no HTTP
-   * round-trip and no second reload code path to drift from SIGHUP's.
+   * round-trip and no second reload code path to drift from SIGHUP's. Its
+   * own result's `sourceEtag` (on success) is the new `getRulesSourceEtag()`
+   * value — read it off THIS result rather than calling
+   * `getRulesSourceEtag()` separately right after, so there is no window
+   * where the two could observe a different reload.
    */
   reloadRulesNow?: () => ReloadResult;
 }

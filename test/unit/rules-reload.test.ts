@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { createRulesHolder, parseRules, type Rule } from "../../src/rules/rules.js";
 import { reloadRules } from "../../src/rules/reload.js";
 import { createFilesystemResourceType } from "../../src/rules/filesystem-type.js";
-import { createRuleResourceType } from "../../src/rules/resource-type.js";
+import { createRuleResourceType, createRuleEventRules } from "../../src/rules/resource-type.js";
 import { unitAgentKey } from "../../src/rules/execution.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
@@ -178,5 +179,49 @@ describe("a reload's effect on an already-running resource type", () => {
 
     const second = await type.discovery.search();
     expect(second.length).toBe(1); // rule "b"'s root has no files; the next poll sees both rules, as expected.
+  });
+});
+
+describe("agentsafety review R1: createRuleEventRules' own poll() loop must not skip a rule when a reload lands mid-poll", () => {
+  const [ruleWA, ruleWB, ruleWC] = parseRules({
+    rules: [
+      { id: "wa", resourceProvider: "jira-work", query: "key = A-1", brief: "a" },
+      { id: "wb", resourceProvider: "jira-work", query: "key = B-1", brief: "b" },
+      { id: "wc", resourceProvider: "jira-work", query: "key = C-1", brief: "c" },
+    ],
+  }) as [Rule, Rule, Rule];
+  const issue = (key: string): JiraIssue => ({ key, summary: "s", status: "To Do", issuetype: "Task", assignee: null, parent: null, updated: "", labels: [] });
+  const unit = (rule: Rule, key: string) => ({ kind: "resource" as const, match: { agentKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId: rule.id, resourceId: key }), rule, issue: issue(key) } });
+
+  test("a reload mid-poll (holder spliced while this poll awaits deps.comments for an earlier rule) still visits EVERY rule in the pre-reload snapshot exactly once — R1's own repro shape (resource-type.ts's for...of over the LIVE holder array, fixed by snapshotting it first)", async () => {
+    const holder = createRulesHolder([ruleWA, ruleWB, ruleWC]);
+    const events = createRuleEventRules({
+      rules: holder.getRules(), // the LIVE array — not a `.filter()` copy — exactly what made this reachable
+      comments: async (key) => {
+        if (key === "A-1") {
+          // Lands WHILE this poll's own loop sits on rule "wa", BEFORE it
+          // has even reached "wb"/"wc" — `setRules` splices the holder's
+          // array CONTENTS in place (never reassigns), so a bare
+          // `for (const rule of deps.rules)` reading index-by-index off
+          // that same array can step onto a shifted element or run out of
+          // bounds early, skipping a rule still due this poll.
+          reloadRules(holder, { BUTCHR_RULES_FILE: "/rules.json" }, () => JSON.stringify({ rules: [{ ...ruleWA, enabled: true }] })); // "wb" AND "wc" both disappear from the holder
+        }
+        return [];
+      },
+    });
+    const prev = { primary: [], related: [] };
+    const next = { primary: [unit(ruleWA, "A-1"), unit(ruleWB, "B-1"), unit(ruleWC, "C-1")], related: [] };
+    const poll = await events.poll(prev as never, next as never);
+    expect(poll.changedPrimary.slice().sort()).toEqual(
+      [
+        encodeAgentKey({ resourceProvider: "jira-work", ruleId: "wa", resourceId: "A-1" }),
+        encodeAgentKey({ resourceProvider: "jira-work", ruleId: "wb", resourceId: "B-1" }),
+        encodeAgentKey({ resourceProvider: "jira-work", ruleId: "wc", resourceId: "C-1" }),
+      ].sort(),
+    );
+    // The reload itself DID land — the holder reflects it; only this one
+    // already-in-flight poll's own rule set was unaffected by it.
+    expect(holder.getRules().map((r) => r.id)).toEqual(["wa"]);
   });
 });

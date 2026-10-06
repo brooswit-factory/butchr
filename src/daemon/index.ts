@@ -29,7 +29,7 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -191,7 +191,7 @@ const rulesHolder = (() => {
     const enabled = loaded.rules.filter((r) => r.enabled).map((r) => r.id);
     if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
     else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
-    return createRulesHolder(loaded.rules);
+    return createRulesHolder(loaded.rules, sourceEtagOf(loaded.text));
   } catch (e) {
     console.error(`butchr: ${(e as Error).message}`);
     process.exit(1);
@@ -791,6 +791,7 @@ const { app, mcp } = buildApp({
   // per this ticket's own scope correction) — see `ViewDeps`'s own doc
   // comment (src/web/view.ts) for who these are for.
   getRules,
+  getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
   reloadRulesNow: () => reloadRules(rulesHolder),
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({

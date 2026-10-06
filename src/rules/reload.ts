@@ -22,7 +22,7 @@
  * exactly as it already does for a restart today (see README's own
  * "Applying a change" section) — a reload changes nothing about that path.
  */
-import { loadRules, rulesPath, type ReadRulesFile, type Rule, type RulesEnv, type RulesHolder } from "./rules.js";
+import { loadRules, rulesPath, sourceEtagOf, type ReadRulesFile, type Rule, type RulesEnv, type RulesHolder } from "./rules.js";
 
 export interface ReloadResult {
   ok: boolean;
@@ -36,6 +36,14 @@ export interface ReloadResult {
   changed: string[];
   /** `loadRules`' own error message, one entry per line — empty on success. */
   problems: string[];
+  /**
+   * FACTORY-657, agentsafety review R2: the holder's NEW `getSourceEtag()`
+   * value after this reload — unset (the OLD etag, unchanged) on failure,
+   * since nothing was swapped. FACTORY-660/662's stale-file flag reads this
+   * off `reloadRulesNow()`'s own result rather than calling `getSourceEtag()`
+   * separately, so there is no window where the two could disagree.
+   */
+  sourceEtag?: string;
 }
 
 const byId = (rules: readonly Rule[]) => new Map(rules.filter((r) => r.enabled).map((r) => [r.id, r] as const));
@@ -49,7 +57,7 @@ const byId = (rules: readonly Rule[]) => new Map(rules.filter((r) => r.enabled).
  * overridden by a test.
  */
 export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRulesFile): ReloadResult {
-  let loaded: { path: string; origin: "file" | "missing"; rules: Rule[] };
+  let loaded: { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined };
   try {
     loaded = loadRules(env, read);
   } catch (e) {
@@ -74,6 +82,11 @@ export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRule
   const added = [...after.keys()].filter((id) => !before.has(id));
   const removed = [...before.keys()].filter((id) => !after.has(id));
   const changed = [...after.keys()].filter((id) => before.has(id) && JSON.stringify(before.get(id)) !== JSON.stringify(after.get(id)));
+  const sourceEtag = sourceEtagOf(loaded.text);
+  // Set together, synchronously, with nothing else able to run in between
+  // (single-threaded JS, no `await` here) — see `RulesHolder`'s own doc
+  // comment for why the two must never be set independently.
   holder.setRules(loaded.rules);
-  return { ok: true, path: loaded.path, added, removed, changed, problems: [] };
+  holder.setSourceEtag(sourceEtag);
+  return { ok: true, path: loaded.path, added, removed, changed, problems: [], sourceEtag };
 }

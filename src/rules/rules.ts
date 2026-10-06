@@ -20,6 +20,7 @@
  * read as "no rules" and stop every rule agent. There are no built-in
  * rules or templates — a present file is the only source of rules.
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
@@ -685,18 +686,29 @@ const readIfExists: ReadRulesFile = (path) => {
  * Loads and validates rules. A missing default file is `origin: "missing"`
  * with zero rules — there is no fallback — so a caller can say plainly why
  * nothing is staffed. A missing explicit `BUTCHR_RULES_FILE` throws.
+ *
+ * `text` is the EXACT raw string `read` returned (`undefined` for a missing
+ * file) — the one and only read of the file this call makes. FACTORY-657,
+ * agentsafety review R2: a caller computing a source etag (`RulesHolder`'s
+ * `setSourceEtag`, `src/rules/reload.ts`) reads THIS field rather than
+ * calling `read`/`readFileSync` a second time, so the hash can never
+ * disagree with what `parseRules` above actually validated (a second read
+ * could race a concurrent write and hash different bytes than were parsed).
  */
-export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[] } {
+/** The SAME `sha256(text ?? "")` convention `src/rules/write-rules.ts`'s `rulesEtag` uses, applied to `loadRules`' own `text` field — the one `sourceEtag` computation, shared by startup (`src/daemon/index.ts`) and `reloadRules` (`src/rules/reload.ts`), so the two can never drift to different hashes for the same bytes. */
+export const sourceEtagOf = (text: string | undefined): string => createHash("sha256").update(text ?? "", "utf8").digest("hex");
+
+export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined } {
   const path = rulesPath(env);
   const text = read(path);
   if (text === undefined) {
     if (env.BUTCHR_RULES_FILE?.trim()) throw new Error(`BUTCHR_RULES_FILE ${path} does not exist; fix or unset it (only the default path may be absent)`);
-    return { path, origin: "missing", rules: [] };
+    return { path, origin: "missing", rules: [], text: undefined };
   }
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }
-  return { path, origin: "file", rules: parseRules(doc, path) };
+  return { path, origin: "file", rules: parseRules(doc, path), text };
 }
 
 /**
@@ -719,18 +731,44 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
  * holder would need to thread a getter *function* through every one of
  * them instead. Mutating in place means a plain `rules: getRules()` at
  * construction time is already reload-safe.
+ *
+ * The flip side of mutating in place (agentsafety review R1): any consumer
+ * that iterates `getRules()`'s array DIRECTLY (not a `.filter()`/`.map()`
+ * copy, which is a new array the splice above can never touch) across an
+ * `await` is reading a live array a concurrent `setRules` can splice
+ * mid-loop — `for...of`'s index-based stepping can then skip (or revisit)
+ * an element. Every such site in this codebase snapshots first
+ * (`for (const rule of [...deps.rules])`, `createRuleEventRules`'s own
+ * `poll`, src/rules/resource-type.ts) specifically because of this; a new
+ * site that loops `getRules()`/`deps.rules` directly with an `await`
+ * inside must do the same.
  */
 export interface RulesHolder {
   getRules(): readonly Rule[];
   /** Replaces the held rules' CONTENTS in place — see this interface's own doc comment for why identity is preserved rather than reassigned. */
   setRules(next: readonly Rule[]): void;
+  /**
+   * FACTORY-657, agentsafety review R2: sha256 hex of the EXACT text the
+   * currently-held rules were parsed from (`loadRules`'s own `text` field;
+   * `undefined` only for the startup "no file at all" case — never
+   * recomputed by a second file read). The SAME `sha256(text ?? "")`
+   * convention `src/rules/write-rules.ts`'s `rulesEtag` already uses, so a
+   * consumer comparing the two (FACTORY-660/662's stale-file flag) is
+   * comparing like with like.
+   */
+  getSourceEtag(): string | undefined;
+  /** Set together with `setRules` by `reloadRules` (src/rules/reload.ts) — never independently, so the two can never name different file reads. */
+  setSourceEtag(etag: string | undefined): void;
 }
 
-export function createRulesHolder(initial: readonly Rule[]): RulesHolder {
+export function createRulesHolder(initial: readonly Rule[], initialSourceEtag?: string): RulesHolder {
   const live: Rule[] = [...initial];
+  let sourceEtag = initialSourceEtag;
   return {
     getRules: () => live,
     setRules: (next) => { live.splice(0, live.length, ...next); },
+    getSourceEtag: () => sourceEtag,
+    setSourceEtag: (etag) => { sourceEtag = etag; },
   };
 }
 
