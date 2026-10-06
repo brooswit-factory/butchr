@@ -7,6 +7,7 @@
  */
 import { Heading } from "@launchpad-ui/components";
 import { realSettingsApi, type SettingsApi } from "../api/settings.js";
+import { realSetupApi, type SetupApi } from "../api/setup.js";
 import { useSettings } from "../hooks/use-settings.js";
 import { PollStatusView } from "../components/PollStatusView.js";
 import { SettingsTable } from "../components/SettingsTable.js";
@@ -15,9 +16,11 @@ import { buildSettingsViewModel } from "../view-model/settings-view.js";
 
 export interface SettingsRouteProps {
   api?: SettingsApi;
+  /** FACTORY-665 (PR-2): powers the Jira connection card's token-rotation control. */
+  setupApi?: SetupApi;
 }
 
-export function SettingsRoute({ api = realSettingsApi }: SettingsRouteProps) {
+export function SettingsRoute({ api = realSettingsApi, setupApi = realSetupApi }: SettingsRouteProps) {
   const state = useSettings(api);
 
   return (
@@ -31,7 +34,7 @@ export function SettingsRoute({ api = realSettingsApi }: SettingsRouteProps) {
           return (
             <>
               <SettingsTable rows={vm.rows} />
-              <JiraConnectionCard api={api} site={vm.jiraSite} email={vm.jiraEmail} tokenFile={vm.tokenFile} />
+              <JiraConnectionCard api={api} site={vm.jiraSite} email={vm.jiraEmail} tokenFile={vm.tokenFile} setupApi={setupApi} />
               {vm.unitHintText !== null && (
                 <p data-testid="settings-unit-hint" style={{ marginTop: "1rem", fontSize: "0.8rem", opacity: 0.8 }}>
                   environment source: {vm.unitHintText}

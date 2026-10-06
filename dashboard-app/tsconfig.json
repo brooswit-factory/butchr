@@ -71,6 +71,10 @@
     "../test/unit/dashboard-app-dashboard-route.test.tsx",
     // FACTORY-661: the Rules page's own DOM-rendering component tests, same
     // reason as the blocks above.
-    "../test/unit/dashboard-app-rules-route.test.tsx"
+    "../test/unit/dashboard-app-rules-route.test.tsx",
+    // FACTORY-665 (PR-2): the Setup page / Jira token-rotation control's
+    // own DOM-rendering component tests, same reason as the blocks above.
+    "../test/unit/dashboard-app-setup-route.test.tsx",
+    "../test/unit/dashboard-app-jira-connection-card.test.tsx"
   ]
 }

@@ -6,6 +6,7 @@ import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
+import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
 import { runSetupModeDaemon } from "./setup-mode.js";
 import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
 import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
@@ -173,17 +174,24 @@ installLogSink();
 // not crash at startup: it starts in SETUP MODE instead (serving only
 // `/health`, the dashboard shell, and the setup API — see
 // `./setup-mode.ts`'s own header) until an operator configures it through
-// the dashboard. Checked BEFORE `loadConfig` itself, which still throws for
-// every OTHER kind of misconfiguration exactly as before — this is not a
-// general "never crash" change, only the one case setup mode exists for.
-if (!isAtlassianConfigured(process.env as Record<string, string | undefined>)) {
+// the dashboard. `resolveEffectiveJiraEnv` is what makes a RESTART after a
+// successful setup actually leave setup mode: it fills in site/email/token
+// from this daemon's own previously-persisted setup state (the durable
+// identity file + the managed token file) for any field `process.env`
+// itself leaves unset — env still wins per-field, exactly as before, for
+// every operator who sets these by hand. Checked BEFORE `loadConfig`
+// itself, which still throws for every OTHER kind of misconfiguration
+// exactly as before — this is not a general "never crash" change, only the
+// one case setup mode exists for.
+const effectiveJiraEnv = resolveEffectiveJiraEnv(process.env as Record<string, string | undefined>, { onWarn: (line) => console.error(`butchr: ${line}`) });
+if (!isAtlassianConfigured(effectiveJiraEnv)) {
   await runSetupModeDaemon();
   process.exit(1); // unreachable in practice: runSetupModeDaemon only returns on a startup failure of its own (e.g. a bad BUTCHR_PORT), already logged by `loadConfig`-style callers elsewhere; listen() itself runs forever.
 }
 
 let config;
 try {
-  config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  config = loadConfig(effectiveJiraEnv, (p) => readFileSync(p, "utf8"));
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   console.error("See .env.example for the required configuration.");

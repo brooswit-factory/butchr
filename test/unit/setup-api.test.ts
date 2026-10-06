@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { buildSetupStatus, isTokenProvidedByEnvironment, handleJiraTokenWrite, type JiraWriteDeps } from "../../src/web/setup-api.js";
 import { createSetupCodeManager } from "../../src/setup/setup-code.js";
 import type { JiraTokenWriteIo, FetchLike } from "../../src/setup/jira-token-write.js";
+import type { JiraIdentityFileIo } from "../../src/setup/jira-identity-file.js";
 
 const CANARY_TOKEN = "s3cr3t-canary-TOKEN";
 const SITE = "https://x.atlassian.net";
@@ -14,6 +15,20 @@ function okFetch(accountId: string): FetchLike {
 }
 
 function fakeIo(): JiraTokenWriteIo {
+  const files = new Map<string, string>();
+  return {
+    readFile: (p) => files.get(p),
+    mkdir: () => {},
+    modeOf: () => undefined,
+    isSymlink: () => false,
+    writeTempExclusive: (p, text) => files.set(`tmp:${p}`, text),
+    rename: (tmp, dest) => { const v = files.get(`tmp:${tmp}`); if (v !== undefined) files.set(dest, v); },
+    removeQuiet: () => {},
+  };
+}
+
+/** Same in-memory shape as `fakeIo` above, for the (separate) identity-file IO — never the real filesystem. */
+function fakeIdentityIo(): JiraIdentityFileIo {
   const files = new Map<string, string>();
   return {
     readFile: (p) => files.get(p),
@@ -44,7 +59,7 @@ describe("isTokenProvidedByEnvironment", () => {
 
 describe("handleJiraTokenWrite", () => {
   function deps(overrides: Partial<JiraWriteDeps> = {}): JiraWriteDeps {
-    return { setupCode: createSetupCodeManager(), io: fakeIo(), fetchFn: okFetch("acct-1"), path: "/p/atlassian-token", ...overrides };
+    return { setupCode: createSetupCodeManager(), io: fakeIo(), fetchFn: okFetch("acct-1"), path: "/p/atlassian-token", identityIo: fakeIdentityIo(), identityPath: "/p/jira-identity.json", ...overrides };
   }
 
   test("requireEnvCheck:true + env-provided token -> 409, before even checking the setup code", () => {
@@ -91,13 +106,34 @@ describe("handleJiraTokenWrite", () => {
     const r2 = await handleJiraTokenWrite({ site: SITE, email: "a@b.c", token: "  ", setupCode: code }, d1, { requireEnvCheck: false });
     expect(r2).toEqual({ ok: false, status: 400, body: { error: "token is required" } });
   });
-  test("happy path: 200 with accountId/displayName/rotated/restartNeeded:true, never the token", async () => {
+  test("happy path: 200 with accountId/displayName/rotated/restartNeeded:true/identityPersisted:true, never the token", async () => {
     const codeManager = createSetupCodeManager();
     const code = codeManager.mint();
-    const d = deps({ setupCode: codeManager });
+    const identityIo = fakeIdentityIo();
+    const d = deps({ setupCode: codeManager, identityIo });
     const r = await handleJiraTokenWrite({ site: SITE, email: "a@b.c", token: CANARY_TOKEN, setupCode: code }, d, { requireEnvCheck: false });
-    expect(r).toEqual({ ok: true, status: 200, body: { ok: true, accountId: "acct-1", displayName: "D", rotated: false, restartNeeded: true } });
+    expect(r).toEqual({ ok: true, status: 200, body: { ok: true, accountId: "acct-1", displayName: "D", rotated: false, restartNeeded: true, identityPersisted: true } });
     expect(JSON.stringify(r)).not.toContain(CANARY_TOKEN);
+    expect(JSON.parse(identityIo.readFile("/p/jira-identity.json")!)).toEqual({ site: SITE, email: "a@b.c" });
+  });
+  test("rotation (requireEnvCheck:true) never writes the identity file, even on success", async () => {
+    const codeManager = createSetupCodeManager();
+    const code = codeManager.mint();
+    const identityIo = fakeIdentityIo();
+    const d = deps({ setupCode: codeManager, identityIo });
+    const r = await handleJiraTokenWrite({ site: SITE, email: "a@b.c", token: CANARY_TOKEN, setupCode: code }, d, { requireEnvCheck: true });
+    expect(r).toMatchObject({ ok: true, body: { identityPersisted: true } }); // trivially true: nothing needed persisting
+    expect(identityIo.readFile("/p/jira-identity.json")).toBeUndefined();
+  });
+  test("an identity-persist failure is reported alongside the success, without unwinding the already-written token", async () => {
+    const codeManager = createSetupCodeManager();
+    const code = codeManager.mint();
+    const failingIdentityIo: JiraIdentityFileIo = { ...fakeIdentityIo(), writeTempExclusive: () => { throw new Error("ENOSPC"); } };
+    const d = deps({ setupCode: codeManager, identityIo: failingIdentityIo });
+    const r = await handleJiraTokenWrite({ site: SITE, email: "a@b.c", token: CANARY_TOKEN, setupCode: code }, d, { requireEnvCheck: false });
+    expect(r.ok).toBe(true);
+    expect((r as { body: { identityPersisted: boolean; identityError?: string } }).body.identityPersisted).toBe(false);
+    expect((r as { body: { identityError?: string } }).body.identityError).toContain("ENOSPC");
   });
   test("a failed token test maps to 400 with the fixed error, never the upstream body", async () => {
     const codeManager = createSetupCodeManager();
@@ -127,10 +163,10 @@ describe("handleJiraTokenWrite", () => {
       const code = codeManager.mint();
       const r = await handleJiraTokenWrite(
         { site: SITE, email: "a@b.c", token: CANARY_TOKEN, setupCode: code },
-        { setupCode: codeManager, fetchFn: okFetch("acct-x"), path: join(dir, "atlassian-token") },
+        { setupCode: codeManager, fetchFn: okFetch("acct-x"), path: join(dir, "atlassian-token"), identityPath: join(dir, "jira-identity.json") },
         { requireEnvCheck: false },
       );
-      expect(r).toMatchObject({ ok: true });
+      expect(r).toMatchObject({ ok: true, body: { identityPersisted: true } });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

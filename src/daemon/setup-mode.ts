@@ -18,6 +18,14 @@
  * daemon is still running in setup mode (this module never restarts
  * itself) — the UI's own "restart needed" messaging, plus PR-1's restart
  * control, is how an operator actually leaves this mode.
+ *
+ * `buildSetupModeViewDeps`'s optional `fetchFn` is for
+ * `scripts/verify-setup-flow-browser.ts` only: site-shape validation
+ * (`validateAtlassianSiteShape`) correctly refuses anything but a real
+ * `https://<name>.atlassian.net`, so a real-browser test that must still
+ * reach a local stub server redirects the OUTBOUND call via an injected
+ * `fetchFn` while the SITE VALUE recorded/persisted stays a real-looking
+ * hostname — production never passes this (defaults to the global `fetch`).
  */
 import { buildApp } from "./app.js";
 import type { ViewDeps } from "../web/view.js";
@@ -29,7 +37,7 @@ import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
 import { buildSetupStatus, handleJiraTokenWrite } from "../web/setup-api.js";
 import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
-import { jiraTokenFilePath } from "../setup/jira-token-write.js";
+import { jiraTokenFilePath, type FetchLike } from "../setup/jira-token-write.js";
 import { rulesPath } from "../rules/rules.js";
 import { join, dirname } from "node:path";
 import { hostname } from "node:os";
@@ -47,11 +55,19 @@ export interface SetupModeDeps {
  * re-parsed from `env`) so a test can pick an arbitrary value without
  * fighting `BUTCHR_PORT` parsing.
  */
-export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void): { viewDeps: ViewDeps; setupCodeManager: ReturnType<typeof createSetupCodeManager> } {
+export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void, fetchFn?: FetchLike): { viewDeps: ViewDeps; setupCodeManager: ReturnType<typeof createSetupCodeManager> } {
   const setupCodeManager = createSetupCodeManager();
 
+  // `dashboardOriginGuard.port` is read FRESH on every `peerUidCheck` call
+  // (never captured by value) so a caller that passes `port: 0` here and
+  // learns the OS-assigned real port only after `.listen()` can still
+  // mutate `dashboardOriginGuard.port` afterward and have it take effect —
+  // same discipline `scripts/verify-settings-page-browser.ts`'s own
+  // `peerUidCheck` already follows (a dynamic port, previously baked into
+  // this closure by value, silently broke the real-uid peer check for
+  // exactly that case, caught by `scripts/verify-setup-flow-browser.ts`).
   const dashboardOriginGuard = { port };
-  const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port } });
+  const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: dashboardOriginGuard.port } });
   const csrfIssuer = createCsrfTokenIssuer();
   const writeGuard = { dashboardOriginGuard, peerUidCheck, csrf: csrfIssuer };
 
@@ -83,7 +99,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     setupStatus: () => buildSetupStatus(false),
     setupJiraWrite: (input) => handleJiraTokenWrite(
       { ...input },
-      { setupCode: setupCodeManager, path: jiraTokenFilePath(env), env },
+      { setupCode: setupCodeManager, path: jiraTokenFilePath(env), env, ...(fetchFn ? { fetchFn } : {}) },
       { requireEnvCheck: false },
     ),
     jiraTokenTestRateLimit: createWriteRateLimiter({ windowMs: 10 * 60_000, max: 5 }),
