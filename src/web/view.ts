@@ -15,6 +15,7 @@ import { buildRulesApiResponse, type RulesApiResponse } from "./rules-api.js";
 import type { RulesFileState } from "../agents/query-agent-inventory.js";
 import type { RulesPreviewResult } from "./rules-preview.js";
 import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps, type WriteGuardRequest } from "./write-guard.js";
+import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
@@ -261,6 +262,23 @@ export interface ViewDeps {
    * closed.
    */
   auditWrite?: (event: { route: string; action: string; ids: string[]; diffSummary: string; origin: string | null; uid: number | undefined; outcome: "accepted" | "rejected"; reason?: string }) => void;
+  /**
+   * N2 (FACTORY-678) — the per-client write-flood limit (`./write-rate-
+   * limit.ts`'s `createWriteRateLimiter`), shared by ALL FOUR write-shaped
+   * routes (`POST /api/rules/:id/enabled`, `PUT /api/rules/:id`, `POST
+   * /api/rules/plan`, `POST /api/undo/:backupId`) — ONE instance, built
+   * once by the caller (same discipline as `rulesPreview`/`scopeOf`
+   * above), so its per-client state actually accumulates across requests
+   * and across routes. Keyed by the caller's own socket address (see that
+   * module's own header for why). Checked AFTER `checkWriteGuard` passes
+   * but BEFORE any route-specific write logic runs, so a request this
+   * limiter refuses never reaches `rulesWrite.*` at all, and a request it
+   * allows still counts against the budget regardless of what the
+   * downstream write logic decides. Optional: an omitted limiter means no
+   * flood protection, never a reason to refuse a write that would
+   * otherwise be allowed.
+   */
+  writeRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
 }
 
 /** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
@@ -286,6 +304,27 @@ function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids:
   if (!deps.auditWrite) return;
   const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.() };
   deps.auditWrite(outcome.ok ? { ...base, outcome: "accepted" } : { ...base, outcome: "rejected", reason: outcome.error ?? "rejected" });
+}
+
+/**
+ * N2 (FACTORY-678) — run right after `checkWriteGuard` passes, before any
+ * route-specific write logic. `null` means "allowed, proceed" (or no
+ * limiter configured at all); a non-null result is the ALREADY-AUDITED
+ * 429 refusal a route handler should return immediately, verbatim —
+ * `auditOutcome` is called here (not left to the caller) so every route
+ * records this refusal through the SAME rejected-write pipeline (and so
+ * the existing B4 rejected-burst alert aggregation, `./audit-log.ts`,
+ * still bounds the alert count across a write-flood burst rather than
+ * this limiter creating its own unbounded stream of 429 alerts).
+ */
+function checkWriteRateLimit(deps: ViewDeps, client: { address: string; port: number } | undefined, ctx: { route: string; action: string; ids: string[]; origin: string | null }): { status: 429; body: { error: string }; retryAfterSeconds: number } | null {
+  if (!deps.writeRateLimit) return null;
+  const clientKey = client?.address ?? "unresolved";
+  const result = deps.writeRateLimit(clientKey);
+  if (result.ok) return null;
+  const error = `rate limited: too many write attempts — retry after ${result.retryAfterSeconds}s`;
+  auditOutcome(deps, ctx, { ok: false, error });
+  return { status: 429, body: { error }, retryAfterSeconds: result.retryAfterSeconds };
 }
 
 /** One open `/agents/:agentKey/pty` socket's server-side bookkeeping — keyed by `ElysiaWS.id`, since neither Elysia nor Bun hands the `open`/`message`/`close` callbacks a shared closure over each other by default. */
@@ -588,10 +627,12 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const id = decodeURIComponent(params.id);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules/:id/enabled", action: "enabled", ids: [id], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      const id = decodeURIComponent(params.id);
       if (typeof b.enabled !== "boolean" || typeof b.ifMatch !== "string" || typeof b.planHash !== "string") {
         set.status = 400;
         return { error: "body must be { enabled: boolean, ifMatch: string, planHash: string, confirm?: boolean }" };
@@ -611,9 +652,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const id = decodeURIComponent(params.id);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "PUT /api/rules/:id", action: "edit", ids: [id], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
-      const id = decodeURIComponent(params.id);
       const b = body as Record<string, unknown>;
       if (typeof b.ifMatch !== "string" || typeof b.planHash !== "string") { set.status = 400; return { error: "body must include ifMatch: string and planHash: string" }; }
       // Same refusal `writeRuleFields` itself enforces (defense in depth,
@@ -648,6 +691,15 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      // N2 decision: `POST /api/rules/plan` shares the SAME per-client
+      // budget as the other three write-shaped routes (one limiter
+      // instance, see `ViewDeps.writeRateLimit`'s own doc comment) — a
+      // report-only plan still does a real Jira dry-run and is cheap to
+      // flood on its own, and N1 needs a plan-then-apply pair (2 calls) to
+      // never trip this limit, which the default budget (10/min) leaves
+      // ample room for.
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules/plan", action: "plan", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
@@ -673,6 +725,8 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const backupId = decodeURIComponent(params.backupId);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = deps.rulesWrite.undo(backupId);
       auditOutcome(deps, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }

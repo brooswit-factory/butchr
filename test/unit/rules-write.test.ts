@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rulesEtag } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, type RulesWriteDeps } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "../../src/rules/rules-write-registry.js";
+import { createRulesPreviewer, DEFAULT_PREVIEW_RATE_LIMIT_MS } from "../../src/web/rules-preview.js";
+import type { JiraIssue } from "../../src/atlassian/types.js";
+import type { Rule } from "../../src/rules/rules.js";
 
 let dir: string;
 
@@ -526,5 +529,182 @@ describe("STALE-LOCK ERROR is passed through verbatim, naming the lock file", ()
       expect(outcome.error).toContain(lockPath);
       expect(outcome.error).toContain(`rm ${lockPath}`);
     }
+  });
+});
+
+describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s rate limit", () => {
+  const issue = (key: string): JiraIssue => ({
+    key, summary: `summary for ${key}`, status: "To Do", issuetype: "Task", assignee: null, parent: null, updated: "2026-01-01", labels: [],
+  });
+
+  function previewRule(overrides: Partial<Rule> = {}): Rule {
+    return {
+      id: "ui-first-rule",
+      enabled: false,
+      resourceProvider: "jira-work",
+      query: "project = BUTCHR",
+      brief: "do the thing",
+      execution: "swarm",
+      account: "none",
+      role: "worker",
+      ...overrides,
+    } as Rule;
+  }
+
+  /** Wires `scopeOf` exactly as `src/daemon/index.ts` does: a real `createRulesPreviewer` (default `rateLimitMs`), wrapped in `createScopeCache` (also at its own real default TTL unless `cacheDeps` says otherwise). */
+  function realScopeOf(rule: Rule, issues: JiraIssue[], cacheDeps?: Parameters<typeof createScopeCache>[1]) {
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => issues, maxAgents: 50 });
+    return createScopeCache(async (id: string): Promise<number> => {
+      const r = await previewer(id);
+      return r.ok ? r.total : Number.POSITIVE_INFINITY;
+    }, cacheDeps);
+  }
+
+  test("GO-RED CONTROL: without the cache, the previewer's own rate limit fails the back-to-back apply with the Infinity-ticket 409 — proves the mechanism, not a harness bug", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    // The uncached shape `src/daemon/index.ts` had BEFORE this fix: a
+    // fresh `scopeOf` closure with no cache in front of it at all.
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => [issue("F-1")], maxAgents: 50 });
+    const uncachedScopeOf = async (id: string): Promise<number> => {
+      const r = await previewer(id);
+      return r.ok ? r.total : Number.POSITIVE_INFINITY;
+    };
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, uncachedScopeOf, deps);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error("expected a successful plan");
+    expect(plan.scope).toBe(1);
+    const etag = rulesEtag(env());
+    // No artificial wait — the second `scopeOf` call below lands well
+    // inside the previewer's own DEFAULT_PREVIEW_RATE_LIMIT_MS window.
+    const apply = await writeRuleEnabled("ui-first-rule", true, etag, false, plan.planHash, uncachedScopeOf, deps);
+    expect(apply.ok).toBe(false);
+    if (!apply.ok) {
+      expect(apply.status).toBe(409);
+      // This repo's own fix for the "Infinity ticket(s)" literal (part of
+      // this same change) already keeps the word out of the message —
+      // the mechanism this test exists to prove is the 409 itself (the
+      // uncached second call hitting the previewer's own rate limit and
+      // failing safe to an unbounded scope), not this exact wording.
+      expect(apply.error).not.toContain("Infinity");
+      expect(apply.error).toMatch(/above the 25-ticket confirm ceiling/);
+    }
+  });
+
+  test("HEADLINE: with the shared scope cache (exactly as src/daemon/index.ts wires it), plan then apply back-to-back succeeds — no wait, real default rateLimitMs", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    const scopeOf = realScopeOf(rule, [issue("F-1")]);
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+    expect(plan.ok).toBe(true);
+    if (!plan.ok) throw new Error("expected a successful plan");
+    expect(plan.scope).toBe(1);
+    expect(plan.requiresConfirm).toBe(false);
+    const etag = rulesEtag(env());
+    const apply = await writeRuleEnabled("ui-first-rule", true, etag, false, plan.planHash, scopeOf, deps);
+    expect(apply.ok).toBe(true);
+    if (apply.ok) expect(apply.changedIds).toEqual(["ui-first-rule"]);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].enabled).toBe(true);
+  });
+
+  test("adding scope to the hash invalidates every in-flight plan computed before this fix (old 2-arg shape never matches the new 3-arg one)", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const counts = { spawned: 1, stopped: 0, restarted: 0 };
+    // Simulates a plan hash computed by code that never bound scope in —
+    // i.e. the OLD `buildPlanHash(nextText, counts)` shape. There is no
+    // 2-arg overload any more, so the closest a caller could reconstruct
+    // it is passing `undefined`/some other scope — which must NOT equal
+    // the real, bound hash.
+    const nextText = JSON.stringify({ rules: [{ ...rule, enabled: true }] }, null, 2) + "\n";
+    const oldStyleHash = buildPlanHash(nextText, counts, null); // old behavior: as if scope were never bound
+    const realHash = buildPlanHash(nextText, counts, 1); // the real evaluated scope
+    expect(oldStyleHash).not.toBe(realHash);
+  });
+
+  test("a disabled rule's scope is still evaluated as if enabled (B5c) even through the cache", async () => {
+    const rule = previewRule({ enabled: false });
+    seed([rule]);
+    const deps = { env: env() };
+    const issues = Array.from({ length: 3 }, (_, i) => issue(`F-${i}`));
+    const scopeOf = realScopeOf(rule, issues);
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(plan.scope).toBe(3);
+  });
+
+  test("confirm: true cannot land a write whose scope was never bound: a tampered planHash (built against a DIFFERENT scope than the real one) is refused even with confirm", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    const scopeOf = realScopeOf(rule, [issue("F-1")]); // real scope will be 1
+    const nextText = JSON.stringify({ rules: [{ ...rule, enabled: true }] }, null, 2) + "\n";
+    const counts = { spawned: 1, stopped: 0, restarted: 0 };
+    const tamperedHash = buildPlanHash(nextText, counts, ENABLE_SCOPE_CEILING + 999); // claims a scope that was never measured
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleEnabled("ui-first-rule", true, etag, true, tamperedHash, scopeOf, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+  });
+
+  test("a genuinely unavailable previewer (not a rate-limit refusal) still fails CLOSED through the cache — the ceiling check still trips", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const scopeOf = createScopeCache(async (id: string): Promise<number> => {
+      const r = await previewer(id);
+      return r.ok ? r.total : Number.POSITIVE_INFINITY;
+    });
+    const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, scopeOf, deps);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) expect(plan.requiresConfirm).toBe(true); // Infinity > ceiling
+    // ...and the serialized response body never contains the literal "Infinity"
+    expect(JSON.stringify(plan)).not.toContain("Infinity");
+    expect(JSON.stringify(plan)).not.toContain("NaN");
+  });
+
+  test("no Infinity/NaN ever appears in a SERIALIZED error body (Infinity does not survive JSON.stringify — assert on the wire format, not the in-process object)", async () => {
+    const rule = previewRule();
+    seed([rule]);
+    const deps = { env: env() };
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const scopeOf = createScopeCache(async (id: string): Promise<number> => {
+      const r = await previewer(id);
+      return r.ok ? r.total : Number.POSITIVE_INFINITY;
+    });
+    // confirm: false, so the pre-lock ceiling check throws with an error string.
+    const outcome = await writeRuleEnabled("ui-first-rule", true, "irrelevant-etag", false, "irrelevant-hash", scopeOf, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(JSON.stringify({ error: outcome.error })).not.toContain("Infinity");
+      expect(outcome.error).not.toContain("Infinity");
+      expect(outcome.error).not.toContain("NaN");
+    }
+  });
+
+  test("the scope cache expires after its TTL: a call after the TTL elapses hits the previewer again (fresh clock, no real timers)", async () => {
+    let now = 0;
+    let calls = 0;
+    const underlying = async (_id: string): Promise<number> => { calls++; return calls; };
+    const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
+    expect(await cached("ui-first-rule")).toBe(1);
+    now += 5_000; // within TTL
+    expect(await cached("ui-first-rule")).toBe(1); // cache hit, no new call
+    expect(calls).toBe(1);
+    now += 6_000; // now 11s since the first call — TTL elapsed
+    expect(await cached("ui-first-rule")).toBe(2);
+    expect(calls).toBe(2);
+  });
+
+  test("the scope cache is per-rule-id: a cached value for one rule never leaks to a different rule", async () => {
+    let now = 0;
+    const underlying = async (id: string): Promise<number> => (id === "a" ? 1 : 2);
+    const cached = createScopeCache(underlying, { ttlMs: 10_000, now: () => now });
+    expect(await cached("a")).toBe(1);
+    expect(await cached("b")).toBe(2);
   });
 });

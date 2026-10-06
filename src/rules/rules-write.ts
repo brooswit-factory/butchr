@@ -174,15 +174,76 @@ export function computeLocalPlanCounts(wasEnabled: boolean, patch: RuleFieldPatc
   return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
 }
 
-/** B3's own plan hash: binds the EXACT next document text to the counts computed for it — `planRuleWrite` and the real write functions both call this over the SAME `nextText` (built by `applyRuleFieldPatch`), so a plan computed against one file state can never be echoed successfully against a different one. */
-export function buildPlanHash(nextText: string, counts: { spawned: number; stopped: number; restarted: number }): string {
-  return sha256(JSON.stringify({ nextText, ...counts }));
+/**
+ * B3's own plan hash: binds the EXACT next document text to the counts
+ * computed for it, AND (N1, FACTORY-678) the evaluated `scope` — `null`
+ * whenever `counts.spawned === 0` (no previewer call was ever made for
+ * this patch, same as `planRuleWrite`'s own gate), otherwise the real
+ * ticket count the previewer reported. `planRuleWrite` and the real write
+ * functions both call this over the SAME `nextText` (built by
+ * `applyRuleFieldPatch`) and the SAME scope value, so a plan computed
+ * against one file state (or one scope reading) can never be echoed
+ * successfully against a different one — in particular, `confirm: true`
+ * can no longer land a write whose scope was never bound into this hash.
+ */
+export function buildPlanHash(nextText: string, counts: { spawned: number; stopped: number; restarted: number }, scope: number | null): string {
+  return sha256(JSON.stringify({ nextText, ...counts, scope }));
+}
+
+/**
+ * N1 (FACTORY-678) — a short-lived cache sitting between the write path's
+ * own `scopeOf` and the real previewer (`../web/rules-preview.ts`):
+ * `planRuleWrite` and `writeRuleEnabled` each call `scopeOf` once for the
+ * same rule id, typically seconds apart (a UI's plan-then-apply flow), and
+ * the previewer itself refuses a second real call on the same rule within
+ * its own `DEFAULT_PREVIEW_RATE_LIMIT_MS` (2s) window. Without this cache,
+ * that refusal fails SAFE to `Number.POSITIVE_INFINITY` (see `scopeOf`'s
+ * own wiring in `../daemon/index.ts`), which trips the scope ceiling on
+ * every back-to-back apply — see FACTORY-677/678 for the full diagnosis.
+ *
+ * `ttlMs` (default 10s) is deliberately longer than the previewer's own
+ * 2s rate limit, so a plan followed by an apply well within a normal UI
+ * interaction always reuses the SAME measured scope rather than racing
+ * the previewer's own window. `now`/`ttlMs` are injectable so a test needs
+ * no real timers. One instance must be shared across every call for a
+ * given rule id to actually elide a second previewer call — `../daemon/
+ * index.ts` wires ONE shared instance around its own `scopeOf`, exactly
+ * like `rulesPreviewer` itself is one shared instance for the same reason.
+ */
+export interface ScopeCacheDeps {
+  ttlMs?: number;
+  now?: () => number;
+}
+
+export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps: ScopeCacheDeps = {}): (id: string) => Promise<number> {
+  const ttlMs = deps.ttlMs ?? 10_000;
+  const now = deps.now ?? (() => Date.now());
+  const cache = new Map<string, { scope: number; at: number }>();
+  return async function cachedScopeOf(id: string): Promise<number> {
+    const t = now();
+    const cached = cache.get(id);
+    if (cached !== undefined && t - cached.at < ttlMs) return cached.scope;
+    const scope = await scopeOf(id);
+    cache.set(id, { scope, at: t });
+    return scope;
+  };
 }
 
 function requireConfirmForBlastRadius(counts: { spawned: number; stopped: number; restarted: number }, confirm: boolean): void {
   if ((counts.stopped > 0 || counts.restarted > 0) && !confirm) {
     throw new WriteRefusedError(`this change would stop ${counts.stopped} and restart ${counts.restarted} running agent(s) — retry with confirm: true to proceed`, 409);
   }
+}
+
+/**
+ * A human-readable stand-in for a non-finite scope (the previewer failed
+ * fail-safe to `Number.POSITIVE_INFINITY` — see `scopeOf`'s own wiring in
+ * `../daemon/index.ts`) — `Infinity`/`NaN` must never appear as a literal
+ * in an error string (they both survive `String()`/template interpolation,
+ * even though `JSON.stringify` itself would turn them into `null`).
+ */
+function scopeLabel(scope: number): string {
+  return Number.isFinite(scope) ? `${scope}` : "an unknown number of (the previewer could not measure it)";
 }
 
 function recordLastUiWrite(deps: RulesWriteDeps, backupId: string | null, resultingEtag: string): void {
@@ -208,6 +269,18 @@ function recordLastUiWrite(deps: RulesWriteDeps, backupId: string | null, result
 export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string, scopeOf: (id: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
   const env = deps.env ?? process.env;
 
+  // N1 (FACTORY-678): computed OUTSIDE the lock (the mutator passed to
+  // `updateRulesFile` is synchronous, so `scopeOf` — a real Jira call, or
+  // (via `createScopeCache`) a cache lookup standing in for one — can never
+  // run inside it). Only evaluated when this call is an actual SPAWN (the
+  // rule is not already enabled) — the SAME gate `planRuleWrite`'s own
+  // `counts.spawned > 0` check uses — so the value bound into the hash
+  // below agrees with the value a preceding `planRuleWrite` call for the
+  // SAME patch would have computed. `confirm: true` only skips the ceiling
+  // THROW immediately below; it never skips this evaluation or the hash
+  // binding under the lock, so a confirmed write still cannot land with a
+  // scope that was never measured.
+  let scopeForHash: number | null = null;
   if (enabled) {
     let current: Record<string, unknown>;
     try {
@@ -220,9 +293,11 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
     if (current.query === PLACEHOLDER_QUERY) {
       return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder — edit the query first` };
     }
-    const scope = await scopeOf(id);
-    if (scope > ENABLE_SCOPE_CEILING && !confirm) {
-      return { ok: false, status: 409, error: `enabling "${id}" would stage ${scope} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed` };
+    if (current.enabled !== true) {
+      scopeForHash = await scopeOf(id);
+      if (scopeForHash > ENABLE_SCOPE_CEILING && !confirm) {
+        return { ok: false, status: 409, error: `enabling "${id}" would stage ${scopeLabel(scopeForHash)} ticket(s), above the ${ENABLE_SCOPE_CEILING}-ticket confirm ceiling — retry with confirm: true to proceed` };
+      }
     }
   }
 
@@ -245,7 +320,16 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
         }
         const nextText = applyRuleFieldPatch(currentText, id, { enabled });
         const counts = computeLocalPlanCounts(rule.enabled === true, { enabled });
-        const freshHash = buildPlanHash(nextText, counts);
+        // N1 (FACTORY-678): bind the SAME scope value the pre-lock check
+        // above evaluated into the hash — but only when this fresh, LOCKED
+        // recomputation agrees it's a spawn (`counts.spawned > 0`, the same
+        // gate `planRuleWrite` uses). A race that changed whether this is a
+        // spawn between the pre-lock read and here produces a hash that
+        // cannot match a legitimately-issued `planHash`, which is refused
+        // below exactly like any other stale plan (B3) — never a write
+        // whose scope silently goes unverified.
+        const scope = counts.spawned > 0 ? scopeForHash : null;
+        const freshHash = buildPlanHash(nextText, counts, scope);
         if (freshHash !== planHash) {
           throw new WriteRefusedError(`planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again`, 409);
         }
@@ -288,7 +372,10 @@ export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: stri
         assertUiEditable(id);
         const nextText = applyRuleFieldPatch(currentText, id, patch);
         const counts = computeLocalPlanCounts(rule.enabled === true, patch);
-        const freshHash = buildPlanHash(nextText, counts);
+        // `patch.enabled` is always undefined here (guarded above), so
+        // `counts.spawned` is always 0 and no scope was ever evaluated for
+        // this patch (same as `planRuleWrite`'s own gate) — `null`, always.
+        const freshHash = buildPlanHash(nextText, counts, null);
         if (freshHash !== planHash) {
           throw new WriteRefusedError(`planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again`, 409);
         }
@@ -392,6 +479,6 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   if (counts.spawned > 0) scope = await scopeOf(id);
   const requiresConfirm = (scope !== null && scope > ENABLE_SCOPE_CEILING && !confirm) || ((counts.stopped > 0 || counts.restarted > 0) && !confirm);
 
-  const planHash = buildPlanHash(nextText, counts);
+  const planHash = buildPlanHash(nextText, counts, scope);
   return { ok: true, planHash, spawned: counts.spawned, stopped: counts.stopped, restarted: counts.restarted, scope, etag, requiresConfirm };
 }
