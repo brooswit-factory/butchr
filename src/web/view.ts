@@ -24,6 +24,8 @@ import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from 
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
 import type { Rule } from "../rules/rules.js";
 import type { ReloadResult } from "../rules/reload.js";
+import type { SettingsApiResponse } from "./settings-api.js";
+import type { JiraTestResult } from "./jira-connection-test.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -279,6 +281,33 @@ export interface ViewDeps {
    * otherwise be allowed.
    */
   writeRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /**
+   * FACTORY-664 (epic FACTORY-659, slice S1, READ-ONLY) — `GET /api/settings`'s
+   * own data: one entry per setting butchr reads (see `./settings-api.ts`),
+   * secrets redacted, plus the `ATLASSIAN_TOKEN_FILE` path status and a
+   * best-effort `unitHint`. Read FRESH every request (same discipline as
+   * `rulesFileState` above) — this does real but small I/O (one `fs.stat`
+   * and one `systemctl` call), never on `/`'s or `/dashboard`'s own request
+   * path. Optional: an omitted value makes the route unreachable (503),
+   * never open.
+   */
+  settings?: () => Promise<SettingsApiResponse>;
+  /**
+   * FACTORY-664 — `POST /api/settings/jira/test`'s own logic: calls
+   * Atlassian `GET /rest/api/3/myself` with the daemon's OWN credentials
+   * (never anything from the request) and reports back the fixed, non-
+   * leaking shape `./jira-connection-test.ts` defines. Optional: an omitted
+   * value makes the route unreachable (503), never open.
+   */
+  jiraTest?: () => Promise<JiraTestResult>;
+  /**
+   * FACTORY-664 — a SEPARATE rate limiter from `writeRateLimit` above (1 per
+   * 5s, per the ticket's own spec, not the generic write budget): this route
+   * makes a real outbound credentialed call, so it gets its own, tighter
+   * budget. Same "absent means no flood protection, never a reason to
+   * refuse" discipline as `writeRateLimit`.
+   */
+  jiraTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
 }
 
 /** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
@@ -604,6 +633,53 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!result.ok) { set.status = result.status; return { error: result.error }; }
       const { ok, ...body } = result;
       return body;
+    })
+    // FACTORY-664 (epic FACTORY-659, slice S1, READ-ONLY) — `GET /api/settings`.
+    // Same guard chain as `GET /api/rules` (dashboard-origin guard, same-UID
+    // peer check, `Cache-Control: no-store`): this reflects live,
+    // possibly-sensitive-feeling configuration state, never cached, and
+    // never reachable by a local user who isn't this daemon's own operator.
+    .get("/api/settings", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.settings) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return deps.settings();
+    })
+    // FACTORY-664 — `POST /api/settings/jira/test`. The FULL write guard
+    // chain (Origin, Host, peer-uid, Content-Type, CSRF) because this makes
+    // an outbound credentialed call, plus its own tighter rate limit (1 per
+    // 5s — separate from the generic write-flood budget). Every attempt
+    // (accepted or rejected by the guard/limiter) is audited; the result
+    // handed back is the fixed, non-leaking shape `jiraTest()` already
+    // returns — this route never sees or forwards the upstream body/token.
+    .post("/api/settings/jira/test", async ({ set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.jiraTest) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      if (deps.jiraTestRateLimit) {
+        const clientKey = server?.requestIP(request)?.address ?? "unresolved";
+        const result = deps.jiraTestRateLimit(clientKey);
+        if (!result.ok) {
+          const error = `rate limited: too many jira connection tests — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          set.status = 429;
+          set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const result = await deps.jiraTest();
+      auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
+      return result;
     })
     // FACTORY-662 item 1: `GET /api/session` — mints/hands out this
     // process's one CSRF token. The Origin/Host/peer-uid guard already ran

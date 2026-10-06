@@ -11,6 +11,7 @@ import { Heading } from "@launchpad-ui/components";
 import { DashboardRoute } from "./routes/DashboardRoute.js";
 import { ConfigurationsRoute } from "./routes/ConfigurationsRoute.js";
 import { RulesRoute } from "./routes/RulesRoute.js";
+import { SettingsRoute } from "./routes/SettingsRoute.js";
 import "./App.css";
 
 export function App() {
@@ -24,6 +25,7 @@ export function App() {
           </NavLink>
           <NavLink to="/configurations">Configurations</NavLink>
           <NavLink to="/rules">Rules</NavLink>
+          <NavLink to="/settings">Settings</NavLink>
         </nav>
       </header>
       <main className="app-main">
@@ -31,6 +33,7 @@ export function App() {
           <Route path="/" element={<DashboardRoute />} />
           <Route path="/configurations" element={<ConfigurationsRoute />} />
           <Route path="/rules" element={<RulesRoute />} />
+          <Route path="/settings" element={<SettingsRoute />} />
         </Routes>
       </main>
     </div>

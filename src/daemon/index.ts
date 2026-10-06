@@ -124,6 +124,9 @@ import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
+import { buildSettingsApiResponse } from "../web/settings-api.js";
+import { readUnitHint } from "../web/settings-unit-hint.js";
+import { testJiraConnection } from "../web/jira-connection-test.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -842,6 +845,11 @@ const csrfIssuer = createCsrfTokenIssuer();
 // each), at its own real default window/cap (`../web/write-rate-limit.ts`).
 const writeRateLimit = createWriteRateLimiter();
 
+// FACTORY-664: a SEPARATE, tighter limiter for `POST /api/settings/jira/test`
+// (1 per 5s, per the ticket's own spec) — this route makes a real outbound
+// credentialed call, so it does not share the generic write budget above.
+const jiraTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
+
 // FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
 // itself (same directory FACTORY-658's own backups live in) — every
 // accepted/rejected write appends one line here AND raises a non-deduped
@@ -1069,6 +1077,16 @@ const { app, mcp } = buildApp({
   },
   auditWrite,
   writeRateLimit,
+  // FACTORY-664 (epic FACTORY-659, slice S1, READ-ONLY): `GET /api/settings`'s
+  // own data — read fresh every request (one `fs.stat` plus a best-effort
+  // `systemctl --user show` call), never a startup snapshot, same discipline
+  // as `rulesFileState` above.
+  settings: () => buildSettingsApiResponse(process.env, { unitHint: () => readUnitHint() }),
+  // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
+  // daemon's own already-loaded credentials, never anything from the
+  // request itself.
+  jiraTest: () => testJiraConnection(config.atlassian),
+  jiraTestRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
