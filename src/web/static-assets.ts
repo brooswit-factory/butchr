@@ -55,7 +55,16 @@ export async function serveStaticAsset(root: string, requestPath: string): Promi
   if (!path) return new Response("not found", { status: 404 });
   const file = Bun.file(path);
   if (!(await file.exists())) return new Response("not found", { status: 404 });
-  return new Response(file);
+  // FACTORY-686: set the content-type EXPLICITLY. A `Response` built from a
+  // bare `Bun.file` carries its type only as the Blob's own implicit type,
+  // not as a header, and Elysia's `onAfterHandle` (src/web/view.ts's
+  // CSP/`nosniff` hook) rebuilds the Response when it adds headers, which
+  // dropped that implicit type: every `/dashboard-app*` response then had NO
+  // `content-type` at all, and with `X-Content-Type-Options: nosniff` a real
+  // browser refuses to run the module script or render the page (blank
+  // dashboard on main and in v0.28.0). An explicit header survives the merge,
+  // the same way `iconResponse` in view.ts already sets its own.
+  return new Response(file, { headers: { "content-type": file.type } });
 }
 
 /** FACTORY-647: whether the dashboard-app's build is actually present at `root` — `index.html` existing is the one file every Vite build (SPA fallback included) always emits, so its presence is the single source of truth both the startup check and `/health`'s `dashboardApp` field read, never re-derived differently in two places. */

@@ -43,6 +43,14 @@ describe("serveStaticAsset", () => {
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("console.log");
   });
+  test("FACTORY-686: every served response carries an EXPLICIT content-type header (html, client-side route fallback, js)", async () => {
+    const html = await serveStaticAsset(root, "/");
+    const route = await serveStaticAsset(root, "/rules");
+    const js = await serveStaticAsset(root, "/assets/index-abc123.js");
+    expect(html.headers.get("content-type")).toMatch(/^text\/html/);
+    expect(route.headers.get("content-type")).toMatch(/^text\/html/);
+    expect(js.headers.get("content-type")).toMatch(/javascript/);
+  });
   test("404s (never crashes) for a missing file", async () => {
     const res = await serveStaticAsset(root, "/assets/does-not-exist.js");
     expect(res.status).toBe(404);

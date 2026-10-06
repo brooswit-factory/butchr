@@ -371,10 +371,28 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
  * by `refreshCapabilities()` — see that method's own doc comment and this
  * file's top comment for why that is deliberate, not a bug.
  */
+/** Maps the server's `GET /api/rules/:id/preview` body (counts + keys only) to this client's `RulePreviewResponse`. Tolerates the older `tickets: [{key}]` shape too, and refuses an `ok: false` body instead of rendering garbage. */
+export function mapServerPreview(ruleId: string, raw: unknown): RulePreviewResponse {
+  const r = (raw ?? {}) as { ok?: boolean; error?: string; keys?: unknown; tickets?: unknown; total?: unknown };
+  if (r.ok === false) throw new Error(typeof r.error === "string" ? r.error : "preview failed");
+  const keys: string[] = Array.isArray(r.keys)
+    ? r.keys.filter((k): k is string => typeof k === "string")
+    : Array.isArray(r.tickets)
+      ? (r.tickets as unknown[]).map((t) => (t && typeof t === "object" ? (t as { key?: unknown }).key : undefined)).filter((k): k is string => typeof k === "string")
+      : [];
+  return { ruleId, total: typeof r.total === "number" ? r.total : keys.length, tickets: keys.map((key) => ({ key })) };
+}
+
 export const realRulesApi: RulesApi = {
   capabilities: { write: false },
   listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
-  previewRule: (ruleId, signal) => request<RulePreviewResponse>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal }),
+  // FACTORY-686: the REAL server answers `{ok, keys: string[], total, cap, warning}`
+  // (src/web/rules-preview.ts), not the `{ruleId, total, tickets: [{key}]}` shape this
+  // client's fixtures grew around: reading `tickets` off the real response was
+  // `undefined`, and the preview dialog's `.map` crashed the whole React app to a blank
+  // page in a real browser. Map at this one edge.
+  previewRule: async (ruleId, signal) =>
+    mapServerPreview(ruleId, await request<unknown>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal })),
   planRule: async (ruleId, patch, confirm, signal) => {
     // `csrf: true` is REQUIRED here even though this route only ever
     // reports, never writes: the real merged guard (`src/web/view.ts`'s

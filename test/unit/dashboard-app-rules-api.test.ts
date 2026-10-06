@@ -3,6 +3,7 @@ import {
   createFixturesRulesApi,
   defaultRulesFixture,
   realRulesApi,
+  mapServerPreview,
   RateLimitError,
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
@@ -469,5 +470,33 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(caught).toBeInstanceOf(Error);
     expect(caught).not.toBeInstanceOf(RateLimitError);
     expect((caught as Error).message).toBe("peer uid check failed");
+  });
+});
+
+describe("mapServerPreview — FACTORY-686: the REAL server preview shape (found by a real-browser pass)", () => {
+  test("maps the server's {ok, keys, total, cap, warning} body to {ruleId, total, tickets:[{key}]}", () => {
+    expect(mapServerPreview("ui-first-rule", { ok: true, keys: ["P-1", "P-2", "P-3"], total: 3, cap: 50, warning: null })).toEqual({
+      ruleId: "ui-first-rule",
+      total: 3,
+      tickets: [{ key: "P-1" }, { key: "P-2" }, { key: "P-3" }],
+    });
+  });
+  test("total above the capped key list is preserved (the server caps keys, not the count)", () => {
+    const r = mapServerPreview("r", { ok: true, keys: ["A-1", "A-2"], total: 40, cap: 2, warning: "cap" });
+    expect(r.total).toBe(40);
+    expect(r.tickets.length).toBe(2);
+  });
+  test("still tolerates the older {tickets:[{key}]} shape", () => {
+    expect(mapServerPreview("r", { total: 1, tickets: [{ key: "Z-9" }] }).tickets).toEqual([{ key: "Z-9" }]);
+  });
+  test("an ok:false body is refused with the server's message, never rendered as an empty list", () => {
+    expect(() => mapServerPreview("r", { ok: false, status: 502, error: "jira unavailable" })).toThrow("jira unavailable");
+  });
+  test("garbage never throws a TypeError at render time: it maps to an empty, well-formed response", () => {
+    for (const raw of [undefined, null, {}, [], "x", { keys: "no" }, { keys: [1, null] }]) {
+      const r = mapServerPreview("r", raw);
+      expect(Array.isArray(r.tickets)).toBe(true);
+      expect(r.tickets.length).toBe(0);
+    }
   });
 });

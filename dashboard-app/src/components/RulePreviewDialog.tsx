@@ -34,7 +34,7 @@ export function RulePreviewDialog({ ruleId, resourceProvider, api, onClose }: Ru
     api
       .previewRule(ruleId, controller.signal)
       .then((data) => {
-        if (!cancelled) setState({ kind: "loaded", total: data.total, tickets: data.tickets });
+        if (!cancelled) setState({ kind: "loaded", total: data.total, tickets: data.tickets ?? [] });
       })
       .catch((e: unknown) => {
         if (!cancelled) setState({ kind: "error", error: e instanceof Error ? e.message : String(e) });
@@ -64,7 +64,7 @@ export function RulePreviewDialog({ ruleId, resourceProvider, api, onClose }: Ru
                 {state.total} matching ticket{state.total === 1 ? "" : "s"}
               </p>
               <ul className="rules-view__preview-list" data-testid="rule-preview-tickets">
-                {state.tickets.map((t) => (
+                {(state.tickets ?? []).map((t) => (
                   <li key={t.key}>
                     <Link href={`/resource/${encodeURIComponent(encodeResourceKey(resourceProvider, ruleId, t.key))}/open`}>{t.key}</Link>
                   </li>
