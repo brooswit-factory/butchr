@@ -13,7 +13,7 @@
  * Usage: bun run build:web && CHROME=/usr/bin/chromium bun run scripts/verify-rules-page-browser.ts
  * (screenshots land next to the temp dir it prints in S; exit code 1 if any check fails).
  */
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpHandle } from "@brooswit/thatch";
@@ -57,8 +57,24 @@ const deps = { state: async () => [], open: unused, openPane: unused, health: ()
   rulesFileState: async () => ({ path: rulesFile, rules: holder.getRules(), error: null, mtime: null, fileEtag: rulesEtag(env) }) } as unknown as ViewDeps;
 const app = liveView(fakeMcp, deps); app.listen(listenOptions(0)); const port = app.server!.port!; guard.port = port;
 
-const dbg = 9300 + Math.floor(Math.random() * 500); const prof = mkdtempSync(join(S, "chrome-prof-"));
-const chrome = Bun.spawn([CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run", `--remote-debugging-port=${dbg}`, "--remote-allow-origins=*", `--user-data-dir=${prof}`, "about:blank"], { stdout: "ignore", stderr: "ignore" });
+const prof = mkdtempSync(join(S, "chrome-prof-"));
+// The browser runs in its OWN session/process group (setsid) so the whole tree can be killed by group id: on normal
+// exit, on any thrown error, and on SIGINT/SIGTERM. Port 0 + the loopback-only default (no fixed port, no
+// `--remote-allow-origins=*`): the DevTools endpoint is unauthenticated, so it must never outlive this script.
+const chrome = Bun.spawn(["setsid", CHROME, "--headless=new", "--disable-gpu", "--no-sandbox", "--no-first-run", "--remote-debugging-port=0", `--user-data-dir=${prof}`, "about:blank"], { stdout: "ignore", stderr: "ignore" });
+let cleaned = false;
+const cleanup = (): void => {
+  if (cleaned) return;
+  cleaned = true;
+  try { process.kill(-chrome.pid, "SIGKILL"); } catch { /* already gone */ }
+  try { chrome.kill(9); } catch { /* already gone */ }
+  try { rmSync(prof, { recursive: true, force: true }); } catch { /* best effort */ }
+};
+process.on("exit", cleanup);
+for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => { cleanup(); process.exit(130); });
+let dbg = 0;
+for (let i = 0; i < 80 && dbg === 0; i++) { try { dbg = Number(readFileSync(join(prof, "DevToolsActivePort"), "utf8").split("\n")[0]) || 0; } catch { await Bun.sleep(250); } }
+if (dbg === 0) { cleanup(); throw new Error("chromium did not report a DevTools port"); }
 for (let i = 0; i < 60; i++) { try { if ((await fetch(`http://127.0.0.1:${dbg}/json/version`)).ok) break; } catch {} await Bun.sleep(250); }
 const tab = await (await fetch(`http://127.0.0.1:${dbg}/json/new?about:blank`, { method: "PUT" })).json() as any;
 const ws = new WebSocket(tab.webSocketDebuggerUrl); await new Promise<void>((res) => { ws.onopen = () => res(); });
@@ -137,7 +153,7 @@ check("H1 same machine, different origin (localhost): the page does not get writ
 
 const consoleErrors = await ev(`window.__errs ?? 'n/a'`);
 console.log(`\nSUMMARY: ${fails === 0 ? "ALL PASS" : fails + " FAILED"}  (screenshots: ${S}/ui-e2e-*.png)`);
-ws.close(); chrome.kill(); app.stop(true); process.exit(fails === 0 ? 0 : 1);
+ws.close(); cleanup(); app.stop(true); process.exit(fails === 0 ? 0 : 1);
 
 }
 
