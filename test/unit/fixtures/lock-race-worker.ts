@@ -1,7 +1,8 @@
 // Standalone worker process for test/unit/write-rules.test.ts's F6 lock-race
 // test: a real OS process, not simulated in-process, since the whole point is
-// to exercise genuine concurrent contention on `.rules.lock`'s stale-lock
-// reclaim path. Not a test file itself — spawned via `bun run` with argv:
+// to exercise genuine concurrent contention on a dead `.rules.lock` — both
+// processes must refuse, since there is no cross-process reclaim. Not a test
+// file itself — spawned via `bun run` with argv:
 //   [2] file:// URL of write-rules.ts to import acquireRulesLock from
 //   [3] the rules directory holding (or about to hold) .rules.lock
 //   [4] a shared log file path — one JSON line appended per outcome

@@ -432,13 +432,16 @@ describe("writeRulesFile: locking (review round 2)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(doc([RULE_A]));
   });
 
-  test("FACTORY-673: two real OS processes racing over the SAME dead lock — NEITHER proceeds, every time (25 rounds, no flake)", async () => {
+  test("FACTORY-673: two real OS processes racing over the SAME dead lock — NEITHER proceeds, every time (200 rounds, no flake)", async () => {
     writeRulesFile(doc([RULE_A]), env());
     const rulesDir = join(dir, "butchr");
     const workerSrc = new URL("../../src/rules/write-rules.ts", import.meta.url).href;
     const worker = new URL("./fixtures/lock-race-worker.ts", import.meta.url).pathname;
     const logPath = join(dir, "race.log");
-    for (let round = 0; round < 25; round++) {
+    // 200 rounds (FACTORY-674/FACTORY-675): the proof the rename-based reclaim
+    // race is gone. Fail condition: any iteration in which more than zero
+    // processes report having held the lock.
+    for (let round = 0; round < 200; round++) {
       writeFileSync(join(rulesDir, ".rules.lock"), "999999999"); // a dead pid both workers find
       rmSync(logPath, { force: true });
       await Promise.all([
@@ -454,7 +457,7 @@ describe("writeRulesFile: locking (review round 2)", () => {
       // the dead lock is still there: nobody reclaimed or removed it
       expect(readFileSync(join(rulesDir, ".rules.lock"), "utf8")).toBe("999999999");
     }
-  }, 120_000);
+  }, 300_000);
 });
 
 describe("writeRulesFile: optimistic concurrency (ifMatch/etag, review round 2)", () => {

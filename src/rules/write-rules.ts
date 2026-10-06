@@ -139,7 +139,7 @@ export interface WriteRulesIo {
    * durable).
    */
   fsyncDir: (dir: string) => void;
-  /** Acquires the cross-process write lock for `dir`, throwing (never sleeping/retrying forever) if another LIVE writer holds it; returns a release function. See `acquireRulesLock`'s own doc comment for the stale-lock reclaim protocol. */
+  /** Acquires the cross-process write lock for `dir`, throwing (never sleeping/retrying, never reclaiming) if a lock file already exists; returns a release function. See `acquireRulesLock`'s own doc comment: a live holder, a dead holder, and corrupt content each refuse with their own message. */
   acquireLock: (dir: string) => () => void;
   now: () => Date;
 }
