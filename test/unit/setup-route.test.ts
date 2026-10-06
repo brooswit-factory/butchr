@@ -165,10 +165,41 @@ describe("POST /api/setup/jira", () => {
     } finally { await app.stop(true); }
   });
 
-  test("the test-rate-limiter refuses before the write-rate-limiter and before setupJiraWrite is ever called", async () => {
-    let called = false;
+  // Director 2026-10-06 item 5: the limiters are consulted through a gate the write handler calls only AFTER the setup code verified.
+  const gatedWrite = (log: string[]) => async (_input: unknown, rateGate?: () => { ok: true } | { ok: false; error: string; retryAfterSeconds: number }) => {
+    log.push("handler");
+    const g = rateGate?.();
+    if (g && !g.ok) return { ok: false as const, status: 429 as const, body: { error: g.error }, retryAfterSeconds: g.retryAfterSeconds };
+    return OK_RESULT;
+  };
+
+  test("the route consults NO rate limiter itself: a handler that never calls the gate sees none spent", async () => {
+    let spent = 0;
+    const log: string[] = [];
     const deps = writeDeps({
-      setupJiraWrite: async () => { called = true; return OK_RESULT; },
+      setupJiraWrite: async () => { log.push("handler"); return { ok: false as const, status: 400 as const, body: { error: "setup code: mismatch" } }; },
+      jiraTokenTestRateLimit: () => { spent++; return { ok: true }; },
+      jiraTokenWriteRateLimit: () => { spent++; return { ok: true }; },
+    });
+    const app = liveView(fakeMcp, baseDeps(deps));
+    app.listen(0);
+    const port = app.server!.port!;
+    deps.dashboardOriginGuard.port = port;
+    try {
+      const token = await csrfToken(port);
+      const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
+      for (let i = 0; i < 4; i++) {
+        const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "bad" }) });
+        expect(res.status).toBe(400);
+      }
+      expect(spent).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  test("the test-rate-limiter, via the gate, answers 429 + retry-after", async () => {
+    const log: string[] = [];
+    const deps = writeDeps({
+      setupJiraWrite: gatedWrite(log),
       jiraTokenTestRateLimit: () => ({ ok: false, retryAfterSeconds: 42 }),
     });
     const app = liveView(fakeMcp, baseDeps(deps));
@@ -181,14 +212,13 @@ describe("POST /api/setup/jira", () => {
       const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "c" }) });
       expect(res.status).toBe(429);
       expect(res.headers.get("retry-after")).toBe("42");
-      expect(called).toBe(false);
     } finally { await app.stop(true); }
   });
 
-  test("the write-rate-limiter (3/hour) refuses even when the test-rate-limiter allows", async () => {
-    let called = false;
+  test("the write-rate-limiter (3/hour), via the gate, refuses even when the test-rate-limiter allows", async () => {
+    const log: string[] = [];
     const deps = writeDeps({
-      setupJiraWrite: async () => { called = true; return OK_RESULT; },
+      setupJiraWrite: gatedWrite(log),
       jiraTokenTestRateLimit: () => ({ ok: true }),
       jiraTokenWriteRateLimit: () => ({ ok: false, retryAfterSeconds: 3600 }),
     });
@@ -201,68 +231,7 @@ describe("POST /api/setup/jira", () => {
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
       const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "c" }) });
       expect(res.status).toBe(429);
-      expect(called).toBe(false);
-    } finally { await app.stop(true); }
-  });
-});
-
-describe("PUT /api/settings/jira/token", () => {
-  test("no writeGuard: 503, never calls jiraTokenRotate()", async () => {
-    let called = false;
-    const app = liveView(fakeMcp, baseDeps({ jiraTokenRotate: async () => { called = true; return OK_RESULT; } }));
-    const res = await app.handle(new Request("http://local/api/settings/jira/token", { method: "PUT", headers: { origin: "http://x", host: "x", "content-type": "application/json" }, body: "{}" }));
-    expect(res.status).toBe(503);
-    expect(called).toBe(false);
-  });
-
-  test("malformed body: 400, never calls jiraTokenRotate()", async () => {
-    let called = false;
-    const deps = writeDeps({ jiraTokenRotate: async () => { called = true; return OK_RESULT; } });
-    const app = liveView(fakeMcp, baseDeps(deps));
-    app.listen(0);
-    const port = app.server!.port!;
-    deps.dashboardOriginGuard.port = port;
-    try {
-      const token = await csrfToken(port);
-      const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const res = await fetch(`http://127.0.0.1:${port}/api/settings/jira/token`, { method: "PUT", headers, body: JSON.stringify({ setupCode: "c" }) });
-      expect(res.status).toBe(400);
-      expect(called).toBe(false);
-    } finally { await app.stop(true); }
-  });
-
-  test("happy path: calls jiraTokenRotate with exactly {token, setupCode} (never site/email from the body), returns its result, audits accepted", async () => {
-    let received: unknown;
-    const audited: Array<{ outcome: string }> = [];
-    const deps = writeDeps({ jiraTokenRotate: async (input) => { received = input; return OK_RESULT; }, auditWrite: (e) => { audited.push(e); } });
-    const app = liveView(fakeMcp, baseDeps(deps));
-    app.listen(0);
-    const port = app.server!.port!;
-    deps.dashboardOriginGuard.port = port;
-    try {
-      const token = await csrfToken(port);
-      const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const payload = { token: "canary-new-token", setupCode: "ABCDEFGHJKMN", site: "https://should-be-ignored.atlassian.net", email: "ignored@b.c" };
-      const res = await fetch(`http://127.0.0.1:${port}/api/settings/jira/token`, { method: "PUT", headers, body: JSON.stringify(payload) });
-      expect(res.status).toBe(200);
-      expect(received).toEqual({ token: "canary-new-token", setupCode: "ABCDEFGHJKMN" });
-      expect(audited[0]!.outcome).toBe("accepted");
-    } finally { await app.stop(true); }
-  });
-
-  test("a 409 env-provided refusal is returned verbatim", async () => {
-    const refusal: JiraWriteRequestOutcome = { ok: false, status: 409, body: { error: "provided by environment" } };
-    const deps = writeDeps({ jiraTokenRotate: async () => refusal });
-    const app = liveView(fakeMcp, baseDeps(deps));
-    app.listen(0);
-    const port = app.server!.port!;
-    deps.dashboardOriginGuard.port = port;
-    try {
-      const token = await csrfToken(port);
-      const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const res = await fetch(`http://127.0.0.1:${port}/api/settings/jira/token`, { method: "PUT", headers, body: JSON.stringify({ token: "t", setupCode: "c" }) });
-      expect(res.status).toBe(409);
-      expect(await res.json()).toEqual({ error: "provided by environment" });
+      expect(res.headers.get("retry-after")).toBe("3600");
     } finally { await app.stop(true); }
   });
 });

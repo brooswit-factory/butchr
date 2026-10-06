@@ -56,7 +56,7 @@ export interface SetupModeDeps {
  * re-parsed from `env`) so a test can pick an arbitrary value without
  * fighting `BUTCHR_PORT` parsing.
  */
-export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void, fetchFn?: FetchLike): { viewDeps: ViewDeps; setupCodeManager: ReturnType<typeof createSetupCodeManager> } {
+export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void, fetchFn?: FetchLike, onSetupComplete: () => void = () => {}): { viewDeps: ViewDeps; setupCodeManager: ReturnType<typeof createSetupCodeManager> } {
   const setupCodeManager = createSetupCodeManager();
 
   // `dashboardOriginGuard.port` is read FRESH on every `peerUidCheck` call
@@ -98,11 +98,20 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     auditWrite,
 
     setupStatus: () => buildSetupStatus(false),
-    setupJiraWrite: (input) => handleJiraTokenWrite(
-      { ...input },
-      { setupCode: setupCodeManager, path: jiraTokenFilePath(env), env, ...(fetchFn ? { fetchFn } : {}) },
-      { requireEnvCheck: false },
-    ),
+    setupJiraWrite: async (input, rateGate) => {
+      const result = await handleJiraTokenWrite(
+        { ...input },
+        { setupCode: setupCodeManager, path: jiraTokenFilePath(env), env, ...(fetchFn ? { fetchFn } : {}) },
+        { requireEnvCheck: false, ...(rateGate ? { rateGate } : {}) },
+      );
+      if (!result.ok) return result;
+      // Setup is complete: leave setup mode WITHOUT a shell. The response goes out first, then onSetupComplete
+      // exits non-zero so the supervisor (systemd Restart=, launchd KeepAlive) starts the daemon in normal mode.
+      // Only when the site/email were persisted durably: a restart without them would just land back in setup mode.
+      if (!result.body.identityPersisted) return result;
+      onSetupComplete();
+      return { ...result, body: { ...result.body, restarting: true } };
+    },
     jiraTokenTestRateLimit: createWriteRateLimiter({ windowMs: 10 * 60_000, max: 5 }),
     jiraTokenWriteRateLimit: createWriteRateLimiter({ windowMs: 60 * 60_000, max: 3 }),
   };
@@ -121,7 +130,10 @@ export async function runSetupModeDaemon(deps: SetupModeDeps = {}): Promise<void
   const log = deps.log ?? ((line: string) => console.error(line));
   const port = parsePort(env);
 
-  const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(port, env, log);
+  const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(port, env, log, undefined, () => {
+    log("butchr: setup complete — exiting so the supervisor restarts butchr in normal mode (a process started by hand must be started again).");
+    setTimeout(() => process.exit(1), 1500);
+  });
 
   log(`butchr: starting in SETUP MODE — no Atlassian identity configured yet.`);
   const initialCode = setupCodeManager.mint();

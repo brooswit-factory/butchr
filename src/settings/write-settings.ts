@@ -206,6 +206,14 @@ export class SettingsWriteRefusedError extends Error {
   }
 }
 
+/** The key is set by the environment, which always wins over settings.json: a write could never take effect, so refuse it (HTTP 409). */
+export class SettingProvidedByEnvironmentError extends SettingsWriteRefusedError {
+  constructor(key: string) {
+    super(`${key} is provided by the environment — change it there (the environment overrides settings.json)`);
+    this.name = "SettingProvidedByEnvironmentError";
+  }
+}
+
 export interface WriteSettingResult {
   path: string;
   backupPath: string | null;
@@ -227,6 +235,7 @@ export interface WriteSettingResult {
 export function writeSetting(key: string, rawValue: string, confirm: boolean, env: SettingsFileEnv = process.env, io: WriteSettingsIo = defaultSettingsIo()): WriteSettingResult {
   const result = validateSettingValue(key, rawValue, confirm);
   if (!result.ok) throw new SettingsWriteRefusedError(result.error, result.needsConfirm === true);
+  if ((env as Record<string, string | undefined>)[key]?.trim()) throw new SettingProvidedByEnvironmentError(key);
 
   const path = settingsFilePath(env);
   const dir = dirname(path);

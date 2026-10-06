@@ -12,7 +12,7 @@
  * and never written to `localStorage`/`sessionStorage` anywhere in this
  * component (there is no persistence call here at all).
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, Text } from "@launchpad-ui/components";
 import type { SetupApi } from "../api/setup.js";
 import { RateLimitError } from "../api/setup.js";
@@ -27,7 +27,7 @@ export interface SetupRouteProps {
 type SetupState =
   | { kind: "idle" }
   | { kind: "pending" }
-  | { kind: "done"; accountId: string; displayName: string; identityPersisted: boolean; identityError?: string }
+  | { kind: "done"; accountId: string; displayName: string; identityPersisted: boolean; identityError?: string; restarting: boolean }
   | { kind: "error"; message: string };
 
 export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
@@ -41,7 +41,7 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
     setState({ kind: "pending" });
     try {
       const result = await api.submitSetup({ site, email, token, setupCode });
-      setState({ kind: "done", accountId: result.accountId, displayName: result.displayName, identityPersisted: result.identityPersisted, ...(result.identityError !== undefined ? { identityError: result.identityError } : {}) });
+      setState({ kind: "done", accountId: result.accountId, displayName: result.displayName, identityPersisted: result.identityPersisted, restarting: result.restarting === true, ...(result.identityError !== undefined ? { identityError: result.identityError } : {}) });
       onSetupSucceeded?.();
     } catch (e) {
       const message = e instanceof RateLimitError
@@ -57,6 +57,16 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
   }
 
   const pending = state.kind === "pending";
+
+  // After a setup that restarts the daemon, poll until the normal-mode daemon answers `configured: true`, then load the dashboard.
+  const restarting = state.kind === "done" && state.restarting;
+  useEffect(() => {
+    if (!restarting) return;
+    const timer = setInterval(() => {
+      api.getStatus().then((s) => { if (s.configured) window.location.assign("/"); }).catch(() => { /* daemon is down mid-restart: keep polling */ });
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [restarting, api]);
 
   return (
     <section aria-labelledby="setup-heading" data-testid="setup-page" className="setup-page">
@@ -93,7 +103,7 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
       {state.kind === "done" && (
         <div data-testid="setup-result" className="setup-page__result setup-page__result--ok">
           <Text elementType="p" size="small">
-            Configured as {state.displayName} ({state.accountId}). Restart needed to leave setup mode.
+            Configured as {state.displayName} ({state.accountId}). {state.restarting ? "butchr is restarting into normal mode — this page reloads when it is back. If it does not, start butchr again (a process started by hand is not restarted)." : "Restart needed to leave setup mode."}
           </Text>
           {!state.identityPersisted && (
             <Text elementType="p" size="small" className="setup-page__warning">

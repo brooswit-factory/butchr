@@ -26,8 +26,9 @@ import type { Rule } from "../rules/rules.js";
 import type { ReloadResult } from "../rules/reload.js";
 import type { SettingsApiResponse } from "./settings-api.js";
 import type { JiraTestResult } from "./jira-connection-test.js";
+import { SettingProvidedByEnvironmentError } from "../settings/write-settings.js";
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
-import type { SetupStatusResponse, JiraWriteRequestOutcome } from "./setup-api.js";
+import type { SetupStatusResponse, JiraWriteRequestOutcome, RateGate } from "./setup-api.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -359,7 +360,7 @@ export interface ViewDeps {
    * after setup" rule). Optional: an omitted value makes the route
    * unreachable (503).
    */
-  setupJiraWrite?: (input: { site: string; email: string; token: string; setupCode: string }) => Promise<JiraWriteRequestOutcome>;
+  setupJiraWrite?: (input: { site: string; email: string; token: string; setupCode: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
   /**
    * FACTORY-665 (PR-2) — `PUT /api/settings/jira/token`'s own logic
    * (configured mode — ROTATION only, never settable site/email here: this
@@ -368,7 +369,7 @@ export interface ViewDeps {
    * `requireEnvCheck: true` baked in). Optional: an omitted value makes
    * the route unreachable (503).
    */
-  jiraTokenRotate?: (input: { token: string; setupCode: string }) => Promise<JiraWriteRequestOutcome>;
+  jiraTokenRotate?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
   /**
    * FACTORY-665 (PR-2) — shared by BOTH `POST /api/setup/jira` and `PUT
    * /api/settings/jira/token`: 5 attempts per 10 minutes per the ticket's
@@ -411,6 +412,17 @@ function bodyProblem(body: unknown): { status: number; error: string } | null {
  * uid equals this process's — so this process's own uid IS the caller's,
  * by construction, with no second lookup needed.
  */
+/** The test limiter then the write limiter, checked only once the setup code has verified (see `RateGate`). */
+function jiraRateGate(deps: ViewDeps, clientKey: string): RateGate {
+  return () => {
+    const test = deps.jiraTokenTestRateLimit?.(clientKey);
+    if (test && !test.ok) return { ok: false, error: `rate limited: too many token tests — retry after ${test.retryAfterSeconds}s`, retryAfterSeconds: test.retryAfterSeconds };
+    const write = deps.jiraTokenWriteRateLimit?.(clientKey);
+    if (write && !write.ok) return { ok: false, error: `rate limited: too many token writes this hour — retry after ${write.retryAfterSeconds}s`, retryAfterSeconds: write.retryAfterSeconds };
+    return { ok: true };
+  };
+}
+
 function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null }, outcome: { ok: boolean; error?: string }): void {
   if (!deps.auditWrite) return;
   const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.() };
@@ -799,24 +811,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       }
       if (!deps.setupJiraWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const clientKey = server?.requestIP(request)?.address ?? "unresolved";
-      if (deps.jiraTokenTestRateLimit) {
-        const result = deps.jiraTokenTestRateLimit(clientKey);
-        if (!result.ok) {
-          const error = `rate limited: too many setup attempts — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
-          return { error };
-        }
-      }
-      if (deps.jiraTokenWriteRateLimit) {
-        const result = deps.jiraTokenWriteRateLimit(clientKey);
-        if (!result.ok) {
-          const error = `rate limited: too many setup writes this hour — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
-          return { error };
-        }
-      }
+      const rateGate = jiraRateGate(deps, clientKey);
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
@@ -824,9 +819,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         set.status = 400;
         return { error: "body must be { site: string, email: string, token: string, setupCode: string }" };
       }
-      const result = await deps.setupJiraWrite({ site: b.site, email: b.email, token: b.token, setupCode: b.setupCode });
+      const result = await deps.setupJiraWrite({ site: b.site, email: b.email, token: b.token, setupCode: b.setupCode }, rateGate);
       auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
+      if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
       return result.body;
     })
     // FACTORY-665 (PR-2) — `PUT /api/settings/jira/token` (configured mode
@@ -844,24 +840,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       }
       if (!deps.jiraTokenRotate) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const clientKey = server?.requestIP(request)?.address ?? "unresolved";
-      if (deps.jiraTokenTestRateLimit) {
-        const result = deps.jiraTokenTestRateLimit(clientKey);
-        if (!result.ok) {
-          const error = `rate limited: too many token tests — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
-          return { error };
-        }
-      }
-      if (deps.jiraTokenWriteRateLimit) {
-        const result = deps.jiraTokenWriteRateLimit(clientKey);
-        if (!result.ok) {
-          const error = `rate limited: too many token rotations this hour — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-          set.status = 429; set.headers["retry-after"] = String(result.retryAfterSeconds);
-          return { error };
-        }
-      }
+      const rateGate = jiraRateGate(deps, clientKey);
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
@@ -869,9 +848,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         set.status = 400;
         return { error: "body must be { token: string, setupCode: string }" };
       }
-      const result = await deps.jiraTokenRotate({ token: b.token, setupCode: b.setupCode });
+      const result = await deps.jiraTokenRotate({ token: b.token, setupCode: b.setupCode }, rateGate);
       auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
+      if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
       return result.body;
     })
     // FACTORY-662 item 1: `GET /api/session` — mints/hands out this
@@ -1036,7 +1016,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       } catch (e) {
         const error = e instanceof Error ? e.message : String(e);
         auditOutcome(deps, { route: "PUT /api/settings/:key", action: `set ${key}`, ids: [key], origin: request.headers.get("origin") }, { ok: false, error });
-        set.status = 400;
+        set.status = e instanceof SettingProvidedByEnvironmentError ? 409 : 400;
         return { error };
       }
     })

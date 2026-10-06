@@ -193,7 +193,7 @@ export function buildSettingEntries(effectiveEnv: Readonly<Record<string, string
   return SETTINGS_DEFINITIONS.map(({ key, description }) => {
     const raw = effectiveEnv[key];
     const source = sourceOf(rawEnv[key], key in settingsFileValues);
-    const editable = isAllowlistedSettingsKey(key);
+    const editable = isAllowlistedSettingsKey(key) && source !== "environment"; // an env-set key always wins, so a write could never take effect (PUT also answers 409)
     if (isSecretKey(key)) {
       return { key, set: raw !== undefined && raw.trim() !== "", source, restartNeeded: true as const, secret: true as const, editable, description };
     }

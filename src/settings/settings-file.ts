@@ -54,6 +54,9 @@ export interface AllowlistKeyDef {
 /** A positive integer past this needs `confirm: true` on the write (fleet-cap "confirm to raise"). Director's own choice for v1 — no existing ceiling constant for `BUTCHR_MAX_AGENTS` elsewhere in this codebase to reuse (unlike `ENABLE_SCOPE_CEILING`, `../rules/rules-write-registry.ts`, which is a different knob). */
 export const MAX_AGENTS_CEILING = 50;
 
+/** Hard maximum for the fleet cap: refused outright, `confirm` cannot lift it (director 2026-10-06; agentsafety A2 item 4b). */
+export const MAX_AGENTS_HARD_MAX = 100;
+
 /** Sub-second poll-staleness tolerances are almost certainly a typo, not an intent — refused outright, no confirm escape hatch (unlike the ceiling above, there is no legitimate reason to go lower, only a float/unit mistake). */
 export const POLL_STALE_MS_FLOOR = 1000;
 
@@ -125,6 +128,7 @@ export function validateSettingValue(key: string, rawValue: string, confirm = fa
     case "positiveIntWithCeiling": {
       const n = Number(value);
       if (!Number.isInteger(n) || n <= 0) return { ok: false, error: `${key} must be a positive integer` };
+      if (n > MAX_AGENTS_HARD_MAX) return { ok: false, error: `${key}=${n} is above the hard maximum (${MAX_AGENTS_HARD_MAX}) — confirm cannot lift it` };
       if (n > MAX_AGENTS_CEILING && !confirm) {
         return { ok: false, error: `${key}=${n} is above the confirm ceiling (${MAX_AGENTS_CEILING}) — retry with confirm: true to proceed`, needsConfirm: true };
       }
@@ -226,7 +230,7 @@ export function loadSettingsFile(env: SettingsFileEnv = process.env, io: Setting
       problems.push(`${path}: "${key}" must be a string — ignored, falls back to its default`);
       continue;
     }
-    const result = validateSettingValue(key, raw);
+    const result = validateSettingValue(key, raw, true) // confirm=true: a value written with confirm must survive the next start; the hard maximum still applies;
     if (!result.ok) {
       problems.push(`${path}: "${key}": ${result.error} — ignored, falls back to its default`);
       continue;

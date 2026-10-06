@@ -22,9 +22,13 @@ export function buildSetupStatus(configured: boolean): SetupStatusResponse {
 }
 
 export type JiraWriteRequestOutcome =
-  | { ok: true; status: 200; body: { ok: true; accountId: string; displayName: string; rotated: boolean; restartNeeded: true; identityPersisted: boolean; identityError?: string } }
+  | { ok: true; status: 200; body: { ok: true; accountId: string; displayName: string; rotated: boolean; restartNeeded: true; restarting?: true; identityPersisted: boolean; identityError?: string } }
   | { ok: false; status: 400; body: { error: string } }
-  | { ok: false; status: 409; body: { error: "provided by environment" } };
+  | { ok: false; status: 409; body: { error: "provided by environment" } }
+  | { ok: false; status: 429; body: { error: string }; retryAfterSeconds: number };
+
+/** Called by `handleJiraTokenWrite` only AFTER the setup code has verified, so a mistyped code can never spend rate-limit budget (director 2026-10-06, item 5). */
+export type RateGate = () => { ok: true } | { ok: false; error: string; retryAfterSeconds: number };
 
 /** True iff the daemon's OWN process env currently supplies the Atlassian token — never derived from the request body. */
 export function isTokenProvidedByEnvironment(env: Record<string, string | undefined>): boolean {
@@ -87,7 +91,7 @@ function outcomeToResponse(outcome: JiraTokenWriteOutcome, identity?: { persiste
 export async function handleJiraTokenWrite(
   input: { site: string; email: string; token: string; setupCode: string },
   deps: JiraWriteDeps,
-  opts: { requireEnvCheck: boolean },
+  opts: { requireEnvCheck: boolean; rateGate?: RateGate },
 ): Promise<JiraWriteRequestOutcome> {
   if (opts.requireEnvCheck && isTokenProvidedByEnvironment(deps.env ?? {})) {
     return { ok: false, status: 409, body: { error: "provided by environment" } };
@@ -97,6 +101,8 @@ export async function handleJiraTokenWrite(
   if (!codeCheck.ok) {
     return { ok: false, status: 400, body: { error: `setup code: ${codeCheck.reason}` } };
   }
+  const gate = opts.rateGate?.();
+  if (gate && !gate.ok) return { ok: false, status: 429, body: { error: gate.error }, retryAfterSeconds: gate.retryAfterSeconds };
 
   try {
     validateAtlassianSiteShape(input.site);

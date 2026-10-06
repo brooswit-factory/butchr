@@ -20,6 +20,8 @@ export interface JiraWriteOk {
   displayName: string;
   rotated: boolean;
   restartNeeded: true;
+  /** Setup mode only: the daemon is exiting so its supervisor restarts it in normal mode; the page polls until it is back. */
+  restarting?: true;
   identityPersisted: boolean;
   identityError?: string;
 }

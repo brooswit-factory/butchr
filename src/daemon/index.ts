@@ -207,7 +207,7 @@ if (!isAtlassianConfigured(effectiveJiraEnv)) {
   // Any PARTIAL state is a misconfiguration: exit 1 loudly, exactly as before, instead of serving a quiet setup page with nothing polling (agentsafety A2 review item 3).
   const partial = [effectiveJiraEnv.ATLASSIAN_SITE, effectiveJiraEnv.ATLASSIAN_EMAIL, effectiveJiraEnv.ATLASSIAN_TOKEN, effectiveJiraEnv.ATLASSIAN_TOKEN_FILE].some((v) => !!v?.trim());
   if (partial) {
-    console.error("butchr: Missing required config: ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE) must all be set (partial Atlassian configuration is not setup mode)");
+    console.error("butchr: Missing required config: ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE) must all be set (partial Atlassian configuration is not setup mode). Inputs counted: ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN/ATLASSIAN_TOKEN_FILE, the identity file written by UI setup (jira-identity.json in the butchr config directory) and the managed token file (secrets/atlassian-token). To start setup over, delete BOTH files.");
     process.exit(1);
   }
   await runSetupModeDaemon();
@@ -1194,10 +1194,10 @@ const { app, mcp } = buildApp({
   // comment), and `requireEnvCheck: true` means an env-provided token
   // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 before
   // the setup code is even checked.
-  jiraTokenRotate: (input) => handleJiraTokenWrite(
+  jiraTokenRotate: (input, rateGate) => handleJiraTokenWrite(
     { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
     { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
-    { requireEnvCheck: true },
+    { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
   ),
   jiraTokenTestRateLimit,
   jiraTokenWriteRateLimit,
