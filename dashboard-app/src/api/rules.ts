@@ -376,7 +376,14 @@ export const realRulesApi: RulesApi = {
   listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
   previewRule: (ruleId, signal) => request<RulePreviewResponse>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal }),
   planRule: async (ruleId, patch, confirm, signal) => {
-    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, signal });
+    // `csrf: true` is REQUIRED here even though this route only ever
+    // reports, never writes: the real merged guard (`src/web/view.ts`'s
+    // `onRequest` hook) fails closed on PATH SHAPE, not per-route
+    // intent — ANY non-safe method under `/api/` (this included) must
+    // pass the full `checkWriteGuard`, CSRF included, before its own
+    // handler (which itself calls `checkWriteGuard` again) is ever
+    // reached. Omitting this would 403 every real plan call.
+    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, csrf: true, signal });
     // `scopeCount` per the ticket's own named contract. The real merged
     // server (PR #647, `src/rules/rules-write.ts`'s `planRuleWrite`) names
     // this field `scope`, typed `number | null` (`null` whenever the patch
