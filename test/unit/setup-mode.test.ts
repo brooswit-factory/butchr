@@ -18,7 +18,7 @@ describe("buildSetupModeViewDeps", () => {
     try {
       const logs: string[] = [];
       const { viewDeps } = buildSetupModeViewDeps(0, scratchEnv(dir), (l) => logs.push(l));
-      expect(viewDeps.health()).toEqual({ ok: false, components: [], setupMode: true });
+      expect(viewDeps.health()).toEqual({ ok: false, components: [], setupMode: true } as never);
       expect(viewDeps.setupStatus?.()).toEqual({ configured: false });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
