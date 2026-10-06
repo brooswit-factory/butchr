@@ -4,7 +4,7 @@
  * follows: every rendering DECISION lives here, so `RulesTable.tsx` only
  * arranges already-settled values.
  */
-import { FIRST_RULE_ID, type RuleDto, type RulesFileError, type RulesListResponse } from "../api/rules.js";
+import { FIRST_RULE_ID, isUiEditableRuleId, type RuleDto, type RulesFileError, type RulesListResponse } from "../api/rules.js";
 
 export interface StaffedView {
   text: string;
@@ -31,6 +31,15 @@ export interface RuleRowView {
   rule: RuleDto;
   staffed: StaffedView;
   preferencesText: string;
+  /**
+   * FACTORY-663 review follow-up: whether this row's id carries the `ui-`
+   * prefix the server actually accepts writes for (`isUiEditableRuleId`,
+   * `../api/rules.js`). `RulesTable` disables the per-row enable/disable
+   * toggle whenever this is `false`, regardless of `canWrite` — the server
+   * has always 403'd a write to a non-`ui-` id; this just stops the table
+   * from inviting a click that is guaranteed to be refused.
+   */
+  uiEditable: boolean;
 }
 
 export interface RulesPageViewModel {
@@ -59,6 +68,7 @@ export function buildRulesViewModel(data: RulesListResponse): RulesPageViewModel
     rule,
     staffed: renderStaffed(rule),
     preferencesText: rule.agentPreferences.length === 0 ? "butchr's global agent config" : rule.agentPreferences.map(preferenceText).join(", "),
+    uiEditable: isUiEditableRuleId(rule.id),
   }));
   return {
     rows,

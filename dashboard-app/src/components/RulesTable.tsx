@@ -15,6 +15,7 @@
  * those two payloads.
  */
 import { Button, Switch, Text } from "@launchpad-ui/components";
+import { FIRST_RULE_ID } from "../api/rules.js";
 import type { RuleRowView } from "../view-model/rules-view.js";
 import "./RulesView.css";
 
@@ -22,15 +23,16 @@ export interface RulesTableProps {
   rows: RuleRowView[];
   /**
    * `api.capabilities.write` AND `!stale` — governs whether the toggle is
-   * interactive at all. NOTE (FACTORY-663): the real server only ever
-   * accepts a write for a `ui-`-prefixed rule id (`isUiEditableRuleId`,
-   * `../api/rules.js`) — a non-`ui-` row left enabled here still fails at
-   * the server with a 403, surfaced through the SAME `rule-toggle-error`
-   * banner as any other write refusal. This table does not pre-filter rows
-   * by id itself: the dedicated `ui-first-rule` flow this ticket builds
-   * (`FirstRuleSetup.tsx`) is the one actually exercised against a real
-   * daemon; this generic per-row toggle predates that contract (FACTORY-661)
-   * and is kept read-compatible rather than narrowed further here.
+   * interactive AT ALL. NOTE (FACTORY-663 review follow-up): the real server
+   * only ever accepts a write for a `ui-`-prefixed rule id
+   * (`isUiEditableRuleId`, `../api/rules.js`) — a non-`ui-` row is now ALSO
+   * disabled per-row, regardless of this flag, via each row's own
+   * `uiEditable` (see `rules-view.ts`'s `RuleRowView`), so the table never
+   * invites a click that the server is guaranteed to refuse with a 403. The
+   * dedicated `ui-first-rule` flow this ticket builds (`FirstRuleSetup.tsx`)
+   * remains the one actually exercised against a real daemon; this generic
+   * per-row toggle predates that contract (FACTORY-661) and stays
+   * read-compatible for every other rule, just no longer clickable for them.
    */
   canWrite: boolean;
   onPreview: (ruleId: string) => void;
@@ -41,7 +43,8 @@ export function RulesTable({ rows, canWrite, onPreview, onToggle }: RulesTablePr
   return (
     <div className="rules-table" role="table" aria-label="rules">
       {rows.map((row) => {
-        const writable = canWrite;
+        const writable = canWrite && row.uiEditable;
+        const toggleTitle = !canWrite ? "needs the write API" : !row.uiEditable ? `only ${FIRST_RULE_ID} can be edited from this page — edit rules.json directly for other rules` : undefined;
         return (
           <div className="rules-table__row" data-testid="rule-row" data-rule-id={row.rule.id} role="row" key={row.rule.id}>
             <div className="rules-table__cell rules-table__cell--id" role="cell">
@@ -71,7 +74,7 @@ export function RulesTable({ rows, canWrite, onPreview, onToggle }: RulesTablePr
               <Button size="small" variant="minimal" onPress={() => onPreview(row.rule.id)}>
                 Preview
               </Button>
-              <span className="rules-table__toggle" title={writable ? undefined : "needs the write API"}>
+              <span className="rules-table__toggle" title={toggleTitle}>
                 <Switch
                   isSelected={row.rule.enabled}
                   isDisabled={!writable}

@@ -71,6 +71,13 @@ describe("buildRulesViewModel — FACTORY-661/FACTORY-663", () => {
     expect(vm.rows[0]!.staffed).toEqual({ text: "UNSTAFFED: disabled", cls: "cnc" });
   });
 
+  test("uiEditable is true only for a ui--prefixed rule id (FACTORY-663 review follow-up — per-row toggle disable)", () => {
+    const vm = buildRulesViewModel(response({ rules: [rule({ id: "factory-triage" }), rule({ id: FIRST_RULE_ID }), rule({ id: "ui-custom" })] }));
+    expect(vm.rows[0]!.uiEditable).toBe(false);
+    expect(vm.rows[1]!.uiEditable).toBe(true);
+    expect(vm.rows[2]!.uiEditable).toBe(true);
+  });
+
   test("sourceEtag and stale pass through verbatim — the ONLY values a write's ifMatch/disabled-state ever read", () => {
     const vm = buildRulesViewModel(response({ sourceEtag: "abc123", fileEtag: "def456", stale: true }));
     expect(vm.sourceEtag).toBe("abc123");

@@ -160,17 +160,55 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     expect(queryByTestId("rule-toggle-confirm-dialog")).toBeNull();
   });
 
-  test("a toggle refused by the server (e.g. a non-ui- rule) shows the server's own message in the toggle-error banner", async () => {
+  test("a toggle refused by the server (e.g. a non-ui- rule) shows the server's own message in the toggle-error banner, for a caller that bypasses the now-disabled client control", async () => {
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
       latencyMs: 0,
       plans: { "factory-triage": { planHash: "h1", spawned: 0, stopped: 0, restarted: 0, etag: "e1" } },
     });
-    const { findAllByTestId, findByTestId } = render(<RulesRoute api={api} />);
+    const { findAllByTestId, findByTestId, container } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
-    fireEvent.click(document.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement);
-    const banner = await findByTestId("rule-toggle-error");
-    expect(banner.textContent).toContain('does not carry the "ui-" prefix');
+    // FACTORY-663 review follow-up: the table now disables this row's toggle
+    // client-side (non-`ui-` id), so a plain click can no longer reach the
+    // server. Exercise the server's own refusal path directly, the same way
+    // a stale/bypassed client would, and confirm it still surfaces verbatim.
+    const toggle = container.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement;
+    expect(toggle.disabled).toBe(true);
+    await expect(api.setEnabled("factory-triage", false, "e1", "h1", false)).rejects.toThrow(/does not carry the "ui-" prefix/);
+  });
+
+  test("the toggle is disabled with a tooltip explaining why for a non-ui- rule, even though writes are otherwise enabled", async () => {
+    const api = createFixturesRulesApi({
+      initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
+      latencyMs: 0,
+    });
+    const { findAllByTestId, container } = render(<RulesRoute api={api} />);
+    await findAllByTestId("rule-row");
+    await waitFor(() => expect(api.capabilities.write).toBe(true));
+    const toggleWrap = container.querySelector(".rules-table__toggle");
+    expect(toggleWrap?.getAttribute("title")).toBe("only ui-first-rule can be edited from this page — edit rules.json directly for other rules");
+    const input = container.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement | null;
+    expect(input?.disabled).toBe(true);
+  });
+
+  test("the toggle stays enabled and clickable for ui-first-rule (and other ui- ids) once writes are enabled", async () => {
+    const api = createFixturesRulesApi({
+      initial: response({ rules: [rule({ id: "ui-triage", enabled: false })] }),
+      latencyMs: 0,
+      plans: { "ui-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1" } },
+    });
+    const { findAllByTestId, container } = render(<RulesRoute api={api} />);
+    await findAllByTestId("rule-row");
+    await waitFor(() => expect(api.capabilities.write).toBe(true));
+    const toggleWrap = container.querySelector(".rules-table__toggle");
+    expect(toggleWrap?.getAttribute("title")).toBeNull();
+    const input = container.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement;
+    expect(input.disabled).toBe(false);
+    fireEvent.click(input);
+    await waitFor(async () => {
+      const after = await api.listRules();
+      expect(after.rules[0]!.enabled).toBe(true);
+    });
   });
 });
 
