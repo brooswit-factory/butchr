@@ -13,12 +13,12 @@ function scratchEnv(dir: string): Record<string, string | undefined> {
 }
 
 describe("buildSetupModeViewDeps", () => {
-  test("every required ViewDeps field is present and health is always ok with no components", () => {
+  test("every required ViewDeps field is present and health is 503-shaped (ok:false, setupMode) with no components", () => {
     const dir = mkdtempSync(join(tmpdir(), "setup-mode-test-"));
     try {
       const logs: string[] = [];
       const { viewDeps } = buildSetupModeViewDeps(0, scratchEnv(dir), (l) => logs.push(l));
-      expect(viewDeps.health()).toEqual({ ok: true, components: [] });
+      expect(viewDeps.health()).toEqual({ ok: false, components: [], setupMode: true });
       expect(viewDeps.setupStatus?.()).toEqual({ configured: false });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -42,7 +42,7 @@ describe("buildSetupModeViewDeps", () => {
       try {
         const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` };
         const health = await fetch(`http://127.0.0.1:${port}/health`);
-        expect(health.status).toBe(200);
+        expect(health.status).toBe(503);
 
         const status = await fetch(`http://127.0.0.1:${port}/api/setup/status`, { headers });
         expect(await status.json()).toEqual({ configured: false });
