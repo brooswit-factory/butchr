@@ -32,6 +32,7 @@ import {
   ENABLE_SCOPE_CEILING,
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
+  RateLimitError,
   type RuleAgentPreferencePatch,
   type RuleDto,
   type RuleFieldPatch,
@@ -68,6 +69,22 @@ const MISSING_TEMPLATE_SNIPPET = `{
   "brief": "Describe what this agent should do when it picks up a matching ticket.",
   "agentPreferences": []
 }`;
+
+/**
+ * FACTORY-678 (landing soon, not yet merged): the server's upcoming
+ * write-rate-limit refusal is a `RateLimitError` (see `../api/rules.js`),
+ * not a plain `Error`. When it carries a parsed `Retry-After` value, show
+ * something a user can act on ("try again in Ns") rather than the generic
+ * verbatim `{error}` text. No `Retry-After` header was present on the
+ * response (always possible) -> fall back to that generic message, same as
+ * every other write refusal this component already renders.
+ */
+function describeWriteError(e: unknown): string {
+  if (e instanceof RateLimitError && e.retryAfterSeconds !== undefined) {
+    return `Too many changes — try again in ${e.retryAfterSeconds}s`;
+  }
+  return e instanceof Error ? e.message : String(e);
+}
 
 interface PendingAction {
   label: string;
@@ -120,7 +137,7 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
           onChanged();
         });
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(describeWriteError(e)))
       .finally(() => setBusy(false));
   }
 
@@ -134,7 +151,7 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
         onChanged();
         setPendingAction(null);
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(describeWriteError(e)))
       .finally(() => setBusy(false));
   }
 
@@ -172,7 +189,7 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
         setLastWrite(null);
         onChanged();
       })
-      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .catch((e: unknown) => setError(describeWriteError(e)))
       .finally(() => setBusy(false));
   }
 

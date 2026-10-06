@@ -316,6 +316,34 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     });
     expect(queryByTestId("first-rule-undo")).toBeNull();
   });
+
+  // FACTORY-678 (landing soon, not yet merged): a server-side write rate
+  // limit will return 429 with a `Retry-After` header on this route. Not
+  // testable end-to-end today (nothing emits a real 429 yet) — these use
+  // the fixture's own one-shot `nextRateLimit` simulation, forward-
+  // compatible handling ahead of that server change landing.
+  test("a write refused with a Retry-After value shows an actionable 'try again in Ns' message, not the raw error text", async () => {
+    const api = createFixturesRulesApi({ initial: defaultRulesFixture(), latencyMs: 0, nextRateLimit: { retryAfterSeconds: 6 } });
+    const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
+    await findByTestId("first-rule-setup");
+    const input = (await findByTestId("first-rule-query-input")) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: "key = XYZ-1" } });
+    fireEvent.click(getByRole("button", { name: "save query" }));
+    const error = await findByTestId("first-rule-error");
+    expect(error.textContent).toContain("Too many changes — try again in 6s");
+  });
+
+  test("a write refused with no Retry-After value falls back to the generic verbatim error message", async () => {
+    const api = createFixturesRulesApi({ initial: defaultRulesFixture(), latencyMs: 0, nextRateLimit: {} });
+    const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
+    await findByTestId("first-rule-setup");
+    const input = (await findByTestId("first-rule-query-input")) as HTMLInputElement;
+    fireEvent.input(input, { target: { value: "key = XYZ-1" } });
+    fireEvent.click(getByRole("button", { name: "save query" }));
+    const error = await findByTestId("first-rule-error");
+    expect(error.textContent).toContain("too many changes — rate limited, retry shortly");
+    expect(error.textContent).not.toContain("Too many changes — try again in");
+  });
 });
 
 describe("RulesRoute — FACTORY-661/FACTORY-663: CSP/escaping (agentsafety review 2026-10-05 item d)", () => {

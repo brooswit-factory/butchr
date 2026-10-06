@@ -276,9 +276,46 @@ async function request<T>(path: string, opts: RequestOpts = {}): Promise<T> {
     } catch {
       // Non-JSON (or unparseable) error body — keep the generic HTTP message.
     }
+    // FACTORY-678 (landing soon, not yet merged): a server-side write rate
+    // limit returns 429 with the SAME `{error}` body shape as every other
+    // refusal on these routes (handled, verbatim, above) PLUS a
+    // `Retry-After` header — an integer number of seconds, per the HTTP
+    // spec. Surface that value structurally (not mashed into the message
+    // string) so a caller can actually use it (e.g. "try again in 6s")
+    // rather than parse it back out of text. Absent/unparseable header ->
+    // `retryAfterSeconds` is `undefined`, same message as today.
+    if (res.status === 429) {
+      const header = res.headers.get("retry-after");
+      const parsed = header !== null ? Number.parseInt(header, 10) : NaN;
+      const retryAfterSeconds = Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+      throw new RateLimitError(message, retryAfterSeconds);
+    }
     throw new Error(message);
   }
   return (await res.json()) as T;
+}
+
+/**
+ * Thrown by `request()` (and, in fixtures, by `createFixturesRulesApi`'s
+ * `nextRateLimit` one-shot — see `FixturesRulesApiOptions.nextRateLimit`)
+ * for a 429 response, in place of a plain `Error` — FACTORY-678 (landing
+ * soon, not yet merged) adds a server-side write rate limit across every
+ * write route this module calls. `message` is still the verbatim `{error}`
+ * body text (or the generic HTTP fallback), exactly as every other refusal
+ * on these routes gets handled — this class is purely additive: every
+ * existing `catch`/`instanceof Error`/`.message` read at any call site
+ * keeps working unchanged. `retryAfterSeconds` is the parsed `Retry-After`
+ * header (an integer number of seconds), or `undefined` when the header was
+ * absent or unparseable — a caller (the UI) reads this field directly
+ * instead of parsing it back out of the message string.
+ */
+export class RateLimitError extends Error {
+  readonly retryAfterSeconds: number | undefined;
+  constructor(message: string, retryAfterSeconds: number | undefined) {
+    super(message);
+    this.name = "RateLimitError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
 }
 
 /** The server's own `GET /api/rules` response shape (`RulesApiResponse`, `src/web/rules-api.ts`) — kept as a private, server-side-only type; `mapServerRulesResponse` is the one place anything reads it. */
@@ -386,6 +423,16 @@ export interface FixturesRulesApiOptions {
    * real `{error}` body.
    */
   nextWriteError?: string;
+  /**
+   * One-shot FACTORY-678 rate-limit simulation, consumed by the very next
+   * `setEnabled`/`updateFields`/`undo` call, then cleared — same one-shot
+   * discipline as `nextWriteError` (a plan/preview call must NOT see it
+   * either). Throws a `RateLimitError` (never a plain `Error`) so a caller
+   * can exercise the "too many changes" UI path without a real daemon.
+   * `retryAfterSeconds` omitted simulates a 429 with no `Retry-After`
+   * header at all — the fallback path a caller must also be able to prove.
+   */
+  nextRateLimit?: { retryAfterSeconds?: number };
 }
 
 const DEFAULT_FIXTURE_ETAG = "fixture-etag-0";
@@ -489,6 +536,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
     : defaultRulesFixture();
   let lastUiWrite: { backupId: string; resultingEtag: string } | null = null;
   let nextWriteError = opts.nextWriteError;
+  let nextRateLimit = opts.nextRateLimit;
   let backupCounter = 0;
   const backups = new Map<string, RulesListResponse>();
 
@@ -497,6 +545,12 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
     if (opts.failWith) throw new Error(opts.failWith);
   };
   const maybeFailWriteOnce = () => {
+    if (nextRateLimit !== undefined) {
+      const { retryAfterSeconds } = nextRateLimit;
+      nextRateLimit = undefined;
+      const message = retryAfterSeconds !== undefined ? `too many changes — retry after ${retryAfterSeconds}s` : "too many changes — rate limited, retry shortly";
+      throw new RateLimitError(message, retryAfterSeconds);
+    }
     if (nextWriteError !== undefined) {
       const message = nextWriteError;
       nextWriteError = undefined;

@@ -3,6 +3,7 @@ import {
   createFixturesRulesApi,
   defaultRulesFixture,
   realRulesApi,
+  RateLimitError,
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
   ENABLE_SCOPE_CEILING,
@@ -198,6 +199,37 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       expect(result.changedIds).toEqual(["ui-demo"]);
     });
 
+    test("nextRateLimit is a ONE-SHOT RateLimitError on the next write, then clears — carrying retryAfterSeconds through, not just mashed into the message", async () => {
+      const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0, nextRateLimit: { retryAfterSeconds: 6 } });
+      const before = await api.listRules();
+      const plan = await api.planRule("ui-demo", { enabled: true }, false);
+      let caught: unknown;
+      try {
+        await api.setEnabled("ui-demo", true, before.sourceEtag, plan.planHash, false);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(RateLimitError);
+      expect((caught as RateLimitError).retryAfterSeconds).toBe(6);
+      // Second attempt (same inputs) succeeds — the one-shot rate limit already fired.
+      const result = await api.setEnabled("ui-demo", true, before.sourceEtag, plan.planHash, false);
+      expect(result.changedIds).toEqual(["ui-demo"]);
+    });
+
+    test("nextRateLimit without retryAfterSeconds still throws a RateLimitError, with retryAfterSeconds undefined (no header simulated)", async () => {
+      const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0, nextRateLimit: {} });
+      const before = await api.listRules();
+      const plan = await api.planRule("ui-demo", { enabled: true }, false);
+      let caught: unknown;
+      try {
+        await api.setEnabled("ui-demo", true, before.sourceEtag, plan.planHash, false);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeInstanceOf(RateLimitError);
+      expect((caught as RateLimitError).retryAfterSeconds).toBeUndefined();
+    });
+
     test("undo restores the most recent UI write's own backup and clears it (a second undo is refused)", async () => {
       const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0 });
       const before = await api.listRules();
@@ -385,5 +417,57 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
   test("a non-2xx response with a non-JSON body falls back to a generic HTTP message", async () => {
     globalThis.fetch = (async () => new Response("nope", { status: 500 })) as unknown as typeof fetch;
     await expect(realRulesApi.listRules()).rejects.toThrow(/HTTP 500/);
+  });
+
+  // FACTORY-678 (landing soon, not yet merged): a server-side write rate
+  // limit will return 429 with a `Retry-After` header across the write
+  // routes. Nothing emits this today, so these tests simulate the response
+  // shape directly against `realRulesApi` — forward-compatible handling,
+  // not an end-to-end check.
+  test("a 429 with a Retry-After header throws a RateLimitError carrying the parsed retryAfterSeconds, same {error} message as every other refusal", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "too many writes — slow down" }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "6" },
+      })) as unknown as typeof fetch;
+    let caught: unknown;
+    try {
+      await realRulesApi.listRules();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(RateLimitError);
+    expect((caught as RateLimitError).message).toBe("too many writes — slow down");
+    expect((caught as RateLimitError).retryAfterSeconds).toBe(6);
+  });
+
+  test("a 429 with no Retry-After header still throws a RateLimitError, with retryAfterSeconds undefined — the fallback path", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "too many writes — slow down" }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    let caught: unknown;
+    try {
+      await realRulesApi.listRules();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(RateLimitError);
+    expect((caught as RateLimitError).retryAfterSeconds).toBeUndefined();
+    expect((caught as RateLimitError).message).toBe("too many writes — slow down");
+  });
+
+  test("non-429 error paths are unaffected: a 403 still throws a plain Error, not a RateLimitError", async () => {
+    globalThis.fetch = (async () => new Response(JSON.stringify({ error: "peer uid check failed" }), { status: 403, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+    let caught: unknown;
+    try {
+      await realRulesApi.listRules();
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(RateLimitError);
+    expect((caught as Error).message).toBe("peer uid check failed");
   });
 });
