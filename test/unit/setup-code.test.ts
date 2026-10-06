@@ -11,10 +11,10 @@ describe("createSetupCodeManager", () => {
     const m = createSetupCodeManager({ randomBytesFn: fakeRandomBytes(1) });
     expect(m.state()).toEqual({ minted: false, locked: false, expiresAt: null });
   });
-  test("mint() returns a 12-character code from the no-ambiguous-character base32 alphabet, and never 0/O/1/I/L", () => {
+  test("mint() returns a 13-character code from the no-ambiguous-character base32 alphabet, and never 0/O/1/I/L", () => {
     const m = createSetupCodeManager({ randomBytesFn: fakeRandomBytes(1) });
     const code = m.mint();
-    expect(code).toHaveLength(12);
+    expect(code).toHaveLength(13);
     expect(code).toMatch(/^[A-HJ-NP-TV-Z2-9]+$/);
     for (const ambiguous of ["0", "O", "1", "I", "L"]) expect(code).not.toContain(ambiguous);
   });

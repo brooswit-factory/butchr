@@ -22,7 +22,7 @@
  * directly operator-edited (it exists purely as this daemon's own
  * record of what the setup/rotation routes last wrote).
  */
-import { chmodSync, closeSync, constants as fsConstants, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -60,9 +60,13 @@ export function defaultJiraIdentityFileIo(): JiraIdentityFileIo {
     writeTempExclusive: (path, text, mode) => {
       const flags = fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0);
       const fd = openSync(path, flags, mode);
-      try { writeSync(fd, text); } finally { closeSync(fd); }
+      try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
     },
-    rename: (tempPath, path) => renameSync(tempPath, path),
+    rename: (tempPath, path) => {
+      renameSync(tempPath, path);
+      // fsync the directory so the rename itself is durable (best-effort: not every filesystem allows opening a directory).
+      try { const dfd = openSync(dirname(path), fsConstants.O_RDONLY); try { fsyncSync(dfd); } finally { closeSync(dfd); } } catch { /* best-effort */ }
+    },
     removeQuiet: (path) => { try { unlinkSync(path); } catch { /* best-effort */ } },
   };
 }

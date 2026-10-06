@@ -18,7 +18,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 
 const BASE32_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // 32 symbols, no 0/O/1/I/L
-const CODE_LENGTH = 12; // 12 * 5 bits = 60 bits
+const CODE_LENGTH = 13; // 31-symbol alphabet: 13 * log2(31) = 64.4 bits (12 would be 59.4, under the 60-bit gate)
 export const SETUP_CODE_TTL_MS = 10 * 60_000;
 export const SETUP_CODE_MAX_ATTEMPTS = 5;
 
