@@ -143,7 +143,7 @@ await setInput("setup-token-input", CANARY_TOKEN);
 await setInput("setup-code-input", codeFromJournal ?? "");
 check("B1 click Configure", await clickBtn("setup-submit-button"));
 check("B2 the result shows the stub account/displayName", await until("configured", `(document.querySelector('[data-testid=setup-result]')?.textContent ?? '').includes('Stub Operator')`));
-check("B3 the result says restart needed", await ev(`(document.querySelector('[data-testid=setup-result]')?.textContent ?? '').toLowerCase().includes('restart needed')`) === true);
+check("B3 the result says butchr is restarting", await ev(`(document.querySelector('[data-testid=setup-result]')?.textContent ?? '').toLowerCase().includes('restarting into normal mode')`) === true);
 check("B4 the candidate token never appears anywhere in the rendered DOM", !((await ev(`document.documentElement.outerHTML`) as string).includes(CANARY_TOKEN)));
 await shot("2-configured");
 
