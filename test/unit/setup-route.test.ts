@@ -27,7 +27,7 @@ async function csrfToken(port: number): Promise<string> {
   return ((await session.json()) as { csrfToken: string }).csrfToken;
 }
 
-const OK_RESULT: JiraWriteRequestOutcome = { ok: true, status: 200, body: { ok: true, accountId: "acct-1", displayName: "D", rotated: false, restartNeeded: true } };
+const OK_RESULT: JiraWriteRequestOutcome = { ok: true, status: 200, body: { ok: true, accountId: "acct-1", displayName: "D", rotated: false, restartNeeded: true, identityPersisted: true } };
 
 describe("GET /api/setup/status", () => {
   test("no dashboardOriginGuard: 503, never calls setupStatus()", async () => {

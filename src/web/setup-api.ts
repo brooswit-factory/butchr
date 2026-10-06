@@ -10,6 +10,7 @@
  */
 import { validateAtlassianSiteShape } from "../config/config.js";
 import { writeJiraToken, jiraTokenFilePath, type JiraTokenWriteIo, type FetchLike, type JiraTokenWriteOutcome } from "../setup/jira-token-write.js";
+import { writeJiraIdentity, jiraIdentityFilePath, type JiraIdentityFileIo } from "../setup/jira-identity-file.js";
 import type { SetupCodeManager } from "../setup/setup-code.js";
 
 export interface SetupStatusResponse {
@@ -21,7 +22,7 @@ export function buildSetupStatus(configured: boolean): SetupStatusResponse {
 }
 
 export type JiraWriteRequestOutcome =
-  | { ok: true; status: 200; body: { ok: true; accountId: string; displayName: string; rotated: boolean; restartNeeded: true } }
+  | { ok: true; status: 200; body: { ok: true; accountId: string; displayName: string; rotated: boolean; restartNeeded: true; identityPersisted: boolean; identityError?: string } }
   | { ok: false; status: 400; body: { error: string } }
   | { ok: false; status: 409; body: { error: "provided by environment" } };
 
@@ -37,11 +38,35 @@ export interface JiraWriteDeps {
   path?: string;
   /** The daemon's own process env — used ONLY for the env-provided-token 409 check (rotation route); the setup route's own caller never has an env to check this against in the first place (setup mode implies it's unset). */
   env?: Record<string, string | undefined>;
+  /** `../setup/jira-identity-file.ts`'s own IO — overridable for tests, same discipline as `io` above. */
+  identityIo?: JiraIdentityFileIo;
+  identityPath?: string;
 }
 
-function outcomeToResponse(outcome: JiraTokenWriteOutcome): JiraWriteRequestOutcome {
+/**
+ * Persists `{site, email}` to the durable identity file so a RESTART after
+ * setup actually leaves setup mode (`../config/effective-env.ts`'s
+ * `resolveEffectiveJiraEnv` is what later reads this back) — called only
+ * on a successful INITIAL setup (`opts.requireEnvCheck === false`), never
+ * on a rotation, since site/email cannot change there. Never throws: a
+ * failure here does not unwind the token write that already succeeded
+ * (that would leave the secret on disk with no way to report it worked);
+ * instead it's reported alongside the success body as `identityPersisted:
+ * false` + `identityError`, so the UI can warn the operator rather than
+ * silently claiming a complete setup that will NOT survive a restart.
+ */
+function persistIdentity(input: { site: string; email: string }, deps: JiraWriteDeps): { persisted: boolean; error?: string } {
+  try {
+    writeJiraIdentity({ site: input.site, email: input.email }, deps.identityPath ?? jiraIdentityFilePath(deps.env), deps.identityIo);
+    return { persisted: true };
+  } catch (e) {
+    return { persisted: false, error: (e as Error).message };
+  }
+}
+
+function outcomeToResponse(outcome: JiraTokenWriteOutcome, identity?: { persisted: boolean; error?: string }): JiraWriteRequestOutcome {
   if (outcome.ok) {
-    return { ok: true, status: 200, body: { ok: true, accountId: outcome.accountId, displayName: outcome.displayName, rotated: outcome.rotated, restartNeeded: true } };
+    return { ok: true, status: 200, body: { ok: true, accountId: outcome.accountId, displayName: outcome.displayName, rotated: outcome.rotated, restartNeeded: true, identityPersisted: identity?.persisted ?? true, ...(identity?.error ? { identityError: identity.error } : {}) } };
   }
   switch (outcome.reason) {
     case "test-failed": return { ok: false, status: 400, body: { error: outcome.error } };
@@ -87,5 +112,12 @@ export async function handleJiraTokenWrite(
 
   const path = deps.path ?? jiraTokenFilePath();
   const outcome = await writeJiraToken({ site: input.site, email: input.email, token: input.token }, path, deps.io, deps.fetchFn);
-  return outcomeToResponse(outcome);
+  if (!outcome.ok) return outcomeToResponse(outcome);
+
+  // Rotation (`requireEnvCheck: true`) never touches site/email — only
+  // the INITIAL setup call persists the identity that makes a later
+  // restart actually leave setup mode (see `persistIdentity`'s own doc
+  // comment for why a failure here doesn't unwind the token write).
+  const identity = opts.requireEnvCheck ? undefined : persistIdentity({ site: input.site, email: input.email }, deps);
+  return outcomeToResponse(outcome, identity);
 }

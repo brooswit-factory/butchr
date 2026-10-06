@@ -49,3 +49,19 @@
   align-items: center;
   gap: 0.5rem;
 }
+.settings-jira-card__rotate {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--lp-border-color, #e2e2e2);
+}
+.settings-jira-card__rotate-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.settings-jira-card__rotate-form input {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--lp-border-color, #e2e2e2);
+  border-radius: 4px;
+}
