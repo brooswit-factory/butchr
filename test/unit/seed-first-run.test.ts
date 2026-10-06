@@ -7,6 +7,7 @@ import { FIRST_RULE_ID } from "../../src/rules/rules-write-registry.js";
 import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
 import { reloadRules } from "../../src/rules/reload.js";
 import { createRulesHolder } from "../../src/rules/rules.js";
+import { resolveRuleBrief } from "../../src/agents/workspace.js";
 
 let dir: string;
 
@@ -44,6 +45,10 @@ describe("seedFirstRunRules — true first run", () => {
     expect(rule.permissionMode).toBe("default");
     expect(rule.lizardMode).toBe(true);
     expect(rule.agentPreferences).toEqual([{ harness: "claude", model: "sonnet", effort: "low" }]);
+    // a real, reviewed instruction from the first enable — never a placeholder the web UI can't edit (brief is file-only)
+    expect(rule.brief).toBe("@builtin:task");
+    expect(resolveRuleBrief(rule.brief)).not.toContain("Placeholder");
+    expect(resolveRuleBrief(rule.brief).length).toBeGreaterThan(20);
   });
 
   test("seeded text passes loadRules with every fixed field exactly as specified (no unknown fields, nothing dropped)", () => {

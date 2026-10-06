@@ -83,6 +83,16 @@ function hasPriorBackup(dir: string, baseName: string, io: WriteRulesIo): boolea
  * so this seed follows the decision's literal text and flags the fixture
  * discrepancy for agentsafety/a reviewer to settle, rather than silently
  * picking the OTHER value), `account: "none"`, `role: "worker"`.
+ *
+ * `brief: "@builtin:task"` (manager-factory review on PR #652, 2026-10-05
+ * 22:09 PDT): `brief` is FILE-ONLY — FACTORY-662's web write path
+ * deliberately never lets the dashboard edit it — so a placeholder brief
+ * text here would be a dead end: a user who edits the QUERY (the one field
+ * the UI lets them touch) and enables the rule would still hand its worker
+ * a "not yet a real instruction" placeholder forever. The shipped,
+ * `loadRules`-validated task brief (`src/agents/workspace.ts`'s `BRIEF_BY_TYPE`,
+ * the same one `docs/rules.example.json`'s own `tasks` rule uses) is a real,
+ * reviewed instruction from the very first enable.
  */
 function templateRuleDoc(): string {
   const doc = {
@@ -92,8 +102,7 @@ function templateRuleDoc(): string {
         enabled: false,
         resourceProvider: "jira-work",
         query: PLACEHOLDER_QUERY,
-        brief:
-          "Placeholder brief seeded by butchr's first-run template (FACTORY-669) — not yet a real instruction to anyone. Open the dashboard, edit this rule's query and this brief to describe real work, then enable it.",
+        brief: "@builtin:task",
         execution: "singleton",
         account: "none",
         role: "worker",

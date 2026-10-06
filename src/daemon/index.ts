@@ -205,7 +205,7 @@ let missingRulesPath: string | null = null;
 // `firstRunSeedOutcome` below).
 const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
 if (firstRunSeedOutcome.kind === "seeded") {
-  console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); open the dashboard, edit its query, then enable it`);
+  console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); edit its query in the dashboard, then enable it (its brief is file-only — edit that in ${firstRunSeedOutcome.path} by hand if you want it)`);
 } else if (firstRunSeedOutcome.kind === "vanished-established-install") {
   console.error(
     `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but a prior backup (.bak-*) exists in its directory — this looks like an established install whose rules file vanished, not a fresh one, so no template was seeded. Restore it (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
@@ -2268,7 +2268,7 @@ if (firstRunSeedOutcome.kind === "seeded") {
     condition: "first-run-seed",
     subject: `rules file ${firstRunSeedOutcome.path}`,
     reason: `seeded one disabled template rule (${FIRST_RULE_ID}) at true first run`,
-    remedy: "Open the dashboard, edit the template rule's query, then enable it.",
+    remedy: "Edit the template rule's query in the dashboard, then enable it; its brief is file-only, edited in the rules file by hand if you want it.",
   });
 } else if (firstRunSeedOutcome.kind === "vanished-established-install") {
   opsAlertRouter.raise({
