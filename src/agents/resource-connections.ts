@@ -36,9 +36,40 @@ export class ResourceConnections {
    * must never break). A brand-new instance (a daemon restart) starts with
    * this empty, which is the whole 503-during-startup window `handle()`
    * gates on below.
+   *
+   * NOT sufficient on its own (PR #658 review, round 1): an agent that was
+   * retired BEFORE the restart — token file still on disk, but no longer
+   * matched by any rule — never gets `prepare()`d again in the NEW
+   * instance, so it would never enter this set and would 503 forever,
+   * exactly the "retry forever for a connection that is never coming back"
+   * case the story's CRITICAL section forbids. `startupDeadlineMs` below
+   * is the global backstop that bounds that: once it has elapsed since
+   * construction, EVERY agent is treated as ready regardless of whether
+   * its own `prepare()` ever ran, so case (b) can only ever apply for a
+   * bounded window after a restart, never indefinitely.
    */
   private readyAgents = new Set<string>();
-  constructor(private readonly baseUrl:string, private readonly herd:Pick<Herd,'paneFor'|'nudge'>, private readonly log:(line:string)=>void) {}
+  private readonly startedAt: number;
+  constructor(
+    private readonly baseUrl:string,
+    private readonly herd:Pick<Herd,'paneFor'|'nudge'>,
+    private readonly log:(line:string)=>void,
+    /** Injectable for tests; defaults to the real clock. */
+    private readonly now:()=>number = Date.now,
+    /**
+     * Global readiness backstop (see `readyAgents`'s own doc comment): a
+     * few multiples of the resource-reconcile loop's own 60s poll interval
+     * (`src/daemon/index.ts`'s `intervalMs: 60_000` wiring `prepare` in),
+     * since a round that is already in flight when this instance is
+     * constructed may not reach a given agent until the NEXT poll tick,
+     * not the one already running.
+     */
+    private readonly startupDeadlineMs:number = 5*60_000,
+  ) { this.startedAt = this.now(); }
+  /** Whether `agent` should be treated as past the 503 window — its own `prepare()` completed, or the global startup backstop has elapsed. */
+  private isReady(agent:string):boolean {
+    return this.readyAgents.has(agent) || this.now()-this.startedAt >= this.startupDeadlineMs;
+  }
   async prepare(spec:SpawnSpec):Promise<SpawnSpec> {
     if (!spec.mcpConfigFile) { this.readyAgents.add(spec.key); return spec; }
     try {
@@ -123,7 +154,7 @@ export class ResourceConnections {
       const headers=new Headers(request.headers);headers.delete('host');headers.set('authorization',c.proxy.headers.Authorization);
       return fetch(c.proxy.url,{method:request.method,headers,...(!['GET','HEAD'].includes(request.method)?{body:await request.arrayBuffer()}:{}),signal:request.signal});
     }
-    if(!this.readyAgents.has(agent)) {
+    if(!this.isReady(agent)) {
       const token=await this.persistedToken(agent,name);
       if(token!==null&&constantTimeEqual(request.headers.get('authorization'),`Bearer ${token}`)) {
         return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});

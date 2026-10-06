@@ -69,6 +69,21 @@ test('empty registry + NOT ready + valid persisted token => 503 + Retry-After + 
  expect(await res.json()).toEqual({error:'butchr is starting; connection not ready, retry'});
 });
 
+test('an agent retired BEFORE a restart (never prepared in the new instance) still gets 401 once the global startup deadline elapses — not 503 forever',async()=>{
+ const f=await fixture();
+ // simulates: agent was retired before the daemon restarted — token file left on disk by the old instance, but this NEW instance's reconcile loop never matches/prepares it again.
+ const token=await persistToken(f.spec.key,'chat');
+ let t=0;const now=()=>t;
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000);
+ cleanup.push(()=>registry.close());
+ const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
+ const withinWindow=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
+ expect(withinWindow.status).toBe(503); // still inside the startup window
+ t=1000; // deadline elapsed; this agent's own prepare() STILL never ran
+ const pastDeadline=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
+ expect(pastDeadline.status).toBe(401);
+});
+
 test('wrong token, at any readiness, is 401',async()=>{
  const f=await fixture();
  const token=await persistToken(f.spec.key,'chat');
