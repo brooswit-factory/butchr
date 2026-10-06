@@ -14,6 +14,7 @@
  */
 import { constants as fsConstants } from "node:fs";
 import { stat } from "node:fs/promises";
+import { isAllowlistedSettingsKey } from "../settings/settings-file.js";
 
 export const SECRET_KEY_RE = /token|secret|password|key/i;
 
@@ -81,21 +82,33 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_RESTORED_RESUME", description: "Policy for which managed-session agents may resume after a restore: off, all, or a comma-separated list." },
 ];
 
+/**
+ * FACTORY-665: a THIRD source joins `"environment"`/`"default"` —
+ * `"file"` means the value came from `settings.json` (an env var was NOT
+ * set for this key; see `../settings/settings-file.ts`'s own
+ * `effectiveSettingsEnv`, which this builder's caller runs BEFORE handing
+ * it an env snapshot). `editable` is `true` exactly for the ticket's own
+ * allowlist (`isAllowlistedSettingsKey`) — the Settings page uses it to
+ * decide which rows get an edit control; nothing else changes about a
+ * non-editable row.
+ */
 export interface SettingEntryPublic {
   key: string;
   value: string | null;
-  source: "environment" | "default";
+  source: "environment" | "file" | "default";
   restartNeeded: true;
   secret: false;
+  editable: boolean;
   description: string;
 }
 
 export interface SettingEntrySecret {
   key: string;
   set: boolean;
-  source: "environment" | "default";
+  source: "environment" | "file" | "default";
   restartNeeded: true;
   secret: true;
+  editable: boolean;
   description: string;
 }
 
@@ -133,8 +146,17 @@ function isSecretKey(key: string): boolean {
   return SECRET_KEY_RE.test(key);
 }
 
-function sourceOf(raw: string | undefined): "environment" | "default" {
-  return raw !== undefined && raw.trim() !== "" ? "environment" : "default";
+/**
+ * `rawEnv` is the UNMERGED `process.env` (before `effectiveSettingsEnv`
+ * layered `settings.json` under it) — needed so this can tell "the env var
+ * itself is set" (`"environment"`) apart from "nothing in the real
+ * environment, but settings.json supplied a value" (`"file"`), which a
+ * single already-merged env snapshot can no longer distinguish once
+ * merged. `fileHasKey` answers that for one key.
+ */
+function sourceOf(rawEnvValue: string | undefined, fileHasKey: boolean): "environment" | "file" | "default" {
+  if (rawEnvValue !== undefined && rawEnvValue.trim() !== "") return "environment";
+  return fileHasKey ? "file" : "default";
 }
 
 /**
@@ -154,16 +176,29 @@ export function redactUrlUserinfo(value: string): string {
   return value.replace(URL_USERINFO_RE, "$1[redacted]@");
 }
 
-/** Pure: builds every entry in `SETTINGS_DEFINITIONS` from an env snapshot — no I/O. `ATLASSIAN_TOKEN_FILE` is handled by `buildAtlassianTokenFileStatus` instead, never duplicated here. */
-export function buildSettingEntries(env: Readonly<Record<string, string | undefined>>): SettingEntry[] {
+/**
+ * Pure: builds every entry in `SETTINGS_DEFINITIONS` — no I/O.
+ * `ATLASSIAN_TOKEN_FILE` is handled by `buildAtlassianTokenFileStatus`
+ * instead, never duplicated here. `effectiveEnv` is what this daemon is
+ * ACTUALLY running with (`settings.json` already layered under
+ * `process.env` by the caller — see `../settings/settings-file.ts`'s
+ * `effectiveSettingsEnv`), so `value`/`set` always reflect real behavior;
+ * `rawEnv` (defaults to `effectiveEnv`, i.e. no settings.json layer, for
+ * every pre-existing caller/test that passes only one env) is used
+ * SOLELY to compute `source`/`editable` correctly — see `sourceOf`'s own
+ * doc comment. `settingsFileValues` (default `{}`) is the exact map
+ * `loadSettingsFile(...).values` produced.
+ */
+export function buildSettingEntries(effectiveEnv: Readonly<Record<string, string | undefined>>, rawEnv: Readonly<Record<string, string | undefined>> = effectiveEnv, settingsFileValues: Readonly<Record<string, string>> = {}): SettingEntry[] {
   return SETTINGS_DEFINITIONS.map(({ key, description }) => {
-    const raw = env[key];
-    const source = sourceOf(raw);
+    const raw = effectiveEnv[key];
+    const source = sourceOf(rawEnv[key], key in settingsFileValues);
+    const editable = isAllowlistedSettingsKey(key);
     if (isSecretKey(key)) {
-      return { key, set: raw !== undefined && raw.trim() !== "", source, restartNeeded: true as const, secret: true as const, description };
+      return { key, set: raw !== undefined && raw.trim() !== "", source, restartNeeded: true as const, secret: true as const, editable, description };
     }
     const value = raw !== undefined && raw.trim() !== "" ? redactUrlUserinfo(raw) : null;
-    return { key, value, source, restartNeeded: true as const, secret: false as const, description };
+    return { key, value, source, restartNeeded: true as const, secret: false as const, editable, description };
   });
 }
 
@@ -200,7 +235,7 @@ export function isModeTooOpen(mode: number): boolean {
 export async function buildAtlassianTokenFileStatus(env: Readonly<Record<string, string | undefined>>, statFn: (path: string) => Promise<StatResult> = statTokenFile): Promise<AtlassianTokenFileStatus> {
   const path = env.ATLASSIAN_TOKEN_FILE?.trim() || null;
   const description = "Path to a file holding the Atlassian API token (preferred over ATLASSIAN_TOKEN).";
-  const source = sourceOf(env.ATLASSIAN_TOKEN_FILE);
+  const source = sourceOf(env.ATLASSIAN_TOKEN_FILE, false) === "environment" ? "environment" : "default"; // ATLASSIAN_TOKEN_FILE is never settings.json-backed, so "file" can never apply here
   if (path === null) {
     return { key: "ATLASSIAN_TOKEN_FILE", path: null, source, restartNeeded: true, secret: false, description, exists: false, readable: false, mode: null, tooOpen: null };
   }
@@ -219,13 +254,23 @@ export async function buildAtlassianTokenFileStatus(env: Readonly<Record<string,
   };
 }
 
-export async function buildSettingsApiResponse(env: Readonly<Record<string, string | undefined>>, deps: { statFn?: (path: string) => Promise<StatResult>; unitHint?: () => Promise<UnitHint | undefined> } = {}): Promise<SettingsApiResponse> {
+/**
+ * `rawEnv` (default `env`, i.e. no settings.json layer — every pre-
+ * existing caller/test keeps working unchanged) and `settingsFileValues`
+ * (default `{}`) are FACTORY-665's additions — see `buildSettingEntries`'s
+ * own doc comment for exactly what they're for. `env` itself is expected
+ * to already be the EFFECTIVE env (settings.json layered under
+ * `process.env`, `../settings/settings-file.ts`'s `effectiveSettingsEnv`)
+ * when the caller has one; `src/daemon/index.ts` is the one production
+ * caller that does.
+ */
+export async function buildSettingsApiResponse(env: Readonly<Record<string, string | undefined>>, deps: { statFn?: (path: string) => Promise<StatResult>; unitHint?: () => Promise<UnitHint | undefined>; rawEnv?: Readonly<Record<string, string | undefined>>; settingsFileValues?: Readonly<Record<string, string>> } = {}): Promise<SettingsApiResponse> {
   const [atlassianTokenFile, unitHint] = await Promise.all([
     buildAtlassianTokenFileStatus(env, deps.statFn),
     deps.unitHint ? deps.unitHint() : Promise.resolve(undefined),
   ]);
   return {
-    settings: buildSettingEntries(env),
+    settings: buildSettingEntries(env, deps.rawEnv ?? env, deps.settingsFileValues ?? {}),
     atlassianTokenFile,
     ...(unitHint ? { unitHint } : {}),
   };

@@ -115,7 +115,7 @@ describe("GET /api/settings", () => {
   test("all guards pass: 200, Cache-Control: no-store, exact body from settings()", async () => {
     const guard = { port: 0 };
     const body: SettingsApiResponse = {
-      settings: [{ key: "BUTCHR_PORT", value: "7717", source: "environment", restartNeeded: true, secret: false, description: "d" }],
+      settings: [{ key: "BUTCHR_PORT", value: "7717", source: "environment", restartNeeded: true, secret: false, editable: false, description: "d" }],
       atlassianTokenFile: emptySettings.atlassianTokenFile,
     };
     const { app, headers } = startApp({ dashboardOriginGuard: guard, peerUidCheck: () => true, settings: async () => body });
@@ -131,7 +131,7 @@ describe("GET /api/settings", () => {
     const guard = { port: 0 };
     const leakSentinel = "sentinel-secret-should-never-leak";
     const body: SettingsApiResponse = {
-      settings: [{ key: "ATLASSIAN_TOKEN", set: true, source: "environment", restartNeeded: true, secret: true, description: "d" }],
+      settings: [{ key: "ATLASSIAN_TOKEN", set: true, source: "environment", restartNeeded: true, secret: true, editable: false, description: "d" }],
       atlassianTokenFile: emptySettings.atlassianTokenFile,
     };
     const { app, headers } = startApp({ dashboardOriginGuard: guard, peerUidCheck: () => true, settings: async () => body });

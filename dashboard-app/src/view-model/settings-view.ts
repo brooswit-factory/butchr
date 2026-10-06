@@ -9,14 +9,19 @@ export interface SettingRowView {
   key: string;
   /** Already the exact text to render — "set" / "not set" for a secret, the literal value or "(default)" otherwise. Never the raw secret. */
   displayValue: string;
-  source: "environment" | "default";
+  source: "environment" | "file" | "default";
   restartNeeded: boolean;
+  /** FACTORY-665: `true` exactly for the editable allowlist — the row gets an edit control when this is true. */
+  editable: boolean;
+  /** FACTORY-665: the raw current value for an editable, non-secret key (empty string when unset) — what the edit control's input is pre-filled with. `null` for a non-editable or secret row (never offered an edit control, so never needs one). */
+  rawValue: string | null;
   description: string;
 }
 
 export function settingRowView(entry: SettingEntry): SettingRowView {
   const displayValue = entry.secret ? (entry.set ? "set" : "not set") : entry.value ?? "(default)";
-  return { key: entry.key, displayValue, source: entry.source, restartNeeded: entry.restartNeeded, description: entry.description };
+  const rawValue = !entry.secret && entry.editable ? entry.value ?? "" : null;
+  return { key: entry.key, displayValue, source: entry.source, restartNeeded: entry.restartNeeded, editable: entry.editable, rawValue, description: entry.description };
 }
 
 export interface TokenFileView {
