@@ -174,6 +174,8 @@ test('GET with no Mcp-Session-Id => 405 (not 400), JSON body — the status the 
  expect(res.status).toBe(405);
  expect(res.headers.get('content-type')).toContain('application/json');
  expect((await res.json()) as any).toMatchObject({jsonrpc:'2.0',error:{message:expect.any(String)}});
+ // FACTORY-697 pre-review #5: listing the rejected method in Allow is self-contradictory to a strict client.
+ expect(res.headers.get('allow')).toBe('POST, DELETE');
 });
 
 test('FACTORY-696/697/698 regression: a client holding its PRE-restart Mcp-Session-Id completes a real tools/call with no re-initialize, no 404, and an unchanged session id',async()=>{
@@ -203,7 +205,8 @@ test('FACTORY-696/697/698 regression: a client holding its PRE-restart Mcp-Sessi
  const res=await app2.handle(toolsCallReq);
  expect(res.status).toBe(200); // not 404 — the whole point of the fix
  const returnedSessionId=res.headers.get('mcp-session-id');
- if(returnedSessionId!==null)expect(returnedSessionId).toBe(staleSessionId!); // the client must never see a DIFFERENT id than the one it's holding
+ // the real contract, checked unconditionally: the client must never see a session id other than its own.
+ expect(returnedSessionId===null||returnedSessionId===staleSessionId).toBe(true);
  const text=await res.text();
  expect(text).toContain('project-P'); // a REAL tools/call reached the real upstream server, through the gen-2 proxy
 
@@ -213,6 +216,37 @@ test('FACTORY-696/697/698 regression: a client holding its PRE-restart Mcp-Sessi
  expect(res2.status).toBe(200);
 
  await client1.close().catch(()=>{}); // against gen1's own (still-open) registry; harmless either way
+});
+
+test('rewriteSessionHeader: a post-adoption response carrying the PROXY-minted Mcp-Session-Id is rewritten to the client\'s own id',async()=>{
+ // What would make this fail: if rewriteSessionHeader were a no-op (e.g. `return response` unconditionally),
+ // the header asserted below would come back as the PROXY's id, not the client's — this test would then fail
+ // at the `toBe(staleSessionId)` assertion. Confirmed by temporarily reverting rewriteSessionHeader to a no-op
+ // and observing exactly that failure.
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId!;
+
+ // A new generation (adoption required) so the proxy mints a session id that DIFFERS from the client's.
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec);
+
+ const res=await app2.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId},
+  body:JSON.stringify({jsonrpc:'2.0',id:'r1',method:'tools/call',params:{name:'identity',arguments:{}}})}));
+ expect(res.status).toBe(200);
+
+ const bindings=((registry2 as unknown) as {connections:Map<string,{sessions:{clientToProxy:Map<string,string>}}>}).connections.get(f.spec.key+'/chat')!.sessions.clientToProxy;
+ const proxySessionId=bindings.get(staleSessionId);
+ expect(proxySessionId).toBeTruthy(); // adoption actually happened
+ expect(proxySessionId).not.toBe(staleSessionId); // and minted a DIFFERENT id — the only case rewrite has anything to do
+ expect(res.headers.get('mcp-session-id')).toBe(staleSessionId); // the client only ever sees its own id
+ expect(res.headers.get('mcp-session-id')).not.toBe(proxySessionId);
+
+ await client1.close().catch(()=>{});
 });
 
 test('a malformed Mcp-Session-Id (not visible-ASCII, or over the length bound) is rejected with 400 JSON — never forwarded or adopted',async()=>{
@@ -278,6 +312,24 @@ test('a successful DELETE drops the client-to-proxy session binding — clientTo
  await client1.close().catch(()=>{});
 });
 
+test('FACTORY-697 pre-review #4: clientToProxy is capped — the connection abandoned without a DELETE (the realistic restart case) still cannot grow the map without bound',async()=>{
+ // A real restart leaves no DELETE behind (see the regression test's own comment to that effect), so DELETE
+ // pruning alone cannot bound this map — exercises `bindSession`'s own eviction, oldest-first.
+ const f=await fixture();await f.registry.prepare(f.spec);
+ type SessionsShape={clientToProxy:Map<string,string>;pending:Map<string,Promise<string>>};
+ const sessions=((f.registry as unknown) as {connections:Map<string,{sessions:SessionsShape}>}).connections.get(f.spec.key+'/chat')!.sessions;
+ const bindSession=(f.registry as unknown as {bindSession(sessions:SessionsShape,clientSessionId:string,proxySessionId:string):void}).bindSession.bind(f.registry);
+ const MAX_BOUND_SESSIONS=10_000; // kept in sync with the private constant in resource-connections.ts
+ for(let i=0;i<MAX_BOUND_SESSIONS;i++)bindSession(sessions,`client-${i}`,`proxy-${i}`);
+ expect(sessions.clientToProxy.size).toBe(MAX_BOUND_SESSIONS);
+ expect(sessions.clientToProxy.has('client-0')).toBe(true); // not yet evicted, still at the cap
+
+ bindSession(sessions,'client-one-more','proxy-one-more'); // pushes past the cap — no DELETE involved
+ expect(sessions.clientToProxy.size).toBe(MAX_BOUND_SESSIONS); // never exceeds the cap
+ expect(sessions.clientToProxy.has('client-0')).toBe(false); // oldest entry evicted
+ expect(sessions.clientToProxy.has('client-one-more')).toBe(true); // newest entry retained
+});
+
 test('concurrent requests for the same unknown/stale Mcp-Session-Id single-flight the gateway-initiated initialize — exactly one, not one per request',async()=>{
  const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
  const client1=new Client({name:'test',version:'1'},{capabilities:{}});
@@ -303,6 +355,66 @@ test('concurrent requests for the same unknown/stale Mcp-Session-Id single-fligh
   expect(initializeCalls).toBe(1); // three racing requests, one adoption
  } finally { globalThis.fetch=origFetch; }
  await client1.close().catch(()=>{});
+});
+
+test('single-flight hole (FACTORY-697 pre-review #3): the clientToProxy binding is recorded BEFORE pending is cleared, so no request can see both empty',async()=>{
+ // What would make this fail: on the pre-fix code, `.finally(() => pending.delete(...))` ran on the INNER
+ // initialize promise, settling (and thus clearing `pending`) strictly before the outer `await promise`
+ // resumed to run `clientToProxy.set(...)` on the next line — so a request arriving in that window would see
+ // `pending` empty AND `clientToProxy` unset, and start a second `initialize`. Confirmed by temporarily
+ // reverting adoptSession to that shape and observing `bindingPresentAtDeleteTime` come back false below.
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId!;
+
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec);
+
+ const conn=((registry2 as unknown) as {connections:Map<string,{sessions:{pending:Map<string,Promise<string>>;clientToProxy:Map<string,string>}}>}).connections.get(f.spec.key+'/chat')!;
+ const originalDelete=conn.sessions.pending.delete.bind(conn.sessions.pending);
+ let bindingPresentAtDeleteTime:boolean|undefined;
+ conn.sessions.pending.delete=(key:string)=>{
+  bindingPresentAtDeleteTime=conn.sessions.clientToProxy.has(key); // snapshot the invariant at the exact instant pending is cleared
+  return originalDelete(key);
+ };
+
+ const res=await app2.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId},
+  body:JSON.stringify({jsonrpc:'2.0',id:'r1',method:'tools/call',params:{name:'identity',arguments:{}}})}));
+ expect(res.status).toBe(200);
+ expect(bindingPresentAtDeleteTime).toBe(true); // the binding must already exist the instant `pending` is cleared — never a window with both empty
+
+ await client1.close().catch(()=>{});
+});
+
+test('FACTORY-697 pre-review #1: a FAILING adoption (gateway-initiated initialize itself fails) is 503 + Retry-After, not a terminal 502 — mirrors the FACTORY-691 idiom',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ // A fake proxy: 404 "Unknown session" for any request carrying a session id (so forward() attempts adoption),
+ // but 500 for the adoption's own gateway-initiated `initialize` (no session id yet) — simulating a transient
+ // failure DURING recovery itself, distinct from "upstream is down" (which the proxy would instead answer with
+ // its own non-404 and `forward()` passes through without attempting adoption at all).
+ const fakeServer=Bun.serve({hostname:'127.0.0.1',port:0,fetch(request){
+  return request.headers.has('mcp-session-id')
+   ? new Response('Unknown session',{status:404})
+   : new Response('Internal error',{status:500});
+ }});
+ cleanup.push(async()=>{await fakeServer.stop(true);});
+ const conn=((f.registry as unknown) as {connections:Map<string,{proxy:{url:string;headers:{Authorization:string}}}>}).connections.get(f.spec.key+'/chat')!;
+ const originalProxy=conn.proxy;
+ conn.proxy={url:`http://127.0.0.1:${fakeServer.port}/mcp`,headers:{Authorization:'Bearer fake-secret'}};
+ try {
+  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'deadbeef-dead-beef-dead-beefdeadbeef'},
+   body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'identity',arguments:{}}})}));
+  // What would make this fail: the pre-fix code returns 502 here (jsonError(502,...)), which is exactly what
+  // this test guards against — a transient recovery failure must never look terminal to the client.
+  expect(res.status).toBe(503);
+  expect(res.headers.get('retry-after')).toBe('2');
+  expect(res.headers.get('content-type')).toContain('application/json');
+  expect((await res.json() as any).error.message).toContain('Upstream session recovery failed');
+ } finally { conn.proxy=originalProxy; }
 });
 
 test('upstream genuinely down is passed straight through (JSON-ified), never adopted or masked as a session problem',async()=>{
