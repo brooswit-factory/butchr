@@ -139,6 +139,24 @@ describe("reportPersistedAgentSessions (FACTORY-714/FACTORY-713/FACTORY-704 re-a
     }
   });
 
+  // PR #676 review round 1 (BLOCKING): `herdr.agent.list()` rejecting used
+  // to be an unhandled promise rejection — this function is called `void`
+  // fire-and-forget at daemon startup (src/daemon/index.ts) specifically
+  // because it is documented to never throw, and startup is exactly when
+  // herdr is least likely to be fully ready yet.
+  test("herdr.agent.list() rejecting is caught, logged, and returns the zeroed result — never throws", async () => {
+    const herdr: ReportAgentSessionsHerdr = {
+      agent: { async list() { throw new Error("herdr not ready yet"); } },
+      pane: { async reportAgentSession() { return {}; } },
+    };
+    const logs: string[] = [];
+
+    const result = await reportPersistedAgentSessions({ herdr, log: (l) => logs.push(l) });
+
+    expect(result).toEqual({ reported: 0, alreadyRegistered: 0, noPersistedId: 0 });
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("herdr not ready yet"))).toBe(true);
+  });
+
   test("a mix of all shapes in one sweep produces the truthful summary log line", async () => {
     const root = mkdtempSync(join(tmpdir(), "report-agent-sessions-"));
     try {

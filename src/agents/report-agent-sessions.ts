@@ -87,10 +87,27 @@ export interface ReportPersistedAgentSessionsResult {
  * for `workspace.reportMetadata`: one pane's herdr call failing must not
  * abort the sweep for every other pane, and this function has no spawn of
  * its own to fail.
+ *
+ * REVIEW FIX (PR #676, round 1): `deps.herdr.agent.list()` itself is now
+ * INSIDE the same try/catch, not just the per-pane `reportAgentSession`
+ * call below. This function is called `void`-fire-and-forget at daemon
+ * startup (src/daemon/index.ts) specifically BECAUSE it is documented to
+ * never throw — the exact moment it runs (daemon startup) is also the
+ * exact moment herdr is least likely to be fully ready, so a rejecting
+ * `list()` here is not a hypothetical, it is the likely failure mode. Before
+ * this fix, that rejection was an unhandled promise rejection with the
+ * potential to crash the daemon at startup — the one thing this function's
+ * own doc comment above promised would never happen.
  */
 export async function reportPersistedAgentSessions(deps: { herdr: ReportAgentSessionsHerdr; log?: (line: string) => void }): Promise<ReportPersistedAgentSessionsResult> {
   const result: ReportPersistedAgentSessionsResult = { reported: 0, alreadyRegistered: 0, noPersistedId: 0 };
-  const { agents } = await deps.herdr.agent.list();
+  let agents: readonly results.AgentInfo[];
+  try {
+    agents = (await deps.herdr.agent.list()).agents;
+  } catch (e) {
+    deps.log?.(`WARNING: [agent-session-report] herdr.agent.list() failed: ${(e as Error)?.message ?? e}`);
+    return result;
+  }
   for (const a of agents) {
     if (a.launch_pending) continue;
     if (a.agent_session) { result.alreadyRegistered++; continue; }
