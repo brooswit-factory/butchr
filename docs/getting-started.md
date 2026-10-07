@@ -8,8 +8,8 @@ This guide takes you from nothing to one working rule.
 
 | Requirement | Why |
 | --- | --- |
-| Linux or macOS | Linux uses systemd user services, macOS uses launchd, to keep the daemon (and herdr) running. Windows runs butchr inside WSL; see [windows-wsl-agent-guide.md](windows-wsl-agent-guide.md). |
-| [Bun](https://bun.sh) | runs the daemon and builds the dashboard |
+| Linux or macOS | Linux uses systemd user services, macOS uses launchd, to keep the daemon (and herdr) running. On Windows, install inside WSL (Linux/systemd path, see [windows-wsl-host.md](windows-wsl-host.md)) or natively, no WSL (see [windows-native-host.md](windows-native-host.md)). |
+| [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`) | runs the daemon and builds the dashboard |
 | `git` | to download butchr |
 | herdr, already running and on the daemon's `PATH` | the terminal manager each agent runs in — see "Installing herdr" below |
 | The `claude` command-line tool, signed in | the default agent provider (Codex is also supported, see [agent-providers.md](agent-providers.md)) — see "Installing the `claude` tool" below |
@@ -163,7 +163,7 @@ Then create `~/Library/LaunchAgents/butchr.plist`, adjusting the paths:
 </dict></plist>
 ```
 
-Load both, herdr first: `launchctl load ~/Library/LaunchAgents/herdr.plist && launchctl load ~/Library/LaunchAgents/butchr.plist`.
+Load both, herdr first: `launchctl load ~/Library/LaunchAgents/herdr.plist && launchctl load ~/Library/LaunchAgents/butchr.plist`. launchd has no equivalent of systemd's `After=`/`Wants=` ordering, so if butchr's agent happens to start before herdr's, it refuses to start and relies on `KeepAlive` to retry it — expect a few failed/retried launches right after login, not a stuck state.
 
 launchd has no equivalent of the dashboard's Settings → **Restart** control (that only works when butchr detects it is running under systemd, today). Restart the daemon yourself instead: `launchctl kickstart -k gui/$(id -u)/butchr` (match the label to your plist's `Label`, and use `/herdr` the same way for herdr). Do this after any settings change, and as the last step of rotating your Jira token — mint a fresh setup code first (the `kill -USR2`/log step from "2. Start the daemon" above), paste it into the Settings page, then kick-start.
 
