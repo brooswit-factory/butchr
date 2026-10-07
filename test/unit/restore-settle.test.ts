@@ -1,10 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { RestoreSettleGate, hasResumableTranscript } from "../../src/agents/restore-settle.js";
-import { persistDiscoveredSessionId, claudeTranscriptExists } from "../../src/agents/workspace.js";
+import { persistDiscoveredSessionId, claudeTranscriptExists, ensureWorkspaceDir } from "../../src/agents/workspace.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import type { Herd, SpawnSpec } from "../../src/agents/herd.js";
 
 const spec = (key: string): SpawnSpec => ({ key, issuetype: "Task", summary: "s", parent: null });
@@ -164,6 +165,138 @@ describe("RestoreSettleGate (FACTORY-710)", () => {
       rmSync(home, { recursive: true, force: true });
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  // FACTORY-713/FACTORY-704 (reopened) acceptance item 4 — `hasResumableTranscript`
+  // asserted against a REAL managed-session-shaped key with the REAL
+  // implementation (never the `hasResumableTranscript` injection seam):
+  // `workspaceDirFor(spec.key)` -> `decodeAnyAgentKey` must resolve a real
+  // per-key directory for an id shaped exactly like `ownsManagedSessionAgent`
+  // requires (`resourceProvider: "filesystem", ruleId: "managed-sessions"`),
+  // and a `.butchr-session-id.json` dropped there (the SAME file
+  // `persistDiscoveredSessionId` writes, and `workspaceSessionId` reads) must
+  // make `hasResumableTranscript` see it as resumable. If this resolution had
+  // failed, the fix would be a no-op that still passes every fake-herdr test
+  // in this file — this is the test that would have caught that.
+  test("real hasResumableTranscript() against a REAL managed-session-shaped key: resolves a real per-key workspace dir, true once a session id + transcript exist there", () => {
+    const root = mkdtempSync(join(tmpdir(), "restore-settle-workspaces-"));
+    const prevWorkspaces = process.env.BUTCHR_WORKSPACES;
+    process.env.BUTCHR_WORKSPACES = root;
+    // `hasResumableTranscript` is the REAL, un-injected implementation — it
+    // calls `claudeTranscriptExists`/`claudeProjectDir` with NO `home`
+    // override, which default to `os.homedir()`. Bun caches `homedir()` at
+    // process start (confirmed: setting `process.env.HOME` mid-test has no
+    // effect on it, unlike Node), so this test cannot redirect that default
+    // — it uses the REAL home's `.claude/projects/` tree instead, writing a
+    // transcript under a name derived from THIS test's own mkdtemp'd
+    // workspace dir (collision-safe) and removing it again in `finally`.
+    const projectDir = join(homedir(), ".claude", "projects", resolve(join(root, "filesystem", "managed-sessions", "buddy")).replace(/[^a-zA-Z0-9]/g, "-"));
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/buddy.json" });
+      const dir = ensureWorkspaceDir(key, root);
+      expect(dir).toBe(join(root, "filesystem", "managed-sessions", "buddy"));
+      const spec: SpawnSpec = { key, issuetype: "Task", summary: "s", parent: null };
+
+      // No session id persisted yet: not resumable.
+      expect(hasResumableTranscript(spec)).toBe(false);
+
+      const sessionId = "session-real-managed";
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(projectDir, `${sessionId}.jsonl`), "{}");
+      persistDiscoveredSessionId(dir, sessionId);
+
+      // The actual claim: workspaceDirFor/decodeAnyAgentKey resolved a REAL
+      // per-key directory for this managed-session-shaped id, and the real
+      // hasResumableTranscript() (no seam) sees the transcript dropped there.
+      expect(hasResumableTranscript(spec)).toBe(true);
+    } finally {
+      process.env.BUTCHR_WORKSPACES = prevWorkspaces;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("RestoreSettleGate per-scope state (FACTORY-713/FACTORY-704 reopened)", () => {
+  // Acceptance item 2 — the director's reopen instructed ONE shared gate
+  // instance across the issue loop and the managed-sessions loop. Taken
+  // literally (a single un-scoped `lastRunning`/`settled`/etc.), that makes
+  // the gate alternate between two disjoint `running` sets on every poll and
+  // NEVER settle by stability — see `RestoreSettleGate`'s own class doc
+  // comment. This test drives ONE shared gate instance exactly the way
+  // production does (two scopes, interleaved polls, disjoint running sets)
+  // and asserts the managed-sessions scope settles by STABILITY, never
+  // falling through to the bounded wait — the assertion that would catch a
+  // regression back to the literal single-episode reading.
+  test("one shared gate instance, two interleaved loops with disjoint running sets: each scope settles independently by stability, never the bounded wait", () => {
+    const issueLogs: string[] = [];
+    const sessionLogs: string[] = [];
+    const gate = new RestoreSettleGate({
+      boundMs: 60_000, // generous — a regression to the shared-episode bug would still need 60s+ to release; this test proves settle happens WITHOUT ever touching the bound.
+      hasResumableTranscript: (s) => s.key === "ISSUE-RESUMABLE" || s.key === "buddy",
+      log: (l) => (l.includes("managed-sessions") ? sessionLogs : issueLogs).push(l),
+    });
+    const issueSpecs = new Map([["ISSUE-RESUMABLE", { key: "ISSUE-RESUMABLE", issuetype: "Task", summary: "s", parent: null } satisfies SpawnSpec]]);
+    const sessionSpecs = new Map([["buddy", { key: "buddy", issuetype: "Task", summary: "s", parent: null } satisfies SpawnSpec]]);
+
+    // Poll 1, both scopes: herdr has listed nothing for either yet (disjoint empty sets either way).
+    expect(gate.filter(["ISSUE-RESUMABLE"], [], issueSpecs, "issue")).toEqual([]);
+    expect(gate.filter(["buddy"], [], sessionSpecs, "managed-sessions")).toEqual([]);
+
+    // Poll 2, interleaved: herdr's restore populates DIFFERENT, disjoint sets
+    // for each scope — exactly the shape the literal shared-instance reading
+    // could never tell apart from churn.
+    expect(gate.filter([], ["ISSUE-RESUMABLE"], issueSpecs, "issue")).toEqual([]);
+    expect(gate.filter([], ["buddy"], sessionSpecs, "managed-sessions")).toEqual([]);
+    expect(issueLogs).toEqual([]);
+    expect(sessionLogs).toEqual([]); // not yet stable across TWO consecutive polls of either scope's OWN running set
+
+    // Poll 3, interleaved again: each scope's running set is identical to
+    // its own poll 2 — stable, by its OWN history, never compared to the
+    // other scope's disjoint set.
+    expect(gate.filter([], ["ISSUE-RESUMABLE"], issueSpecs, "issue")).toEqual([]);
+    expect(gate.filter([], ["buddy"], sessionSpecs, "managed-sessions")).toEqual([]);
+
+    expect(issueLogs).toEqual(["[restore-settle:issue] 1 resumed, 0 fresh"]);
+    expect(sessionLogs).toEqual(["[restore-settle:managed-sessions] 1 resumed, 0 fresh"]);
+    // Neither log line mentions a WARNING/bounded-wait fallback — both
+    // settled by stability alone, well inside the generous 60s bound.
+    expect(issueLogs.some((l) => l.includes("WARNING"))).toBe(false);
+    expect(sessionLogs.some((l) => l.includes("WARNING"))).toBe(false);
+  });
+
+  // One scope settling/releasing must not release the other scope's held
+  // candidates — the OTHER half of acceptance item 2. The issue scope
+  // settles immediately (its own running set is already non-empty and
+  // stable from poll 1); the managed-sessions scope's candidate must stay
+  // held regardless, across many more issue-scope polls, until ITS OWN
+  // running set stabilizes.
+  test("the issue scope settling (and repeatedly re-filtering afterward) never releases a held managed-sessions candidate", () => {
+    const gate = new RestoreSettleGate({
+      boundMs: 60_000,
+      hasResumableTranscript: (s) => s.key === "buddy",
+    });
+    const issueSpecs = new Map<string, SpawnSpec>();
+    const sessionSpecs = new Map([["buddy", { key: "buddy", issuetype: "Task", summary: "s", parent: null } satisfies SpawnSpec]]);
+
+    // Issue scope: nothing ever needed gating there — settles trivially (the "ordinary poll" no-op path) on its very first call.
+    expect(gate.filter([], ["ISSUE-OTHER"], issueSpecs, "issue")).toEqual([]);
+    expect(gate.filter([], ["ISSUE-OTHER"], issueSpecs, "issue")).toEqual([]);
+
+    // Managed-sessions scope: buddy is resumable and herdr has not listed it yet.
+    expect(gate.filter(["buddy"], [], sessionSpecs, "managed-sessions")).toEqual([]);
+
+    // Drive many more issue-scope polls (its own settle/no-op path) — none
+    // of this is evidence for the managed-sessions scope's stability.
+    for (let i = 0; i < 5; i++) {
+      expect(gate.filter([], ["ISSUE-OTHER"], issueSpecs, "issue")).toEqual([]);
+      expect(gate.filter(["buddy"], [], sessionSpecs, "managed-sessions")).toEqual([]); // still held — herdr still hasn't listed it
+    }
+
+    // Now herdr's own restore actually lists buddy — resumed, not fresh-spawned.
+    sessionSpecs; // (no change needed — resolved via `running`, not specs)
+    expect(gate.filter([], ["buddy"], sessionSpecs, "managed-sessions")).toEqual([]);
+    expect(gate.filter([], ["buddy"], sessionSpecs, "managed-sessions")).toEqual([]); // stable now — settles
   });
 });
 

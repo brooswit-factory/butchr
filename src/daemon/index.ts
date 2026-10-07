@@ -100,7 +100,7 @@ import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
-import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
+import { MANAGED_SESSIONS_POLL_MS, MANAGED_SESSIONS_RESTORE_SETTLE_SCOPE, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
@@ -1812,15 +1812,22 @@ const issueResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
-// FACTORY-710/FACTORY-708/FACTORY-704 — ONE instance for this daemon
-// process's whole life (see `RestoreSettleGate`'s own doc comment for why
-// it deliberately never re-arms after its first settle), wired into the
-// ISSUE loop only below — the project tier has no Claude transcript to
-// resume.
+// FACTORY-710/FACTORY-708/FACTORY-704/FACTORY-713 — ONE instance for this
+// daemon process's whole life (see `RestoreSettleGate`'s own doc comment
+// for why it deliberately never re-arms after its first settle), wired
+// into BOTH the ISSUE loop below AND the managed-sessions loop
+// (`startManagedSessionsLoop`, below) — each supplying its own
+// `restoreSettleScope` so the two loops' disjoint `running` sets are never
+// compared against each other (see `RestoreSettleGate`'s class doc comment
+// for why a literal single shared, un-scoped episode would make the gate
+// behave WORSE than no gate at all). The project tier stays unwired — it
+// has no Claude transcript to resume (FACTORY-711).
 const restoreSettleGate = new RestoreSettleGate({
   boundMs: config.restoreSettleBoundMs,
   log: (line) => console.error(`  ${line}`),
 });
+/** FACTORY-713 — this daemon's own scope id for the issue loop's `restoreSettleGate` episode; see that construction's own comment. */
+const RESTORE_SETTLE_SCOPE_ISSUE = "issue";
 // BUTCHR-352: the issue tier's own admission census bucket — the SAME
 // `admissionController` instance the issue/project `runResourceLoop` calls
 // below already share (see that construction's own comment for why one
@@ -2019,6 +2026,7 @@ runResourceLoop(ruleResourceType, {
   checkReap: issueReaper.check,
   checkResidency: issueResidencyGuard.filter,
   restoreSettleGate,
+  restoreSettleScope: RESTORE_SETTLE_SCOPE_ISSUE,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
@@ -2173,6 +2181,12 @@ startManagedSessionsLoop({
   resolvedAgents: managedSessionResolvedAgents,
   lizardModes: managedSessionLizardModes,
   account: accountLifecycle,
+  // FACTORY-713/FACTORY-704 (reopened) — the SAME `restoreSettleGate`
+  // instance the issue loop above uses; see that construction's own
+  // comment and `ManagedSessionsLoopDeps.restoreSettleGate`'s doc comment
+  // (src/daemon/session-definitions-loop.ts) for why sharing the instance
+  // is safe here (this loop supplies its own scope internally).
+  restoreSettleGate,
   herd,
   deliver: async (agent, resource, msg) => {
     void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));

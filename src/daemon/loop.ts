@@ -447,6 +447,17 @@ export interface ReconcileOptions {
    */
   restoreSettleGate?: RestoreSettleGate;
   /**
+   * FACTORY-713 — which of `restoreSettleGate`'s per-scope episodes this
+   * call's `running`/`candidates` belong to. See `RestoreSettleGate`'s own
+   * doc comment for why this must be unique per caller sharing one gate
+   * instance (e.g. `"issue"` vs. `"managed-sessions"`, src/daemon/index.ts):
+   * two callers that pass the SAME scope, or omit it, share one episode's
+   * stability comparison — correct only when `running` for both is the
+   * same herd namespace. Optional; omitted, `RestoreSettleGate.filter`'s own
+   * default scope is used (today's exact single-loop behaviour).
+   */
+  restoreSettleScope?: string;
+  /**
    * BUTCHR-297 (§B4): reports which of THIS poll's admitted candidates
    * actually SUCCEEDED their spawn — see src/agents/admission.ts's own top-
    * comment B4 addendum for why admission and running are different events
@@ -665,7 +676,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // never re-fetches it, so the existing "herd.runningIssues() rejects =>
   // nothing spawns" property (this function's own top comment) is completely
   // untouched: a rejection there already threw before this line is reached.
-  if (opts.restoreSettleGate) live = opts.restoreSettleGate.filter(live, running, desired);
+  if (opts.restoreSettleGate) live = opts.restoreSettleGate.filter(live, running, desired, opts.restoreSettleScope);
   // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
   // spawn loop below, and is the ONE hook in this function that actually
   // replaces its input rather than merely observing it — see
@@ -1139,8 +1150,10 @@ export interface GenericLoopDeps<T> {
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  /** FACTORY-710: see `ReconcileOptions.restoreSettleGate`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the ISSUE loop only (src/daemon/index.ts) — the project tier's own agents have no Claude transcript to resume and nothing in its herd namespace is ever `isHerdrRestoredPane`-shaped. Optional; omitted, no settle gate runs (every caller before this ticket). */
+  /** FACTORY-710/FACTORY-713: see `ReconcileOptions.restoreSettleGate`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the ISSUE loop and the MANAGED-SESSIONS loop (src/daemon/index.ts), as the SAME shared instance — see `RestoreSettleGate`'s own doc comment for why that is safe only because each caller also supplies its own `restoreSettleScope` below. The project tier stays unwired — its own agents have no Claude transcript to resume and nothing in its herd namespace is ever `isHerdrRestoredPane`-shaped (FACTORY-711). Optional; omitted, no settle gate runs (every caller before FACTORY-710). */
   restoreSettleGate?: RestoreSettleGate;
+  /** FACTORY-713: see `ReconcileOptions.restoreSettleScope`'s doc comment — threaded straight through to `reconcileNow` below. REQUIRED whenever `restoreSettleGate` is shared by more than one `runResourceLoop` caller (the issue loop passes `"issue"`, the managed-sessions loop passes `"managed-sessions"` — src/daemon/index.ts) — two callers sharing a gate but omitting this, or passing the same value, would compare one loop's `running` against another's, exactly the hazard `RestoreSettleGate`'s own doc comment describes. Optional; omitted, `RestoreSettleGate.filter`'s own default scope is used. */
+  restoreSettleScope?: string;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
   /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
@@ -1244,6 +1257,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.restoreSettleGate ? { restoreSettleGate: deps.restoreSettleGate } : {}),
+        ...(deps.restoreSettleScope !== undefined ? { restoreSettleScope: deps.restoreSettleScope } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),

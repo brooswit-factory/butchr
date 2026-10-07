@@ -105,6 +105,38 @@ const DEFAULT_BOUND_MS = 60_000;
  * held id now running" (resumed-detection, and `hasResumableTranscript`'s
  * own exclusion check), since that question is about the id itself, not
  * about what it implies for the stability signal.
+ *
+ * FACTORY-713/FACTORY-704 — PER-SCOPE STATE. `filter()` takes a `scope`
+ * (default `DEFAULT_SCOPE`), and every field below that used to be a single
+ * value for the whole gate (`settled`, `episodeStartedAt`, `lastRunning`,
+ * `everHeld`, `held`, `selfReleasedIds`) is now keyed by that scope in
+ * `episodes`, lazily created on first use. This is "one instance per daemon
+ * process" (the class's own long-standing discipline, directly above) —
+ * NOT "one instance per loop" — but each loop's settle decision is
+ * independent of every other loop's.
+ *
+ * This exists because the literal reading of "one shared instance" — a
+ * single un-scoped set of the fields above, shared by the issue loop and
+ * the managed-sessions loop — makes the gate behave WORSE than no gate at
+ * all. `runResourceLoop` hands this class a `running` array already scoped
+ * to that loop's own ids (`scopedHerd`'s `ownsId` filter, src/daemon/loop.ts)
+ * — the issue loop's and the managed-sessions loop's `running` sets are
+ * always disjoint. Both loops poll on the same 15s cadence, so they
+ * interleave rather than coincide. A single shared `lastRunning` would
+ * therefore alternate between two disjoint sets almost every poll:
+ * `setsEqual` is false essentially always, so the gate would never settle
+ * by stability — only ever via the 60s bounded wait — on EVERY boot,
+ * holding every resumable definition for the full bound before
+ * fresh-spawning exactly what it exists to protect. A single shared
+ * `settled` is worse still: it latches permanently once EITHER loop
+ * resolves, silently opening the gate for the other loop before that one
+ * has observed anything of its own. Keying `episodes` by scope gives each
+ * loop its own `lastRunning`/`settled`/`everHeld`/`held`/`selfReleasedIds`,
+ * so a comparison is never made between one loop's `running` and another's,
+ * and one loop's progress can never release another loop's held
+ * candidates — while still being the one object the daemon constructs once
+ * per boot, which is what "decide the settle once per boot" actually asked
+ * for.
  */
 export class RestoreSettleGate {
   private readonly boundMs: number;
@@ -112,21 +144,7 @@ export class RestoreSettleGate {
   private readonly log: ((line: string) => void) | undefined;
   private readonly hasResumableTranscript: (spec: SpawnSpec) => boolean;
 
-  private settled = false;
-  private episodeStartedAt: number | undefined;
-  private lastRunning: ReadonlySet<string> | undefined;
-  /** Ids ever held this episode, including ones later resolved by `running` catching up (resumed). */
-  private everHeld = new Set<string>();
-  /** Ids CURRENTLY held — still absent from `running`, still waiting. */
-  private held = new Set<string>();
-  /**
-   * Every id this gate has itself returned from `filter()` so far (spawned
-   * immediately, resumed-and-passed-through, or released on settle) — see
-   * this class's own doc comment (review round 2). Excluded from `running`
-   * before the empty/stable checks so butchr's own spawns never masquerade
-   * as herdr's restore progress.
-   */
-  private selfReleasedIds = new Set<string>();
+  private readonly episodes = new Map<string, Episode>();
 
   constructor(opts: RestoreSettleGateOptions = {}) {
     this.boundMs = opts.boundMs ?? DEFAULT_BOUND_MS;
@@ -135,33 +153,59 @@ export class RestoreSettleGate {
     this.hasResumableTranscript = opts.hasResumableTranscript ?? hasResumableTranscript;
   }
 
+  private episodeFor(scope: string): Episode {
+    let episode = this.episodes.get(scope);
+    if (!episode) {
+      episode = {
+        settled: false,
+        episodeStartedAt: undefined,
+        lastRunning: undefined,
+        everHeld: new Set<string>(),
+        held: new Set<string>(),
+        selfReleasedIds: new Set<string>(),
+      };
+      this.episodes.set(scope, episode);
+    }
+    return episode;
+  }
+
   /**
-   * Filter this poll's fresh-spawn candidates. `running` is this SAME poll's
-   * `herd.runningIssues()` result (already resolved by `reconcileNow` —
+   * Filter this poll's fresh-spawn candidates for `scope` (default
+   * `DEFAULT_SCOPE` — every caller before FACTORY-713 passed no scope at
+   * all, and omitting it still works unchanged for a single-loop caller).
+   * `running` is this SAME poll's `herd.runningIssues()` result, already
+   * scoped to THIS CALLER's own ids (already resolved by `reconcileNow` —
    * never re-fetched here, so a rejecting `runningIssues()` still throws out
    * of `reconcileNow` before this is ever reached, exactly as today). `specs`
    * resolves a candidate id to its `SpawnSpec`, for `hasResumableTranscript`.
    *
+   * Two different scopes never interact: each keeps its own stability
+   * comparison, its own settle latch, and its own self-released-id set —
+   * see this class's own doc comment for why a single shared set of that
+   * state across two independently-polling loops is actively harmful.
+   *
    * Returns `candidates` unchanged for every candidate with no resumable
-   * transcript, always. Once settled (by stability or by bound), returns
-   * `candidates` unchanged for everything — the gate is permanently open for
-   * the rest of this process's life.
+   * transcript, always. Once `scope` has settled (by stability or by
+   * bound), returns `candidates` unchanged for everything in that scope —
+   * permanently open for the rest of this process's life, for that scope
+   * only.
    */
-  filter(candidates: readonly string[], running: readonly string[], specs: ReadonlyMap<string, SpawnSpec>): readonly string[] {
-    if (this.settled) return candidates;
+  filter(candidates: readonly string[], running: readonly string[], specs: ReadonlyMap<string, SpawnSpec>, scope: string = DEFAULT_SCOPE): readonly string[] {
+    const ep = this.episodeFor(scope);
+    if (ep.settled) return candidates;
 
     const rawRunningSet = new Set(running);
     // Ids THIS gate has itself released (spawned, resumed-and-passed-
     // through, or fresh-spawned on an earlier settle) must not count as
     // settle evidence — see this class's doc comment (review round 2).
     // Only ids herdr listed on its own are real evidence.
-    const runningSet = new Set([...rawRunningSet].filter((id) => !this.selfReleasedIds.has(id)));
+    const runningSet = new Set([...rawRunningSet].filter((id) => !ep.selfReleasedIds.has(id)));
     // An EMPTY (post-exclusion) listing never counts as "stable" — see this
     // class's doc comment. Only a non-empty listing that repeats unchanged
     // is evidence herdr's restore has actually settled; emptiness repeating
     // is just the unresolved hazard persisting.
-    const stableSincePrevPoll = runningSet.size > 0 && this.lastRunning !== undefined && setsEqual(this.lastRunning, runningSet);
-    this.lastRunning = runningSet;
+    const stableSincePrevPoll = runningSet.size > 0 && ep.lastRunning !== undefined && setsEqual(ep.lastRunning, runningSet);
+    ep.lastRunning = runningSet;
 
     const resumableHeldCandidates = candidates.filter((id) => {
       if (rawRunningSet.has(id)) return false;
@@ -169,45 +213,66 @@ export class RestoreSettleGate {
       return !!spec && this.hasResumableTranscript(spec);
     });
 
-    if (this.everHeld.size === 0 && resumableHeldCandidates.length === 0) {
+    if (ep.everHeld.size === 0 && resumableHeldCandidates.length === 0) {
       // Nothing has ever needed gating — an ordinary poll, not a cold-boot
       // settle episode. Stays un-settled (a later poll may still start one)
       // but there is nothing to hold or log this poll.
-      for (const id of candidates) this.selfReleasedIds.add(id);
+      for (const id of candidates) ep.selfReleasedIds.add(id);
       return candidates;
     }
 
-    if (this.episodeStartedAt === undefined) this.episodeStartedAt = this.now();
+    if (ep.episodeStartedAt === undefined) ep.episodeStartedAt = this.now();
     for (const id of resumableHeldCandidates) {
-      this.everHeld.add(id);
-      this.held.add(id);
+      ep.everHeld.add(id);
+      ep.held.add(id);
     }
     // An id picked up by `running` since it was first held was resumed by
     // the ordinary stale/resumeInPlace path (FACTORY-470/472/491/500/501) —
     // resolved, not fresh-spawned; stop holding it. Uses the RAW set: this
     // asks about one specific id, not about what the overall listing implies.
-    for (const id of [...this.held]) if (rawRunningSet.has(id)) this.held.delete(id);
+    for (const id of [...ep.held]) if (rawRunningSet.has(id)) ep.held.delete(id);
 
-    const boundExceeded = this.now() - this.episodeStartedAt >= this.boundMs;
+    const boundExceeded = this.now() - ep.episodeStartedAt >= this.boundMs;
     if (!stableSincePrevPoll && !boundExceeded) {
       // Still settling: hold every currently-held id out of this poll's
       // spawn candidates; let anything else (never held) through unchanged.
-      const result = candidates.filter((id) => !this.held.has(id));
-      for (const id of result) this.selfReleasedIds.add(id);
+      const result = candidates.filter((id) => !ep.held.has(id));
+      for (const id of result) ep.selfReleasedIds.add(id);
       return result;
     }
 
-    this.settled = true;
-    const fresh = [...this.held];
-    const resumed = this.everHeld.size - fresh.length;
+    ep.settled = true;
+    const fresh = [...ep.held];
+    const resumed = ep.everHeld.size - fresh.length;
     if (boundExceeded && !stableSincePrevPoll) {
-      this.log?.(`WARNING: [restore-settle] bounded wait of ${this.boundMs}ms exceeded before herdr's restore settled — falling back to fresh-spawn for ${fresh.length} definition(s): ${fresh.join(", ") || "(none)"}`);
+      this.log?.(`WARNING: [restore-settle${scope === DEFAULT_SCOPE ? "" : `:${scope}`}] bounded wait of ${this.boundMs}ms exceeded before herdr's restore settled — falling back to fresh-spawn for ${fresh.length} definition(s): ${fresh.join(", ") || "(none)"}`);
     }
-    this.log?.(`[restore-settle] ${resumed} resumed, ${fresh.length} fresh`);
-    this.held.clear();
-    for (const id of candidates) this.selfReleasedIds.add(id);
+    this.log?.(`[restore-settle${scope === DEFAULT_SCOPE ? "" : `:${scope}`}] ${resumed} resumed, ${fresh.length} fresh`);
+    ep.held.clear();
+    for (const id of candidates) ep.selfReleasedIds.add(id);
     return candidates;
   }
+}
+
+/** Scope used by every caller that doesn't pass one — unchanged log-line shape for the gate's original (pre-FACTORY-713) single-loop caller. */
+const DEFAULT_SCOPE = "default";
+
+interface Episode {
+  settled: boolean;
+  episodeStartedAt: number | undefined;
+  lastRunning: ReadonlySet<string> | undefined;
+  /** Ids ever held this episode, including ones later resolved by `running` catching up (resumed). */
+  everHeld: Set<string>;
+  /** Ids CURRENTLY held — still absent from `running`, still waiting. */
+  held: Set<string>;
+  /**
+   * Every id this gate has itself returned from `filter()` so far for this
+   * scope (spawned immediately, resumed-and-passed-through, or released on
+   * settle) — see this class's own doc comment (review round 2). Excluded
+   * from `running` before the empty/stable checks so butchr's own spawns
+   * never masquerade as herdr's restore progress.
+   */
+  selfReleasedIds: Set<string>;
 }
 
 function setsEqual(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {

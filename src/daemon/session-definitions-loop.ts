@@ -22,6 +22,16 @@ import type { NotifyReason } from "../resources/types.js";
 import type { AccountPolicy, AgentEffort, AgentRole } from "../rules/rules.js";
 import { builtinManagedSessionsRule, createManagedSessionResourceType, ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { runResourceLoop } from "./loop.js";
+import type { RestoreSettleGate } from "../agents/restore-settle.js";
+
+/**
+ * FACTORY-713 — the scope this loop passes to a shared `RestoreSettleGate`'s
+ * `filter()`, so its settle episode is never compared against the issue
+ * loop's disjoint `running` set. See `RestoreSettleGate`'s own doc comment
+ * (src/agents/restore-settle.ts) for why that comparison would otherwise be
+ * actively harmful, and `ManagedSessionsLoopDeps.restoreSettleGate` below.
+ */
+export const MANAGED_SESSIONS_RESTORE_SETTLE_SCOPE = "managed-sessions";
 
 /** Local disk reads are cheap; same cadence as the (very similar) filesystem rule loop. */
 export const MANAGED_SESSIONS_POLL_MS = 15_000;
@@ -116,6 +126,21 @@ export interface ManagedSessionsLoopDeps {
    * sessions (existing behaviour before FACTORY-501).
    */
   checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
+  /**
+   * FACTORY-713/FACTORY-704 (reopened) — see `ReconcileOptions.restoreSettleGate`'s
+   * doc comment (src/daemon/loop.ts) and `RestoreSettleGate`'s own class doc
+   * comment (src/agents/restore-settle.ts) for the full mechanism and why a
+   * gate shared with the issue loop needs per-scope state to be safe. Pass
+   * the SAME `RestoreSettleGate` instance the issue loop uses
+   * (src/daemon/index.ts) — this loop always identifies its own episode to
+   * it with `MANAGED_SESSIONS_RESTORE_SETTLE_SCOPE`, below, so sharing the
+   * instance is safe regardless of what scope the issue loop passes.
+   * Optional; omitted, no settle gate runs for managed sessions — the exact
+   * gap FACTORY-704 (reopened) reported: a cold boot fresh-spawns every
+   * one of the 12 definition sessions even when each has a resumable
+   * transcript on disk.
+   */
+  restoreSettleGate?: RestoreSettleGate;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -191,6 +216,7 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
     ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
     ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
+    ...(deps.restoreSettleGate ? { restoreSettleGate: deps.restoreSettleGate, restoreSettleScope: MANAGED_SESSIONS_RESTORE_SETTLE_SCOPE } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? MANAGED_SESSIONS_POLL_MS,
     onError: (e) => {
