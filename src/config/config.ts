@@ -321,6 +321,18 @@ export interface Config {
    */
   pollStaleMs: number;
   /**
+   * FACTORY-710: the bounded wait, in ms, the cold-boot settle gate
+   * (src/agents/restore-settle.ts) gives herdr's restore to finish listing
+   * every restored pane before it gives up and falls back to today's
+   * fresh-spawn behaviour for whatever resumable-transcript definitions are
+   * still not listed. Default 60_000, the bound the director's own staffing
+   * spec (FACTORY-704) named directly — not derived from `intervalMs` or
+   * `pollStaleMs` the way most of this file's other bounds are, since this
+   * one is about a ONE-TIME startup condition (herdr's restore), not a
+   * steady-state polling cadence.
+   */
+  restoreSettleBoundMs: number;
+  /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
    * issuetype. All three are optional so a daemon that only ever reads Jira
    * still boots; the refusal for an unstaffable Story/Task/Epic happens
@@ -567,6 +579,7 @@ export interface ConfigEnv {
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
+  BUTCHR_RESTORE_SETTLE_BOUND_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
@@ -749,6 +762,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
 
+  const restoreSettleBoundMs = env.BUTCHR_RESTORE_SETTLE_BOUND_MS ? Number(env.BUTCHR_RESTORE_SETTLE_BOUND_MS) : 60_000;
+  if (!Number.isFinite(restoreSettleBoundMs) || restoreSettleBoundMs <= 0) throw new Error(`BUTCHR_RESTORE_SETTLE_BOUND_MS is not a positive number: ${env.BUTCHR_RESTORE_SETTLE_BOUND_MS}`);
+
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
   const assigneeEpic = env.BUTCHR_ASSIGNEE_EPIC?.trim();
@@ -793,6 +809,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
+    restoreSettleBoundMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -983,7 +1000,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} restoreSettleBoundMs=${c.restoreSettleBoundMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
