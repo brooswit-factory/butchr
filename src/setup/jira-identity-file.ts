@@ -21,6 +21,12 @@
  * machinery would be overkill for two string fields, and it's never
  * directly operator-edited (it exists purely as this daemon's own
  * record of what the setup/rotation routes last wrote).
+ *
+ * FACTORY-716: this file's basename is on `../rules/seed-first-run.ts`'s own
+ * `setupWriteAllowlist` — the first-run seed must not read THIS write's own
+ * output as "an established install configured some other way" on the
+ * daemon's next restart. If this file ever moves to a different basename or
+ * a second file joins it, update that allowlist too.
  */
 import { chmodSync, closeSync, constants as fsConstants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { homedir } from "node:os";

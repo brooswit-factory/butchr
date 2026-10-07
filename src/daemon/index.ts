@@ -128,7 +128,7 @@ import { isSameUidPeer } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
-import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
+import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { readUnitHint } from "../web/settings-unit-hint.js";
@@ -267,7 +267,7 @@ if (firstRunSeedOutcome.kind === "seeded") {
   );
 } else if (firstRunSeedOutcome.kind === "config-dir-not-empty") {
   console.error(
-    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but its directory already holds other state — this looks like an established install some other way, not a fresh one, so no template was seeded. Add a rules file (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
+    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but its directory already holds other state (beyond what the web setup flow itself writes) — this looks like an established install some other way, not a fresh one, so no template was seeded. Add a rules file (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
   );
 } else if (firstRunSeedOutcome.kind === "seed-failed") {
   console.error(`WARNING: butchr: first-run seed of ${firstRunSeedOutcome.path} failed, starting with no rules as if the file were simply absent: ${firstRunSeedOutcome.error}`);
@@ -931,7 +931,7 @@ const jiraTokenWriteRateLimit = createWriteRateLimiter({ windowMs: 60 * 60_000, 
 // an actual write happens, well after `teamAdminNotify` is initialized; see
 // `ptyAttach.read`'s own comment just below in this file for the identical,
 // already-established pattern.
-const auditLogPath = join(dirname(rulesPath()), "web-write-audit.jsonl");
+const auditLogPath = join(dirname(rulesPath()), WEB_WRITE_AUDIT_LOG_BASENAME);
 // B4 (agentsafety second pass): ONE logger instance, not rebuilt per call —
 // its rejected-write aggregation (`createAuditLogger`'s own header) only
 // works if the SAME instance sees every write.

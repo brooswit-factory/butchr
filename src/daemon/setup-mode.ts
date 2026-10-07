@@ -35,7 +35,7 @@ import { parsePort, type ConfigEnv } from "../config/config.js";
 import { isSameUidPeer } from "../web/peer-uid.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
-import { createAuditLogger, fileAuditAppend } from "../web/audit-log.js";
+import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { buildSetupStatus, handleJiraTokenWrite } from "../web/setup-api.js";
 import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
 import { jiraTokenFilePath, type FetchLike } from "../setup/jira-token-write.js";
@@ -77,7 +77,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
   // `postAlert` is omitted: setup mode has no Rocket.Chat credential loaded
   // (that requires the very configuration this mode exists to not require
   // yet) — the audit file and journal `log` line still happen either way.
-  const auditLogPath = join(dirname(rulesPath(env)), "web-write-audit.jsonl");
+  const auditLogPath = join(dirname(rulesPath(env)), WEB_WRITE_AUDIT_LOG_BASENAME);
   const auditWrite = createAuditLogger({ append: fileAuditAppend(auditLogPath), host: hostname(), log });
 
   const unused = (): never => { throw new Error("unused in setup mode"); };
