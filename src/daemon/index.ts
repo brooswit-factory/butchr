@@ -94,6 +94,7 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
+import { RestoreSettleGate } from "../agents/restore-settle.js";
 import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
@@ -1811,6 +1812,15 @@ const issueResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
+// FACTORY-710/FACTORY-708/FACTORY-704 — ONE instance for this daemon
+// process's whole life (see `RestoreSettleGate`'s own doc comment for why
+// it deliberately never re-arms after its first settle), wired into the
+// ISSUE loop only below — the project tier has no Claude transcript to
+// resume.
+const restoreSettleGate = new RestoreSettleGate({
+  boundMs: config.restoreSettleBoundMs,
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-352: the issue tier's own admission census bucket — the SAME
 // `admissionController` instance the issue/project `runResourceLoop` calls
 // below already share (see that construction's own comment for why one
@@ -2008,6 +2018,7 @@ runResourceLoop(ruleResourceType, {
   checkReconcileFailure: issueReconcileFailureDetector.check,
   checkReap: issueReaper.check,
   checkResidency: issueResidencyGuard.filter,
+  restoreSettleGate,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
