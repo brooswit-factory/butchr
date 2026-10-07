@@ -185,6 +185,120 @@ test('FACTORY-696/697/698 regression: a client holding its PRE-restart Mcp-Sessi
  await client1.close().catch(()=>{}); // against gen1's own (still-open) registry; harmless either way
 });
 
+test('a malformed Mcp-Session-Id (not visible-ASCII, or over the length bound) is rejected with 400 JSON — never forwarded or adopted',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const attempts=['has space','has\ttab','x'.repeat(257)];
+ for(const bad of attempts) {
+  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':bad},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{}})}));
+  expect(res.status).toBe(400);
+  expect(res.headers.get('content-type')).toContain('application/json');
+  expect((await res.json()) as any).toMatchObject({jsonrpc:'2.0',error:{message:expect.any(String)}});
+ }
+ // the exact boundary (256) is still accepted as well-formed (rejected later for other reasons, never for shape)
+ const boundary=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'x'.repeat(256)},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{}})}));
+ expect(boundary.status).not.toBe(400);
+});
+
+test('DELETE for an unknown/stale Mcp-Session-Id is a pass-through, never triggers adoption (no pointless adopt-then-delete)',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId!;
+
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec);
+
+ const origFetch=globalThis.fetch;let initializeCalls=0;
+ globalThis.fetch=(async(input:any,init?:any)=>{
+  if(init?.method==='POST'&&!new Headers(init?.headers??{}).has('mcp-session-id')&&typeof init?.body==='string'&&init.body.includes('"method":"initialize"'))initializeCalls++;
+  return origFetch(input,init);
+ }) as typeof fetch;
+ try {
+  const res=await app2.handle(new Request(server.url,{method:'DELETE',headers:{...server.headers!,'mcp-session-id':staleSessionId}}));
+  expect(res.status).not.toBe(200); // nothing was adopted, so there's nothing to successfully delete either
+  expect(initializeCalls).toBe(0); // never adopted a session just to serve a DELETE for it
+ } finally { globalThis.fetch=origFetch; }
+ await client1.close().catch(()=>{});
+});
+
+test('a successful DELETE drops the client-to-proxy session binding — clientToProxy does not grow forever',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId!;
+
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec);
+
+ // Adopt the stale id via an ordinary tools/call first.
+ await app2.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId},
+  body:JSON.stringify({jsonrpc:'2.0',id:'x',method:'tools/call',params:{name:'identity',arguments:{}}})}));
+ const bindings=((registry2 as unknown) as {connections:Map<string,{sessions:{clientToProxy:Map<string,string>}}>}).connections.get(f.spec.key+'/chat')!.sessions.clientToProxy;
+ expect(bindings.has(staleSessionId)).toBe(true);
+
+ const del=await app2.handle(new Request(server.url,{method:'DELETE',headers:{...server.headers!,'mcp-session-id':staleSessionId}}));
+ expect(del.status).toBe(200);
+ expect(bindings.has(staleSessionId)).toBe(false);
+ await client1.close().catch(()=>{});
+});
+
+test('concurrent requests for the same unknown/stale Mcp-Session-Id single-flight the gateway-initiated initialize — exactly one, not one per request',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId!;
+
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec);
+
+ const origFetch=globalThis.fetch;let initializeCalls=0;
+ globalThis.fetch=(async(input:any,init?:any)=>{
+  if(init?.method==='POST'&&!new Headers(init?.headers??{}).has('mcp-session-id')&&typeof init?.body==='string'&&init.body.includes('"method":"initialize"'))initializeCalls++;
+  return origFetch(input,init);
+ }) as typeof fetch;
+ try {
+  const makeReq=(id:number)=>new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId},
+   body:JSON.stringify({jsonrpc:'2.0',id,method:'tools/call',params:{name:'identity',arguments:{}}})});
+  const results=await Promise.all([app2.handle(makeReq(1)),app2.handle(makeReq(2)),app2.handle(makeReq(3))]);
+  for(const r of results)expect(r.status).toBe(200);
+  expect(initializeCalls).toBe(1); // three racing requests, one adoption
+ } finally { globalThis.fetch=origFetch; }
+ await client1.close().catch(()=>{});
+});
+
+test('upstream genuinely down is passed straight through (JSON-ified), never adopted or masked as a session problem',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ // Swap the connection's real proxy for a stub that always answers like startMcpChannelProxy does when
+ // `keepChannelSource` has no upstream client yet — a genuinely-down upstream, never a 404.
+ const fakeServer=Bun.serve({hostname:'127.0.0.1',port:0,fetch(){return new Response('MCP upstream disconnected',{status:503});}});
+ cleanup.push(async()=>{await fakeServer.stop(true);});
+ const conn=((f.registry as unknown) as {connections:Map<string,{proxy:{url:string;headers:{Authorization:string}}}>}).connections.get(f.spec.key+'/chat')!;
+ const originalProxy=conn.proxy;
+ conn.proxy={url:`http://127.0.0.1:${fakeServer.port}/mcp`,headers:{Authorization:'Bearer fake-secret'}};
+ const origFetch=globalThis.fetch;let initializeCalls=0;
+ globalThis.fetch=(async(input:any,init?:any)=>{
+  if(init?.method==='POST'&&!new Headers(init?.headers??{}).has('mcp-session-id')&&typeof init?.body==='string'&&init.body.includes('"method":"initialize"'))initializeCalls++;
+  return origFetch(input,init);
+ }) as typeof fetch;
+ try {
+  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'deadbeef-dead-beef-dead-beefdeadbeef'},
+   body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'identity',arguments:{}}})}));
+  expect(res.status).toBe(503); // passed straight through — NOT reinterpreted as an unknown-session 404
+  expect(res.headers.get('content-type')).toContain('application/json');
+  expect((await res.json() as any).error.message).toContain('MCP upstream disconnected');
+  expect(initializeCalls).toBe(0); // never attempted adoption for a down upstream
+ } finally { globalThis.fetch=origFetch; conn.proxy=originalProxy; }
+});
+
 test('integration: a daemon restart (new ResourceConnections, same workspace dir) answers 503 — never 401 — until prepare() runs again, then 200',async()=>{
  const f=await fixture();
  const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;

@@ -39,6 +39,16 @@ function jsonError(status:number, message:string, extraHeaders?:Record<string,st
   return new Response(JSON.stringify({jsonrpc:'2.0',error:{code:-32000,message},id:null}),{status,headers:{'content-type':'application/json',...extraHeaders}});
 }
 
+/**
+ * A `Mcp-Session-Id` the gateway will consider adopting: visible ASCII
+ * (0x21-0x7E, the HTTP header-value token range — excludes whitespace and
+ * control bytes) and length-bounded. Anything else is rejected outright —
+ * `forward()` never runs it through `send()`/`adoptSession()` at all, so a
+ * garbage or oversized header can't reach the proxy or trigger a spurious
+ * `initialize`.
+ */
+const SESSION_ID_RE=/^[\x21-\x7E]{1,256}$/;
+
 /** The vendored proxy answers some errors as bare plain text (`"Unknown session"`, `"Initialize required"`) — wrap anything that slips through unconverted so a JSON-parsing client never fails on top of the status. 2xx/3xx passes through untouched. */
 async function jsonifyPlainTextError(response:Response):Promise<Response> {
   if(response.status<400) return response;
@@ -236,11 +246,22 @@ export class ResourceConnections {
    * `notifications/tools/list_changed` on every adoption) would fire on
    * ordinary restarts where nothing changed, and MCP clients already
    * treat their tool cache as advisory between explicit refreshes.
+   *
+   * `DELETE` is deliberately exempted from adoption: a client closing a
+   * session it no longer holds a live binding for (most commonly: the
+   * post-restart stale id it never got to use before giving up on it) has
+   * nothing worth recovering — adopting one just to immediately tear it
+   * down would be a wasted `initialize` round trip for no observable
+   * benefit. A `DELETE` that DOES hit a bound session drops the binding on
+   * success, so `clientToProxy` doesn't grow forever.
    */
   private async forward(c:Connection,request:Request):Promise<Response> {
     const clientSessionId=request.headers.get('mcp-session-id');
     if(clientSessionId===null&&request.method==='GET') {
       return jsonError(405,'Method not allowed: GET requires an active session (initialize first).',{Allow:'GET, POST, DELETE'});
+    }
+    if(clientSessionId!==null&&!SESSION_ID_RE.test(clientSessionId)) {
+      return jsonError(400,'Bad Request: Mcp-Session-Id header is malformed.');
     }
     const body=['GET','HEAD'].includes(request.method)?undefined:await request.arrayBuffer();
     const send=async(proxySessionId:string|null):Promise<Response> => {
@@ -250,12 +271,15 @@ export class ResourceConnections {
     };
     let proxySessionId=clientSessionId!==null?(c.sessions.clientToProxy.get(clientSessionId)??clientSessionId):null;
     let response=await send(proxySessionId);
-    if(clientSessionId!==null&&response.status===404) {
+    if(clientSessionId!==null&&response.status===404&&request.method!=='DELETE') {
       let adopted:string;
       try { adopted=await this.adoptSession(c,clientSessionId,request); }
       catch(e) { return jsonError(502,`Upstream session recovery failed: ${e instanceof Error?e.message:String(e)}`); }
       proxySessionId=adopted;
       response=await send(proxySessionId);
+    }
+    if(clientSessionId!==null&&request.method==='DELETE'&&response.ok) {
+      c.sessions.clientToProxy.delete(clientSessionId);
     }
     return this.rewriteSessionHeader(await jsonifyPlainTextError(response),clientSessionId,proxySessionId);
   }
