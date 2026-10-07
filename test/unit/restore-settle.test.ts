@@ -71,17 +71,61 @@ describe("RestoreSettleGate (FACTORY-710)", () => {
     expect(logs).toEqual(["[restore-settle] 1 resumed, 0 fresh"]);
   });
 
-  test("a candidate still absent from running when stability resolves is let through as fresh, counted correctly", () => {
+  test("a candidate still absent from running when a NON-EMPTY listing stabilizes is let through as fresh, counted correctly", () => {
     const logs: string[] = [];
     const specs = new Map([["A", spec("A")]]);
     const gate = new RestoreSettleGate({ hasResumableTranscript: () => true, log: (l) => logs.push(l) });
 
-    expect(gate.filter(["A"], [], specs)).toEqual([]); // poll 1: held
-    expect(gate.filter(["A"], [], specs)).toEqual(["A"]); // poll 2: running stable ([] == []) — settles, A let through as fresh
+    expect(gate.filter(["A"], ["OTHER"], specs)).toEqual([]); // poll 1: held; herdr has listed something else
+    expect(gate.filter(["A"], ["OTHER"], specs)).toEqual(["A"]); // poll 2: running stable AND non-empty — settles, A let through as fresh
     expect(logs).toEqual(["[restore-settle] 0 resumed, 1 fresh"]);
 
     // Settled — the gate never re-holds anything again, even a fresh resumable candidate.
-    expect(gate.filter(["A"], [], specs)).toEqual(["A"]);
+    expect(gate.filter(["A"], ["OTHER"], specs)).toEqual(["A"]);
+  });
+
+  // FACTORY-710 review round 1: an EMPTY listing must never count as "stable"
+  // on its own — `[] == []` was true, so two empty polls used to settle the
+  // gate and fresh-spawn the exact hazard (herdr socket up, pane list not
+  // yet populated) it exists to prevent. These two tests replace that
+  // behaviour; the test above was changed from an empty to a non-empty
+  // stable listing for the same reason (intentional correction of a
+  // bug-confirming assertion, not a weakened one — see PR #673).
+  test("an empty listing never counts as stable, however many consecutive polls see it — held until the listing is non-empty and stable, or populates outright", () => {
+    const logs: string[] = [];
+    const specs = new Map([["A", spec("A")]]);
+    const gate = new RestoreSettleGate({ hasResumableTranscript: () => true, log: (l) => logs.push(l) });
+
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // poll 1: episode starts
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // poll 2: [] == [] but empty is never "stable"
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // poll 3: still empty, still held
+    expect(logs).toEqual([]); // never settled on empty alone
+
+    // poll 4: herdr's restore populates — A appears in running (resumed via the ordinary path, outside this gate)
+    expect(gate.filter([], ["A"], specs)).toEqual([]);
+    expect(logs).toEqual([]); // not yet stable across two polls of the NEW (non-empty) running set
+
+    // poll 5: running identical to poll 4, and non-empty — stable, settles
+    expect(gate.filter([], ["A"], specs)).toEqual([]);
+    expect(logs).toEqual(["[restore-settle] 1 resumed, 0 fresh"]);
+  });
+
+  test("an empty listing forever is held until the bound elapses, then falls back to fresh-spawn with the warning", () => {
+    const logs: string[] = [];
+    let t = 0;
+    const specs = new Map([["A", spec("A")]]);
+    const gate = new RestoreSettleGate({ hasResumableTranscript: () => true, boundMs: 1000, now: () => t, log: (l) => logs.push(l) });
+
+    t = 0;
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // episode starts
+    t = 400;
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // [] == [] but empty never counts as stable
+    t = 900;
+    expect(gate.filter(["A"], [], specs)).toEqual([]); // still under the bound
+    t = 1500; // past the 1000ms bound
+    expect(gate.filter(["A"], [], specs)).toEqual(["A"]); // falls back to fresh-spawn
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("bounded wait") && l.includes("1000ms") && l.includes("A"))).toBe(true);
+    expect(logs).toContain("[restore-settle] 0 resumed, 1 fresh");
   });
 
   test("bounded wait: a herdr that never stabilizes (constant churn) still releases once the bound elapses, logging why", () => {
@@ -168,6 +212,29 @@ describe("reconcileNow + RestoreSettleGate integration (FACTORY-710) — fake he
 
     t = 1500; // past bound
     herd.running = new Set(["noise-2"]);
+    await reconcileNow(herd, desired, { restoreSettleGate: gate });
+
+    expect(herd.spawned).toEqual(["RESUMABLE-1"]);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("bounded wait"))).toBe(true);
+    expect(logs).toContain("[restore-settle] 0 resumed, 1 fresh");
+  });
+
+  test("empty listing forever (herdr never lists anything): held until the bound elapses, then fresh-spawned, warning logged", async () => {
+    const herd = fakeHerd();
+    let t = 0;
+    const logs: string[] = [];
+    const gate = new RestoreSettleGate({ hasResumableTranscript: (s) => s.key === "RESUMABLE-1", boundMs: 1000, now: () => t, log: (l) => logs.push(l) });
+    const desired = new Map([["RESUMABLE-1", spec("RESUMABLE-1")]]);
+
+    t = 0;
+    await reconcileNow(herd, desired, { restoreSettleGate: gate });
+    expect(herd.spawned).toEqual([]);
+
+    t = 400;
+    await reconcileNow(herd, desired, { restoreSettleGate: gate }); // still empty — [] == [] must not settle
+    expect(herd.spawned).toEqual([]);
+
+    t = 1500; // past bound
     await reconcileNow(herd, desired, { restoreSettleGate: gate });
 
     expect(herd.spawned).toEqual(["RESUMABLE-1"]);

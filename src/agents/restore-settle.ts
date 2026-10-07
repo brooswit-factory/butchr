@@ -70,6 +70,20 @@ const DEFAULT_BOUND_MS = 60_000;
  * polls, with a hard bound, is the documented fallback the ticket itself
  * allows for exactly this case — this gate does not invent a richer signal
  * herdr cannot actually provide.
+ *
+ * FACTORY-710 review round 1: an EMPTY listing must never count as the
+ * "stable" half of that signal on its own. `herd.runningIssues()` reads
+ * `[]` identically whether nothing is running or herdr's restore simply
+ * hasn't populated it yet (the exact ambiguity this whole gate exists to
+ * resolve — see `HerdrHerd.byIssue()`'s doc comment) — so two consecutive
+ * empty polls are the WEAKEST possible evidence of settling, not the
+ * strongest: `[] == []` is trivially true on every poll before herdr has
+ * listed anything at all. Treating that as "stable" let the gate buy
+ * exactly one poll interval and then release straight into the cold-boot
+ * hazard it was built to close. A non-empty listing that repeats is real
+ * evidence (herdr said something, twice); an empty one that repeats is no
+ * evidence at all. Only the bounded wait, not stability, may release a
+ * held candidate while the listing is empty.
  */
 export class RestoreSettleGate {
   private readonly boundMs: number;
@@ -108,7 +122,11 @@ export class RestoreSettleGate {
     if (this.settled) return candidates;
 
     const runningSet = new Set(running);
-    const stableSincePrevPoll = this.lastRunning !== undefined && setsEqual(this.lastRunning, runningSet);
+    // An EMPTY listing never counts as "stable" — see this class's doc
+    // comment. Only a non-empty listing that repeats unchanged is evidence
+    // herdr's restore has actually settled; emptiness repeating is just the
+    // unresolved hazard persisting.
+    const stableSincePrevPoll = runningSet.size > 0 && this.lastRunning !== undefined && setsEqual(this.lastRunning, runningSet);
     this.lastRunning = runningSet;
 
     const resumableHeldCandidates = candidates.filter((id) => {
