@@ -258,4 +258,57 @@ describe("reconcileNow + RestoreSettleGate integration (FACTORY-710) — fake he
     await reconcileNow(herd, desired, {});
     expect(herd.spawned).toEqual(["A"]);
   });
+
+  // FACTORY-710 review round 2: butchr's OWN spawns must never count as
+  // settle evidence. A plain (no-transcript) definition spawns immediately
+  // and the fake herd's `spawn()` adds it straight to `running` (exactly
+  // what herdr itself does for a pane it now manages) — so a mix of one
+  // plain and one resumable definition must not let the plain one's own
+  // appearance in `running` masquerade as herdr's restore settling.
+  test("a plain definition's own fresh spawn never counts as settle evidence for a resumable sibling — (a) herdr later lists it: resumed", async () => {
+    const herd = fakeHerd();
+    const gate = new RestoreSettleGate({ hasResumableTranscript: (s) => s.key === "RESUMABLE-1" });
+    const desired = new Map([["PLAIN-1", spec("PLAIN-1")], ["RESUMABLE-1", spec("RESUMABLE-1")]]);
+
+    await reconcileNow(herd, desired, { restoreSettleGate: gate }); // poll 1: PLAIN-1 spawns, added to herd.running by the fake itself
+    expect(herd.spawned).toEqual(["PLAIN-1"]);
+
+    for (let i = 0; i < 4; i++) {
+      await reconcileNow(herd, desired, { restoreSettleGate: gate }); // polls 2-5: running stably contains only PLAIN-1 (self-spawned) — must NOT settle
+      expect(herd.spawned).toEqual(["PLAIN-1"]); // RESUMABLE-1 still held, not fresh-spawned
+    }
+
+    herd.running.add("RESUMABLE-1"); // herdr's own restore catches up
+    await reconcileNow(herd, desired, { restoreSettleGate: gate });
+    await reconcileNow(herd, desired, { restoreSettleGate: gate }); // stable now that herdr itself listed something new
+
+    expect(herd.spawned).toEqual(["PLAIN-1"]); // RESUMABLE-1 was resumed, never fresh-spawned
+  });
+
+  test("a plain definition's own fresh spawn never counts as settle evidence for a resumable sibling — (b) herdr never lists it: fresh-spawned only after the bound", async () => {
+    const herd = fakeHerd();
+    let t = 0;
+    const logs: string[] = [];
+    const gate = new RestoreSettleGate({ hasResumableTranscript: (s) => s.key === "RESUMABLE-1", boundMs: 1000, now: () => t, log: (l) => logs.push(l) });
+    const desired = new Map([["PLAIN-1", spec("PLAIN-1")], ["RESUMABLE-1", spec("RESUMABLE-1")]]);
+
+    t = 0;
+    await reconcileNow(herd, desired, { restoreSettleGate: gate }); // PLAIN-1 spawns; herd.running now {PLAIN-1}
+    expect(herd.spawned).toEqual(["PLAIN-1"]);
+
+    t = 400;
+    await reconcileNow(herd, desired, { restoreSettleGate: gate }); // running stably {PLAIN-1} across polls — self-caused, must not settle
+    expect(herd.spawned).toEqual(["PLAIN-1"]);
+
+    t = 900;
+    await reconcileNow(herd, desired, { restoreSettleGate: gate });
+    expect(herd.spawned).toEqual(["PLAIN-1"]);
+
+    t = 1500; // past the bound
+    await reconcileNow(herd, desired, { restoreSettleGate: gate });
+
+    expect(herd.spawned).toEqual(["PLAIN-1", "RESUMABLE-1"]);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("bounded wait"))).toBe(true);
+    expect(logs).toContain("[restore-settle] 0 resumed, 1 fresh");
+  });
 });

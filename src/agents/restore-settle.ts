@@ -84,6 +84,27 @@ const DEFAULT_BOUND_MS = 60_000;
  * evidence (herdr said something, twice); an empty one that repeats is no
  * evidence at all. Only the bounded wait, not stability, may release a
  * held candidate while the listing is empty.
+ *
+ * FACTORY-710 review round 2: a NON-empty listing can be just as false a
+ * signal, if the ids in it are there because THIS process put them there.
+ * `filter()` lets plain (no-transcript) candidates spawn immediately every
+ * poll; herdr's `agent.list()` then reports those same ids right back on
+ * the very next poll, because they are now genuinely running panes herdr
+ * manages — indistinguishable, by id alone, from a pane herdr itself
+ * restored. Two polls of "only the pane I spawned a moment ago" is not
+ * herdr's restore settling, it is butchr watching its own actions reflected
+ * back at it — yet `stableSincePrevPoll` would read exactly like real
+ * settling and release every held resumable candidate straight into the
+ * hazard the empty-listing fix above already closed for the emptier case.
+ * So every id this gate has itself returned from `filter()` — spawned,
+ * resumed-and-passed-through, or fresh-spawned on settle, in this or any
+ * earlier poll — is remembered in `selfReleasedIds` and subtracted from
+ * `running` before the empty/stable checks run. Only ids herdr listed on
+ * its own are evidence of herdr's restore progressing; the raw (unfiltered)
+ * `running` set is still used everywhere this class asks "is THIS SPECIFIC
+ * held id now running" (resumed-detection, and `hasResumableTranscript`'s
+ * own exclusion check), since that question is about the id itself, not
+ * about what it implies for the stability signal.
  */
 export class RestoreSettleGate {
   private readonly boundMs: number;
@@ -98,6 +119,14 @@ export class RestoreSettleGate {
   private everHeld = new Set<string>();
   /** Ids CURRENTLY held — still absent from `running`, still waiting. */
   private held = new Set<string>();
+  /**
+   * Every id this gate has itself returned from `filter()` so far (spawned
+   * immediately, resumed-and-passed-through, or released on settle) — see
+   * this class's own doc comment (review round 2). Excluded from `running`
+   * before the empty/stable checks so butchr's own spawns never masquerade
+   * as herdr's restore progress.
+   */
+  private selfReleasedIds = new Set<string>();
 
   constructor(opts: RestoreSettleGateOptions = {}) {
     this.boundMs = opts.boundMs ?? DEFAULT_BOUND_MS;
@@ -121,16 +150,21 @@ export class RestoreSettleGate {
   filter(candidates: readonly string[], running: readonly string[], specs: ReadonlyMap<string, SpawnSpec>): readonly string[] {
     if (this.settled) return candidates;
 
-    const runningSet = new Set(running);
-    // An EMPTY listing never counts as "stable" — see this class's doc
-    // comment. Only a non-empty listing that repeats unchanged is evidence
-    // herdr's restore has actually settled; emptiness repeating is just the
-    // unresolved hazard persisting.
+    const rawRunningSet = new Set(running);
+    // Ids THIS gate has itself released (spawned, resumed-and-passed-
+    // through, or fresh-spawned on an earlier settle) must not count as
+    // settle evidence — see this class's doc comment (review round 2).
+    // Only ids herdr listed on its own are real evidence.
+    const runningSet = new Set([...rawRunningSet].filter((id) => !this.selfReleasedIds.has(id)));
+    // An EMPTY (post-exclusion) listing never counts as "stable" — see this
+    // class's doc comment. Only a non-empty listing that repeats unchanged
+    // is evidence herdr's restore has actually settled; emptiness repeating
+    // is just the unresolved hazard persisting.
     const stableSincePrevPoll = runningSet.size > 0 && this.lastRunning !== undefined && setsEqual(this.lastRunning, runningSet);
     this.lastRunning = runningSet;
 
     const resumableHeldCandidates = candidates.filter((id) => {
-      if (runningSet.has(id)) return false;
+      if (rawRunningSet.has(id)) return false;
       const spec = specs.get(id);
       return !!spec && this.hasResumableTranscript(spec);
     });
@@ -139,6 +173,7 @@ export class RestoreSettleGate {
       // Nothing has ever needed gating — an ordinary poll, not a cold-boot
       // settle episode. Stays un-settled (a later poll may still start one)
       // but there is nothing to hold or log this poll.
+      for (const id of candidates) this.selfReleasedIds.add(id);
       return candidates;
     }
 
@@ -149,14 +184,17 @@ export class RestoreSettleGate {
     }
     // An id picked up by `running` since it was first held was resumed by
     // the ordinary stale/resumeInPlace path (FACTORY-470/472/491/500/501) —
-    // resolved, not fresh-spawned; stop holding it.
-    for (const id of [...this.held]) if (runningSet.has(id)) this.held.delete(id);
+    // resolved, not fresh-spawned; stop holding it. Uses the RAW set: this
+    // asks about one specific id, not about what the overall listing implies.
+    for (const id of [...this.held]) if (rawRunningSet.has(id)) this.held.delete(id);
 
     const boundExceeded = this.now() - this.episodeStartedAt >= this.boundMs;
     if (!stableSincePrevPoll && !boundExceeded) {
       // Still settling: hold every currently-held id out of this poll's
       // spawn candidates; let anything else (never held) through unchanged.
-      return candidates.filter((id) => !this.held.has(id));
+      const result = candidates.filter((id) => !this.held.has(id));
+      for (const id of result) this.selfReleasedIds.add(id);
+      return result;
     }
 
     this.settled = true;
@@ -167,6 +205,7 @@ export class RestoreSettleGate {
     }
     this.log?.(`[restore-settle] ${resumed} resumed, ${fresh.length} fresh`);
     this.held.clear();
+    for (const id of candidates) this.selfReleasedIds.add(id);
     return candidates;
   }
 }
