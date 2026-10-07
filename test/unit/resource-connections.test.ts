@@ -138,6 +138,53 @@ test('path-traversal and reserved-name attempts in agent and name are 401 and to
  expect(await allFiles(f.dir)).toEqual(before); // nothing created
 });
 
+test('GET with no Mcp-Session-Id => 405 (not 400), JSON body — the status the SDK client special-cases as "no SSE, carry on"',async()=>{
+ const f=await fixture();const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+ const res=await f.app.handle(new Request(server.url,{method:'GET',headers:server.headers!}));
+ expect(res.status).toBe(405);
+ expect(res.headers.get('content-type')).toContain('application/json');
+ expect((await res.json()) as any).toMatchObject({jsonrpc:'2.0',error:{message:expect.any(String)}});
+});
+
+test('FACTORY-696/697/698 regression: a client holding its PRE-restart Mcp-Session-Id completes a real tools/call with no re-initialize, no 404, and an unchanged session id',async()=>{
+ const f=await fixture();
+ const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
+
+ // Generation 1: a real client connects, initializes, and holds a session id.
+ const client1=new Client({name:'test',version:'1'},{capabilities:{}});
+ const transport1=new StreamableHTTPClientTransport(new URL(server.url),{requestInit:{headers:server.headers!},fetch:async(input,init)=>f.app.handle(new Request(input.toString(),init))});
+ await client1.connect(transport1 as Parameters<Client["connect"]>[0]);
+ const staleSessionId=transport1.sessionId;
+ expect(staleSessionId).toBeTruthy();
+ expect((await client1.listTools()).tools[0]!.name).toBe('identity');
+ // Do NOT close client1 — a real restart leaves no DELETE behind either.
+
+ // "daemon restart": a BRAND NEW ResourceConnections + prepare(), same BUTCHR_WORKSPACES — this MUST fail on
+ // current (pre-fix) code: the new proxy generation's session map is empty, so replaying the stale id 404s.
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ cleanup.push(()=>registry2.close());
+ const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
+ await registry2.prepare(f.spec); // reconcile already re-prepared this agent before the client's next request arrives
+
+ // Replay the GEN-1 session id against the GEN-2 registry, as a raw tools/call — exactly what the client's
+ // existing (un-reinitialized) transport would send next. No initialize, no re-connect.
+ const toolsCallReq=new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId!,'mcp-protocol-version':transport1.protocolVersion??''},
+  body:JSON.stringify({jsonrpc:'2.0',id:'r1',method:'tools/call',params:{name:'identity',arguments:{}}})});
+ const res=await app2.handle(toolsCallReq);
+ expect(res.status).toBe(200); // not 404 — the whole point of the fix
+ const returnedSessionId=res.headers.get('mcp-session-id');
+ if(returnedSessionId!==null)expect(returnedSessionId).toBe(staleSessionId!); // the client must never see a DIFFERENT id than the one it's holding
+ const text=await res.text();
+ expect(text).toContain('project-P'); // a REAL tools/call reached the real upstream server, through the gen-2 proxy
+
+ // A second request with the SAME stale id reuses the now-bound proxy session — still no 404, still the same id.
+ const res2=await app2.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':staleSessionId!},
+  body:JSON.stringify({jsonrpc:'2.0',id:'r2',method:'tools/call',params:{name:'identity',arguments:{}}})}));
+ expect(res2.status).toBe(200);
+
+ await client1.close().catch(()=>{}); // against gen1's own (still-open) registry; harmless either way
+});
+
 test('integration: a daemon restart (new ResourceConnections, same workspace dir) answers 503 — never 401 — until prepare() runs again, then 200',async()=>{
  const f=await fixture();
  const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
