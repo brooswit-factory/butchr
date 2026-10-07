@@ -89,6 +89,23 @@ export class ResourceConnections {
    * bounded window after a restart, never indefinitely.
    */
   private readyAgents = new Set<string>();
+  /**
+   * Agent keys whose `prepare()` call is CURRENTLY RUNNING on this instance
+   * (FACTORY-702, work item 3). Distinct from `readyAgents`: that set only
+   * gains an entry once a round finishes (success or failure), so checking
+   * it alone cannot tell "still actively preparing, just slow" apart from
+   * "never submitted for prepare() at all" (e.g. a retired agent whose
+   * token file is still on disk) — both just read as `false` to it. The
+   * 503->401 cliff (FACTORY-700's regression test, "an agent whose
+   * prepare() is still IN FLIGHT") happened because `isReady()`'s deadline
+   * arm fired on elapsed wall-clock time ALONE, with no regard for which of
+   * those two cases it actually was. Checked by `isReady()` below: while an
+   * agent's own key is in this set, the deadline can never flip it to 401 —
+   * only `readyAgents` (i.e. that specific round actually finishing) can.
+   * An agent that is genuinely retired/unknown never enters this set at
+   * all, so the deadline backstop still applies to it exactly as before.
+   */
+  private readonly inFlightPrepares = new Set<string>();
   private readonly startedAt: number;
   constructor(
     private readonly baseUrl:string,
@@ -105,16 +122,40 @@ export class ResourceConnections {
      * not the one already running.
      */
     private readonly startupDeadlineMs:number = 5*60_000,
+    /**
+     * FACTORY-702 work item 2: bound on how long `handle()` will HOLD an
+     * otherwise-503-worthy request open, waiting for this agent's own
+     * `prepare()` round to finish, before falling back to the old
+     * immediate 503. Real `claude` CLI v2.1.251 (FACTORY-700) burns its
+     * entire reconnect budget in ~7.8s (POST + 3 retries at 1s/2s/4s) and
+     * then goes silent for the rest of the 5-minute window — far short of
+     * `prepareExternal`'s own up-to-20s-per-server timeout, so a bare 503
+     * is never actually retried enough times to matter. Holding instead of
+     * failing fast means the client's retry logic never has to engage at
+     * all: its single in-flight request simply resolves once `prepare()`
+     * does. Defaults to the per-server timeout (20_000, see
+     * `prepareExternal`) plus a 5s margin for the proxy/stdio handshake
+     * overhead that sits outside that inner timeout; this is now the
+     * worst-case time-to-first-success for a reconnecting client, down
+     * from ~60s (3 `resource_*` servers prepared serially, each up to 20s)
+     * now that `prepareExternal` below prepares a given agent's servers
+     * CONCURRENTLY rather than serially.
+     */
+    private readonly requestHoldMs:number = 25_000,
   ) { this.startedAt = this.now(); }
-  /** Whether `agent` should be treated as past the 503 window — its own `prepare()` completed, or the global startup backstop has elapsed. */
+  /** Whether `agent` should be treated as past the 503 window — its own `prepare()` completed, or the global startup backstop has elapsed AND no `prepare()` for it is actually in flight right now. */
   private isReady(agent:string):boolean {
-    return this.readyAgents.has(agent) || this.now()-this.startedAt >= this.startupDeadlineMs;
+    if (this.readyAgents.has(agent)) return true;
+    if (this.inFlightPrepares.has(agent)) return false;
+    return this.now()-this.startedAt >= this.startupDeadlineMs;
   }
   async prepare(spec:SpawnSpec):Promise<SpawnSpec> {
     if (!spec.mcpConfigFile) { this.readyAgents.add(spec.key); return spec; }
+    this.inFlightPrepares.add(spec.key);
     try {
       return await this.prepareExternal(spec);
     } finally {
+      this.inFlightPrepares.delete(spec.key);
       this.readyAgents.add(spec.key);
     }
   }
@@ -143,11 +184,25 @@ export class ResourceConnections {
     // (src/agents/workspace.ts) for why centralizing the claim here is what
     // keeps every caller agreeing on one directory for one key.
     const dir=ensureWorkspaceDir(spec.key);
-    const servers:NonNullable<SpawnSpec['externalMcpServers']>=[];
     const created:string[]=[];
+    const entries=Object.entries(definitions);
+    // Validated up front, before any connection for ANY entry starts, so an
+    // invalid/reserved name in entry N can never race the side effects
+    // (token files, spawned proxies) of entries that would otherwise have
+    // already started concurrently below.
+    for(const [name] of entries) if (!/^[a-zA-Z0-9_-]+$/.test(name) || name==='butchr') throw new Error('Invalid/reserved external MCP server name');
     try {
-      for(const [name,definition] of Object.entries(definitions)) {
-        if (!/^[a-zA-Z0-9_-]+$/.test(name) || name==='butchr') throw new Error('Invalid/reserved external MCP server name');
+      // FACTORY-702 work item 2: prepared CONCURRENTLY, not serially — a
+      // multi-server agent (e.g. wDK's three `resource_*` servers) used to
+      // pay each server's own up-to-20s `proxy.ready` timeout back to back
+      // (up to ~60s total); now the worst case for the whole agent is one
+      // server's timeout, not the sum of all of them. `Promise.allSettled`
+      // (not `Promise.all`) so that EVERY entry's `created.push` below has
+      // actually run — and so `created` is fully populated — before the
+      // catch block below decides whether/what to roll back; `Promise.all`
+      // would let still-pending siblings outlive an early rejection and
+      // leak their connections past this function's own cleanup.
+      const outcomes=await Promise.allSettled(entries.map(async([name,definition])=>{
         const key=spec.key+'/'+name;
         const tokenFile=join(dir,`.butchr-mcp-${name}.token`);
         let token:string;
@@ -167,8 +222,11 @@ export class ResourceConnections {
         this.connections.set(key,{proxy,token,relay,agent:spec.key,sessions:{clientToProxy:new Map(),pending:new Map()}});created.push(key);
         let timer:ReturnType<typeof setTimeout>|undefined;
         try {await Promise.race([proxy.ready,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('External MCP connection timeout')),20000);})]);}finally{clearTimeout(timer);}
-        servers.push({name:`resource_${name}`,url:`${this.baseUrl}/resource-mcp/${encodeURIComponent(spec.key)}/${name}`,headers:{Authorization:`Bearer ${token}`}});
-      }
+        return {name:`resource_${name}`,url:`${this.baseUrl}/resource-mcp/${encodeURIComponent(spec.key)}/${name}`,headers:{Authorization:`Bearer ${token}`}};
+      }));
+      const failed=outcomes.find((o):o is PromiseRejectedResult=>o.status==='rejected');
+      if (failed) throw failed.reason;
+      const servers=outcomes.map(o=>(o as PromiseFulfilledResult<NonNullable<SpawnSpec['externalMcpServers']>[number]>).value);
       this.prepared.set(spec.key,{file,servers});return {...spec,externalMcpServers:servers};
     } catch(e) {for(const key of created)await this.closeConnection(key);throw e;}
   }
@@ -178,9 +236,19 @@ export class ResourceConnections {
    *  (a) bearer valid for a connection IN the registry -> forward, exactly as before.
    *  (b) absent from the registry, this agent's first `prepare()` round has
    *      NOT yet completed, and the bearer matches the token PERSISTED for
-   *      this agent/name -> 503 + `Retry-After`, telling a client reconnecting
-   *      right after a restart to retry rather than treating this as a bad
-   *      credential.
+   *      this agent/name -> HOLD the request (FACTORY-702 work item 2;
+   *      `holdForReadiness` below) until that round finishes or
+   *      `requestHoldMs` elapses, then re-check: connection now present ->
+   *      forward it, exactly as a connection that was ready from the start
+   *      (a real reconnecting client gets a plain success, never an error,
+   *      so its own retry/backoff logic is never even exercised); round
+   *      still genuinely in flight past our bound -> the same 503 +
+   *      `Retry-After` as before (belt-and-suspenders fallback for a
+   *      `prepare()` that is unusually slow even for a concurrent,
+   *      per-server-timeout-bounded round); round finished WITHOUT this
+   *      connection (this agent's `prepare()` failed, or the global
+   *      backstop elapsed with no `prepare()` for it ever in flight) -> 401,
+   *      same as case (c).
    *  (c) anything else — wrong/missing bearer, unknown agent, unknown name,
    *      no token file, or a READY gateway's absent connection (e.g. a
    *      retired agent — `retain()` closes the connection but leaves the
@@ -188,7 +256,8 @@ export class ResourceConnections {
    *      about whether `agent`/`name` exist.
    */
   async handle(request:Request,agent:string,name:string):Promise<Response> {
-    const c=this.connections.get(agent+'/'+name);
+    const key=agent+'/'+name;
+    const c=this.connections.get(key);
     if(c) {
       if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${c.token}`))return UNAUTHORIZED();
       return this.forward(c,request);
@@ -196,10 +265,53 @@ export class ResourceConnections {
     if(!this.isReady(agent)) {
       const token=await this.persistedToken(agent,name);
       if(token!==null&&constantTimeEqual(request.headers.get('authorization'),`Bearer ${token}`)) {
+        // Only HOLD when there is actually something to wait for: a
+        // `prepare()` round genuinely in flight right now. If reconcile
+        // simply hasn't reached this agent yet (no round in flight at all —
+        // e.g. the very first request immediately after a restart, before
+        // the reconcile loop's first tick), holding would just burn
+        // `requestHoldMs` waiting on nothing; the immediate 503 below (a
+        // client that retries will find a round in flight by its next
+        // attempt in the overwhelmingly common case, since reconcile starts
+        // at daemon boot independent of any request) is correct here, byte-
+        // for-byte the pre-FACTORY-702 behaviour.
+        if(this.inFlightPrepares.has(agent)) {
+          await this.holdForReadiness(agent,request.signal);
+          const held=this.connections.get(key);
+          if(held) {
+            if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${held.token}`))return UNAUTHORIZED();
+            return this.forward(held,request);
+          }
+          if(!this.isReady(agent)) {
+            return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
+          }
+          // isReady flipped true (this agent's prepare() round finished — success or failure — or the global backstop elapsed with none ever in flight) but still no connection for THIS name: the same "ready, absent connection" outcome as case (c).
+          return UNAUTHORIZED();
+        }
         return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
       }
     }
     return UNAUTHORIZED();
+  }
+  /**
+   * Blocks until `agent`'s in-flight `prepare()` round settles
+   * (`isReady(agent)` flips true), the request is aborted by the client, or
+   * `requestHoldMs` elapses — whichever comes first. Polling rather than an
+   * event-based wake: `isReady` is a cheap, pure check of two small
+   * `Set`s/one subtraction, and polling needs no bookkeeping to avoid
+   * leaking a waiter that a never-settling round would otherwise orphan
+   * (every real round DOES settle, bounded by `prepareExternal`'s own
+   * per-server timeout — but a held HTTP request is exactly the kind of
+   * resource a bookkeeping bug here would leak silently).
+   */
+  private async holdForReadiness(agent:string,signal:AbortSignal):Promise<void> {
+    const deadline=Date.now()+this.requestHoldMs;
+    const pollMs=50;
+    while(!this.isReady(agent)&&!signal.aborted) {
+      const remaining=deadline-Date.now();
+      if(remaining<=0)return;
+      await new Promise(resolve=>setTimeout(resolve,Math.min(pollMs,remaining)));
+    }
   }
   /**
    * Forwards an authenticated request to `c.proxy`, bridging the client's

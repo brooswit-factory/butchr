@@ -5,6 +5,7 @@ import {randomBytes} from 'node:crypto';
 import {Elysia} from 'elysia';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {LATEST_PROTOCOL_VERSION} from '@modelcontextprotocol/sdk/types.js';
 import {ResourceConnections} from '../../src/agents/resource-connections.js';
 import {workspaceDirFor,type SpawnSpec} from '../../src/agents/workspace.js';
 const cleanup:(()=>Promise<void>|void)[]=[];afterEach(async()=>{for(const f of cleanup.splice(0).reverse())await f();});
@@ -85,16 +86,27 @@ test('an agent retired BEFORE a restart (never prepared in the new instance) sti
 });
 
 /**
- * FACTORY-700 cliff analysis: the test above models a RETIRED agent (never
- * re-`prepare()`d in the new instance at all). This one models the OTHER
- * half of the ticket's hypothesis — an agent whose `prepare()` is simply
- * SLOW (still actively in flight, not abandoned) when `startupDeadlineMs`
- * elapses. `isReady()` cannot distinguish the two: both just mean
- * `readyAgents.has(agent)` is still false when the deadline check runs, so
- * this is expected to behave identically to the retired case — confirmed
- * here rather than merely inferred from the code.
+ * FACTORY-700 cliff analysis, UPDATED by FACTORY-702 (work item 3) rather
+ * than quietly deleted: the test above models a RETIRED agent (never
+ * re-`prepare()`d in the new instance at all) — the deadline backstop must
+ * still flip that case to 401, and still does (unchanged above). This one
+ * models the OTHER half of FACTORY-700's hypothesis — an agent whose
+ * `prepare()` is simply SLOW (still actively in flight, not abandoned) when
+ * `startupDeadlineMs` elapses. Before FACTORY-702, `isReady()` could not
+ * distinguish the two (both just read as `readyAgents.has(agent) === false`
+ * to the deadline check), so this case ALSO got a wrongful 401 — FACTORY-700
+ * confirmed that by measurement, not merely inference. FACTORY-702 fixes
+ * it: `inFlightPrepares` (resource-connections.ts) now tracks exactly this
+ * case, so the deadline cannot fire while a `prepare()` round for this
+ * agent is genuinely running, and `handle()` HOLDS the request until that
+ * round finishes instead of answering at all while it's indeterminate. The
+ * request below is a bare GET (the SDK client's SSE probe, no session id)
+ * — once the held round finishes and the connection comes up, `forward()`
+ * answers it `405` (the spec-correct, non-fatal-to-the-client outcome for
+ * that probe — FACTORY-696/697/698), which is the proof: a 401 here would
+ * mean the cliff fired again despite `prepare()` only being slow, not dead.
  */
-test('FACTORY-700: an agent whose prepare() is still IN FLIGHT (not abandoned) when the global deadline elapses also gets 401, not 503 — the cliff does not distinguish "slow" from "never coming back"',async()=>{
+test('FACTORY-700/702: an agent whose prepare() is still IN FLIGHT (not abandoned) when the global deadline elapses is HELD, not flipped to 401 — the cliff no longer fires for "slow", only for "never coming back"',async()=>{
  const f=await fixture();
  // Replace the fixture's instant-reply script with one whose `initialize` response is deliberately delayed well past the injected deadline below, so prepare() is still genuinely in flight (not merely unstarted) when the request lands.
  await writeFile(f.script,`const rl=require('node:readline');const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
@@ -102,15 +114,17 @@ test('FACTORY-700: an agent whose prepare() is still IN FLIGHT (not abandoned) w
  if(m.method==='initialize')setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'local',version:'1'}}}),300);
  });`);
  let t=0;const now=()=>t;
- const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000);
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000,5000);
  cleanup.push(()=>registry.close());
  const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
  // Persisted BEFORE prepare() runs, exactly as a real restart finds it: the token file already exists on disk from a prior generation, so prepare() just re-reads it (no race with its own ENOENT-triggered write).
  const token=await persistToken(f.spec.key,'chat');
  const prepared=registry.prepare(f.spec); // NOT awaited: prepare() is genuinely running (blocked on the slow stdio `initialize`), not abandoned.
  t=1000; // deadline elapsed per the injected clock, while prepare() above is still in flight.
+ const start=Date.now();
  const res=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
- expect(res.status).toBe(401); // not 503 — the cliff fires even though this agent's own prepare() is actively running, not abandoned.
+ expect(Date.now()-start).toBeGreaterThanOrEqual(250); // held for roughly the real 300ms prepare() delay, not answered instantly
+ expect(res.status).toBe(405); // forwarded once ready — NOT 401: the cliff no longer fires while prepare() is genuinely in flight
  await prepared; // let the in-flight prepare() finish before the fixture's own cleanup closes the registry.
 });
 
@@ -439,6 +453,71 @@ test('upstream genuinely down is passed straight through (JSON-ified), never ado
   expect((await res.json() as any).error.message).toContain('MCP upstream disconnected');
   expect(initializeCalls).toBe(0); // never attempted adoption for a down upstream
  } finally { globalThis.fetch=origFetch; conn.proxy=originalProxy; }
+});
+
+/**
+ * Models the real `claude` CLI v2.1.251's measured reconnect algorithm
+ * (FACTORY-700): one initial POST, then up to `backoffsMs.length` retries
+ * spaced by `backoffsMs`, each firing ONLY after the previous attempt's
+ * response completed (the client's retry timer starts on a completed
+ * failure, never while a request is still in flight) — and, critically,
+ * NOTHING further once the backoffs are exhausted. Returns every attempt's
+ * response so a test can assert exactly which one (if any) succeeded.
+ */
+async function simulateReconnectingClient(attempt:()=>Promise<Response>,backoffsMs:readonly number[]):Promise<Response[]> {
+ const responses:Response[]=[];
+ for(let i=0;;i++) {
+  const res=await attempt();responses.push(res);
+  if(res.ok||i>=backoffsMs.length)return responses;
+  await Bun.sleep(backoffsMs[i]!);
+ }
+}
+
+test('FACTORY-702: a client modelled on the real ~8s retry budget (initial POST + 3 retries at 1s/2s/4s, THEN NOTHING MORE) still reaches a working connection when prepare() takes longer than that whole budget',async()=>{
+ const f=await fixture();
+ // Scaled down ~20x from FACTORY-700's real measurements so this test runs in well under a second while preserving the one ratio that matters: prepare() takes LONGER than the client's entire retry budget.
+ //   real:  client's budget is spent in ~7.8s (instant initial POST + retries at 1s/2s/4s); prepare() can legitimately take up to 20s per server.
+ //   here:  client's budget is spent in <70ms (backoffs of 10/20/40ms after an instant initial attempt); the single upstream's `initialize` is deliberately delayed 250ms — more than THREE TIMES the client's whole budget.
+ await writeFile(f.script,`const rl=require('node:readline');const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+ rl.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.method==='initialize')setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'local',version:'1'}}}),250);
+ else if(m.method==='notifications/initialized'){}
+ else if(m.method==='tools/list')send({jsonrpc:'2.0',id:m.id,result:{tools:[{name:'identity',description:'identity',inputSchema:{type:'object'}}]}});
+ });`);
+ const token=await persistToken(f.spec.key,'chat');
+ // requestHoldMs generous relative to the 250ms prepare() delay, modelling FACTORY-702's real default (20s per-server timeout + 5s margin) scaled down by the same ~20x.
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},Date.now,5*60_000,1500);
+ cleanup.push(()=>registry.close());
+ const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
+ const prepared=registry.prepare(f.spec); // the reconcile loop is already running concurrently with the client's reconnect attempts below — exactly like a real restart, NOT awaited here.
+
+ const attempt=()=>app.handle(new Request(urlFor(f.spec.key,'chat'),{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json',accept:'application/json, text/event-stream'},
+  body:JSON.stringify({jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:LATEST_PROTOCOL_VERSION,capabilities:{},clientInfo:{name:'test-client',version:'1'}}})}));
+
+ const start=Date.now();
+ const responses=await simulateReconnectingClient(attempt,[10,20,40]); // client's real backoff shape, scaled down; 4 attempts max, then the client would send nothing further.
+ const elapsed=Date.now()-start;
+
+ expect(responses).toHaveLength(1); // the client's FIRST attempt already succeeds — held open by the gateway rather than failing fast — so its own retry loop above never even has to fire a 2nd attempt.
+ expect(responses[0]!.ok).toBe(true);
+ expect(elapsed).toBeGreaterThanOrEqual(200); // genuinely held until prepare() finished (~250ms) — not answered with an instant 503 that the 70ms-budgeted retries above would then have exhausted and gone silent on, exactly as FACTORY-700 measured the real client doing.
+ await prepared;
+});
+
+test('FACTORY-702: prepare() runs an agent\'s multiple MCP servers CONCURRENTLY, not serially — worst case is the slowest ONE server, not their sum',async()=>{
+ const f=await fixture();
+ const delays=[400,400,400]; // if serial, this agent's prepare() would take >=1200ms; if concurrent, ~400ms (plus process-spawn overhead, shared across all three either way).
+ await writeFile(f.file,JSON.stringify({mcpServers:Object.fromEntries(delays.map((ms,i)=>[`srv${i}`,{command:process.execPath,args:['-e',
+  `const rl=require('node:readline');const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');`+
+  `rl.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);`+
+  `if(m.method==='initialize')setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'local',version:'1'}}}),${ms});`+
+  `});`]}]))}));
+ const start=Date.now();
+ const spec=await f.registry.prepare(f.spec);
+ const elapsed=Date.now()-start;
+ expect(spec.externalMcpServers).toHaveLength(3);
+ expect(spec.externalMcpServers!.map(s=>s.name).sort()).toEqual(['resource_srv0','resource_srv1','resource_srv2']);
+ expect(elapsed).toBeLessThan(1000); // well under the serial sum (>=1200ms) — proves the three servers were prepared concurrently, not one after another.
 });
 
 test('integration: a daemon restart (new ResourceConnections, same workspace dir) answers 503 — never 401 — until prepare() runs again, then 200',async()=>{
