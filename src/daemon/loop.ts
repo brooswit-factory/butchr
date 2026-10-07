@@ -3,7 +3,6 @@ import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
 import { RESTORED_PANE_STALE_REASON_PREFIX } from "../agents/herd.js";
-import type { RestoreSettleGate } from "../agents/restore-settle.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
@@ -432,21 +431,6 @@ export interface ReconcileOptions {
    */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /**
-   * FACTORY-710: the cold-boot settle gate — see `RestoreSettleGate`
-   * (src/agents/restore-settle.ts) for the full mechanism. Runs AFTER
-   * `checkResidency` (so a phantom already-running candidate was already
-   * removed, same reasoning `checkResidency`'s own doc comment gives for
-   * running before `admission`) and BEFORE `admission` (so a held candidate
-   * never consumes fleet-wide spawn budget while it waits — same "withheld
-   * candidate must not count as an attempt" discipline `checkResidency`
-   * itself establishes). Its return value REPLACES `live` for everything
-   * downstream (`admission`, `checkCrashLoop`, the spawn loop), same
-   * "consulted for control flow" shape `checkResidency`/`admission` already
-   * use. Optional; omitted (every caller before this ticket), `live` passes
-   * through unchanged — today's exact fresh-spawn-immediately behaviour.
-   */
-  restoreSettleGate?: RestoreSettleGate;
-  /**
    * BUTCHR-297 (§B4): reports which of THIS poll's admitted candidates
    * actually SUCCEEDED their spawn — see src/agents/admission.ts's own top-
    * comment B4 addendum for why admission and running are different events
@@ -657,15 +641,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // and `checkCrashLoop` below actually see. Omitted, `live` is `plan.spawn`
   // itself (the same array), so every existing caller and test is unaffected.
   let live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
-  // FACTORY-710: hold any resumable-transcript candidate back from fresh-
-  // spawning until herdr's restore has settled — see
-  // `ReconcileOptions.restoreSettleGate`'s own doc comment for why this runs
-  // here specifically (after checkResidency, before admission). Reads
-  // `running` (already resolved above, same snapshot `planReconcile` used) —
-  // never re-fetches it, so the existing "herd.runningIssues() rejects =>
-  // nothing spawns" property (this function's own top comment) is completely
-  // untouched: a rejection there already threw before this line is reached.
-  if (opts.restoreSettleGate) live = opts.restoreSettleGate.filter(live, running, desired);
   // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
   // spawn loop below, and is the ONE hook in this function that actually
   // replaces its input rather than merely observing it — see
@@ -1139,8 +1114,6 @@ export interface GenericLoopDeps<T> {
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  /** FACTORY-710: see `ReconcileOptions.restoreSettleGate`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the ISSUE loop only (src/daemon/index.ts) — the project tier's own agents have no Claude transcript to resume and nothing in its herd namespace is ever `isHerdrRestoredPane`-shaped. Optional; omitted, no settle gate runs (every caller before this ticket). */
-  restoreSettleGate?: RestoreSettleGate;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
   /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
@@ -1243,7 +1216,6 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
-        ...(deps.restoreSettleGate ? { restoreSettleGate: deps.restoreSettleGate } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),

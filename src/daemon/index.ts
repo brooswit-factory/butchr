@@ -20,6 +20,7 @@ import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { reportPersistedAgentSessions } from "../agents/report-agent-sessions.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, dirname, join } from "node:path";
@@ -94,7 +95,6 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
-import { RestoreSettleGate } from "../agents/restore-settle.js";
 import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
@@ -585,6 +585,17 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 // Fire-and-forget: a slow or failing herdr must never delay the rest of
 // startup, and the method itself never throws.
 void herd.relabelOwnedWorkspaces();
+// FACTORY-714/FACTORY-713/FACTORY-704 (re-aimed) — report each already-
+// running pane's persisted Claude session id to herdr, once per daemon
+// startup, for whichever panes herdr doesn't already hold an
+// `agent_session` for (see `reportPersistedAgentSessions`'s own doc
+// comment, src/agents/report-agent-sessions.ts, for why this is the real
+// fix — not the abandoned settle-gate approach — and why it is safe to run
+// on every startup). Same fire-and-forget, idempotent-startup-sweep shape
+// as `relabelOwnedWorkspaces` immediately above: a slow or failing herdr
+// must never delay the rest of startup, and the function itself never
+// throws (per-pane failures are swallowed and logged inside it).
+void reportPersistedAgentSessions({ herdr, log: (line) => console.error(`  ${line}`) });
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
 // binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the
@@ -1812,15 +1823,6 @@ const issueResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
-// FACTORY-710/FACTORY-708/FACTORY-704 — ONE instance for this daemon
-// process's whole life (see `RestoreSettleGate`'s own doc comment for why
-// it deliberately never re-arms after its first settle), wired into the
-// ISSUE loop only below — the project tier has no Claude transcript to
-// resume.
-const restoreSettleGate = new RestoreSettleGate({
-  boundMs: config.restoreSettleBoundMs,
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-352: the issue tier's own admission census bucket — the SAME
 // `admissionController` instance the issue/project `runResourceLoop` calls
 // below already share (see that construction's own comment for why one
@@ -2018,7 +2020,6 @@ runResourceLoop(ruleResourceType, {
   checkReconcileFailure: issueReconcileFailureDetector.check,
   checkReap: issueReaper.check,
   checkResidency: issueResidencyGuard.filter,
-  restoreSettleGate,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ISSUE),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
