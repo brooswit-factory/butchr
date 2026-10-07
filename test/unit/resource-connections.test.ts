@@ -84,6 +84,36 @@ test('an agent retired BEFORE a restart (never prepared in the new instance) sti
  expect(pastDeadline.status).toBe(401);
 });
 
+/**
+ * FACTORY-700 cliff analysis: the test above models a RETIRED agent (never
+ * re-`prepare()`d in the new instance at all). This one models the OTHER
+ * half of the ticket's hypothesis — an agent whose `prepare()` is simply
+ * SLOW (still actively in flight, not abandoned) when `startupDeadlineMs`
+ * elapses. `isReady()` cannot distinguish the two: both just mean
+ * `readyAgents.has(agent)` is still false when the deadline check runs, so
+ * this is expected to behave identically to the retired case — confirmed
+ * here rather than merely inferred from the code.
+ */
+test('FACTORY-700: an agent whose prepare() is still IN FLIGHT (not abandoned) when the global deadline elapses also gets 401, not 503 — the cliff does not distinguish "slow" from "never coming back"',async()=>{
+ const f=await fixture();
+ // Replace the fixture's instant-reply script with one whose `initialize` response is deliberately delayed well past the injected deadline below, so prepare() is still genuinely in flight (not merely unstarted) when the request lands.
+ await writeFile(f.script,`const rl=require('node:readline');const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+ rl.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.method==='initialize')setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'local',version:'1'}}}),300);
+ });`);
+ let t=0;const now=()=>t;
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000);
+ cleanup.push(()=>registry.close());
+ const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
+ // Persisted BEFORE prepare() runs, exactly as a real restart finds it: the token file already exists on disk from a prior generation, so prepare() just re-reads it (no race with its own ENOENT-triggered write).
+ const token=await persistToken(f.spec.key,'chat');
+ const prepared=registry.prepare(f.spec); // NOT awaited: prepare() is genuinely running (blocked on the slow stdio `initialize`), not abandoned.
+ t=1000; // deadline elapsed per the injected clock, while prepare() above is still in flight.
+ const res=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
+ expect(res.status).toBe(401); // not 503 — the cliff fires even though this agent's own prepare() is actively running, not abandoned.
+ await prepared; // let the in-flight prepare() finish before the fixture's own cleanup closes the registry.
+});
+
 test('wrong token, at any readiness, is 401',async()=>{
  const f=await fixture();
  const token=await persistToken(f.spec.key,'chat');
