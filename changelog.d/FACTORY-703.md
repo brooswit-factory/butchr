@@ -17,16 +17,24 @@ bump: patch
   worst case to one server's own timeout (~20s) regardless of how many
   servers the agent has.
   `ResourceConnections.handle()` also now **holds** an otherwise-503-worthy
-  request (bounded by a new `requestHoldMs`, default 25s) while that
-  agent's `prepare()` round is genuinely in flight, instead of answering
-  `503` immediately — a reconnecting client's single in-flight request can
-  then resolve directly to success once `prepare()` finishes, rather than
-  needing to survive being told to retry at all. Bounded: if `prepare()`
-  is still running once `requestHoldMs` elapses, the pre-existing `503` +
-  `Retry-After` behaviour is the fallback; if the round has genuinely
-  finished without this connection (the agent's `prepare()` failed, or the
-  global startup backstop elapsed with none in flight), the response is the
-  same `401` as any other absent-and-ready connection.
+  request (bounded by a new `requestHoldMs`, default 25s) instead of
+  answering `503` or forwarding immediately — a reconnecting client's
+  single in-flight request can then resolve directly to success once
+  ready, rather than needing to survive being told to retry at all. This
+  covers every case that previously answered too early: no connection yet
+  and this agent's `prepare()` round not yet even invoked (reconcile
+  hasn't reached it); no connection yet and a round genuinely in flight;
+  and — the gap the first version of this fix missed, since
+  `startMcpChannelProxy()` registers a connection well before its own
+  upstream handshake resolves — a connection that already EXISTS but isn't
+  ready yet, which used to forward straight into the vendored proxy's own
+  "not ready" passthrough for that entire window. Bounded: if still
+  genuinely indeterminate once `requestHoldMs` elapses, the pre-existing
+  503/forward-and-let-the-proxy-answer behaviour is the fallback; if the
+  round has settled without this connection (the agent's `prepare()`
+  failed, or the global startup backstop elapsed with none ever in
+  flight), the response is the same `401` as any other absent-and-ready
+  connection.
 - **Fixed the 503→401 cliff** (FACTORY-700's own regression test): `isReady()`
   used to flip an agent straight to `401` once the global `startupDeadlineMs`
   backstop elapsed, with no regard for whether that agent's own `prepare()`

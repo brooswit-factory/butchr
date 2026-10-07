@@ -34,7 +34,23 @@ type Proxy = Awaited<ReturnType<typeof startMcpChannelProxy>>;
  * one per request.
  */
 interface SessionBindings { clientToProxy: Map<string,string>; pending: Map<string,Promise<string>>; }
-interface Connection { proxy: Proxy; token: string; relay: InboxRelay; agent: string; sessions: SessionBindings; }
+/**
+ * `ready` (FACTORY-702 review round 1): `connections.set()` registers a
+ * Connection as soon as `startMcpChannelProxy()` itself returns — which
+ * happens near-instantly, well BEFORE that proxy's own upstream handshake
+ * (`proxy.ready`) resolves. Before this field existed, `handle()`'s
+ * registry-hit branch forwarded unconditionally the moment the Connection
+ * object existed, regardless of whether its upstream was actually up —
+ * reaching the vendored proxy's own "MCP upstream disconnected" passthrough
+ * instead of ever reaching the hold logic below, for the ENTIRE window
+ * between object-registration and real upstream readiness. Flipped to
+ * `true` by `prepareExternal`, in place on this exact object, once its own
+ * `proxy.ready` wins the race against the per-server timeout — never
+ * flipped back; a Connection that never reaches it is simply removed
+ * (`closeConnection`, via the round's own failure cleanup) rather than left
+ * permanently `false`.
+ */
+interface Connection { proxy: Proxy; token: string; relay: InboxRelay; agent: string; sessions: SessionBindings; ready: boolean; }
 /** Per-connection cap on `clientToProxy`; tiny per entry, so generous. */
 const MAX_BOUND_SESSIONS=10_000;
 
@@ -219,9 +235,11 @@ export class ResourceConnections {
         const source=definition.type==='http' ? {url:definition.url,...(definition.headers?{headers:definition.headers}:{})}
           : {url:'http://stdio.invalid',connect:stdioConnector(definition,dir)};
         const proxy=await startMcpChannelProxy({name,...source,onMessage:m=>{if(raw.mcpServers[name].notifications!==false)relay.push(m);},onStatus:s=>this.log(`[connections] ${spec.key}/${name}: ${s.kind}`)});
-        this.connections.set(key,{proxy,token,relay,agent:spec.key,sessions:{clientToProxy:new Map(),pending:new Map()}});created.push(key);
+        const conn:Connection={proxy,token,relay,agent:spec.key,sessions:{clientToProxy:new Map(),pending:new Map()},ready:false};
+        this.connections.set(key,conn);created.push(key);
         let timer:ReturnType<typeof setTimeout>|undefined;
         try {await Promise.race([proxy.ready,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('External MCP connection timeout')),20000);})]);}finally{clearTimeout(timer);}
+        conn.ready=true; // mutated in place — the SAME object `handle()`/`holdForConnection` may already be holding a reference to.
         return {name:`resource_${name}`,url:`${this.baseUrl}/resource-mcp/${encodeURIComponent(spec.key)}/${name}`,headers:{Authorization:`Bearer ${token}`}};
       }));
       const failed=outcomes.find((o):o is PromiseRejectedResult=>o.status==='rejected');
@@ -233,22 +251,30 @@ export class ResourceConnections {
   /**
    * Stable local endpoint survives daemon restarts; tokens never reach the
    * upstream service. Three outcomes (FACTORY-688/689/691):
-   *  (a) bearer valid for a connection IN the registry -> forward, exactly as before.
-   *  (b) absent from the registry, this agent's first `prepare()` round has
-   *      NOT yet completed, and the bearer matches the token PERSISTED for
-   *      this agent/name -> HOLD the request (FACTORY-702 work item 2;
-   *      `holdForReadiness` below) until that round finishes or
-   *      `requestHoldMs` elapses, then re-check: connection now present ->
-   *      forward it, exactly as a connection that was ready from the start
-   *      (a real reconnecting client gets a plain success, never an error,
-   *      so its own retry/backoff logic is never even exercised); round
-   *      still genuinely in flight past our bound -> the same 503 +
-   *      `Retry-After` as before (belt-and-suspenders fallback for a
-   *      `prepare()` that is unusually slow even for a concurrent,
-   *      per-server-timeout-bounded round); round finished WITHOUT this
-   *      connection (this agent's `prepare()` failed, or the global
-   *      backstop elapsed with no `prepare()` for it ever in flight) -> 401,
-   *      same as case (c).
+   *  (a) bearer valid for a connection IN the registry AND that connection
+   *      is READY (its own `proxy.ready` already won its race) -> forward,
+   *      exactly as before.
+   *  (b) a connection exists but is NOT yet ready, OR no connection exists
+   *      at all and this agent's first `prepare()` round has not yet
+   *      completed (REGARDLESS of whether that round has even STARTED —
+   *      FACTORY-702 review round 1: reconcile not having reached this
+   *      agent yet is not a reason to skip holding, it is exactly the
+   *      post-restart state the ticket targets), with a bearer matching
+   *      either the live connection's own token or the token PERSISTED for
+   *      this agent/name -> HOLD the request (`holdForConnection` below)
+   *      until THIS SPECIFIC connection becomes ready, the round settles
+   *      without it, or `requestHoldMs` elapses — whichever comes first.
+   *      Ready in time -> forward it, exactly as a connection that was
+   *      ready from the start (a real reconnecting client gets a plain
+   *      success, never an error, so its own retry/backoff logic is never
+   *      even exercised). Round settles without this connection (this
+   *      agent's `prepare()` failed, or the global backstop elapsed with
+   *      no round ever in flight) -> 401, same as case (c). Bound elapses
+   *      while still genuinely indeterminate -> falls through to forward()
+   *      anyway if a (not-yet-ready) connection now exists — the pre-702
+   *      behaviour, bounded then left to the proxy's own passthrough — or
+   *      the same 503 + `Retry-After` as before if no connection exists at
+   *      all yet.
    *  (c) anything else — wrong/missing bearer, unknown agent, unknown name,
    *      no token file, or a READY gateway's absent connection (e.g. a
    *      retired agent — `retain()` closes the connection but leaves the
@@ -260,54 +286,53 @@ export class ResourceConnections {
     const c=this.connections.get(key);
     if(c) {
       if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${c.token}`))return UNAUTHORIZED();
-      return this.forward(c,request);
+      if(c.ready)return this.forward(c,request);
+      await this.holdForConnection(key,agent,request.signal);
+      // Bounded, then fail (FACTORY-702 review round 1): whatever is at `key`
+      // now — ready, still not ready, or gone entirely — is handled by the
+      // SAME logic below as the no-connection-yet path, so there is exactly
+      // one place this decision is made.
+    } else if(this.isReady(agent)) {
+      return UNAUTHORIZED();
+    } else {
+      const token=await this.persistedToken(agent,name);
+      if(token===null||!constantTimeEqual(request.headers.get('authorization'),`Bearer ${token}`))return UNAUTHORIZED();
+      await this.holdForConnection(key,agent,request.signal);
+    }
+    const after=this.connections.get(key);
+    if(after) {
+      if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${after.token}`))return UNAUTHORIZED();
+      return this.forward(after,request); // ready, or not — forward() / the proxy's own passthrough is the existing, tested fallback for "still not ready".
     }
     if(!this.isReady(agent)) {
-      const token=await this.persistedToken(agent,name);
-      if(token!==null&&constantTimeEqual(request.headers.get('authorization'),`Bearer ${token}`)) {
-        // Only HOLD when there is actually something to wait for: a
-        // `prepare()` round genuinely in flight right now. If reconcile
-        // simply hasn't reached this agent yet (no round in flight at all —
-        // e.g. the very first request immediately after a restart, before
-        // the reconcile loop's first tick), holding would just burn
-        // `requestHoldMs` waiting on nothing; the immediate 503 below (a
-        // client that retries will find a round in flight by its next
-        // attempt in the overwhelmingly common case, since reconcile starts
-        // at daemon boot independent of any request) is correct here, byte-
-        // for-byte the pre-FACTORY-702 behaviour.
-        if(this.inFlightPrepares.has(agent)) {
-          await this.holdForReadiness(agent,request.signal);
-          const held=this.connections.get(key);
-          if(held) {
-            if(!constantTimeEqual(request.headers.get('authorization'),`Bearer ${held.token}`))return UNAUTHORIZED();
-            return this.forward(held,request);
-          }
-          if(!this.isReady(agent)) {
-            return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
-          }
-          // isReady flipped true (this agent's prepare() round finished — success or failure — or the global backstop elapsed with none ever in flight) but still no connection for THIS name: the same "ready, absent connection" outcome as case (c).
-          return UNAUTHORIZED();
-        }
-        return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
-      }
+      return new Response(JSON.stringify({error:'butchr is starting; connection not ready, retry'}),{status:503,headers:{'Retry-After':'2','content-type':'application/json'}});
     }
-    return UNAUTHORIZED();
+    return UNAUTHORIZED(); // round settled (success or failure) or the global backstop elapsed with none ever in flight, and still no connection for THIS name.
   }
   /**
-   * Blocks until `agent`'s in-flight `prepare()` round settles
-   * (`isReady(agent)` flips true), the request is aborted by the client, or
-   * `requestHoldMs` elapses — whichever comes first. Polling rather than an
-   * event-based wake: `isReady` is a cheap, pure check of two small
-   * `Set`s/one subtraction, and polling needs no bookkeeping to avoid
-   * leaking a waiter that a never-settling round would otherwise orphan
-   * (every real round DOES settle, bounded by `prepareExternal`'s own
-   * per-server timeout — but a held HTTP request is exactly the kind of
-   * resource a bookkeeping bug here would leak silently).
+   * Blocks until the connection at `key` becomes READY, the round for
+   * `agent` settles without ever producing one, the request is aborted, or
+   * `requestHoldMs` elapses — whichever comes first. Checks the SPECIFIC
+   * connection's own `ready` flag on every poll (not just `isReady(agent)`,
+   * which only flips once the WHOLE round — every server for this agent —
+   * finishes): under FACTORY-702's concurrent `prepareExternal`, a
+   * multi-server agent's OTHER servers may still be mid-handshake while
+   * THIS one has already finished, and a held request must not wait for
+   * siblings it does not care about. Polling rather than an event-based
+   * wake: cheap, and needs no bookkeeping to avoid leaking a waiter that a
+   * never-settling round would otherwise orphan (every real round DOES
+   * settle, bounded by `prepareExternal`'s own per-server timeout — but a
+   * held HTTP request is exactly the kind of resource a bookkeeping bug
+   * here would leak silently).
    */
-  private async holdForReadiness(agent:string,signal:AbortSignal):Promise<void> {
+  private async holdForConnection(key:string,agent:string,signal:AbortSignal):Promise<void> {
     const deadline=Date.now()+this.requestHoldMs;
     const pollMs=50;
-    while(!this.isReady(agent)&&!signal.aborted) {
+    for(;;) {
+      const c=this.connections.get(key);
+      if(c?.ready)return;
+      if(!c&&this.isReady(agent))return; // round settled (or the global backstop elapsed with none ever in flight) without ever producing this connection
+      if(signal.aborted)return;
       const remaining=deadline-Date.now();
       if(remaining<=0)return;
       await new Promise(resolve=>setTimeout(resolve,Math.min(pollMs,remaining)));

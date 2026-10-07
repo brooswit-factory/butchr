@@ -21,7 +21,11 @@ async function fixture(){
  });`);
  await writeFile(file,JSON.stringify({mcpServers:{chat:{command:process.execPath,args:[script],env:{TEST_ID:'project-P'}}}}));
  const messages:string[]=[];const logs:string[]=[];
- const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async(_id,text)=>{messages.push(text);return {delivered:true};}},s=>logs.push(s));cleanup.push(()=>registry.close());
+ // requestHoldMs=50: short so tests that hit the "not ready, nothing ever
+ // prepares it" path (handle() now holds there too, per FACTORY-702 review
+ // round 1) still return promptly; tests that want to exercise a real hold
+ // window construct their own registry with an explicit longer value.
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async(_id,text)=>{messages.push(text);return {delivered:true};}},s=>logs.push(s),Date.now,5*60_000,50);cleanup.push(()=>registry.close());
  const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
  const spec:SpawnSpec={key:'jira-project:managers:P',resource:'P',issuetype:'project',summary:'P',parent:null,mcpConfigFile:join(dir,'config-{{KEY}}.json')};
  return {dir,file,script,spec,registry,app,messages,logs};
@@ -75,7 +79,7 @@ test('an agent retired BEFORE a restart (never prepared in the new instance) sti
  // simulates: agent was retired before the daemon restarted — token file left on disk by the old instance, but this NEW instance's reconcile loop never matches/prepares it again.
  const token=await persistToken(f.spec.key,'chat');
  let t=0;const now=()=>t;
- const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000);
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},now,1000,50);
  cleanup.push(()=>registry.close());
  const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
  const withinWindow=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
@@ -520,6 +524,54 @@ test('FACTORY-702: prepare() runs an agent\'s multiple MCP servers CONCURRENTLY,
  expect(elapsed).toBeLessThan(1000); // well under the serial sum (>=1200ms) — proves the three servers were prepared concurrently, not one after another.
 });
 
+test('FACTORY-702 review round 1: a connection that EXISTS but is NOT YET ready (its own proxy.ready still pending) is HELD, never forwarded straight into the proxy\'s own not-ready passthrough',async()=>{
+ // What this guards against: `connections.set()` registers a Connection as soon as `startMcpChannelProxy()`
+ // itself returns — near-instantly, well before that proxy's own upstream handshake (`proxy.ready`) resolves.
+ // Pre-fix, `handle()`'s registry-hit branch forwarded the moment the object existed, regardless of readiness,
+ // reaching the vendored proxy's own "not ready yet" passthrough for the ENTIRE handshake window instead of
+ // ever holding. What would make this fail: the response coming back before the upstream's delayed `initialize`
+ // ever replies (proving no hold happened), or as anything other than the spec-correct 405 once it is held
+ // through to a genuinely ready connection.
+ const f=await fixture();
+ await writeFile(f.script,`const rl=require('node:readline');const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+ rl.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);
+ if(m.method==='initialize')setTimeout(()=>send({jsonrpc:'2.0',id:m.id,result:{protocolVersion:m.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'local',version:'1'}}}),300);
+ });`);
+ const token=await persistToken(f.spec.key,'chat'); // persisted BEFORE prepare() runs, as a real restart finds it.
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},Date.now,5*60_000,2000);
+ cleanup.push(()=>registry.close());
+ const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
+ const prepared=registry.prepare(f.spec); // NOT awaited.
+ await Bun.sleep(150); // the connection OBJECT has had time to register (near-instant); its own proxy.ready (300ms away) has not.
+ const conn=((registry as unknown) as {connections:Map<string,{ready:boolean}>}).connections.get(f.spec.key+'/chat');
+ expect(conn).toBeTruthy(); // sanity: the connection already exists in the registry
+ expect(conn!.ready).toBe(false); // ...but is not ready yet — exactly the window this test targets
+ const start=Date.now();
+ const res=await app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}}));
+ expect(Date.now()-start).toBeGreaterThanOrEqual(100); // held for roughly the remaining ~150ms, not answered instantly
+ expect(res.status).toBe(405); // forwarded once ready — a bare GET's spec-correct outcome, not a mid-handshake passthrough error
+ await prepared;
+});
+
+test('FACTORY-702 review round 1: a request arriving BEFORE prepare() has even been INVOKED for this agent is still HELD, not failed fast, once prepare() starts and finishes within the hold window',async()=>{
+ // What this guards against: the first round of this fix only held while `inFlightPrepares.has(agent)` —
+ // i.e. only once `prepare()` had actually started. Reconcile not yet having reached this agent at all (the
+ // very first moment after a restart) got the SAME immediate 503 as before this ticket, which is exactly the
+ // post-restart state the story targets. What would make this fail: the response resolving to 503 before
+ // `prepare()` is ever even invoked below (proving no hold happened).
+ const f=await fixture();
+ const token=await persistToken(f.spec.key,'chat');
+ const registry=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},Date.now,5*60_000,2000);
+ cleanup.push(()=>registry.close());
+ const app=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry.handle(request,params.agent,params.name));
+ const resPromise=app.handle(new Request(urlFor(f.spec.key,'chat'),{headers:{authorization:`Bearer ${token}`}})); // sent before prepare() is ever called.
+ await Bun.sleep(50); // the request is genuinely in flight with NOTHING to wait for yet — not a single prepare() round anywhere.
+ const prepared=registry.prepare(f.spec); // reconcile finally reaches this agent.
+ const res=await resPromise;
+ expect(res.status).toBe(405); // held straight through to a real forwarded response — never saw a 503 at all.
+ await prepared;
+});
+
 test('integration: a daemon restart (new ResourceConnections, same workspace dir) answers 503 — never 401 — until prepare() runs again, then 200',async()=>{
  const f=await fixture();
  const spec=await f.registry.prepare(f.spec);const server=spec.externalMcpServers![0]!;
@@ -530,7 +582,8 @@ test('integration: a daemon restart (new ResourceConnections, same workspace dir
  await client1.close();
 
  // "daemon restart": a BRAND NEW ResourceConnections on the SAME workspace dir — empty in-memory registry, token file still on disk.
- const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{});
+ // requestHoldMs=50: nothing is ever going to prepare this agent in this test before the assertion below, so a short bound keeps this fast.
+ const registry2=new ResourceConnections('http://local',{paneFor:async()=> 'pane',nudge:async()=>({delivered:true})},()=>{},Date.now,5*60_000,50);
  cleanup.push(()=>registry2.close());
  const app2=new Elysia().all('/resource-mcp/:agent/:name',({request,params})=>registry2.handle(request,params.agent,params.name));
 
