@@ -8,15 +8,32 @@ This guide takes you from nothing to one working rule.
 
 | Requirement | Why |
 | --- | --- |
-| Linux or macOS | Linux uses a systemd user service, macOS uses launchd, to keep the daemon running. Windows runs butchr inside WSL; see [windows-wsl-agent-guide.md](windows-wsl-agent-guide.md). |
+| Linux or macOS | Linux uses systemd user services, macOS uses launchd, to keep the daemon (and herdr) running. Windows runs butchr inside WSL; see [windows-wsl-agent-guide.md](windows-wsl-agent-guide.md). |
 | [Bun](https://bun.sh) | runs the daemon and builds the dashboard |
 | `git` | to download butchr |
-| [herdr](https://herdr.dev) | the terminal manager each agent runs in; must be on the daemon's `PATH` |
-| The `claude` command-line tool, signed in | the default agent provider (Codex is also supported, see [agent-providers.md](agent-providers.md)) |
+| herdr, already running and on the daemon's `PATH` | the terminal manager each agent runs in — see "Installing herdr" below |
+| The `claude` command-line tool, signed in | the default agent provider (Codex is also supported, see [agent-providers.md](agent-providers.md)) — see "Installing the `claude` tool" below |
 | `python3` on the daemon's `PATH` | used by a safety hook that runs before each agent shell command. On macOS run `xcode-select --install` if `python3` is only Apple's stub |
 | A Jira Cloud site and an API token | create the token at <https://id.atlassian.com/manage-profile/security/api-tokens>. The account that owns it is the one butchr reads and writes tickets as |
 
 Your Jira site address must look like `https://<name>.atlassian.net`.
+
+You do **not** need a GitHub account or `gh login` for any of this: cloning butchr below is an anonymous, unauthenticated `git clone` over HTTPS. (A GitHub token is only needed later if you turn on this daemon's own `github-issue`/`github-pr` rule providers — see the root `README.md` — which is unrelated to getting the daemon itself installed.)
+
+### Installing herdr
+
+This repo does not vendor or build herdr. Get the binary for your platform from <https://herdr.dev> and put it somewhere on the daemon's `PATH`, for example `~/.local/bin/herdr`. Confirm it with `herdr --version`.
+
+herdr must already be running before butchr starts a rule's first agent — step 3 below runs it as its own service, started before butchr. If you're just trying things out in a terminal rather than under a service manager, start it yourself first, in another terminal: `herdr server`.
+
+### Installing the `claude` command-line tool
+
+```
+npm install -g @anthropic-ai/claude-code
+claude
+```
+
+The second command, run once, walks you through signing in.
 
 ## 1. Install
 
@@ -31,7 +48,7 @@ bun run build
 
 ## 2. Start the daemon
 
-Keep it running under your system's service manager (step 3 shows how). To try it first, run it in a terminal:
+Keep it running under your system's service manager (step 3 shows how, and starts herdr too). To try it first, make sure herdr is already running (see "Installing herdr" above), then run butchr in a terminal:
 
 ```
 bun run start
@@ -59,18 +76,39 @@ systemctl --user kill -s SIGUSR2 butchr.service   # under systemd
 
 ## 3. Keep it running (required for the end of setup)
 
-When you finish setup the daemon **exits on purpose and relies on its service manager to start it again** in normal mode. Without a service manager, you start it yourself once after setup. Running it under one is the supported way.
+When you finish setup the daemon **exits on purpose and relies on its service manager to start it again** in normal mode. Without a service manager, you start it yourself once after setup. Running it under one is the supported way — and it's also how herdr itself should stay up, since butchr needs herdr already running to start any agent.
 
-**Linux (systemd user service).** Create `~/.config/systemd/user/butchr.service`, adjusting the paths:
+**Linux (systemd user services).** Give herdr its own unit, and make butchr's unit depend on it. Create `~/.config/systemd/user/herdr.service`, adjusting the path to wherever you installed herdr:
+
+```ini
+[Unit]
+Description=herdr
+
+[Service]
+ExecStart=%h/.local/bin/herdr server
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=default.target
+```
+
+(`LimitNOFILE` is raised because herdr holds one pty per running agent, and the default per-process file-descriptor limit is often too low for a busy fleet.)
+
+Create `~/.config/systemd/user/butchr.service`, adjusting the paths:
 
 ```ini
 [Unit]
 Description=butchr
+After=herdr.service
+Wants=herdr.service
 
 [Service]
 WorkingDirectory=%h/butchr
-ExecStart=%h/.bun/bin/bun run start
+ExecStart=%h/.bun/bin/bun run src/daemon/index.ts
 Restart=always
+RestartSec=2
 # herdr, claude and python3 must be on this PATH:
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
@@ -78,9 +116,34 @@ Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 ```
 
-Then `systemctl --user daemon-reload && systemctl --user enable --now butchr.service`. To keep it running when you are logged out: `loginctl enable-linger $USER`.
+`ExecStart` runs the daemon's entry file directly rather than going through `bun run start`'s own wrapper process. With that wrapper as the unit's `MainPID`, the dashboard's Settings → **Restart** control answers 409, and the process does not survive a second signal — running the entry file directly avoids both.
 
-**macOS (launchd).** Create `~/Library/LaunchAgents/butchr.plist`, adjusting the paths:
+Then:
+
+```
+systemctl --user daemon-reload
+systemctl --user enable --now herdr.service butchr.service
+```
+
+To keep both running when you are logged out: `loginctl enable-linger $USER`.
+
+**macOS (launchd).** Create `~/Library/LaunchAgents/herdr.plist`, adjusting the paths:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>herdr</string>
+  <key>ProgramArguments</key><array>
+    <string>/Users/YOU/.local/bin/herdr</string><string>server</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/Users/YOU/herdr.log</string>
+</dict></plist>
+```
+
+Then create `~/Library/LaunchAgents/butchr.plist`, adjusting the paths:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -89,7 +152,7 @@ Then `systemctl --user daemon-reload && systemctl --user enable --now butchr.ser
   <key>Label</key><string>butchr</string>
   <key>WorkingDirectory</key><string>/Users/YOU/butchr</string>
   <key>ProgramArguments</key><array>
-    <string>/Users/YOU/.bun/bin/bun</string><string>run</string><string>start</string>
+    <string>/Users/YOU/.bun/bin/bun</string><string>run</string><string>src/daemon/index.ts</string>
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>/Users/YOU/.bun/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
@@ -100,11 +163,15 @@ Then `systemctl --user daemon-reload && systemctl --user enable --now butchr.ser
 </dict></plist>
 ```
 
-Then `launchctl load ~/Library/LaunchAgents/butchr.plist`.
+Load both, herdr first: `launchctl load ~/Library/LaunchAgents/herdr.plist && launchctl load ~/Library/LaunchAgents/butchr.plist`.
+
+launchd has no equivalent of the dashboard's Settings → **Restart** control (that only works when butchr detects it is running under systemd, today). Restart the daemon yourself instead: `launchctl kickstart -k gui/$(id -u)/butchr` (match the label to your plist's `Label`, and use `/herdr` the same way for herdr). Do this after any settings change, and as the last step of rotating your Jira token — mint a fresh setup code first (the `kill -USR2`/log step from "2. Start the daemon" above), paste it into the Settings page, then kick-start.
 
 ## 4. Open the dashboard and finish setup
 
-Open <http://127.0.0.1:7717/dashboard-app/> (7717 is the default port; set `BUTCHR_PORT` to change it). In setup mode the page asks for:
+Open <http://127.0.0.1:7717/dashboard-app/> (7717 is the default port; set `BUTCHR_PORT` to change it). The dashboard only listens on loopback, so on a headless box — no browser on the machine butchr runs on — forward the port over SSH first: `ssh -L 7717:127.0.0.1:7717 <host>`, then open that same URL in a browser on your own machine.
+
+In setup mode the page asks for:
 
 1. your **Jira site** (`https://<name>.atlassian.net`),
 2. your **account email**,
@@ -147,6 +214,7 @@ The **Settings** page shows each setting and where its value comes from: the env
 | An agent does not start after enabling | Check the maximum agent count on Settings, then the daemon log. |
 | The page will not load / "connection refused" | The daemon is down. `curl http://127.0.0.1:7717/health`; check `systemctl --user status butchr.service` (Linux) or `launchctl list | grep butchr` (macOS), then the log. |
 | The dashboard says it is not built | Run `bun run build` in the butchr folder and reload. |
+| On macOS, Settings → Restart does nothing | That control only works under systemd today. Use `launchctl kickstart -k gui/$(id -u)/butchr` instead (see step 3). |
 | The daemon exits at start with "Missing required config" | Jira settings are only partly present (for example site and email but no token). Set all of site, email and token, or delete the identity file `~/.config/butchr/jira-identity.json` and the token file `~/.config/butchr/secrets/atlassian-token` to start setup over. |
 
 ## Reporting a problem
