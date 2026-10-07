@@ -26,13 +26,17 @@ type Proxy = Awaited<ReturnType<typeof startMcpChannelProxy>>;
  * client's `Mcp-Session-Id` is the durable name; the proxy's is a fresh,
  * process-local implementation detail that goes empty on every restart.
  * `clientToProxy` remembers a binding once established so later requests
- * for the same client id skip straight to it. `pending` single-flights the
+ * for the same client id skip straight to it, capped at `MAX_BOUND_SESSIONS`
+ * (oldest evicted first — see `bindSession`) since a real restart leaves no
+ * `DELETE` behind to prune an abandoned one. `pending` single-flights the
  * adoption itself — concurrent requests racing to adopt the SAME unknown
  * client id must trigger exactly one gateway-initiated `initialize`, never
  * one per request.
  */
 interface SessionBindings { clientToProxy: Map<string,string>; pending: Map<string,Promise<string>>; }
 interface Connection { proxy: Proxy; token: string; relay: InboxRelay; agent: string; sessions: SessionBindings; }
+/** Per-connection cap on `clientToProxy`; tiny per entry, so generous. */
+const MAX_BOUND_SESSIONS=10_000;
 
 /** A JSON-RPC-shaped error body for every non-2xx this endpoint returns on a JSON-RPC path — EXCEPT the FACTORY-691 401, which stays byte-identical. */
 function jsonError(status:number, message:string, extraHeaders?:Record<string,string>):Response {
@@ -253,12 +257,14 @@ export class ResourceConnections {
    * nothing worth recovering — adopting one just to immediately tear it
    * down would be a wasted `initialize` round trip for no observable
    * benefit. A `DELETE` that DOES hit a bound session drops the binding on
-   * success, so `clientToProxy` doesn't grow forever.
+   * success, pruning it early — but a real restart leaves no `DELETE`
+   * behind at all, so `clientToProxy` is actually bounded by
+   * `bindSession`'s own eviction cap, not by `DELETE` traffic.
    */
   private async forward(c:Connection,request:Request):Promise<Response> {
     const clientSessionId=request.headers.get('mcp-session-id');
     if(clientSessionId===null&&request.method==='GET') {
-      return jsonError(405,'Method not allowed: GET requires an active session (initialize first).',{Allow:'GET, POST, DELETE'});
+      return jsonError(405,'Method not allowed: GET requires an active session (initialize first).',{Allow:'POST, DELETE'});
     }
     if(clientSessionId!==null&&!SESSION_ID_RE.test(clientSessionId)) {
       return jsonError(400,'Bad Request: Mcp-Session-Id header is malformed.');
@@ -274,7 +280,7 @@ export class ResourceConnections {
     if(clientSessionId!==null&&response.status===404&&request.method!=='DELETE') {
       let adopted:string;
       try { adopted=await this.adoptSession(c,clientSessionId,request); }
-      catch(e) { return jsonError(502,`Upstream session recovery failed: ${e instanceof Error?e.message:String(e)}`); }
+      catch(e) { return jsonError(503,`Upstream session recovery failed: ${e instanceof Error?e.message:String(e)}`,{'Retry-After':'2'}); }
       proxySessionId=adopted;
       response=await send(proxySessionId);
     }
@@ -294,11 +300,26 @@ export class ResourceConnections {
   private async adoptSession(c:Connection,clientSessionId:string,request:Request):Promise<string> {
     const existing=c.sessions.pending.get(clientSessionId);
     if(existing)return existing;
-    const promise=this.initializeProxySession(c,request).finally(()=>{c.sessions.pending.delete(clientSessionId);});
+    const promise=this.initializeProxySession(c,request)
+      .then(proxySessionId=>{this.bindSession(c.sessions,clientSessionId,proxySessionId);return proxySessionId;})
+      .finally(()=>{c.sessions.pending.delete(clientSessionId);});
     c.sessions.pending.set(clientSessionId,promise);
-    const proxySessionId=await promise;
-    c.sessions.clientToProxy.set(clientSessionId,proxySessionId);
-    return proxySessionId;
+    return promise;
+  }
+  /**
+   * Records a client->proxy session binding, evicting the OLDEST entry once
+   * `clientToProxy` exceeds `MAX_BOUND_SESSIONS` (`Map` preserves insertion
+   * order, so the first key is always the least-recently-adopted one). A
+   * real restart leaves no `DELETE` behind (nothing closes the abandoned
+   * client session), so pruning on `DELETE` alone cannot bound this map —
+   * this cap is what actually does.
+   */
+  private bindSession(sessions:SessionBindings,clientSessionId:string,proxySessionId:string):void {
+    sessions.clientToProxy.set(clientSessionId,proxySessionId);
+    if(sessions.clientToProxy.size>MAX_BOUND_SESSIONS) {
+      const oldest=sessions.clientToProxy.keys().next().value;
+      if(oldest!==undefined)sessions.clientToProxy.delete(oldest);
+    }
   }
   /**
    * Runs a gateway-initiated `initialize` + `notifications/initialized`
@@ -307,9 +328,16 @@ export class ResourceConnections {
    * (the spec-honest source for a non-initialize request) falling back to
    * the SDK's latest when absent (e.g. the very first adoption of a
    * session whose original `initialize` predates this gateway and never
-   * carried the header this far). Capabilities are sent empty: this
-   * handshake is local to the proxy's already-connected upstream and
-   * negotiates nothing the gateway itself will ever call.
+   * carried the header this far). Capabilities are sent empty: as verified
+   * against the vendored proxy (`startMcpChannelProxy` in
+   * `@brooswit/drovr-events`), its upstream `Client` installs only
+   * `fallbackNotificationHandler` — never a `fallbackRequestHandler` — so a
+   * server-to-client request (sampling, roots) from the real upstream has
+   * nowhere to land and gets the SDK's own default "method not found"
+   * instead of ever reaching a client capability. Only client->upstream
+   * requests (via the local `rpc.fallbackRequestHandler`) and notifications
+   * in both directions are bridged, so an empty capabilities set here can't
+   * suppress anything that would otherwise be answered.
    */
   private async initializeProxySession(c:Connection,request:Request):Promise<string> {
     const protocolVersion=request.headers.get('mcp-protocol-version')??LATEST_PROTOCOL_VERSION;
