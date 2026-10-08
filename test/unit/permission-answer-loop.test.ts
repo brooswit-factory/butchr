@@ -209,6 +209,59 @@ describe("runPermissionAnswerTick", () => {
     expect(lines.some((l) => l.includes("tick failed") && l.includes("herdr socket down"))).toBe(true);
   });
 
+  test("FACTORY-752: a completed tick with NOTHING eligible still fires onTickSuccess, never onTickError — the whole point of the new /health field", async () => {
+    const { client } = fakeClient({ p1: "some ordinary working pane, nothing pending here" });
+    let successCalls = 0;
+    const errors: unknown[] = [];
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: noneEligible, auditPath: "/dev/null",
+      onTickSuccess: () => { successCalls++; },
+      onTickError: (e) => errors.push(e),
+    });
+
+    expect(results).toEqual([]);
+    expect(successCalls).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("FACTORY-752: a tick that answers a pane also fires onTickSuccess exactly once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+    let successCalls = 0;
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, onTickSuccess: () => { successCalls++; } });
+
+    expect(results).toHaveLength(1);
+    expect(successCalls).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("FACTORY-752: a rejecting scan (agent.list throws) fires onTickError with the raw caught error, never onTickSuccess — distinguishable from a completed idle tick", async () => {
+    const boom = new Error("herdr socket down");
+    const client: PermissionAnswerClient = {
+      agent: {
+        list: (async () => { throw boom; }) as PermissionAnswerClient["agent"]["list"],
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    let successCalls = 0;
+    const errors: unknown[] = [];
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath: "/dev/null",
+      onTickSuccess: () => { successCalls++; },
+      onTickError: (e) => errors.push(e),
+    });
+
+    expect(results).toEqual([]);
+    expect(successCalls).toBe(0);
+    expect(errors).toEqual([boom]);
+  });
+
   test("FACTORY-100/FACTORY-103: onApproved fires once per answered pane, and a throwing onApproved never fails the tick", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
