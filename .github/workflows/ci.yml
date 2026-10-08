@@ -17,7 +17,17 @@ jobs:
         run: bun run generate && bun run scripts/verify-generated-is-committed.ts
       - run: bun run typecheck
       - name: unit + load tests, coverage ≥ 90%
-        run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+        run: >
+          mkdir -p test-results &&
+          bun test test/unit test/load --reporter=junit --reporter-outfile=test-results/junit.xml &&
+          bun run scripts/coverage/gate.ts
+      - name: upload test report (always, even on failure — FACTORY-179)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: test-results/junit.xml
+          if-no-files-found: ignore
       - run: bun run build
   windows:
     name: windows
