@@ -142,8 +142,14 @@ describe("FACTORY-716: real setup-then-restart seeds the starter rule", () => {
     // real herdr socket happens to be reachable in this process's ambient
     // environment.
     const herdrSocket = join(home, "no-such-herdr.sock");
-    const proc = Bun.spawn(["bun", "src/daemon/index.ts"], {
-      cwd: join(import.meta.dir, "../.."),
+    // Bun loads a repo-root .env into the child's process.env regardless of
+    // the `env` option passed to Bun.spawn (see test/unit/setup-mode-entry.test.ts),
+    // so this spawn must run with `--no-env-file` AND a cwd that is never
+    // the repo root (HOME, a scratch dir, works fine) rather than the real
+    // repo cwd this used before — otherwise a developer's real .env reaches
+    // this spawn too.
+    const proc = Bun.spawn(["bun", "--no-env-file", join(import.meta.dir, "../../src/daemon/index.ts")], {
+      cwd: home,
       env: { PATH: process.env.PATH ?? "", HOME: home, XDG_CONFIG_HOME: configDir, BUTCHR_PORT: String(port2), HERDR_SOCKET: herdrSocket },
       stdout: "pipe",
       stderr: "pipe",
