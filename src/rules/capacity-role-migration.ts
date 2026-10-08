@@ -244,8 +244,14 @@ export function classifyJqlQuery(query: string): ClassifyResult {
     return { outcome: "skip", reason: "issuetype-clause-is-negated-or-unrecognised-operator" };
   }
 
+  // A top-level `ORDER BY ...` is JQL's own final, always-trailing construct
+  // (never inside parens, never followed by anything else — the same fact
+  // `scanJql`'s `orderByIndex`, `src/tools/jira-project-scope.ts`, exists to
+  // find) — it ends the filter exactly like end-of-string does, so it must
+  // not make an otherwise-clean, AND-ed, non-negated issuetype clause look
+  // unclassifiable just because something follows it.
   const after = followingWord(query, afterIdx);
-  if (after !== "" && after !== "and") return { outcome: "skip", reason: after === "or" ? "issuetype-clause-combined-with-or" : "issuetype-clause-is-negated-or-unrecognised-operator" };
+  if (after !== "" && after !== "and" && after !== "order") return { outcome: "skip", reason: after === "or" ? "issuetype-clause-combined-with-or" : "issuetype-clause-is-negated-or-unrecognised-operator" };
 
   const normalized = values.map((v) => v.trim().toLowerCase());
   if (normalized.length === 0 || !normalized.every((v) => EXEMPT_ISSUE_TYPES.has(v))) {

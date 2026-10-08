@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyCapacityRoleMigration, classifyJqlQuery, planCapacityRoleMigration, runCapacityRoleMigration } from "../../src/rules/capacity-role-migration.js";
 import { defaultIo } from "../../src/rules/write-rules.js";
-import { capacityRoleFor, type AgentCapacityRole } from "../../src/agents/capacity-role.js";
+import { capacityRoleFor } from "../../src/agents/capacity-role.js";
+import type { AgentCapacityRole } from "../../src/agents/admission.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 import rulesExample from "../../docs/rules.example.json";
@@ -83,6 +84,24 @@ describe("classifyJqlQuery", () => {
 
   test("a quoted string literal containing the word issuetype/order-by-like text is inert, never mistaken for a real clause", () => {
     expect(classifyJqlQuery(`summary ~ "issuetype = Epic" AND issuetype = Bug`)).toEqual({ outcome: "migrate", issueTypes: ["bug"] });
+  });
+
+  // Review finding (PR #701): a trailing top-level `ORDER BY` — JQL's own always-final construct —
+  // must terminate the filter exactly like end-of-string, not read as "something follows the clause".
+  test("a trailing top-level ORDER BY does not stop an otherwise-clean issuetype clause from migrating", () => {
+    expect(classifyJqlQuery(`assignee = currentUser() AND issuetype = Epic ORDER BY created`)).toEqual({ outcome: "migrate", issueTypes: ["epic"] });
+  });
+
+  test("ORDER BY after an `in (...)` list also does not block migration", () => {
+    expect(classifyJqlQuery(`assignee = currentUser() AND issuetype IN (Story, Bug) ORDER BY created`)).toEqual({ outcome: "migrate", issueTypes: ["story", "bug"] });
+  });
+
+  test("ORDER BY after a non-exempt issuetype still correctly skips (Task is not epic/story/bug)", () => {
+    expect(classifyJqlQuery(`assignee = currentUser() AND issuetype = Task ORDER BY created`)).toEqual({
+      outcome: "skip",
+      reason: "issuetype-set-not-a-subset-of-epic-story-bug",
+      issueTypes: ["task"],
+    });
   });
 });
 
