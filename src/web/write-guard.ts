@@ -40,7 +40,7 @@ export interface SocketEndpoint {
 export interface WriteGuardDeps {
   dashboardOriginGuard: DashboardOriginGuardDeps;
   /** `null`/`undefined` fails closed (as `isSameUidPeer` itself does on anything unresolvable) — see `ViewDeps.peerUidCheck`'s own doc comment for why this is a function of the client's own socket endpoint, not a fixed value. */
-  peerUidCheck: (client: SocketEndpoint) => boolean;
+  peerUidCheck: (client: SocketEndpoint) => boolean | Promise<boolean>;
   csrf: CsrfTokenIssuer;
 }
 
@@ -55,11 +55,11 @@ export interface WriteGuardRequest {
   client: SocketEndpoint | undefined;
 }
 
-export function checkWriteGuard(req: WriteGuardRequest, deps: WriteGuardDeps): WriteGuardOutcome {
+export async function checkWriteGuard(req: WriteGuardRequest, deps: WriteGuardDeps): Promise<WriteGuardOutcome> {
   const originGuard = checkDashboardOrigin({ origin: req.origin, host: req.host, method: req.method }, deps.dashboardOriginGuard);
   if (!originGuard.ok) return { ok: false, status: originGuard.status, body: originGuard.body, reason: originGuard.reason };
 
-  if (req.client === undefined || !deps.peerUidCheck(req.client)) {
+  if (req.client === undefined || !(await deps.peerUidCheck(req.client))) {
     return { ok: false, status: 403, body: { error: "peer uid check failed" }, reason: "peer uid check failed" };
   }
 

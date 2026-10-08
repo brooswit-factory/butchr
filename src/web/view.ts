@@ -206,7 +206,7 @@ export interface ViewDeps {
    * `dashboardOriginGuard` above: absent means the route is unreachable,
    * never open.
    */
-  peerUidCheck?: (client: { address: string; port: number }) => boolean;
+  peerUidCheck?: (client: { address: string; port: number }) => boolean | Promise<boolean>;
   /**
    * FACTORY-660: `GET /api/rules`' own data — the validated rules file
    * state (reusing `loadRulesFileState`, `../agents/query-agent-
@@ -517,7 +517,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
   }
 
   return new Elysia()
-    .onRequest(({ request, set, server }) => {
+    .onRequest(async ({ request, set, server }) => {
       const method = request.method;
       const path = new URL(request.url).pathname;
       const isSessionRoute = method === "GET" && path === "/api/session";
@@ -532,12 +532,12 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         if (!originGuard.ok) { set.status = originGuard.status; return originGuard.body; }
         if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
         const client = server?.requestIP(request) ?? undefined;
-        if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+        if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
         return;
       }
       if (SAFE_METHODS.has(method) || !path.startsWith(API_PREFIX)) return; // not a write route this gate owns
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
     })
     // FACTORY-662 item 3: a capped, counted read (never a trust in
@@ -683,7 +683,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const client = server?.requestIP(request);
-      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.rulesFileState || !deps.getRulesSourceEtag) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // FACTORY-657/review round 2, R2: `getRulesSourceEtag()` reads this
       // daemon's LIVE holder — the SAME value `getRules()` (fed through
@@ -713,7 +713,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const client = server?.requestIP(request);
-      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.rulesPreview) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       let id: string;
       try {
@@ -739,7 +739,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const client = server?.requestIP(request);
-      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.settings) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
       return deps.settings();
@@ -753,7 +753,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // returns — this route never sees or forwards the upstream body/token.
     .post("/api/settings/jira/test", async ({ set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
         auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
         set.status = guard.status;
@@ -786,7 +786,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const client = server?.requestIP(request);
-      if (!client || !deps.peerUidCheck(client)) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.setupStatus) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
       return deps.setupStatus();
@@ -803,7 +803,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // the route and a fixed action string.
     .post("/api/setup/jira", async ({ set, request, server, body }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
         auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
         set.status = guard.status;
@@ -832,7 +832,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `POST /api/setup/jira` immediately above.
     .put("/api/settings/jira/token", async ({ set, request, server, body }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
         auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
         set.status = guard.status;
@@ -873,7 +873,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // bearing (guard-by-construction), not merely redundant with it.
     .post("/api/rules/:id/enabled", async ({ params, body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const id = decodeURIComponent(params.id);
@@ -898,7 +898,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `checkWriteGuard` call, see the enable route's own comment above.
     .put("/api/rules/:id", async ({ params, body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const id = decodeURIComponent(params.id);
@@ -937,7 +937,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // guard, same as any other write-shaped route.
     .post("/api/rules/plan", async ({ body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       // N2 decision: `POST /api/rules/plan` shares the SAME per-client
@@ -970,7 +970,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `checkWriteGuard` call, see the enable route's own comment above.
     .post("/api/undo/:backupId", async ({ params, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const backupId = decodeURIComponent(params.backupId);
@@ -994,7 +994,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // can't fix it.
     .put("/api/settings/:key", async ({ params, body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
       if (!deps.settingsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const key = decodeURIComponent(params.key);
@@ -1027,7 +1027,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // own retry/reconnect loop is a client-side concern, not this route's.
     .post("/api/daemon/restart", async ({ body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
         auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
         set.status = guard.status;

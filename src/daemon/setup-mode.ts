@@ -32,7 +32,7 @@ import { buildApp } from "./app.js";
 import type { ViewDeps } from "../web/view.js";
 import { listenOptions, DAEMON_HOSTNAME } from "./listen.js";
 import { parsePort, type ConfigEnv } from "../config/config.js";
-import { isSameUidPeer } from "../web/peer-uid.js";
+import { isSameUidPeerAsync } from "../web/peer-uid.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
@@ -68,7 +68,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
   // this closure by value, silently broke the real-uid peer check for
   // exactly that case, caught by `scripts/verify-setup-flow-browser.ts`).
   const dashboardOriginGuard = { port };
-  const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: dashboardOriginGuard.port } });
+  const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: dashboardOriginGuard.port } });
   const csrfIssuer = createCsrfTokenIssuer();
   const writeGuard = { dashboardOriginGuard, peerUidCheck, csrf: csrfIssuer };
 

@@ -124,7 +124,7 @@ import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.
 import { createRoutingLinkStore } from "../resources/link-store-router.js";
 import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
 import { createRulesPreviewer } from "../web/rules-preview.js";
-import { isSameUidPeer } from "../web/peer-uid.js";
+import { isSameUidPeerAsync } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
@@ -1121,7 +1121,7 @@ const { app, mcp } = buildApp({
   // port alone is not a unique socket identity). FACTORY-662 (write path)
   // builds its own equivalent closure from the SAME `isSameUidPeer` helper,
   // over the SAME `{ address: DAEMON_HOSTNAME, port: config.port }`.
-  peerUidCheck: (client) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }),
+  peerUidCheck: (client) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }),
   // FACTORY-660: `GET /api/rules`' own data — SAME discipline as
   // `configInventory` above: `rules: getRules()`/`error: null` are this
   // daemon's own already-loaded, already-validated LIVE values (review
@@ -1151,7 +1151,7 @@ const { app, mcp } = buildApp({
   // `rulesWriteDeps`'s own declaration for why `reload` is a stub and
   // `scopeOf` reuses `rulesPreviewer`.
   csrf: csrfIssuer,
-  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (client) => isSameUidPeer(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }), csrf: csrfIssuer },
+  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (client) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }), csrf: csrfIssuer },
   rulesWrite: {
     enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, rulesWriteDeps),

@@ -13,54 +13,54 @@ function baseReq(csrf: ReturnType<typeof createCsrfTokenIssuer>, overrides: Part
 }
 
 describe("checkWriteGuard", () => {
-  test("every check passing: ok", () => {
+  test("every check passing: ok", async () => {
     const csrf = createCsrfTokenIssuer();
-    const outcome = checkWriteGuard(baseReq(csrf), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
     expect(outcome.ok).toBe(true);
   });
 
-  test("Origin check runs first: a forged origin is refused before peer-uid is even consulted", () => {
+  test("Origin check runs first: a forged origin is refused before peer-uid is even consulted", async () => {
     const csrf = createCsrfTokenIssuer();
     let peerChecked = false;
-    const outcome = checkWriteGuard(baseReq(csrf, { origin: "http://evil.example" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { peerChecked = true; return true; }, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf, { origin: "http://evil.example" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { peerChecked = true; return true; }, csrf });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(403);
     expect(peerChecked).toBe(false);
   });
 
-  test("peer-uid rejects: 403, never reaches the content-type/csrf checks", () => {
+  test("peer-uid rejects: 403, never reaches the content-type/csrf checks", async () => {
     const csrf = createCsrfTokenIssuer();
-    const outcome = checkWriteGuard(baseReq(csrf, { contentType: "text/plain", csrfHeader: "wrong" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => false, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf, { contentType: "text/plain", csrfHeader: "wrong" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => false, csrf });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) { expect(outcome.status).toBe(403); expect(outcome.reason).toBe("peer uid check failed"); }
   });
 
-  test("client undefined (could not resolve the real server): refused, same as a failed peer-uid check", () => {
+  test("client undefined (could not resolve the real server): refused, same as a failed peer-uid check", async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
-    const outcome = checkWriteGuard(baseReq(csrf, { client: undefined }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { called = true; return true; }, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf, { client: undefined }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => { called = true; return true; }, csrf });
     expect(outcome.ok).toBe(false);
     expect(called).toBe(false);
   });
 
-  test("wrong content-type: 415", () => {
+  test("wrong content-type: 415", async () => {
     const csrf = createCsrfTokenIssuer();
-    const outcome = checkWriteGuard(baseReq(csrf, { contentType: "text/plain" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf, { contentType: "text/plain" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(415);
   });
 
-  test("content-type with a charset suffix is still accepted", () => {
+  test("content-type with a charset suffix is still accepted", async () => {
     const csrf = createCsrfTokenIssuer();
-    const outcome = checkWriteGuard(baseReq(csrf, { contentType: "application/json; charset=utf-8" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
+    const outcome = await checkWriteGuard(baseReq(csrf, { contentType: "application/json; charset=utf-8" }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
     expect(outcome.ok).toBe(true);
   });
 
-  test("missing/wrong CSRF token: 403", () => {
+  test("missing/wrong CSRF token: 403", async () => {
     const csrf = createCsrfTokenIssuer();
-    const missing = checkWriteGuard(baseReq(csrf, { csrfHeader: null }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
+    const missing = await checkWriteGuard(baseReq(csrf, { csrfHeader: null }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
     expect(missing.ok).toBe(false);
-    const wrong = checkWriteGuard(baseReq(csrf, { csrfHeader: "0".repeat(csrf.token.length) }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
+    const wrong = await checkWriteGuard(baseReq(csrf, { csrfHeader: "0".repeat(csrf.token.length) }), { dashboardOriginGuard: { port: PORT }, peerUidCheck: () => true, csrf });
     expect(wrong.ok).toBe(false);
     if (!wrong.ok) expect(wrong.status).toBe(403);
   });

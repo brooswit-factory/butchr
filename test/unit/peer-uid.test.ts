@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { peerUidOf, isSameUidPeer, lsofToProcNetTcp } from "../../src/web/peer-uid.js";
+import { peerUidOf, isSameUidPeer, isSameUidPeerAsync, lsofToProcNetTcp, createLsofPeerUid } from "../../src/web/peer-uid.js";
 
 const HEADER = "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode";
 
@@ -104,9 +104,62 @@ describe.skipIf(process.platform !== "darwin")("real loopback connection on macO
     try {
       await (await fetch(`http://127.0.0.1:${srv.port}/`)).text();
       expect(seen).toBeDefined();
-      expect(isSameUidPeer(seen!, { server: { address: "127.0.0.1", port: srv.port! } })).toBe(true);
+      expect(await isSameUidPeerAsync(seen!, { server: { address: "127.0.0.1", port: srv.port! } })).toBe(true);
     } finally {
       srv.stop(true);
     }
+  });
+});
+
+describe("peerUidOf with two holders of one socket", () => {
+  test("rows for one 4-tuple that disagree on uid are not an answer; agreeing rows are", () => {
+    const row = (uid: number) => `   0: 0100007F:C350 0100007F:1E26 01 00000000:00000000 00:00000000 00000000 ${uid} 0 0`;
+    expect(peerUidOf(`${HEADER}\n${row(501)}\n${row(502)}`, client(50000), SERVER)).toBeNull();
+    expect(peerUidOf(`${HEADER}\n${row(501)}\n${row(501)}`, client(50000), SERVER)).toBe(501);
+  });
+});
+
+describe("createLsofPeerUid (async, single-flight, positive cache)", () => {
+  const OUT = ["p200", "u502", "n127.0.0.1:50000->127.0.0.1:7718", ""].join("\n");
+  test("concurrent checks of one tuple share a single lsof run; the answer is cached for a few seconds, then re-run", async () => {
+    let runs = 0;
+    let t = 0;
+    const lookup = createLsofPeerUid({ run: async () => { runs++; return OUT; }, now: () => t });
+    const [a, b] = await Promise.all([lookup(client(50000), SERVER), lookup(client(50000), SERVER)]);
+    expect([a, b, runs]).toEqual([502, 502, 1]);
+    t = 1000;
+    expect(await lookup(client(50000), SERVER)).toBe(502);
+    expect(runs).toBe(1);
+    t = 4000;
+    await lookup(client(50000), SERVER);
+    expect(runs).toBe(2);
+  });
+  test("a negative answer is never cached", async () => {
+    let runs = 0;
+    const lookup = createLsofPeerUid({ run: async () => { runs++; return ""; } });
+    expect(await lookup(client(50000), SERVER)).toBeNull();
+    expect(await lookup(client(50000), SERVER)).toBeNull();
+    expect(runs).toBe(2);
+  });
+  test("lsof runs one at a time and a flood of distinct tuples is refused beyond the queue cap", async () => {
+    let active = 0, peak = 0;
+    const lookup = createLsofPeerUid({ run: async () => { active++; peak = Math.max(peak, active); await Bun.sleep(5); active--; return OUT; } });
+    const results = await Promise.all(Array.from({ length: 20 }, (_, i) => lookup(client(50000 + i), SERVER)));
+    expect(peak).toBe(1);
+    expect(results.filter((r) => r === null).length).toBeGreaterThanOrEqual(11);
+  });
+  test("a failing runner fails closed", async () => {
+    const lookup = createLsofPeerUid({ run: async () => { throw new Error("boom"); } });
+    expect(await lookup(client(50000), SERVER)).toBeNull();
+  });
+});
+
+describe("isSameUidPeerAsync on the darwin path", () => {
+  test("accepts only when the looked-up uid is our own; no lookup answer or no ownUid is refused", async () => {
+    const d = { server: SERVER, darwin: true, ownUid: () => 502 };
+    expect(await isSameUidPeerAsync(client(50000), { ...d, lookup: async () => 502 })).toBe(true);
+    expect(await isSameUidPeerAsync(client(50000), { ...d, lookup: async () => 501 })).toBe(false);
+    expect(await isSameUidPeerAsync(client(50000), { ...d, lookup: async () => null })).toBe(false);
+    expect(await isSameUidPeerAsync(client(50000), { ...d, ownUid: () => undefined, lookup: async () => 502 })).toBe(false);
   });
 });

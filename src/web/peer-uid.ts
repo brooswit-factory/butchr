@@ -96,6 +96,7 @@ export function peerUidOf(table: string, local: SocketEndpoint, remote: SocketEn
   const remoteAddrHex = ipv4ToHex(remote.address);
   if (localAddrHex === null || remoteAddrHex === null) return null;
   const lines = table.split("\n").slice(1); // header row
+  let found: number | null = null;
   for (const line of lines) {
     const fields = line.trim().split(/\s+/);
     if (fields.length < 8) continue;
@@ -106,9 +107,13 @@ export function peerUidOf(table: string, local: SocketEndpoint, remote: SocketEn
     if (hexPort(localField) !== local.port) continue;
     if (hexPort(remoteField) !== remote.port) continue;
     const uid = Number(fields[7]);
-    return Number.isFinite(uid) ? uid : null;
+    if (!Number.isFinite(uid)) return null;
+    // One socket, one owner: rows for the same 4-tuple that disagree on the uid
+    // (lsof prints one row per process holding the socket) are not an answer.
+    if (found !== null && found !== uid) return null;
+    found = uid;
   }
-  return null;
+  return found;
 }
 
 /**
@@ -139,16 +144,8 @@ export function lsofToProcNetTcp(lsofOutput: string): string {
   return rows.join("\n");
 }
 
-/** Real production read. Linux: `/proc/net/tcp` (IPv4) and `/proc/net/tcp6` (IPv6 — a loopback peer may connect over `::1`), concatenated. macOS: `lsof` (always present, no Xcode needed), converted by `lsofToProcNetTcp`. A missing/unreadable table (a sandboxed `/proc`, no `lsof`) yields the empty string for that half, never a thrown error — `peerUidOf` then finds no matching row, which fails closed exactly as intended. */
+/** Real production read on Linux: `/proc/net/tcp` (IPv4) and `/proc/net/tcp6` (IPv6 — a loopback peer may connect over `::1`), concatenated. A missing/unreadable table (a sandboxed `/proc`) yields the empty string for that half, never a thrown error — `peerUidOf` then finds no matching row, which fails closed exactly as intended. macOS goes through `lsofPeerUid` below instead. */
 export const readProcNetTcp: ReadProcNetTcp = () => {
-  if (process.platform === "darwin") {
-    try {
-      const r = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-iTCP@127.0.0.1", "-F", "pun"], { stdout: "pipe", stderr: "ignore", timeout: 5000 });
-      return r.exitCode === 0 || r.stdout.length > 0 ? lsofToProcNetTcp(r.stdout.toString()) : "";
-    } catch {
-      return "";
-    }
-  }
   const readOrEmpty = (path: string): string => {
     try {
       return readFileSync(path, "utf8");
@@ -158,6 +155,76 @@ export const readProcNetTcp: ReadProcNetTcp = () => {
   };
   return `${readOrEmpty("/proc/net/tcp")}\n${readOrEmpty("/proc/net/tcp6")}`;
 };
+
+const LSOF_PATH = "/usr/sbin/lsof";
+const LSOF_TIMEOUT_MS = 2000;
+/** A positive answer for one 4-tuple is reused this long, so a page's burst of requests costs one `lsof`. */
+const POSITIVE_TTL_MS = 3000;
+/** Checks queued behind the running `lsof`; beyond this a check is refused outright (fail closed) so a flood cannot build an unbounded backlog. */
+const MAX_PENDING_LSOF = 8;
+
+export type RunLsof = () => Promise<string>;
+
+/** One `lsof` run, never blocking the event loop. A timeout or kill signal yields "" — no partial output is ever parsed — as does a missing binary or any error. */
+export const runLsof: RunLsof = async () => {
+  try {
+    const proc = Bun.spawn([LSOF_PATH, "-nP", "-iTCP@127.0.0.1", "-F", "pun"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", timeout: LSOF_TIMEOUT_MS });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    if (proc.killed || proc.signalCode) return ""; // timeout kill: never parse partial output
+    return proc.exitCode === 0 || out.length > 0 ? out : "";
+  } catch {
+    return "";
+  }
+};
+
+export interface LsofPeerUidDeps {
+  run?: RunLsof;
+  now?: () => number;
+}
+
+/**
+ * macOS owner lookup for one socket: async, single-flight per 4-tuple, runs
+ * one `lsof` at a time, caches only positive answers for a few seconds, and
+ * refuses (null) when too many lookups are already waiting.
+ */
+export function createLsofPeerUid(deps: LsofPeerUidDeps = {}): (client: SocketEndpoint, server: SocketEndpoint) => Promise<number | null> {
+  const run = deps.run ?? runLsof;
+  const now = deps.now ?? Date.now;
+  const cache = new Map<string, { uid: number; at: number }>();
+  const inflight = new Map<string, Promise<number | null>>();
+  let queue: Promise<unknown> = Promise.resolve();
+  let pending = 0;
+  return (client, server) => {
+    const key = `${client.address}:${client.port}>${server.address}:${server.port}`;
+    const hit = cache.get(key);
+    if (hit && now() - hit.at < POSITIVE_TTL_MS) return Promise.resolve(hit.uid);
+    cache.delete(key);
+    const shared = inflight.get(key);
+    if (shared) return shared;
+    if (pending >= MAX_PENDING_LSOF) return Promise.resolve(null);
+    pending++;
+    const p = queue
+      .then(() => run())
+      .then((out) => {
+        const uid = peerUidOf(lsofToProcNetTcp(out), client, server);
+        if (uid !== null) {
+          for (const [k, v] of cache) if (now() - v.at >= POSITIVE_TTL_MS) cache.delete(k);
+          cache.set(key, { uid, at: now() });
+        }
+        return uid;
+      })
+      .catch(() => null)
+      .finally(() => {
+        pending--;
+        inflight.delete(key);
+      });
+    queue = p;
+    inflight.set(key, p);
+    return p;
+  };
+}
+
+const lsofPeerUid = createLsofPeerUid();
 
 export interface PeerUidCheckDeps {
   /** This daemon's own listening address+port — the REMOTE endpoint on the caller's own socket row. */
@@ -179,5 +246,18 @@ export function isSameUidPeer(client: SocketEndpoint, deps: PeerUidCheckDeps): b
   if (ownUid === undefined) return false;
   const table = (deps.read ?? readProcNetTcp)();
   const peerUid = peerUidOf(table, client, deps.server);
+  return peerUid !== null && peerUid === ownUid;
+}
+
+/**
+ * The check the daemon's routes use. Linux (and any injected `read`) is the
+ * synchronous `isSameUidPeer`; macOS resolves the owner with the async,
+ * non-blocking `lsof` lookup above. Fails closed the same way.
+ */
+export async function isSameUidPeerAsync(client: SocketEndpoint, deps: PeerUidCheckDeps & { darwin?: boolean; lookup?: typeof lsofPeerUid }): Promise<boolean> {
+  if (deps.read || !(deps.darwin ?? process.platform === "darwin")) return isSameUidPeer(client, deps);
+  const ownUid = (deps.ownUid ?? (() => process.getuid?.()))();
+  if (ownUid === undefined) return false;
+  const peerUid = await (deps.lookup ?? lsofPeerUid)(client, deps.server);
   return peerUid !== null && peerUid === ownUid;
 }
