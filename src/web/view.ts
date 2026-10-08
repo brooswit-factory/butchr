@@ -18,7 +18,7 @@ import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type Writ
 import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
-import type { RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
+import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
@@ -450,6 +450,7 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   if (patch.query !== undefined) parts.push(`query: ${show(current?.query)} -> ${show(patch.query)}`);
   if (patch.permissionMode !== undefined) parts.push(`permissionMode: ${show(current?.permissionMode)} -> ${show(patch.permissionMode)}`);
   if (patch.lizardMode !== undefined) parts.push(`lizardMode: ${show(current?.lizardMode)} -> ${show(patch.lizardMode)}`);
+  if (patch.role !== undefined) parts.push(`role: ${show(current?.role)} -> ${show(patch.role)}`);
   if (patch.agentPreferences !== undefined) {
     patch.agentPreferences.forEach((p, i) => {
       const cur = current?.agentPreferences?.[i] as Record<string, unknown> | undefined;
@@ -753,7 +754,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.rulesCatalog) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
-      return { harnesses: deps.rulesCatalog() };
+      // FACTORY-817: `role` ("Included in capacity") is not per-harness like
+      // the rest of this catalog — one global pair of allowed values plus
+      // the engine's own default, documented here so the UI never hardcodes
+      // either (`AGENT_ROLES`/the `"worker"` default both come straight off
+      // `../rules/rules.js`'s own `Rule.role` doc comment, never a second,
+      // hand-maintained copy).
+      return { harnesses: deps.rulesCatalog(), capacityRoles: { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT } };
     })
     // FACTORY-660 — the rules page's read-only dry-run preview. A GET that
     // DOES do outbound Jira reads (SPEC CHANGE (b): counts and ticket keys

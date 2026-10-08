@@ -46,8 +46,24 @@
  * and-sandbox` (`agentLaunchConfig`'s Codex branch, `../agents/argv.ts`) —
  * that mapping is a launch-time concern, not a catalog-time restriction.
  */
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "./agent-harness.js";
+import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./agent-harness.js";
 import { AGENT_EFFORTS, CLAUDE_MODEL_POWER_TABLE, CODEX_MODEL_POWER_TABLE, type AgentEffort, type ModelPowerBand } from "../resources/power-scale.js";
+
+/**
+ * FACTORY-817 — the "Included in capacity" toggle's own catalog entry:
+ * NOT per-harness (unlike `RULE_FORM_CATALOG` above) — `Rule.role` applies
+ * uniformly across every harness/provider, so this is one global pair of
+ * allowed values plus the engine's own default, re-exported from the SAME
+ * leaf module (`./agent-harness.ts`) `AGENT_HARNESSES`/`RULE_PERMISSION_MODES`
+ * already come from, for the identical bundle-safety reason (see that
+ * module's own top comment). `GET /api/rules/catalog` (`../web/view.ts`)
+ * serves this verbatim as `capacityRoles`; the write-path validator
+ * (`./rules-write-registry.ts`'s `validateRuleFieldPatch`) checks a
+ * submitted `role` against the SAME `AGENT_ROLES`, so a value the UI offers
+ * is always one the server accepts.
+ */
+export const CAPACITY_ROLE_DEFAULT: AgentRole = "worker";
+export { AGENT_ROLES, type AgentRole };
 
 export interface RuleFormCatalogEntry {
   harness: AgentHarness;

@@ -349,7 +349,12 @@ describe("GET /api/rules/catalog", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("cache-control")).toBe("no-store");
       const body = await res.json();
-      expect(body).toEqual({ harnesses: fakeCatalog });
+      // FACTORY-817: `capacityRoles` is served alongside `harnesses` — not
+      // sourced from `deps.rulesCatalog()` (that dep is per-harness only),
+      // but computed straight from `AGENT_ROLES`/`CAPACITY_ROLE_DEFAULT`
+      // (`src/rules/rule-form-catalog.ts`), so it is present regardless of
+      // what `fakeCatalog` above contains.
+      expect(body).toEqual({ harnesses: fakeCatalog, capacityRoles: { values: ["worker", "sentinel"], default: "worker" } });
     } finally { await app.stop(true); }
   });
 });
