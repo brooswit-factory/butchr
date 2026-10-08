@@ -606,6 +606,58 @@ describe("runPermissionAnswerTick — FACTORY-145 fast-path latency", () => {
   });
 });
 
+// FACTORY-776 (a): `runPermissionAnswerTick` must reap a `fastPathTriggers`
+// entry for a pane it did not (and in these two cases, could not) consume
+// through the normal "scanned this tick" path — see
+// `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc comment and
+// `watchdogThresholdMs`'s (permission-answer-watch.ts) for why a surviving
+// entry is supposed to mean "no tick has run", not "a tick ran but had
+// nothing eligible, or scanned a different pane set".
+describe("FACTORY-776 (a): a stale fastPathTriggers entry cannot outlive its own relevance", () => {
+  test("labels.size === 0 (nothing eligible this tick) still reaps every stale entry, not just the panes it happens to scan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-reap-"));
+    const auditPath = join(dir, "audit.jsonl");
+    // No panes at all this tick — `eligiblePanes` returns an empty map
+    // regardless of what agent.list() reports, reproducing the
+    // `labels.size === 0` early-return path directly.
+    const { client } = fakeClient({});
+    const noneEligible = (): ReadonlyMap<string, string> => new Map();
+    const fastPathTriggers = new Map<string, number>([["p1", 0]]);
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: noneEligible, auditPath, fastPathTriggers, now: () => 999 });
+
+    expect(results).toEqual([]);
+    // Before the FACTORY-776 fix, the `labels.size === 0` early return sat
+    // ABOVE the consumption block, so this entry survived forever — every
+    // later tick (empty-eligible or not) would leave it right where it was.
+    expect(fastPathTriggers.has("p1")).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a pane that left the eligible set has its stale entry reaped even though the tick never iterates it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-reap-"));
+    const auditPath = join(dir, "audit.jsonl");
+    // p1 is eligible (so labels.size > 0, and the consumption loop DOES run
+    // this tick) but p2's entry is stale from before it left the eligible
+    // set — the consumption loop only walks `labels.keys()`, so p2 is never
+    // visited by it at all.
+    const { client } = fakeClient({ p1: NO_ALWAYS_SCREEN });
+    const onlyP1 = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.filter((a) => a.pane_id === "p1").map((a) => [a.pane_id, a.pane_id]));
+    const fastPathTriggers = new Map<string, number>([["p2", 0]]);
+
+    await runPermissionAnswerTick({ client, eligiblePanes: onlyP1, auditPath, fastPathTriggers, now: () => 999 });
+
+    // Before the fix, nothing ever deletes an entry for a pane absent from
+    // `labels` — p2's own entry would sit here forever, re-tripping the
+    // watchdog on every check despite a perfectly healthy tick loop.
+    expect(fastPathTriggers.has("p2")).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("startPermissionAnswerLoop", () => {
   test("guards against overlapping ticks: a slow tick makes the next timer firing a no-op instead of running concurrently", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
