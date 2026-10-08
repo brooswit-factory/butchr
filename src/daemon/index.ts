@@ -396,14 +396,12 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  */
 const ruleLizardModeOf = (id: string): boolean =>
   sharedRuleLizardModeOf(id, { rules: getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
-// BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
-// (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
-// agents are classified "sentinel" here (see src/agents/capacity-role.ts).
-// `issueMeta` (declared below, filled by every jira-work search) supplies
-// the issue type; it is only read at call time, after the whole module has
-// initialised.
-const roleOfAgent = (id: string): AgentCapacityRole =>
-  capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
+// FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
+// capacity is decided solely by each rule's own `role` field — see
+// src/agents/capacity-role.ts for the construction-level exceptions (bare
+// project agents, `jira-project` agents) and why issue type no longer plays
+// any part here.
+const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
