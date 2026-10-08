@@ -209,6 +209,59 @@ describe("runPermissionAnswerTick", () => {
     expect(lines.some((l) => l.includes("tick failed") && l.includes("herdr socket down"))).toBe(true);
   });
 
+  test("FACTORY-752: a completed tick with NOTHING eligible still fires onTickSuccess, never onTickError — the whole point of the new /health field", async () => {
+    const { client } = fakeClient({ p1: "some ordinary working pane, nothing pending here" });
+    let successCalls = 0;
+    const errors: unknown[] = [];
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: noneEligible, auditPath: "/dev/null",
+      onTickSuccess: () => { successCalls++; },
+      onTickError: (e) => errors.push(e),
+    });
+
+    expect(results).toEqual([]);
+    expect(successCalls).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  test("FACTORY-752: a tick that answers a pane also fires onTickSuccess exactly once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: ALWAYS_ALLOW_SCREEN });
+    let successCalls = 0;
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath, onTickSuccess: () => { successCalls++; } });
+
+    expect(results).toHaveLength(1);
+    expect(successCalls).toBe(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("FACTORY-752: a rejecting scan (agent.list throws) fires onTickError with the raw caught error, never onTickSuccess — distinguishable from a completed idle tick", async () => {
+    const boom = new Error("herdr socket down");
+    const client: PermissionAnswerClient = {
+      agent: {
+        list: (async () => { throw boom; }) as PermissionAnswerClient["agent"]["list"],
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    let successCalls = 0;
+    const errors: unknown[] = [];
+
+    const results = await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath: "/dev/null",
+      onTickSuccess: () => { successCalls++; },
+      onTickError: (e) => errors.push(e),
+    });
+
+    expect(results).toEqual([]);
+    expect(successCalls).toBe(0);
+    expect(errors).toEqual([boom]);
+  });
+
   test("FACTORY-100/FACTORY-103: onApproved fires once per answered pane, and a throwing onApproved never fails the tick", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
@@ -548,6 +601,58 @@ describe("runPermissionAnswerTick — FACTORY-145 fast-path latency", () => {
     // The second pane's own latency record still landed despite the first one's write failing.
     const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(audit.some((r) => r.paneId === "p2" && r.trigger === "sweep")).toBe(true);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// FACTORY-776 (a): `runPermissionAnswerTick` must reap a `fastPathTriggers`
+// entry for a pane it did not (and in these two cases, could not) consume
+// through the normal "scanned this tick" path — see
+// `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc comment and
+// `watchdogThresholdMs`'s (permission-answer-watch.ts) for why a surviving
+// entry is supposed to mean "no tick has run", not "a tick ran but had
+// nothing eligible, or scanned a different pane set".
+describe("FACTORY-776 (a): a stale fastPathTriggers entry cannot outlive its own relevance", () => {
+  test("labels.size === 0 (nothing eligible this tick) still reaps every stale entry, not just the panes it happens to scan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-reap-"));
+    const auditPath = join(dir, "audit.jsonl");
+    // No panes at all this tick — `eligiblePanes` returns an empty map
+    // regardless of what agent.list() reports, reproducing the
+    // `labels.size === 0` early-return path directly.
+    const { client } = fakeClient({});
+    const noneEligible = (): ReadonlyMap<string, string> => new Map();
+    const fastPathTriggers = new Map<string, number>([["p1", 0]]);
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: noneEligible, auditPath, fastPathTriggers, now: () => 999 });
+
+    expect(results).toEqual([]);
+    // Before the FACTORY-776 fix, the `labels.size === 0` early return sat
+    // ABOVE the consumption block, so this entry survived forever — every
+    // later tick (empty-eligible or not) would leave it right where it was.
+    expect(fastPathTriggers.has("p1")).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a pane that left the eligible set has its stale entry reaped even though the tick never iterates it", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-reap-"));
+    const auditPath = join(dir, "audit.jsonl");
+    // p1 is eligible (so labels.size > 0, and the consumption loop DOES run
+    // this tick) but p2's entry is stale from before it left the eligible
+    // set — the consumption loop only walks `labels.keys()`, so p2 is never
+    // visited by it at all.
+    const { client } = fakeClient({ p1: NO_ALWAYS_SCREEN });
+    const onlyP1 = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.filter((a) => a.pane_id === "p1").map((a) => [a.pane_id, a.pane_id]));
+    const fastPathTriggers = new Map<string, number>([["p2", 0]]);
+
+    await runPermissionAnswerTick({ client, eligiblePanes: onlyP1, auditPath, fastPathTriggers, now: () => 999 });
+
+    // Before the fix, nothing ever deletes an entry for a pane absent from
+    // `labels` — p2's own entry would sit here forever, re-tripping the
+    // watchdog on every check despite a perfectly healthy tick loop.
+    expect(fastPathTriggers.has("p2")).toBe(false);
 
     rmSync(dir, { recursive: true, force: true });
   });
