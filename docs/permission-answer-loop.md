@@ -1,5 +1,19 @@
 # The permission-answer loop / "lizard mode" (DROVR-42, FACTORY-67, FACTORY-87/FACTORY-76)
 
+> **FACTORY-722: a wedged herdr socket no longer leaves the watch dead
+> forever.** Two independent fixes: (1) the daemon's shared herdr client now
+> carries a client-side call deadline (`Config.herdrCallTimeoutMs`/
+> `BUTCHR_HERDR_TIMEOUT_MS`, default 10s), and the one call path that bypasses
+> it (`herdr.subscribe()`) gets its own deadline wrapper at the daemon's own
+> call site — before this, a hung `agent.list()`/`subscribe()` call left the
+> tick's in-flight guard set forever, with no recovery. (2) An independent
+> watchdog, on its own timer rather than the tick's, detects a pane whose
+> push-triggered `blocked` event has sat unconsumed for over 5 minutes and
+> force-restarts the watch — clears the in-flight guard, reopens the
+> subscription, kicks a fresh tick — logging `[watchdog] restarted
+> permission-answer` and raising an ops alert. See `permission-answer-watch.ts`'s
+> own header and `PermissionAnswerWatchDeps.watchdogThresholdMs`'s doc comment.
+
 > **FACTORY-145: every `answered:` journal line and audit record now carries
 > a `trigger` (`"fast"` or `"sweep"`), plus a `latencyMs` number when
 > `trigger` is `"fast"`.** See "Fast-path latency (FACTORY-145)" further down

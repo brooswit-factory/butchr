@@ -499,4 +499,142 @@ describe("startPermissionAnswerWatch", () => {
     handle.stop();
     rmSync(dir, { recursive: true, force: true });
   });
+
+  // FACTORY-722: reproduces the wedge finding directly — a herdr call
+  // (`agent.list()`) that never settles, same as the incident's own
+  // "one never-settling herdr await stalls everything that serializes on
+  // it" root cause, BEFORE this ticket's `Config.herdrCallTimeoutMs` fix
+  // existed to bound it. `inFlight` would otherwise never clear (its own
+  // `.finally` never runs), leaving every later push event coalesced into a
+  // `pending` flag a dead tick can never consume. The watchdog is the
+  // defense-in-depth backstop for exactly this: independent of the tick
+  // (fix-scope item (c)/(d) on the ticket's own two manager-factory
+  // comments), not merely a second path that could wedge the same way.
+  test("watchdog: a tick stuck forever on an unresolving herdr call is force-restarted, not left dead", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    let listCalls = 0;
+    const client: PermissionAnswerClient = {
+      agent: {
+        // The FIRST call resolves normally — exactly like the real
+        // incident: the daemon boots healthy, learns p1 is eligible, and
+        // opens a subscription for it. Every call AFTER that never settles
+        // — no socket error, no timeout, nothing to catch — reproducing
+        // "a herdr socket error" leaving a LATER call wedged mid-flight,
+        // not merely a daemon that could never list anything in the first
+        // place. The ONLY way `inFlight` ever clears again from here is the
+        // watchdog forcing it.
+        list: (async () => {
+          listCalls++;
+          if (listCalls === 1) return { type: "agent_list" as const, agents: [{ ...AGENT_BASE, pane_id: "p1", agent_status: "idle" as const }] };
+          return new Promise<never>(() => {});
+        }) as PermissionAnswerClient["agent"]["list"],
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    const subs: FakeSubscription[] = [];
+    const lines: string[] = [];
+    const tripped: (readonly string[])[] = [];
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: onlyP1,
+        auditPath,
+        log: (l) => lines.push(l),
+        watchdogThresholdMs: 30,
+        watchdogCheckIntervalMs: 10,
+        onWatchdogTripped: (stuck) => tripped.push(stuck),
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      // Huge sweep interval: the only tick attempts observed below are the
+      // initial `fire()` and the watchdog's own forced one, never a sweep tick.
+      1_000_000,
+    );
+
+    // Tick 1 (the initial fire()) resolves fine: it learns p1 is eligible
+    // and opens the subscription for it.
+    await waitFor(() => subs.length > 0);
+    expect(listCalls).toBe(1);
+
+    // A pane goes blocked. This fires a SECOND tick (tick 1 already
+    // finished, so `inFlight` was clear) — THAT call to `agent.list()` is
+    // the one that never settles, wedging `inFlight` true forever and
+    // leaving this push's own `fastPathTriggers` entry permanently unconsumed.
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => listCalls > 1);
+    const listsBeforeTrigger = listCalls;
+
+    await waitFor(() => tripped.length > 0);
+    expect(tripped[0]).toEqual(["p1"]);
+    expect(lines.some((l) => l.includes("[watchdog] restarted permission-answer") && l.includes("p1"))).toBe(true);
+
+    // Recovery actually happened: the old subscription was torn down and a
+    // new one opened, AND a fresh tick was kicked off (inFlight forced
+    // clear) rather than leaving `fire()` permanently coalescing into `pending`.
+    expect(subs[0]!.closeCalls).toBe(1);
+    await waitFor(() => subs.length > 1);
+    await waitFor(() => listCalls > listsBeforeTrigger);
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("watchdog disabled (watchdogThresholdMs: 0) never trips, even with a permanently unconsumed trigger", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    let listCalls = 0;
+    const client: PermissionAnswerClient = {
+      agent: {
+        // Same two-phase shape as the sibling test above: the first call
+        // resolves (so a subscription opens for p1), every call after that
+        // never settles (so the trigger set by the push below is never
+        // consumed by any tick).
+        list: (async () => {
+          listCalls++;
+          if (listCalls === 1) return { type: "agent_list" as const, agents: [{ ...AGENT_BASE, pane_id: "p1", agent_status: "idle" as const }] };
+          return new Promise<never>(() => {});
+        }) as PermissionAnswerClient["agent"]["list"],
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    const subs: FakeSubscription[] = [];
+    const tripped: (readonly string[])[] = [];
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: onlyP1,
+        auditPath,
+        watchdogThresholdMs: 0,
+        onWatchdogTripped: (stuck) => tripped.push(stuck),
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      1_000_000,
+    );
+
+    await waitFor(() => subs.length > 0);
+    expect(listCalls).toBe(1);
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => listCalls > 1); // the second tick is now permanently wedged
+    await new Promise((r) => setTimeout(r, 60)); // comfortably past the threshold the OTHER test trips at
+
+    expect(tripped).toEqual([]);
+    expect(subs[0]!.closeCalls).toBe(0); // never torn down — the watchdog never ran at all
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
