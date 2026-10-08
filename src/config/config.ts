@@ -45,6 +45,29 @@ export interface Config {
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
   herdrSocket?: string;
+  /**
+   * FACTORY-722: client-side deadline (`HerdrClientOptions.timeoutMs`,
+   * `@brooswit/herdr-sdk`) on every call the daemon's single shared
+   * `DrovrClient` instance makes to herdr (src/daemon/index.ts). Before this,
+   * that instance was constructed with no `timeoutMs` at all, so a herdr
+   * socket wedge (confirmed live: FACTORY-722's own wedge journal — a socket
+   * error that never produced a rejection) left `herdr.agent.list()` and
+   * `herdr.subscribe()` calls pending FOREVER. Every caller that serializes
+   * on one of those two calls then wedges too — not just the one that made
+   * the call: `permission-answer-watch.ts`'s `inFlight` guard only clears in
+   * the `.finally()` of a tick whose first await is `agent.list()`, and
+   * `HerdrHerd.runningIssues()` (src/agents/herd.ts) — read by
+   * `admissionController`'s shared `residency()` — is the SAME call, which
+   * is why pollLoop/notify/jira-idea/filesystem/managed-sessions all went
+   * stale together in that incident, not only the permission-answer timer.
+   * Default 10_000: comfortably below every sweep interval a hung call could
+   * otherwise block forever (the permission-answer watch's 20s,
+   * `PERMISSION_ANSWER_READ_TIMEOUT_MS`'s 8s), while still a small multiple
+   * of the 5s loops (`watchPrompts`, `blockingEscalationTimer`) that also
+   * serialize on this client — a timeout this short recovers within one or
+   * two of their ticks instead of a human noticing hours later.
+   */
+  herdrCallTimeoutMs: number;
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
   terminalPrefix?: string[];
   /**
@@ -567,6 +590,7 @@ export interface ConfigEnv {
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
+  BUTCHR_HERDR_TIMEOUT_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
@@ -748,6 +772,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
+  const herdrCallTimeoutMs = env.BUTCHR_HERDR_TIMEOUT_MS ? Number(env.BUTCHR_HERDR_TIMEOUT_MS) : 10_000;
+  if (!Number.isFinite(herdrCallTimeoutMs) || herdrCallTimeoutMs <= 0) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS is not a positive number: ${env.BUTCHR_HERDR_TIMEOUT_MS}`);
 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
@@ -793,6 +819,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
+    herdrCallTimeoutMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -983,7 +1010,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +

@@ -12,6 +12,7 @@ import TASK from "../../briefs/task.md" with { type: "text" };
 import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
+import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
@@ -182,7 +183,32 @@ export interface SpawnSpec {
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
 export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
 
-const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
+/**
+ * FACTORY-735/FACTORY-739: the marker every `briefs/*.md` template carries
+ * (once, verbatim) to pull in the shared "before you stop" section —
+ * `briefs/_before-you-stop.md` itself is NOT a template and carries no
+ * marker of its own; `test/unit/before-you-stop-coverage.test.ts`'s coverage
+ * check fails loud if any OTHER template under `briefs/` lacks it, so a new
+ * brief type cannot ship without the include. Deliberately NOT `{{UPPER_CASE}}`-
+ * shaped: that family is `WORKSPACE_PLACEHOLDERS`'s own closed-union,
+ * per-spec substitution syntax (`interpolate()`, below) — this is a
+ * separate, minimal, build-time text include with no `SpawnSpec` to read,
+ * so reusing that syntax would make `src/workspace/workspace-scan.ts`'s
+ * scanner demand a (meaningless) `WORKSPACE_PLACEHOLDERS`/registry entry for
+ * a name that is never actually interpolated per-spec.
+ */
+export const BEFORE_YOU_STOP_INCLUDE_MARKER = "<!-- include: briefs/_before-you-stop.md -->";
+
+/** Resolves `BEFORE_YOU_STOP_INCLUDE_MARKER` in a shipped brief template to the shared section's real text. */
+const resolveIncludes = (template: string): string => template.replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim());
+
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = {
+  epic: resolveIncludes(EPIC),
+  story: resolveIncludes(STORY),
+  task: resolveIncludes(TASK),
+  bug: resolveIncludes(BUG),
+  project: resolveIncludes(PROJECT),
+};
 
 /**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
@@ -213,7 +239,7 @@ export type WorkspacePlaceholder = (typeof WORKSPACE_PLACEHOLDERS)[number];
  * spawn-config work before assuming the caller shape reaching this function
  * hasn't moved — this file only adds the `project` entry additively.
  */
-export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.toLowerCase()] ?? DEFAULT;
+export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.toLowerCase()] ?? resolveIncludes(DEFAULT);
 
 /**
  * The issue-type keys `briefFor` maps explicitly (lowercase). Every other
