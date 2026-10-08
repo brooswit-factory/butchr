@@ -69,6 +69,7 @@ import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
@@ -1498,6 +1499,16 @@ const stalled = createStalledCheck({
   comments: (issue) => atlassian.comments(issue),
   log: (line) => console.error(`  ${line}`),
 });
+// FACTORY-740: dry-run only — see src/agents/silent-stop.ts's own top
+// comment. `undefined` when BUTCHR_SILENT_STOP_MODE=off, the same
+// disables-entirely-when-omitted shape `stalled`/`stallRemediation` use —
+// src/labels/sync.ts's `silentStop?.check` is then simply never called.
+const silentStop = config.silentStopMode === "off" ? undefined : createSilentStopCheck({
+  now: () => Date.now(),
+  suppressMinutes: config.silentStopSuppressMinutes,
+  comments: (issue) => atlassian.comments(issue),
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-221 criterion 10: a synchronous "is this issue quota-blocked right
 // now" predicate, built by teeing the SAME list()/read() calls handed to
 // watchSessionLimits below — through the SAME session-limit.ts recogniser —
@@ -1878,6 +1889,7 @@ const syncLabels = createLabelSync({
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
+  ...(silentStop ? { silentStop } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
