@@ -62,7 +62,7 @@
 import { chmodSync, closeSync, constants as fsConstants, copyFileSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { basename, dirname, join } from "node:path";
-import { loadRules, parseRules, rulesPath, type ReadRulesFile, type Rule, type RulesEnv } from "./rules.js";
+import { loadRules, parseRules, rulesPath, type AgentRole, type ReadRulesFile, type Rule, type RulesEnv } from "./rules.js";
 
 /** Kept 0600 (the ticket's own default) when the file does not exist yet; an EXISTING file's own mode always wins. */
 const DEFAULT_MODE = 0o600;
@@ -851,5 +851,52 @@ export function setRuleEnabled(text: string, id: string, enabled: boolean): stri
   if (!idMember) throw new Error(`rule ${JSON.stringify(id)} has no "id" field to anchor the new "enabled" field onto`);
   const indent = detectIndent(text, idMember.keyStart);
   const insertion = `,\n${indent}"enabled": ${value}`;
+  return text.slice(0, idMember.valueEnd) + insertion + text.slice(idMember.valueEnd);
+}
+
+/**
+ * `setRuleRole`'s own twin of `setRuleEnabled` immediately above — same
+ * surgical, formatting-preserving text edit (byte-identical outside the one
+ * field touched), same unknown-id error — for the `role` field instead of
+ * `enabled`. Written for FACTORY-810's upgrade migration
+ * (`../rules/capacity-role-migration.ts`), which must write `role:
+ * "sentinel"` onto exactly the rules that relied on the deleted issue-type
+ * capacity exemption while leaving every other byte of the file (including
+ * every OTHER rule's own formatting) untouched — the same discipline
+ * `setRuleEnabled` already established for its own field, reused rather
+ * than reinvented. `value` is written as a JSON string literal (`role` is
+ * `"worker" | "sentinel"`, never a bare word), unlike `enabled`'s bare
+ * `true`/`false`.
+ */
+export function setRuleRole(text: string, id: string, role: AgentRole): string {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`invalid JSON: ${(e as Error).message}`);
+  }
+  if (!doc || typeof doc !== "object" || !Array.isArray((doc as Record<string, unknown>).rules)) {
+    throw new Error(`expected an object with a "rules" array`);
+  }
+  const rules = (doc as { rules: unknown[] }).rules;
+  const idx = rules.findIndex((r) => r !== null && typeof r === "object" && (r as Record<string, unknown>).id === id);
+  if (idx === -1) throw new Error(`no rule with id ${JSON.stringify(id)}`);
+
+  const arraySpan = findRulesArraySpan(text);
+  const elems = scanArrayElements(text, arraySpan.start, arraySpan.end);
+  const obj = elems[idx];
+  if (!obj) throw new Error(`rule ${JSON.stringify(id)} was found by JSON.parse but not by the text scanner — this should be unreachable; the rules file may use a JSON feature (e.g. a duplicate key) this scanner doesn't expect`);
+  const members = scanObjectMembers(text, obj.start, obj.end);
+
+  const value = JSON.stringify(role);
+  const roleMember = members.get("role");
+  if (roleMember) {
+    return text.slice(0, roleMember.valueStart) + value + text.slice(roleMember.valueEnd);
+  }
+
+  const idMember = members.get("id");
+  if (!idMember) throw new Error(`rule ${JSON.stringify(id)} has no "id" field to anchor the new "role" field onto`);
+  const indent = detectIndent(text, idMember.keyStart);
+  const insertion = `,\n${indent}"role": ${value}`;
   return text.slice(0, idMember.valueEnd) + insertion + text.slice(idMember.valueEnd);
 }
