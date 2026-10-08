@@ -36,6 +36,66 @@ export interface CommentRow { id: string; body: string; created: string }
 export const MANAGED_ESCALATION_MARKER = "[managed-escalation]";
 
 /**
+ * FACTORY-811: journal-line marker for the KEYED-or-not path's own
+ * `onNoPrompt`, distinct from the plain "blocked with no parseable dialog"
+ * line it sits beside. That plain line cannot tell a real permission dialog
+ * the parser rejected (a defect — a worker is stuck on a real prompt) from a
+ * pane that is simply busy with no dialog at all (normal); measured, 40/40
+ * such lines in a 6h window showed ordinary scrollback, none a dialog
+ * (FACTORY-774/811). This marker is emitted ONLY when the screen contains a
+ * `Do you want to ...?` line the parser still rejected, so `journalctl
+ * --user -u <unit> | grep -F '[unrecognized-dialog]'` finds exactly the
+ * defect case and nothing else.
+ */
+export const UNRECOGNIZED_DIALOG_MARKER = "[unrecognized-dialog]";
+
+/**
+ * FACTORY-811: a real Claude Code / drovr permission dialog always poses its
+ * question as a line of exactly this shape (every captured fixture in this
+ * repo and in FACTORY-774/809's measurements — "Do you want to proceed?").
+ * Anchored to the whole line (optional leading whitespace, nothing after the
+ * `?`) for the same reason `prompt.ts`'s own `FOOTER` is anchored: matching
+ * the phrase merely occurring somewhere lets an agent's own narration about a
+ * dialog (not a dialog itself) trigger the defect marker.
+ */
+const DIALOG_QUESTION_LINE = /^\s*Do you want to .+\?\s*$/m;
+
+/**
+ * FACTORY-811: how many characters of the screen, counted from the matched
+ * `DIALOG_QUESTION_LINE` onward, go into the journal when that line is
+ * present. Tail-oriented on purpose — "Do you want to...?" is always
+ * followed immediately by the option list and the footer, which is the part
+ * a reader needs to identify the dialog, never the scrollback above it. 400
+ * chars comfortably covers every captured fixture's question + full option
+ * list + footer (the FACTORY-774/809 "Nor you" renders are both well under
+ * 200) while bounding what a pane's own output — which can carry secrets or
+ * customer content — pushes into the shared journal; this is a tail window,
+ * never a screen dump.
+ */
+const UNRECOGNIZED_DIALOG_WINDOW_CHARS = 400;
+
+/**
+ * FACTORY-811: build the journal line for a blocked pane whose text did not
+ * parse as a dialog. Two distinct cases, per FACTORY-811 AC 1-3:
+ *  - the screen contains a `DIALOG_QUESTION_LINE` the parser nonetheless
+ *    rejected: a real, greppable defect signal (`UNRECOGNIZED_DIALOG_MARKER`)
+ *    carrying the bounded tail window starting at that line, so the cause is
+ *    identifiable from the journal alone without reproducing it.
+ *  - no such line: the ordinary busy/no-dialog case, which stays exactly the
+ *    short, un-markered line it always was — clearly not a defect signal.
+ * `sanitizeForJournal` (newline-flatten + control-char strip, FACTORY-611
+ * item 6(d)) is applied to the captured window so pane text can never forge
+ * an extra marker-looking journal line (BUTCHR-343/346's own concern about
+ * this exact log site).
+ */
+function formatUnparseableLine(paneId: string, text: string): string {
+  const matchIdx = text.search(DIALOG_QUESTION_LINE);
+  if (matchIdx === -1) return `${paneId} blocked with no parseable dialog: "${sanitizeForJournal(text.trim().slice(0, 60))}"`;
+  const window = text.slice(matchIdx, matchIdx + UNRECOGNIZED_DIALOG_WINDOW_CHARS);
+  return `${UNRECOGNIZED_DIALOG_MARKER} ${paneId} blocked on an unrecognized dialog (parser rejected a real "Do you want to...?" prompt): "${sanitizeForJournal(window).trim()}"`;
+}
+
+/**
  * FACTORY-45: a keyless pane's managed-session identity, resolved fresh on
  * every poll from the pane's own workspace path (`EscalatorDeps.managedSessionOf`)
  * — never persisted by this module. `agentKey` is the filesystem agent key
@@ -1750,7 +1810,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const h = hashText(text);
     if (lastUnparseableHash.get(paneId) !== h) {
       lastUnparseableHash.set(paneId, h);
-      log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
+      log(formatUnparseableLine(paneId, text));
     }
 
     // FACTORY-369 AC 2: a keyless pane widens to the SAME managed-session
