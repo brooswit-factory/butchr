@@ -157,9 +157,9 @@ export const readProcNetTcp: ReadProcNetTcp = () => {
 };
 
 const LSOF_PATH = "/usr/sbin/lsof";
-const LSOF_TIMEOUT_MS = 2000;
+const LSOF_TIMEOUT_MS = 4000;
 /** A positive answer for one 4-tuple is reused this long, so a page's burst of requests costs one `lsof`. */
-const POSITIVE_TTL_MS = 3000;
+const POSITIVE_TTL_MS = 1000;
 /** Checks queued behind the running `lsof`; beyond this a check is refused outright (fail closed) so a flood cannot build an unbounded backlog. */
 const MAX_PENDING_LSOF = 8;
 
@@ -179,8 +179,14 @@ export function runLsofAt(path: string = LSOF_PATH, timeoutMs: number = LSOF_TIM
       let timedOut = false;
       const timer = setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, timeoutMs);
       const outP = new Response(proc.stdout).text(); // read while it runs so a full pipe cannot block the exit
-      const code = await proc.exited;
+      // Outer deadline: a child that ignores even SIGKILL's reaping must not hold the queue.
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const code = await Promise.race([
+        proc.exited,
+        new Promise<null>((resolve) => { deadline = setTimeout(() => { timedOut = true; resolve(null); }, timeoutMs + 500); }),
+      ]);
       clearTimeout(timer);
+      clearTimeout(deadline);
       if (timedOut || proc.signalCode || code === null) return "";
       const out = await outP;
       return code === 0 || out.length > 0 ? out : "";
@@ -198,12 +204,12 @@ export interface LsofPeerUidDeps {
 
 /**
  * macOS owner lookup for one socket: async, single-flight per 4-tuple, runs
- * one `lsof` at a time, caches only positive answers for a few seconds, and
+ * one `lsof` at a time, caches only positive answers for about a second, and
  * refuses (null) when too many lookups are already waiting.
  */
 export function createLsofPeerUid(deps: LsofPeerUidDeps = {}): (client: SocketEndpoint, server: SocketEndpoint) => Promise<number | null> {
   const run = deps.run ?? runLsof;
-  const now = deps.now ?? Date.now;
+  const now = deps.now ?? (() => performance.now()); // monotonic: a wall-clock step must not extend a cached answer
   const cache = new Map<string, { uid: number; at: number }>();
   const inflight = new Map<string, Promise<number | null>>();
   let queue: Promise<unknown> = Promise.resolve();
@@ -212,6 +218,7 @@ export function createLsofPeerUid(deps: LsofPeerUidDeps = {}): (client: SocketEn
     const key = `${client.address}:${client.port}>${server.address}:${server.port}`;
     const hit = cache.get(key);
     if (hit && now() - hit.at < POSITIVE_TTL_MS) return Promise.resolve(hit.uid);
+    const previous = hit?.uid;
     cache.delete(key);
     const shared = inflight.get(key);
     if (shared) return shared;
@@ -221,6 +228,8 @@ export function createLsofPeerUid(deps: LsofPeerUidDeps = {}): (client: SocketEn
       .then(() => run())
       .then((out) => {
         const uid = peerUidOf(lsofToProcNetTcp(out), client, server);
+        // A different owner for the same 4-tuple than we just saw is not an answer.
+        if (uid !== null && previous !== undefined && previous !== uid) return null;
         if (uid !== null) {
           for (const [k, v] of cache) if (now() - v.at >= POSITIVE_TTL_MS) cache.delete(k);
           cache.set(key, { uid, at: now() });

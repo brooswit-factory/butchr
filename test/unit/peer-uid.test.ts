@@ -130,10 +130,10 @@ describe("createLsofPeerUid (async, single-flight, positive cache)", () => {
     const lookup = createLsofPeerUid({ run: async () => { runs++; return OUT; }, now: () => t });
     const [a, b] = await Promise.all([lookup(client(50000), SERVER), lookup(client(50000), SERVER)]);
     expect([a, b, runs]).toEqual([502, 502, 1]);
-    t = 1000;
+    t = 500;
     expect(await lookup(client(50000), SERVER)).toBe(502);
     expect(runs).toBe(1);
-    t = 4000;
+    t = 1500;
     await lookup(client(50000), SERVER);
     expect(runs).toBe(2);
   });
@@ -184,5 +184,28 @@ describe("runLsofAt (stand-in lsof scripts)", () => {
   test("a missing binary, and a failing run with no output, return \"\"", async () => {
     expect(await runLsofAt(join(dir, "nope"), 2000)).toBe("");
     expect(await runLsofAt(script("fail", "exit 1"), 2000)).toBe("");
+  });
+});
+
+describe("createLsofPeerUid ownership change", () => {
+  test("a different uid for the same 4-tuple than the cached one is a miss, not an answer", async () => {
+    let uid = 502;
+    let t = 0;
+    const lookup = createLsofPeerUid({ run: async () => `p1\nu${uid}\nn127.0.0.1:50000->127.0.0.1:7718\n`, now: () => t });
+    expect(await lookup(client(50000), SERVER)).toBe(502);
+    uid = 501; t = 2000;
+    expect(await lookup(client(50000), SERVER)).toBeNull();
+  });
+});
+
+describe("runLsofAt outer deadline", () => {
+  test("a child that ignores SIGTERM is still abandoned at the deadline", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "lsof-"));
+    const f = join(dir, "stubborn");
+    writeFileSync(f, "#!/bin/sh\ntrap '' TERM\nprintf 'p1\\nu501\\n'\nsleep 3\n");
+    chmodSync(f, 0o755);
+    const t0 = performance.now();
+    expect(await runLsofAt(f, 300)).toBe("");
+    expect(performance.now() - t0).toBeLessThan(2500);
   });
 });
