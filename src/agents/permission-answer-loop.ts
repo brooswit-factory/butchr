@@ -361,6 +361,25 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     // that IS still eligible keeps its entry here — that case is handled by
     // the consumption loop below, which runs regardless of this tick's
     // answered/skipped/failed outcome.
+    //
+    // This reap covers two of the three paths a stale entry can survive
+    // through (an empty eligible set, and a pane that left the eligible
+    // set) — NOT the third: this whole block sits after `await
+    // deps.client.agent.list()` above, so a REJECTING list() call (the
+    // deadline/"not a hang" case) skips this reap entirely via the outer
+    // `catch` below and reaches neither this code nor the consumption loop.
+    // That path is deliberately left to `startPermissionAnswerWatch`'s own
+    // watchdog instead (it clears exactly the entries it trips on) rather
+    // than bolted on here too: a rejecting list() means this tick never
+    // learned an eligible set at all, so there is nothing for THIS
+    // mechanism to reap by eligibility against — only the watchdog's
+    // age-based "no tick has scanned this pane in `watchdogThresholdMs`"
+    // signal can recognize that case, independent of whether any list()
+    // call ever succeeds again. The cost is one bounded, not unbounded,
+    // spurious trip for that path alone (see `watchdogThresholdMs`'s own
+    // doc comment) — still satisfies "trips bounded, not one per interval
+    // forever", just not "zero trips", which only the two in-tick-reaped
+    // paths achieve.
     if (deps.fastPathTriggers) {
       for (const id of deps.fastPathTriggers.keys()) {
         if (!labels.has(id)) deps.fastPathTriggers.delete(id);

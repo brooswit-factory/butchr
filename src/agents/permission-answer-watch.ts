@@ -106,19 +106,33 @@ export interface PermissionAnswerWatchDeps extends PermissionAnswerLoopDeps {
    * UNCONSUMED this long means no tick has scanned it since — the exact
    * "a never-settling herdr await stalls everything that serializes on it"
    * shape the wedge incident this ticket closes was named for, independent
-   * of whatever root cause produced it this time. `runPermissionAnswerTick`
-   * reaps a pane's entry as soon as it is no longer in the current eligible
-   * set, and otherwise deletes it on every tick that scans it (answered,
-   * skipped, or failed — see `PermissionAnswerLoopDeps.fastPathTriggers`'s
-   * own doc comment) — FACTORY-776 fixed both of those paths, which this
-   * comment used to claim (falsely) could never strand an entry at all. So
-   * a surviving entry past this threshold really is unambiguous NOW: the
-   * tick has not successfully reached its own `agent.list()`-returning scan
-   * of that pane in all that time (a hung/rejecting herdr call), not merely
-   * that one pane's own attempt failed. Default 5 minutes (the incident's
-   * own evidence: FACTORY-722's wedge journal measured panes blocked for
-   * tens of minutes before anyone noticed). `0` disables the watchdog
-   * entirely (tests that don't want its timer running).
+   * of whatever root cause produced it this time. FACTORY-776 fixed the
+   * two paths that used to strand an entry forever despite a perfectly
+   * healthy tick loop: `runPermissionAnswerTick` now reaps a pane's entry
+   * as soon as it is no longer in the current eligible set (covers both an
+   * empty eligible set and a pane that simply left it), and otherwise
+   * deletes it on every tick that scans it (answered, skipped, or failed —
+   * see `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc comment).
+   * This comment used to claim NEITHER of those could ever happen; false,
+   * now fixed.
+   *
+   * One path is DELIBERATELY NOT covered by that in-tick reap, and still
+   * relies on THIS watchdog: a rejecting `agent.list()` call (a deadline,
+   * not a hang) skips the reap and the consumption loop alike, since both
+   * sit after the `await` that rejected — the tick never even learns an
+   * eligible set to reap against. So a surviving entry past this threshold
+   * means one of two things: a genuinely wedged tick (never reaches its
+   * own `agent.list()`-returning scan at all — the hang this watchdog was
+   * built for), OR a tick whose `agent.list()` keeps rejecting (settles
+   * quickly, but with nothing to reap against). Either way, this watchdog
+   * firing and clearing the entry is what bounds it: one trip for the
+   * reject case (not unbounded re-tripping, since the trip itself clears
+   * the entry this timer fired on), indefinite re-tripping only for a
+   * genuinely wedged tick that never recovers on its own. Default 5
+   * minutes (the incident's own evidence: FACTORY-722's wedge journal
+   * measured panes blocked for tens of minutes before anyone noticed). `0`
+   * disables the watchdog entirely (tests that don't want its timer
+   * running).
    */
   watchdogThresholdMs?: number;
   /** How often the watchdog above checks. Default 30s — far below `watchdogThresholdMs`, so a trip is noticed promptly once the threshold passes, without re-checking so often it costs anything measurable. */
