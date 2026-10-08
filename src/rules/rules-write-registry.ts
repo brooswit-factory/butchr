@@ -4,22 +4,29 @@
  * validators, so a later write slice (FACTORY-665/666/667/668) adds a row
  * here rather than an ad-hoc handler. This file holds the RULES v1 row only.
  *
+ * FACTORY-729 widens the row: `permissionMode`/`lizardMode` (top-level) and
+ * `agentPreferences[i].harness` (previously refused on purpose — see that
+ * leaf's own comment on `EDITABLE_AGENT_PREFERENCE_LEAVES` below for why it
+ * is now deliberately allowed) join `query`/`agentPreferences[i].model/
+ * effort/modelPower/effortPower` as editable. `execution`, `account`,
+ * `role`, `mcpServers`, `mcpConfigFile`, `brief` remain fixed — still
+ * refused for free, same mechanism, just a shorter list of what's fixed.
+ *
  * TWO INDEPENDENT GATES, both required, for a different reason each:
  *   1. A per-write, PER-INDEX `assertOnlyChanged` allowlist (FACTORY-658) —
  *      a DEFAULT-DENY diff check: any changed path NOT matched here throws,
  *      which is what makes the fixed template fields (`execution`,
- *      `account`, `role`, `mcpServers`, `mcpConfigFile`, `brief`,
- *      `permissionMode`, `lizardMode`) refused FOR FREE — they are refused
- *      because they are simply never in this list, not because of a second,
- *      separate "is this a fixed field" check that could drift from the
- *      first. Built by `../rules/rules-write-apply.ts`'s
- *      `buildEnabledAllowedPaths`/`buildFieldsAllowedPaths`, from the
- *      LOCKED read, naming the target rule's CURRENT array index literally
- *      (`"rules.3.enabled"`, never `"rules.*.enabled"`) — a static,
- *      wildcarded allowlist was agentsafety's own 2026-10-05 17:0x PDT
- *      re-check finding: `*` matches ANY index, so it would permit a write
- *      to ANY rule's `enabled`/`query`, not just the one this route already
- *      checked `isUiEditableRuleId` against. `EDITABLE_TOP_LEVEL_FIELDS`/
+ *      `account`, `role`, `mcpServers`, `mcpConfigFile`, `brief`) refused
+ *      FOR FREE — they are refused because they are simply never in this
+ *      list, not because of a second, separate "is this a fixed field"
+ *      check that could drift from the first. Built by `../rules/rules-
+ *      write-apply.ts`'s `buildEnabledAllowedPaths`/`buildFieldsAllowedPaths`,
+ *      from the LOCKED read, naming the target rule's CURRENT array index
+ *      literally (`"rules.3.enabled"`, never `"rules.*.enabled"`) — a
+ *      static, wildcarded allowlist was agentsafety's own 2026-10-05 17:0x
+ *      PDT re-check finding: `*` matches ANY index, so it would permit a
+ *      write to ANY rule's `enabled`/`query`, not just the one this route
+ *      already checked `isUiEditableRuleId` against. `EDITABLE_TOP_LEVEL_FIELDS`/
  *      `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
  *      builders use — never consulted directly by `assertOnlyChanged`.
  *   2. `isUiEditableRuleId` — a route-level check, BEFORE any diff is even
@@ -29,6 +36,9 @@
  *      or touches an unmarked rule (e.g. `managers`) — see this ticket's
  *      "DECISION ADDED" comment.
  */
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "./rules.js";
+import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
+import { customModelProblems } from "./rule-form-catalog.js";
 
 /** The reserved id prefix FACTORY-669 seeds its one template rule under (`ui-first-rule`). Only a rule whose id starts with this may ever be written by a web-UI route. */
 export const UI_EDITABLE_ID_PREFIX = "ui-";
@@ -41,15 +51,45 @@ export function isUiEditableRuleId(id: string): boolean {
 export const FIRST_RULE_ID = "ui-first-rule";
 
 /**
- * The editable LEAVES of one `agentPreferences` element — never `harness`
- * (a prefix match on the bare `agentPreferences.<m>` path would also let
- * `harness` through; agentsafety's finding (ii)), and never the whole
+ * The editable LEAVES of one `agentPreferences` element — never the whole
  * element object (which would permit adding/removing keys). Consumed by
  * `../rules/rules-write-apply.ts`'s `buildFieldsAllowedPaths`, which
  * appends the target rule's own CURRENT index and each existing
  * preference's own index ahead of these leaf names.
+ *
+ * FACTORY-729: `harness` is now included, deliberately reversing the
+ * original FACTORY-662 design (agentsafety's finding (ii) there was about a
+ * PREFIX match on the bare `agentPreferences.<m>` path letting `harness`
+ * through BY ACCIDENT; this is an explicit, LEAF-listed addition, the same
+ * discipline every other leaf here already has, not a reopening of that
+ * hole) — the rule form's harness dropdown edits an existing preference's
+ * harness in place; `validateAgentPreferencePatch` below validates the
+ * value against `AGENT_HARNESSES` before it ever reaches this allowlist.
  */
-export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["model", "effort", "modelPower", "effortPower"];
+export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "model", "effort", "modelPower", "effortPower"];
+
+/**
+ * FACTORY-729: the editable TOP-LEVEL `Rule` fields `PUT /api/rules/:id`
+ * accepts, beyond `agentPreferences` (handled separately — see
+ * `EDITABLE_AGENT_PREFERENCE_LEAVES` above) — consumed the same way, by
+ * `../rules/rules-write-apply.ts`'s `buildFieldsAllowedPaths`, which
+ * appends the target rule's own CURRENT index ahead of each name present in
+ * the patch. `enabled` is deliberately absent (that field's own dedicated
+ * route, `POST /api/rules/:id/enabled`, owns it — see `validateRuleFieldPatch`'s
+ * own explicit rejection of it on this route).
+ */
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode"];
+
+/**
+ * FACTORY-729: `permissionMode` values that are never a default and always
+ * require an explicit `confirm: true` on the write that sets them (see
+ * `../rules/rules-write.ts`'s `requireConfirmForRiskyFields`) — unattended
+ * dangerous-permission launches must be an opt-in a human visibly confirmed,
+ * not a value that slipped in alongside an unrelated edit. `lizardMode: true`
+ * carries the same requirement unconditionally (there is no "safe" value of
+ * it to exempt).
+ */
+export const RISKY_PERMISSION_MODES: ReadonlySet<RulePermissionMode> = new Set(["bypassPermissions", "auto"]);
 
 /**
  * FACTORY-669: re-exported from `./rules.ts`, which owns the canonical
@@ -66,23 +106,71 @@ export { PLACEHOLDER_QUERY } from "./rules.js";
 export const ENABLE_SCOPE_CEILING = 25;
 
 export interface AgentPreferencePatch {
+  /** FACTORY-729: see `EDITABLE_AGENT_PREFERENCE_LEAVES`'s own doc comment for why this leaf is now deliberately editable. Validated against `AGENT_HARNESSES` below. */
+  harness?: AgentHarness;
   model?: string;
-  effort?: string;
+  effort?: AgentEffort;
   modelPower?: number;
   effortPower?: number;
 }
 
-/** The only shape a PUT body's `agentPreferences` element may take — any OTHER key (`harness` included) fails validation before any diff is even computed, so a caller gets a clear 400 rather than a confusing `assertOnlyChanged` throw. */
-const AGENT_PREFERENCE_PATCH_KEYS = new Set(["model", "effort", "modelPower", "effortPower"]);
+/** The only shape a PUT body's `agentPreferences` element may take — any OTHER key fails validation before any diff is even computed, so a caller gets a clear 400 rather than a confusing `assertOnlyChanged` throw. */
+const AGENT_PREFERENCE_PATCH_KEYS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 
-export function validateAgentPreferencePatch(value: unknown): value is AgentPreferencePatch {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.keys(value as object).every((k) => AGENT_PREFERENCE_PATCH_KEYS.has(k));
+/**
+ * FACTORY-729: widened from a bare key-allowlist type guard to a real
+ * per-value validator — every leaf's VALUE is now checked against the SAME
+ * catalog (`./rule-form-catalog.js`'s `customModelProblems`, `AGENT_HARNESSES`,
+ * `AGENT_EFFORTS`, `powerValueProblems`) the write path's own GET
+ * `/api/rules/catalog` route serves, so a value this validator accepts is
+ * always one the UI actually offered (or, for `model`, a custom id shaped
+ * the way the UI's "Other…" field promises). `model`/`modelPower` and
+ * `effort`/`effortPower` remain mutually exclusive, same as the file-load
+ * path's own `parsePreferences` (`./rules.ts`) — ambiguous precedence is
+ * refused, never silently resolved by picking one.
+ */
+export function validateAgentPreferencePatch(value: unknown): { ok: true; patch: AgentPreferencePatch } | { ok: false; error: string } {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return { ok: false, error: "agentPreferences entries must be objects" };
+  const v = value as Record<string, unknown>;
+  for (const k of Object.keys(v)) {
+    if (!AGENT_PREFERENCE_PATCH_KEYS.has(k)) return { ok: false, error: `agentPreferences entries may only contain ${[...AGENT_PREFERENCE_PATCH_KEYS].join("/")}` };
+  }
+  const patch: AgentPreferencePatch = {};
+  if ("harness" in v) {
+    if (typeof v.harness !== "string" || !(AGENT_HARNESSES as readonly string[]).includes(v.harness)) return { ok: false, error: `agentPreferences.harness must be one of ${AGENT_HARNESSES.join(", ")}` };
+    patch.harness = v.harness as AgentHarness;
+  }
+  if ("model" in v) {
+    const problems = customModelProblems(v.model, "agentPreferences.model");
+    if (problems.length) return { ok: false, error: problems.join("; ") };
+    patch.model = v.model as string;
+  }
+  if ("effort" in v) {
+    if (typeof v.effort !== "string" || !(AGENT_EFFORTS as readonly string[]).includes(v.effort)) return { ok: false, error: `agentPreferences.effort must be one of ${AGENT_EFFORTS.join(", ")}` };
+    patch.effort = v.effort as AgentEffort;
+  }
+  if ("modelPower" in v) {
+    const problems = powerValueProblems(v.modelPower, "agentPreferences.modelPower");
+    if (problems.length) return { ok: false, error: problems.join("; ") };
+    patch.modelPower = v.modelPower as number;
+  }
+  if ("effortPower" in v) {
+    const problems = powerValueProblems(v.effortPower, "agentPreferences.effortPower");
+    if (problems.length) return { ok: false, error: problems.join("; ") };
+    patch.effortPower = v.effortPower as number;
+  }
+  if (patch.model !== undefined && patch.modelPower !== undefined) return { ok: false, error: "agentPreferences entries must not set both model and modelPower" };
+  if (patch.effort !== undefined && patch.effortPower !== undefined) return { ok: false, error: "agentPreferences entries must not set both effort and effortPower" };
+  return { ok: true, patch };
 }
 
 export interface RuleFieldPatch {
   enabled?: boolean;
   query?: string;
+  /** FACTORY-729 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. Validated against `RULE_PERMISSION_MODES` below; `"bypassPermissions"`/`"auto"` additionally require `confirm: true` on the write itself (`../rules/rules-write.ts`). */
+  permissionMode?: RulePermissionMode;
+  /** FACTORY-729 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. `true` additionally requires `confirm: true` on the write itself (`../rules/rules-write.ts`) — never a default. */
+  lizardMode?: boolean;
   /** Must be the SAME LENGTH as the rule's current `agentPreferences` (see `RULES_V1_ALLOWED_PATHS`'s own doc comment on why an array-length change is never permitted) — one entry per existing preference, in order. */
   agentPreferences?: AgentPreferencePatch[];
 }
@@ -100,14 +188,25 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.query !== "string" || b.query.length === 0 || b.query.length > 10_000) return { ok: false, error: "query must be a non-empty string, at most 10000 characters" };
     patch.query = b.query;
   }
+  if ("permissionMode" in b) {
+    if (typeof b.permissionMode !== "string" || !(RULE_PERMISSION_MODES as readonly string[]).includes(b.permissionMode)) return { ok: false, error: `permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}` };
+    patch.permissionMode = b.permissionMode as RulePermissionMode;
+  }
+  if ("lizardMode" in b) {
+    if (typeof b.lizardMode !== "boolean") return { ok: false, error: "lizardMode must be a boolean" };
+    patch.lizardMode = b.lizardMode;
+  }
   if ("agentPreferences" in b) {
     if (!Array.isArray(b.agentPreferences)) return { ok: false, error: "agentPreferences must be an array" };
+    const entries: AgentPreferencePatch[] = [];
     for (const entry of b.agentPreferences) {
-      if (!validateAgentPreferencePatch(entry)) return { ok: false, error: `agentPreferences entries may only contain ${[...AGENT_PREFERENCE_PATCH_KEYS].join("/")}` };
+      const parsed = validateAgentPreferencePatch(entry);
+      if (!parsed.ok) return parsed;
+      entries.push(parsed.patch);
     }
-    patch.agentPreferences = b.agentPreferences as AgentPreferencePatch[];
+    patch.agentPreferences = entries;
   }
-  const allowedKeys = new Set(["enabled", "query", "agentPreferences", "ifMatch", "confirm", "planHash"]);
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "agentPreferences", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }

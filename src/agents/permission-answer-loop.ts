@@ -316,6 +316,28 @@ export interface PermissionAnswerLoopDeps {
   now?: () => number;
   /** Test seam: how a latency audit line is appended. Defaults to the real filesystem (`mkdir` + `appendFile`, same shape as `@brooswit/drovr`'s own `defaultDeps.appendAudit`). */
   appendAudit?: (path: string, line: string) => Promise<void>;
+  /**
+   * FACTORY-752 (FACTORY-746 (c)): called once this tick COMPLETES — whether
+   * or not anything was eligible (even the `labels.size === 0` early-out
+   * below still counts: an `agent.list()` that succeeded and found nothing
+   * to do is exactly the "idle, ticking normally" case the daemon's `/health`
+   * must NOT mistake for "has not ticked at all" — see
+   * `createTickHealth`'s own doc comment, src/daemon/health.ts). Never called
+   * alongside `onTickError` for the same tick: this fires only on the path
+   * that returns without throwing. Optional; omitted, nothing records a
+   * heartbeat for this tick (unchanged from before this ticket).
+   */
+  onTickSuccess?: () => void;
+  /**
+   * FACTORY-752 (FACTORY-746 (c)): called once per tick that REJECTED — the
+   * same `catch` below that already logs `"tick failed: …"` (the exact shape
+   * the 10-08 incident's own journal showed twice, then silence). Receives
+   * the raw caught value. Never called alongside `onTickSuccess` for the
+   * same tick. Optional; omitted, a rejection is still logged but not
+   * recorded as a distinguishable health event (unchanged from before this
+   * ticket).
+   */
+  onTickError?: (error: unknown) => void;
 }
 
 /**
@@ -352,7 +374,47 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     const { agents } = await deps.client.agent.list();
     const labels = deps.eligiblePanes(agents.map((a) => ({ pane_id: a.pane_id, cwd: a.cwd })));
     deps.onEligiblePaneIds?.([...labels.keys()]);
-    if (labels.size === 0) return [];
+    // FACTORY-776 (a): reap every fastPathTriggers entry for a pane that is
+    // NOT in this tick's eligible set — above the `labels.size === 0` early
+    // return below (so an empty eligible set still reaps) and unconditional
+    // on outcome, so a pane that left the eligible set (its own entry is
+    // never otherwise visited: the consumption loop further down only walks
+    // `labels.keys()`) cannot keep re-tripping the watchdog forever. A pane
+    // that IS still eligible keeps its entry here — that case is handled by
+    // the consumption loop below, which runs regardless of this tick's
+    // answered/skipped/failed outcome.
+    //
+    // This reap covers two of the three paths a stale entry can survive
+    // through (an empty eligible set, and a pane that left the eligible
+    // set) — NOT the third: this whole block sits after `await
+    // deps.client.agent.list()` above, so a REJECTING list() call (the
+    // deadline/"not a hang" case) skips this reap entirely via the outer
+    // `catch` below and reaches neither this code nor the consumption loop.
+    // That path is deliberately left to `startPermissionAnswerWatch`'s own
+    // watchdog instead (it clears exactly the entries it trips on) rather
+    // than bolted on here too: a rejecting list() means this tick never
+    // learned an eligible set at all, so there is nothing for THIS
+    // mechanism to reap by eligibility against — only the watchdog's
+    // age-based "no tick has scanned this pane in `watchdogThresholdMs`"
+    // signal can recognize that case, independent of whether any list()
+    // call ever succeeds again. The cost is one bounded, not unbounded,
+    // spurious trip for that path alone (see `watchdogThresholdMs`'s own
+    // doc comment) — still satisfies "trips bounded, not one per interval
+    // forever", just not "zero trips", which only the two in-tick-reaped
+    // paths achieve.
+    if (deps.fastPathTriggers) {
+      for (const id of deps.fastPathTriggers.keys()) {
+        if (!labels.has(id)) deps.fastPathTriggers.delete(id);
+      }
+    }
+    if (labels.size === 0) {
+      // FACTORY-752 (FACTORY-746 (c)): a completed tick with NOTHING eligible
+      // still advances the health heartbeat — this is the whole point (see
+      // `onTickSuccess`'s own doc comment above): an idle tick must never
+      // look identical to a tick that never ran at all.
+      deps.onTickSuccess?.();
+      return [];
+    }
     const eligible = agents.filter((a) => labels.has(a.pane_id));
     const scopedClient: PermissionAnswerClient = {
       agent: {
@@ -484,9 +546,11 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     }
 
     if (deps.loggedSkips && deps.loggedSkips.size > 1000) deps.loggedSkips.clear();
+    deps.onTickSuccess?.();
     return [...results, ...codexResults];
   } catch (e) {
     log(`[permission-answer] tick failed: ${(e as Error)?.message ?? e}`);
+    deps.onTickError?.(e);
     return [];
   }
 }
