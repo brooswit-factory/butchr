@@ -72,6 +72,9 @@
     // FACTORY-661: the Rules page's own DOM-rendering component tests, same
     // reason as the blocks above.
     "../test/unit/dashboard-app-rules-route.test.tsx",
+    // FACTORY-730: the generic rule-edit dialog's own DOM-rendering
+    // component tests, same reason as the blocks above.
+    "../test/unit/dashboard-app-rule-edit-dialog.test.tsx",
     // FACTORY-665 (PR-2): the Setup page / Jira token-rotation control's
     // own DOM-rendering component tests, same reason as the blocks above.
     "../test/unit/dashboard-app-setup-route.test.tsx",
