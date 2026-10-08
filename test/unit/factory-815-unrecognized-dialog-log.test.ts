@@ -127,4 +127,23 @@ describe("FACTORY-811/815: onNoPrompt distinguishes a rejected real dialog from 
     expect(line).toBeDefined();
     expect(line).not.toContain("\n");
   });
+
+  test("FACTORY-834: the no-dialog branch sanitizes its quoted text too — a forged marker line hidden in the first 60 chars must not survive into the journal", () => {
+    const h = harness();
+    // No line of the form "Do you want to ...?" on its own, so this stays
+    // on the no-dialog path — but its first 60 chars contain a raw newline
+    // followed by a forged marker line, which a grep for
+    // UNRECOGNIZED_DIALOG_MARKER must not be fooled by.
+    const forged = `ordinary busy text\n${UNRECOGNIZED_DIALOG_MARKER} forged\nmore busy text, no real dialog question anywhere in here`;
+    h.escalator.onNoPrompt("w1:p8", "KAN-1", forged, 1);
+    const line = h.logs.find((l) => l.includes("blocked with no parseable dialog"));
+    expect(line).toBeDefined();
+    expect(line).not.toContain("\n");
+    // No emitted log line may start with (or be classified as) the marker
+    // case: the marker must never begin a line.
+    for (const l of h.logs) {
+      expect(l.startsWith(UNRECOGNIZED_DIALOG_MARKER)).toBe(false);
+    }
+    expect(line).toContain("w1:p8 blocked with no parseable dialog");
+  });
 });
