@@ -26,6 +26,12 @@
  *    — every outcome is a fixed-shape, fixed-string result the caller can
  *    log/audit/alert on directly with no redaction step of its own to get
  *    right.
+ *
+ * FACTORY-716: the `secrets/` directory this writes into is on
+ * `../rules/seed-first-run.ts`'s own `setupWriteAllowlist` — the first-run
+ * seed must not read THIS write's own output as "an established install
+ * configured some other way" on the daemon's next restart. If this ever
+ * moves to a different directory name, update that allowlist too.
  */
 import { chmodSync, closeSync, constants as fsConstants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { homedir } from "node:os";

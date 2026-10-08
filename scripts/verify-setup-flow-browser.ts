@@ -27,12 +27,19 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync as wf } from "node:fs"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpHandle } from "@brooswit/thatch";
-import { liveView } from "../src/web/view.js";
+import { liveView, type ViewDeps } from "../src/web/view.js";
 import { buildApp } from "../src/daemon/app.js";
 import { buildSetupModeViewDeps } from "../src/daemon/setup-mode.js";
 import { listenOptions } from "../src/daemon/listen.js";
 import { isAtlassianConfigured, loadConfig } from "../src/config/config.js";
 import { resolveEffectiveJiraEnv } from "../src/config/effective-env.js";
+import { seedFirstRunRules } from "../src/rules/seed-first-run.js";
+import { loadRules, createRulesHolder, sourceEtagOf } from "../src/rules/rules.js";
+import { rulesEtag } from "../src/rules/write-rules.js";
+import { FIRST_RULE_ID } from "../src/rules/rules-write-registry.js";
+import { createCsrfTokenIssuer } from "../src/web/csrf.js";
+import { isSameUidPeer } from "../src/web/peer-uid.js";
+import { createAuditLogger } from "../src/web/audit-log.js";
 
 async function main(): Promise<void> {
 
@@ -171,6 +178,54 @@ try {
 check("D2 loadConfig succeeds after the simulated restart (the actual bug this PR fixes)", restarted !== null, restartError ?? "");
 check("D3 the restarted config's site/email match what was submitted", restarted?.site === fakeSite && restarted?.email === "butchr@example.com");
 check("D4 the restarted config's token matches the candidate token written during setup", restarted?.token === CANARY_TOKEN);
+
+// E: FACTORY-716 — the actual gap this ticket closes. By this point the
+// config dir holds exactly what UI setup wrote (jira-identity.json,
+// secrets/atlassian-token, web-write-audit.jsonl): pre-fix, the first-run
+// seed read that as "an established install configured some other way"
+// (`config-dir-not-empty`) and never seeded, leaving the Rules page with
+// nothing to show. Call the REAL seed (same function/args `src/daemon/
+// index.ts`'s own startup calls) against this SAME scratch config dir, then
+// render the REAL dashboard-app Rules page against what it produced, in
+// the SAME already-open Chromium tab, and look for the starter-rule setup
+// UI (`first-rule-setup`) — the same testid `scripts/verify-rules-page-
+// browser.ts` checks for a hand-seeded `ui-first-rule`.
+const seedOutcome = seedFirstRunRules(effectiveEnv);
+check("E1 the first-run seed now seeds (not config-dir-not-empty) against the real post-setup config dir", seedOutcome.kind === "seeded", JSON.stringify(seedOutcome));
+const { rules: restartedRules } = loadRules(effectiveEnv);
+const starterRule = restartedRules.find((r) => r.id === FIRST_RULE_ID);
+check("E2 the starter rule is present, disabled, after the (simulated) restart", starterRule !== undefined && starterRule.enabled === false);
+
+const rulesHolder = createRulesHolder(restartedRules, sourceEtagOf(readFileSync(join(CONFIG_DIR, "butchr", "rules.json"), "utf8")));
+const rulesGuard = { port: 0 };
+const rulesPeerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: "127.0.0.1", port: rulesGuard.port } });
+const rulesCsrf = createCsrfTokenIssuer();
+const rulesUnused = (): never => { throw new Error("unused in this normal-mode render"); };
+const normalModeDeps = {
+  state: async () => [], open: rulesUnused, openPane: rulesUnused, health: () => ({ ok: true }),
+  dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
+  header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag" as const, versionUnknownReason: null } }),
+  resourceLink: rulesUnused,
+  configInventory: async () => ({ rules: rulesHolder.getRules().map((r) => ({ kind: "rule" as const, id: r.id, resourceProvider: r.resourceProvider, query: r.query, enabled: r.enabled, execution: r.execution, account: r.account, role: r.role, agentPreferences: r.agentPreferences ?? [], linkedEventing: !!r.linkedEventing, mcpServerNames: [], staffed: null, reason: "verify-setup-flow-browser: no agent fleet" })), sessionDefinitions: [], errors: [] }),
+  dashboardAppRoot,
+  dashboardOriginGuard: rulesGuard, peerUidCheck: rulesPeerUidCheck,
+  csrf: rulesCsrf, writeGuard: { dashboardOriginGuard: rulesGuard, peerUidCheck: rulesPeerUidCheck, csrf: rulesCsrf },
+  auditWrite: createAuditLogger({ append: () => {}, host: "verify-setup-flow-browser", log: () => {} }),
+  rulesPreview: async () => ({ ok: false as const, error: "not needed for this check" }),
+  getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
+  rulesFileState: async () => ({ path: join(CONFIG_DIR, "butchr", "rules.json"), rules: rulesHolder.getRules(), error: null, mtime: null, fileEtag: rulesEtag(effectiveEnv) }),
+} as unknown as ViewDeps;
+const normalModeApp = liveView({ connections: { list: () => [] } } as unknown as McpHandle, normalModeDeps);
+normalModeApp.listen(listenOptions(0));
+const rulesPort = normalModeApp.server!.port!;
+rulesGuard.port = rulesPort;
+
+await send("Page.navigate", { url: `http://127.0.0.1:${rulesPort}/dashboard-app/rules` });
+await Promise.race([loadedP, Bun.sleep(8000)]);
+await Bun.sleep(500);
+check("E3 the Rules page (real dashboard-app) shows the first-rule setup flow for the seeded starter rule", await until("first-rule-setup after restart", `!!document.querySelector('[data-testid=first-rule-setup]')`));
+await shot("3-rules-page-after-restart");
+normalModeApp.stop(true);
 
 console.log(`\nSUMMARY: ${fails === 0 ? "ALL PASS" : fails + " FAILED"}  (screenshots: ${S}/setup-e2e-*.png)`);
 ws.close(); cleanup(); app.stop(true);
