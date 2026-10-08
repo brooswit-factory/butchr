@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
+import { createOutstandingGuard } from "./herdr-subscribe-deadline.js";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
 import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
 import { runSetupModeDaemon } from "./setup-mode.js";
@@ -2649,36 +2650,23 @@ async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subsc
 // `config` itself is an un-annotated `let` narrowed by control flow (see its
 // own declaration above), and TypeScript cannot carry that narrowing into a
 // hoisted top-level `function` declaration — reading `config` directly from
-// inside one (as `withHerdrSubscribeDeadline` below originally did) makes
-// the WHOLE variable implicitly `any`, including every other read of it in
-// this file. A `const` has a definite type at its own declaration site
+// inside one (as the deadline guard below originally did) makes the WHOLE
+// variable implicitly `any`, including every other read of it in this
+// file. A `const` has a definite type at its own declaration site
 // regardless of where it's later closed over, so capturing the one field
 // this function needs here sidesteps the problem entirely.
 const HERDR_CALL_TIMEOUT_MS = config.herdrCallTimeoutMs;
-function withHerdrSubscribeDeadline(p: Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>>): Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>> {
-  return new Promise((resolve, reject) => {
-    let timedOut = false;
-    const t = setTimeout(() => {
-      timedOut = true;
-      reject(new HerdrTransportError(`events.subscribe: no ack within ${HERDR_CALL_TIMEOUT_MS}ms`));
-    }, HERDR_CALL_TIMEOUT_MS);
-    p.then(
-      (sub) => {
-        clearTimeout(t);
-        // A late ack after this call already rejected on the deadline above
-        // must not leak an open connection nobody holds a reference to —
-        // close it immediately rather than returning it to a caller that
-        // has already moved on (scheduleReconnect, permission-answer-watch.ts).
-        if (timedOut) { sub.close(); return; }
-        resolve(sub);
-      },
-      (e) => { clearTimeout(t); if (!timedOut) reject(e); },
-    );
-  });
-}
+// FACTORY-751/FACTORY-775: ONE guard instance for the lifetime of this
+// daemon process, shared across every `subscribeAgentStatus` call
+// (including across resubscribes with a different pane-id set) — see
+// `createOutstandingGuard`'s own doc comment (herdr-subscribe-deadline.ts)
+// for why a fresh instance per call would defeat the bound entirely.
+const guardedHerdrSubscribe = createOutstandingGuard<Awaited<ReturnType<DrovrClient["subscribe"]>>>(
+  HERDR_CALL_TIMEOUT_MS,
+  (ms) => new HerdrTransportError(`events.subscribe: no ack within ${ms}ms`),
+);
 function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
-  return withHerdrSubscribeDeadline(herdr
-    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id }))))
+  return guardedHerdrSubscribe(() => herdr.subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id }))))
     .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
 }
 startPermissionAnswerWatch(
