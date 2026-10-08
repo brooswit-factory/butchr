@@ -24,7 +24,7 @@
  * seeing before save).
  */
 import { useEffect, useState } from "react";
-import { Alert, AlertText, Button, Dialog, Modal, ModalOverlay, Switch, Text } from "@launchpad-ui/components";
+import { Button, Dialog, Modal, ModalOverlay, Switch } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
 // Imported from the LEAF module, never `../../../src/rules/rules.js` directly — see `FirstRuleSetup.tsx`'s own top comment for why a VALUE import from that module breaks the Vite client bundle.
 import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
@@ -212,14 +212,14 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
         <Dialog aria-label={`edit rule ${rule.id}`} data-testid="rule-edit-dialog">
           <h3>Edit "{rule.id}"</h3>
           {stale && (
-            <Alert status="info" data-testid="rule-edit-stale">
-              <AlertText>reload pending — the rules file changed on disk; every control below is disabled until the next reload</AlertText>
-            </Alert>
+            <p className="rules-view__cnc" data-testid="rule-edit-stale">
+              reload pending — the rules file changed on disk; every control below is disabled until the next reload
+            </p>
           )}
           {error !== null && (
-            <Alert status="error" data-testid="rule-edit-error">
-              <AlertText>{error}</AlertText>
-            </Alert>
+            <p className="rules-view__cnc" data-testid="rule-edit-error">
+              {error}
+            </p>
           )}
 
           <label htmlFor="rule-edit-query-input">query</label>
@@ -236,27 +236,27 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             disabled={disabled}
           />
           {isPlaceholder && (
-            <Text elementType="p" size="small" className="rules-view__cnc" data-testid="rule-edit-placeholder-notice">
+            <p className="rules-view__cnc" data-testid="rule-edit-placeholder-notice">
               this query is still the placeholder — this rule cannot be enabled until it is changed
-            </Text>
+            </p>
           )}
           {queryChanged && (
             <div className="rules-view__scope-preview">
               <Button size="small" variant="minimal" isDisabled={disabled || scopePreview.kind === "loading"} onPress={checkQueryScope}>
                 check scope for this query
               </Button>
-              {scopePreview.kind === "loading" && <Text elementType="span" size="small"> checking…</Text>}
+              {scopePreview.kind === "loading" && <span> checking…</span>}
               {scopePreview.kind === "loaded" && (
-                <Text elementType="span" size="small" data-testid="rule-edit-scope-count">
+                <span data-testid="rule-edit-scope-count">
                   {" "}
                   would match {scopePreview.total} ticket{scopePreview.total === 1 ? "" : "s"}
-                </Text>
+                </span>
               )}
               {scopePreview.kind === "error" && (
-                <Text elementType="span" size="small" className="rules-view__cnc" data-testid="rule-edit-scope-error">
+                <span className="rules-view__cnc" data-testid="rule-edit-scope-error">
                   {" "}
                   could not check scope — {scopePreview.error}
-                </Text>
+                </span>
               )}
             </div>
           )}
@@ -340,9 +340,9 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
               </select>
             </>
           ) : (
-            <Text elementType="p" size="small" data-testid="rule-edit-no-preference-slot">
+            <p data-testid="rule-edit-no-preference-slot">
               this rule has no agent preference slot to edit — it uses butchr's global agent config
-            </Text>
+            </p>
           )}
 
           <label htmlFor="rule-edit-permission-mode-select">permission mode</label>
@@ -362,9 +362,9 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             ))}
           </select>
           {draftPermissionMode === "bypassPermissions" || draftPermissionMode === "auto" ? (
-            <Text elementType="p" size="small" className="rules-view__cnc" data-testid="rule-edit-risky-permission-notice">
+            <p className="rules-view__cnc" data-testid="rule-edit-risky-permission-notice">
               "{draftPermissionMode}" skips the agent's own permission prompts — saving this needs an explicit confirm
-            </Text>
+            </p>
           ) : null}
 
           <label htmlFor="rule-edit-lizard-mode-toggle">lizard mode</label>
@@ -380,14 +380,14 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             />
           </span>
           {draftLizardMode && (
-            <Text elementType="p" size="small" className="rules-view__cnc" data-testid="rule-edit-lizard-notice">
+            <p className="rules-view__cnc" data-testid="rule-edit-lizard-notice">
               lizard mode is never a default — saving this needs an explicit confirm
-            </Text>
+            </p>
           )}
 
           {pendingAction && (
-            <Alert status="warning" data-testid="rule-edit-confirm">
-              <AlertText>
+            <div className="rules-view__cnc" data-testid="rule-edit-confirm">
+              <p>
                 this would start {pendingAction.plan.spawned} agent{pendingAction.plan.spawned === 1 ? "" : "s"}
                 {pendingAction.plan.scopeCount !== undefined ? `, scope ${pendingAction.plan.scopeCount} ticket${pendingAction.plan.scopeCount === 1 ? "" : "s"}` : ""}, stop{" "}
                 {pendingAction.plan.stopped}, and restart {pendingAction.plan.restarted} — confirm {pendingAction.label}?
@@ -399,7 +399,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
                     {pendingAction.ticketKeys && pendingAction.ticketKeys.length === 10 ? ", ..." : ""}
                   </span>
                 )}
-              </AlertText>
+              </p>
               <div className="rules-view__dialog-actions">
                 <Button variant="default" onPress={() => setPendingAction(null)}>
                   cancel
@@ -408,7 +408,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
                   confirm
                 </Button>
               </div>
-            </Alert>
+            </div>
           )}
 
           <div className="rules-view__dialog-actions">

@@ -172,10 +172,18 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
   // the FACTORY-663 review follow-up this test used to exercise), and a
   // plain click reaches the server and succeeds.
   test("FACTORY-730: a non-ui- row's toggle is enabled and clicking it flips the rule", async () => {
+    // execution: "singleton" (and starting DISABLED, so the click is an
+    // enable with spawned=1/stopped=0/restarted=0) — a genuinely
+    // zero-blast-radius transition, same discipline the FACTORY-685 comment
+    // on the pre-existing toggle test above this describe block documents:
+    // a swarm rule's enable needs confirm at ANY scope, which would make
+    // `requiresConfirm: false` below an unrealistic plan for THIS test's
+    // own point (a plain click reaching the server and succeeding with no
+    // confirm step at all).
     const api = createFixturesRulesApi({
-      initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
+      initial: response({ rules: [rule({ id: "factory-triage", enabled: false, execution: "singleton" })] }),
       latencyMs: 0,
-      plans: { "factory-triage": { planHash: "h1", spawned: 0, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
+      plans: { "factory-triage": { planHash: "h1", spawned: 1, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
     });
     const { findAllByTestId, container } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
@@ -185,7 +193,7 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     fireEvent.click(toggle);
     await waitFor(async () => {
       const after = await api.listRules();
-      expect(after.rules.find((r) => r.id === "factory-triage")!.enabled).toBe(false);
+      expect(after.rules.find((r) => r.id === "factory-triage")!.enabled).toBe(true);
     });
   });
 

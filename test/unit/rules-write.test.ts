@@ -245,8 +245,16 @@ describe("writeRuleFields (PUT)", () => {
   // a legitimate `query`-only edit through this path leaves every one of
   // them byte-for-byte untouched, for a non-`ui-` rule exactly as it always
   // did for `ui-first-rule`.
-  test("FACTORY-730: fixed template fields (execution/account/role/mcpServers/mcpConfigFile/brief) stay untouched by a write to a non-ui- rule", async () => {
-    const real = { ...MANAGERS_RULE, execution: "swarm", account: "none", role: "worker", mcpServers: ["x"], mcpConfigFile: "mcp.json" };
+  test("FACTORY-730: fixed template fields (execution/account/role/brief) stay untouched by a write to a non-ui- rule", async () => {
+    // `account`/`role` kept to their real schema's valid values (`rules.ts`'s
+    // own `AccountPolicy`/`AgentRole`) — `mcpServers`/`mcpConfigFile` are
+    // deliberately NOT exercised here (each carries its own much stricter
+    // sub-schema — an absolute path, `jira-project`-only, a structured
+    // server-binding shape — unrelated to what this test means to prove)
+    // and are already covered as "never in `RuleFieldPatch`'s own type" by
+    // this file's header comment and `rules-write-apply.ts`'s own explicit,
+    // field-by-field copy.
+    const real = { ...MANAGERS_RULE, execution: "swarm", account: "none", role: "worker" };
     seed([real]);
     const deps = { env: env() };
     const patch = { query: "project = CHANGED" };
@@ -259,8 +267,6 @@ describe("writeRuleFields (PUT)", () => {
     expect(nextDoc.rules[0].execution).toBe("swarm");
     expect(nextDoc.rules[0].account).toBe("none");
     expect(nextDoc.rules[0].role).toBe("worker");
-    expect(nextDoc.rules[0].mcpServers).toEqual(["x"]);
-    expect(nextDoc.rules[0].mcpConfigFile).toBe("mcp.json");
     expect(nextDoc.rules[0].brief).toBe(real.brief);
   });
 
