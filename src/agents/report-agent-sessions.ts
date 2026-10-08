@@ -12,10 +12,51 @@ import { workspaceSessionId } from "./workspace.js";
  */
 export const AGENT_SESSION_REPORT_SOURCE = "herdr:claude";
 
-/** Minimal slice of `DrovrClient` this needs — real callers pass the real client; tests pass a fake. */
-export interface ReportAgentSessionsHerdr {
-  agent: { list(): Promise<{ agents: readonly results.AgentInfo[] }> };
+/** Minimal slice of `DrovrClient` a single report needs — real callers pass the real client; tests pass a fake. */
+export interface ReportAgentSessionHerdr {
   pane: { reportAgentSession(p: params.PaneReportAgentSessionParams): Promise<unknown> };
+}
+
+/** Minimal slice of `DrovrClient` the startup sweep needs (adds `agent.list()` on top of `ReportAgentSessionHerdr`). */
+export interface ReportAgentSessionsHerdr extends ReportAgentSessionHerdr {
+  agent: { list(): Promise<{ agents: readonly results.AgentInfo[] }> };
+}
+
+/**
+ * The single `pane.report_agent_session` call both the startup sweep below
+ * and `herd.ts`'s `spawn()` make — factored out so a respawn's report (made
+ * the moment a NEW id is persisted, closing the staleness PR #678's review
+ * found) uses the exact same shape and the exact same swallow-and-log
+ * discipline as the sweep, rather than a second hand-maintained copy that
+ * could drift from it. No `seq`: established read-only against the
+ * installed `herdr-sdk`/`herdr` sources (`hook_report_is_newer` /
+ * `accept_hook_report` in herdr's `src/terminal/state.rs`) that for a
+ * source nothing has EVER attached a `seq` to, `hook_report_sequences` never
+ * gains an entry for that source, so every subsequent report — seq-less,
+ * from either call site — is still treated as "newer than the last" and its
+ * `session_ref` plainly overwrites the previous one. Supplying `seq` only
+ * from this second call site would instead PERMANENTLY lock out every future
+ * seq-less report from the other (the sweep never sends one), which is worse
+ * than not sending it at all — so neither call site sends one.
+ */
+export async function reportAgentSession(
+  deps: { herdr: ReportAgentSessionHerdr; log?: ((line: string) => void) | undefined },
+  paneId: string,
+  agent: string,
+  sessionId: string,
+): Promise<boolean> {
+  try {
+    await deps.herdr.pane.reportAgentSession({
+      pane_id: paneId,
+      agent,
+      agent_session_id: sessionId,
+      source: AGENT_SESSION_REPORT_SOURCE,
+    });
+    return true;
+  } catch (e) {
+    deps.log?.(`WARNING: [agent-session-report] ${paneId} report failed: ${(e as Error)?.message ?? e}`);
+    return false;
+  }
 }
 
 export interface ReportPersistedAgentSessionsResult {
@@ -63,7 +104,15 @@ export interface ReportPersistedAgentSessionsResult {
  * (result.account.provider === "claude")` branch), so a non-Claude pane
  * simply never has one and `workspaceSessionId` returns `undefined` for it
  * — the `noPersistedId` branch below already covers that case without a
- * separate check needed.
+ * separate check needed. That is also why the report call's own `a.agent ??
+ * "claude"` fallback is safe rather than an unjustified claim about what is
+ * running on a pane herdr has not detected an agent on: by the time the
+ * loop reaches that call, `workspaceSessionId(a.cwd)` has already returned
+ * a value, which — by the same one-sentence-above reasoning — could only
+ * have been persisted by a Claude launch. A pane herdr genuinely cannot
+ * identify is already excluded upstream (no persisted id to find), so the
+ * fallback never actually asserts anything beyond what the persisted-id
+ * check already established.
  *
  * A pane already carrying `agent_session` (herdr already knows, by whatever
  * means) is skipped — reporting again would be harmless but pointless, and
@@ -114,17 +163,7 @@ export async function reportPersistedAgentSessions(deps: { herdr: ReportAgentSes
     if (!a.cwd) { result.noPersistedId++; continue; }
     const sessionId = workspaceSessionId(a.cwd);
     if (!sessionId) { result.noPersistedId++; continue; }
-    try {
-      await deps.herdr.pane.reportAgentSession({
-        pane_id: a.pane_id,
-        agent: a.agent ?? "claude",
-        agent_session_id: sessionId,
-        source: AGENT_SESSION_REPORT_SOURCE,
-      });
-      result.reported++;
-    } catch (e) {
-      deps.log?.(`WARNING: [agent-session-report] ${a.pane_id} report failed: ${(e as Error)?.message ?? e}`);
-    }
+    if (await reportAgentSession(deps, a.pane_id, a.agent ?? "claude", sessionId)) result.reported++;
   }
   deps.log?.(`[agent-session-report] ${result.reported} reported, ${result.alreadyRegistered} already registered, ${result.noPersistedId} with no persisted id`);
   return result;
