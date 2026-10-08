@@ -43,7 +43,12 @@ agent from butchr's existing live view to chat interactively.
 Every `jira-project` agent is a fleet capacity **sentinel** (see
 `docs/execution-modes.md`'s `role` section): it never counts toward
 `BUTCHR_MAX_AGENTS` and is never withheld, regardless of the rule's own
-`role` field (which a `jira-project` rule need not set at all).
+`role` field (which a `jira-project` rule need not set at all). This is a
+construction-level exception, kept deliberately — FACTORY-757 removed the
+equivalent issue-type hardcoding for `jira-work` rules (Epic/Story/Bug now
+count by default, like any other rule), but left this one in place so no
+live `jira-project` rule needs a config change to keep its current
+behaviour.
 
 ## Optional external tools and messages
 

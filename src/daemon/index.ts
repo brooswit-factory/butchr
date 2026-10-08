@@ -39,6 +39,7 @@ import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
+import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
 import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -69,6 +70,7 @@ import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
@@ -86,6 +88,7 @@ import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { restrictJiraProjectManagers } from "../tools/jira-project-scope.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -397,14 +400,12 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  */
 const ruleLizardModeOf = (id: string): boolean =>
   sharedRuleLizardModeOf(id, { rules: getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
-// BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
-// (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
-// agents are classified "sentinel" here (see src/agents/capacity-role.ts).
-// `issueMeta` (declared below, filled by every jira-work search) supplies
-// the issue type; it is only read at call time, after the whole module has
-// initialised.
-const roleOfAgent = (id: string): AgentCapacityRole =>
-  capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
+// FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
+// capacity is decided solely by each rule's own `role` field — see
+// src/agents/capacity-role.ts for the construction-level exceptions (bare
+// project agents, `jira-project` agents) and why issue type no longer plays
+// any part here.
+const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
@@ -1151,6 +1152,8 @@ const { app, mcp } = buildApp({
   // (passed to `buildApp` above) is read fresh too, by this route itself —
   // that gap between it and this call's own `fileEtag` is exactly what
   // `stale` reports.
+  // FACTORY-729: `GET /api/rules/catalog`'s own data — pure constants, no I/O.
+  rulesCatalog: () => RULE_FORM_CATALOG,
   rulesFileState: async () => {
     let mtime: string | null = null;
     try {
@@ -1233,7 +1236,11 @@ const { app, mcp } = buildApp({
 // loop reads.
 }, {
   // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  // FACTORY-732: a jira-project (manager) caller passes `forJiraCallers`
+  // now, but `restrictJiraProjectManagers` immediately confines it to its
+  // own project's jira_get_issue/jira_search/jira_add_comment/jira_transition
+  // — see src/tools/jira-project-scope.ts.
+  ...restrictJiraProjectManagers(forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)), ops),
   // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
   // provider-specific tool set below it — the local file store needs no
   // credentials and works for every ResourceRef kind, and a `jira-project`
@@ -1241,9 +1248,17 @@ const { app, mcp } = buildApp({
   // already has Jira credentials loaded, unlike the CLI, so the factory
   // below is cheap and side-effect-free rather than genuinely lazy) — see
   // `src/resources/link-store-router.ts` for the routing decision itself.
-  ...resourceLinkTools(
-    routingLinkStore,
-    (line) => console.error(line),
+  // FACTORY-732: a jira-project (manager) CALLER (not the `resource` a link
+  // names — the resource-link test fixtures above a jira-project OWNER as
+  // an argument, which this gate never touches) has no allowlisted name
+  // here (add_link/remove_link/list_links are all outside
+  // JIRA_PROJECT_MANAGER_TOOLS), so it is refused on every one of these.
+  ...restrictJiraProjectManagers(
+    resourceLinkTools(
+      routingLinkStore,
+      (line) => console.error(line),
+    ),
+    ops,
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -1257,7 +1272,11 @@ const { app, mcp } = buildApp({
   // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
   // the managed-sessions loop and `butchr session` CLI already use, never a
   // second resolution of "where definitions live" or "which freeze store".
-  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+  // FACTORY-732: freeze_session is not in JIRA_PROJECT_MANAGER_TOOLS, so a jira-project (manager) caller is refused here too.
+  ...restrictJiraProjectManagers(
+    sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+    ops,
+  ),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
@@ -1483,6 +1502,16 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
+  comments: (issue) => atlassian.comments(issue),
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-740: dry-run only — see src/agents/silent-stop.ts's own top
+// comment. `undefined` when BUTCHR_SILENT_STOP_MODE=off, the same
+// disables-entirely-when-omitted shape `stalled`/`stallRemediation` use —
+// src/labels/sync.ts's `silentStop?.check` is then simply never called.
+const silentStop = config.silentStopMode === "off" ? undefined : createSilentStopCheck({
+  now: () => Date.now(),
+  suppressMinutes: config.silentStopSuppressMinutes,
   comments: (issue) => atlassian.comments(issue),
   log: (line) => console.error(`  ${line}`),
 });
@@ -1866,6 +1895,7 @@ const syncLabels = createLabelSync({
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
+  ...(silentStop ? { silentStop } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),

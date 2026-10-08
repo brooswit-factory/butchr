@@ -42,7 +42,7 @@ import { readFileSync } from "node:fs";
 import { updateRulesFile, restoreBackup, rulesEtag, type WriteRulesIo, type WriteRulesResult } from "./write-rules.js";
 import { rulesPath, type RulesEnv } from "./rules.js";
 import { applyRuleFieldPatch, readRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, RuleWriteApplyError } from "./rules-write-apply.js";
-import { isUiEditableRuleId, PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "./rules-write-registry.js";
+import { isUiEditableRuleId, PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch } from "./rules-write-registry.js";
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -181,7 +181,10 @@ export function computeLocalPlanCounts(wasEnabled: boolean, patch: RuleFieldPatc
   if (patch.enabled !== undefined && patch.enabled !== wasEnabled) {
     return patch.enabled ? { spawned: 1, stopped: 0, restarted: 0 } : { spawned: 0, stopped: 1, restarted: 0 };
   }
-  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined;
+  // FACTORY-729: permissionMode/lizardMode change the SpawnSpec an
+  // already-running rule's agent was launched with, same as query/
+  // agentPreferences — counted as a restart for the SAME reason those are.
+  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined;
   return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
 }
 
@@ -299,6 +302,32 @@ export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps:
 function requireConfirmForBlastRadius(counts: { spawned: number; stopped: number; restarted: number }, confirm: boolean): void {
   if ((counts.stopped > 0 || counts.restarted > 0) && !confirm) {
     throw new WriteRefusedError(`this change would stop ${counts.stopped} and restart ${counts.restarted} running agent(s) — retry with confirm: true to proceed`, 409);
+  }
+}
+
+/**
+ * FACTORY-729: `permissionMode: "bypassPermissions" | "auto"` and
+ * `lizardMode: true` are never defaults (`RuleFieldPatch`'s own doc
+ * comments, `./rules-write-registry.ts`) — a write that SETS either one
+ * must say so explicitly via `confirm: true`, independent of, and checked
+ * in addition to, `requireConfirmForBlastRadius` above (a patch can trip
+ * both gates at once; either missing confirmation refuses the whole
+ * write). Mirrors that function's own shape: a pure, synchronous check
+ * `rawRiskyField`/`planRuleWrite` and `writeRuleFields` both reduce to, so
+ * the plan and the apply can never disagree about whether this gate
+ * applies to a given patch.
+ */
+function isRiskyFieldPatch(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">): boolean {
+  return (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true;
+}
+
+function requireConfirmForRiskyFields(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">, confirm: boolean): void {
+  if (isRiskyFieldPatch(patch) && !confirm) {
+    const named = [
+      patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode) ? `permissionMode: ${JSON.stringify(patch.permissionMode)}` : undefined,
+      patch.lizardMode === true ? "lizardMode: true" : undefined,
+    ].filter((s): s is string => s !== undefined);
+    throw new WriteRefusedError(`setting ${named.join(" and ")} is never a default and requires an explicit confirm — retry with confirm: true to proceed`, 409);
   }
 }
 
@@ -471,6 +500,7 @@ export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: stri
           throw new WriteRefusedError(`planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again`, 409);
         }
         requireConfirmForBlastRadius(counts, confirm);
+        requireConfirmForRiskyFields(patch, confirm);
         allowedPaths = buildFieldsAllowedPaths(currentText, id, patch);
         return nextText;
       },
@@ -545,7 +575,11 @@ export interface RulesPlanResult {
    * condition applies, most-specific first: `"unmeasurable-scope"` (no real
    * number exists to confirm — always wins), `"scope-ceiling"` (a real,
    * over-25 number — more informative than the generic swarm-enable
-   * reason), `"swarm-enable"` (any other swarm enable), `"stop-restart"`.
+   * reason), `"swarm-enable"` (any other swarm enable), `"stop-restart"`,
+   * `"risky-permission"` (FACTORY-729 — `permissionMode: "bypassPermissions"
+   * | "auto"` or `lizardMode: true`; least specific, so a patch that ALSO
+   * trips `stop-restart` reports that instead, which already implies this
+   * one's own "confirm before this lands" posture).
    *
    * DELIBERATE DEVIATION from the ticket's literal `confirmRequired` +
    * `reason` field names (stated here and in the PR body per this ticket's
@@ -553,7 +587,7 @@ export interface RulesPlanResult {
    * already reads it — renaming it is a breaking change to a live client
    * for no behavioral gain, so this field is additive instead.
    */
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart";
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart" | "risky-permission";
 }
 export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; error: string };
 
@@ -622,7 +656,12 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   const rawSwarmEnable = counts.spawned > 0 && executionOf(current.execution) === "swarm";
   const rawOverCeiling = scope !== null && scope > ENABLE_SCOPE_CEILING;
   const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
-  const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm);
+  // FACTORY-729: see `requireConfirmForRiskyFields`'s own doc comment — the
+  // same raw/unconditional computation style as the three gates above, so
+  // `confirmReason` can classify it even on a call that already supplied
+  // `confirm: true`.
+  const rawRiskyField = isRiskyFieldPatch(patch);
+  const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
   // `confirmReason` names which gate is why `requiresConfirm` is `true` —
   // absent exactly when `requiresConfirm` is `false` (whether because no
   // gate applies at all, or because `confirm: true` already satisfies every
@@ -636,7 +675,9 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
         ? "scope-ceiling"
         : rawSwarmEnable
           ? "swarm-enable"
-          : "stop-restart";
+          : rawStopRestart
+            ? "stop-restart"
+            : "risky-permission";
 
   const planHash = buildPlanHash(nextText, counts, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
   return {

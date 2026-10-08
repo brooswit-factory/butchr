@@ -191,6 +191,31 @@ export interface Config {
    */
   stalledMinutes: number;
   /**
+   * FACTORY-740: the silent-stop detector's mode. `"off"` runs nothing at
+   * all (today's behaviour, pre-FACTORY-740). `"dry-run"` — the default —
+   * runs src/agents/silent-stop.ts's detector but ONLY logs
+   * `[silent-stop] would flag KEY` lines; it never writes Jira (no comment,
+   * label, transition, escalation, or wake) regardless of what it observes.
+   * There is deliberately no enforcing value yet: FACTORY-736 (blocked on
+   * this story) adds one when it wires up real action on this signal — see
+   * src/agents/silent-stop.ts's own top comment for why the detector itself
+   * is already structured so that flip costs no rewrite, only a new mode
+   * value and a caller that acts on `check`'s result.
+   */
+  silentStopMode: "off" | "dry-run";
+  /**
+   * FACTORY-740 DoD 3: minutes after a daemon start or a detected
+   * herdr-reconnect gap during which a stop is suppressed (not evaluated,
+   * not logged as a flag) — see src/agents/silent-stop.ts's
+   * `DISCONTINUITY_GAP_MS` doc comment for how the gap itself is detected.
+   * Default 5: comfortably more than one ~15s poll cycle's worth of margin
+   * for herdr/the daemon to finish reconnecting and for any panes it
+   * restarts to report a steady status again, while staying well under 2%
+   * of the ~24h measurement window DoD 5 asks for, so the suppression
+   * window itself never meaningfully shrinks the data collected.
+   */
+  silentStopSuppressMinutes: number;
+  /**
    * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
    * a live (In Progress) boss before the parked-ticket detector's stage 1
    * escalation comment fires (see src/agents/parked.ts) — also the interval
@@ -596,6 +621,8 @@ export interface ConfigEnv {
   BUTCHR_OPS_ALERT_DEDUP_MINUTES?: string | undefined;
   BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_SILENT_STOP_MODE?: string | undefined;
+  BUTCHR_SILENT_STOP_SUPPRESS_MINUTES?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
@@ -761,6 +788,15 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
+  const silentStopModeRaw = env.BUTCHR_SILENT_STOP_MODE?.trim();
+  if (silentStopModeRaw !== undefined && silentStopModeRaw !== "" && silentStopModeRaw !== "off" && silentStopModeRaw !== "dry-run") {
+    throw new Error(`BUTCHR_SILENT_STOP_MODE must be "off" or "dry-run": ${env.BUTCHR_SILENT_STOP_MODE}`);
+  }
+  const silentStopMode: "off" | "dry-run" = silentStopModeRaw === "off" ? "off" : "dry-run";
+
+  const silentStopSuppressMinutes = env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES ? Number(env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES) : 5;
+  if (!Number.isFinite(silentStopSuppressMinutes) || silentStopSuppressMinutes <= 0) throw new Error(`BUTCHR_SILENT_STOP_SUPPRESS_MINUTES is not a positive number: ${env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES}`);
+
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
 
@@ -834,6 +870,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
+    silentStopMode,
+    silentStopSuppressMinutes,
     parkedMinutes,
     abandonedMinutes,
     atRestMinutes,
@@ -1037,7 +1075,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
+  `stalledMinutes=${c.stalledMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +

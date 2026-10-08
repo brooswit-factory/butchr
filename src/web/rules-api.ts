@@ -22,7 +22,7 @@
  * one resource provider — see `Rule.id`'s own doc comment, `../rules/rules.ts`).
  */
 import type { RuleInventoryEntry, RulesFileState } from "../agents/query-agent-inventory.js";
-import type { Rule } from "../rules/rules.js";
+import type { Rule, RulePermissionMode } from "../rules/rules.js";
 
 export const BRIEF_EXCERPT_MAX = 200;
 
@@ -64,6 +64,18 @@ export interface RulesApiRuleEntry {
   agentPreferences: RuleInventoryEntry["agentPreferences"];
   linkedEventing: boolean;
   mcpServerNames: string[];
+  /**
+   * FACTORY-729: like `briefExcerpt` below, read off the raw `Rule` list
+   * `loadRulesFileState` already produced (keyed the SAME way,
+   * `resourceProvider:id`) rather than added to `RuleInventoryEntry` — that
+   * type is consumed far beyond this one route (`/configurations`, the
+   * dashboard), and neither field is relevant there. `null` when absent on
+   * the rule (butchr's own launch default applies) or the rule could not be
+   * matched (defensive, never thrown).
+   */
+  permissionMode: RulePermissionMode | null;
+  /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (today's "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts` — not necessarily `false`). */
+  lizardMode: boolean | null;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -111,23 +123,32 @@ export interface BuildRulesApiResponseArgs {
 
 export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApiResponse {
   const briefs = new Map<string, string>();
-  for (const r of args.rulesFile.rules as readonly Rule[]) briefs.set(briefKey(r.resourceProvider, r.id), r.brief);
+  const rawRules = new Map<string, Rule>();
+  for (const r of args.rulesFile.rules as readonly Rule[]) {
+    briefs.set(briefKey(r.resourceProvider, r.id), r.brief);
+    rawRules.set(briefKey(r.resourceProvider, r.id), r);
+  }
 
-  const rules: RulesApiRuleEntry[] = args.ruleInventory.map((entry) => ({
-    id: entry.id,
-    resourceProvider: entry.resourceProvider,
-    query: entry.query,
-    enabled: entry.enabled,
-    execution: entry.execution,
-    account: entry.account,
-    role: entry.role,
-    agentPreferences: entry.agentPreferences,
-    linkedEventing: entry.linkedEventing,
-    mcpServerNames: entry.mcpServerNames,
-    briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
-    staffed: entry.staffed,
-    whyUnstaffed: entry.reason,
-  }));
+  const rules: RulesApiRuleEntry[] = args.ruleInventory.map((entry) => {
+    const raw = rawRules.get(briefKey(entry.resourceProvider, entry.id));
+    return {
+      id: entry.id,
+      resourceProvider: entry.resourceProvider,
+      query: entry.query,
+      enabled: entry.enabled,
+      execution: entry.execution,
+      account: entry.account,
+      role: entry.role,
+      agentPreferences: entry.agentPreferences,
+      linkedEventing: entry.linkedEventing,
+      mcpServerNames: entry.mcpServerNames,
+      permissionMode: raw?.permissionMode ?? null,
+      lizardMode: raw?.lizardMode ?? null,
+      briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
+      staffed: entry.staffed,
+      whyUnstaffed: entry.reason,
+    };
+  });
 
   return redactSecretLike({
     path: args.rulesFile.path,

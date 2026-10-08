@@ -78,6 +78,20 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "dry-run" }, noRead).silentStopMode).toBe("dry-run");
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_MODE/);
+  });
+
+  test("FACTORY-740: silentStopSuppressMinutes defaults to 5, honours BUTCHR_SILENT_STOP_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).silentStopSuppressMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "15" }, noRead).silentStopSuppressMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+  });
+
   test("abandonedMinutes defaults to 30, honours BUTCHR_ABANDONED_MINUTES, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).abandonedMinutes).toBe(30);
     expect(loadConfig({ ...base, BUTCHR_ABANDONED_MINUTES: "45" }, noRead).abandonedMinutes).toBe(45);
