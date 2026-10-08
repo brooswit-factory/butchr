@@ -389,6 +389,81 @@ export function createLoopHealth(opts: LoopHealthOptions): LoopHealth {
   };
 }
 
+/**
+ * FACTORY-752 (FACTORY-746 (c)): a liveness component — same `components[]`
+ * AND-gating contract as `createLoopHealth` — that ALSO distinguishes a tick
+ * that REJECTED from one that simply completed with nothing to do.
+ *
+ * EXPLICIT DESIGN DECISION (argued here, restated in the PR description):
+ * this rides in `components[]`, NOT in the `resourceLoops[]` sibling array
+ * `createResourceLoopHealth` already feeds. `createResourceLoopHealth`
+ * tracks the identical recordSuccess/recordError pair, but its own doc
+ * comment on `HealthStatus.resourceLoops` explains why THOSE stay siblings:
+ * a GitHub/Jira/Zendesk poll failing is an EXTERNAL degradation, already
+ * logged, that a daemon restart cannot fix — folding it into `ok` would
+ * make an uptime checker cry "restart me" for a condition restarting does
+ * nothing about. The permission-answer tick is a different case: FACTORY-746's
+ * 10-08 incident was precisely a LIVENESS blind spot of this daemon's own —
+ * a wedged in-process loop going unnoticed for ~50 minutes, the same class
+ * of failure `pollLoop`/`notify` already gate `ok` on. So this component
+ * asserts the permission-answer tick IS a liveness signal of the daemon,
+ * joining the AND, same as its two `components[]` siblings — not an
+ * external-degradation sibling like the resource loops.
+ *
+ * `recordSuccess()` must be called once per tick that COMPLETED, whether or
+ * not it found anything eligible — an idle tick is exactly the case this
+ * exists to make indistinguishable from "stale" only once it has genuinely
+ * been too long (`thresholdMs`), never on every idle pass. `recordError()`
+ * is called once per tick that REJECTED (e.g. the `agent.list()` failure
+ * path in `runPermissionAnswerTick`, src/agents/permission-answer-loop.ts) —
+ * it does NOT advance `lastSuccessAt`/`staleForMs` on its own (a run of
+ * rejections alone still goes stale on schedule, which is the point), it
+ * only records `lastErrorAt`/`consecutiveFailures` so a reader can tell "has
+ * not ticked in a while, and the last attempt rejected" apart from "has not
+ * ticked in a while, with no rejection ever logged" (the original incident's
+ * own silence: two rejections, THEN nothing at all — this field is what
+ * would have let a reader tell those two shapes of silence apart).
+ */
+export interface TickHealthReport extends ComponentHealth {
+  /** ISO timestamp of the most recent tick that REJECTED, or null if none ever has. */
+  lastErrorAt: string | null;
+  /** Ticks that have rejected since the last success (reset to 0 by `recordSuccess()`, same convention as `ResourceLoopReport.consecutiveFailures`). */
+  consecutiveFailures: number;
+}
+
+export interface TickHealth extends LoopHealth {
+  /** Call once per tick that rejected (e.g. a failed `agent.list()`) — distinct from, and never a substitute for, `recordSuccess()`. */
+  recordError(error: unknown): void;
+  status(): { ok: boolean; components: TickHealthReport[] };
+}
+
+export function createTickHealth(opts: LoopHealthOptions): TickHealth {
+  const heartbeat = createLoopHealth(opts);
+  const now = opts.now ?? Date.now;
+  let lastErrorAt: number | null = null;
+  let consecutiveFailures = 0;
+  return {
+    recordSuccess() {
+      consecutiveFailures = 0;
+      heartbeat.recordSuccess();
+    },
+    recordError(_error: unknown) {
+      consecutiveFailures++;
+      lastErrorAt = now();
+    },
+    status() {
+      const [component] = heartbeat.status().components;
+      const report: TickHealthReport = {
+        ...component!,
+        lastErrorAt: lastErrorAt === null ? null : new Date(lastErrorAt).toISOString(),
+        consecutiveFailures,
+      };
+      return { ok: report.ok, components: [report] };
+    },
+    stop: () => heartbeat.stop(),
+  };
+}
+
 export interface ResourceLoopHealthOptions extends LoopHealthOptions {
   enabled: boolean;
   disabledReason?: string;
