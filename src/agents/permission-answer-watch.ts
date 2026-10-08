@@ -93,6 +93,37 @@ export interface PermissionAnswerWatchDeps extends PermissionAnswerLoopDeps {
    * long enough not to hot-loop against a herdr that is rejecting connects.
    */
   resubscribeDelayMs?: number;
+  /**
+   * FACTORY-722 fix-scope item (d): a pane whose own `fastPathTriggers`
+   * entry (the instant its `blocked` push frame was received) has sat
+   * UNCONSUMED this long means no tick has scanned it since — the exact
+   * "a never-settling herdr await stalls everything that serializes on it"
+   * shape the wedge incident this ticket closes was named for, independent
+   * of whatever root cause produced it this time. `runPermissionAnswerTick`
+   * deletes a pane's entry on every tick that scans it (answered, skipped,
+   * or failed — see `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc
+   * comment), so a surviving entry past this threshold is unambiguous: the
+   * tick itself has not run, not merely that one pane's own attempt failed.
+   * Default 5 minutes (the incident's own evidence: FACTORY-722's wedge
+   * journal measured panes blocked for tens of minutes before anyone
+   * noticed). `0` disables the watchdog entirely (tests that don't want its
+   * timer running).
+   */
+  watchdogThresholdMs?: number;
+  /** How often the watchdog above checks. Default 30s — far below `watchdogThresholdMs`, so a trip is noticed promptly once the threshold passes, without re-checking so often it costs anything measurable. */
+  watchdogCheckIntervalMs?: number;
+  /**
+   * Called once per watchdog trip (not once per stuck pane) — lets a caller
+   * (the daemon's own ops-alert router) raise a loud, human-facing alert
+   * alongside the `[watchdog] restarted permission-answer` journal line
+   * `startPermissionAnswerWatch` always logs on a trip regardless. Never
+   * awaited and never allowed to affect recovery: the trip's own forced
+   * resubscribe/fire happens unconditionally, the same "never affects this
+   * tick's own outcome" contract `onApproved`/`onAnswered` already hold
+   * (permission-answer-loop.ts). Optional; omitted, nothing extra happens
+   * beyond the journal line.
+   */
+  onWatchdogTripped?: (stuckPaneIds: readonly string[]) => void;
 }
 
 export interface PermissionAnswerWatchHandle {
@@ -220,11 +251,44 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
   const timer = setInterval(fire, intervalMs);
   timer.unref?.();
 
+  // FACTORY-722 fix-scope item (d): independent of `fire`/the sweep timer
+  // above — this runs even when a tick is wedged (the exact case it exists
+  // to catch), checking `fastPathTriggers` for an entry no tick has
+  // consumed in `watchdogThresholdMs`. `0` opts out entirely (no timer at
+  // all, not merely a check that never trips) — a caller with no herdr
+  // alert channel, or a test that doesn't want a background timer running
+  // past its own assertions.
+  const watchdogThresholdMs = deps.watchdogThresholdMs ?? 5 * 60_000;
+  let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+  if (watchdogThresholdMs > 0) {
+    watchdogTimer = setInterval(() => {
+      if (stopped) return;
+      const nowMs = now();
+      const stuck = [...fastPathTriggers.entries()].filter(([, at]) => nowMs - at >= watchdogThresholdMs).map(([id]) => id);
+      if (stuck.length === 0) return;
+      log(`[watchdog] restarted permission-answer — ${stuck.length} pane(s) blocked with a push trigger unconsumed for over ${Math.round(watchdogThresholdMs / 1000)}s: ${stuck.join(", ")}`);
+      try { deps.onWatchdogTripped?.(stuck); } catch { /* never allowed to affect recovery below */ }
+      // Force recovery rather than merely reporting: a tick that has not
+      // consumed a trigger in this long is not merely slow (the client-side
+      // deadlines elsewhere in this ticket's fix bound every herdr call this
+      // module makes well under a minute) — treat `inFlight` as wedged and
+      // clear it so the NEXT `fire()` (below) can actually start a tick
+      // instead of coalescing into a `pending` flag a dead tick's `.finally`
+      // will never run to consume.
+      inFlight = false;
+      pending = false;
+      resubscribe(currentPaneIds);
+      fire();
+    }, deps.watchdogCheckIntervalMs ?? 30_000);
+    watchdogTimer.unref?.();
+  }
+
   return {
     stop: () => {
       stopped = true;
       generation++;
       clearInterval(timer);
+      if (watchdogTimer) clearInterval(watchdogTimer);
       currentSub?.close();
       currentSub = undefined;
     },
