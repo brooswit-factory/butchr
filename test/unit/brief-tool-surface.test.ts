@@ -281,8 +281,12 @@ describe("FACTORY-112: briefs stop teaching per-ticket doc maintenance; on-reque
   // AGENTS.md/CLAUDE.md are generic pointer files ("read brief.md and follow
   // it") — they carry no doc-workflow prose of their own, issue-type or
   // otherwise, so they're excluded from both assertions below the same way
-  // project.md is excluded from the first.
-  const files = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md") && f !== "AGENTS.md" && f !== "CLAUDE.md");
+  // project.md is excluded from the first. FACTORY-735/FACTORY-739:
+  // _before-you-stop.md is the shared "before you stop" section every
+  // tier-specific template includes (see workspace.ts's
+  // BEFORE_YOU_STOP_INCLUDE_MARKER) — it is not itself a tier brief and
+  // carries no doc-workflow prose either, so it's excluded the same way.
+  const files = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md") && f !== "AGENTS.md" && f !== "CLAUDE.md" && f !== "_before-you-stop.md");
   const issueTierFiles = files.filter((f) => f !== "project.md");
 
   test("no brief claims a ticket already has, or gets, a per-ticket Confluence doc", () => {

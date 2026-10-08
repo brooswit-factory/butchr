@@ -2,7 +2,7 @@ import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, readdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spawnArgs, checkArgv, codexMcpServerNames, inventoryCodexMcp, type AgentProvider } from "../../src/agents/argv.js";
+import { spawnArgs, checkArgv, codexMcpServerNames, inventoryCodexMcp, AGENTS_KICKOFF_PROMPT, type AgentProvider } from "../../src/agents/argv.js";
 import { buildWorkspace, workspaceRoot } from "../../src/agents/workspace.js";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import { loadConfig } from "../../src/config/config.js";
@@ -129,7 +129,7 @@ describe("provider selection", () => {
 
   test("Codex MCP TOML round-trips and no Claude-only flags or model leak", () => {
     const args = spawnArgs(spec, "/fixture dir", { provider: "codex" }, url);
-    expect(args[0]).toBe("follow your AGENTS.md");
+    expect(args[0]).toBe(AGENTS_KICKOFF_PROMPT);
     for (const flag of ["--model", "--effort", "--permission-mode", "--mcp-config", "--dangerously-load-development-channels"]) expect(args).not.toContain(flag);
     const config = Bun.TOML.parse(args[args.indexOf("--config") + 1]!) as any;
     expect(config.mcp_servers.butchr).toEqual({ url, enabled: true, http_headers: { "x-issue": spec.key, "x-butchr-provider": "codex" } });
@@ -184,7 +184,7 @@ describe("provider selection", () => {
     await herd.spawn(spec);
     expect(started).toHaveLength(1);
     expect(started[0].kind).toBe("codex");
-    expect(started[0].args).toContain("follow your AGENTS.md");
+    expect(started[0].args).toContain(AGENTS_KICKOFF_PROMPT);
     expect(prompts).toEqual([]);
     expect(await herd.nudge(spec.key, "fixture update")).toEqual({ delivered: true });
     expect(prompts[0].text).toBe("fixture update");
