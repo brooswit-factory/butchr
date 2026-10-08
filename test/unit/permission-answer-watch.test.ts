@@ -637,4 +637,237 @@ describe("startPermissionAnswerWatch", () => {
     handle.stop();
     rmSync(dir, { recursive: true, force: true });
   });
+
+  // FACTORY-776 (a): same two-phase client shape as the sibling wedge test
+  // above, but the SECOND call REJECTS instead of hanging — the "deadline"
+  // case (e.g. `Config.herdrCallTimeoutMs` turning a slow herdr call into a
+  // rejection), which lands in `runPermissionAnswerTick`'s own outer `catch`
+  // and therefore never reaches the reap/consumption code at all. Before the
+  // fix, nothing ever cleared this pane's trigger — not the tick (it can't,
+  // it never gets there) and not the watchdog either — so it re-tripped on
+  // every single `watchdogCheckIntervalMs` forever, with a perfectly healthy
+  // loop otherwise. This test proves the watchdog itself now bounds it to
+  // exactly one trip per genuine stall, by clearing the entry it trips on.
+  test("watchdog: a tick whose agent.list() REJECTS (not hangs) does not strand its trigger — trips are bounded, not one per interval forever", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    let listCalls = 0;
+    const client: PermissionAnswerClient = {
+      agent: {
+        list: (async () => {
+          listCalls++;
+          if (listCalls === 1) return { type: "agent_list" as const, agents: [{ ...AGENT_BASE, pane_id: "p1", agent_status: "idle" as const }] };
+          throw new Error("herdr call deadline exceeded");
+        }) as PermissionAnswerClient["agent"]["list"],
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+    const subs: FakeSubscription[] = [];
+    const tripped: (readonly string[])[] = [];
+    const fastPathTriggers = new Map<string, number>();
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: onlyP1,
+        auditPath,
+        fastPathTriggers,
+        watchdogThresholdMs: 30,
+        watchdogCheckIntervalMs: 10,
+        onWatchdogTripped: (stuck) => tripped.push(stuck),
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      1_000_000,
+    );
+
+    await waitFor(() => subs.length > 0);
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => listCalls > 1); // the second tick's own agent.list() rejected, stranding the trigger it just set
+
+    await waitFor(() => tripped.length > 0);
+    expect(tripped[0]).toEqual(["p1"]);
+    // Not merely reported — the entry this trip fired on is actually gone,
+    // so nothing is left for a later check to re-trip on.
+    expect(fastPathTriggers.has("p1")).toBe(false);
+
+    // Several more check intervals, comfortably past the threshold: with
+    // nothing re-adding a trigger (every later agent.list() call still
+    // rejects, same as before), there is nothing left to trip on again.
+    await new Promise((r) => setTimeout(r, 80));
+    expect(tripped.length).toBe(1);
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // FACTORY-776 (a): a pane that cleanly leaves the eligible set, with the
+  // tick loop otherwise healthy throughout — the watchdog must never trip at
+  // all here, since the tick's own reap (not the watchdog) is what clears a
+  // stale entry for a no-longer-eligible pane well within one sweep
+  // interval, long before `watchdogThresholdMs` could ever elapse.
+  test("watchdog: a healthy tick loop with a pane that leaves the eligible set produces no trips at all", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "idle", p2: "idle" });
+    let eligibleIds = new Set(["p1", "p2"]);
+    const eligiblePanes = (agents: readonly PermissionAnswerPane[]): ReadonlyMap<string, string> =>
+      new Map(agents.filter((a) => eligibleIds.has(a.pane_id)).map((a) => [a.pane_id, a.pane_id]));
+    const subs: FakeSubscription[] = [];
+    const tripped: (readonly string[])[] = [];
+    const fastPathTriggers = new Map<string, number>();
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes,
+        auditPath,
+        fastPathTriggers,
+        watchdogThresholdMs: 30,
+        watchdogCheckIntervalMs: 10,
+        onWatchdogTripped: (stuck) => tripped.push(stuck),
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      // A fast sweep so the tick-side reap keeps running well inside the
+      // watchdog threshold above, same as a healthy real deployment where
+      // intervalMs sits far below watchdogThresholdMs.
+      15,
+    );
+
+    await waitFor(() => subs.length > 0);
+    // p1 goes blocked (sets its trigger), then immediately leaves the
+    // eligible set — before any tick has a chance to answer or consume it
+    // through the ordinary per-pane consumption loop (p2 stays eligible
+    // throughout, so `labels.size` never drops to 0 either — this is
+    // specifically the "pane left the eligible set" path, not the
+    // "nothing eligible" one).
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    eligibleIds = new Set(["p2"]);
+    await waitFor(() => fastPathTriggers.size === 0); // the next sweep tick reaps p1's now-stale entry
+
+    await new Promise((r) => setTimeout(r, 80)); // several watchdog check intervals, comfortably past the threshold
+    expect(tripped).toEqual([]);
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // FACTORY-776 (b): reproduces the exact ordering the finding described —
+  // watchdog clears the flag -> fire() starts tick B -> a WEDGED tick A's
+  // own `.finally()` eventually settles and, pre-fix, clears `inFlight`
+  // UNDER B, letting the next `fire()` start tick C concurrently with B.
+  // Observed via the `autoAnswer` dep seam itself (never just a call count):
+  // each fake call only resolves when THIS test releases its own gate, so
+  // two calls "active" (unresolved) at the same wall-clock instant is a
+  // directly observed concurrent answer pass, not an inference from timing.
+  test("FACTORY-776 (b): a forced restart with a late-settling stale tick never starts a concurrent answer pass", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-watch-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const client: PermissionAnswerClient = {
+      agent: {
+        list: async () => ({ type: "agent_list" as const, agents: [{ ...AGENT_BASE, pane_id: "p1", agent_status: "blocked" as const }] }),
+        get: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["get"],
+        read: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["read"],
+        sendKeys: (async () => { throw new Error("not used"); }) as PermissionAnswerClient["agent"]["sendKeys"],
+      },
+    };
+
+    let autoAnswerCalls = 0;
+    // One gate per call index (1-based); a call with no gate registered
+    // resolves immediately. `gates[n]` is released by the test to let that
+    // specific call's own answer pass finish exactly when the test chooses.
+    const gates = new Map<number, () => void>();
+    const fakeAutoAnswer = (async () => {
+      autoAnswerCalls++;
+      const n = autoAnswerCalls;
+      await new Promise<void>((resolve) => {
+        gates.set(n, resolve);
+      });
+      return [];
+    }) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions;
+    const fakeAutoAnswerCodex = (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals;
+
+    const subs: FakeSubscription[] = [];
+    const tripped: (readonly string[])[] = [];
+    const fastPathTriggers = new Map<string, number>();
+
+    const handle = startPermissionAnswerWatch(
+      {
+        client,
+        eligiblePanes: onlyP1,
+        auditPath,
+        fastPathTriggers,
+        autoAnswer: fakeAutoAnswer,
+        autoAnswerCodex: fakeAutoAnswerCodex,
+        watchdogThresholdMs: 150,
+        watchdogCheckIntervalMs: 20,
+        onWatchdogTripped: (stuck) => tripped.push(stuck),
+        subscribe: async () => {
+          const sub = new FakeSubscription();
+          subs.push(sub);
+          return sub;
+        },
+      },
+      1_000_000,
+    );
+
+    // Tick 0 (the initial fire()) is call #1 — release it right away so the
+    // watch settles into its normal idle state and opens the subscription.
+    await waitFor(() => gates.has(1));
+    gates.get(1)!();
+    await waitFor(() => subs.length > 0);
+
+    // A push event starts tick A — call #2 — and stalls it: its own
+    // fastPathTriggers entry for p1 stays unconsumed because the tick is
+    // still awaiting this very call.
+    subs[0]!.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await waitFor(() => gates.has(2));
+
+    // The watchdog trips on that unconsumed entry, forcing a restart: tick
+    // B — call #3 — starts. Stall it too, so it is still genuinely
+    // in-flight when zombie tick A is allowed to settle below.
+    await waitFor(() => tripped.length > 0);
+    expect(tripped[0]).toEqual(["p1"]);
+    await waitFor(() => gates.has(3));
+    expect(autoAnswerCalls).toBe(3); // exactly tick A (zombie) and tick B (current) have ever started
+    // The trip's own `resubscribe` tore down the OLD subscription and opened
+    // a fresh one (same `currentPaneIds`, new identity) — later pushes must
+    // target THIS one; the old `subs[0]` is dead, and a frame pushed onto it
+    // now would never reach any consumer.
+    await waitFor(() => subs.length > 1);
+    const liveSub = subs[subs.length - 1]!;
+
+    // A second push arrives while B is genuinely in flight — coalesced into
+    // `pending`, not a new call (inFlight is true for B's own tick).
+    liveSub.push({ event: "pane.agent_status_changed", data: { pane_id: "p1", agent_status: "blocked" } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(autoAnswerCalls).toBe(3); // the coalesced request did not start a new call
+
+    // Zombie tick A's own call finally settles — LATE, well after the
+    // watchdog already moved on to tick B. Pre-fix, A's own unconditional
+    // `.finally()` would clear `inFlight` out from under B here and
+    // immediately start a FOURTH call concurrently with B's still-active
+    // third call — the exact "2 concurrent answer passes" this ticket closes.
+    gates.get(2)!();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(autoAnswerCalls).toBe(3); // still just A (now settled) and B (still active) — no concurrent third pass
+
+    // Only once B itself settles does the coalesced `pending` request get
+    // its own trailing tick — sequentially after B, never overlapping it.
+    gates.get(3)!();
+    await waitFor(() => autoAnswerCalls === 4);
+    gates.get(4)!();
+
+    handle.stop();
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
