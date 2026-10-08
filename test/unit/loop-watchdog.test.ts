@@ -183,7 +183,7 @@ describe("loop-watchdog (FACTORY-772)", () => {
     // repeat-trip behavior has its own dedicated test above; this test is
     // only about one restart covering two names, so the stub must recover.
     const stale: ComponentHealth = { name: "either", ok: false, state: "stale", lastSuccessAt: null, staleForMs: 10_000 };
-    const healthy: ComponentHealth = { name: "either", ok: true, state: "ok", lastSuccessAt: Date.now(), staleForMs: 0 };
+    const healthy: ComponentHealth = { name: "either", ok: true, state: "ok", lastSuccessAt: new Date().toISOString(), staleForMs: 0 };
     let recovered = false;
     const watchdog = createLoopWatchdog(
       [{ names: ["pollLoop", "notify"], components: () => [recovered ? healthy : stale], restart: () => { restarts++; recovered = true; } }],
