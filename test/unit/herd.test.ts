@@ -8,7 +8,7 @@ import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdr
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
-import { spawnArgs, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
+import { spawnArgs, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
 import { effectiveAgent } from "../../src/resources/session-definition.js";
@@ -209,7 +209,7 @@ describe("HerdrHerd", () => {
     expect(f.started[0].args).toContain("--dangerously-load-development-channels=server:butchr");
     // the kickoff prompt is the FIRST argument: the variadic mcp flag would
     // swallow a trailing positional as one of its own entries
-    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args[0]).toBe(KICKOFF_PROMPT);
     expect(f.started[0].args[f.started[0].args.length - 1]).toBe("--dangerously-load-development-channels=server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
@@ -830,7 +830,7 @@ describe("staleIssues", () => {
 
   test("a claude process carrying the full flag set -> not stale", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
@@ -1177,7 +1177,7 @@ describe("staleIssues", () => {
       const cwd = buildWorkspace(spec, "http://x/mcp", "claude"); // no permissionMode persisted, same as before this ticket.
       // What every currently-running agent's argv actually looks like today: no --permission-mode flag was ever
       // sent by butchr, so Drovr's own `launch.permissionMode ?? "bypassPermissions"` fallback produced this value.
-      const preChangeArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const preChangeArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: preChangeArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -1348,7 +1348,7 @@ describe("staleIssues", () => {
         const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
         // A pre-existing build's real launch: agentLaunchConfig always emits both --model and --effort for Claude, unconditionally (its own default fallback resolved to sonnet/high here).
-        const argv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default, not Drovr's bypassPermissions fallback.
+        const argv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default, not Drovr's bypassPermissions fallback.
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
         // The tier1 definition still resolves to sonnet, no effort — matches what's actually running.
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "sonnet" }));
@@ -1368,7 +1368,7 @@ describe("staleIssues", () => {
       try {
         const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // legacy: no persisted model/effort file.
-        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const legacyArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
         // The operator has since moved this definition to modelPower=100/effort=70 (Fable/xhigh).
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
@@ -1378,7 +1378,7 @@ describe("staleIssues", () => {
         // Respawn happens: buildWorkspace persists the NEW resolved values.
         writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
         writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
-        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "fable", "--effort", "xhigh", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
+        const freshArgv = ["claude", KICKOFF_PROMPT, "--model", "fable", "--effort", "xhigh", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
         const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
         const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
         for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
@@ -1398,7 +1398,7 @@ describe("staleIssues", () => {
         const issue = "jira-work:triage:KAN-500";
         const cwd = workspaceDirFor(issue);
         mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file.
-        const argv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default.
+        const argv = ["claude", KICKOFF_PROMPT, "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default.
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "opus", effort: "high" }));
         expect(await herd.staleIssues()).toEqual([]);
@@ -1418,7 +1418,7 @@ describe("staleIssues", () => {
         const issue = "jira-work:triage:KAN-501";
         const cwd = workspaceDirFor(issue);
         mkdirSync(cwd, { recursive: true });
-        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const legacyArgv = ["claude", KICKOFF_PROMPT, "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
         // An operator edit to rules.json moved this rule to a different explicit model.
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
@@ -1427,7 +1427,7 @@ describe("staleIssues", () => {
         expect(stale[0]!.reason).toContain("opus"); expect(stale[0]!.reason).toContain("haiku");
         writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("haiku"));
         writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("low"));
-        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "haiku", "--effort", "low", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
+        const freshArgv = ["claude", KICKOFF_PROMPT, "--model", "haiku", "--effort", "low", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
         const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
         const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
         for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
@@ -1499,7 +1499,7 @@ describe("staleIssues", () => {
   test("pane.process_info rejects -> unknown, not stale, and does not abort the sweep for other issues", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
     const otherCwd = join(workspaceRoot(), "KAN-9");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${otherCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${otherCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd(
       [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }, { name: "butchr-kan-9", pane_id: "w1:p2", cwd: otherCwd }],
       { "w1:p1": async () => { throw new Error("herdr socket hiccup"); }, "w1:p2": ok([{ pid: 2, argv: goodArgv, name: "claude" }]) },
@@ -1552,7 +1552,7 @@ describe("staleIssues", () => {
     // processes outside the pane's OWN foreground list, so the stray is
     // structurally invisible to the verdict.
     const cwd = join(workspaceRoot(), "KAN-811");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd(
       [{ name: "butchr-kan-811", pane_id: "w1:p1", cwd }],
       // Only w1:p1 (the named, healthy pane) is ever queried — a stray pane
@@ -1589,14 +1589,14 @@ describe("staleIssues", () => {
       const oldKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/legacy#7" });
       const oldCwd = join(root, ...oldKey.split(":"));
       mkdirSync(oldCwd, { recursive: true });
-      const oldArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const oldArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       // New-layout: a different github-issue key, already migrated (a real,
       // stamped ensureWorkspaceDir claim at its short leaf).
       const newKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/shiny#9" });
       const newCwd = ensureWorkspaceDir(newKey);
       expect(newCwd.endsWith("/github-issue/bugs/shiny#9")).toBe(true);
-      const newArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const newArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       const { client } = fakeHerdrWithCwd(
         [{ pane_id: "w-old:p1", cwd: oldCwd }, { pane_id: "w-new:p1", cwd: newCwd }],
@@ -1786,7 +1786,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     // a) pane closed AND a new agent started whose args equal the full spawn argv
     expect(f.closed).toEqual(["w1:p1"]);
     expect(f.started.length).toBe(1);
-    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args[0]).toBe(KICKOFF_PROMPT);
     expect(f.started[0].args).toContain("--permission-mode");
     expect(f.started[0].args).toContain("acceptEdits"); // FACTORY-138: no explicit permissionMode on the spec -> butchr's own default.
     expect(f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1]).toBe(dir + "/mcp.json");
@@ -1799,7 +1799,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
   });
 
   test("b) a second pass, now with process-info showing the full argv, closes/starts nothing", async () => {
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const f = fakeHerdrStale(ok([{ pid: 1, argv: goodArgv, name: "claude" }]));
     const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];
@@ -1828,7 +1828,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     // pane.process_info is scoped to ONE pane, so the stray (which lives on
     // some other, non-butchr-managed pane) is never even asked about here —
     // there is no cwd-based lookup left for it to pollute.
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const f = fakeHerdrStale(ok([{ pid: 999999, argv: goodArgv, name: "claude" }]));
     const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];

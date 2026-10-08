@@ -322,3 +322,5 @@ say so, stop retrying, and wait for whatever wakes you next; your fresh
 session re-reads your root doc and the live state of your epics. Only a
 complete argv makes a refusal real — then report it as policy, quoting the
 prompt text.
+
+<!-- include: briefs/_before-you-stop.md -->

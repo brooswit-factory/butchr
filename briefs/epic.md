@@ -326,3 +326,5 @@ watching that ticket while you remain In Progress, so only a PERSON READING YOUR
 and do not wait as though one will — a human happening to read the ticket is
 the only responder this channel can reach for an In Progress epic with no
 safe option.
+
+<!-- include: briefs/_before-you-stop.md -->

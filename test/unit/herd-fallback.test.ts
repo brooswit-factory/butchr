@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ProviderAvailabilityRegistry, processProviderAvailability } from "@brooswit/drovr";
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { AgentConfig } from "../../src/agents/argv.js";
+import { AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
 import { buildWorkspace, workspaceRoot } from "../../src/agents/workspace.js";
 
 const spec = { key: "TEST-1", issuetype: "Task", summary: "fallback fixture", parent: null };
@@ -129,7 +130,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(await recovery).toBe("recovered");
     expect(await nudge).toEqual({ delivered: true });
     expect(f.prompts).toEqual([
-      { target: "new-1", text: "follow your AGENTS.md" },
+      { target: "new-1", text: AGENTS_KICKOFF_PROMPT },
       { target: "new-1", text: "new request" },
     ]);
   });
@@ -152,7 +153,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     await herd.spawn(spec);
     expect(f.starts.map(p => p.kind)).toEqual(["claude", "agy"]);
     expect(f.starts[1].args[1]).toContain("ONLY for importing and compacting historical context");
-    expect(f.prompts).toEqual([{ target: "new-2", text: "follow your AGENTS.md" }]);
+    expect(f.prompts).toEqual([{ target: "new-2", text: AGENTS_KICKOFF_PROMPT }]);
     expect(f.closed).toEqual(["new-1"]);
     expect(JSON.parse(readFileSync(join(f.creates[1].cwd, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: url });
     expect(await herd.runningIssues()).toEqual([spec.key]);
