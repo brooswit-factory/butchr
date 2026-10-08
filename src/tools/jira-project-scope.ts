@@ -52,6 +52,76 @@ function currentProjectOf(issue: unknown): string | undefined {
 }
 
 /**
+ * A single quote/paren-aware scan of a caller's JQL, feeding both scoping
+ * defects a review (FACTORY-732) found in the FIRST version of the
+ * `jira_search` wrapper:
+ *   - PAREN BREAKOUT: `project = X AND (<jql>)` is unsafe if `<jql>` itself
+ *     carries an unbalanced parenthesis — `x) OR project = OTHER OR (y`
+ *     wraps into `project = X AND (x) OR project = OTHER OR (y)`, and `AND`
+ *     binds tighter than the bare `OR`, so `OTHER` leaks out from under the
+ *     `project = X` restriction entirely. `balanced` is false whenever a
+ *     `)` closes before a matching `(` (checked live, not just at the end)
+ *     or the string ends with a paren or quote still open.
+ *   - ORDER BY: JQL's grammar puts `ORDER BY` OUTSIDE any parens, at the
+ *     very end of the whole query — `project = X AND (<jql> ORDER BY …)`
+ *     is simply invalid JQL, breaking the common case of an ordered
+ *     search. `orderByIndex` names where a top-level (not inside quotes or
+ *     parens) `ORDER BY` keyword starts, so the caller can hoist it OUT of
+ *     the wrapped parens rather than leaving it trapped inside them — this
+ *     is still "wrap, don't detect": the split only ever relocates a
+ *     trailing suffix, it never inspects the body for a `project` clause.
+ * Both checks share one scan so a quoted `"ORDER BY"` string literal (JQL
+ * allows arbitrary text in quotes) is treated as inert text for BOTH
+ * purposes, not just one.
+ */
+function scanJql(jql: string): { balanced: boolean; orderByIndex: number | null } {
+  let depth = 0;
+  let quote: string | null = null;
+  let orderByIndex: number | null = null;
+  for (let i = 0; i < jql.length; i++) {
+    const ch = jql[i]!;
+    if (quote) {
+      if (ch === "\\") { i++; continue; } // an escaped char inside a quoted string is never structural
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === "(") { depth++; continue; }
+    if (ch === ")") {
+      depth--;
+      if (depth < 0) return { balanced: false, orderByIndex: null }; // closes before it ever opened — breakout attempt, stop scanning
+      continue;
+    }
+    if (depth === 0) {
+      const prevChar = jql[i - 1];
+      const atWordStart = prevChar === undefined || !/\w/.test(prevChar);
+      if (atWordStart && /^order\s+by\b/i.test(jql.slice(i))) orderByIndex = i;
+    }
+  }
+  return { balanced: depth === 0 && quote === null, orderByIndex };
+}
+
+/**
+ * `project = <own> AND (<jql>)` — except a trailing, top-level `ORDER BY …`
+ * is hoisted OUT of the parens first (`scanJql` above), since JQL requires
+ * it outside them. Refuses (never wraps) a `jql` `scanJql` finds
+ * paren/quote-unbalanced, rather than producing JQL whose real grouping no
+ * longer matches what the wrapper intended.
+ */
+function wrapJqlToProject(jql: string, ownProject: string): string {
+  const { balanced, orderByIndex } = scanJql(jql);
+  if (!balanced) {
+    throw new Refusal(
+      `jira_search: refusing a jira-project (manager) agent — its JQL has an unbalanced parenthesis or quote, which could break out of the "project = ${ownProject} AND (…)" scope wrapper`,
+    );
+  }
+  if (orderByIndex === null) return `project = ${ownProject} AND (${jql})`;
+  const body = jql.slice(0, orderByIndex).trim();
+  const orderByClause = jql.slice(orderByIndex).trim();
+  return body.length > 0 ? `project = ${ownProject} AND (${body}) ${orderByClause}` : `project = ${ownProject} ${orderByClause}`;
+}
+
+/**
  * Wraps a tool map so a `jira-project` caller is confined to
  * `JIRA_PROJECT_MANAGER_TOOLS`, each scoped to its OWN project
  * (`callerIdentity(...).resource`). Every OTHER caller (a `jira-work` agent,
@@ -68,6 +138,12 @@ function currentProjectOf(issue: unknown): string | undefined {
  *     (<jql>)`), never parsed/detected — a caller cannot smuggle a
  *     different project in by writing `OR project = OTHER`, since its own
  *     clause is always AND-ed inside the wrapper, not substituted for it.
+ *     Two defects a review found in the first version of this wrapper are
+ *     fixed in `scanJql`/`wrapJqlToProject` below: a trailing, top-level
+ *     `ORDER BY …` is hoisted OUT of the parens (JQL requires it there,
+ *     not inside them), and a `jql` whose own parens/quotes are
+ *     unbalanced — which could otherwise let a clause break OUT of the
+ *     wrapper's grouping — is refused rather than wrapped.
  *   - `jira_get_issue` / `jira_add_comment` / `jira_transition`: the `key`
  *     argument is validated against the same strict issue-key regex
  *     `set_doc`/`get_doc` already use (`JIRA_KEY_RE`, src/tools/docs.ts),
@@ -121,7 +197,13 @@ export function restrictJiraProjectManagers(
         if (name === "jira_search") {
           const { jql } = (args ?? {}) as { jql?: string };
           if (typeof jql !== "string") return def.handler(args as never, c as never); // malformed input — let the tool's own zod schema refuse it
-          const wrapped = `project = ${ownProject} AND (${jql})`;
+          let wrapped: string;
+          try {
+            wrapped = wrapJqlToProject(jql, ownProject);
+          } catch (err) {
+            log(`  [tools] ${who.agent} → refused jira_search: ${(err as Error).message}`);
+            throw err;
+          }
           log(`  [tools] ${who.agent} → jira-project scope: wrapped jira_search JQL for project ${ownProject}`);
           return def.handler({ ...(args as object), jql: wrapped } as never, c as never);
         }

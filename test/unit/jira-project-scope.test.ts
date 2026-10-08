@@ -124,6 +124,55 @@ describe("restrictJiraProjectManagers", () => {
       await call(gated, "jira_search", { jql: "project = OTHER OR status = Open" }, managerConn("BUTCHR"));
       expect(handlerCalls).toEqual([["jira_search", { jql: "project = BUTCHR AND (project = OTHER OR status = Open)" }]]);
     });
+
+    test("a trailing ORDER BY is hoisted OUTSIDE the wrapper's parens, not left trapped inside invalid JQL", async () => {
+      const { gated, handlerCalls } = rig();
+      await call(gated, "jira_search", { jql: "status = Open ORDER BY created DESC" }, managerConn("BUTCHR"));
+      expect(handlerCalls).toEqual([["jira_search", { jql: "project = BUTCHR AND (status = Open) ORDER BY created DESC" }]]);
+    });
+
+    test("ORDER BY is matched case-insensitively and with irregular spacing", async () => {
+      const { gated, handlerCalls } = rig();
+      await call(gated, "jira_search", { jql: "status = Open order   by created desc" }, managerConn("BUTCHR"));
+      expect(handlerCalls).toEqual([["jira_search", { jql: "project = BUTCHR AND (status = Open) order   by created desc" }]]);
+    });
+
+    test("a bare ORDER BY with no other filter wraps without an empty, invalid () group", async () => {
+      const { gated, handlerCalls } = rig();
+      await call(gated, "jira_search", { jql: "ORDER BY created DESC" }, managerConn("BUTCHR"));
+      expect(handlerCalls).toEqual([["jira_search", { jql: "project = BUTCHR ORDER BY created DESC" }]]);
+    });
+
+    test("an ORDER BY keyword that is only text inside a quoted string literal is NOT hoisted — it stays part of the wrapped body", async () => {
+      const { gated, handlerCalls } = rig();
+      await call(gated, "jira_search", { jql: 'summary ~ "order by priority"' }, managerConn("BUTCHR"));
+      expect(handlerCalls).toEqual([["jira_search", { jql: 'project = BUTCHR AND (summary ~ "order by priority")' }]]);
+    });
+
+    test("paren breakout: unbalanced parentheses in the caller's own JQL are refused, never wrapped", async () => {
+      const { gated, handlerCalls, logs } = rig();
+      await expect(call(gated, "jira_search", { jql: "x) OR project = OTHER OR (y" }, managerConn("BUTCHR"))).rejects.toBeInstanceOf(Refusal);
+      expect(handlerCalls).toEqual([]);
+      expect(logs.some((l) => l.includes("refused jira_search") && l.includes("unbalanced"))).toBe(true);
+    });
+
+    test("paren breakout: a close-before-open is refused even when the rest of the string would otherwise balance", async () => {
+      const { gated, handlerCalls } = rig();
+      await expect(call(gated, "jira_search", { jql: ") (" }, managerConn("BUTCHR"))).rejects.toBeInstanceOf(Refusal);
+      expect(handlerCalls).toEqual([]);
+    });
+
+    test("an unterminated quoted string is refused rather than trusted", async () => {
+      const { gated, handlerCalls } = rig();
+      await expect(call(gated, "jira_search", { jql: 'summary ~ "unterminated' }, managerConn("BUTCHR"))).rejects.toBeInstanceOf(Refusal);
+      expect(handlerCalls).toEqual([]);
+    });
+
+    test("balanced parens nested inside the caller's own JQL are fine", async () => {
+      const { gated, handlerCalls } = rig();
+      await call(gated, "jira_search", { jql: "(status = Open OR status = Blocked) AND priority = High" }, managerConn("BUTCHR"));
+      expect(handlerCalls).toEqual([["jira_search", { jql: "project = BUTCHR AND ((status = Open OR status = Blocked) AND priority = High)" }]]);
+    });
   });
 
   describe("every other tool is refused", () => {
