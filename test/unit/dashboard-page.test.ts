@@ -310,6 +310,28 @@ describe("renderDashboard: mutation 3 — per-source census independence, never 
 });
 
 // ---------------------------------------------------------------------------
+// FACTORY-219 (Z4): a CHECKED census source's own line must carry its
+// `(confirmed X ago)` age — dropping it leaves a source that reports
+// "checked" with no freshness, which never goes stale no matter how long ago
+// the last real check happened. Scoped to the source's own element, and with
+// render-time `now` moved past the source's own confirmedAt, so a mutation
+// that drops the whole "(confirmed ... ago)" clause fails here even though
+// "checked" alone would still read as superficially fine.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: Z4 — a checked census source's own entry carries its confirmed age (FACTORY-219)", () => {
+  test("a checked source's admission line reads 'checked (confirmed Xs ago)', never bare 'checked'", async () => {
+    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue"], now: () => 0 });
+    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked at now=0
+    const census = controller.census();
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
+    const html = renderDashboard(response, opts({ now: 10_000 })); // rendered 10s after the source's own confirmedAt
+    const sourceText = elementText(html, 'data-source="issue"', "</div>");
+    expect(sourceText).toBe("issue: checked (confirmed 10s ago)");
+    expect(sourceText).not.toBe("issue: checked"); // what dropping the age clause would leave behind
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Mutation 4: the time-in-status floor rendered without its "since daemon
 // start" marking when exact is false, or buried rather than prominent.
 // ---------------------------------------------------------------------------
@@ -416,6 +438,55 @@ describe("renderDashboard: a withheld row from a currently-declined source rende
     // The "project" row (declined source) reads STALE, scoped to itself.
     expect(html).toContain('class="conf cnc" data-source="project"');
     expect(html).not.toContain('class="conf cnc" data-source="issue"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-219 (Z1): the withheld-row version of mutation 5 — a withheld row's
+// freshness must come from its OWN `confirmedAt`, never be re-stamped at
+// render time (`new Date(opts.now).toISOString()`). The agent-row sibling of
+// this bug is already pinned by mutation 5's own test above, and the
+// page-level whole-response case is pinned by test 1a; this is the one site
+// (renderWithheldRow) BUTCHR-263 found nothing pinning. A render-time
+// re-stamp would always read "observed 0s ago" (both arguments to `ageText`
+// become the same `now`), and the declined-source STALE case would always
+// read "at least 0s old, as of <now>" instead of the row's real anchor — so
+// holding `confirmedAt` fixed and advancing render-time `now` is exactly
+// the check that catches it.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: Z1 — a withheld row's freshness is its OWN confirmedAt, never re-stamped at render time (FACTORY-219)", () => {
+  test("a non-declined withheld row's observed age grows with render-time `now`, never pinned at 0s", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"], now: () => 0 });
+    await controller.admit(["BUTCHR-1"], [], "issue"); // census confirmedAt observed at now=0
+    const census = controller.census();
+    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
+    expect(withheldRows).toHaveLength(1);
+    const row = withheldRows[0]!;
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
+
+    const html = renderDashboard(response, opts({ now: 10_000 })); // rendered 10s after the row's own confirmedAt
+    const confText = elementText(html, 'class="conf known" data-source="issue"', "</span>");
+    expect(confText).toContain("observed 10s ago");
+    expect(confText).not.toContain("observed 0s ago"); // what a render-time re-stamp would always say
+    // the title attribute is the row's OWN confirmedAt anchor, not render-time `now`
+    expect(html).toContain(`class="conf known" data-source="issue" title="${row.confirmedAt}"`);
+  });
+
+  test("a withheld row whose source has declined reads STALE from its OWN confirmedAt anchor, not render-time `now`", async () => {
+    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue", "project"], now: () => 0 });
+    await controller.admit(["BUTCHR-1"], [], "issue"); // "issue" checked; "project" never reports -> declined
+    const census = controller.census();
+    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
+    // Attribute this row to a now-declined source, same construction the
+    // existing review-gap-#2 test above uses for the identical shape.
+    const row = { ...withheldRows[0]!, resourceKey: "KAN", source: "project" };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [row], admission: buildAdmissionView(census) };
+
+    const html = renderDashboard(response, opts({ now: 10_000 }));
+    const staleText = elementText(html, 'class="conf cnc" data-source="project"', "</span>");
+    expect(staleText).toContain("at least 10s old"); // 10s is the real elapsed time since the row's own confirmedAt (0)
+    expect(staleText).not.toContain("at least 0s old"); // what a render-time re-stamp would always say
+    expect(staleText).toContain(`as of ${row.confirmedAt}`);
   });
 });
 
@@ -583,6 +654,54 @@ describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
     // instruction names current, stale, AND unknown as the three verdicts
     // this exact opening tag must be pinned for.
     expect(html).toContain('<div class="hdrline build">');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-219 (Z13): a dirty build sha must render " (dirty)" — never
+// " (clean)". A dirty tree means the sha does not truthfully describe what
+// is running, so mislabelling it clean is an ACTIVE false provenance claim,
+// not merely a missing one. A sibling assertion pins the true-clean case the
+// other way, so a mutation that flips the ternary in either direction fails
+// one of the two.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: Z13 — a dirty build sha is labelled '(dirty)', never '(clean)' (FACTORY-219)", () => {
+  const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+
+  test("shaDirty:true renders '(dirty)', never '(clean)'", () => {
+    const build = { sha: "e".repeat(40), shaDirty: true, shaUnknownReason: null, version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
+    const html = renderDashboard(response, opts({ header: { build } }));
+    const buildText = elementText(html, 'class="hdrline build"', "</div>");
+    expect(buildText).toContain("(dirty)");
+    expect(buildText).not.toContain("(clean)");
+  });
+
+  test("shaDirty:false renders '(clean)', never '(dirty)' — the other direction of the same ternary", () => {
+    const build = { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
+    const html = renderDashboard(response, opts({ header: { build } }));
+    const buildText = elementText(html, 'class="hdrline build"', "</div>");
+    expect(buildText).toContain("(clean)");
+    expect(buildText).not.toContain("(dirty)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-219 (Z14): "build sha unknown" must carry its own reason in
+// parentheses — minor (BUTCHR-263 marked it so), but the same
+// could-not-check-without-its-reason shape as the rest of this page. Scoped
+// to the header element so a mutation that drops just the reason clause
+// (leaving the bare "build sha unknown") fails here even though that bare
+// text would still pass an unscoped `toContain("build sha unknown")`.
+// ---------------------------------------------------------------------------
+describe("renderDashboard: Z14 — 'build sha unknown' carries its own reason (FACTORY-219)", () => {
+  test("a null sha with a shaUnknownReason renders 'build sha unknown (<reason>)', not the bare phrase", () => {
+    const build = { sha: null, shaDirty: null, shaUnknownReason: "git not available in this container", version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const html = renderDashboard(response, opts({ header: { build } }));
+    const buildText = elementText(html, 'class="hdrline build"', "</div>");
+    expect(buildText).toContain("build sha unknown (git not available in this container)");
+    expect(buildText).not.toContain("build sha unknown</div>"); // the bare phrase dropping its reason would close the div immediately after
+    expect(buildText).not.toBe("build sha unknown");
   });
 });
 
