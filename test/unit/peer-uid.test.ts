@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { peerUidOf, isSameUidPeer } from "../../src/web/peer-uid.js";
+import { peerUidOf, isSameUidPeer, lsofToProcNetTcp } from "../../src/web/peer-uid.js";
 
 const HEADER = "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode";
 
@@ -68,5 +68,45 @@ describe("isSameUidPeer", () => {
   test("read throws-free empty table: false", () => {
     const ok = isSameUidPeer(client(50000), { server: SERVER, read: () => "", ownUid: () => 1000 });
     expect(ok).toBe(false);
+  });
+});
+
+describe("lsofToProcNetTcp (macOS has no /proc/net/tcp)", () => {
+  const LSOF = [
+    "p100", "u501", "f9", "n127.0.0.1:7718", "f10", "n127.0.0.1:7718->127.0.0.1:50000",
+    "p200", "u502", "f36", "n127.0.0.1:50000->127.0.0.1:7718",
+    "p300", "unotanumber", "f4", "n127.0.0.1:50001->127.0.0.1:7718",
+    "p400", "u503", "f5", "n[::1]:50002->[::1]:7718", "",
+  ].join("\n");
+  test("rows feed peerUidOf: the client's own socket resolves to the client process's uid, not the server's", () => {
+    expect(peerUidOf(lsofToProcNetTcp(LSOF), client(50000), SERVER)).toBe(502);
+  });
+  test("a listening socket, a process with an unparseable uid, and IPv6 sockets yield no row (fail closed)", () => {
+    const table = lsofToProcNetTcp(LSOF);
+    expect(peerUidOf(table, client(50001), SERVER)).toBeNull();
+    expect(peerUidOf(table, client(50002), SERVER)).toBeNull();
+  });
+  test("empty or garbage output: header only, never throws", () => {
+    expect(peerUidOf(lsofToProcNetTcp(""), client(50000), SERVER)).toBeNull();
+    expect(peerUidOf(lsofToProcNetTcp("garbage\nn1.2.3.4"), client(50000), SERVER)).toBeNull();
+  });
+  test("isSameUidPeer accepts when the converted row's uid is this process's own", () => {
+    const read = () => lsofToProcNetTcp(LSOF);
+    expect(isSameUidPeer(client(50000), { server: SERVER, read, ownUid: () => 502 })).toBe(true);
+    expect(isSameUidPeer(client(50000), { server: SERVER, read, ownUid: () => 501 })).toBe(false);
+  });
+});
+
+describe.skipIf(process.platform !== "darwin")("real loopback connection on macOS", () => {
+  test("the production reader identifies our own client socket as our own uid", async () => {
+    let seen: { address: string; port: number } | undefined;
+    const srv = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req, s) { seen = s.requestIP(req) ?? undefined; return new Response("ok"); } });
+    try {
+      await (await fetch(`http://127.0.0.1:${srv.port}/`)).text();
+      expect(seen).toBeDefined();
+      expect(isSameUidPeer(seen!, { server: { address: "127.0.0.1", port: srv.port! } })).toBe(true);
+    } finally {
+      srv.stop(true);
+    }
   });
 });

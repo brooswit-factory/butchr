@@ -111,8 +111,44 @@ export function peerUidOf(table: string, local: SocketEndpoint, remote: SocketEn
   return null;
 }
 
-/** Real production read: `/proc/net/tcp` (IPv4) and `/proc/net/tcp6` (IPv6 — a loopback peer may connect over `::1`), concatenated. A missing/unreadable table (non-Linux, a sandboxed `/proc`) yields the empty string for that half, never a thrown error — `peerUidOf` then finds no matching row, which fails closed exactly as intended. */
+/**
+ * macOS has no `/proc`. `lsof -F` output (`-nP -iTCP@127.0.0.1`, one `u<uid>`
+ * line per process followed by one `n<local>-><remote>` line per socket) is
+ * rewritten here into the same row shape `peerUidOf` already parses, so the
+ * 4-tuple match and the fail-closed rules stay in one place. Anything that
+ * doesn't parse is dropped, never guessed at.
+ */
+export function lsofToProcNetTcp(lsofOutput: string): string {
+  const rows = ["  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode"];
+  let uid: number | null = null;
+  for (const line of lsofOutput.split("\n")) {
+    if (line.startsWith("p")) uid = null; // a new process record: its `u` line follows
+    else if (line.startsWith("u")) uid = /^\d+$/.test(line.slice(1)) ? Number(line.slice(1)) : null;
+    else if (line.startsWith("n") && uid !== null) {
+      const m = /^n(\d+\.\d+\.\d+\.\d+):(\d+)->(\d+\.\d+\.\d+\.\d+):(\d+)$/.exec(line);
+      if (!m) continue;
+      const hex = (addr: string, port: string) => {
+        const a = ipv4ToHex(addr);
+        return a === null ? null : `${a}:${Number(port).toString(16).toUpperCase().padStart(4, "0")}`;
+      };
+      const local = hex(m[1]!, m[2]!);
+      const remote = hex(m[3]!, m[4]!);
+      if (local && remote) rows.push(`   0: ${local} ${remote} 01 00000000:00000000 00:00000000 00000000 ${uid} 0 0`);
+    }
+  }
+  return rows.join("\n");
+}
+
+/** Real production read. Linux: `/proc/net/tcp` (IPv4) and `/proc/net/tcp6` (IPv6 — a loopback peer may connect over `::1`), concatenated. macOS: `lsof` (always present, no Xcode needed), converted by `lsofToProcNetTcp`. A missing/unreadable table (a sandboxed `/proc`, no `lsof`) yields the empty string for that half, never a thrown error — `peerUidOf` then finds no matching row, which fails closed exactly as intended. */
 export const readProcNetTcp: ReadProcNetTcp = () => {
+  if (process.platform === "darwin") {
+    try {
+      const r = Bun.spawnSync(["/usr/sbin/lsof", "-nP", "-iTCP@127.0.0.1", "-F", "pun"], { stdout: "pipe", stderr: "ignore", timeout: 5000 });
+      return r.exitCode === 0 || r.stdout.length > 0 ? lsofToProcNetTcp(r.stdout.toString()) : "";
+    } catch {
+      return "";
+    }
+  }
   const readOrEmpty = (path: string): string => {
     try {
       return readFileSync(path, "utf8");
