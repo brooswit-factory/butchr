@@ -9,6 +9,7 @@ import {
   PLACEHOLDER_QUERY,
   ENABLE_SCOPE_CEILING,
   type RuleDto,
+  type RuleFormCatalogEntry,
   type RulesListResponse,
 } from "../../dashboard-app/src/api/rules.js";
 
@@ -388,7 +389,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
     let calledUrl: string | undefined;
-    const fakeHarnesses = [{ harness: "claude", models: ["sonnet"], allowsCustomModel: true, efforts: ["low"], permissionModes: ["default"] }];
+    const fakeHarnesses: RuleFormCatalogEntry[] = [{ harness: "claude", models: ["sonnet"], allowsCustomModel: true, efforts: ["low"], permissionModes: ["default"] }];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
       calledUrl = String(input);
       return new Response(JSON.stringify({ harnesses: fakeHarnesses }), { status: 200, headers: { "content-type": "application/json" } });

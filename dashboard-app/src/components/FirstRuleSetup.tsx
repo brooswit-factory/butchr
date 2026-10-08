@@ -461,7 +461,8 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
       ) : null}
 
       <label htmlFor="first-rule-lizard-mode-toggle">lizard mode</label>
-      <span className="rules-table__toggle" title="auto-answers unambiguous tool-permission prompts so the agent is never left frozen waiting on one">
+      {/* FACTORY-729: a DISTINCT class from `RulesTable`'s own `rules-table__toggle` — the Rules page renders this form ABOVE the rules table, so a shared class name would make `document.querySelector(".rules-table__toggle")` ambiguously match this element first (a real collision, caught by `dashboard-app-rules-route.test.tsx`'s own capabilities.write test). */}
+      <span className="first-rule-lizard-toggle" title="auto-answers unambiguous tool-permission prompts so the agent is never left frozen waiting on one">
         <Switch
           id="first-rule-lizard-mode-toggle"
           data-testid="first-rule-lizard-mode-toggle"

@@ -38,7 +38,7 @@ describe("RULE_FORM_CATALOG", () => {
   });
 
   test("ruleFormCatalogEntry is a plain lookup, not a copy of a mutated table", () => {
-    expect(ruleFormCatalogEntry("claude")).toBe(RULE_FORM_CATALOG.find((e) => e.harness === "claude"));
+    expect(ruleFormCatalogEntry("claude")).toBe(RULE_FORM_CATALOG.find((e) => e.harness === "claude")!);
   });
 });
 

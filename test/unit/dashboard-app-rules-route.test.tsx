@@ -459,5 +459,16 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: CSP/escaping (agentsafety revi
     expect(input.value).toBe(scriptPayload);
     expect(container.querySelector("script")).toBeNull();
     expect((globalThis as { __pwned2?: boolean }).__pwned2).toBeUndefined();
+    // FACTORY-729: `FirstRuleSetup` now fetches `GET /api/rules/catalog` on
+    // mount (its own `useEffect`) — a second async hop beyond this test's
+    // own `findByTestId` wait. This is the LAST test in the file: with
+    // nothing else to await, `afterAll`'s `GlobalRegistrator.unregister()`
+    // (`../setup/happy-dom.js`) can tear down `window` before React's own
+    // scheduler (a `MessageChannel`-posted task, not a plain microtask) has
+    // flushed the state update that promise resolution triggers — the
+    // macrotask that flushes it then throws `window is not defined`. A bare
+    // `setTimeout(resolve, 0)` was NOT enough (still raced it); 50ms reliably
+    // gives that scheduler task room to run before the file's own teardown.
+    await new Promise((resolve) => setTimeout(resolve, 50));
   });
 });
