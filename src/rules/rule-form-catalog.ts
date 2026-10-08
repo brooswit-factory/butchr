@@ -2,14 +2,23 @@
  * FACTORY-729 — the single source of truth for the rule form's
  * harness/model/effort/permission-mode dropdowns and the lizard-mode
  * toggle: one catalog entry per `AgentHarness`, built from this codebase's
- * own EXISTING constants (`AGENT_HARNESSES`, `./rules.ts:59`; `AGENT_EFFORTS`,
- * `../resources/power-scale.ts:44`; `RULE_PERMISSION_MODES`, `./rules.ts:90`;
- * the model-power tables, `../resources/power-scale.ts`) — never a second,
- * hand-maintained list. `GET /api/rules/catalog` (`../web/view.ts`) serves
- * this verbatim; the write-path validator (`./rules-write-registry.ts`)
- * imports the SAME `CUSTOM_MODEL_PATTERN` this module exports, so a model
- * value the write path accepts is always shaped the way the UI's "Other…"
- * custom-model field promises.
+ * own EXISTING constants (`AGENT_HARNESSES`/`RULE_PERMISSION_MODES`,
+ * `./agent-harness.ts` — re-exported unchanged from `./rules.ts` too, for
+ * every importer that already used that path; `AGENT_EFFORTS` and the
+ * model-power tables, `../resources/power-scale.ts`) — never a second,
+ * hand-maintained list. Imports `AGENT_HARNESSES`/`RULE_PERMISSION_MODES`
+ * from the LEAF module (`./agent-harness.ts`), never from `./rules.ts`
+ * directly: `rules.ts` pulls in `node:fs`/`node:crypto` and several other
+ * server-only modules, and a plain VALUE import (not `import type`, which
+ * TypeScript erases) of anything named from it drags that whole graph into
+ * whatever bundles it — this module is imported from browser-bundled code
+ * (`dashboard-app/src/api/rules.ts`, `FirstRuleSetup.tsx`), where that was
+ * observed to break the Vite build outright (see `./agent-harness.ts`'s own
+ * top comment for the exact symptom). `GET /api/rules/catalog`
+ * (`../web/view.ts`) serves this verbatim; the write-path validator
+ * (`./rules-write-registry.ts`) imports the SAME `CUSTOM_MODEL_PATTERN`
+ * this module exports, so a model value the write path accepts is always
+ * shaped the way the UI's "Other…" custom-model field promises.
  *
  * `models` is drawn from each vendor's own `ModelPowerBand` table
  * (`../resources/power-scale.ts`) — the short aliases a launch itself
@@ -37,7 +46,7 @@
  * and-sandbox` (`agentLaunchConfig`'s Codex branch, `../agents/argv.ts`) —
  * that mapping is a launch-time concern, not a catalog-time restriction.
  */
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "./rules.js";
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "./agent-harness.js";
 import { AGENT_EFFORTS, CLAUDE_MODEL_POWER_TABLE, CODEX_MODEL_POWER_TABLE, type AgentEffort, type ModelPowerBand } from "../resources/power-scale.js";
 
 export interface RuleFormCatalogEntry {

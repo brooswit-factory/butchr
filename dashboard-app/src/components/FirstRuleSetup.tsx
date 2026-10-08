@@ -37,7 +37,11 @@
 import { useEffect, useState } from "react";
 import { Alert, AlertText, Button, Switch, Text } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/rules.js";
+// FACTORY-729: imported from the LEAF module, never `../../../src/rules/rules.js` directly — that
+// module pulls in `node:fs`/`node:crypto` (and more), and a VALUE import of anything named from it
+// (unlike `import type`, which TypeScript erases) drags that whole graph into this Vite client bundle
+// — observed to break the build outright. See `src/rules/agent-harness.ts`'s own top comment.
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import {
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
