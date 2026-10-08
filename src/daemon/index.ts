@@ -85,6 +85,7 @@ import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { restrictJiraProjectManagers } from "../tools/jira-project-scope.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -1227,7 +1228,11 @@ const { app, mcp } = buildApp({
 // loop reads.
 }, {
   // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  // FACTORY-732: a jira-project (manager) caller passes `forJiraCallers`
+  // now, but `restrictJiraProjectManagers` immediately confines it to its
+  // own project's jira_get_issue/jira_search/jira_add_comment/jira_transition
+  // — see src/tools/jira-project-scope.ts.
+  ...restrictJiraProjectManagers(forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)), ops),
   // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
   // provider-specific tool set below it — the local file store needs no
   // credentials and works for every ResourceRef kind, and a `jira-project`
@@ -1235,9 +1240,17 @@ const { app, mcp } = buildApp({
   // already has Jira credentials loaded, unlike the CLI, so the factory
   // below is cheap and side-effect-free rather than genuinely lazy) — see
   // `src/resources/link-store-router.ts` for the routing decision itself.
-  ...resourceLinkTools(
-    routingLinkStore,
-    (line) => console.error(line),
+  // FACTORY-732: a jira-project (manager) CALLER (not the `resource` a link
+  // names — the resource-link test fixtures above a jira-project OWNER as
+  // an argument, which this gate never touches) has no allowlisted name
+  // here (add_link/remove_link/list_links are all outside
+  // JIRA_PROJECT_MANAGER_TOOLS), so it is refused on every one of these.
+  ...restrictJiraProjectManagers(
+    resourceLinkTools(
+      routingLinkStore,
+      (line) => console.error(line),
+    ),
+    ops,
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -1251,7 +1264,11 @@ const { app, mcp } = buildApp({
   // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
   // the managed-sessions loop and `butchr session` CLI already use, never a
   // second resolution of "where definitions live" or "which freeze store".
-  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+  // FACTORY-732: freeze_session is not in JIRA_PROJECT_MANAGER_TOOLS, so a jira-project (manager) caller is refused here too.
+  ...restrictJiraProjectManagers(
+    sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+    ops,
+  ),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
