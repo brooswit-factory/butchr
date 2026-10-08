@@ -135,7 +135,8 @@ describe("writeRuleEnabled", () => {
     const planHash = await planHashFor("ui-first-rule", { enabled: true }, false, noScope, deps);
     // the file changes after the plan was computed (another write landed)
     const etag1 = rulesEtag(env());
-    const edit = writeRuleFields("ui-first-rule", { query: "project = CHANGED" }, etag1, false, await planHashFor("ui-first-rule", { query: "project = CHANGED" }, false, noScope, deps), deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const edit = await writeRuleFields("ui-first-rule", { query: "project = CHANGED" }, etag1, true, await planHashFor("ui-first-rule", { query: "project = CHANGED" }, true, noScope, deps), noScope, deps);
     expect(edit.ok).toBe(true);
     const etag2 = rulesEtag(env());
     const outcome = await writeRuleEnabled("ui-first-rule", true, etag2, false, planHash, noScope, deps);
@@ -165,9 +166,12 @@ describe("allowlist is per-index, never a wildcard (agentsafety 2026-10-05 17:0x
     seed([MANAGERS_RULE, UI_RULE]);
     const deps = { env: env() };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730 (review round 2): any query change now requires confirm
+    // (dry-run scope) — unrelated to what THIS test means to prove (index
+    // tracking), so it just supplies it.
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0]).toEqual(MANAGERS_RULE); // completely untouched
@@ -196,7 +200,7 @@ describe("allowlist is per-index, never a wildcard (agentsafety 2026-10-05 17:0x
     const patch = { agentPreferences: [{ model: "opus", nickname: "bob" } as any] };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(400);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -212,7 +216,7 @@ describe("allowlist is per-index, never a wildcard (agentsafety 2026-10-05 17:0x
     const patch = { agentPreferences: [{ harness: "codex" } as any] };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
@@ -227,10 +231,75 @@ describe("writeRuleFields (PUT)", () => {
     const patch = { query: "project = NEW" };
     const planHash = await planHashFor("managers", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("managers", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].query).toBe("project = NEW");
+  });
+
+  // FACTORY-730 (review round 2, blocking finding — AC3): a query edit must
+  // be refused WITHOUT confirm, regardless of whether the rule is currently
+  // enabled or disabled — the gap the review found was specifically the
+  // DISABLED case (zero blast radius by every OTHER gate, so nothing
+  // previously required a look at what the new query would match).
+  test("FACTORY-730 (review): a query edit to a DISABLED non-ui- rule without confirm is refused, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const scope = async () => 7;
+    const planHash = await planHashFor("managers", patch, false, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("managers", patch, etag, false, planHash, scope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toMatch(/match 7 ticket/);
+      expect(outcome.error).toMatch(/confirm/);
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("FACTORY-730 (review): the SAME disabled-rule query edit WITH confirm: true succeeds", async () => {
+    seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const scope = async () => 7;
+    const planHash = await planHashFor("managers", patch, true, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("managers", patch, etag, true, planHash, scope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].query).toBe("project = NEW");
+  });
+
+  // The ENABLED case already trips the pre-existing stop/restart gate
+  // (`requireConfirmForBlastRadius`) — this proves the NEW query-change gate
+  // doesn't somehow skip itself just because another gate already applies
+  // (both must agree the write is refused without confirm).
+  test("FACTORY-730 (review): a query edit to an ENABLED non-ui- rule without confirm is refused, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: true, execution: "singleton" }]);
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const scope = async () => 7;
+    const planHash = await planHashFor("managers", patch, false, scope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("managers", patch, etag, false, planHash, scope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("FACTORY-730 (review): an unmeasurable new-query scope refuses closed (503), even with confirm: true", async () => {
+    seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const unmeasurable = async () => Number.POSITIVE_INFINITY;
+    const outcome = await writeRuleFields("managers", patch, "irrelevant-etag", true, "irrelevant-hash", unmeasurable, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(503);
+      expect(outcome.error).toMatch(/previewer is unavailable/);
+    }
   });
 
   // FACTORY-730 (story's own review-bar comment, item 3): the fixed
@@ -260,7 +329,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch = { query: "project = CHANGED" };
     const planHash = await planHashFor("managers", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("managers", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].query).toBe("project = CHANGED");
@@ -298,9 +367,9 @@ describe("writeRuleFields (PUT)", () => {
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
   });
 
-  test("refuses a stale ifMatch, writes nothing", () => {
+  test("refuses a stale ifMatch, writes nothing", async () => {
     const text = seed([UI_RULE]);
-    const outcome = writeRuleFields("ui-first-rule", { query: "project = X" }, "stale", false, "irrelevant-hash", { env: env() });
+    const outcome = await writeRuleFields("ui-first-rule", { query: "project = X" }, "stale", false, "irrelevant-hash", noScope, { env: env() });
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -310,9 +379,10 @@ describe("writeRuleFields (PUT)", () => {
     seed([UI_RULE]);
     const deps = { env: env() };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].query).toBe("project = NEW");
@@ -326,7 +396,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch = { agentPreferences: [{ model: "opus" }] };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].agentPreferences[0].model).toBe("opus");
@@ -341,7 +411,7 @@ describe("writeRuleFields (PUT)", () => {
     // The plan itself would also throw on this (applyRuleFieldPatch runs
     // the same validation) — pass an arbitrary hash, the length-mismatch
     // error fires before the hash is ever compared.
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, "irrelevant-hash", deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, "irrelevant-hash", noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(400);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -353,7 +423,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch = { query: "project = NEW" };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
   });
@@ -364,7 +434,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch = { query: "project = NEW" };
     const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -373,7 +443,7 @@ describe("writeRuleFields (PUT)", () => {
     const deps = { env: env() };
     const planHash = await planHashFor("ui-first-rule", { query: "project = A" }, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", { query: "project = B" }, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", { query: "project = B" }, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -385,7 +455,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch: RuleFieldPatch = { permissionMode: "default", agentPreferences: [{ harness: "codex" }] };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].permissionMode).toBe("default");
@@ -400,7 +470,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { permissionMode: "bypassPermissions" };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -412,7 +482,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { permissionMode: "auto" };
     const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -422,7 +492,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { lizardMode: true };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -434,7 +504,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { lizardMode: true };
     const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -444,7 +514,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { lizardMode: false };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -481,9 +551,10 @@ describe("writeUndo (B2: only the last UI write's own backup, at its own resulti
     const original = seed([UI_RULE]);
     const deps = { env: env() };
     const patch = { query: "project = CHANGED" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const edited = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const edited = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(edited.ok).toBe(true);
     if (!edited.ok || !edited.backupId) throw new Error("expected a backup id");
     const undone = writeUndo(edited.backupId, deps);
@@ -504,7 +575,7 @@ describe("writeUndo (B2: only the last UI write's own backup, at its own resulti
     const patch = { query: "project = CHANGED" };
     const planHash = await planHashFor("managers", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const edited = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    const edited = await writeRuleFields("managers", patch, etag, true, planHash, noScope, deps);
     expect(edited.ok).toBe(true);
     if (!edited.ok || !edited.backupId) throw new Error("expected a backup id");
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
@@ -517,17 +588,18 @@ describe("writeUndo (B2: only the last UI write's own backup, at its own resulti
   test("B2: a backup id that is NOT the last UI write's own is refused, even if it genuinely exists on disk", async () => {
     seed([UI_RULE]);
     const deps = { env: env() };
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
     const patch1 = { query: "project = FIRST" };
-    const hash1 = await planHashFor("ui-first-rule", patch1, false, noScope, deps);
+    const hash1 = await planHashFor("ui-first-rule", patch1, true, noScope, deps);
     const etag1 = rulesEtag(env());
-    const first = writeRuleFields("ui-first-rule", patch1, etag1, false, hash1, deps);
+    const first = await writeRuleFields("ui-first-rule", patch1, etag1, true, hash1, noScope, deps);
     expect(first.ok).toBe(true);
     const firstBackupId = first.ok ? first.backupId : null;
 
     const patch2 = { query: "project = SECOND" };
-    const hash2 = await planHashFor("ui-first-rule", patch2, false, noScope, deps);
+    const hash2 = await planHashFor("ui-first-rule", patch2, true, noScope, deps);
     const etag2 = rulesEtag(env());
-    const second = writeRuleFields("ui-first-rule", patch2, etag2, false, hash2, deps);
+    const second = await writeRuleFields("ui-first-rule", patch2, etag2, true, hash2, noScope, deps);
     expect(second.ok).toBe(true);
 
     // firstBackupId genuinely exists on disk, but it is NOT the tracked
@@ -543,9 +615,10 @@ describe("writeUndo (B2: only the last UI write's own backup, at its own resulti
     seed([UI_RULE]);
     const deps = { env: env() };
     const patch = { query: "project = CHANGED" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const edited = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const edited = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(edited.ok).toBe(true);
     if (!edited.ok || !edited.backupId) throw new Error("expected a backup id");
 
@@ -603,6 +676,65 @@ describe("planRuleWrite (report-only)", () => {
     if (plan.ok) { expect(plan.restarted).toBe(1); expect(plan.requiresConfirm).toBe(true); }
   });
 
+  // FACTORY-730 (review round 2, blocking finding — AC3): a changed `query`
+  // is dry-run against its OWN NEW text, never the rule's CURRENT (still on
+  // disk) query — the review's own repro was that `scope` stayed `null`
+  // (never evaluated at all) for a field PUT; this proves it's now
+  // evaluated, and against the right text.
+  test("FACTORY-730 (review): a query edit's scope reflects the NEW query text, not the rule's current one, even for a DISABLED rule (zero blast radius by every other gate)", async () => {
+    seed([{ ...UI_RULE, enabled: false, query: "project = OLD" }]);
+    let seenQuery: string | undefined;
+    const scope = async (_id: string, queryText: string) => { seenQuery = queryText; return 7; };
+    const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW" }, false, scope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.scope).toBe(7);
+      expect(plan.spawned).toBe(0);
+      expect(plan.stopped).toBe(0);
+      expect(plan.restarted).toBe(0);
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("query-change");
+    }
+    expect(seenQuery).toBe("project = NEW");
+  });
+
+  test("FACTORY-730 (review): confirm: true already satisfies the query-change gate — requiresConfirm is false", async () => {
+    seed([{ ...UI_RULE, enabled: false, query: "project = OLD" }]);
+    const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW" }, true, async () => 7, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.scope).toBe(7);
+      expect(plan.requiresConfirm).toBe(false);
+      expect(plan.confirmReason).toBeUndefined();
+    }
+  });
+
+  test("FACTORY-730 (review): no query change (patch.query absent, or equal to the current one) never evaluates scope — scope stays null", async () => {
+    seed([{ ...UI_RULE, enabled: false, query: "project = OLD" }]);
+    let called = false;
+    const scope = async () => { called = true; return 7; };
+    const noChange = await planRuleWrite("ui-first-rule", { permissionMode: "default" }, false, scope, { env: env() });
+    expect(noChange.ok).toBe(true);
+    if (noChange.ok) expect(noChange.scope).toBeNull();
+    const sameQuery = await planRuleWrite("ui-first-rule", { query: "project = OLD" }, false, scope, { env: env() });
+    expect(sameQuery.ok).toBe(true);
+    if (sameQuery.ok) expect(sameQuery.scope).toBeNull();
+    expect(called).toBe(false);
+  });
+
+  test("FACTORY-730 (review): an unmeasurable new-query scope reports scopeUnmeasurable, requiresConfirm true, confirmReason 'unmeasurable-scope'", async () => {
+    seed([{ ...UI_RULE, enabled: false, query: "project = OLD" }]);
+    const unmeasurable = async () => Number.POSITIVE_INFINITY;
+    const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW" }, false, unmeasurable, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.scope).toBeNull();
+      expect(plan.scopeUnmeasurable).toBe(true);
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("unmeasurable-scope");
+    }
+  });
+
   test("refuses enabling while query is the placeholder", async () => {
     seed([{ ...UI_RULE, query: PLACEHOLDER_QUERY }]);
     const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => 1, { env: env() });
@@ -652,7 +784,7 @@ describe("STALE-FILE REFUSAL (agentsafety second pass): daemon's loaded etag vs 
     const text = seed([UI_RULE]);
     const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => "stale-sha" };
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", { query: "project = NEW" }, etag, false, "irrelevant-hash", deps);
+    const outcome = await writeRuleFields("ui-first-rule", { query: "project = NEW" }, etag, false, "irrelevant-hash", noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -670,9 +802,10 @@ describe("STALE-FILE REFUSAL (agentsafety second pass): daemon's loaded etag vs 
     seed([UI_RULE]);
     const deps: RulesWriteDeps = { env: env(), getSourceEtag: () => rulesEtag(env()) };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -680,9 +813,10 @@ describe("STALE-FILE REFUSAL (agentsafety second pass): daemon's loaded etag vs 
     seed([UI_RULE]);
     const deps: RulesWriteDeps = { env: env() };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 });
@@ -692,9 +826,10 @@ describe("B5a: reload is wired for real (not a stub) — see src/daemon/index.ts
     seed([UI_RULE]);
     const deps: RulesWriteDeps = { env: env(), reload: () => ({ applied: true, problems: [] }) };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     if (outcome.ok) expect(outcome.reload).toEqual({ applied: true, problems: [] });
   });
@@ -703,9 +838,10 @@ describe("B5a: reload is wired for real (not a stub) — see src/daemon/index.ts
     seed([UI_RULE]);
     const deps: RulesWriteDeps = { env: env(), reload: () => ({ applied: false, problems: ["simulated reload failure"] }) };
     const patch = { query: "project = NEW" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    // FACTORY-730: any query change now requires confirm (dry-run scope).
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     if (outcome.ok) expect(outcome.reload).toEqual({ applied: false, problems: ["simulated reload failure"] });
   });
@@ -915,7 +1051,7 @@ describe("STALE-LOCK ERROR is passed through verbatim, naming the lock file", ()
     const patch = { query: "project = NEW" };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) {
       expect(outcome.status).toBe(503);

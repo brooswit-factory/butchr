@@ -189,13 +189,25 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       await expect(api.setEnabled("ui-demo", true, "stale-etag", "h", false)).rejects.toThrow(/etag mismatch/);
     });
 
-    test("updateFields on ui-first-rule's query succeeds while disabled, with zero blast radius (no confirm needed)", async () => {
+    // FACTORY-730 (review round 2, blocking finding — AC3): a query edit is
+    // NEVER zero-blast-radius any more — `planRule` dry-runs the NEW query
+    // and `requiresConfirm`/`confirmReason: "query-change"` regardless of
+    // `stopped`/`restarted` (both still 0 here — a disabled rule's edit
+    // trips NO OTHER gate, which is exactly the case the review found
+    // unprotected). `updateFields` refuses without `confirm: true`.
+    test("updateFields on ui-first-rule's query requires confirm (the new query's dry-run scope), even while disabled (stopped/restarted both 0)", async () => {
       const api = createFixturesRulesApi({ latencyMs: 0 });
       const before = await api.listRules();
       const plan = await api.planRule(FIRST_RULE_ID, { query: "key = XYZ-1" }, false);
       expect(plan.stopped).toBe(0);
       expect(plan.restarted).toBe(0);
-      const result = await api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, plan.planHash, false);
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("query-change");
+      await expect(api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, plan.planHash, false)).rejects.toThrow(/confirm: true/);
+
+      const confirmedPlan = await api.planRule(FIRST_RULE_ID, { query: "key = XYZ-1" }, true);
+      expect(confirmedPlan.requiresConfirm).toBe(false);
+      const result = await api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, confirmedPlan.planHash, true);
       expect(result.changedIds).toEqual([FIRST_RULE_ID]);
       const after = await api.listRules();
       expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.query).toBe("key = XYZ-1");

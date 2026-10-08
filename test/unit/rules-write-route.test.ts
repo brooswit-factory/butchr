@@ -462,7 +462,10 @@ describe("PUT /api/rules/:id", () => {
       writeFileSync(rulesFilePath, originalText);
       const writeDeps = { env: envDeps };
       const noScope = async () => 0;
-      const plan = await planRuleWrite("managers", { query: "project = CHANGED" }, false, noScope, writeDeps);
+      // FACTORY-730 (review round 2): any query change now requires
+      // confirm (dry-run scope) — unrelated to what THIS test means to
+      // prove (atomic write + backup + audit), so it just supplies it.
+      const plan = await planRuleWrite("managers", { query: "project = CHANGED" }, true, noScope, writeDeps);
       if (!plan.ok) throw new Error("expected a successful plan");
       const etag = rulesEtag(envDeps);
 
@@ -472,7 +475,7 @@ describe("PUT /api/rules/:id", () => {
         csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
         rulesWrite: {
           enabled: (() => { throw new Error("unused"); }) as any,
-          fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps)) as any,
+          fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => writeRuleFields(id, patch as any, ifMatch, confirm, planHash, noScope, writeDeps)) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
         },
@@ -481,7 +484,7 @@ describe("PUT /api/rules/:id", () => {
       try {
         const res = await fetch(`${origin}/api/rules/managers`, {
           method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-          body: JSON.stringify({ ifMatch: etag, planHash: plan.planHash, query: "project = CHANGED" }),
+          body: JSON.stringify({ ifMatch: etag, planHash: plan.planHash, query: "project = CHANGED", confirm: true }),
         });
         expect(res.status).toBe(200);
         const nextDoc = JSON.parse(readFileSync(rulesFilePath, "utf8"));
@@ -871,7 +874,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           enabled: (() => { throw new Error("unused"); }) as any,
           fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
             const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
-            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, scopeOf, writeDeps);
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
@@ -908,7 +911,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           enabled: (() => { throw new Error("unused"); }) as any,
           fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
             const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
-            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, scopeOf, writeDeps);
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,

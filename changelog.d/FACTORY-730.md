@@ -6,7 +6,10 @@ bump: minor
   page — a per-row Edit button opens a dialog reusing the shared plan ->
   confirm -> apply write path (ifMatch/etag, planHash, undo), with harness/
   model/effort/permission-mode options from the existing rule-form catalog.
-  A changed query can be dry-run for its matching ticket count before saving.
+- A changed `query` is always dry-run against its new text and must be
+  confirmed before it applies — server-enforced (`POST /api/rules/plan` and
+  `PUT /api/rules/:id` both refuse a query edit without `confirm: true`),
+  regardless of whether the rule is currently enabled or disabled.
 - `GET /api/rules/:id/preview` accepts an optional `?query=` override, dry-
   running a draft (not-yet-saved) query through the same preview capability.
 

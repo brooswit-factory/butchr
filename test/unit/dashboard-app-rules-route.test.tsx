@@ -320,9 +320,14 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     expect(wrote).toBe(false);
   });
 
-  test("shows the guided form when ui-first-rule is present, and saving a new query succeeds with zero blast radius (no confirm)", async () => {
+  // FACTORY-730 (review round 2): ANY query change now requires a
+  // server-enforced confirm (the dry-run scope count) — this is no longer
+  // a zero-blast-radius save, even for a disabled rule whose query was
+  // still the placeholder. The confirm step's own count comes from the
+  // fixture's default (no `previewsByQuery` override): 0 tickets.
+  test("shows the guided form when ui-first-rule is present, and saving a new query shows a confirm step (the new-query scope count) before it succeeds", async () => {
     const api = createFixturesRulesApi({ initial: defaultRulesFixture(), latencyMs: 0 });
-    const { findByTestId, findAllByTestId } = render(<RulesRoute api={api} />);
+    const { findByTestId, findAllByTestId, getByRole } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
     const section = await findByTestId("first-rule-setup");
     expect(section).toBeTruthy();
@@ -332,6 +337,10 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     const saveButtons = section.querySelectorAll("button");
     const saveButton = Array.from(saveButtons).find((b) => b.textContent === "save query")!;
     fireEvent.click(saveButton);
+
+    const confirm = await findByTestId("first-rule-confirm");
+    expect(confirm.textContent).toContain("scope 0 ticket");
+    fireEvent.click(getByRole("button", { name: "confirm" }));
 
     await waitFor(async () => {
       const after = await api.listRules();
@@ -425,6 +434,9 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     const input = (await findByTestId("first-rule-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "key = XYZ-1" } });
     fireEvent.click(getByRole("button", { name: "save query" }));
+    // FACTORY-730 (review round 2): ANY query change now requires confirm.
+    await findByTestId("first-rule-confirm");
+    fireEvent.click(getByRole("button", { name: "confirm" }));
     const undoButton = await findByTestId("first-rule-undo");
     fireEvent.click(undoButton);
     await waitFor(async () => {
@@ -446,6 +458,10 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     const input = (await findByTestId("first-rule-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "key = XYZ-1" } });
     fireEvent.click(getByRole("button", { name: "save query" }));
+    // FACTORY-730 (review round 2): ANY query change now requires confirm;
+    // the simulated rate limit only fires on the real write, not the plan.
+    await findByTestId("first-rule-confirm");
+    fireEvent.click(getByRole("button", { name: "confirm" }));
     const error = await findByTestId("first-rule-error");
     expect(error.textContent).toContain("Too many changes — try again in 6s");
   });
@@ -457,6 +473,10 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     const input = (await findByTestId("first-rule-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "key = XYZ-1" } });
     fireEvent.click(getByRole("button", { name: "save query" }));
+    // FACTORY-730 (review round 2): ANY query change now requires confirm;
+    // the simulated rate limit only fires on the real write, not the plan.
+    await findByTestId("first-rule-confirm");
+    fireEvent.click(getByRole("button", { name: "confirm" }));
     const error = await findByTestId("first-rule-error");
     expect(error.textContent).toContain("too many changes — rate limited, retry shortly");
     expect(error.textContent).not.toContain("Too many changes — try again in");

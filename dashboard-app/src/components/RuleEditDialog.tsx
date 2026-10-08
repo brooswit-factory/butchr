@@ -13,15 +13,19 @@
  * permission-mode options come from `GET /api/rules/catalog`
  * (`api.getCatalog()`) — never a second, hand-maintained list.
  *
- * QUERY DRY-RUN (ticket item 3): whenever the draft query differs from the
- * rule's own saved query, a "check scope" button dry-runs the DRAFT text
- * through the SAME preview capability the Preview button already uses
- * (`api.previewRule(ruleId, signal, draftQuery)` — FACTORY-730's own
- * `queryOverride` param, `../api/rules.js`), so the operator sees what the
- * NEW query would match before ever saving it, independent of whether the
- * save itself also needs a confirm (an edit to a currently-disabled rule's
- * query never trips the stop/restart gate, but the scope is still worth
- * seeing before save).
+ * QUERY DRY-RUN (ticket item 3, review round 2): a CHANGED query is now a
+ * SERVER-ENFORCED confirm gate, same mechanism as a stop/restart or a risky
+ * permission — `planRule` dry-runs the NEW query text whenever it differs
+ * from the rule's saved one (regardless of the rule's enabled state) and
+ * reports it back as `scopeCount` with `confirmReason: "query-change"`.
+ * Save always goes through `planRule` first; when that scope requires
+ * confirming, the SAME confirm step every other gate here already uses
+ * shows "this query would now match N ticket(s)" and the write is refused
+ * server-side until `confirm: true` is resent — there is no separate,
+ * optional "check scope" affordance to skip (a prior revision had one; the
+ * review found it did not actually gate Save, which is the whole point of
+ * AC3). A disabled rule's query edit, previously zero-blast-radius, now
+ * ALSO goes through this confirm step.
  */
 import { useEffect, useState } from "react";
 import { Button, Dialog, Modal, ModalOverlay, Switch } from "@launchpad-ui/components";
@@ -72,8 +76,6 @@ interface PendingAction {
   ticketKeys?: string[];
 }
 
-type ScopePreviewState = { kind: "idle" } | { kind: "loading" } | { kind: "loaded"; total: number } | { kind: "error"; error: string };
-
 export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChanged, onClose }: RuleEditDialogProps) {
   const [draftQuery, setDraftQuery] = useState(rule.query);
   const [draftHarness, setDraftHarness] = useState<AgentHarness>(rule.agentPreferences[0]?.harness ?? AGENT_HARNESSES[0]);
@@ -86,7 +88,6 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
-  const [scopePreview, setScopePreview] = useState<ScopePreviewState>({ kind: "idle" });
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
 
   useEffect(() => {
@@ -109,14 +110,6 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
 
   const disabled = stale || busy || !canWrite;
   const queryChanged = draftQuery !== rule.query;
-
-  function checkQueryScope() {
-    setScopePreview({ kind: "loading" });
-    api
-      .previewRule(rule.id, undefined, draftQuery)
-      .then((preview) => setScopePreview({ kind: "loaded", total: preview.total }))
-      .catch((e: unknown) => setScopePreview({ kind: "error", error: e instanceof Error ? e.message : String(e) }));
-  }
 
   function startAction(label: string, patch: Parameters<RulesApi["planRule"]>[1], commit: (planHash: string, confirm: boolean) => Promise<RuleWriteResult>) {
     setBusy(true);
@@ -229,10 +222,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             aria-label="rule query"
             data-testid="rule-edit-query-input"
             value={draftQuery}
-            onInput={(e) => {
-              setDraftQuery((e.target as HTMLInputElement).value);
-              setScopePreview({ kind: "idle" });
-            }}
+            onInput={(e) => setDraftQuery((e.target as HTMLInputElement).value)}
             disabled={disabled}
           />
           {isPlaceholder && (
@@ -241,24 +231,9 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             </p>
           )}
           {queryChanged && (
-            <div className="rules-view__scope-preview">
-              <Button size="small" variant="minimal" isDisabled={disabled || scopePreview.kind === "loading"} onPress={checkQueryScope}>
-                check scope for this query
-              </Button>
-              {scopePreview.kind === "loading" && <span> checking…</span>}
-              {scopePreview.kind === "loaded" && (
-                <span data-testid="rule-edit-scope-count">
-                  {" "}
-                  would match {scopePreview.total} ticket{scopePreview.total === 1 ? "" : "s"}
-                </span>
-              )}
-              {scopePreview.kind === "error" && (
-                <span className="rules-view__cnc" data-testid="rule-edit-scope-error">
-                  {" "}
-                  could not check scope — {scopePreview.error}
-                </span>
-              )}
-            </div>
+            <p className="rules-view__cnc" data-testid="rule-edit-query-changed-notice">
+              saving a changed query requires confirming what it would now match
+            </p>
           )}
 
           {canEditPreferences(rule) ? (
@@ -388,9 +363,24 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
           {pendingAction && (
             <div className="rules-view__cnc" data-testid="rule-edit-confirm">
               <p>
-                this would start {pendingAction.plan.spawned} agent{pendingAction.plan.spawned === 1 ? "" : "s"}
-                {pendingAction.plan.scopeCount !== undefined ? `, scope ${pendingAction.plan.scopeCount} ticket${pendingAction.plan.scopeCount === 1 ? "" : "s"}` : ""}, stop{" "}
-                {pendingAction.plan.stopped}, and restart {pendingAction.plan.restarted} — confirm {pendingAction.label}?
+                {/* FACTORY-730 (review round 2): a query-change confirm leads
+                    with the dry-run scope count itself ("this query would now
+                    match N tickets") — the actionable number AC3 asks for —
+                    rather than the generic spawn/stop/restart summary, which
+                    for a disabled rule's query edit would otherwise read "0
+                    agents, 0 stop, 0 restart" and bury the one number that
+                    matters. */}
+                {pendingAction.plan.confirmReason === "query-change" ? (
+                  <>
+                    this query would now match {pendingAction.plan.scopeCount ?? 0} ticket{(pendingAction.plan.scopeCount ?? 0) === 1 ? "" : "s"} — confirm {pendingAction.label}?
+                  </>
+                ) : (
+                  <>
+                    this would start {pendingAction.plan.spawned} agent{pendingAction.plan.spawned === 1 ? "" : "s"}
+                    {pendingAction.plan.scopeCount !== undefined ? `, scope ${pendingAction.plan.scopeCount} ticket${pendingAction.plan.scopeCount === 1 ? "" : "s"}` : ""}, stop{" "}
+                    {pendingAction.plan.stopped}, and restart {pendingAction.plan.restarted} — confirm {pendingAction.label}?
+                  </>
+                )}
                 {(pendingAction.plan.confirmReason === "swarm-enable" || pendingAction.plan.confirmReason === "scope-ceiling") && (
                   <span data-testid="rule-edit-confirm-tickets">
                     {" "}

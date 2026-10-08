@@ -275,8 +275,19 @@ export interface ScopeOf {
  * cached reading can never survive whatever caused the reload, even for a
  * rule whose query text happens not to have changed (e.g. the underlying
  * Jira data shifted instead).
+ *
+ * FACTORY-730 (review round 2): `queryText` IS now also forwarded to the raw
+ * `scopeOf` as its own `queryOverride` param — the review's own finding was
+ * that a changed-but-not-yet-saved `query` was never dry-run against its
+ * NEW text at all (only the enable path's `current.query` was ever
+ * measured). `createRulesPreviewer`'s own `queryOverride` (`../web/rules-
+ * preview.ts`) makes this safe for the PRE-EXISTING enable call site too:
+ * `writeRuleEnabled`/`planRuleWrite`'s own enable-scope call always passes
+ * the rule's CURRENT query as `queryText`, so forwarding it as an
+ * "override" there searches with the SAME text the rule already carries —
+ * byte-identical behavior, never a second code path.
  */
-export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps: ScopeCacheDeps = {}): ScopeOf {
+export function createScopeCache(scopeOf: (id: string, queryOverride: string) => Promise<number>, deps: ScopeCacheDeps = {}): ScopeOf {
   const ttlMs = deps.ttlMs ?? 10_000;
   const now = deps.now ?? (() => Date.now());
   const cache = new Map<string, { scope: number; at: number }>();
@@ -285,7 +296,7 @@ export function createScopeCache(scopeOf: (id: string) => Promise<number>, deps:
     const t = now();
     const cached = cache.get(key);
     if (cached !== undefined && t - cached.at < ttlMs) return cached.scope;
-    const scope = await scopeOf(id);
+    const scope = await scopeOf(id, queryText);
     cache.set(key, { scope, at: t });
     return scope;
   }) as ScopeOf;
@@ -469,11 +480,42 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
  * `planHash`/`confirm` binding as `writeRuleEnabled` (B3): editing
  * `query`/`agentPreferences` on an already-enabled rule restarts its agent
  * (`restarted=1`), which now requires `confirm: true` exactly like a stop.
+ *
+ * FACTORY-730 (review round 2, blocking finding): a CHANGED `query` is ALSO
+ * dry-run against its NEW text and bound into the hash/confirm gate below,
+ * independent of `restarted` — a query edit to a currently-DISABLED rule
+ * (`restarted` stays 0; nothing else here would have required a confirm)
+ * still must show, and confirm, what the new query would match. Same
+ * pre-lock-then-recheck-under-lock shape as `writeRuleEnabled`'s own
+ * `scopeForHash` — see that function's own comment for why (`updateRulesFile`'s
+ * mutator is synchronous, so the real Jira call can never run inside it).
  */
-export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string, deps: RulesWriteDeps): RulesWriteOutcome {
+export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
   if (patch.enabled !== undefined) {
     return { ok: false, status: 400, error: `PUT /api/rules/:id does not accept "enabled" — use POST /api/rules/:id/enabled` };
   }
+  const env = deps.env ?? process.env;
+
+  let scopeForHash: number | null = null;
+  if (patch.query !== undefined) {
+    let current: Record<string, unknown>;
+    try {
+      current = readRuleById(readCurrentRulesText(env), id);
+    } catch (e) {
+      if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
+      throw e;
+    }
+    if (patch.query !== current.query) {
+      scopeForHash = await scopeOf(id, patch.query);
+      // Same unconditional fail-closed discipline as `writeRuleEnabled`'s
+      // own unmeasurable-scope guard — there is no real number a `confirm:
+      // true` could possibly be confirming otherwise.
+      if (!Number.isFinite(scopeForHash)) {
+        return { ok: false, status: 503, error: `could not evaluate the scope for "${id}"'s new query — the previewer is unavailable; this write is refused closed (even with confirm: true) until scope can be measured — try again` };
+      }
+    }
+  }
+
   let allowedPaths: string[] = [];
   try {
     const result = updateRulesFile(
@@ -484,18 +526,24 @@ export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: stri
         const nextText = applyRuleFieldPatch(currentText, id, patch);
         const counts = computeLocalPlanCounts(rule.enabled === true, patch);
         // `patch.enabled` is always undefined here (guarded above), so
-        // `counts.spawned` is always 0 and no scope was ever evaluated for
-        // this patch (same as `planRuleWrite`'s own gate) — `null`, always.
-        const freshHash = buildPlanHash(nextText, counts, null);
+        // `counts.spawned` is always 0 — a query edit's scope (if any) is
+        // bound in via `queryChanged` below instead, mirroring
+        // `planRuleWrite`'s own `spawned === 0, queryChanged` branch.
+        const queryChanged = patch.query !== undefined && patch.query !== rule.query;
+        const scope = queryChanged ? scopeForHash : null;
+        const freshHash = buildPlanHash(nextText, counts, scope);
         if (freshHash !== planHash) {
           throw new WriteRefusedError(`planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again`, 409);
         }
         requireConfirmForBlastRadius(counts, confirm);
         requireConfirmForRiskyFields(patch, confirm);
+        if (queryChanged && !confirm) {
+          throw new WriteRefusedError(`editing "${id}"'s query would now match ${scopeLabel(scopeForHash ?? Number.POSITIVE_INFINITY)} ticket(s) — retry with confirm: true to proceed`, 409);
+        }
         allowedPaths = buildFieldsAllowedPaths(currentText, id, patch);
         return nextText;
       },
-      deps.env ?? process.env,
+      env,
       deps.io,
       { get allowedPaths() { return allowedPaths; } },
     );
@@ -539,19 +587,29 @@ export interface RulesPlanResult {
   spawned: number;
   stopped: number;
   restarted: number;
+  /**
+   * FACTORY-730: besides the original "would this spawn" dry-run
+   * (`spawned > 0`), `scope` is now ALSO evaluated — against the NEW
+   * `query` text, never the rule's current one — whenever `patch.query`
+   * differs from the rule's current query (`spawned === 0` for every real
+   * `query` edit, since no write path ever combines `query` with
+   * `enabled`). `null` means NEITHER case applied — no previewer call was
+   * ever made for this patch.
+   */
   scope: number | null;
   /**
    * Review round 1 (PR #651) finding 1 — `scope: null` already means "no
-   * previewer call was ever made for this patch" (`spawned === 0`).
+   * previewer call was ever made for this patch" (see `scope`'s own doc
+   * comment for the two cases that DO evaluate it).
    * Without this field, a previewer that genuinely failed (Jira down,
    * timeout) ALSO serializes as `scope: null` (`JSON.stringify` turns
    * `Number.POSITIVE_INFINITY`/`NaN` into `null`), making the two cases
-   * indistinguishable on the wire. `true` only when a spawn WAS evaluated
-   * (`spawned > 0`) but the previewer could not produce a finite reading
-   * — in that case `scope` is still `null` (never a fake number) and
-   * `requiresConfirm` is always `true`. Absent/`false`/omitted in every
-   * other case — a NEW, OPTIONAL field, so an existing reader (e.g. PR
-   * #650) that doesn't know about it sees unchanged behavior.
+   * indistinguishable on the wire. `true` only when a scope WAS evaluated
+   * but the previewer could not produce a finite reading — in that case
+   * `scope` is still `null` (never a fake number) and `requiresConfirm` is
+   * always `true`. Absent/`false`/omitted in every other case — a NEW,
+   * OPTIONAL field, so an existing reader (e.g. PR #650) that doesn't know
+   * about it sees unchanged behavior.
    */
   scopeUnmeasurable?: boolean;
   etag: string;
@@ -566,11 +624,14 @@ export interface RulesPlanResult {
    * condition applies, most-specific first: `"unmeasurable-scope"` (no real
    * number exists to confirm — always wins), `"scope-ceiling"` (a real,
    * over-25 number — more informative than the generic swarm-enable
-   * reason), `"swarm-enable"` (any other swarm enable), `"stop-restart"`,
-   * `"risky-permission"` (FACTORY-729 — `permissionMode: "bypassPermissions"
-   * | "auto"` or `lizardMode: true`; least specific, so a patch that ALSO
-   * trips `stop-restart` reports that instead, which already implies this
-   * one's own "confirm before this lands" posture).
+   * reason), `"swarm-enable"` (any other swarm enable), `"query-change"`
+   * (FACTORY-730 — a CHANGED `query`'s own dry-run scope; an edit to an
+   * ENABLED rule's query also trips `"stop-restart"`, but this is the more
+   * actionable thing to show), `"stop-restart"`, `"risky-permission"`
+   * (FACTORY-729 — `permissionMode: "bypassPermissions" | "auto"` or
+   * `lizardMode: true`; least specific, so a patch that ALSO trips
+   * `stop-restart` reports that instead, which already implies this one's
+   * own "confirm before this lands" posture).
    *
    * DELIBERATE DEVIATION from the ticket's literal `confirmRequired` +
    * `reason` field names (stated here and in the PR body per this ticket's
@@ -578,7 +639,7 @@ export interface RulesPlanResult {
    * already reads it — renaming it is a breaking change to a live client
    * for no behavioral gain, so this field is additive instead.
    */
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart" | "risky-permission";
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission";
 }
 export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; error: string };
 
@@ -622,6 +683,17 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   }
 
   const counts = computeLocalPlanCounts(wasEnabled, patch);
+  // FACTORY-730 (review round 2, blocking finding): a CHANGED `query` must
+  // be dry-run against its NEW text — regardless of `counts.spawned`, which
+  // is 0 for every PUT (a field edit never spawns) — so a query edit to a
+  // currently-DISABLED rule (zero blast radius by every OTHER gate here)
+  // still shows, and requires confirming, what the new query would match.
+  // Mutually exclusive with the spawn-scope branch below in every real
+  // write path (`writeRuleEnabled` never sends `query`; `writeRuleFields`
+  // never sends `enabled`) — only this report-only endpoint's own general
+  // `patch` could combine them, in which case the spawn scope (the rule
+  // ACTUALLY starting up) takes priority as the more consequential one.
+  const queryChanged = patch.query !== undefined && patch.query !== current.query;
   let scope: number | null = null;
   let scopeUnmeasurable = false;
   if (counts.spawned > 0) {
@@ -637,25 +709,40 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
       // real number for a caller to have confirmed.
       scopeUnmeasurable = true;
     }
+  } else if (queryChanged) {
+    const rawScope = await scopeOf(id, patch.query!);
+    if (Number.isFinite(rawScope)) {
+      scope = rawScope;
+    } else {
+      scopeUnmeasurable = true;
+    }
   }
   // FACTORY-685 (item 2): ANY enable of a swarm rule needs confirm, not
   // only one above the ceiling — computed "raw" (independent of `confirm`)
   // so `confirmReason` can classify the gate even on a call that already
   // supplied `confirm: true`.
   const rawSwarmEnable = counts.spawned > 0 && executionOf(current.execution) === "swarm";
-  const rawOverCeiling = scope !== null && scope > ENABLE_SCOPE_CEILING;
+  const rawOverCeiling = counts.spawned > 0 && scope !== null && scope > ENABLE_SCOPE_CEILING;
+  // FACTORY-730: raw/unconditional, same discipline as the three gates
+  // above — `queryChanged` alone is the gate (there is no "ceiling" for a
+  // query-change scope; any changed query needs an explicit look, however
+  // small the resulting count).
+  const rawQueryChange = queryChanged;
   const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
   // FACTORY-729: see `requireConfirmForRiskyFields`'s own doc comment — the
   // same raw/unconditional computation style as the three gates above, so
   // `confirmReason` can classify it even on a call that already supplied
   // `confirm: true`.
   const rawRiskyField = isRiskyFieldPatch(patch);
-  const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
+  const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawQueryChange && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
   // `confirmReason` names which gate is why `requiresConfirm` is `true` —
   // absent exactly when `requiresConfirm` is `false` (whether because no
   // gate applies at all, or because `confirm: true` already satisfies every
   // gate that WOULD otherwise apply), never a reason for a gate that isn't
-  // actually requiring anything on THIS call.
+  // actually requiring anything on THIS call. FACTORY-730: `"query-change"`
+  // slots in ABOVE `"stop-restart"` — an edit to an ENABLED rule's query
+  // trips both, and the scope count is the more actionable thing to show
+  // ("this would now match N tickets") than the generic restart count.
   const confirmReason: RulesPlanResult["confirmReason"] = !requiresConfirm
     ? undefined
     : scopeUnmeasurable
@@ -664,9 +751,11 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
         ? "scope-ceiling"
         : rawSwarmEnable
           ? "swarm-enable"
-          : rawStopRestart
-            ? "stop-restart"
-            : "risky-permission";
+          : rawQueryChange
+            ? "query-change"
+            : rawStopRestart
+              ? "stop-restart"
+              : "risky-permission";
 
   const planHash = buildPlanHash(nextText, counts, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
   return {

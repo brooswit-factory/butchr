@@ -169,11 +169,14 @@ export interface RulePlanPatch extends RuleFieldPatch {
  * `POST /api/rules/plan`'s response, named on the ticket:
  * `{planHash, spawned, stopped, restarted, etag, scopeCount?}`.
  * Report-only — computing one never changes anything. `scopeCount` is
- * present only for a patch that would newly enable the rule (a dry-run Jira
- * ticket count); PR #647's own in-flight implementation at the time this was
- * written names this field `scope`, not `scopeCount` — `planRule` below
- * reads either key defensively (see its own comment) so a late rename on
- * that PR doesn't break this slice either way.
+ * present for a patch that would newly enable the rule (a dry-run Jira
+ * ticket count against the CURRENT query) OR — FACTORY-730 — a patch that
+ * CHANGES `query` (a dry-run against the NEW query text, regardless of the
+ * rule's enabled state; `confirmReason: "query-change"` names this case).
+ * PR #647's own in-flight implementation at the time this was written names
+ * this field `scope`, not `scopeCount` — `planRule` below reads either key
+ * defensively (see its own comment) so a late rename on that PR doesn't
+ * break this slice either way.
  */
 export interface RulePlanResponse {
   planHash: string;
@@ -196,8 +199,8 @@ export interface RulePlanResponse {
    */
   requiresConfirm: boolean;
   /** Mirrors `src/rules/rules-write.ts`'s own `RulesPlanResult.confirmReason` — present iff `requiresConfirm` is `true`. Display-only: which gate is why. */
-  /** FACTORY-729 adds `"risky-permission"` — `permissionMode: "bypassPermissions" | "auto"` or `lizardMode: true`, never a default. */
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart" | "risky-permission";
+  /** FACTORY-729 adds `"risky-permission"` — `permissionMode: "bypassPermissions" | "auto"` or `lizardMode: true`, never a default. FACTORY-730 adds `"query-change"` — a CHANGED `query`'s own dry-run scope, regardless of the rule's enabled state. */
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission";
 }
 
 /** The success shape every real write route (`enabled`, `PUT`, `undo`) returns — `RulesWriteOutcome`'s `ok: true` branch, PR #647's `src/rules/rules-write.ts`, minus the `reload` field (an internal daemon detail this UI has no use for). */
@@ -747,25 +750,39 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
       }
       const counts = computeLocalPlanCounts(rule.enabled, patch);
-      const scopeCount = counts.spawned > 0 ? opts.previews?.[ruleId]?.total ?? 0 : undefined;
+      // FACTORY-730 (review round 2): a CHANGED `query` is dry-run against
+      // its NEW text — regardless of `counts.spawned` (always 0 for a real
+      // field edit) — mirroring the real server's own `planRuleWrite`.
+      // `previewsByQuery` (keyed `${ruleId}:${patch.query}`) lets a test fix
+      // a distinct count for the draft text; falls back to `previews`.
+      const queryChanged = patch.query !== undefined && patch.query !== rule.query;
+      const scopeCount = counts.spawned > 0
+        ? opts.previews?.[ruleId]?.total ?? 0
+        : queryChanged
+          ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0
+          : undefined;
       // Mirrors `src/rules/rules-write.ts`'s own `planRuleWrite` gate order
       // (FACTORY-685, item 2): a swarm enable needs confirm at ANY scope,
       // not only above the ceiling.
       const rawSwarmEnable = counts.spawned > 0 && rule.execution === "swarm";
-      const rawOverCeiling = scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      const rawOverCeiling = counts.spawned > 0 && scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      // FACTORY-730: raw/unconditional, same discipline as the gates above.
+      const rawQueryChange = queryChanged;
       const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
       // FACTORY-729: mirrors the real server's own `planRuleWrite` — least-specific gate, see that function's own comment.
       const rawRiskyField = isRiskyFieldPatch(patch);
-      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
+      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawQueryChange && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
       const confirmReason: RulePlanResponse["confirmReason"] = !requiresConfirm
         ? undefined
         : rawOverCeiling
           ? "scope-ceiling"
           : rawSwarmEnable
             ? "swarm-enable"
-            : rawStopRestart
-              ? "stop-restart"
-              : "risky-permission";
+            : rawQueryChange
+              ? "query-change"
+              : rawStopRestart
+                ? "stop-restart"
+                : "risky-permission";
       const base: RulePlanResponse = {
         planHash: `${ruleId}:${JSON.stringify(patch)}:${confirm}:${state.sourceEtag}`,
         spawned: counts.spawned,
@@ -812,6 +829,15 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       const counts = computeLocalPlanCounts(rule.enabled, patch);
       requireConfirmForBlastRadius(counts, confirm);
       requireConfirmForRiskyFields(patch, confirm);
+      // FACTORY-730 (review round 2): a CHANGED query must be confirmed —
+      // mirrors the real server's own `writeRuleFields` gate, regardless of
+      // whether `requireConfirmForBlastRadius` above already caught it
+      // (an enabled rule's query edit trips both; a disabled rule's trips
+      // only this one).
+      if (patch.query !== undefined && patch.query !== rule.query && !confirm) {
+        const scopeCount = opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0;
+        throw new Error(`editing "${ruleId}"'s query would now match ${scopeCount} ticket(s) — retry with confirm: true to proceed`);
+      }
       const updated: RuleDto = {
         ...rule,
         query: patch.query ?? rule.query,

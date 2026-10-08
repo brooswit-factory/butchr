@@ -267,7 +267,7 @@ export interface ViewDeps {
    */
   rulesWrite?: {
     enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
-    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => RulesWriteOutcome;
+    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
@@ -991,7 +991,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // summary's "old" side must be the PRE-write value, never the
       // just-written one a read taken after would see.
       const ruleBeforeWrite = deps.getRules?.()?.find((r) => r.id === id);
-      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
+      const outcome = await deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
       auditOutcome(deps, { route: "PUT /api/rules/:id", action: buildFieldDiffSummary(ruleBeforeWrite, parsed.patch), ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;

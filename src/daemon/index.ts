@@ -988,8 +988,8 @@ const auditWrite = createAuditLogger({
 // per-rule rate limit (which previously fell through to the
 // `Number.POSITIVE_INFINITY` fail-safe below, tripping the scope ceiling
 // on every back-to-back apply).
-const scopeOf = createScopeCache(async (id: string): Promise<number> => {
-  const result = await rulesPreviewer(id);
+const scopeOf = createScopeCache(async (id: string, queryOverride: string): Promise<number> => {
+  const result = await rulesPreviewer(id, queryOverride);
   return result.ok ? result.total : Number.POSITIVE_INFINITY;
 });
 const rulesWriteDeps = {
@@ -1172,7 +1172,7 @@ const { app, mcp } = buildApp({
   writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (client) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }), csrf: csrfIssuer },
   rulesWrite: {
     enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
-    fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, rulesWriteDeps),
+    fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
   },

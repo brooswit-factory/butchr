@@ -44,14 +44,31 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     expect(input.value).toBe("project = FACTORY AND type = Epic");
   });
 
-  test("editing a disabled rule's query and saving writes it with zero blast radius (no confirm)", async () => {
-    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+  // FACTORY-730 (review round 2, blocking finding — AC3): a query edit is
+  // NEVER zero-blast-radius any more, even for a disabled rule — Save shows
+  // a confirm step naming the new query's own dry-run scope, and the write
+  // is refused server-side (via the fixture's own mirrored gate) until
+  // that confirm is sent. This replaces the old "...with zero blast radius
+  // (no confirm)" test, whose premise the review found unsafe (AC3).
+  test("editing a disabled rule's query shows a confirm step naming the new scope, and only writes once confirmed", async () => {
+    const api = createFixturesRulesApi({
+      initial: { rules: [rule()], errors: [] },
+      latencyMs: 0,
+      previewsByQuery: { "epics:project = FACTORY AND type = Epic AND status != Done": { ruleId: "epics", total: 7, tickets: [] } },
+    });
     const { findByTestId, getByRole } = render(
       <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
     );
     const input = (await findByTestId("rule-edit-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "project = FACTORY AND type = Epic AND status != Done" } });
     fireEvent.click(getByRole("button", { name: "Save" }));
+    const confirm = await findByTestId("rule-edit-confirm");
+    expect(confirm.textContent).toContain("would now match 7 tickets");
+
+    const stillOld = await api.listRules();
+    expect(stillOld.rules.find((r) => r.id === "epics")!.query).toBe(rule().query);
+
+    fireEvent.click(getByRole("button", { name: "confirm" }));
     await waitFor(async () => {
       const after = await api.listRules();
       expect(after.rules.find((r) => r.id === "epics")!.query).toBe("project = FACTORY AND type = Epic AND status != Done");
@@ -59,13 +76,21 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     expect(await findByTestId("rule-edit-undo")).toBeTruthy();
   });
 
-  // ticket item 3: a confirm step is required before applying an edit that
-  // would restart a running agent, and applying without confirming is
-  // impossible (server-enforced — the fixture mirrors the real server's own
-  // `requireConfirmForBlastRadius`).
-  test("editing the query of an ALREADY-ENABLED rule shows a confirm step naming the restart, and only writes once confirmed", async () => {
+  // ticket item 3: a confirm step is required before applying a query edit
+  // to an ENABLED rule, and applying without confirming is impossible
+  // (server-enforced — the fixture mirrors the real server's own
+  // `requireConfirmForBlastRadius`). FACTORY-730 (review round 2):
+  // `confirmReason` is `"query-change"` here, not the generic
+  // `"stop-restart"` — both gates independently require confirm (either
+  // alone would block Save), but the dialog leads with the more actionable
+  // scope count rather than the generic restart count when both apply.
+  test("editing the query of an ALREADY-ENABLED rule shows a confirm step naming the new scope, and only writes once confirmed", async () => {
     const enabledRule = rule({ enabled: true });
-    const api = createFixturesRulesApi({ initial: { rules: [enabledRule], errors: [] }, latencyMs: 0 });
+    const api = createFixturesRulesApi({
+      initial: { rules: [enabledRule], errors: [] },
+      latencyMs: 0,
+      previewsByQuery: { "epics:project = FACTORY AND type = Epic AND status != Done": { ruleId: "epics", total: 3, tickets: [] } },
+    });
     const { findByTestId, getByRole } = render(
       <RuleEditDialog api={api} rule={enabledRule} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
     );
@@ -73,7 +98,7 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     fireEvent.input(input, { target: { value: "project = FACTORY AND type = Epic AND status != Done" } });
     fireEvent.click(getByRole("button", { name: "Save" }));
     const confirm = await findByTestId("rule-edit-confirm");
-    expect(confirm.textContent).toContain("restart 1");
+    expect(confirm.textContent).toContain("would now match 3 tickets");
 
     const stillOld = await api.listRules();
     expect(stillOld.rules.find((r) => r.id === "epics")!.query).toBe(enabledRule.query);
@@ -85,12 +110,12 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     });
   });
 
-  // ticket item 3: "before apply, show the operator what the edit would do,
-  // including the dry-run/preview scope count for a CHANGED query" — the
-  // scope check is available (and surfaces a count) independent of whether
-  // the save itself needs a confirm (this rule is DISABLED, so saving its
-  // query alone never trips the stop/restart gate).
-  test("FACTORY-730 (ticket item 3): changing the query reveals a 'check scope' control that dry-runs the DRAFT text and shows the count, before saving", async () => {
+  // ticket item 3 / AC3 (review round 2): "applying without the confirm
+  // step must be impossible (server-enforced, not just UI)" — a changed
+  // query shows a notice as soon as it's dirty, and clicking Save (never
+  // skippable) is what surfaces the actual dry-run scope count, inside the
+  // mandatory confirm step itself.
+  test("FACTORY-730 (ticket item 3 / AC3): a dirty query shows a notice, and Save's confirm step shows the new query's own dry-run count", async () => {
     const api = createFixturesRulesApi({
       initial: { rules: [rule()], errors: [] },
       latencyMs: 0,
@@ -99,12 +124,13 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     const { findByTestId, getByRole, queryByTestId } = render(
       <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
     );
-    expect(queryByTestId("rule-edit-scope-count")).toBeNull();
+    expect(queryByTestId("rule-edit-query-changed-notice")).toBeNull();
     const input = (await findByTestId("rule-edit-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "project = FACTORY AND type = Epic AND status != Done" } });
-    fireEvent.click(getByRole("button", { name: "check scope for this query" }));
-    const scope = await findByTestId("rule-edit-scope-count");
-    expect(scope.textContent).toContain("would match 7 tickets");
+    expect(await findByTestId("rule-edit-query-changed-notice")).toBeTruthy();
+    fireEvent.click(getByRole("button", { name: "Save" }));
+    const confirm = await findByTestId("rule-edit-confirm");
+    expect(confirm.textContent).toContain("would now match 7 tickets");
   });
 
   test("setting permissionMode: bypassPermissions requires an explicit confirm before saving", async () => {
@@ -133,6 +159,12 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     const input = (await findByTestId("rule-edit-query-input")) as HTMLInputElement;
     fireEvent.input(input, { target: { value: "project = CHANGED" } });
     fireEvent.click(getByRole("button", { name: "Save" }));
+    // FACTORY-730 (review round 2): the query change itself now requires a
+    // confirm step first (planRule's own `requiresConfirm`, independent of
+    // the sourceEtag) — the etag mismatch only surfaces once that's
+    // confirmed and the real write (`updateFields`) is attempted.
+    await findByTestId("rule-edit-confirm");
+    fireEvent.click(getByRole("button", { name: "confirm" }));
     const error = await findByTestId("rule-edit-error");
     expect(error.textContent).toContain("etag mismatch");
   });

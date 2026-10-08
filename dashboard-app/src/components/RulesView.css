@@ -104,10 +104,3 @@
   flex-wrap: wrap;
   gap: var(--lp-spacing-150);
 }
-
-/** FACTORY-730 — `RuleEditDialog.tsx`'s "check scope for this query" row. */
-.rules-view__scope-preview {
-  display: flex;
-  align-items: center;
-  gap: var(--lp-spacing-100);
-}
