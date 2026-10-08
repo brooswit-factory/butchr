@@ -12,10 +12,19 @@
  *     the file is always a manual step outside this UI (scope discipline:
  *     "no new server/API endpoints").
  *   - `rule` is present: the guided form (starter query examples, a
- *     model/effort picker when the rule already carries a preference slot
- *     to edit — see `canEditPreferences`'s own comment for why an EMPTY
- *     `agentPreferences` array can't just grow one), Preview (via the
- *     existing `RulePreviewDialog`), Save, Enable/Disable, and Undo.
+ *     provider/model/effort picker when the rule already carries a
+ *     preference slot to edit — see `canEditPreferences`'s own comment for
+ *     why an EMPTY `agentPreferences` array can't just grow one — plus a
+ *     permission-mode picker and lizard-mode toggle, FACTORY-729, which
+ *     apply regardless of that slot), Preview (via the existing
+ *     `RulePreviewDialog`), Save, Enable/Disable, and Undo.
+ *
+ * FACTORY-729: the provider/model/effort/permission-mode options above are
+ * never hardcoded here — all four, plus whether a custom model id is
+ * allowed, are fetched once on mount from `GET /api/rules/catalog`
+ * (`api.getCatalog()`), the SAME catalog (`../../../src/rules/rule-form-
+ * catalog.js`'s `RULE_FORM_CATALOG`) the write path's own validator checks
+ * every submitted value against server-side.
  *
  * WRITE DISCIPLINE (ticket items 3-5): every write goes through
  * `planRule` FIRST to get a fresh `planHash` — the SAME plan the real
@@ -25,9 +34,14 @@
  * `sourceEtag` (never `fileEtag` — ticket item 5). `stale` disables every
  * control here outright, independent of `canWrite`.
  */
-import { useState } from "react";
-import { Alert, AlertText, Button, Text } from "@launchpad-ui/components";
+import { useEffect, useState } from "react";
+import { Alert, AlertText, Button, Switch, Text } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
+// FACTORY-729: imported from the LEAF module, never `../../../src/rules/rules.js` directly — that
+// module pulls in `node:fs`/`node:crypto` (and more), and a VALUE import of anything named from it
+// (unlike `import type`, which TypeScript erases) drags that whole graph into this Vite client bundle
+// — observed to break the build outright. See `src/rules/agent-harness.ts`'s own top comment.
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import {
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
@@ -35,6 +49,7 @@ import {
   type RuleAgentPreferencePatch,
   type RuleDto,
   type RuleFieldPatch,
+  type RuleFormCatalogEntry,
   type RulePlanResponse,
   type RuleWriteResult,
   type RulesApi,
@@ -108,14 +123,42 @@ function canEditPreferences(rule: RuleDto): boolean {
 
 export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChanged }: FirstRuleSetupProps) {
   const [draftQuery, setDraftQuery] = useState(rule?.query ?? "");
+  const [draftHarness, setDraftHarness] = useState<AgentHarness>(rule?.agentPreferences[0]?.harness ?? AGENT_HARNESSES[0]);
   const [draftModel, setDraftModel] = useState(rule?.agentPreferences[0]?.model ?? "");
+  /** Set only by explicitly picking "Other…" in the model select below — reset whenever a shipped model (or "butchr's default") is picked instead. `showCustomModelInput` below ALSO goes true automatically once the catalog loads if the rule's current model isn't in the shipped list, with no need for this flag to anticipate that. */
+  const [forceCustomModel, setForceCustomModel] = useState(false);
   const [draftEffort, setDraftEffort] = useState<AgentEffort | "">(rule?.agentPreferences[0]?.effort ?? "");
+  const [draftPermissionMode, setDraftPermissionMode] = useState<RulePermissionMode | "">(rule?.permissionMode ?? "");
+  const [draftLizardMode, setDraftLizardMode] = useState(rule?.lizardMode ?? false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  // FACTORY-729: `GET /api/rules/catalog`, fetched once on mount — the
+  // single source for the harness/model/effort/permission-mode dropdowns
+  // below, never a hardcoded list. `null` until it resolves (the pickers
+  // render with no options meanwhile — `stale`/`busy` already disable every
+  // control until the first `/api/rules` poll lands anyway, so a brief
+  // catalog-less render is not actionable either way).
+  const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void api.getCatalog().then((c) => {
+      if (!cancelled) setCatalog(c);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [api]);
+  const catalogEntry = catalog?.find((e) => e.harness === draftHarness);
+  const shippedModels = catalogEntry?.models ?? [];
+  const modelInShippedList = draftModel !== "" && shippedModels.includes(draftModel);
+  const showCustomModelInput = forceCustomModel || (draftModel !== "" && !modelInShippedList);
+  const modelSelectValue = showCustomModelInput ? "__custom__" : draftModel;
+  const effortOptions = catalogEntry?.efforts ?? AGENT_EFFORTS;
+  const permissionModeOptions = catalogEntry?.permissionModes ?? RULE_PERMISSION_MODES;
 
   const disabled = stale || busy || !canWrite;
 
@@ -175,11 +218,27 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
 
   function handleSavePreferences() {
     if (!rule || !canEditPreferences(rule)) return;
-    const entry: RuleAgentPreferencePatch = {};
+    const entry: RuleAgentPreferencePatch = { harness: draftHarness };
     if (draftModel) entry.model = draftModel;
     if (draftEffort) entry.effort = draftEffort;
     const patch: RuleFieldPatch = { agentPreferences: [entry] };
     startAction("save agent preferences", patch, (planHash, confirm) => api.updateFields(rule.id, patch, sourceEtag, planHash, confirm));
+  }
+
+  /**
+   * FACTORY-729 — `permissionMode`/`lizardMode` share one Save button: both
+   * are top-level `Rule` fields (unlike `agentPreferences`, there is no
+   * per-slot gate to check first). `permissionMode: ""` ("butchr's
+   * default") is OMITTED from the patch entirely rather than sent as some
+   * sentinel — there is no "clear this field" value on the wire, only
+   * "don't mention it" (same discipline `draftModel`/`draftEffort` already
+   * follow in `handleSavePreferences` above). `lizardMode` is always sent —
+   * a checkbox has no "leave unchanged" state to omit instead.
+   */
+  function handleSaveLaunchSettings() {
+    if (!rule) return;
+    const patch: RuleFieldPatch = { lizardMode: draftLizardMode, ...(draftPermissionMode ? { permissionMode: draftPermissionMode } : {}) };
+    startAction("save launch settings", patch, (planHash, confirm) => api.updateFields(rule.id, patch, sourceEtag, planHash, confirm));
   }
 
   function handleEnable() {
@@ -294,16 +353,69 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
 
       {canEditPreferences(rule) ? (
         <>
-          <label htmlFor="first-rule-model-input">preferred model</label>
-          <input
-            id="first-rule-model-input"
-            type="text"
-            aria-label="preferred model"
-            data-testid="first-rule-model-input"
-            value={draftModel}
-            onInput={(e) => setDraftModel((e.target as HTMLInputElement).value)}
+          <label htmlFor="first-rule-harness-select">provider</label>
+          {/* FACTORY-729 — `AGENT_HARNESSES` fallback keeps this select
+              populated before the catalog resolves; its OWN values are what
+              drive `catalogEntry` (and so the model/effort options below)
+              once it does. */}
+          <select
+            id="first-rule-harness-select"
+            aria-label="provider"
+            data-testid="first-rule-harness-select"
+            value={draftHarness}
+            onChange={(e) => {
+              setDraftHarness(e.target.value as AgentHarness);
+              setForceCustomModel(false);
+              setDraftModel("");
+              setDraftEffort("");
+            }}
             disabled={disabled}
-          />
+          >
+            {(catalog?.map((c) => c.harness) ?? AGENT_HARNESSES).map((h) => (
+              <option key={h} value={h}>
+                {h}
+              </option>
+            ))}
+          </select>
+
+          <label htmlFor="first-rule-model-select">preferred model</label>
+          <select
+            id="first-rule-model-select"
+            aria-label="preferred model"
+            data-testid="first-rule-model-select"
+            value={modelSelectValue}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (v === "__custom__") {
+                setForceCustomModel(true);
+              } else {
+                setForceCustomModel(false);
+                setDraftModel(v);
+              }
+            }}
+            disabled={disabled}
+          >
+            <option value="">butchr's default</option>
+            {shippedModels.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+            {catalogEntry?.allowsCustomModel !== false && <option value="__custom__">Other…</option>}
+          </select>
+          {showCustomModelInput && (
+            <input
+              id="first-rule-model-input"
+              type="text"
+              aria-label="custom model id"
+              data-testid="first-rule-model-input"
+              placeholder="custom model id"
+              value={draftModel}
+              onInput={(e) => setDraftModel((e.target as HTMLInputElement).value)}
+              disabled={disabled}
+            />
+          )}
+
           <label htmlFor="first-rule-effort-select">preferred effort</label>
           <select
             id="first-rule-effort-select"
@@ -314,14 +426,14 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
             disabled={disabled}
           >
             <option value="">butchr's default</option>
-            {AGENT_EFFORTS.map((e) => (
+            {effortOptions.map((e) => (
               <option key={e} value={e}>
                 {e}
               </option>
             ))}
           </select>
           <Button size="small" isDisabled={disabled} onPress={handleSavePreferences}>
-            save model/effort
+            save provider/model/effort
           </Button>
         </>
       ) : (
@@ -329,6 +441,50 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
           this rule has no agent preference slot to edit yet — it uses butchr's global agent config
         </Text>
       )}
+
+      <label htmlFor="first-rule-permission-mode-select">permission mode</label>
+      <select
+        id="first-rule-permission-mode-select"
+        aria-label="permission mode"
+        data-testid="first-rule-permission-mode-select"
+        value={draftPermissionMode}
+        onChange={(e) => setDraftPermissionMode(e.target.value as RulePermissionMode | "")}
+        disabled={disabled}
+      >
+        <option value="">butchr's default</option>
+        {permissionModeOptions.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+      </select>
+      {draftPermissionMode === "bypassPermissions" || draftPermissionMode === "auto" ? (
+        <Text elementType="p" size="small" className="rules-view__cnc" data-testid="first-rule-risky-permission-notice">
+          "{draftPermissionMode}" skips the agent's own permission prompts — saving this needs an explicit confirm
+        </Text>
+      ) : null}
+
+      <label htmlFor="first-rule-lizard-mode-toggle">lizard mode</label>
+      {/* FACTORY-729: a DISTINCT class from `RulesTable`'s own `rules-table__toggle` — the Rules page renders this form ABOVE the rules table, so a shared class name would make `document.querySelector(".rules-table__toggle")` ambiguously match this element first (a real collision, caught by `dashboard-app-rules-route.test.tsx`'s own capabilities.write test). */}
+      <span className="first-rule-lizard-toggle" title="auto-answers unambiguous tool-permission prompts so the agent is never left frozen waiting on one">
+        <Switch
+          id="first-rule-lizard-mode-toggle"
+          data-testid="first-rule-lizard-mode-toggle"
+          isSelected={draftLizardMode}
+          isDisabled={disabled}
+          switchLabels={false}
+          aria-label="lizard mode"
+          onChange={(isSelected) => setDraftLizardMode(isSelected)}
+        />
+      </span>
+      {draftLizardMode && (
+        <Text elementType="p" size="small" className="rules-view__cnc" data-testid="first-rule-lizard-notice">
+          lizard mode is never a default — saving this needs an explicit confirm
+        </Text>
+      )}
+      <Button size="small" isDisabled={disabled} onPress={handleSaveLaunchSettings}>
+        save permission mode/lizard mode
+      </Button>
 
       <Button size="small" variant="minimal" isDisabled={!rule || busy} onPress={() => setPreviewOpen(true)}>
         Preview

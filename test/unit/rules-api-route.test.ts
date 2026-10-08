@@ -280,6 +280,80 @@ describe("GET /api/rules", () => {
   });
 });
 
+describe("GET /api/rules/catalog", () => {
+  test("no dashboardOriginGuard configured: 503, never reached rulesCatalog", async () => {
+    let called = false;
+    const app = liveView(fakeMcp, baseDeps({ rulesCatalog: () => { called = true; return []; } }));
+    const res = await app.handle(new Request("http://local/api/rules/catalog", { headers: { origin: ORIGIN, host: HOST } }));
+    expect(res.status).toBe(503);
+    expect(called).toBe(false);
+  });
+
+  test("forged Origin: 403, never reached peerUidCheck or rulesCatalog", async () => {
+    let checked = false;
+    let called = false;
+    const app = liveView(fakeMcp, baseDeps({
+      dashboardOriginGuard: { port: PORT },
+      peerUidCheck: () => { checked = true; return true; },
+      rulesCatalog: () => { called = true; return []; },
+    }));
+    const res = await app.handle(new Request("http://local/api/rules/catalog", { headers: { origin: "http://evil.example", host: HOST } }));
+    expect(res.status).toBe(403);
+    expect(checked).toBe(false);
+    expect(called).toBe(false);
+  });
+
+  test("origin/host pass but peer-uid check fails: 403, never reached rulesCatalog", async () => {
+    const guard = { port: 0 };
+    let called = false;
+    const app = liveView(fakeMcp, baseDeps({
+      dashboardOriginGuard: guard,
+      peerUidCheck: () => false,
+      rulesCatalog: () => { called = true; return []; },
+    }));
+    app.listen(0);
+    const port = app.server?.port ?? 0;
+    guard.port = port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/rules/catalog`, { headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` } });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("no rulesCatalog dep configured (guards pass): 503", async () => {
+    const guard = { port: 0 };
+    const app = liveView(fakeMcp, baseDeps({ dashboardOriginGuard: guard, peerUidCheck: () => true }));
+    app.listen(0);
+    const port = app.server?.port ?? 0;
+    guard.port = port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/rules/catalog`, { headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` } });
+      expect(res.status).toBe(503);
+    } finally { await app.stop(true); }
+  });
+
+  test("all guards pass: 200, returns the catalog verbatim, no-store", async () => {
+    const guard = { port: 0 };
+    const fakeCatalog = [{ harness: "claude", models: ["sonnet"], allowsCustomModel: true, efforts: ["low"], permissionModes: ["default"] }];
+    const app = liveView(fakeMcp, baseDeps({
+      dashboardOriginGuard: guard,
+      peerUidCheck: () => true,
+      rulesCatalog: () => fakeCatalog as never,
+    }));
+    app.listen(0);
+    const port = app.server?.port ?? 0;
+    guard.port = port;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/rules/catalog`, { headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` } });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
+      const body = await res.json();
+      expect(body).toEqual({ harnesses: fakeCatalog });
+    } finally { await app.stop(true); }
+  });
+});
+
 describe("GET /api/rules/:id/preview", () => {
   test("no dashboardOriginGuard: 503, never checks peer uid or previews", async () => {
     let checked = false;

@@ -38,6 +38,7 @@ import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
+import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
 import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -1144,6 +1145,8 @@ const { app, mcp } = buildApp({
   // (passed to `buildApp` above) is read fresh too, by this route itself —
   // that gap between it and this call's own `fileEtag` is exactly what
   // `stale` reports.
+  // FACTORY-729: `GET /api/rules/catalog`'s own data — pure constants, no I/O.
+  rulesCatalog: () => RULE_FORM_CATALOG,
   rulesFileState: async () => {
     let mtime: string | null = null;
     try {
