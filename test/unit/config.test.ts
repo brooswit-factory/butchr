@@ -120,6 +120,22 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("pollStaleMs=60000");
   });
 
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs defaults to 10000, honours BUTCHR_HERDR_TIMEOUT_MS, and rejects 0/negative/NaN/non-numeric", () => {
+    expect(loadConfig(base, noRead).herdrCallTimeoutMs).toBe(10_000);
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "5000" }, noRead).herdrCallTimeoutMs).toBe(5_000);
+    for (const bad of ["0", "-1", "NaN", "nope"]) {
+      expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: bad }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    }
+  });
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs throws above its ceiling (300000) instead of silently clamping", () => {
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300000" }, noRead).herdrCallTimeoutMs).toBe(300_000);
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300001" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    // The specific overflow value the finding named (2147483648ms, which bun's
+    // setTimeout silently wraps to ~1ms instead of waiting) must throw too,
+    // not merely "some" large value above the ceiling.
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "2147483648" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+  });
+
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
     const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
     expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });
