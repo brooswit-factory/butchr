@@ -567,8 +567,11 @@ already has (FACTORY-662/FACTORY-729) and the Rules page form it serves:
 - **The Rules page form**: FACTORY-725/FACTORY-729 ship their
   catalog-sourced dropdowns and the lizard toggle only on the first-rule
   setup form (`FirstRuleSetup.tsx`) — editing an EXISTING rule's form is
-  FACTORY-726, a different epic, still shelved. The "Included in capacity"
-  toggle lands on that same `FirstRuleSetup` surface, in the same
+  FACTORY-730 (corrected from an earlier, wrong "FACTORY-726" citation —
+  see FACTORY-748's 2026-10-08 correction comment on FACTORY-756), a
+  different epic, actively in flight as of this writing (PR #704, OPEN
+  with CHANGES_REQUESTED). The "Included in capacity" toggle lands on
+  that same `FirstRuleSetup` surface, in the same
   field-definition/validation/layout pattern as the lizard toggle, and
   nowhere else — there is no existing-rule edit form to add it to yet.
   Toggling it off shows the same "never a default, needs confirm" notice
