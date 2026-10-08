@@ -35,6 +35,17 @@ claude
 
 The second command, run once, walks you through signing in.
 
+### Installing herdr's Claude integration
+
+Every host that runs herdr and `claude` also needs herdr's Claude integration. It adds a SessionStart hook that registers each Claude session with herdr, which is what lets herdr bring a pane back with `claude --resume` after a restart or reboot (without it, sessions start fresh).
+
+```
+herdr integration install claude
+herdr integration status     # the claude line should read "current"
+```
+
+This writes `~/.claude/hooks/herdr-agent-state.sh` and adds a hook block to `~/.claude/settings.json`. **Do not overwrite or hand-replace that `settings.json` block** (for example when copying a settings file from another machine): without it, resume silently stops working. If you edit the file, keep the herdr block; to repair it, rerun the install command.
+
 ## 1. Install
 
 ```
