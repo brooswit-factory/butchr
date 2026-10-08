@@ -31,6 +31,16 @@ export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
 const CLEAVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
 /**
+ * FACTORY-751/FACTORY-775: upper bound for `BUTCHR_HERDR_TIMEOUT_MS` — see
+ * `Config.herdrCallTimeoutMs`'s own doc comment for the full rationale
+ * (well under the 2147483647ms int32 `setTimeout` overflow point bun
+ * 1.3.14 shares with `node:timers`, chosen because this knob's own purpose
+ * is already defeated long before that point, not because the overflow
+ * itself is the only concern).
+ */
+export const HERDR_CALL_TIMEOUT_MS_CEILING = 300_000;
+
+/**
  * Butchr's configuration, parsed from the environment once at startup.
  *
  * The Atlassian credential is a classic API token used as HTTP Basic auth
@@ -66,6 +76,21 @@ export interface Config {
    * of the 5s loops (`watchPrompts`, `blockingEscalationTimer`) that also
    * serialize on this client — a timeout this short recovers within one or
    * two of their ticks instead of a human noticing hours later.
+   *
+   * FACTORY-751/FACTORY-775: bounded above by `HERDR_CALL_TIMEOUT_MS_CEILING`
+   * (300_000, 5 minutes) — `loadConfig` throws rather than accepting a value
+   * past it. Below that ceiling this knob behaves as documented; ABOVE it,
+   * on bun 1.3.14, `setTimeout(fn, ms)` for `ms > 2147483647` (~24.8 days,
+   * the int32 millisecond overflow point `node:timers`/Bun share) silently
+   * wraps and fires in about 1ms instead of waiting — i.e. a LARGER value
+   * would make every herdr call reject almost immediately, the exact
+   * opposite of what setting it was meant to do. 300_000 is chosen well
+   * under that overflow point (not merely under it) because this knob's own
+   * purpose — failing a hung call fast enough for a human or the daemon's
+   * own recovery paths to notice — is already defeated long before 2^31ms;
+   * a 5-minute ceiling still comfortably covers a deliberately patient
+   * operator while refusing a value that would make the knob meaningless
+   * (or, past the overflow point, backwards).
    */
   herdrCallTimeoutMs: number;
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
@@ -369,6 +394,23 @@ export interface Config {
    */
   pollStaleMs: number;
   /**
+   * FACTORY-772: how long, in ms, the issue-loop watchdog (src/daemon/
+   * loop-watchdog.ts) tolerates `pollLoop` or `notify` reporting `stale`
+   * (see `pollStaleMs` above — this is a DIFFERENT, longer threshold: going
+   * stale briefly is normal and `/health` already reports it; this is the
+   * point at which the daemon stops waiting and restarts the loop itself)
+   * before forcing a fresh `runResourceLoop` in its place. Default 120_000
+   * (2 minutes, the story's own stated default). BOUNDS-CHECKED, unlike
+   * `BUTCHR_HERDR_TIMEOUT_MS` above (shipped with no upper bound in #682 —
+   * see that var's own comment — a defect this var deliberately does not
+   * repeat): rejected below 30_000 (a watchdog that can trip faster than a
+   * few slow-but-genuine polls would false-positive) or above 1_800_000 (30
+   * minutes — past this a knob this large is not "configure the threshold",
+   * it is "disable the watchdog", which should be an explicit, auditable
+   * choice this var does not offer).
+   */
+  loopWatchdogThresholdMs: number;
+  /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
    * issuetype. All three are optional so a daemon that only ever reads Jira
    * still boots; the refusal for an unstaffable Story/Task/Epic happens
@@ -618,6 +660,7 @@ export interface ConfigEnv {
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
   BUTCHR_HERDR_TIMEOUT_MS?: string | undefined;
+  BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
@@ -810,6 +853,15 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
   const herdrCallTimeoutMs = env.BUTCHR_HERDR_TIMEOUT_MS ? Number(env.BUTCHR_HERDR_TIMEOUT_MS) : 10_000;
   if (!Number.isFinite(herdrCallTimeoutMs) || herdrCallTimeoutMs <= 0) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS is not a positive number: ${env.BUTCHR_HERDR_TIMEOUT_MS}`);
+  if (herdrCallTimeoutMs > HERDR_CALL_TIMEOUT_MS_CEILING) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS=${herdrCallTimeoutMs} is above the ceiling (${HERDR_CALL_TIMEOUT_MS_CEILING}ms): see Config.herdrCallTimeoutMs's own doc comment for why a larger value defeats this knob's purpose`);
+  // FACTORY-772: bounded, unlike BUTCHR_HERDR_TIMEOUT_MS above — see
+  // Config.loopWatchdogThresholdMs' own doc comment for why both ends are
+  // checked (NaN/invalid/out-of-range all rejected clearly, never a silent
+  // fallback) rather than merely "is it a positive number".
+  const loopWatchdogThresholdMs = env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS ? Number(env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS) : 120_000;
+  if (!Number.isFinite(loopWatchdogThresholdMs) || loopWatchdogThresholdMs < 30_000 || loopWatchdogThresholdMs > 1_800_000) {
+    throw new Error(`BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS must be a number between 30000 and 1800000 (ms): ${env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS}`);
+  }
 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
@@ -858,6 +910,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     idleDialogMinutes,
     pollStaleMs,
     herdrCallTimeoutMs,
+    loopWatchdogThresholdMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
@@ -1048,7 +1101,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} ` +
+  `stalledMinutes=${c.stalledMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
