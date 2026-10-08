@@ -78,6 +78,20 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "dry-run" }, noRead).silentStopMode).toBe("dry-run");
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_MODE/);
+  });
+
+  test("FACTORY-740: silentStopSuppressMinutes defaults to 5, honours BUTCHR_SILENT_STOP_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).silentStopSuppressMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "15" }, noRead).silentStopSuppressMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+  });
+
   test("abandonedMinutes defaults to 30, honours BUTCHR_ABANDONED_MINUTES, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).abandonedMinutes).toBe(30);
     expect(loadConfig({ ...base, BUTCHR_ABANDONED_MINUTES: "45" }, noRead).abandonedMinutes).toBe(45);
@@ -134,6 +148,19 @@ describe("loadConfig", () => {
     // setTimeout silently wraps to ~1ms instead of waiting) must throw too,
     // not merely "some" large value above the ceiling.
     expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "2147483648" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+  });
+  // FACTORY-772: BOUNDED on both ends (as BUTCHR_HERDR_TIMEOUT_MS now is, too).
+  test("loopWatchdogThresholdMs defaults to 120000, honours BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS, and rejects NaN/below-min/above-max", () => {
+    expect(loadConfig(base, noRead).loopWatchdogThresholdMs).toBe(120_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "60000" }, noRead).loopWatchdogThresholdMs).toBe(60_000);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "nope" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "29999" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800001" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "30000" }, noRead).loopWatchdogThresholdMs).toBe(30_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800000" }, noRead).loopWatchdogThresholdMs).toBe(1_800_000);
+  });
+  test("describeConfig includes loopWatchdogThresholdMs", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("loopWatchdogThresholdMs=120000");
   });
 
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {

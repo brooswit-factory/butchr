@@ -9,8 +9,17 @@ import {
   PLACEHOLDER_QUERY,
   ENABLE_SCOPE_CEILING,
   type RuleDto,
+  type RuleFieldPatch,
+  type RuleFormCatalogEntry,
   type RulesListResponse,
 } from "../../dashboard-app/src/api/rules.js";
+// FACTORY-729 (FACTORY-725 review, comment 30291): this epic was bitten once
+// by a client/route contract mismatch that only the fixtures-mode API
+// exercised (the client sent {ruleId, enabled} to a route reading {id,
+// patch} — a silent 400 on every REAL call). The tests below feed the
+// bytes `realRulesApi` actually sends over the wire straight into the REAL
+// server's own validator, never a hand-typed guess at either shape.
+import { validateRuleFieldPatch } from "../../src/rules/rules-write-registry.js";
 
 /**
  * A second `ui-`-prefixed rule (NOT the placeholder template) for write-flow
@@ -33,6 +42,8 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     account: "none",
     role: "worker",
     agentPreferences: [],
+    permissionMode: null,
+    lizardMode: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -181,6 +192,43 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.query).toBe("key = XYZ-1");
     });
 
+    test("FACTORY-729: setting permissionMode: bypassPermissions without confirm is refused; confirm: true succeeds and merges harness into agentPreferences", async () => {
+      const withPreference: RulesListResponse = {
+        ...defaultRulesFixture(),
+        rules: [...defaultRulesFixture().rules, uiDemoRule({ id: "ui-with-pref", agentPreferences: [{ harness: "claude", model: "sonnet" }] })],
+      };
+      const api = createFixturesRulesApi({ initial: withPreference, latencyMs: 0 });
+      const before = await api.listRules();
+      const refusedPlan = await api.planRule("ui-with-pref", { permissionMode: "bypassPermissions" }, false);
+      expect(refusedPlan.requiresConfirm).toBe(true);
+      expect(refusedPlan.confirmReason).toBe("risky-permission");
+      await expect(api.updateFields("ui-with-pref", { permissionMode: "bypassPermissions" }, before.sourceEtag, refusedPlan.planHash, false)).rejects.toThrow(/never a default/);
+
+      const confirmedPlan = await api.planRule("ui-with-pref", { permissionMode: "bypassPermissions", agentPreferences: [{ harness: "codex" }] }, true);
+      const result = await api.updateFields("ui-with-pref", { permissionMode: "bypassPermissions", agentPreferences: [{ harness: "codex" }] }, before.sourceEtag, confirmedPlan.planHash, true);
+      expect(result.changedIds).toEqual(["ui-with-pref"]);
+      const after = await api.listRules();
+      const updated = after.rules.find((r) => r.id === "ui-with-pref")!;
+      expect(updated.permissionMode).toBe("bypassPermissions");
+      expect(updated.agentPreferences[0]!.harness).toBe("codex");
+      expect(updated.agentPreferences[0]!.model).toBe("sonnet");
+    });
+
+    test("FACTORY-729: lizardMode: true without confirm is refused; lizardMode: false needs no confirm", async () => {
+      const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0 });
+      const before = await api.listRules();
+      const riskyPlan = await api.planRule("ui-demo", { lizardMode: true }, false);
+      expect(riskyPlan.requiresConfirm).toBe(true);
+      await expect(api.updateFields("ui-demo", { lizardMode: true }, before.sourceEtag, riskyPlan.planHash, false)).rejects.toThrow(/never a default/);
+
+      const safePlan = await api.planRule("ui-demo", { lizardMode: false }, false);
+      expect(safePlan.requiresConfirm).toBe(false);
+      const result = await api.updateFields("ui-demo", { lizardMode: false }, before.sourceEtag, safePlan.planHash, false);
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "ui-demo")!.lizardMode).toBe(false);
+      expect(result.changedIds).toEqual(["ui-demo"]);
+    });
+
     test("enabling over the scope ceiling without confirm is refused with the server's own wording; confirm:true succeeds", async () => {
       const seeded = defaultRulesFixture();
       const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
@@ -326,6 +374,8 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               agentPreferences: [],
               linkedEventing: false,
               mcpServerNames: [],
+              permissionMode: "acceptEdits",
+              lizardMode: true,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -342,7 +392,19 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, staffed: false, reason: "disabled" }]);
+  });
+
+  test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
+    let calledUrl: string | undefined;
+    const fakeHarnesses: RuleFormCatalogEntry[] = [{ harness: "claude", models: ["sonnet"], allowsCustomModel: true, efforts: ["low"], permissionModes: ["default"] }];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+      calledUrl = String(input);
+      return new Response(JSON.stringify({ harnesses: fakeHarnesses }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const result = await realRulesApi.getCatalog();
+    expect(calledUrl).toBe("/api/rules/catalog");
+    expect(result).toEqual(fakeHarnesses);
   });
 
   test("previewRule calls GET /api/rules/:id/preview with the id encoded", async () => {
@@ -406,6 +468,59 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     const writeCall = calls.find((c) => c.url === "/api/rules/triage")!;
     expect(writeCall.init?.method).toBe("PUT");
     expect(JSON.parse(String(writeCall.init?.body))).toEqual({ query: "key = X-1", ifMatch: "e1", planHash: "hash1", confirm: true });
+  });
+
+  // FACTORY-729 (FACTORY-725 review, comment 30291): the exact bytes
+  // `realRulesApi.updateFields` puts on the wire for the three fields this
+  // ticket adds (agentPreferences[].harness, permissionMode, lizardMode),
+  // fed straight into the REAL server's own `validateRuleFieldPatch`
+  // (`src/rules/rules-write-registry.ts`) — proving the client and the
+  // route agree on field names/shape, not just that each compiles against
+  // its own typed seam.
+  test("updateFields' real wire body for harness/permissionMode/lizardMode is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [FIRST_RULE_ID] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { permissionMode: "bypassPermissions", lizardMode: true, agentPreferences: [{ harness: "codex", model: "sonnet" }] };
+    await realRulesApi.updateFields(FIRST_RULE_ID, patch, "e1", "hash1", true);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...patch, ifMatch: "e1", planHash: "hash1", confirm: true });
+    // `wireBody` ALSO carries `ifMatch`/`planHash`/`confirm` — exactly what
+    // a real PUT /api/rules/:id handler receives as `body` before it reads
+    // those three fields off separately and hands the REST to this same
+    // validator (`src/web/view.ts`'s PUT route) — those three names are
+    // themselves in `validateRuleFieldPatch`'s own allowlist, so passing
+    // the unmodified wire body through it is the actual contract, not a
+    // simplification of it.
+    const serverResult = validateRuleFieldPatch(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) {
+      expect(serverResult.patch).toEqual({ permissionMode: "bypassPermissions", lizardMode: true, agentPreferences: [{ harness: "codex", model: "sonnet" }] });
+    }
+  });
+
+  // Same cross-contract proof for `POST /api/rules/plan`'s own `patch` field (`src/web/view.ts`'s
+  // plan route reads `body.patch` and feeds exactly that sub-object into the SAME validator).
+  test("planRule's real wire body for harness/permissionMode/lizardMode: its own `patch` sub-object is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let calledInit: RequestInit | undefined;
+    globalThis.fetch = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      calledInit = init;
+      return new Response(JSON.stringify({ planHash: "h", spawned: 0, stopped: 0, restarted: 0, etag: "e" }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { permissionMode: "auto", lizardMode: false, agentPreferences: [{ harness: "claude", effort: "high" }] };
+    await realRulesApi.planRule(FIRST_RULE_ID, patch, true);
+    const wireBody = JSON.parse(String(calledInit?.body));
+    expect(wireBody).toEqual({ id: FIRST_RULE_ID, patch, confirm: true });
+    const serverResult = validateRuleFieldPatch(wireBody.patch);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) {
+      expect(serverResult.patch).toEqual(patch);
+    }
   });
 
   test("undo POSTs to /api/undo/:backupId with the id encoded", async () => {

@@ -368,3 +368,5 @@ ticket; no agent is watching it, so only a PERSON READING YOUR TICKET
 DIRECTLY will ever see it, and no agent will answer it. Post it and do not
 wait as though one will — a human happening to read the ticket is the only
 responder this channel can reach for a top-level bug with no safe option.
+
+<!-- include: briefs/_before-you-stop.md -->

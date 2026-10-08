@@ -693,6 +693,121 @@ describe("createLabelSync", () => {
     });
   });
 
+  // FACTORY-740: the dry-run detector is checked unconditionally, every
+  // poll, for every active issue — the SAME "always observed" discipline
+  // `stalled` above uses — and gets this poll's PR-open context for free
+  // (never a second GitHub search). It never gates agentStatus/stalled/
+  // desiredLabels, and omitting it entirely must not throw (same
+  // disables-entirely-when-omitted shape as `stalled`/`stallRemediation`).
+  describe("silentStop wiring (FACTORY-740)", () => {
+    function fakeSilentStop() {
+      const calls: Array<{ issue: string; label: string; prOpen: boolean | undefined }> = [];
+      const forgotten: string[] = [];
+      return {
+        calls,
+        forgotten,
+        check: async (issue: string, label: string, context?: { prOpen?: boolean }) => {
+          calls.push({ issue, label, prOpen: context?.prOpen });
+        },
+        forget: (issue: string) => forgotten.push(issue),
+      };
+    }
+
+    test("checked every poll for every active issue, with this poll's observed label", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "working"]]),
+        silentStop: ss,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(ss.calls).toEqual([{ issue: "KAN-1", label: "working", prOpen: undefined }]);
+    });
+
+    test("never gates agentStatus or the Jira write — a ticket it would flag still gets its ordinary agent:* label", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        silentStop: ss,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(jira.calls).toEqual([{ key: "KAN-1", add: ["agent:idle"], remove: [] }]);
+    });
+
+    test("receives the SAME poll's PR-open context, derived from prState — no second GitHub search", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      let prStateCalls = 0;
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "working"]]),
+        prState: async () => { prStateCalls++; return "open"; },
+        silentStop: ss,
+      });
+      await sync([iss("KAN-1", "In Progress", [])]);
+      expect(ss.calls).toEqual([{ issue: "KAN-1", label: "working", prOpen: true }]);
+      expect(prStateCalls).toBe(1);
+    });
+
+    test("prOpen is undefined when PR tracking is disabled, and false when a PR lookup resolves to no PR", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      const syncNoPr = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "working"]]), silentStop: ss });
+      await syncNoPr([iss("KAN-1", "In Progress", [])]);
+      expect(ss.calls[0]!.prOpen).toBeUndefined();
+
+      ss.calls.length = 0;
+      const syncNoPrOpen = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-2", "working"]]),
+        prState: async () => null,
+        silentStop: ss,
+      });
+      await syncNoPrOpen([iss("KAN-2", "In Progress", [])]);
+      expect(ss.calls[0]!.prOpen).toBe(false);
+    });
+
+    test("forget is called on the inactive-status path and when a ticket disappears from the feed", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        silentStop: ss,
+      });
+      await sync([iss("KAN-1", "Done", ["agent:idle"])]);
+      expect(ss.forgotten).toEqual(["KAN-1"]);
+
+      ss.forgotten.length = 0;
+      const sync2 = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-2", "idle"]]), silentStop: ss });
+      await sync2([iss("KAN-2", "In Progress", [])]);
+      ss.forgotten.length = 0;
+      await sync2([]); // KAN-2 disappears
+      expect(ss.forgotten).toEqual(["KAN-2"]);
+    });
+
+    test("omitting silentStop entirely (existing callers/fixtures) does not throw", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]) });
+      await expect(sync([iss("KAN-1", "In Progress", [])])).resolves.toBeInstanceOf(Set);
+    });
+
+    test("silentStop is never invoked while the ticket is inactive", async () => {
+      const jira = fakeJira();
+      const ss = fakeSilentStop();
+      const sync = createLabelSync({
+        jira,
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        silentStop: ss,
+      });
+      await sync([iss("KAN-1", "Done", ["agent:idle"])]);
+      expect(ss.calls).toEqual([]);
+    });
+  });
+
   // BUTCHR-279: the whole path, real dependencies (createStalledCheck +
   // createStallRemediator, not stubs), driven poll-by-poll through
   // createLabelSync exactly as src/daemon/index.ts wires them. The tracker
