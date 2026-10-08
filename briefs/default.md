@@ -56,3 +56,5 @@ nothing is ever archived) keep working on it exactly as before.
 The assistant documents how this factory works, how to verify a claim in it,
 and how it fails, in the ASSIST Confluence space:
 https://wroosbit.atlassian.net/wiki/spaces/ASSIST
+
+<!-- include: briefs/_before-you-stop.md -->

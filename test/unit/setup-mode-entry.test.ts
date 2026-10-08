@@ -13,11 +13,33 @@ function freePort(): number {
   return p;
 }
 
+// Absolute, so the entry script resolves independently of cwd below.
+const DAEMON_ENTRY = join(import.meta.dir, "../../src/daemon/index.ts");
+
+// Bun loads a repo-root .env into the child's process.env regardless of the
+// `env` option passed to Bun.spawn — a developer's real ATLASSIAN_SITE/EMAIL/
+// TOKEN_FILE would otherwise reach the spawned daemon. `--no-env-file` plus a
+// cwd that is never the repo (so there is no .env to find even if the flag
+// were ignored) are both load-bearing; this probes the EXACT (cwd, env,
+// flags) triple the real spawn below uses, with a throwaway script that just
+// dumps its own process.env, so the guard reflects real spawn conditions
+// instead of merely re-checking the object we built.
+function assertHermeticSpawn(cwd: string, env: Record<string, string>, allowedAtlassianKeys: ReadonlySet<string>): void {
+  const probe = Bun.spawnSync(["bun", "--no-env-file", "-e", "process.stdout.write(JSON.stringify(process.env))"], { cwd, env, stdout: "pipe", stderr: "pipe" });
+  const seen = JSON.parse(probe.stdout.toString()) as Record<string, string>;
+  const leaked = Object.keys(seen).filter((k) => k.startsWith("ATLASSIAN_") && !allowedAtlassianKeys.has(k));
+  if (leaked.length > 0) {
+    throw new Error(`setup-mode-entry guard: ATLASSIAN_* leaked into the spawned daemon's environment: ${leaked.join(", ")}`);
+  }
+}
+
 async function spawnEntry(extraEnv: Record<string, string>, port: number) {
   const home = mkdtempSync(join(tmpdir(), "butchr-setup-entry-"));
-  const proc = Bun.spawn(["bun", "src/daemon/index.ts"], {
-    cwd: join(import.meta.dir, "../.."),
-    env: { PATH: process.env.PATH ?? "", HOME: home, XDG_CONFIG_HOME: join(home, "cfg"), BUTCHR_PORT: String(port), BUTCHR_SECRETS_DIR: join(home, "secrets"), ...extraEnv },
+  const env = { PATH: process.env.PATH ?? "", HOME: home, XDG_CONFIG_HOME: join(home, "cfg"), BUTCHR_PORT: String(port), BUTCHR_SECRETS_DIR: join(home, "secrets"), ...extraEnv };
+  assertHermeticSpawn(home, env, new Set(Object.keys(extraEnv).filter((k) => k.startsWith("ATLASSIAN_"))));
+  const proc = Bun.spawn(["bun", "--no-env-file", DAEMON_ENTRY], {
+    cwd: home, // never the repo root — no .env here even if a flag were ever dropped
+    env,
     stdout: "pipe", stderr: "pipe",
   });
   return { proc, home };

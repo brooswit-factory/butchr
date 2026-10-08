@@ -9,9 +9,26 @@ import {
   type ManagedAgentLaunch,
   type ParamsOf,
 } from "@brooswit/drovr";
+// Bun embeds this at build time, so the built binary carries it — same discipline as workspace.ts's own briefs/*.md imports.
+import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
+
+/**
+ * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
+ * every kickoff prompt below, so it is in context from the agent's very
+ * first turn — not just inside `brief.md` (which a long session's own
+ * context compaction can push out) — and so it is still there at the moment
+ * the agent is deciding whether to stop or go idle. Same shared source
+ * (`briefs/_before-you-stop.md`) `src/agents/workspace.ts`'s own
+ * `BEFORE_YOU_STOP_INCLUDE_MARKER` resolves into every `briefs/*.md`
+ * template — this is the SECOND of the two places FACTORY-735 requires the
+ * text to land, not a competing copy of it.
+ */
+const KICKOFF_REMINDER = BEFORE_YOU_STOP.trim();
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
-export const KICKOFF_PROMPT = "follow your CLAUDE.md";
+export const KICKOFF_PROMPT = `follow your CLAUDE.md\n\n${KICKOFF_REMINDER}`;
+/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above, same reminder appended. */
+export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md\n\n${KICKOFF_REMINDER}`;
 /**
  * FACTORY-127/FACTORY-138 (operator decision, FACTORY-67 director comment
  * 2026-09-26 22:24Z): butchr's own default for a Claude launch whose spec
@@ -111,7 +128,7 @@ export function inventoryCodexMcp(
  */
 export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
   if (spec?.cwd && spec.brief) return `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${spec.brief}`;
-  return provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+  return provider === "claude" ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
 };
 
 /**

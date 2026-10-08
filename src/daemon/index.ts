@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
 import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
@@ -554,7 +554,15 @@ const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
-const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+// FACTORY-722: `timeoutMs` bounds EVERY call this shared client makes
+// (`@brooswit/herdr-sdk`'s `rpc()` arms its timer around the whole
+// connect-write-respond sequence, not merely the read) — see
+// `Config.herdrCallTimeoutMs`'s own doc comment for why this one knob is the
+// actual fix for the wedge finding this ticket closes, not a defensive
+// extra: before this, a hung herdr socket left `herdr.agent.list()` and
+// `herdr.subscribe()` pending forever, wedging every caller that serializes
+// on one of them.
+const herdr = new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs });
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
 // rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
@@ -2637,9 +2645,57 @@ async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subsc
     }
   }
 }
+/**
+ * FACTORY-722: `DrovrClient.subscribe`/`HerdrClient.subscribe` opens its own
+ * long-lived connection OUTSIDE `rpc()` (`Subscription.open`,
+ * `@brooswit/herdr-sdk`) and never reads `herdr`'s own `timeoutMs` at all —
+ * confirmed against that package's own source, which passes only
+ * `socketPath` through, never the options object `timeoutMs` lives on. So
+ * `config.herdrCallTimeoutMs` (which bounds every OTHER call this daemon
+ * makes through `herdr`, including `agent.list()`) does nothing for this
+ * one — a hung connect or a never-acked `events.subscribe` here would still
+ * wedge `permission-answer-watch.ts`'s `runSubscription` forever without
+ * this wrapper, leaving the push fast-path permanently unarmed (the sweep
+ * alone would still answer prompts, just without the fast path — but a
+ * caller can't know that from here, so this closes the gap rather than
+ * relying on the fallback). Reuses `config.herdrCallTimeoutMs` rather than a
+ * second knob — this is the same "a herdr call must not hang forever" bound,
+ * just on the one call path the SDK doesn't already cover.
+ */
+// A `const` capture, not a direct `config.herdrCallTimeoutMs` read below:
+// `config` itself is an un-annotated `let` narrowed by control flow (see its
+// own declaration above), and TypeScript cannot carry that narrowing into a
+// hoisted top-level `function` declaration — reading `config` directly from
+// inside one (as `withHerdrSubscribeDeadline` below originally did) makes
+// the WHOLE variable implicitly `any`, including every other read of it in
+// this file. A `const` has a definite type at its own declaration site
+// regardless of where it's later closed over, so capturing the one field
+// this function needs here sidesteps the problem entirely.
+const HERDR_CALL_TIMEOUT_MS = config.herdrCallTimeoutMs;
+function withHerdrSubscribeDeadline(p: Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>>): Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>> {
+  return new Promise((resolve, reject) => {
+    let timedOut = false;
+    const t = setTimeout(() => {
+      timedOut = true;
+      reject(new HerdrTransportError(`events.subscribe: no ack within ${HERDR_CALL_TIMEOUT_MS}ms`));
+    }, HERDR_CALL_TIMEOUT_MS);
+    p.then(
+      (sub) => {
+        clearTimeout(t);
+        // A late ack after this call already rejected on the deadline above
+        // must not leak an open connection nobody holds a reference to —
+        // close it immediately rather than returning it to a caller that
+        // has already moved on (scheduleReconnect, permission-answer-watch.ts).
+        if (timedOut) { sub.close(); return; }
+        resolve(sub);
+      },
+      (e) => { clearTimeout(t); if (!timedOut) reject(e); },
+    );
+  });
+}
 function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
-  return herdr
-    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id })))
+  return withHerdrSubscribeDeadline(herdr
+    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id }))))
     .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
 }
 startPermissionAnswerWatch(
@@ -2658,6 +2714,18 @@ startPermissionAnswerWatch(
     // non-managed-session pane.
     onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
     subscribe: subscribeAgentStatus,
+    // FACTORY-722 fix-scope item (d): the watchdog's own journal line
+    // (`[watchdog] restarted permission-answer`, permission-answer-watch.ts)
+    // already fires on every trip regardless of alert routing below —
+    // deduped per trip set of pane ids, so a watchdog that keeps tripping on
+    // the SAME stuck panes doesn't spam the room every 30s check.
+    onWatchdogTripped: (stuckPaneIds) => opsAlertRouter.raise({
+      key: `permission-answer-watchdog:${stuckPaneIds.slice().sort().join(",")}`,
+      condition: "permission-answer-watchdog",
+      subject: "permission-answer watch",
+      reason: `${stuckPaneIds.length} pane(s) blocked with a push trigger unconsumed for over 5 minutes — forced a resubscribe and tick restart: ${stuckPaneIds.join(", ")}`,
+      remedy: "Check journalctl for '[permission-answer]'/'[watchdog]' lines and whether herdr itself is healthy; if this keeps tripping, the daemon may need a restart.",
+    }),
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );
