@@ -69,6 +69,7 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_UNRESPONSIVE_MINUTES", description: "Minutes a pane must be blocked with unparseable text before the sustained-unresponsive alarm fires." },
   { key: "BUTCHR_IDLE_DIALOG_MINUTES", description: "Minutes a pane must read idle/done before its text is checked for a missed end-of-pane dialog." },
   { key: "BUTCHR_POLL_STALE_MS", description: "Milliseconds /health tolerates the poll loop going without a completed cycle before reporting stale." },
+  { key: "BUTCHR_HERDR_TIMEOUT_MS", description: "Client-side deadline, in milliseconds, on every call this daemon makes to herdr. A hung herdr socket rejects instead of hanging forever past this. Default 10000." },
   { key: "BUTCHR_ASSIGNEE_STORY", description: "Atlassian accountId staffed as the assignee for Story-type jira_create_issue calls." },
   { key: "BUTCHR_ASSIGNEE_TASK", description: "Atlassian accountId staffed as the assignee for Task-type jira_create_issue calls." },
   { key: "BUTCHR_ASSIGNEE_EPIC", description: "Atlassian accountId staffed as the assignee for Epic-type jira_create_issue calls." },

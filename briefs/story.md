@@ -365,3 +365,5 @@ Choose as the reviewer: prefer the option that respects the protocol you set
 for that task. If no option is safe, DO NOT answer — `report_to_boss` (no
 key — it always posts to YOUR OWN ticket) stating why, so it escalates to
 whoever watches you. The human is the fallback, not the first responder.
+
+<!-- include: briefs/_before-you-stop.md -->
