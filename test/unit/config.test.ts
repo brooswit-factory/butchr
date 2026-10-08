@@ -134,6 +134,21 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("pollStaleMs=60000");
   });
 
+  // FACTORY-772: BOUNDED on both ends, unlike BUTCHR_HERDR_TIMEOUT_MS above
+  // (no upper bound — a defect this var deliberately does not repeat).
+  test("loopWatchdogThresholdMs defaults to 120000, honours BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS, and rejects NaN/below-min/above-max", () => {
+    expect(loadConfig(base, noRead).loopWatchdogThresholdMs).toBe(120_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "60000" }, noRead).loopWatchdogThresholdMs).toBe(60_000);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "nope" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "29999" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800001" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "30000" }, noRead).loopWatchdogThresholdMs).toBe(30_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800000" }, noRead).loopWatchdogThresholdMs).toBe(1_800_000);
+  });
+  test("describeConfig includes loopWatchdogThresholdMs", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("loopWatchdogThresholdMs=120000");
+  });
+
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
     const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
     expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });

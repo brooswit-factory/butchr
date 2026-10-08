@@ -16,6 +16,7 @@ import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
 import { combineHealth, createLoopHealth, createResourceLoopHealth } from "./health.js";
+import { createLoopWatchdog } from "./loop-watchdog.js";
 import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
@@ -1045,7 +1046,12 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot)),
+  // FACTORY-772: `issueLoopWatchdog` is assigned further below (after the
+  // issue loop itself is started — see that call site's own comment for
+  // why), but this closure only runs lazily per `/health` request, by which
+  // point module-load has long finished and the forward reference has
+  // resolved — same reasoning as every other health-sibling source here.
+  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -2006,7 +2012,19 @@ const ruleResourceType = createRuleResourceType({
   notify: notifyRuleAgent,
 });
 
-runResourceLoop(ruleResourceType, {
+// FACTORY-772: wrapped in a function, rather than called inline once, so
+// the watchdog below can discard a wedged loop's `Stop` handle and start a
+// completely independent replacement in its place — see
+// src/daemon/loop-watchdog.ts's own top comment for why this (never a
+// shared in-flight flag the old and new loop would have to race over) is
+// the restart shape this ticket's watchdog relies on. Every dependency
+// closed over here (herd, ops, the detectors, admissionController, …) is
+// itself a long-lived instance shared across every call, so a restart
+// recreates ONLY the `watch()` loop's own internal state (RespawnGuard,
+// ResumeDeferGuard, the notify-tick hash counter — all local to
+// `runResourceLoop`/`startLoop`) — never re-registers an agent, re-reads
+// config, or duplicates any of this daemon's other long-lived state.
+const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   herd,
   ownsId: ownsRuleAgent,
   notify: notifyRuleAgent,
@@ -2069,6 +2087,34 @@ runResourceLoop(ruleResourceType, {
   onPollSuccess: () => loopHealth.recordSuccess(),
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
+
+let stopIssueLoop = startIssueLoop();
+
+// FACTORY-772: the backstop for any never-settling await that
+// BUTCHR_HERDR_TIMEOUT_MS and the permission-answer watchdog do NOT cover
+// (see src/daemon/loop-watchdog.ts's own top comment) — `pollLoop` and
+// `notify` are two independent liveness heartbeats for the ONE issue loop
+// started above, so both names share a single restart action: discard the
+// current `Stop` handle and start a completely fresh loop in its place.
+// Reported under BOTH names in `/health`'s `loopWatchdog` sibling (wired
+// into the `health` callback far above this file — see that call site's
+// own comment for why the forward reference there is safe) since one
+// restart fixes both.
+const issueLoopWatchdog = createLoopWatchdog(
+  [{
+    names: ["pollLoop", "notify"],
+    components: () => [...loopHealth.status().components, ...notifyHealth.status().components],
+    restart: () => {
+      try {
+        stopIssueLoop();
+      } catch (e) {
+        console.error(`  WARNING: [watchdog] stopping the wedged issue loop threw (starting its replacement anyway): ${(e as Error)?.message ?? e}`);
+      }
+      stopIssueLoop = startIssueLoop();
+    },
+  }],
+  { thresholdMs: config.loopWatchdogThresholdMs, log: (line) => console.error(line) },
+);
 
 // The github-issue rule loop: its own agents only, its own admission bucket
 // under the same host cap, and none of the Jira-writing detectors above.
