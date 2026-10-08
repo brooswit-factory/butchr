@@ -211,6 +211,42 @@ export interface HealthStatus {
    * fixture in this file's own test suite, unaffected by this addition).
    */
   dashboardApp?: { built: boolean; path: string };
+  /**
+   * FACTORY-772: per-loop restart history recorded by the issue-loop
+   * watchdog (src/daemon/loop-watchdog.ts) — an EIGHTH sibling, same
+   * "additive, never flips `ok`" reasoning as every sibling above: a
+   * restart already having happened is reported here for an operator to
+   * SEE, but `ok` must keep meaning only "is a loop currently fresh" —
+   * folding a past restart into that AND would make a daemon that has
+   * already self-healed read as unhealthy forever, which is backwards (the
+   * whole point of the watchdog is that it fixes the problem, not merely
+   * flags it). This is the surface that answers "did this restart silently
+   * and come back, with no trace?" — the failure mode `ComponentHealth`'s
+   * `state` flipping from `"stale"` back to `"ok"` on its own cannot answer,
+   * since a bare `"ok"` looks identical whether the loop was always healthy
+   * or was just force-restarted a moment ago. ABSENT (no key at all), never
+   * an empty array, when no watchdog is wired in (e.g. every existing test
+   * fixture in this file's own test suite, unaffected by this addition).
+   */
+  loopWatchdog?: LoopWatchdogReport[];
+}
+
+/**
+ * FACTORY-772: one named loop's restart history, as tracked by
+ * `createLoopWatchdog` (src/daemon/loop-watchdog.ts). `restartCount` and
+ * `lastRestartAt` are watchdog-forced restarts ONLY — an ordinary successful
+ * poll never touches either field, so a reader can tell "healthy the whole
+ * time" (`restartCount` 0) apart from "healthy again, but only because the
+ * watchdog intervened" (`restartCount` > 0) — the exact distinction a bare
+ * `ComponentHealth.state` of `"ok"` cannot make on its own.
+ */
+export interface LoopWatchdogReport {
+  /** The `ComponentHealth.name` this restart history is for (e.g. "pollLoop", "notify"). */
+  name: string;
+  /** How many times the watchdog has forced a restart of this loop since the daemon started. */
+  restartCount: number;
+  /** ISO timestamp of the most recent watchdog-forced restart, or null if it has never fired. */
+  lastRestartAt: string | null;
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -275,6 +311,7 @@ export const combineHealth = (
   credentialDeathAlert?: CredentialDeathAlert,
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
   dashboardApp?: { built: boolean; path: string },
+  loopWatchdog?: readonly LoopWatchdogReport[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -292,6 +329,7 @@ export const combineHealth = (
       ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
       : {}),
     ...(dashboardApp ? { dashboardApp } : {}),
+    ...(loopWatchdog && loopWatchdog.length ? { loopWatchdog: [...loopWatchdog] } : {}),
   };
 };
 

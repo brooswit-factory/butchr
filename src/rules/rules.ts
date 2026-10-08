@@ -40,6 +40,7 @@ import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
+import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode } from "./agent-harness.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /**
@@ -55,9 +56,14 @@ export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
  * concern this plain data constant has no need to depend on.
  */
 export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
-/** Agent harnesses Drovr can launch. */
-export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
-export type AgentHarness = (typeof AGENT_HARNESSES)[number];
+/**
+ * FACTORY-729: moved to `./agent-harness.ts` (that module's own top comment
+ * explains why — a dependency-free leaf, safe for browser-bundled code to
+ * import a VALUE from, unlike this module, which pulls in `node:fs`/
+ * `node:crypto`) and re-exported here unchanged for every existing
+ * importer of `rules.js`.
+ */
+export { AGENT_HARNESSES, type AgentHarness };
 /**
  * FACTORY-75: moved to src/resources/power-scale.ts (that module's own top
  * comment explains why — it needs this type for its shared effort table,
@@ -69,10 +75,14 @@ export { AGENT_EFFORTS, type AgentEffort };
  * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
  * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
- * an INDEPENDENT copy here rather than imported: that module already imports
- * `ExecutionMode`/`AccountPolicy`/`AgentRole`/`McpServerBinding` FROM this
- * file, so importing its `SESSION_PERMISSION_MODES` back would cycle this
- * file with it. FACTORY-577: no longer Claude-only — `agentLaunchConfig`
+ * an INDEPENDENT copy of that constant (not imported FROM that module: it
+ * already imports `ExecutionMode`/`AccountPolicy`/`AgentRole`/
+ * `McpServerBinding` FROM this file, so importing its
+ * `SESSION_PERMISSION_MODES` back would cycle this file with it).
+ * FACTORY-729: THIS copy's own value+type now live in `./agent-harness.ts`
+ * (a dependency-free leaf — see that module's own top comment) and are
+ * re-exported here unchanged, same reason/pattern as `AGENT_HARNESSES`
+ * above. FACTORY-577: no longer Claude-only — `agentLaunchConfig`
  * (src/agents/argv.ts) reads `spec.permissionMode` on its Codex branch too
  * now (mapped onto `bypassApprovalsAndSandbox`), same as `permissionMode`'s
  * own doc comment there. Still silently never forwarded to an Agy launch
@@ -87,8 +97,7 @@ export { AGENT_EFFORTS, type AgentEffort };
  * absent `permissionMode` always gave that branch. `Rule.lizardMode` below
  * is a DIFFERENT case as of FACTORY-108 — see its own doc comment.
  */
-export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
-export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
+export { RULE_PERMISSION_MODES, type RulePermissionMode };
 
 /**
  * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
