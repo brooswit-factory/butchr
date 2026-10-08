@@ -3,7 +3,7 @@ import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
 import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
@@ -86,6 +86,7 @@ import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
 import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { restrictJiraProjectManagers } from "../tools/jira-project-scope.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -397,14 +398,12 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  */
 const ruleLizardModeOf = (id: string): boolean =>
   sharedRuleLizardModeOf(id, { rules: getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
-// BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
-// (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
-// agents are classified "sentinel" here (see src/agents/capacity-role.ts).
-// `issueMeta` (declared below, filled by every jira-work search) supplies
-// the issue type; it is only read at call time, after the whole module has
-// initialised.
-const roleOfAgent = (id: string): AgentCapacityRole =>
-  capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
+// FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
+// capacity is decided solely by each rule's own `role` field — see
+// src/agents/capacity-role.ts for the construction-level exceptions (bare
+// project agents, `jira-project` agents) and why issue type no longer plays
+// any part here.
+const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
@@ -554,7 +553,15 @@ const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
-const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+// FACTORY-722: `timeoutMs` bounds EVERY call this shared client makes
+// (`@brooswit/herdr-sdk`'s `rpc()` arms its timer around the whole
+// connect-write-respond sequence, not merely the read) — see
+// `Config.herdrCallTimeoutMs`'s own doc comment for why this one knob is the
+// actual fix for the wedge finding this ticket closes, not a defensive
+// extra: before this, a hung herdr socket left `herdr.agent.list()` and
+// `herdr.subscribe()` pending forever, wedging every caller that serializes
+// on one of them.
+const herdr = new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs });
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
 // rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
@@ -1222,7 +1229,11 @@ const { app, mcp } = buildApp({
 // loop reads.
 }, {
   // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
+  // FACTORY-732: a jira-project (manager) caller passes `forJiraCallers`
+  // now, but `restrictJiraProjectManagers` immediately confines it to its
+  // own project's jira_get_issue/jira_search/jira_add_comment/jira_transition
+  // — see src/tools/jira-project-scope.ts.
+  ...restrictJiraProjectManagers(forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)), ops),
   // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
   // provider-specific tool set below it — the local file store needs no
   // credentials and works for every ResourceRef kind, and a `jira-project`
@@ -1230,9 +1241,17 @@ const { app, mcp } = buildApp({
   // already has Jira credentials loaded, unlike the CLI, so the factory
   // below is cheap and side-effect-free rather than genuinely lazy) — see
   // `src/resources/link-store-router.ts` for the routing decision itself.
-  ...resourceLinkTools(
-    routingLinkStore,
-    (line) => console.error(line),
+  // FACTORY-732: a jira-project (manager) CALLER (not the `resource` a link
+  // names — the resource-link test fixtures above a jira-project OWNER as
+  // an argument, which this gate never touches) has no allowlisted name
+  // here (add_link/remove_link/list_links are all outside
+  // JIRA_PROJECT_MANAGER_TOOLS), so it is refused on every one of these.
+  ...restrictJiraProjectManagers(
+    resourceLinkTools(
+      routingLinkStore,
+      (line) => console.error(line),
+    ),
+    ops,
   ),
   ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
@@ -1246,7 +1265,11 @@ const { app, mcp } = buildApp({
   // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
   // the managed-sessions loop and `butchr session` CLI already use, never a
   // second resolution of "where definitions live" or "which freeze store".
-  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+  // FACTORY-732: freeze_session is not in JIRA_PROJECT_MANAGER_TOOLS, so a jira-project (manager) caller is refused here too.
+  ...restrictJiraProjectManagers(
+    sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
+    ops,
+  ),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
@@ -2623,9 +2646,57 @@ async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subsc
     }
   }
 }
+/**
+ * FACTORY-722: `DrovrClient.subscribe`/`HerdrClient.subscribe` opens its own
+ * long-lived connection OUTSIDE `rpc()` (`Subscription.open`,
+ * `@brooswit/herdr-sdk`) and never reads `herdr`'s own `timeoutMs` at all —
+ * confirmed against that package's own source, which passes only
+ * `socketPath` through, never the options object `timeoutMs` lives on. So
+ * `config.herdrCallTimeoutMs` (which bounds every OTHER call this daemon
+ * makes through `herdr`, including `agent.list()`) does nothing for this
+ * one — a hung connect or a never-acked `events.subscribe` here would still
+ * wedge `permission-answer-watch.ts`'s `runSubscription` forever without
+ * this wrapper, leaving the push fast-path permanently unarmed (the sweep
+ * alone would still answer prompts, just without the fast path — but a
+ * caller can't know that from here, so this closes the gap rather than
+ * relying on the fallback). Reuses `config.herdrCallTimeoutMs` rather than a
+ * second knob — this is the same "a herdr call must not hang forever" bound,
+ * just on the one call path the SDK doesn't already cover.
+ */
+// A `const` capture, not a direct `config.herdrCallTimeoutMs` read below:
+// `config` itself is an un-annotated `let` narrowed by control flow (see its
+// own declaration above), and TypeScript cannot carry that narrowing into a
+// hoisted top-level `function` declaration — reading `config` directly from
+// inside one (as `withHerdrSubscribeDeadline` below originally did) makes
+// the WHOLE variable implicitly `any`, including every other read of it in
+// this file. A `const` has a definite type at its own declaration site
+// regardless of where it's later closed over, so capturing the one field
+// this function needs here sidesteps the problem entirely.
+const HERDR_CALL_TIMEOUT_MS = config.herdrCallTimeoutMs;
+function withHerdrSubscribeDeadline(p: Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>>): Promise<Awaited<ReturnType<DrovrClient["subscribe"]>>> {
+  return new Promise((resolve, reject) => {
+    let timedOut = false;
+    const t = setTimeout(() => {
+      timedOut = true;
+      reject(new HerdrTransportError(`events.subscribe: no ack within ${HERDR_CALL_TIMEOUT_MS}ms`));
+    }, HERDR_CALL_TIMEOUT_MS);
+    p.then(
+      (sub) => {
+        clearTimeout(t);
+        // A late ack after this call already rejected on the deadline above
+        // must not leak an open connection nobody holds a reference to —
+        // close it immediately rather than returning it to a caller that
+        // has already moved on (scheduleReconnect, permission-answer-watch.ts).
+        if (timedOut) { sub.close(); return; }
+        resolve(sub);
+      },
+      (e) => { clearTimeout(t); if (!timedOut) reject(e); },
+    );
+  });
+}
 function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
-  return herdr
-    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id })))
+  return withHerdrSubscribeDeadline(herdr
+    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id }))))
     .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
 }
 startPermissionAnswerWatch(
@@ -2644,6 +2715,18 @@ startPermissionAnswerWatch(
     // non-managed-session pane.
     onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
     subscribe: subscribeAgentStatus,
+    // FACTORY-722 fix-scope item (d): the watchdog's own journal line
+    // (`[watchdog] restarted permission-answer`, permission-answer-watch.ts)
+    // already fires on every trip regardless of alert routing below —
+    // deduped per trip set of pane ids, so a watchdog that keeps tripping on
+    // the SAME stuck panes doesn't spam the room every 30s check.
+    onWatchdogTripped: (stuckPaneIds) => opsAlertRouter.raise({
+      key: `permission-answer-watchdog:${stuckPaneIds.slice().sort().join(",")}`,
+      condition: "permission-answer-watchdog",
+      subject: "permission-answer watch",
+      reason: `${stuckPaneIds.length} pane(s) blocked with a push trigger unconsumed for over 5 minutes — forced a resubscribe and tick restart: ${stuckPaneIds.join(", ")}`,
+      remedy: "Check journalctl for '[permission-answer]'/'[watchdog]' lines and whether herdr itself is healthy; if this keeps tripping, the daemon may need a restart.",
+    }),
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );

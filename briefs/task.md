@@ -221,3 +221,5 @@ Quote the `claude` line in a comment on {{KEY}}. Good:
 say so on {{KEY}}, stop retrying, and wait for `[butchr:respawn]`; your fresh
 session re-reads the ticket. Only a complete argv makes a refusal real — then
 report it as policy, quoting the prompt text.
+
+<!-- include: briefs/_before-you-stop.md -->

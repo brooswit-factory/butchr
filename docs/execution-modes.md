@@ -491,15 +491,31 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
   fails, or its rule has since been removed) is always a WORKER — an
   unrecognised agent silently escaping the cap would be the opposite of
   safe.
-- **`jira-project` is always a sentinel** (BUTCHR-425), unconditionally —
-  `capacityRoleFor` (`src/agents/capacity-role.ts`) checks the resource
-  provider before ever consulting the rule's own `role` field, the same
-  precedence its Epic/Story-issue-type check already uses. Free-form project
-  managers are operator-directed, not admission-capped workers: Codey runs
-  dozens of them, and none may consume `BUTCHR_MAX_AGENTS`. This is a
-  DIFFERENT mechanism from the `role` field's own default — a `jira-project`
-  rule that never sets `role` at all (every live rule today) still gets
-  `"sentinel"`, not the field's own `"worker"` default.
+- **FACTORY-757: capacity is a per-query decision, not a per-issue-type
+  one.** Earlier (BUTCHR-422/FACTORY-39), `capacityRoleFor`
+  (`src/agents/capacity-role.ts`) also exempted any Jira work item whose
+  issue type was Epic, Story or Bug, regardless of its rule's own `role` —
+  a `jira-work`-specific special case layered on top of this field. That
+  hardcoding is gone: an `epics`/`stories`/`bugs`-shaped rule now counts
+  exactly like any other rule, unless it explicitly sets `role: "sentinel"`
+  itself. This is a deliberate behaviour change — a live rules file that
+  relied on the old issue-type exemption now needs to add `role: "sentinel"`
+  to each rule it wants exempt (no migration ships with this change; see
+  this ticket, FACTORY-757, for why).
+- **`jira-project` is still always a sentinel** (BUTCHR-425), unconditionally
+  — `capacityRoleFor` checks the resource provider before ever consulting
+  the rule's own `role` field. Free-form project managers are
+  operator-directed, not admission-capped workers: Codey runs dozens of
+  them, and none may consume `BUTCHR_MAX_AGENTS`. Unlike the issue-type
+  exemption just above, this ONE exception survived FACTORY-757's cleanup on
+  purpose — removing it would require every live `jira-project` rule to add
+  `role: "sentinel"` just to keep today's behaviour, which is exactly the
+  migration this ticket's definition of done rules out. This is a DIFFERENT
+  mechanism from the `role` field's own default — a `jira-project` rule that
+  never sets `role` at all (every live rule today) still gets `"sentinel"`,
+  not the field's own `"worker"` default. A bare project-tier agent (no rule
+  at all — the project-wide agent, e.g. a plain `BUTCHR` id) is sentinel for
+  the same construction-level reason: there is no rule to ask for a `role`.
 - **Reporting**: the `[admission2]` log line and the `/dashboard` admission
   panel report `residency(workers)=<n> sentinels=<m>` — a deliberate format
   change from the old bare `residency=<n>` (same convention `ADMISSION2_TAG`

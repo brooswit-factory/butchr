@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
+import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
 import { SESSION_PERMISSION_MODES } from "../../src/resources/session-definition.js";
 import { RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
@@ -11,17 +11,17 @@ describe("spawnArgs", () => {
     const launch = agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy", model: "test-model" });
     expect(launch).toEqual(buildAgentStartParams({
       provider: "agy", cwd: "/w/KAN-783", paneId: "pane", name: "worker",
-      prompt: "follow your AGENTS.md", model: "test-model", skipPermissions: true,
+      prompt: AGENTS_KICKOFF_PROMPT, model: "test-model", skipPermissions: true,
     }));
-    expect(launch.args).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--model", "test-model", "--dangerously-skip-permissions"]);
-    expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
+    expect(launch.args).toEqual(["--prompt-interactive", AGENTS_KICKOFF_PROMPT, "--model", "test-model", "--dangerously-skip-permissions"]);
+    expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", AGENTS_KICKOFF_PROMPT, "--dangerously-skip-permissions"]);
     expect(providerOrder({ provider: "agy", providers: ["claude", "agy"], roleProviders: { task: ["agy", "codex"] } }, "Task")).toEqual(["agy", "codex"]);
   });
   test("FACTORY-138: a spec with no permissionMode gets butchr's own default, acceptEdits, in the built argv — not Drovr's bypassPermissions fallback", () => {
     const args = spawnArgs(spec, "/w/KAN-783");
-    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args[0]).toBe(KICKOFF_PROMPT);
     expect(args).toEqual([
-      "follow your CLAUDE.md",
+      KICKOFF_PROMPT,
       "--model", "sonnet",
       "--effort", "high",
       "--permission-mode", DEFAULT_PERMISSION_MODE,
@@ -47,7 +47,7 @@ describe("spawnArgs", () => {
   test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig produces --strict-mcp-config in a Claude launch's argv; absent produces no such flag", () => {
     const withFlag = spawnArgs({ ...spec, strictMcpConfig: true }, "/w/KAN-783");
     expect(withFlag).toEqual([
-      "follow your CLAUDE.md",
+      KICKOFF_PROMPT,
       "--model", "sonnet",
       "--effort", "high",
       "--permission-mode", DEFAULT_PERMISSION_MODE,
@@ -85,8 +85,8 @@ describe("spawnArgs", () => {
 
   test("PR #394 review fix (round 2/3): a spec WITHOUT cwd is byte-for-byte unchanged — kickoff stays \"follow your CLAUDE.md\"/\"follow your AGENTS.md\" even when brief is set", () => {
     const briefedSpec = { ...spec, brief: "Some rule-engine brief text." };
-    expect(spawnArgs(briefedSpec, "/w/KAN-783")[0]).toBe("follow your CLAUDE.md");
-    expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe("follow your AGENTS.md");
+    expect(spawnArgs(briefedSpec, "/w/KAN-783")[0]).toBe(KICKOFF_PROMPT);
+    expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe(AGENTS_KICKOFF_PROMPT);
   });
 
   test("BUTCHR-408 (McsServerBinding ported from S4): a channel:true bound server adds its own development-channels flag alongside server:butchr; channel:false does not", () => {
@@ -215,7 +215,7 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
 
   test("a bound channel server appends its own --dangerously-load-development-channels flag, kickoff still first", () => {
     const args = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
-    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args[0]).toBe(KICKOFF_PROMPT);
     expect(args).toContain("--dangerously-load-development-channels=server:butchr");
     expect(args).toContain("--dangerously-load-development-channels=server:mud");
     // server:butchr's own flag precedes the bound one — order follows spec.mcpServers, butchr always first.
