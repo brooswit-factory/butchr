@@ -165,17 +165,31 @@ const MAX_PENDING_LSOF = 8;
 
 export type RunLsof = () => Promise<string>;
 
-/** One `lsof` run, never blocking the event loop. A timeout or kill signal yields "" — no partial output is ever parsed — as does a missing binary or any error. */
-export const runLsof: RunLsof = async () => {
-  try {
-    const proc = Bun.spawn([LSOF_PATH, "-nP", "-iTCP@127.0.0.1", "-F", "pun"], { stdout: "pipe", stderr: "ignore", stdin: "ignore", timeout: LSOF_TIMEOUT_MS });
-    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-    if (proc.killed || proc.signalCode) return ""; // timeout kill: never parse partial output
-    return proc.exitCode === 0 || out.length > 0 ? out : "";
-  } catch {
-    return "";
-  }
-};
+/**
+ * One `lsof` run, never blocking the event loop. A timeout kill (a signal
+ * exit) yields "" — no partial output is ever parsed — as does a missing
+ * binary, a non-zero exit with no output, or any error. Deliberately NOT
+ * `proc.killed`: on Bun for macOS it is true even after a clean exit.
+ */
+export function runLsofAt(path: string = LSOF_PATH, timeoutMs: number = LSOF_TIMEOUT_MS): Promise<string> {
+  return (async () => {
+    try {
+      const proc = Bun.spawn([path, "-nP", "-iTCP@127.0.0.1", "-F", "pun"], { stdout: "pipe", stderr: "ignore", stdin: "ignore" });
+      // Our own timer: Bun's `timeout` spawn option did not kill the process in testing.
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, timeoutMs);
+      const outP = new Response(proc.stdout).text(); // read while it runs so a full pipe cannot block the exit
+      const code = await proc.exited;
+      clearTimeout(timer);
+      if (timedOut || proc.signalCode || code === null) return "";
+      const out = await outP;
+      return code === 0 || out.length > 0 ? out : "";
+    } catch {
+      return "";
+    }
+  })();
+}
+export const runLsof: RunLsof = () => runLsofAt();
 
 export interface LsofPeerUidDeps {
   run?: RunLsof;

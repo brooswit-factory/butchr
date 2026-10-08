@@ -1,5 +1,8 @@
+import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { peerUidOf, isSameUidPeer, isSameUidPeerAsync, lsofToProcNetTcp, createLsofPeerUid } from "../../src/web/peer-uid.js";
+import { peerUidOf, isSameUidPeer, isSameUidPeerAsync, lsofToProcNetTcp, createLsofPeerUid, runLsofAt } from "../../src/web/peer-uid.js";
 
 const HEADER = "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt   uid  timeout inode";
 
@@ -161,5 +164,25 @@ describe("isSameUidPeerAsync on the darwin path", () => {
     expect(await isSameUidPeerAsync(client(50000), { ...d, lookup: async () => 501 })).toBe(false);
     expect(await isSameUidPeerAsync(client(50000), { ...d, lookup: async () => null })).toBe(false);
     expect(await isSameUidPeerAsync(client(50000), { ...d, ownUid: () => undefined, lookup: async () => 502 })).toBe(false);
+  });
+});
+
+describe("runLsofAt (stand-in lsof scripts)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "lsof-"));
+  const script = (name: string, body: string) => {
+    const f = join(dir, name);
+    writeFileSync(f, `#!/bin/sh\n${body}\n`);
+    chmodSync(f, 0o755);
+    return f;
+  };
+  test("a clean exit returns the output (regression: proc.killed is true after a clean exit on macOS)", async () => {
+    expect(await runLsofAt(script("ok", "printf 'p1\\nu501\\n'"), 2000)).toBe("p1\nu501\n");
+  });
+  test("a timed-out run returns \"\" even though it printed rows first", async () => {
+    expect(await runLsofAt(script("slow", "printf 'p1\\nu501\\n'; sleep 5"), 300)).toBe("");
+  });
+  test("a missing binary, and a failing run with no output, return \"\"", async () => {
+    expect(await runLsofAt(join(dir, "nope"), 2000)).toBe("");
+    expect(await runLsofAt(script("fail", "exit 1"), 2000)).toBe("");
   });
 });
