@@ -8,6 +8,7 @@ import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
 import { reloadRules } from "../../src/rules/reload.js";
 import { createRulesHolder } from "../../src/rules/rules.js";
 import { resolveRuleBrief } from "../../src/agents/workspace.js";
+import { WEB_WRITE_AUDIT_LOG_BASENAME } from "../../src/web/audit-log.js";
 
 let dir: string;
 
@@ -189,13 +190,71 @@ describe("runtime delete does not recreate — nothing but the one startup call 
   });
 });
 
-describe("seedFirstRunRules — L1 (FACTORY-685): absent-or-EMPTY config dir only — other state blocks the seed", () => {
-  test("GO-RED: a config dir holding unrelated state (session-definitions/, secrets/), but no rules.json, is NOT seeded", () => {
+describe("seedFirstRunRules — L1 (FACTORY-685, narrowed by FACTORY-716): absent, empty, or setup-output-only config dir — any OTHER state still blocks the seed", () => {
+  // FACTORY-716 narrowed this pinned FACTORY-685 (L1) assertion: this test
+  // previously included a bare `secrets/` dir in its "unrelated state" list
+  // and expected `config-dir-not-empty`. `secrets/` (holding the managed
+  // Atlassian token) is exactly what the web UI setup flow itself writes
+  // into the config dir before the daemon's next restart ever reaches this
+  // seed (FACTORY-705/FACTORY-715), so it is now allowlisted — see
+  // `src/rules/seed-first-run.ts`'s `setupWriteAllowlist`. `session-definitions/`
+  // is NOT anything setup writes, so it still blocks the seed; that part of
+  // this assertion is unchanged and still GO-RED-worthy on its own.
+  test("GO-RED: a config dir holding genuinely unrelated state (session-definitions/), but no rules.json, is NOT seeded", () => {
     mkdirSync(join(dir, "butchr", "session-definitions"), { recursive: true });
-    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
     const outcome = seedFirstRunRules(env());
     expect(outcome.kind).toBe("config-dir-not-empty");
     if (outcome.kind === "config-dir-not-empty") expect(outcome.path).toBe(rulesFilePath());
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+    expect(existsSync(rulesFilePath())).toBe(false);
+  });
+
+  test("a config dir holding ONLY what UI setup itself writes (jira-identity.json, secrets/) plus a bare secrets/ dir with no other entries is still seeded", () => {
+    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
+    writeFileSync(join(dir, "butchr", "jira-identity.json"), JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.com" }));
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+  });
+
+  test("a config dir holding a session-definitions/ dir ALONGSIDE the setup-written entries is still NOT seeded — the allowlist excuses only setup's own entries, nothing else", () => {
+    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
+    mkdirSync(join(dir, "butchr", "session-definitions"), { recursive: true });
+    writeFileSync(join(dir, "butchr", "jira-identity.json"), JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.com" }));
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("config-dir-not-empty");
+  });
+
+  // `POST /api/setup/jira` audits EVERY attempt, success or failure, to this
+  // same-directory file (`src/daemon/setup-mode.ts`/`src/daemon/index.ts`,
+  // both via `dirname(rulesPath(env))`) — so it exists after a real UI setup
+  // too, same as the identity file and secrets dir, and must not block the
+  // seed either.
+  test("a config dir holding ONLY the write-audit log (web-write-audit.jsonl) — e.g. a failed setup attempt logged before any identity/token write succeeded — is still seeded", () => {
+    mkdirSync(join(dir, "butchr"), { recursive: true });
+    writeFileSync(join(dir, "butchr", WEB_WRITE_AUDIT_LOG_BASENAME), '{"time":"x"}\n');
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+  });
+
+  test("a config dir holding all three setup-written entries (identity file, secrets/, audit log) together is still seeded", () => {
+    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
+    writeFileSync(join(dir, "butchr", "jira-identity.json"), JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.com" }));
+    writeFileSync(join(dir, "butchr", WEB_WRITE_AUDIT_LOG_BASENAME), '{"time":"x"}\n');
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("seeded");
+  });
+
+  // Director's non-negotiable (FACTORY-705/FACTORY-715): vanished-established-install
+  // must keep declining AND keep PRECEDENCE over the new (setup-allowlist-widened)
+  // seeding condition — a deliberately-deleted rules file must never be re-seeded
+  // just because the only OTHER entries present happen to be ones setup writes.
+  test("a .bak-* entry PLUS every setup-written entry (identity file, secrets/, audit log) still reports vanished-established-install, never seeded", () => {
+    mkdirSync(join(dir, "butchr", "secrets"), { recursive: true });
+    writeFileSync(join(dir, "butchr", "jira-identity.json"), JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.com" }));
+    writeFileSync(join(dir, "butchr", WEB_WRITE_AUDIT_LOG_BASENAME), '{"time":"x"}\n');
+    writeFileSync(join(dir, "butchr", "rules.json.bak-20261005T180000Z"), JSON.stringify({ rules: [] }));
+    const outcome = seedFirstRunRules(env());
+    expect(outcome.kind).toBe("vanished-established-install");
     const { existsSync } = require("node:fs") as typeof import("node:fs");
     expect(existsSync(rulesFilePath())).toBe(false);
   });

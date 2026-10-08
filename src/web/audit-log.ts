@@ -33,6 +33,20 @@ import { appendFileSync, chmodSync, closeSync, constants as fsConstants, lstatSy
 import { dirname } from "node:path";
 import { quoteField, quotedBlock } from "../agents/rocketchat-text.js";
 
+/**
+ * The audit log's basename, same `dirname(rulesPath(env))` directory as
+ * `rules.json` itself in both callers (`src/daemon/index.ts`'s normal-mode
+ * startup and `src/daemon/setup-mode.ts`'s setup mode) — exported as one
+ * constant rather than the literal string living separately in three
+ * places, since `src/rules/seed-first-run.ts`'s `setupWriteAllowlist`
+ * (FACTORY-716) also needs this exact name: `POST /api/setup/jira` audits
+ * every attempt, success or failure, so this file exists in the config dir
+ * after UI setup same as the identity file and secrets dir do, and must not
+ * read as "an established install configured some other way" either. If
+ * this basename ever changes, update that allowlist too.
+ */
+export const WEB_WRITE_AUDIT_LOG_BASENAME = "web-write-audit.jsonl";
+
 export interface AuditWriteEvent {
   time: string; // ISO 8601
   route: string;

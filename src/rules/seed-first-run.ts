@@ -28,13 +28,23 @@
  *      DIFFERENT condition from a true first run — something wrote a rules
  *      file before and it is gone now — reported back as
  *      `"vanished-established-install"` instead of seeded.
- *   4. (FACTORY-685, L1) the rules directory is either absent or genuinely
- *      EMPTY — not merely "has no rules.json". A directory that already
- *      holds OTHER state (`session-definitions/`, `project-managers/`,
- *      `secrets/`, anything) but no rules file and no `.bak-*` is an
- *      established install some OTHER way (its rules file was never this
- *      module's concern, or a provisioning step ran before rules.json was
- *      ever written) — not a fresh config dir either. Reported back as
+ *   4. (FACTORY-685, L1, narrowed by FACTORY-716) the rules directory is
+ *      either absent or holds nothing but the entries UI setup (FACTORY-663)
+ *      itself is known to write there before the daemon ever reaches this
+ *      seed — the Jira identity file (`../setup/jira-identity-file.ts`'s
+ *      `jiraIdentityFilePath`), the secrets directory
+ *      (`dirname(../setup/jira-token-write.ts`'s `jiraTokenFilePath`)`,
+ *      holding the managed token), and the write-audit log every
+ *      `POST /api/setup/jira` attempt appends to regardless of outcome
+ *      (`../web/audit-log.ts`'s `WEB_WRITE_AUDIT_LOG_BASENAME`). Those names
+ *      are ALLOWLISTED (see
+ *      `setupWriteAllowlist` below) precisely because FACTORY-705 found
+ *      setup's own output reading as "an established install configured
+ *      some other way" — L1's original intent, which this keeps: a
+ *      directory holding anything ELSE (`session-definitions/`,
+ *      `project-managers/`, a hand-placed file, anything not on the
+ *      allowlist) but no rules file and no `.bak-*` is still an established
+ *      install some other way, not a fresh config dir. Reported back as
  *      `"config-dir-not-empty"`, no seed.
  *
  * WRITE (constraint 2): through `./write-rules.ts`'s `createRulesFileExclusive`
@@ -78,6 +88,9 @@ import { basename, dirname } from "node:path";
 import { createRulesFileExclusive, defaultIo, type WriteRulesIo } from "./write-rules.js";
 import { rulesPath, PLACEHOLDER_QUERY, type RulesEnv } from "./rules.js";
 import { FIRST_RULE_ID } from "./rules-write-registry.js";
+import { jiraIdentityFilePath } from "../setup/jira-identity-file.js";
+import { jiraTokenFilePath } from "../setup/jira-token-write.js";
+import { WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 
 export type FirstRunSeedOutcome =
   /** Seeded `path` with the one template rule below. `dirPermissionsWarning`, when present (FACTORY-685, L2), means the rules directory already existed wider than mode 0700 — left untouched, but worth the caller surfacing. */
@@ -100,9 +113,34 @@ function hasPriorBackup(dir: string, baseName: string, io: WriteRulesIo): boolea
   return io.listDir(dir).some((name) => re.test(name));
 }
 
-/** FACTORY-685 (L1): whether `dir` holds ANY entry at all. `io.listDir` already returns `[]` for an absent directory (see `defaultIo`'s own doc comment), so an absent dir and a genuinely empty one are indistinguishable here — both read as "no other state", which is exactly the "absent OR empty" condition this ticket asks for. Called only after the caller has already confirmed nothing sits at the rules path itself and no `.bak-*` entry exists, so any entry found here is neither of those — some OTHER file or subdirectory a prior provisioning step (or a hand-placed file) left behind. */
-function hasOtherState(dir: string, io: WriteRulesIo): boolean {
-  return io.listDir(dir).length > 0;
+/**
+ * FACTORY-716: the exact top-level entry names UI setup (FACTORY-663) itself
+ * writes into the SAME config directory the rules file lives in, before the
+ * daemon's next restart ever reaches this seed — see this file's header for
+ * why these two, and only these two, are allowlisted. Computed from `env`
+ * rather than hard-coded so an operator override (`BUTCHR_JIRA_IDENTITY_FILE`,
+ * `BUTCHR_SECRETS_DIR`) that points either one OUTSIDE the rules directory
+ * correctly drops it from the allowlist — only an entry setup actually
+ * places IN THIS directory is ever excused, never the bare name on its own.
+ */
+function setupWriteAllowlist(dir: string, env: RulesEnv): ReadonlySet<string> {
+  const allowed = new Set<string>();
+  const identityPath = jiraIdentityFilePath(env);
+  if (dirname(identityPath) === dir) allowed.add(basename(identityPath));
+  const secretsDir = dirname(jiraTokenFilePath(env));
+  if (dirname(secretsDir) === dir) allowed.add(basename(secretsDir));
+  // Every `POST /api/setup/jira` attempt (success OR failure) audits to this
+  // file, in the SAME directory as `rules.json` (`src/daemon/setup-mode.ts`,
+  // `src/daemon/index.ts` — both derive it from `dirname(rulesPath(env))`,
+  // never from an overridable env var), so it exists after UI setup exactly
+  // like the identity file and secrets dir do.
+  allowed.add(WEB_WRITE_AUDIT_LOG_BASENAME);
+  return allowed;
+}
+
+/** FACTORY-685 (L1), narrowed by FACTORY-716: whether `dir` holds any entry OTHER than the ones on `allowlist`. `io.listDir` already returns `[]` for an absent directory (see `defaultIo`'s own doc comment), so an absent dir and a genuinely empty (or setup-output-only) one are indistinguishable here — all read as "no other state", which is exactly the "absent, empty, or only-what-setup-wrote" condition this ticket asks for. Called only after the caller has already confirmed nothing sits at the rules path itself and no `.bak-*` entry exists, so any non-allowlisted entry found here is neither of those — some OTHER file or subdirectory a prior provisioning step (or a hand-placed file) left behind. */
+function hasOtherState(dir: string, io: WriteRulesIo, allowlist: ReadonlySet<string>): boolean {
+  return io.listDir(dir).some((name) => !allowlist.has(name));
 }
 
 /**
@@ -174,10 +212,11 @@ export function seedFirstRunRules(env: RulesEnv, io: WriteRulesIo = defaultIo())
 
     if (hasPriorBackup(dir, baseName, io)) return { kind: "vanished-established-install", path };
 
-    // FACTORY-685 (L1): absent-or-empty only — a dir already holding other
-    // state (but no rules file, no backup) is an established install some
-    // other way, not a fresh one.
-    if (hasOtherState(dir, io)) return { kind: "config-dir-not-empty", path };
+    // FACTORY-685 (L1), narrowed by FACTORY-716: absent, empty, or holding
+    // only the entries UI setup itself is known to write — a dir already
+    // holding anything ELSE (but no rules file, no backup) is an established
+    // install some other way, not a fresh one.
+    if (hasOtherState(dir, io, setupWriteAllowlist(dir, env))) return { kind: "config-dir-not-empty", path };
 
     let dirPermissionsWarning: string | undefined;
     createRulesFileExclusive(path, templateRuleDoc(), io, { onWarn: (message) => { dirPermissionsWarning = message; } });
