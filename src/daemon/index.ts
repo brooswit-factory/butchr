@@ -16,7 +16,7 @@ import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
-import { combineHealth, createLoopHealth, createResourceLoopHealth } from "./health.js";
+import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "./health.js";
 import { createLoopWatchdog } from "./loop-watchdog.js";
 import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
@@ -1052,7 +1052,11 @@ const { app, mcp } = buildApp({
   // why), but this closure only runs lazily per `/health` request, by which
   // point module-load has long finished and the forward reference has
   // resolved — same reasoning as every other health-sibling source here.
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports()),
+  // FACTORY-752 (FACTORY-746 (c)): `permissionAnswerHealth` (assigned further
+  // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
+  // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
+  // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports()),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -2675,6 +2679,23 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // one sweep, same bound as before this ticket), not the only path.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+// FACTORY-752 (FACTORY-746 (c)): liveness for the permission-answer tick —
+// the exact observable the 10-08 incident's own silence was missing (two
+// `agent.list()` rejections, then NO line at all until a 50-minute-later
+// restart). `thresholdMs` follows the SAME "at least three polls of the
+// slower loop" convention the resource-loop healths above already use
+// (`Math.max(config.pollStaleMs, 3 * <this loop's own interval>)`) — three
+// missed sweeps (60s) is long enough that an ordinary slow tick (one pane
+// near its own `PERMISSION_ANSWER_READ_TIMEOUT_MS` deadline) never trips it,
+// but short enough that a genuinely wedged loop is flagged in roughly a
+// minute, not the ~50 minutes the incident actually ran silent for. See
+// `createTickHealth`'s own doc comment (src/daemon/health.ts) for why this
+// rides in `components[]` (the liveness AND) rather than beside it.
+const permissionAnswerHealth = createTickHealth({
+  name: "permissionAnswer",
+  thresholdMs: Math.max(config.pollStaleMs, 3 * PERMISSION_ANSWER_INTERVAL_MS),
+  log: (line) => console.error(line),
+});
 // FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
 // (see Config.lizardApprovalSound's own doc comment) — `enabled: false`
 // makes `createApprovalSoundNotifier` return a no-op `notifyApproved` before
@@ -2760,6 +2781,11 @@ startPermissionAnswerWatch(
     // comment (src/agents/escalation-loop.ts). A no-op for every
     // non-managed-session pane.
     onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
+    // FACTORY-752 (FACTORY-746 (c)): see `permissionAnswerHealth`'s own
+    // declaration above and `createTickHealth`'s doc comment for the full
+    // reasoning — never called together for the same tick.
+    onTickSuccess: () => permissionAnswerHealth.recordSuccess(),
+    onTickError: (e) => permissionAnswerHealth.recordError(e),
     subscribe: subscribeAgentStatus,
     // FACTORY-722 fix-scope item (d): the watchdog's own journal line
     // (`[watchdog] restarted permission-answer`, permission-answer-watch.ts)
