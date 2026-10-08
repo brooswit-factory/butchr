@@ -825,6 +825,19 @@ describe("startPermissionAnswerWatch", () => {
     await waitFor(() => gates.has(1));
     gates.get(1)!();
     await waitFor(() => subs.length > 0);
+    // `subs.length > 0` is true as soon as tick 0 resubscribes, well BEFORE
+    // its own Promise.all(autoAnswer, autoAnswerCodex) has actually settled
+    // and it reaches its own consumption step (which reads the CURRENT,
+    // live fastPathTriggers map for every pane in ITS OWN labels set — see
+    // runPermissionAnswerTick). p1 is unconditionally eligible for every
+    // tick here, so if the push below fired before tick 0's consumption
+    // step actually runs, tick 0 — not tick A — would consume (delete) the
+    // very trigger this test means to hand to tick A, and the watchdog
+    // would then have nothing to ever trip on. A real macrotask tick (not
+    // just a microtask flush) guarantees tick 0 has fully finished —
+    // Promise.all's own resolution plus the synchronous consumption code
+    // after it — before the push below runs.
+    await flush();
 
     // A push event starts tick A — call #2 — and stalls it: its own
     // fastPathTriggers entry for p1 stays unconsumed because the tick is
