@@ -169,27 +169,48 @@ describe("allowlist is per-index, never a wildcard (agentsafety 2026-10-05 17:0x
     expect(nextDoc.rules[1].query).toBe("project = NEW");
   });
 
-  test("agentPreferences leaf-only scoping: a crafted agentPreferences entry with an extra key (harness) is refused, writes nothing", async () => {
+  // FACTORY-729: `harness` is now a DELIBERATELY editable leaf (see
+  // `EDITABLE_AGENT_PREFERENCE_LEAVES`'s own doc comment,
+  // `rules-write-registry.ts`) — the crafted-extra-key scenario this test
+  // originally exercised with `harness` now legitimately succeeds (see the
+  // test just below). `EDITABLE_AGENT_PREFERENCE_LEAVES` now covers EVERY
+  // real `AgentPreference` field (`harness`/`model`/`effort`/`modelPower`/
+  // `effortPower`), so there is no longer a SCHEMA-VALID preference leaf
+  // left for `assertOnlyChanged`'s own allowlist to be the one catching —
+  // a made-up key (`nickname`, no `AgentPreference` field is ever named
+  // this) is caught one layer EARLIER instead, by `loadRules`'s own
+  // `parseRules` schema validation (`updateRulesFile`'s re-validate-before-
+  // commit step, `write-rules.ts`) — a 400, not a 403. Still "refused,
+  // writes nothing": defense in depth is intact, just via the schema gate
+  // now that the allowlist gate has nothing left to independently catch at
+  // THIS sub-object (it still would, for a future `AgentPreference` field
+  // that's schema-valid but deliberately not made editable).
+  test("agentPreferences leaf-only scoping: a crafted agentPreferences entry with an unknown field (nickname) is refused by schema validation, writes nothing", async () => {
     const text = seed([UI_RULE]);
     const deps = { env: env() };
-    const patch = { agentPreferences: [{ model: "opus", harness: "codex" } as any] };
-    // validateRuleFieldPatch would normally reject this before it ever
-    // reaches writeRuleFields — this exercises the allowlist itself as a
-    // second, independent gate by calling applyRuleFieldPatch's own
-    // caller directly with a patch shape the HTTP-layer validator would
-    // have already blocked, proving the allowlist does not silently trust
-    // the HTTP layer alone. A REAL planHash (planning this same patch
-    // succeeds — the plan stage doesn't enforce the allowlist) so the
-    // allowlist's own refusal, not a stale-plan refusal, is what's tested.
+    const patch = { agentPreferences: [{ model: "opus", nickname: "bob" } as any] };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
     const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
-    // applyRuleFieldPatch spreads the patch element over the current one,
-    // so `harness` WOULD change in the next text — assertOnlyChanged must
-    // catch it since no built allowed path ever names `.harness`.
     expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.status).toBe(403);
+    if (!outcome.ok) expect(outcome.status).toBe(400);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  // FACTORY-729: the NEW leaf-only-scoping proof for `harness`, mirroring
+  // the pre-existing `model`/`effort`/etc. coverage this `describe` block
+  // already has for the array-index-tracking case above — `harness` alone
+  // (no `model`/`effort` in the same patch) is accepted by the allowlist.
+  test("agentPreferences leaf-only scoping: harness alone is now a legitimately editable leaf", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch = { agentPreferences: [{ harness: "codex" } as any] };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
   });
 });
 
@@ -282,6 +303,95 @@ describe("writeRuleFields (PUT)", () => {
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("edits permissionMode: default + agentPreferences[0].harness, no confirm needed (never risky, rule stays disabled)", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "default", agentPreferences: [{ harness: "codex" }] };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].permissionMode).toBe("default");
+    expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
+  });
+});
+
+describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true are never defaults — require confirm", () => {
+  test("setting permissionMode: bypassPermissions without confirm is refused, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "bypassPermissions" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("setting permissionMode: auto WITH confirm succeeds", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "auto" };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("setting lizardMode: true without confirm is refused, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: true };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("setting lizardMode: true WITH confirm succeeds", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: true };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("setting lizardMode: false (an explicit opt-out) needs no confirm", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: false };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("planRuleWrite: requiresConfirm with confirmReason \"risky-permission\" for permissionMode: bypassPermissions alone", async () => {
+    seed([UI_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { permissionMode: "bypassPermissions" }, false, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("risky-permission");
+    }
+  });
+
+  test("planRuleWrite: confirm: true already satisfies the gate — requiresConfirm is false, no confirmReason", async () => {
+    seed([UI_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { lizardMode: true }, true, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(false);
+      expect(plan.confirmReason).toBeUndefined();
+    }
   });
 });
 

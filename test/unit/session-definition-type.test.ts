@@ -9,7 +9,8 @@ import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
 import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import {
   builtinManagedSessionsRule, createManagedSessionResourceType, createSessionDefinitionEventRules,
-  MANAGED_SESSIONS_RULE_ID, onceDeprecatedTier, onceFrozenDefinition, onceInvalidDefinition, onceMissingRoot, ownsManagedSessionAgent,
+  MANAGED_SESSIONS_RULE_ID, onceDeprecatedTier, onceFrozenDefinition, onceInvalidDefinition, onceMissingRoot,
+  onceSkippedNonDefinitionFile, ownsManagedSessionAgent,
   searchSessionDefinitions, specForSessionDefinition, specForSessionDefinitionUnit,
   type SessionDefinitionMatch,
 } from "../../src/rules/session-definition-type.js";
@@ -123,6 +124,100 @@ describe("searchSessionDefinitions — eligible = valid, not frozen", () => {
     expect(frozen).toEqual([]);
   });
 
+  test("FACTORY-755: a byte-identical *.json.bak-* backup is never a candidate — exactly one match, the real .json, identity asserted not just count", async () => {
+    const body = JSON.stringify(goodDef());
+    const { list, read } = fakeFiles({
+      [absPath("defs", "admin-agentsafety.json")]: body,
+      [absPath("defs", "admin-agentsafety.json.bak-1008")]: body,
+    });
+    const skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read }, undefined, undefined, undefined, undefined, undefined,
+      (p) => skipped.push(p),
+    );
+    expect(matches).toHaveLength(1);
+    expect(matches[0]!.resource.path).toBe(absPath("defs", "admin-agentsafety.json"));
+    expect(skipped).toEqual([absPath("defs", "admin-agentsafety.json.bak-1008")]);
+  });
+
+  test("FACTORY-755: notes.txt/README are skipped via the NEW onSkippedNonDefinition channel, never onInvalid", async () => {
+    const { list, read } = fakeFiles({
+      [absPath("defs", "notes.txt")]: "just some notes",
+      [absPath("defs", "README")]: "# hi",
+      [absPath("defs", "good.json")]: JSON.stringify(goodDef()),
+    });
+    const invalid: string[] = [];
+    const skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read }, undefined, (p) => invalid.push(p), undefined, undefined, undefined,
+      (p) => skipped.push(p),
+    );
+    expect(matches.map((m) => m.resource.path)).toEqual([absPath("defs", "good.json")]);
+    expect(invalid).toEqual([]);
+    expect(skipped.sort()).toEqual([absPath("defs", "README"), absPath("defs", "notes.txt")].sort());
+  });
+
+  test("FACTORY-755: a genuinely malformed broken.json STILL goes to onInvalid, never the new skip channel", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", "broken.json")]: "{not json" });
+    const invalid: string[] = [];
+    const skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read }, undefined, (p) => invalid.push(p), undefined, undefined, undefined,
+      (p) => skipped.push(p),
+    );
+    expect(matches).toEqual([]);
+    expect(invalid).toEqual([absPath("defs", "broken.json")]);
+    expect(skipped).toEqual([]);
+  });
+
+  test("FACTORY-755: uppercase .JSON is NOT accepted — case-sensitive extension match, decided+pinned here — skipped via the new channel, not staffed", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", "weird.JSON")]: JSON.stringify(goodDef()) });
+    const skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read }, undefined, undefined, undefined, undefined, undefined,
+      (p) => skipped.push(p),
+    );
+    expect(matches).toEqual([]);
+    expect(skipped).toEqual([absPath("defs", "weird.JSON")]);
+  });
+
+  test("FACTORY-755: a bare basename of literally \".json\" is dot-prefixed — hits the SILENT hidden-file gate, never the new skip channel, nothing logged", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", ".json")]: JSON.stringify(goodDef()) });
+    const skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read }, undefined, undefined, undefined, undefined, undefined,
+      (p) => skipped.push(p),
+    );
+    expect(matches).toEqual([]);
+    expect(skipped).toEqual([]);
+  });
+
+  test("FACTORY-755: pre-existing behaviour intact — frozen *.json still reports frozen, deprecated tier *.json still reports deprecated, oversized-path check still fires, alongside the new filter", async () => {
+    const oversized = absPath("defs", `${"d".repeat(300)}.json`);
+    const { list, read } = fakeFiles({
+      [oversized]: JSON.stringify(goodDef()),
+      [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })),
+      [absPath("defs", "old.json")]: JSON.stringify(goodDef()),
+      [absPath("defs", "notes.txt")]: "ignore me",
+      [absPath("defs", "good.json")]: JSON.stringify(goodDef({ tier: undefined, modelPower: 25, effort: 20 })),
+    });
+    const oversizedPaths: string[] = [], frozen: string[] = [], deprecated: string[] = [], skipped: string[] = [];
+    const matches = await searchSessionDefinitions(
+      { rule, list, read },
+      (_r, p) => oversizedPaths.push(p),
+      undefined,
+      (p) => frozen.push(p),
+      undefined,
+      (p) => deprecated.push(p),
+      (p) => skipped.push(p),
+    );
+    expect(matches.map((m) => m.resource.path).sort()).toEqual([absPath("defs", "good.json"), absPath("defs", "old.json")].sort());
+    expect(oversizedPaths).toEqual([oversized]);
+    expect(frozen).toEqual([absPath("defs", "frozen.json")]);
+    expect(deprecated).toEqual([absPath("defs", "old.json")]);
+    expect(skipped).toEqual([absPath("defs", "notes.txt")]);
+  });
+
   test("PR #394 review fix 3: a missing well-known directory (ENOENT) is 0 definitions, NEVER a poll error — reported via onMissingRoot, once", async () => {
     const missing: number[] = [];
     const list = async (): Promise<FilesystemResource[]> => { throw Object.assign(new Error("filesystem root /nope is not readable: ENOENT: no such file or directory, realpath '/nope'"), { code: "ENOENT" }); };
@@ -194,6 +289,23 @@ describe("onceInvalidDefinition / onceFrozenDefinition — log once, never spam"
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("deprecated");
     expect(lines[0]).toContain("modelPower");
+  });
+
+  // FACTORY-755: a skipped non-.json file (a .bak backup, notes.txt, ...) is
+  // reported once per path via this NEW channel, distinctly from
+  // onceInvalidDefinition — it was never offered as a definition, so it's
+  // never "invalid".
+  test("FACTORY-755: the same skipped-non-definition path logs only once, never respammed across repeated polls", () => {
+    const lines: string[] = [];
+    const onSkipped = onceSkippedNonDefinitionFile((l) => lines.push(l));
+    onSkipped(absPath("defs", "admin-agentsafety.json.bak-1008"));
+    onSkipped(absPath("defs", "admin-agentsafety.json.bak-1008"));
+    onSkipped(absPath("defs", "admin-agentsafety.json.bak-1008"));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]!).toContain("[managed-sessions]");
+    expect(lines[0]!).toContain("admin-agentsafety.json.bak-1008");
+    expect(lines[0]!.toLowerCase()).toContain("not a definition file");
+    expect(lines[0]!.toLowerCase()).toContain("never staffed");
   });
 });
 

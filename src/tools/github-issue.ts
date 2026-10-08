@@ -10,7 +10,17 @@
  * The tool surface is one list for every connection (thatch has no
  * per-connection tool lists), so the separation is enforced at call time:
  * `forJiraCallers` refuses a GitHub agent on every Jira/Confluence tool
- * before the tool runs. A Jira caller passes through it untouched.
+ * before the tool runs. A `jira-work` caller passes through it untouched.
+ *
+ * FACTORY-732: a `jira-project` caller ALSO passes through this gate
+ * untouched now — it used to be refused here exactly like every other
+ * non-`jira-work` provider (see `OWN_TOOLS`'s old entry for it). It is
+ * instead confined to a narrow, project-scoped allowlist one layer further
+ * out — `restrictJiraProjectManagers` (src/tools/jira-project-scope.ts),
+ * composed around this gate's own output at the call site
+ * (src/daemon/index.ts) — because doing that scoping HERE would need this
+ * module to know about Jira issue keys/JQL, which belongs with the rest of
+ * the Jira tool layer, not with the GitHub-issue gate.
  *
  * FACTORY-57: `github-pr`'s own tools (`github_get_pr`/`github_pr_add_comment`)
  * live in `./github-pr.ts`, a sibling module — never here — but its provider
@@ -87,9 +97,13 @@ export function githubIssueTools(deps: GithubIssueToolDeps): Record<string, Tool
   return withOutcomeRecording(tools, log);
 }
 
-/** The only tools each key-only provider's agents may use instead of the Jira work tools. */
-const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work">, string>> = {
-  "jira-project": "operator-configured MCP tools (free-form project agent)",
+/**
+ * The only tools each key-only provider's agents may use instead of the
+ * Jira work tools. `jira-project` is deliberately ABSENT (FACTORY-732): it
+ * is no longer one of "every other provider" this table refuses — see this
+ * file's own top comment and `forJiraCallers` below.
+ */
+const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work" | "jira-project">, string>> = {
   "github-issue": "github_get_issue, github_add_comment and github_link_jira_idea",
   "github-pr": "github_get_pr and github_pr_add_comment",
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
@@ -98,9 +112,13 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
 };
 
 /**
- * Wrap Jira/Confluence tools so a `github-issue`, `jira-idea` or `zendesk-ticket` agent is
- * refused before any of them runs. A caller the tools already accepted
- * (anyone with `x-issue`) reaches the original handler exactly as before.
+ * Wrap Jira/Confluence tools so a `github-issue`, `jira-idea` or
+ * `zendesk-ticket` agent is refused before any of them runs. A caller the
+ * tools already accepted (`jira-work`, with `x-issue`) reaches the original
+ * handler exactly as before. FACTORY-732: a `jira-project` caller ALSO
+ * reaches the original handler here, unlike before — it is narrowed
+ * instead by `restrictJiraProjectManagers` (src/tools/jira-project-scope.ts),
+ * composed around this function's own output rather than inside it.
  */
 export function forJiraCallers(tools: Record<string, ToolDef<any>>, log: (line: string) => void = console.error): Record<string, ToolDef<any>> {
   const gated: Record<string, ToolDef<any>> = {};
@@ -109,7 +127,7 @@ export function forJiraCallers(tools: Record<string, ToolDef<any>>, log: (line: 
       ...def,
       handler: (args: unknown, c: { headers: Readonly<Record<string, string>> }) => {
         const provider = callerIdentity(c.headers)?.provider;
-        if (provider && provider !== "jira-work") {
+        if (provider && provider !== "jira-work" && provider !== "jira-project") {
           log(`  [tools] ${c.headers["x-butchr-agent"]} → refused ${name}: ${provider} agents have no Jira work or Confluence tools`);
           throw new Refusal(`${name}: refusing a ${provider} agent — Jira and Confluence tools are for jira-work agents; use ${OWN_TOOLS[provider]}`);
         }
