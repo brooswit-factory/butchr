@@ -31,6 +31,16 @@ export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
 const CLEAVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
 
 /**
+ * FACTORY-751/FACTORY-775: upper bound for `BUTCHR_HERDR_TIMEOUT_MS` — see
+ * `Config.herdrCallTimeoutMs`'s own doc comment for the full rationale
+ * (well under the 2147483647ms int32 `setTimeout` overflow point bun
+ * 1.3.14 shares with `node:timers`, chosen because this knob's own purpose
+ * is already defeated long before that point, not because the overflow
+ * itself is the only concern).
+ */
+export const HERDR_CALL_TIMEOUT_MS_CEILING = 300_000;
+
+/**
  * Butchr's configuration, parsed from the environment once at startup.
  *
  * The Atlassian credential is a classic API token used as HTTP Basic auth
@@ -66,6 +76,21 @@ export interface Config {
    * of the 5s loops (`watchPrompts`, `blockingEscalationTimer`) that also
    * serialize on this client — a timeout this short recovers within one or
    * two of their ticks instead of a human noticing hours later.
+   *
+   * FACTORY-751/FACTORY-775: bounded above by `HERDR_CALL_TIMEOUT_MS_CEILING`
+   * (300_000, 5 minutes) — `loadConfig` throws rather than accepting a value
+   * past it. Below that ceiling this knob behaves as documented; ABOVE it,
+   * on bun 1.3.14, `setTimeout(fn, ms)` for `ms > 2147483647` (~24.8 days,
+   * the int32 millisecond overflow point `node:timers`/Bun share) silently
+   * wraps and fires in about 1ms instead of waiting — i.e. a LARGER value
+   * would make every herdr call reject almost immediately, the exact
+   * opposite of what setting it was meant to do. 300_000 is chosen well
+   * under that overflow point (not merely under it) because this knob's own
+   * purpose — failing a hung call fast enough for a human or the daemon's
+   * own recovery paths to notice — is already defeated long before 2^31ms;
+   * a 5-minute ceiling still comfortably covers a deliberately patient
+   * operator while refusing a value that would make the knob meaningless
+   * (or, past the overflow point, backwards).
    */
   herdrCallTimeoutMs: number;
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
@@ -828,6 +853,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
   const herdrCallTimeoutMs = env.BUTCHR_HERDR_TIMEOUT_MS ? Number(env.BUTCHR_HERDR_TIMEOUT_MS) : 10_000;
   if (!Number.isFinite(herdrCallTimeoutMs) || herdrCallTimeoutMs <= 0) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS is not a positive number: ${env.BUTCHR_HERDR_TIMEOUT_MS}`);
+  if (herdrCallTimeoutMs > HERDR_CALL_TIMEOUT_MS_CEILING) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS=${herdrCallTimeoutMs} is above the ceiling (${HERDR_CALL_TIMEOUT_MS_CEILING}ms): see Config.herdrCallTimeoutMs's own doc comment for why a larger value defeats this knob's purpose`);
   // FACTORY-772: bounded, unlike BUTCHR_HERDR_TIMEOUT_MS above — see
   // Config.loopWatchdogThresholdMs' own doc comment for why both ends are
   // checked (NaN/invalid/out-of-range all rejected clearly, never a silent

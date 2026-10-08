@@ -134,8 +134,22 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("pollStaleMs=60000");
   });
 
-  // FACTORY-772: BOUNDED on both ends, unlike BUTCHR_HERDR_TIMEOUT_MS above
-  // (no upper bound — a defect this var deliberately does not repeat).
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs defaults to 10000, honours BUTCHR_HERDR_TIMEOUT_MS, and rejects 0/negative/NaN/non-numeric", () => {
+    expect(loadConfig(base, noRead).herdrCallTimeoutMs).toBe(10_000);
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "5000" }, noRead).herdrCallTimeoutMs).toBe(5_000);
+    for (const bad of ["0", "-1", "NaN", "nope"]) {
+      expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: bad }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    }
+  });
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs throws above its ceiling (300000) instead of silently clamping", () => {
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300000" }, noRead).herdrCallTimeoutMs).toBe(300_000);
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300001" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    // The specific overflow value the finding named (2147483648ms, which bun's
+    // setTimeout silently wraps to ~1ms instead of waiting) must throw too,
+    // not merely "some" large value above the ceiling.
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "2147483648" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+  });
+  // FACTORY-772: BOUNDED on both ends (as BUTCHR_HERDR_TIMEOUT_MS now is, too).
   test("loopWatchdogThresholdMs defaults to 120000, honours BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS, and rejects NaN/below-min/above-max", () => {
     expect(loadConfig(base, noRead).loopWatchdogThresholdMs).toBe(120_000);
     expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "60000" }, noRead).loopWatchdogThresholdMs).toBe(60_000);
