@@ -176,9 +176,17 @@ describe("loop-watchdog (FACTORY-772)", () => {
 
   test("one restart can cover more than one reported name (pollLoop and notify share one underlying loop)", async () => {
     let restarts = 0;
+    // Mirrors production: a restart replaces the underlying loop, so the
+    // liveness component it reports goes back to healthy. Without this, the
+    // stub stays permanently stale and the watchdog's re-trip cooldown
+    // (correctly) keeps tripping it again once the cooldown elapses — that
+    // repeat-trip behavior has its own dedicated test above; this test is
+    // only about one restart covering two names, so the stub must recover.
     const stale: ComponentHealth = { name: "either", ok: false, state: "stale", lastSuccessAt: null, staleForMs: 10_000 };
+    const healthy: ComponentHealth = { name: "either", ok: true, state: "ok", lastSuccessAt: Date.now(), staleForMs: 0 };
+    let recovered = false;
     const watchdog = createLoopWatchdog(
-      [{ names: ["pollLoop", "notify"], components: () => [stale], restart: () => { restarts++; } }],
+      [{ names: ["pollLoop", "notify"], components: () => [recovered ? healthy : stale], restart: () => { restarts++; recovered = true; } }],
       { thresholdMs: 10, checkIntervalMs: 5 },
     );
     await Bun.sleep(30);
