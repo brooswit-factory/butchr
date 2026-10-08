@@ -28,6 +28,12 @@ interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined; workspace_id?: string }>) {
   const started: any[] = []; const closed: string[] = []; const renamed: any[] = []; const metadata: any[] = []; const creates: any[] = [];
+  // FACTORY-720: every `pane.report_agent_session` call `HerdrHerd.spawn()`
+  // makes once a fresh/respawned launch discovers and persists a NEW id —
+  // tracked here (never rejecting on its own) so tests can assert the exact
+  // reports made; `reportAgentSessionFails` lets a test flip it into the
+  // "herdr call fails" branch without touching every other fixture user.
+  const reportedSessions: any[] = []; let reportAgentSessionFails = false;
   let createdCwd: string | undefined; let createdWorkspaceId = "w9";
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
@@ -36,7 +42,15 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string 
       const workspace_id = a.workspace_id ?? "w9";
       return cwd ? { ...a, agent: "claude", cwd, workspace_id } : { ...a, workspace_id };
     }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd, workspace_id: createdWorkspaceId }); } },
-    pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
+    pane: {
+      close: async (id: string) => { closed.push(id); },
+      read: async () => ({ read: { text: "" } }),
+      reportAgentSession: async (p: any) => {
+        if (reportAgentSessionFails) throw new Error("herdr socket hiccup");
+        reportedSessions.push(p);
+        return {};
+      },
+    },
     workspace: {
       // `label` is passed to `workspace.create` by drovr's own `ManagedHerdrLifecycle.start()`
       // (never to `agent.start`) — see this fake's own `creates` tracking array below.
@@ -45,7 +59,10 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string 
       reportMetadata: async (p: any) => { metadata.push(p); return {}; },
     },
   };
-  return { client: client as any, started, closed, renamed, metadata, creates };
+  return {
+    client: client as any, started, closed, renamed, metadata, creates, reportedSessions,
+    setReportAgentSessionFails: (v: boolean) => { reportAgentSessionFails = v; },
+  };
 }
 
 describe("agent name convention", () => {
@@ -2789,6 +2806,117 @@ describe("resumeInPlace", () => {
         expect(f.started[0]!.args).not.toContain("--session-id"); // confirms the real launch path carries no butchr-chosen id at all
         expect(f.started[0]!.args).not.toContain("--resume");
         expect(workspaceSessionId(cwd)).toBe(claudeChosenId); // discovered from Claude's OWN transcript, not guessed
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-720 (PR #678 review, BLOCKING): `reportPersistedAgentSessions`
+  // (./report-agent-sessions.ts) reports a persisted id to herdr only ONCE,
+  // at daemon startup. Without ALSO reporting at the point `spawn()` itself
+  // persists a id, a later respawn in the SAME pane (model/effort change,
+  // crash-loop restart, an ordinary relaunch) would leave herdr still
+  // holding whatever the earlier report said — a confident wrong `--resume`
+  // into a finished conversation on the NEXT herdr restart. RED FIRST
+  // against the pre-fix code: this test fails because nothing ever calls
+  // `pane.reportAgentSession` from `spawn()` at all.
+  test("FACTORY-720: a respawn that discovers and persists a NEW session id reports the NEW id to herdr, not the old one", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-908" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-report-"));
+      try {
+        // Passed by reference into `fakeHerdr` so the test can mutate it
+        // between calls: emptying it between the two `spawn()` calls below
+        // simulates herdr no longer listing a live agent for this pane (a
+        // crash-loop restart, the ticket's own example) — the ONLY way to
+        // drive a SECOND real launch through `startProviders` rather than
+        // `spawnExclusive`'s "noop — already has a live agent" short-circuit.
+        const agents: any[] = [];
+        const f = fakeHerdr(agents);
+        const realStart = f.client.agent.start;
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        let nextId = "";
+        f.client.agent.start = async (p: any) => {
+          await realStart(p);
+          await new Promise((r) => setTimeout(r, 20));
+          writeFileSync(join(projectDir, `${nextId}.jsonl`), "{}");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+
+        // First launch: Claude picks C1. The sweep (not exercised here) would
+        // have been the only reporter before this fix; `spawn()` itself now
+        // also reports it.
+        nextId = "claude-session-C1";
+        await herd.spawn(spec);
+        expect(workspaceSessionId(cwd)).toBe("claude-session-C1");
+        expect(f.reportedSessions).toEqual([{ pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C1", source: "herdr:claude" }]);
+
+        // Respawn of the SAME pane (e.g. a crash-loop restart): mirrors the
+        // real `reconcileNow` sequence (its own big comment above
+        // `clearVanishedWorker` names it: "the normal reconcile loop stops
+        // the stale agent and respawns it") — `herd.stop()` releases
+        // `ManagedHerdrLifecycle`'s cached `active` identity, and clearing
+        // the fixture's `agents` list simulates herdr no longer listing the
+        // old (crashed) pane, so the next `spawn()` is a genuine fresh
+        // launch rather than `spawnExclusive`'s "noop" short-circuit.
+        await herd.stop(key);
+        agents.length = 0;
+        // Claude picks a DIFFERENT id, C2, this time. Disk now says C2 —
+        // herdr must be told C2 too, not left holding C1 from above.
+        nextId = "claude-session-C2";
+        await herd.spawn(spec);
+        expect(workspaceSessionId(cwd)).toBe("claude-session-C2");
+        expect(f.reportedSessions).toEqual([
+          { pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C1", source: "herdr:claude" },
+          { pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C2", source: "herdr:claude" },
+        ]);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-720 (PR #678 review): same "a report hiccup must never read as a
+  // failed spawn" discipline `reportFullAgentKey` already follows for
+  // `workspace.reportMetadata` — a failed `pane.reportAgentSession` call at
+  // the exact moment a fresh/respawned launch persists its new id must not
+  // make `spawn()` itself reject. The launch already succeeded; only the
+  // herdr notification about it failed.
+  test("FACTORY-720: a failed pane.reportAgentSession report after a successful launch does not fail the spawn", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-909" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-report-fail-"));
+      try {
+        const f = fakeHerdr([]);
+        f.setReportAgentSessionFails(true);
+        const realStart = f.client.agent.start;
+        const claudeChosenId = "claude-picked-this-id-despite-report-failure";
+        f.client.agent.start = async (p: any) => {
+          await realStart(p);
+          await new Promise((r) => setTimeout(r, 20));
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `${claudeChosenId}.jsonl`), "{}");
+        };
+        const logs: string[] = [];
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => logs.push(l), undefined, undefined, homeOf(home));
+
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null }); // must not throw
+        expect(f.started).toHaveLength(1);
+        expect(workspaceSessionId(cwd)).toBe(claudeChosenId); // the launch's own bookkeeping is unaffected
+        expect(f.reportedSessions).toEqual([]); // the report never actually recorded (it rejected)
+        expect(logs.some((l) => l.includes("WARNING") && l.includes("herdr socket hiccup"))).toBe(true);
       } finally {
         rmSync(home, { recursive: true, force: true });
       }

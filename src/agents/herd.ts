@@ -10,6 +10,7 @@ import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, 
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
+import { reportAgentSession } from "./report-agent-sessions.js";
 import { panesFor, groupOwnedPanes, aggregateVerdict, type ResidencyVerdict } from "./residency-census.js";
 export type { SpawnSpec } from "./workspace.js";
 export type { StrandedCandidate } from "./reap.js";
@@ -1516,7 +1517,22 @@ export class HerdrHerd implements Herd {
           if (discovered || attempt === SESSION_DISCOVERY_ATTEMPTS - 1) break;
           await this.wait(SESSION_DISCOVERY_POLL_MS);
         }
-        if (discovered) persistDiscoveredSessionId(dir, discovered);
+        if (discovered) {
+          persistDiscoveredSessionId(dir, discovered);
+          // PR #678 review (BLOCKING): the startup sweep (`reportPersistedAgentSessions`,
+          // ./report-agent-sessions.ts) reports a persisted id to herdr only
+          // ONCE, at daemon start. Without this, a later respawn in this
+          // SAME pane (model/effort change, crash-loop restart, an ordinary
+          // relaunch) persists this NEW id on disk but leaves herdr still
+          // holding whatever the last sweep saw — so the NEXT herdr restart
+          // would confidently `--resume` a finished conversation instead of
+          // this one. Reporting here, at the exact moment butchr itself
+          // learns the new id, closes that gap. Same swallow-and-log
+          // discipline as the sweep (`reportAgentSession` itself never
+          // throws) — a failed report here must never read as a failed
+          // spawn, which already succeeded.
+          await reportAgentSession({ herdr: this.herdr, log: this.log }, result.value, "claude", discovered);
+        }
         else {
           // Already invalidated above, before the poll began. Nothing left
           // to clear here — `workspaceSessionId` already fails safe to
