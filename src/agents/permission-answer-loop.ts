@@ -316,6 +316,28 @@ export interface PermissionAnswerLoopDeps {
   now?: () => number;
   /** Test seam: how a latency audit line is appended. Defaults to the real filesystem (`mkdir` + `appendFile`, same shape as `@brooswit/drovr`'s own `defaultDeps.appendAudit`). */
   appendAudit?: (path: string, line: string) => Promise<void>;
+  /**
+   * FACTORY-752 (FACTORY-746 (c)): called once this tick COMPLETES — whether
+   * or not anything was eligible (even the `labels.size === 0` early-out
+   * below still counts: an `agent.list()` that succeeded and found nothing
+   * to do is exactly the "idle, ticking normally" case the daemon's `/health`
+   * must NOT mistake for "has not ticked at all" — see
+   * `createTickHealth`'s own doc comment, src/daemon/health.ts). Never called
+   * alongside `onTickError` for the same tick: this fires only on the path
+   * that returns without throwing. Optional; omitted, nothing records a
+   * heartbeat for this tick (unchanged from before this ticket).
+   */
+  onTickSuccess?: () => void;
+  /**
+   * FACTORY-752 (FACTORY-746 (c)): called once per tick that REJECTED — the
+   * same `catch` below that already logs `"tick failed: …"` (the exact shape
+   * the 10-08 incident's own journal showed twice, then silence). Receives
+   * the raw caught value. Never called alongside `onTickSuccess` for the
+   * same tick. Optional; omitted, a rejection is still logged but not
+   * recorded as a distinguishable health event (unchanged from before this
+   * ticket).
+   */
+  onTickError?: (error: unknown) => void;
 }
 
 /**
@@ -385,7 +407,14 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
         if (!labels.has(id)) deps.fastPathTriggers.delete(id);
       }
     }
-    if (labels.size === 0) return [];
+    if (labels.size === 0) {
+      // FACTORY-752 (FACTORY-746 (c)): a completed tick with NOTHING eligible
+      // still advances the health heartbeat — this is the whole point (see
+      // `onTickSuccess`'s own doc comment above): an idle tick must never
+      // look identical to a tick that never ran at all.
+      deps.onTickSuccess?.();
+      return [];
+    }
     const eligible = agents.filter((a) => labels.has(a.pane_id));
     const scopedClient: PermissionAnswerClient = {
       agent: {
@@ -517,9 +546,11 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     }
 
     if (deps.loggedSkips && deps.loggedSkips.size > 1000) deps.loggedSkips.clear();
+    deps.onTickSuccess?.();
     return [...results, ...codexResults];
   } catch (e) {
     log(`[permission-answer] tick failed: ${(e as Error)?.message ?? e}`);
+    deps.onTickError?.(e);
     return [];
   }
 }
