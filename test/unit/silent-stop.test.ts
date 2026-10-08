@@ -2,26 +2,53 @@ import { describe, expect, test } from "bun:test";
 import { SilentStopTracker, createSilentStopCheck } from "../../src/agents/silent-stop.js";
 
 describe("SilentStopTracker", () => {
-  test("working -> idle reports the stop exactly once; the episode's working observation never reports", () => {
+  // PR #692 review: a stop confirms only after STOP_CONFIRM_POLLS (2)
+  // consecutive idle/none observations — the same two-consecutive-polls
+  // debounce src/labels/sync.ts's AgentLabelStabilizer applies to the
+  // agent:* label itself, applied here to the stop event instead.
+
+  test("working, idle, working => no stop: a single idle poll sandwiched between working polls is a flicker, not a stop", () => {
     let now = 0;
     const t = new SilentStopTracker(() => now);
     expect(t.observe("K-1", "working")).toBeNull();
-    now = 60_000;
-    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
-    now = 75_000;
-    expect(t.observe("K-1", "idle")).toBeNull(); // dedup: still the same stopped episode
-    now = 90_000;
-    expect(t.observe("K-1", "idle")).toBeNull();
+    now = 15_000;
+    expect(t.observe("K-1", "idle")).toBeNull(); // 1st idle poll: not yet confirmed
+    now = 30_000;
+    expect(t.observe("K-1", "working")).toBeNull(); // back to working before confirming: cancelled
   });
 
-  test("working -> none reports a stop too (the session is simply gone)", () => {
+  test("working, idle, idle => exactly one stop, reported on the 2nd confirming poll, anchored to the ORIGINAL working instant", () => {
+    let now = 0;
+    const t = new SilentStopTracker(() => now);
+    t.observe("K-1", "working"); // episode starts at 0
+    now = 15_000;
+    expect(t.observe("K-1", "idle")).toBeNull(); // 1st idle poll: not yet confirmed
+    now = 30_000;
+    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 }); // 2nd: confirmed, anchored to 0
+  });
+
+  test("dedup still holds after confirmation: further idle/none polls report nothing", () => {
     let now = 0;
     const t = new SilentStopTracker(() => now);
     t.observe("K-1", "working");
+    now = 15_000;
+    t.observe("K-1", "idle");
+    now = 30_000;
+    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
+    now = 45_000;
+    expect(t.observe("K-1", "idle")).toBeNull(); // dedup: still the same stopped episode
+    now = 60_000;
+    expect(t.observe("K-1", "none")).toBeNull(); // dedup holds across idle<->none too
+  });
+
+  test("working -> none confirms exactly like idle (the session is simply gone)", () => {
+    let now = 0;
+    const t = new SilentStopTracker(() => now);
+    t.observe("K-1", "working");
+    now = 15_000;
+    expect(t.observe("K-1", "none")).toBeNull();
     now = 30_000;
     expect(t.observe("K-1", "none")).toEqual({ episodeStart: 0 });
-    now = 45_000;
-    expect(t.observe("K-1", "none")).toBeNull(); // dedup
   });
 
   test("blocked counts as active: working -> blocked -> working never reports a stop", () => {
@@ -34,14 +61,16 @@ describe("SilentStopTracker", () => {
     expect(t.observe("K-1", "working")).toBeNull();
   });
 
-  test("blocked counts as active: a working -> blocked -> idle run's episode starts from when WORKING began, not from when blocked ended", () => {
+  test("blocked counts as active: a working -> blocked -> idle,idle run's episode starts from when WORKING began, not from when blocked ended", () => {
     let now = 0;
     const t = new SilentStopTracker(() => now);
     t.observe("K-1", "working"); // episode starts at 0
     now = 10_000;
     t.observe("K-1", "blocked"); // still the same episode
     now = 20_000;
-    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
+    t.observe("K-1", "idle"); // 1st confirming poll
+    now = 30_000;
+    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 }); // 2nd: confirmed, still anchored to 0
   });
 
   test("resuming after a reported stop starts a fresh episode, and a later stop reports again", () => {
@@ -49,18 +78,24 @@ describe("SilentStopTracker", () => {
     const t = new SilentStopTracker(() => now);
     t.observe("K-1", "working");
     now = 10_000;
-    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
+    t.observe("K-1", "idle");
     now = 15_000;
+    expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
+    now = 16_000;
     expect(t.observe("K-1", "idle")).toBeNull(); // dedup
     now = 20_000;
     t.observe("K-1", "working"); // resumes: fresh episode starts at 20_000
     now = 50_000;
+    t.observe("K-1", "idle");
+    now = 55_000;
     expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 20_000 }); // reports again, anchored to the resume
   });
 
   test("a ticket only ever observed idle/none never reports a stop (it was never active)", () => {
     let now = 0;
     const t = new SilentStopTracker(() => now);
+    expect(t.observe("K-1", "idle")).toBeNull();
+    now = 15_000;
     expect(t.observe("K-1", "idle")).toBeNull();
     now = 60_000;
     expect(t.observe("K-1", "none")).toBeNull();
@@ -71,11 +106,15 @@ describe("SilentStopTracker", () => {
     const t = new SilentStopTracker(() => now);
     t.observe("K-1", "working");
     now = 10_000;
+    t.observe("K-1", "idle");
+    now = 15_000;
     expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 0 });
     t.forget("K-1");
     now = 20_000;
     t.observe("K-1", "working"); // fresh entry, fresh episode at 20_000
     now = 30_000;
+    t.observe("K-1", "idle");
+    now = 35_000;
     expect(t.observe("K-1", "idle")).toEqual({ episodeStart: 20_000 });
   });
 });
@@ -102,7 +141,9 @@ describe("createSilentStopCheck", () => {
     now = PAST_STARTUP;
     await check.check("K-1", "working");
     now += 60_000;
-    await check.check("K-1", "idle");
+    await check.check("K-1", "idle"); // 1st idle poll: not yet confirmed
+    now += 15_000;
+    await check.check("K-1", "idle"); // 2nd: confirms the stop
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("[silent-stop] would flag K-1");
   });
@@ -120,6 +161,8 @@ describe("createSilentStopCheck", () => {
     await check.check("K-1", "working");
     now += 60_000;
     await check.check("K-1", "idle");
+    now += 15_000;
+    await check.check("K-1", "idle");
     expect(lines).toHaveLength(0);
   });
 
@@ -135,6 +178,8 @@ describe("createSilentStopCheck", () => {
     now = PAST_STARTUP;
     await check.check("K-1", "working");
     now += 60_000;
+    await check.check("K-1", "idle");
+    now += 15_000;
     await check.check("K-1", "idle");
     expect(lines.some((l) => l.includes("would flag K-1"))).toBe(true);
   });
@@ -152,6 +197,8 @@ describe("createSilentStopCheck", () => {
     await check.check("K-1", "working");
     now += 60_000;
     await check.check("K-1", "idle");
+    now += 15_000;
+    await check.check("K-1", "idle");
     expect(lines.some((l) => l.includes("would flag K-1"))).toBe(true);
   });
 
@@ -167,6 +214,8 @@ describe("createSilentStopCheck", () => {
     now = PAST_STARTUP;
     await check.check("K-1", "working"); // episode starts at `now`
     now += 60_000;
+    await check.check("K-1", "idle");
+    now += 15_000;
     await check.check("K-1", "idle");
     expect(lines.some((l) => l.includes("would flag K-1"))).toBe(true);
   });
@@ -204,6 +253,8 @@ describe("createSilentStopCheck", () => {
     await check.check("K-1", "working");
     now += 60_000;
     await check.check("K-1", "idle");
+    now += 15_000;
+    await check.check("K-1", "idle");
     expect(lines.some((l) => l.includes("would flag"))).toBe(false);
   });
 
@@ -220,6 +271,8 @@ describe("createSilentStopCheck", () => {
     await check.check("K-1", "working");
     now += 60_000;
     await check.check("K-1", "idle");
+    now += 15_000;
+    await check.check("K-1", "idle");
     expect(lines.some((l) => l.includes("would flag"))).toBe(false);
     expect(lines.some((l) => l.startsWith("WARNING:"))).toBe(true);
   });
@@ -235,7 +288,9 @@ describe("createSilentStopCheck", () => {
     });
     await check.check("K-1", "working");
     now = 2 * 60_000; // 2 minutes after daemon start: inside the 5-minute window
-    await check.check("K-1", "idle");
+    await check.check("K-1", "idle"); // 1st idle poll: not yet confirmed
+    now += 15_000;
+    await check.check("K-1", "idle"); // 2nd: confirms the stop, which is then suppressed
     expect(lines.some((l) => l.includes("would flag"))).toBe(false);
     expect(lines.some((l) => l.includes("suppressed"))).toBe(true);
   });
@@ -258,7 +313,9 @@ describe("createSilentStopCheck", () => {
       now += 15_000;
       await check.check("K-1", "working");
     }
-    await check.check("K-1", "idle");
+    await check.check("K-1", "idle"); // 1st idle poll: not yet confirmed
+    now += 15_000;
+    await check.check("K-1", "idle"); // 2nd: confirms, well past the suppression window
     expect(lines.some((l) => l.includes("would flag K-1"))).toBe(true);
   });
 
@@ -277,7 +334,9 @@ describe("createSilentStopCheck", () => {
     now += 5 * 60_000; // a 5-minute gap: far past DISCONTINUITY_GAP_MS — herdr was unreachable
     await check.check("K-1", "working"); // this poll is what notices the gap and re-arms the window
     now += 30_000; // 30s after the just-noticed reconnect: inside the fresh 5-minute window
-    await check.check("K-1", "idle");
+    await check.check("K-1", "idle"); // 1st idle poll: not yet confirmed
+    now += 15_000;
+    await check.check("K-1", "idle"); // 2nd: confirms the stop, which is then suppressed
     expect(lines.some((l) => l.includes("would flag"))).toBe(false);
     expect(lines.some((l) => l.includes("suppressed"))).toBe(true);
   });
@@ -298,7 +357,10 @@ describe("createSilentStopCheck", () => {
     await check.check("K-1", "working"); // notices the gap, re-arms
     await check.check("K-2", "working"); // same poll, same discontinuity instant
     now += 60_000; // inside the fresh window for both
-    await check.check("K-1", "idle");
+    await check.check("K-1", "idle"); // 1st idle poll for each: not yet confirmed
+    await check.check("K-2", "idle");
+    now += 15_000;
+    await check.check("K-1", "idle"); // 2nd: confirms, suppressed
     await check.check("K-2", "idle");
     expect(lines.some((l) => l.includes("would flag"))).toBe(false);
     expect(lines.filter((l) => l.includes("suppressed")).length).toBe(2);
@@ -316,7 +378,9 @@ describe("createSilentStopCheck", () => {
     now = PAST_STARTUP;
     await check.check("K-1", "working");
     now += 60_000;
-    await check.check("K-1", "idle", { prOpen: true });
+    await check.check("K-1", "idle", { prOpen: true }); // 1st idle poll: not yet confirmed
+    now += 15_000;
+    await check.check("K-1", "idle", { prOpen: true }); // 2nd: confirms
     expect(lines[0]).toContain("pr open=yes");
   });
 });

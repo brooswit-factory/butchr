@@ -3,6 +3,19 @@ import type { ObservedAgentLabel } from "../labels/plan.js";
 /** Alias kept local for readability — see labels/plan.ts's ObservedAgentLabel. */
 export type ObservedLabel = ObservedAgentLabel;
 
+/**
+ * PR #692 review: herdr's agent_status flickers (src/labels/sync.ts's own
+ * `AgentLabelStabilizer` doc comment: "flapping working/blocked/working
+ * within seconds", observed live). A single idle/none poll sandwiched
+ * between two working/blocked polls is noise, not a stop — exactly the
+ * condition that stabilizer already guards the AGENT:* LABEL against by
+ * requiring the SAME candidate value on two consecutive polls before it
+ * applies. This detector guards its own STOP EVENT the same way, for the
+ * same reason: a measurement whose whole purpose is the false-positive
+ * rate must not manufacture one out of its own debouncing gap.
+ */
+const STOP_CONFIRM_POLLS = 2;
+
 interface Entry {
   /**
    * Instant the CURRENT working/blocked episode started, or `null` when no
@@ -10,7 +23,9 @@ interface Entry {
    * ever been seen idle/none). Re-armed to a fresh `now()` the moment
    * `working`/`blocked` resumes after a reported stop, so a LATER stop's
    * "since" window always starts from the most recent resume — never from an
-   * earlier episode, and never accumulating across stops.
+   * earlier episode, and never accumulating across stops. NOT reset by a
+   * single-poll idle/none flicker that never reaches `STOP_CONFIRM_POLLS` —
+   * see `pendingStopPolls` below.
    */
   activeSince: number | null;
   /**
@@ -20,6 +35,15 @@ interface Entry {
    * episode must report nothing, not log a line per ~15s tick.
    */
   reported: boolean;
+  /**
+   * Consecutive idle/none observations seen so far since the last
+   * working/blocked observation, reset to 0 the instant working/blocked
+   * resumes. A stop is reported only once this reaches `STOP_CONFIRM_POLLS`
+   * — the SAME two-consecutive-polls debounce `AgentLabelStabilizer` already
+   * applies to the agent:* label itself (src/labels/sync.ts), applied here
+   * to this detector's own stop event instead of a label write.
+   */
+  pendingStopPolls: number;
 }
 
 /**
@@ -49,25 +73,29 @@ export class SilentStopTracker {
 
   /**
    * Record this poll's observation for `issue`. Returns the instant the
-   * episode that JUST ended began, exactly once per working/blocked ->
-   * idle/none transition — `null` on every other poll, including every
-   * later poll where the ticket simply stays idle/none (the dedup this
-   * module exists to guarantee) and every poll where the agent is currently
-   * active.
+   * episode that JUST ended began, once the working/blocked -> idle/none
+   * transition has held for `STOP_CONFIRM_POLLS` consecutive polls — `null`
+   * on every other poll, including: every poll while the agent is currently
+   * active, a single idle/none poll that hasn't yet confirmed (flicker), and
+   * every later poll once the stop has already been reported (the dedup
+   * this module exists to guarantee).
    */
   observe(issue: string, label: ObservedLabel): { episodeStart: number } | null {
     let e = this.entries.get(issue);
     if (!e) {
-      e = { activeSince: null, reported: true };
+      e = { activeSince: null, reported: true, pendingStopPolls: 0 };
       this.entries.set(issue, e);
     }
     const active = label === "working" || label === "blocked";
     if (active) {
       if (e.reported || e.activeSince == null) e.activeSince = this.now();
       e.reported = false;
+      e.pendingStopPolls = 0; // a flicker back to active cancels any pending (unconfirmed) stop
       return null;
     }
     if (e.reported || e.activeSince == null) return null; // already reported this stop, or never was active
+    e.pendingStopPolls += 1;
+    if (e.pendingStopPolls < STOP_CONFIRM_POLLS) return null; // not yet confirmed — could still be a flicker
     e.reported = true;
     return { episodeStart: e.activeSince };
   }
