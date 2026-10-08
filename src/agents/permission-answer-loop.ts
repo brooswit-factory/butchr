@@ -352,6 +352,20 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
     const { agents } = await deps.client.agent.list();
     const labels = deps.eligiblePanes(agents.map((a) => ({ pane_id: a.pane_id, cwd: a.cwd })));
     deps.onEligiblePaneIds?.([...labels.keys()]);
+    // FACTORY-776 (a): reap every fastPathTriggers entry for a pane that is
+    // NOT in this tick's eligible set — above the `labels.size === 0` early
+    // return below (so an empty eligible set still reaps) and unconditional
+    // on outcome, so a pane that left the eligible set (its own entry is
+    // never otherwise visited: the consumption loop further down only walks
+    // `labels.keys()`) cannot keep re-tripping the watchdog forever. A pane
+    // that IS still eligible keeps its entry here — that case is handled by
+    // the consumption loop below, which runs regardless of this tick's
+    // answered/skipped/failed outcome.
+    if (deps.fastPathTriggers) {
+      for (const id of deps.fastPathTriggers.keys()) {
+        if (!labels.has(id)) deps.fastPathTriggers.delete(id);
+      }
+    }
     if (labels.size === 0) return [];
     const eligible = agents.filter((a) => labels.has(a.pane_id));
     const scopedClient: PermissionAnswerClient = {
