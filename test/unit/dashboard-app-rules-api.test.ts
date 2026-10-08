@@ -33,6 +33,8 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     account: "none",
     role: "worker",
     agentPreferences: [],
+    permissionMode: null,
+    lizardMode: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -181,6 +183,43 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.query).toBe("key = XYZ-1");
     });
 
+    test("FACTORY-729: setting permissionMode: bypassPermissions without confirm is refused; confirm: true succeeds and merges harness into agentPreferences", async () => {
+      const withPreference: RulesListResponse = {
+        ...defaultRulesFixture(),
+        rules: [...defaultRulesFixture().rules, uiDemoRule({ id: "ui-with-pref", agentPreferences: [{ harness: "claude", model: "sonnet" }] })],
+      };
+      const api = createFixturesRulesApi({ initial: withPreference, latencyMs: 0 });
+      const before = await api.listRules();
+      const refusedPlan = await api.planRule("ui-with-pref", { permissionMode: "bypassPermissions" }, false);
+      expect(refusedPlan.requiresConfirm).toBe(true);
+      expect(refusedPlan.confirmReason).toBe("risky-permission");
+      await expect(api.updateFields("ui-with-pref", { permissionMode: "bypassPermissions" }, before.sourceEtag, refusedPlan.planHash, false)).rejects.toThrow(/never a default/);
+
+      const confirmedPlan = await api.planRule("ui-with-pref", { permissionMode: "bypassPermissions", agentPreferences: [{ harness: "codex" }] }, true);
+      const result = await api.updateFields("ui-with-pref", { permissionMode: "bypassPermissions", agentPreferences: [{ harness: "codex" }] }, before.sourceEtag, confirmedPlan.planHash, true);
+      expect(result.changedIds).toEqual(["ui-with-pref"]);
+      const after = await api.listRules();
+      const updated = after.rules.find((r) => r.id === "ui-with-pref")!;
+      expect(updated.permissionMode).toBe("bypassPermissions");
+      expect(updated.agentPreferences[0]!.harness).toBe("codex");
+      expect(updated.agentPreferences[0]!.model).toBe("sonnet");
+    });
+
+    test("FACTORY-729: lizardMode: true without confirm is refused; lizardMode: false needs no confirm", async () => {
+      const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0 });
+      const before = await api.listRules();
+      const riskyPlan = await api.planRule("ui-demo", { lizardMode: true }, false);
+      expect(riskyPlan.requiresConfirm).toBe(true);
+      await expect(api.updateFields("ui-demo", { lizardMode: true }, before.sourceEtag, riskyPlan.planHash, false)).rejects.toThrow(/never a default/);
+
+      const safePlan = await api.planRule("ui-demo", { lizardMode: false }, false);
+      expect(safePlan.requiresConfirm).toBe(false);
+      const result = await api.updateFields("ui-demo", { lizardMode: false }, before.sourceEtag, safePlan.planHash, false);
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "ui-demo")!.lizardMode).toBe(false);
+      expect(result.changedIds).toEqual(["ui-demo"]);
+    });
+
     test("enabling over the scope ceiling without confirm is refused with the server's own wording; confirm:true succeeds", async () => {
       const seeded = defaultRulesFixture();
       const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
@@ -326,6 +365,8 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               agentPreferences: [],
               linkedEventing: false,
               mcpServerNames: [],
+              permissionMode: "acceptEdits",
+              lizardMode: true,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -342,7 +383,19 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, staffed: false, reason: "disabled" }]);
+  });
+
+  test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
+    let calledUrl: string | undefined;
+    const fakeHarnesses = [{ harness: "claude", models: ["sonnet"], allowsCustomModel: true, efforts: ["low"], permissionModes: ["default"] }];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+      calledUrl = String(input);
+      return new Response(JSON.stringify({ harnesses: fakeHarnesses }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const result = await realRulesApi.getCatalog();
+    expect(calledUrl).toBe("/api/rules/catalog");
+    expect(result).toEqual(fakeHarnesses);
   });
 
   test("previewRule calls GET /api/rules/:id/preview with the id encoded", async () => {

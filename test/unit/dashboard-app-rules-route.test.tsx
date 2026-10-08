@@ -18,6 +18,8 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     account: "none",
     role: "worker",
     agentPreferences: [],
+    permissionMode: null,
+    lizardMode: null,
     staffed: true,
     reason: null,
     ...overrides,

@@ -283,6 +283,95 @@ describe("writeRuleFields (PUT)", () => {
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
   });
+
+  test("edits permissionMode: default + agentPreferences[0].harness, no confirm needed (never risky, rule stays disabled)", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "default", agentPreferences: [{ harness: "codex" }] };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].permissionMode).toBe("default");
+    expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
+  });
+});
+
+describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true are never defaults — require confirm", () => {
+  test("setting permissionMode: bypassPermissions without confirm is refused, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "bypassPermissions" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("setting permissionMode: auto WITH confirm succeeds", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { permissionMode: "auto" };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("setting lizardMode: true without confirm is refused, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: true };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("setting lizardMode: true WITH confirm succeeds", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: true };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("setting lizardMode: false (an explicit opt-out) needs no confirm", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { lizardMode: false };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("planRuleWrite: requiresConfirm with confirmReason \"risky-permission\" for permissionMode: bypassPermissions alone", async () => {
+    seed([UI_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { permissionMode: "bypassPermissions" }, false, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("risky-permission");
+    }
+  });
+
+  test("planRuleWrite: confirm: true already satisfies the gate — requiresConfirm is false, no confirmReason", async () => {
+    seed([UI_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { lizardMode: true }, true, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(false);
+      expect(plan.confirmReason).toBeUndefined();
+    }
+  });
 });
 
 describe("writeUndo (B2: only the last UI write's own backup, at its own resulting etag)", () => {
