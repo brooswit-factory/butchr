@@ -90,7 +90,7 @@ const UNRECOGNIZED_DIALOG_WINDOW_CHARS = 400;
  */
 function formatUnparseableLine(paneId: string, text: string): string {
   const matchIdx = text.search(DIALOG_QUESTION_LINE);
-  if (matchIdx === -1) return `${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`;
+  if (matchIdx === -1) return `${paneId} blocked with no parseable dialog: "${sanitizeForJournal(text.trim().slice(0, 60))}"`;
   const window = text.slice(matchIdx, matchIdx + UNRECOGNIZED_DIALOG_WINDOW_CHARS);
   return `${UNRECOGNIZED_DIALOG_MARKER} ${paneId} blocked on an unrecognized dialog (parser rejected a real "Do you want to...?" prompt): "${sanitizeForJournal(window).trim()}"`;
 }
