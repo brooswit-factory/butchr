@@ -244,8 +244,9 @@ a **different defect from the tally** — pass/fail counts are the stable
 number this document trusts — but whoever ran the falsifier batch did not
 record which test failed, so the observation could not be matched against
 a future recurrence. It was filed as FACTORY-179 and **could not be
-reproduced**: 18 further runs of `bun test test/unit` on the same branch
-(6 before, 12 after this addendum) all reported `0 fail`.
+reproduced**: the original BUTCHR-113 investigation's own 18 further runs
+of `bun test test/unit` on the same branch (6 before, 12 after that
+task's work — not this addendum) all reported `0 fail`.
 
 Rather than loop the suite further to try to catch it again (this host
 runs multiple concurrent agents and repeated full-suite runs are
