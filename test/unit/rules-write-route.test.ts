@@ -362,6 +362,86 @@ describe("PUT /api/rules/:id", () => {
       expect(receivedArgs).toEqual(["ui-first-rule", { query: "project = X" }, "etag-1", false, "hash-1"]);
     } finally { await app.stop(true); }
   });
+
+  // FACTORY-729: permissionMode/lizardMode (top-level) and
+  // agentPreferences[i].harness are now editable.
+  test("valid permissionMode + lizardMode + agentPreferences.harness edit: 200, write called with the parsed patch", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let receivedArgs: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, (...a) => { receivedArgs = a; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({
+          ifMatch: "etag-1", planHash: "hash-1", confirm: true,
+          permissionMode: "default", lizardMode: true,
+          agentPreferences: [{ harness: "codex", model: "gpt-5.6-sol" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(receivedArgs).toEqual([
+        "ui-first-rule",
+        { permissionMode: "default", lizardMode: true, agentPreferences: [{ harness: "codex", model: "gpt-5.6-sol" }] },
+        "etag-1", true, "hash-1",
+      ]);
+    } finally { await app.stop(true); }
+  });
+
+  test("invalid permissionMode value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", permissionMode: "not-a-real-mode" }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("invalid agentPreferences.harness value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ harness: "not-a-real-harness" }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("agentPreferences.model with a shell-metacharacter value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ model: "sonnet; rm -rf /" }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("setting both model and modelPower on one preference entry: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ model: "sonnet", modelPower: 50 }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
 });
 
 describe("POST /api/undo/:backupId", () => {

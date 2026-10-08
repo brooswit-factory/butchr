@@ -90,6 +90,28 @@ describe("buildRulesApiResponse", () => {
     expect("title" in out).toBe(false);
     expect("maxAgents" in out).toBe(false);
   });
+  test("FACTORY-729: permissionMode/lizardMode are read off the raw Rule, matched by (resourceProvider, id) same as briefExcerpt", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule({ permissionMode: "acceptEdits", lizardMode: true })], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.permissionMode).toBe("acceptEdits");
+    expect(r.rules[0]!.lizardMode).toBe(true);
+  });
+  test("FACTORY-729: absent permissionMode/lizardMode on the raw Rule read as null, never undefined or false", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule()], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.permissionMode).toBeNull();
+    expect(r.rules[0]!.lizardMode).toBeNull();
+  });
   test("invalid file: valid:false, problems populated from the error message, zero rules", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [], error: { path: "/rules.json", message: "line 1 is bad\nline 2 is also bad" } },

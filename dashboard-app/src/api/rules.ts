@@ -49,7 +49,10 @@
  * `realRulesApi`/`createFixturesRulesApi` BY NAME instead of this
  * flag-selected default: a test must never depend on which bundler ran it.
  */
-import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, ResourceProvider } from "../../../src/rules/rules.js";
+import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, ResourceProvider, RulePermissionMode } from "../../../src/rules/rules.js";
+import { RULE_FORM_CATALOG, type RuleFormCatalogEntry } from "../../../src/rules/rule-form-catalog.js";
+
+export type { RuleFormCatalogEntry };
 
 /** The reserved id prefix FACTORY-669 seeds its one template rule under — see `src/rules/rules-write-registry.ts`'s own `UI_EDITABLE_ID_PREFIX` (PR #647). Only a rule whose id starts with this may ever be written by this module. */
 export const UI_EDITABLE_ID_PREFIX = "ui-";
@@ -84,6 +87,10 @@ export interface RuleDto {
   role: AgentRole;
   /** `[]` when the rule sets no preference (uses butchr's global agent config) — same as `RuleInventoryEntry.agentPreferences`. */
   agentPreferences: RuleAgentPreferenceDto[];
+  /** FACTORY-729 — `null` when absent (butchr's own launch default applies; see `Rule.permissionMode`'s own doc comment, `../../../src/rules/rules.js`). */
+  permissionMode: RulePermissionMode | null;
+  /** FACTORY-729 — `null` when absent (the "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment). */
+  lizardMode: boolean | null;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
@@ -131,17 +138,31 @@ export interface RulePreviewResponse {
   tickets: RulePreviewTicket[];
 }
 
-/** The only shape a PUT body's `agentPreferences` element may take, per `src/rules/rules-write-registry.ts`'s own `AgentPreferencePatch` (PR #647) — never `harness`, never the whole element. */
+/** The only shape a PUT body's `agentPreferences` element may take, per `src/rules/rules-write-registry.ts`'s own `AgentPreferencePatch`. FACTORY-729: `harness` is now included — see that interface's own doc comment for why the original "never harness" restriction was reversed. */
 export interface RuleAgentPreferencePatch {
+  harness?: AgentHarness;
   model?: string;
   effort?: AgentEffort;
   modelPower?: number;
   effortPower?: number;
 }
 
-/** `PUT /api/rules/:id`'s own editable allowlist — `query` and/or `agentPreferences[i].model/effort/modelPower/effortPower` ONLY. No `title`/`maxAgents`/`brief`/`mcpServers`/`account`/`role`/`relationships`/`linked*`/`harness`/`mcpConfigFile`/`permissionMode`/`lizardMode`/`resourceProvider`/`id` field exists here — those stay file-only, per this ticket's own scope discipline. */
+/**
+ * `PUT /api/rules/:id`'s own editable allowlist — `query`, `permissionMode`,
+ * `lizardMode`, and/or `agentPreferences[i].harness/model/effort/modelPower/
+ * effortPower` ONLY (FACTORY-729 adds `permissionMode`/`lizardMode`/
+ * `agentPreferences[i].harness` to FACTORY-663's original `query`/
+ * `agentPreferences[i].model/effort/modelPower/effortPower`). No `title`/
+ * `maxAgents`/`brief`/`mcpServers`/`account`/`role`/`relationships`/
+ * `linked*`/`mcpConfigFile`/`resourceProvider`/`id` field exists here — those
+ * stay file-only, per this ticket's own scope discipline.
+ */
 export interface RuleFieldPatch {
   query?: string;
+  /** `"bypassPermissions"`/`"auto"` additionally require `confirm: true` on the write (the server's own `requireConfirmForRiskyFields`) — never a default. */
+  permissionMode?: RulePermissionMode;
+  /** `true` additionally requires `confirm: true` on the write — never a default. */
+  lizardMode?: boolean;
   agentPreferences?: RuleAgentPreferencePatch[];
 }
 
@@ -181,7 +202,8 @@ export interface RulePlanResponse {
    */
   requiresConfirm: boolean;
   /** Mirrors `src/rules/rules-write.ts`'s own `RulesPlanResult.confirmReason` — present iff `requiresConfirm` is `true`. Display-only: which gate is why. */
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart";
+  /** FACTORY-729 adds `"risky-permission"` — `permissionMode: "bypassPermissions" | "auto"` or `lizardMode: true`, never a default. */
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart" | "risky-permission";
 }
 
 /** The success shape every real write route (`enabled`, `PUT`, `undo`) returns — `RulesWriteOutcome`'s `ok: true` branch, PR #647's `src/rules/rules-write.ts`, minus the `reload` field (an internal daemon detail this UI has no use for). */
@@ -206,6 +228,16 @@ export interface RulesApiCapabilities {
 export interface RulesApi {
   readonly capabilities: RulesApiCapabilities;
   listRules(signal?: AbortSignal): Promise<RulesListResponse>;
+  /**
+   * FACTORY-729 — `GET /api/rules/catalog`: the rule form's own harness/
+   * model/effort/permission-mode catalog (one entry per `AgentHarness`),
+   * served verbatim from `../../../src/rules/rule-form-catalog.js`'s
+   * `RULE_FORM_CATALOG` — never a second, hand-maintained list on this side
+   * either. `realRulesApi` fetches it fresh every call (it is cheap, pure
+   * constants server-side, and never changes within a daemon's lifetime —
+   * a caller that wants to avoid refetching may cache the result itself).
+   */
+  getCatalog(signal?: AbortSignal): Promise<readonly RuleFormCatalogEntry[]>;
   previewRule(ruleId: string, signal?: AbortSignal): Promise<RulePreviewResponse>;
   /** Report-only: never applies anything. */
   planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
@@ -353,6 +385,8 @@ interface ServerRuleEntry {
   account: AccountPolicy;
   role: AgentRole;
   agentPreferences: RuleAgentPreferenceDto[];
+  permissionMode: RulePermissionMode | null;
+  lizardMode: boolean | null;
   staffed: boolean | null;
   whyUnstaffed: string | null;
 }
@@ -372,6 +406,8 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       account: r.account,
       role: r.role,
       agentPreferences: r.agentPreferences,
+      permissionMode: r.permissionMode,
+      lizardMode: r.lizardMode,
       staffed: r.staffed,
       reason: r.whyUnstaffed,
     })),
@@ -401,6 +437,7 @@ export function mapServerPreview(ruleId: string, raw: unknown): RulePreviewRespo
 export const realRulesApi: RulesApi = {
   capabilities: { write: false },
   listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
+  getCatalog: async (signal) => (await request<{ harnesses: RuleFormCatalogEntry[] }>("/api/rules/catalog", { signal })).harnesses,
   // FACTORY-686: the REAL server answers `{ok, keys: string[], total, cap, warning}`
   // (src/web/rules-preview.ts), not the `{ruleId, total, tickets: [{key}]}` shape this
   // client's fixtures grew around: reading `tickets` off the real response was
@@ -493,6 +530,8 @@ export interface FixturesRulesApiOptions {
    * header at all — the fallback path a caller must also be able to prove.
    */
   nextRateLimit?: { retryAfterSeconds?: number };
+  /** FACTORY-729: override `getCatalog()`'s answer — defaults to the real `RULE_FORM_CATALOG`. Set this only to rehearse a UI against a DIFFERENT catalog shape than the real one ships (e.g. an empty harness list) — not needed for ordinary tests. */
+  catalog?: readonly RuleFormCatalogEntry[];
 }
 
 const DEFAULT_FIXTURE_ETAG = "fixture-etag-0";
@@ -502,7 +541,8 @@ function computeLocalPlanCounts(wasEnabled: boolean, patch: RulePlanPatch): { sp
   if (patch.enabled !== undefined && patch.enabled !== wasEnabled) {
     return patch.enabled ? { spawned: 1, stopped: 0, restarted: 0 } : { spawned: 0, stopped: 1, restarted: 0 };
   }
-  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined;
+  // FACTORY-729: mirrors the real server's own `computeLocalPlanCounts` (`src/rules/rules-write.ts`) — permissionMode/lizardMode count the same as query/agentPreferences.
+  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined;
   return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
 }
 
@@ -529,6 +569,8 @@ export function defaultRulesFixture(): RulesListResponse {
         account: "none",
         role: "worker",
         agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
+        permissionMode: null,
+        lizardMode: null,
         staffed: true,
         reason: null,
       },
@@ -541,6 +583,8 @@ export function defaultRulesFixture(): RulesListResponse {
         account: "none",
         role: "worker",
         agentPreferences: [],
+        permissionMode: null,
+        lizardMode: null,
         staffed: false,
         reason: "disabled",
       },
@@ -553,6 +597,8 @@ export function defaultRulesFixture(): RulesListResponse {
         account: "none",
         role: "worker",
         agentPreferences: [{ harness: "claude", effort: "high" }],
+        permissionMode: "default",
+        lizardMode: true,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
@@ -565,6 +611,8 @@ export function defaultRulesFixture(): RulesListResponse {
         account: "none",
         role: "worker",
         agentPreferences: [],
+        permissionMode: null,
+        lizardMode: null,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
       },
@@ -637,6 +685,15 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       throw new Error(`this change would stop ${counts.stopped} and restart ${counts.restarted} running agent(s) — retry with confirm: true to proceed`);
     }
   };
+  // FACTORY-729: mirrors the real server's own `RISKY_PERMISSION_MODES`/`requireConfirmForRiskyFields` (`src/rules/rules-write-registry.ts`/`rules-write.ts`).
+  const RISKY_PERMISSION_MODES = new Set<RulePermissionMode>(["bypassPermissions", "auto"]);
+  const isRiskyFieldPatch = (patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">): boolean =>
+    (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true;
+  const requireConfirmForRiskyFields = (patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">, confirm: boolean) => {
+    if (isRiskyFieldPatch(patch) && !confirm) {
+      throw new Error(`setting ${patch.permissionMode !== undefined ? `permissionMode: ${JSON.stringify(patch.permissionMode)}` : "lizardMode: true"} is never a default and requires an explicit confirm — retry with confirm: true to proceed`);
+    }
+  };
   const commitWrite = (nextRules: RuleDto[], changedIds: string[]): RuleWriteResult => {
     const n = ++backupCounter;
     const backupId = `fixture-backup-${n}`;
@@ -659,6 +716,13 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       return opts.previews?.[ruleId] ?? { ruleId, total: 0, tickets: [] };
     },
+    async getCatalog() {
+      await delay();
+      maybeFail();
+      // FACTORY-729: the SAME `RULE_FORM_CATALOG` the real server serves
+      // from `GET /api/rules/catalog` — never a second, fixture-only list.
+      return opts.catalog ?? RULE_FORM_CATALOG;
+    },
     async planRule(ruleId, patch, confirm) {
       await delay();
       maybeFail();
@@ -679,14 +743,18 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       const rawSwarmEnable = counts.spawned > 0 && rule.execution === "swarm";
       const rawOverCeiling = scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
       const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
-      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm);
+      // FACTORY-729: mirrors the real server's own `planRuleWrite` — least-specific gate, see that function's own comment.
+      const rawRiskyField = isRiskyFieldPatch(patch);
+      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
       const confirmReason: RulePlanResponse["confirmReason"] = !requiresConfirm
         ? undefined
         : rawOverCeiling
           ? "scope-ceiling"
           : rawSwarmEnable
             ? "swarm-enable"
-            : "stop-restart";
+            : rawStopRestart
+              ? "stop-restart"
+              : "risky-permission";
       const base: RulePlanResponse = {
         planHash: `${ruleId}:${JSON.stringify(patch)}:${confirm}:${state.sourceEtag}`,
         spawned: counts.spawned,
@@ -734,9 +802,12 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       if (!planHash) throw new Error("planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again");
       const counts = computeLocalPlanCounts(rule.enabled, patch);
       requireConfirmForBlastRadius(counts, confirm);
+      requireConfirmForRiskyFields(patch, confirm);
       const updated: RuleDto = {
         ...rule,
         query: patch.query ?? rule.query,
+        permissionMode: patch.permissionMode ?? rule.permissionMode,
+        lizardMode: patch.lizardMode ?? rule.lizardMode,
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
