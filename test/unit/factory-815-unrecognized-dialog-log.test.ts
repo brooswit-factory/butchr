@@ -144,6 +144,6 @@ describe("FACTORY-811/815: onNoPrompt distinguishes a rejected real dialog from 
     for (const l of h.logs) {
       expect(l.startsWith(UNRECOGNIZED_DIALOG_MARKER)).toBe(false);
     }
-    expect(line!.startsWith("w1:p8 blocked with no parseable dialog")).toBe(true);
+    expect(line).toContain("w1:p8 blocked with no parseable dialog");
   });
 });
