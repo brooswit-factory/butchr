@@ -38,3 +38,19 @@ export type AgentHarness = (typeof AGENT_HARNESSES)[number];
  */
 export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
+
+/**
+ * FACTORY-817 — `AgentRole`/`AGENT_ROLES` joins this leaf module for the
+ * SAME reason as the two constants above: the "Included in capacity"
+ * toggle (`dashboard-app/src/components/FirstRuleSetup.tsx`, via
+ * `../rules/rule-form-catalog.ts`) needs this as a real VALUE, and a value
+ * import from `rules.ts` directly would drag that whole server-only module
+ * graph into the Vite client bundle — see this file's own top comment for
+ * the exact breakage observed. `rules.ts` re-exports both unchanged for
+ * every existing importer, same as `RULE_PERMISSION_MODES`. See `Rule.role`'s
+ * own doc comment (`./rules.ts`) for the full fleet-capacity contract
+ * (default, admission semantics) — this file only owns the constant's
+ * VALUE and TYPE.
+ */
+export const AGENT_ROLES = ["worker", "sentinel"] as const;
+export type AgentRole = (typeof AGENT_ROLES)[number];

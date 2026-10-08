@@ -40,7 +40,7 @@ import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
-import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode } from "./agent-harness.js";
+import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /**
@@ -134,9 +134,15 @@ export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
  * per-agent: a swarm rule's every per-resource agent is a sentinel, or a
  * singleton/persistent rule's one query-level agent is. See
  * src/agents/admission.ts for how residency/admission honour this.
+ *
+ * FACTORY-817: THIS copy's own value+type now live in `./agent-harness.ts`
+ * (a dependency-free leaf — see that module's own top comment) and are
+ * re-exported here unchanged, same reason/pattern as `AGENT_HARNESSES`/
+ * `RULE_PERMISSION_MODES` above — the rule form's "Included in capacity"
+ * toggle (`dashboard-app/src/components/FirstRuleSetup.tsx`) needs this as
+ * a real VALUE, via `./rule-form-catalog.ts`.
  */
-export const AGENT_ROLES = ["worker", "sentinel"] as const;
-export type AgentRole = (typeof AGENT_ROLES)[number];
+export { AGENT_ROLES, type AgentRole };
 
 /**
  * FACTORY-75: `modelPower`/`effortPower` are the SAME 0-100 two-axis
