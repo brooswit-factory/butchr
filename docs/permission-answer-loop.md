@@ -25,6 +25,10 @@
 > socket is ever outstanding past this fix, not zero: a herdr that never
 > acks at all still holds that one connection open forever (the SDK gives
 > no way to reclaim it), but no additional connections pile up behind it.
+> The cost of that trade: while the one outstanding slot is pinned by such
+> a herdr, push resubscription is effectively disabled — every later
+> attempt just times out against the guard — until that raw attempt
+> settles on its own or the daemon restarts.
 > `BUTCHR_HERDR_TIMEOUT_MS` also gained an upper bound (300000ms / 5
 > minutes) — see `Config.herdrCallTimeoutMs`'s own doc comment for why a
 > larger value made this knob mean its own opposite.
