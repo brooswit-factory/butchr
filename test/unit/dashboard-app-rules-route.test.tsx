@@ -167,24 +167,29 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     expect(queryByTestId("rule-toggle-confirm-dialog")).toBeNull();
   });
 
-  test("a toggle refused by the server (e.g. a non-ui- rule) shows the server's own message in the toggle-error banner, for a caller that bypasses the now-disabled client control", async () => {
+  // FACTORY-730: the real server's route-level `ui-`-prefix gate is retired
+  // — a non-`ui-` row's toggle is no longer disabled client-side (contrast
+  // the FACTORY-663 review follow-up this test used to exercise), and a
+  // plain click reaches the server and succeeds.
+  test("FACTORY-730: a non-ui- row's toggle is enabled and clicking it flips the rule", async () => {
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
       latencyMs: 0,
       plans: { "factory-triage": { planHash: "h1", spawned: 0, stopped: 0, restarted: 0, etag: "e1", requiresConfirm: false } },
     });
-    const { findAllByTestId, findByTestId, container } = render(<RulesRoute api={api} />);
+    const { findAllByTestId, container } = render(<RulesRoute api={api} />);
     await findAllByTestId("rule-row");
-    // FACTORY-663 review follow-up: the table now disables this row's toggle
-    // client-side (non-`ui-` id), so a plain click can no longer reach the
-    // server. Exercise the server's own refusal path directly, the same way
-    // a stale/bypassed client would, and confirm it still surfaces verbatim.
+    await waitFor(() => expect(api.capabilities.write).toBe(true));
     const toggle = container.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement;
-    expect(toggle.disabled).toBe(true);
-    await expect(api.setEnabled("factory-triage", false, "e1", "h1", false)).rejects.toThrow(/does not carry the "ui-" prefix/);
+    expect(toggle.disabled).toBe(false);
+    fireEvent.click(toggle);
+    await waitFor(async () => {
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "factory-triage")!.enabled).toBe(false);
+    });
   });
 
-  test("the toggle is disabled with a tooltip explaining why for a non-ui- rule, even though writes are otherwise enabled", async () => {
+  test("FACTORY-730: the toggle carries no special tooltip for a non-ui- rule when writes are otherwise enabled", async () => {
     const api = createFixturesRulesApi({
       initial: response({ rules: [rule({ id: "factory-triage", enabled: true })] }),
       latencyMs: 0,
@@ -193,9 +198,9 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
     await findAllByTestId("rule-row");
     await waitFor(() => expect(api.capabilities.write).toBe(true));
     const toggleWrap = container.querySelector(".rules-table__toggle");
-    expect(toggleWrap?.getAttribute("title")).toBe("only ui-first-rule can be edited from this page — edit rules.json directly for other rules");
+    expect(toggleWrap?.getAttribute("title")).toBeNull();
     const input = container.querySelector('.rules-table__toggle input[type="checkbox"]') as HTMLInputElement | null;
-    expect(input?.disabled).toBe(true);
+    expect(input?.disabled).toBe(false);
   });
 
   test("the toggle stays enabled and clickable for ui-first-rule (and other ui- ids) once writes are enabled", async () => {
@@ -257,6 +262,36 @@ describe("RulesRoute — FACTORY-661/FACTORY-663: toggle + plan-confirm warning"
       });
       expect(queryByTestId("rule-toggle-confirm-dialog")).toBeNull();
     });
+  });
+});
+
+describe("RulesRoute — FACTORY-730: edit an existing rule from the Rules page", () => {
+  test("clicking Edit on a non-ui- row opens RuleEditDialog prefilled with that rule's own query", async () => {
+    const api = createFixturesRulesApi({
+      initial: response({ rules: [rule({ id: "epics", query: "project = FACTORY AND type = Epic" })] }),
+      latencyMs: 0,
+    });
+    const { findAllByTestId, findByTestId, getAllByRole } = render(<RulesRoute api={api} />);
+    await findAllByTestId("rule-row");
+    const editButton = getAllByRole("button", { name: "Edit" })[0]!;
+    fireEvent.click(editButton);
+    const dialog = await findByTestId("rule-edit-dialog");
+    expect(dialog.textContent).toContain("epics");
+    const input = (await findByTestId("rule-edit-query-input")) as HTMLInputElement;
+    expect(input.value).toBe("project = FACTORY AND type = Epic");
+  });
+
+  test("closing the dialog removes it from the DOM", async () => {
+    const api = createFixturesRulesApi({
+      initial: response({ rules: [rule({ id: "epics" })] }),
+      latencyMs: 0,
+    });
+    const { findAllByTestId, findByTestId, queryByTestId, getAllByRole, getByRole } = render(<RulesRoute api={api} />);
+    await findAllByTestId("rule-row");
+    fireEvent.click(getAllByRole("button", { name: "Edit" })[0]!);
+    await findByTestId("rule-edit-dialog");
+    fireEvent.click(getByRole("button", { name: "close" }));
+    expect(queryByTestId("rule-edit-dialog")).toBeNull();
   });
 });
 

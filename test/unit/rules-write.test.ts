@@ -2,9 +2,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { rulesEtag } from "../../src/rules/write-rules.js";
+import { rulesEtag, updateRulesFile } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
+import { buildFieldsAllowedPaths } from "../../src/rules/rules-write-apply.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "../../src/rules/rules-write-registry.js";
 import { createRulesPreviewer, DEFAULT_PREVIEW_RATE_LIMIT_MS } from "../../src/web/rules-preview.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
@@ -48,16 +49,20 @@ async function planHashFor(id: string, patch: RuleFieldPatch, confirm: boolean, 
 }
 
 describe("writeRuleEnabled", () => {
-  test("refuses a non-ui- rule id, writes nothing", async () => {
-    const text = seed([MANAGERS_RULE]);
+  // FACTORY-730: the route-level `ui-`-prefix guard is retired — a write to
+  // ANY existing rule id (an operator's real `managers` rule, not only a
+  // seeded `ui-`-prefixed one) is now accepted, same as the field allowlist
+  // already enforced for a `ui-` rule.
+  test("FACTORY-730: accepts a non-ui- rule id (e.g. managers), writes it", async () => {
+    seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await planHashFor("managers", { enabled: false }, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = await writeRuleEnabled("managers", false, etag, false, "irrelevant-hash", noScope, { env: env() });
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) {
-      expect(outcome.status).toBe(403);
-      expect(outcome.error).toMatch(/ui-/);
-    }
-    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+    const outcome = await writeRuleEnabled("managers", false, etag, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.changedIds).toEqual(["managers"]);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].enabled).toBe(false);
   });
 
   test("refuses a stale ifMatch, writes nothing", async () => {
@@ -215,12 +220,75 @@ describe("allowlist is per-index, never a wildcard (agentsafety 2026-10-05 17:0x
 });
 
 describe("writeRuleFields (PUT)", () => {
-  test("refuses a non-ui- rule id, writes nothing", () => {
-    const text = seed([MANAGERS_RULE]);
+  // FACTORY-730: see `writeRuleEnabled`'s own identically-named test above.
+  test("FACTORY-730: accepts a non-ui- rule id (e.g. managers), writes it", async () => {
+    seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const patch = { query: "project = NEW" };
+    const planHash = await planHashFor("managers", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("managers", { query: "project = X" }, etag, false, "irrelevant-hash", { env: env() });
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.status).toBe(403);
+    const outcome = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].query).toBe("project = NEW");
+  });
+
+  // FACTORY-730 (story's own review-bar comment, item 3): the fixed
+  // template fields stay refused for a NON-`ui-` rule too — same precedent
+  // as this file's own `"a write that would touch a FIXED field is
+  // impossible through this path"` test (`writeRuleEnabled`, above), just
+  // against an operator's real rule instead of the seeded template, and
+  // via `writeRuleFields` instead of `writeRuleEnabled`. `RuleFieldPatch`'s
+  // own TYPE (`rules-write-registry.ts`) names `execution`/`account`/`role`/
+  // `mcpServers`/`mcpConfigFile`/`brief` nowhere, and `applyRuleFieldPatch`
+  // only ever copies an explicitly-named field onto the next document — so
+  // a legitimate `query`-only edit through this path leaves every one of
+  // them byte-for-byte untouched, for a non-`ui-` rule exactly as it always
+  // did for `ui-first-rule`.
+  test("FACTORY-730: fixed template fields (execution/account/role/mcpServers/mcpConfigFile/brief) stay untouched by a write to a non-ui- rule", async () => {
+    const real = { ...MANAGERS_RULE, execution: "swarm", account: "none", role: "worker", mcpServers: ["x"], mcpConfigFile: "mcp.json" };
+    seed([real]);
+    const deps = { env: env() };
+    const patch = { query: "project = CHANGED" };
+    const planHash = await planHashFor("managers", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].query).toBe("project = CHANGED");
+    expect(nextDoc.rules[0].execution).toBe("swarm");
+    expect(nextDoc.rules[0].account).toBe("none");
+    expect(nextDoc.rules[0].role).toBe("worker");
+    expect(nextDoc.rules[0].mcpServers).toEqual(["x"]);
+    expect(nextDoc.rules[0].mcpConfigFile).toBe("mcp.json");
+    expect(nextDoc.rules[0].brief).toBe(real.brief);
+  });
+
+  // FACTORY-730: the OTHER half of "two independent gates" (now one gate):
+  // `assertOnlyChanged`'s per-index default-deny diff check still refuses a
+  // change outside the allowlist for an arbitrary non-`ui-` rule at an
+  // arbitrary array index — not only the seeded rule at index 0. Crafts the
+  // next document text directly (bypassing `RuleFieldPatch`'s own type and
+  // `applyRuleFieldPatch`'s explicit field copying) to prove the DIFF gate
+  // itself, not just that the typed path never offers this field.
+  test("FACTORY-730: assertOnlyChanged refuses an out-of-allowlist change for an arbitrary non-ui- rule at an arbitrary index", () => {
+    const text = seed([UI_RULE, MANAGERS_RULE]); // managers occupies index 1
+    expect(() =>
+      updateRulesFile(
+        (currentText) => {
+          // A validly-typed value ("singleton" is a real `ExecutionMode`) —
+          // this must be refused for being OUTSIDE the allowlist, not for
+          // failing schema validation (a separate, earlier gate this test
+          // does not mean to exercise).
+          const parsed = JSON.parse(currentText ?? "{}");
+          parsed.rules[1] = { ...parsed.rules[1], execution: "singleton" };
+          return JSON.stringify(parsed, null, 2) + "\n";
+        },
+        env(),
+        undefined,
+        { get allowedPaths() { return buildFieldsAllowedPaths(text, "managers", { query: "irrelevant" }); } },
+      ),
+    ).toThrow(/is not in the allowed set/);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
   });
 
@@ -420,6 +488,26 @@ describe("writeUndo (B2: only the last UI write's own backup, at its own resulti
     expect(second.ok).toBe(false);
   });
 
+  // FACTORY-730 (story's own review-bar comment, item 4): the SAME
+  // end-to-end undo proof, against a non-`ui-` rule — undo restores the
+  // previous rules file content byte-for-byte for an operator's real rule
+  // exactly as it always did for the seeded template.
+  test("FACTORY-730: undoing an edit to a non-ui- rule restores byte-for-byte", async () => {
+    const original = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const patch = { query: "project = CHANGED" };
+    const planHash = await planHashFor("managers", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const edited = writeRuleFields("managers", patch, etag, true, planHash, deps);
+    expect(edited.ok).toBe(true);
+    if (!edited.ok || !edited.backupId) throw new Error("expected a backup id");
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].query).toBe("project = CHANGED");
+    const undone = writeUndo(edited.backupId, deps);
+    expect(undone.ok).toBe(true);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(original);
+  });
+
   test("B2: a backup id that is NOT the last UI write's own is refused, even if it genuinely exists on disk", async () => {
     seed([UI_RULE]);
     const deps = { env: env() };
@@ -515,10 +603,20 @@ describe("planRuleWrite (report-only)", () => {
     expect(plan.ok).toBe(false);
   });
 
-  test("refuses a non-ui- rule id", async () => {
+  // FACTORY-730: planning (and, per the other tests in this file, applying)
+  // a write to a non-`ui-` rule id is accepted — the route-level prefix
+  // gate is retired. `managers` is seeded `enabled: true`, so a `query`
+  // edit restarts it (`restarted=1`), which is exactly why this plan
+  // reports `requiresConfirm: true` rather than refusing outright — the
+  // id itself is no longer the reason anything is gated.
+  test("FACTORY-730: accepts a non-ui- rule id — a query edit restarts it, same as any other rule", async () => {
     seed([MANAGERS_RULE]);
     const plan = await planRuleWrite("managers", { query: "x" }, false, noScope, { env: env() });
-    expect(plan.ok).toBe(false);
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.restarted).toBe(1);
+      expect(plan.requiresConfirm).toBe(true);
+    }
   });
 
   test("the SAME patch against the SAME file state always hashes identically (apply can verify it)", async () => {

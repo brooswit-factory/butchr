@@ -1164,7 +1164,7 @@ const { app, mcp } = buildApp({
     }
     return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
   },
-  rulesPreview: (id) => rulesPreviewer(id),
+  rulesPreview: (id, queryOverride) => rulesPreviewer(id, queryOverride),
   // FACTORY-662: the write path's own deps — see the comments just above
   // `rulesWriteDeps`'s own declaration for why `reload` is a stub and
   // `scopeOf` reuses `rulesPreviewer`.

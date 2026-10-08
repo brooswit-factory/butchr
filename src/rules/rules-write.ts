@@ -12,7 +12,7 @@
  * lock `updateRulesFile` (FACTORY-658 finding F1) already takes for its
  * read — never a separate read-then-decide step outside the lock, which
  * would reopen exactly the TOCTOU window F1 exists to close. A refusal
- * (stale etag, non-`ui-` id, a fixed field in the diff, a placeholder
+ * (stale etag, a fixed field in the diff, a placeholder
  * query, a stale/missing plan hash, a stop/restart without confirm) throws
  * from inside the mutator, which `updateRulesFile` propagates with NOTHING
  * written — same "throws, writes nothing" contract `writeRulesFile` itself
@@ -42,7 +42,7 @@ import { readFileSync } from "node:fs";
 import { updateRulesFile, restoreBackup, rulesEtag, type WriteRulesIo, type WriteRulesResult } from "./write-rules.js";
 import { rulesPath, type RulesEnv } from "./rules.js";
 import { applyRuleFieldPatch, readRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, RuleWriteApplyError } from "./rules-write-apply.js";
-import { isUiEditableRuleId, PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch } from "./rules-write-registry.js";
+import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch } from "./rules-write-registry.js";
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -142,8 +142,8 @@ function refusalToOutcome(e: unknown): RulesWriteOutcome {
   // the allowlist. Always a forbidden-action refusal here, never a 400:
   // this slice's own validators (`validateRuleFieldPatch`) already reject
   // every shape that could produce this on their own, so reaching it means
-  // either a non-`ui-` prefixed rule somehow got here, or a bug — either
-  // way, "refused" is the correct and safe answer.
+  // a bug in the allowlist builders themselves — "refused" is the correct
+  // and safe answer either way.
   if (message.includes("is not in the allowed set")) return { ok: false, status: 403, error: message };
   if (message.includes("etag mismatch") || message.includes("already being written")) return { ok: false, status: 409, error: message };
   // A crashed-writer's leftover `.rules.lock` (FACTORY-673's own message,
@@ -153,12 +153,6 @@ function refusalToOutcome(e: unknown): RulesWriteOutcome {
   // cannot serve a write right now", not a problem with the request itself.
   if (message.includes(".rules.lock") || message.includes("was left behind by pid")) return { ok: false, status: 503, error: message };
   return { ok: false, status: 400, error: message };
-}
-
-function assertUiEditable(id: string): void {
-  if (!isUiEditableRuleId(id)) {
-    throw new WriteRefusedError(`rule "${id}" does not carry the "ui-" prefix — only web-UI-marked rules may be written by this route`, 403);
-  }
 }
 
 function checkIfMatch(currentText: string | undefined, ifMatch: string): void {
@@ -349,7 +343,7 @@ function recordLastUiWrite(deps: RulesWriteDeps, backupId: string | null, result
 }
 
 /**
- * `POST /api/rules/:id/enabled`'s own write. Refuses: a non-`ui-` id, a
+ * `POST /api/rules/:id/enabled`'s own write. Refuses: an unknown rule id, a
  * stale `ifMatch`, enabling while `query` is still the placeholder, (when
  * enabling) a dry-run scope above `ENABLE_SCOPE_CEILING` without `confirm`,
  * a `planHash` that doesn't match the fresh locked recomputation (B3), and
@@ -393,7 +387,6 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
       if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
       throw e;
     }
-    if (!isUiEditableRuleId(id)) return { ok: false, status: 403, error: `rule "${id}" does not carry the "ui-" prefix — only web-UI-marked rules may be written by this route` };
     if (current.query === PLACEHOLDER_QUERY) {
       return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder — edit the query first` };
     }
@@ -434,7 +427,6 @@ export async function writeRuleEnabled(id: string, enabled: boolean, ifMatch: st
         checkIfMatch(currentText, ifMatch);
         assertNotStale(deps, currentText);
         const rule = readRuleById(currentText, id);
-        assertUiEditable(id);
         if (enabled && rule.query === PLACEHOLDER_QUERY) {
           throw new WriteRefusedError(`rule "${id}" cannot be enabled while its query is still the placeholder — edit the query first`, 403);
         }
@@ -489,7 +481,6 @@ export function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch: stri
         checkIfMatch(currentText, ifMatch);
         assertNotStale(deps, currentText);
         const rule = readRuleById(currentText, id); // throws if unknown
-        assertUiEditable(id);
         const nextText = applyRuleFieldPatch(currentText, id, patch);
         const counts = computeLocalPlanCounts(rule.enabled === true, patch);
         // `patch.enabled` is always undefined here (guarded above), so
@@ -623,8 +614,6 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
     if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
     throw e;
   }
-  if (!isUiEditableRuleId(id)) return { ok: false, status: 403, error: `rule "${id}" does not carry the "ui-" prefix` };
-
   const etag = rulesEtag(env, deps.io);
   const wasEnabled = current.enabled === true;
 
