@@ -253,6 +253,64 @@ describe("runCapacityRoleMigration (I/O entry point)", () => {
     const after = JSON.parse(readFileSync(rulesPath(), "utf8")) as { rules: Array<{ id: string; role?: string }> };
     expect(after.rules[0]!.role).toBeUndefined();
   });
+
+  /**
+   * An `io` whose locked read (the read `updateRulesFile`'s mutator receives)
+   * returns DIFFERENT text from the first, unlocked read `runCapacityRoleMigration`
+   * itself does — simulating a concurrent writer landing in the window between
+   * the two. The real filesystem already holds the "locked" text (what a
+   * concurrent writer actually left behind); only the FIRST `readFile` call is
+   * swapped out for the stale text a pre-lock read would have seen.
+   */
+  function staleFirstReadIo(staleText: string) {
+    const realIo = defaultIo();
+    let calls = 0;
+    return {
+      ...realIo,
+      readFile: (path: string) => {
+        calls++;
+        return calls === 1 ? staleText : realIo.readFile(path);
+      },
+    };
+  }
+
+  test("a rule that gains an explicit role between the two reads is re-classified under the lock and NEVER overwritten (regression, review finding #1)", () => {
+    const staleText = JSON.stringify({ rules: [{ id: "epics", resourceProvider: "jira-work", query: "issuetype = Epic", brief: "b" }] });
+    // The locked/real text: a concurrent writer set an explicit role in the window between the two reads.
+    writeRulesFileDirect([{ id: "epics", resourceProvider: "jira-work", query: "issuetype = Epic", brief: "b", role: "worker" }]);
+
+    const outcome = runCapacityRoleMigration(env(), staleFirstReadIo(staleText));
+    expect(outcome.kind).toBe("migrated"); // the pre-lock early-out still saw a migrate candidate, so a write was attempted
+    if (outcome.kind !== "migrated") throw new Error("unreachable");
+    expect(outcome.migratedIds).toEqual([]); // but the LOCKED re-plan found an explicit role already present, so nothing was actually migrated
+
+    const after = JSON.parse(readFileSync(rulesPath(), "utf8")) as { rules: Array<{ id: string; role?: string }> };
+    expect(after.rules.find((r) => r.id === "epics")!.role).toBe("worker"); // never overwritten with "sentinel"
+  });
+
+  test("a rule deleted between the two reads is simply absent from the locked plan — no throw, no crash (regression, review finding #2)", () => {
+    const staleText = JSON.stringify({
+      rules: [
+        { id: "epics", resourceProvider: "jira-work", query: "issuetype = Epic", brief: "b" },
+        { id: "stories", resourceProvider: "jira-work", query: "issuetype = Story", brief: "b" },
+      ],
+    });
+    // The locked/real text: "epics" was deleted by a concurrent writer in the window between the two reads.
+    writeRulesFileDirect([{ id: "stories", resourceProvider: "jira-work", query: "issuetype = Story", brief: "b" }]);
+
+    let outcome: ReturnType<typeof runCapacityRoleMigration>;
+    expect(() => {
+      outcome = runCapacityRoleMigration(env(), staleFirstReadIo(staleText));
+    }).not.toThrow(); // setRuleRole must never be asked to touch the deleted rule's (nonexistent) id
+
+    expect(outcome!.kind).toBe("migrated");
+    if (outcome!.kind !== "migrated") throw new Error("unreachable");
+    expect(outcome!.migratedIds).toEqual(["stories"]); // the surviving rule still migrates normally
+
+    const after = JSON.parse(readFileSync(rulesPath(), "utf8")) as { rules: Array<{ id: string; role?: string }> };
+    expect(after.rules.find((r) => r.id === "stories")!.role).toBe("sentinel");
+    expect(after.rules.find((r) => r.id === "epics")).toBeUndefined();
+  });
 });
 
 /**

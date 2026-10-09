@@ -56,6 +56,15 @@
  * further: when nothing needs to change, it never calls `updateRulesFile`
  * at all, so a second run performs ZERO filesystem writes — no new backup,
  * no touched mtime, truly a no-op, not merely a written-but-unchanged file.
+ *
+ * NO READ-THEN-WRITE RACE: the plan `runCapacityRoleMigration` applies is
+ * always computed from the SAME locked text `updateRulesFile`'s mutator
+ * receives, never from the earlier unlocked read (that earlier plan exists
+ * only to decide the cheap "nothing to migrate" early-out above). A rule
+ * that gained an explicit `role`, or was deleted, in the window between the
+ * unlocked and locked reads is therefore classified correctly against the
+ * text actually being written — never overwritten, never missing and
+ * causing a throw.
  */
 import { type AgentRole, type ReadRulesFile, type RulesEnv, rulesPath } from "./rules.js";
 import { type WriteRulesIo, defaultIo, setRuleRole, updateRulesFile } from "./write-rules.js";
@@ -344,11 +353,19 @@ export type CapacityRoleMigrationOutcome =
  * and does nothing at all — no parse-and-rewrite, no backup, no touched
  * mtime — when the file is absent, unreadable as the expected shape, or
  * the plan has nothing to migrate: a true no-op second run, not merely a
- * written-but-unchanged one. Only when at least one rule needs migrating
- * does it call `updateRulesFile` (the same locked, validated, backed-up,
- * atomic write path every other rules writer uses), inside whose mutator
- * `applyCapacityRoleMigration` runs against the text read under that same
- * lock — no read-then-write race with a concurrent writer.
+ * written-but-unchanged one. That unlocked read's plan is used ONLY for
+ * this cheap early-out; it is never the plan that gets applied. Only when
+ * at least one rule needs migrating does it call `updateRulesFile` (the
+ * same locked, validated, backed-up, atomic write path every other rules
+ * writer uses), and INSIDE that mutator `planCapacityRoleMigration` runs
+ * AGAIN, against the text read under that same lock, with
+ * `applyCapacityRoleMigration` applying THAT plan — not the stale one from
+ * the unlocked read above. This is what makes "no read-then-write race
+ * with a concurrent writer" true: a rule that gained an explicit `role`
+ * between the two reads is re-classified as `"already-has-role"` by the
+ * locked re-plan and never overwritten; a rule deleted in that window is
+ * simply absent from the locked plan and never passed to `setRuleRole`, so
+ * it can't throw.
  *
  * A rules file that fails to `JSON.parse`, or does not have the expected
  * `{ rules: [...] }` shape, is left entirely alone here (`"unreadable"`):
@@ -373,6 +390,12 @@ export function runCapacityRoleMigration(env: RulesEnv = process.env, io: WriteR
   const migratedIds = plan.filter((e) => e.outcome === "migrate").map((e) => e.id);
   if (migratedIds.length === 0) return { kind: "no-op", plan };
 
-  const result = updateRulesFile((text) => applyCapacityRoleMigration(text ?? currentText, plan), env, io);
-  return { kind: "migrated", plan, migratedIds, backupPath: result.backupPath };
+  let lockedPlan: CapacityMigrationPlanEntry[] = plan;
+  const result = updateRulesFile((text) => {
+    const lockedText = text ?? currentText;
+    lockedPlan = planCapacityRoleMigration(lockedText);
+    return applyCapacityRoleMigration(lockedText, lockedPlan);
+  }, env, io);
+  const lockedMigratedIds = lockedPlan.filter((e) => e.outcome === "migrate").map((e) => e.id);
+  return { kind: "migrated", plan: lockedPlan, migratedIds: lockedMigratedIds, backupPath: result.backupPath };
 }
