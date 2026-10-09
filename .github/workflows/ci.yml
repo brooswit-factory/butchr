@@ -54,7 +54,7 @@ jobs:
           curl -fsSL -o /usr/local/bin/herdr https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-linux-x86_64
           chmod +x /usr/local/bin/herdr
           herdr --version
-      - name: install the stub 'claude' (CI has no Claude account; see scripts/ci-fixtures/claude's own doc comment). Installed to /usr/local/bin, same as herdr above — a pane's own shell may not inherit a PATH only exported to this step. (No --version check: the stub ignores all args and just sleeps, so that would hang this step.)
+      - name: "install the stub 'claude' (CI has no Claude account; see scripts/ci-fixtures/claude's own doc comment). Installed to /usr/local/bin, same as herdr above — a pane's own shell may not inherit a PATH only exported to this step. No --version check here — the stub ignores all args and just sleeps, so that would hang this step."
         run: install -m 0755 scripts/ci-fixtures/claude /usr/local/bin/claude
       - name: start herdr server
         run: |
