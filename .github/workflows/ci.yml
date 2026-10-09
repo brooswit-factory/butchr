@@ -17,8 +17,55 @@ jobs:
         run: bun run generate && bun run scripts/verify-generated-is-committed.ts
       - run: bun run typecheck
       - name: unit + load tests, coverage ≥ 90%
-        run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+        run: >
+          mkdir -p test-results &&
+          bun test test/unit test/load --reporter=junit --reporter-outfile=test-results/junit.xml &&
+          bun run scripts/coverage/gate.ts
+      - name: upload test report (always, even on failure — FACTORY-179)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: test-results/junit.xml
+          if-no-files-found: ignore
       - run: bun run build
+  spawn-smoke:
+    name: spawn smoke (FACTORY-892)
+    # Starts a REAL agent through a REAL herdr with butchr's REAL kickoff
+    # argv — the one thing test/unit (which only inspects the array
+    # spawnArgs() returns, never hands it to herdr) cannot catch: herdr
+    # itself rejecting a start argument it can't shell-quote
+    # (invalid_agent_argument), which is exactly how FACTORY-735/739 broke
+    # every spawn in production. See scripts/verify-ci-spawn-smoke.ts.
+    runs-on: ubuntu-latest
+    env:
+      # FACTORY-891 review: the smoke test's own "did the stub actually
+      # run" proof — see scripts/ci-fixtures/claude. Set at JOB level so
+      # both the `herdr server` process (whose env every pane it spawns
+      # inherits) and the verify script agree on the same path.
+      BUTCHR_CI_SPAWN_SMOKE_SENTINEL: /tmp/butchr-ci-spawn-smoke-claude.ran
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - run: bun install --frozen-lockfile
+      - name: install herdr 0.8.2 (pinned — the verified CLI surface per docs/agent-providers.md; same binary docs/getting-started.md points operators at, from herdrdev/herdr's own GitHub release)
+        run: |
+          curl -fsSL -o /usr/local/bin/herdr https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-linux-x86_64
+          chmod +x /usr/local/bin/herdr
+          herdr --version
+      - name: "install the stub 'claude' (CI has no Claude account; see scripts/ci-fixtures/claude's own doc comment). Installed to /usr/local/bin, same as herdr above — a pane's own shell may not inherit a PATH only exported to this step. No --version check here — the stub ignores all args and just sleeps, so that would hang this step."
+        run: install -m 0755 scripts/ci-fixtures/claude /usr/local/bin/claude
+      - name: start herdr server
+        run: |
+          herdr server > herdr-server.log 2>&1 &
+          for i in $(seq 1 30); do herdr api snapshot >/dev/null 2>&1 && exit 0; sleep 1; done
+          echo "herdr server never became ready:"; cat herdr-server.log; exit 1
+      - name: run the real spawn smoke test
+        run: bun run scripts/verify-ci-spawn-smoke.ts
+      - name: stop herdr server
+        if: always()
+        run: herdr server stop || true
   windows:
     name: windows
     runs-on: windows-latest

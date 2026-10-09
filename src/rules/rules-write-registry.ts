@@ -16,42 +16,32 @@
  * `role` ("Included in capacity" on the rule form) joins the editable
  * top-level fields — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
  *
- * TWO INDEPENDENT GATES, both required, for a different reason each:
- *   1. A per-write, PER-INDEX `assertOnlyChanged` allowlist (FACTORY-658) —
- *      a DEFAULT-DENY diff check: any changed path NOT matched here throws,
- *      which is what makes the fixed template fields (`execution`,
- *      `account`, `role`, `mcpServers`, `mcpConfigFile`, `brief`) refused
- *      FOR FREE — they are refused because they are simply never in this
- *      list, not because of a second, separate "is this a fixed field"
- *      check that could drift from the first. Built by `../rules/rules-
- *      write-apply.ts`'s `buildEnabledAllowedPaths`/`buildFieldsAllowedPaths`,
- *      from the LOCKED read, naming the target rule's CURRENT array index
- *      literally (`"rules.3.enabled"`, never `"rules.*.enabled"`) — a
- *      static, wildcarded allowlist was agentsafety's own 2026-10-05 17:0x
- *      PDT re-check finding: `*` matches ANY index, so it would permit a
- *      write to ANY rule's `enabled`/`query`, not just the one this route
- *      already checked `isUiEditableRuleId` against. `EDITABLE_TOP_LEVEL_FIELDS`/
- *      `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
- *      builders use — never consulted directly by `assertOnlyChanged`.
- *   2. `isUiEditableRuleId` — a route-level check, BEFORE any diff is even
- *      computed: a write to a rule whose id does not carry the reserved
- *      `ui-` prefix is refused outright, even for a change that would
- *      otherwise be entirely inside the allowlist. The web UI never creates
- *      or touches an unmarked rule (e.g. `managers`) — see this ticket's
- *      "DECISION ADDED" comment.
+ * FACTORY-730 retires the `UI_EDITABLE_ID_PREFIX`/`isUiEditableRuleId` route-
+ * level gate this header used to describe as "gate 2": a write to ANY
+ * existing rule id (an operator's real `epics`/`tasks`/`bugs` rule, not only
+ * a seeded `ui-`-prefixed one) is now permitted through this write path —
+ * the story's own decision (option (a)). The ONE remaining gate is the
+ * per-write, PER-INDEX `assertOnlyChanged` allowlist below:
+ *   A DEFAULT-DENY diff check: any changed path NOT matched here throws,
+ *   which is what makes the fixed template fields (`execution`, `account`,
+ *   `role`, `mcpServers`, `mcpConfigFile`, `brief`) refused FOR FREE — they
+ *   are refused because they are simply never in this list, not because of
+ *   a second, separate "is this a fixed field" check that could drift from
+ *   the first. Built by `../rules/rules-write-apply.ts`'s
+ *   `buildEnabledAllowedPaths`/`buildFieldsAllowedPaths`, from the LOCKED
+ *   read, naming the target rule's CURRENT array index literally
+ *   (`"rules.3.enabled"`, never `"rules.*.enabled"`) — a static, wildcarded
+ *   allowlist was agentsafety's own 2026-10-05 17:0x PDT re-check finding:
+ *   `*` matches ANY index, so it would permit a write to ANY rule's
+ *   `enabled`/`query`, not just the one targeted by id. `EDITABLE_TOP_LEVEL_FIELDS`/
+ *   `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
+ *   builders use — never consulted directly by `assertOnlyChanged`.
  */
 import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./rules.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
 
-/** The reserved id prefix FACTORY-669 seeds its one template rule under (`ui-first-rule`). Only a rule whose id starts with this may ever be written by a web-UI route. */
-export const UI_EDITABLE_ID_PREFIX = "ui-";
-
-export function isUiEditableRuleId(id: string): boolean {
-  return id.startsWith(UI_EDITABLE_ID_PREFIX);
-}
-
-/** The id FACTORY-669's daemon-startup seed writes its one template rule under — see `../rules/seed-first-run.ts`. Carries the reserved `ui-` prefix above, so the web write path may edit and enable it like any other `ui-` rule. */
+/** The id FACTORY-669's daemon-startup seed writes its one template rule under — see `../rules/seed-first-run.ts`. FACTORY-730: this id carries no special write-eligibility anymore (every rule is web-UI-writable now) — it is still the one id the "Set up your first rule" flow (`FirstRuleSetup.tsx`) looks for specifically. */
 export const FIRST_RULE_ID = "ui-first-rule";
 
 /**

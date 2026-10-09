@@ -41,7 +41,7 @@
  * RULE ID (`MANAGED_SESSIONS_RULE_ID`), never by provider alone.
  *
  * COMBINING WITH THE RULE ID: an ordinary resource agent displays as
- * `"<shortId> · <ruleId>"` (e.g. `"FACTORY-51 · jira-work"`) — a managed
+ * `"<ruleId> · <shortId>"` (e.g. `"jira-work · FACTORY-51"`; rule id first so panes group by query when sorted, FACTORY-861) — a managed
  * session displays its bare short id alone (its rule id is the same reserved
  * literal for every session, so appending it would add noise, not
  * information), and a query-level agent (BUTCHR-397 singleton/persistent
@@ -98,7 +98,7 @@ export function baseDisplayLabel(agentKey: string): string {
   if (decoded.kind === "query") return decoded.ruleId;
   const shortId = shortDisplayId(decoded.resourceProvider, decoded.ruleId, decoded.resourceId);
   if (decoded.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID) return shortId;
-  return `${shortId} · ${decoded.ruleId}`;
+  return `${decoded.ruleId} · ${shortId}`;
 }
 
 /**
