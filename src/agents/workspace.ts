@@ -1423,8 +1423,8 @@ export function claudeTranscriptExists(dir: string, sessionId: string, home?: st
 }
 
 /**
- * FACTORY-850 — the path `claudeTranscriptExists` above checks, exported so
- * `src/agents/resume-decision.ts` can `statSync` it directly (to ESTIMATE a
+ * FACTORY-916 — the path `claudeTranscriptExists` above checks, exported so
+ * `src/agents/respawn.ts` can `statSync` it directly (to ESTIMATE a
  * token count from its byte size, for the respawn-resume context cutoff)
  * without duplicating `claudeProjectDir`'s own encoding.
  */

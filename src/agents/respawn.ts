@@ -123,6 +123,18 @@ export interface RespawnResumeDecision {
  * resumes — because the marker's own staleness risk (see `clearStopCause`)
  * is about ANY later spawn of this workspace, not only one that happens to
  * resume.
+ *
+ * FACTORY-930: this clear still runs at DECISION time, before the launch
+ * it is deciding for has actually happened — deliberately kept that way
+ * (this function stays a pure, side-effect-at-call-time decision, and
+ * `test/unit/respawn-resume-decision.test.ts`'s marker-clearing tests call
+ * it directly with no notion of launch success, so they must keep seeing
+ * the clear on every call). The caller — `HerdrHerd.tryClaudeResume` /
+ * `spawnExclusive` (src/agents/herd.ts) — is where "decided" is reconciled
+ * with "actually happened": it snapshots the marker before calling this
+ * function at all, and restores that snapshot if the launch this decision
+ * was for (the resume attempt, or the ordinary fallback spawn) ends up
+ * failing. See `clearStopCause`'s own doc comment for the full story.
  */
 export function decideRespawnResume(input: RespawnResumeDecisionInput): RespawnResumeDecision {
   const stopCause = workspaceStopCause(input.dir);
