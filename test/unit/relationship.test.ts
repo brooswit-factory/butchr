@@ -7,9 +7,10 @@ import {
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, classifyDestination, ORPHAN_LABEL, ASK_MARKER, CORRECTION_MARKER,
   CORRECTION_REJECTED_MARKER, JIRA_DESCRIPTION_CHAR_LIMIT, JIRA_SUMMARY_CHAR_LIMIT, JIRA_COMMENT_CHAR_LIMIT, CORRECTION_CHAIN_INCOMPLETE_MARKER,
   ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER, guardShortProse, SWALLOWED_ARGUMENT_RE,
-  checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE,
+  checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE, MISSING_IMPLEMENTS_LABEL,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
+import { workspaceStopCause, persistIntentionalStop } from "../../src/agents/stop-cause.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
 
@@ -47,16 +48,21 @@ function makeWorld() {
       // already exercise here.
       description?: unknown;
       summary?: string;
+      // FACTORY-909: Jira's NATIVE `parent` field — a SEPARATE axis from
+      // `bossKey` (the Implements link) above. A fixture can carry either,
+      // both (agreeing or disagreeing), or neither, exactly like real Jira.
+      parentKey?: string;
     }
   >();
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
   const projectProperties = new Map<string, unknown>();
 
-  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: unknown; summary?: string }) {
+  function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: unknown; summary?: string; parentKey?: string }) {
     issues.set(key, {
       issuetype: p.issuetype, project: p.project, status: p.status ?? "To Do", labels: p.labels ?? [], comments: [],
       ...(p.bossKey ? { bossKey: p.bossKey } : {}), ...(p.assignee ? { assignee: p.assignee } : {}),
       ...(p.description !== undefined ? { description: p.description } : {}), ...(p.summary ? { summary: p.summary } : {}),
+      ...(p.parentKey ? { parentKey: p.parentKey } : {}),
     });
   }
   function setProjectProperty(projectKey: string, value: unknown) {
@@ -104,10 +110,26 @@ function makeWorld() {
           assignee: i.assignee ? { accountId: i.assignee } : null,
           issuelinks: [...(i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : []), ...workerLinks],
           description: i.description,
+          ...(i.parentKey ? { parent: { key: i.parentKey, fields: { issuetype: { name: issues.get(i.parentKey)?.issuetype } } } } : {}),
         },
       };
     },
-    search: async () => ({}),
+    // FACTORY-909: the ONLY jql shape this fake needs to understand is the
+    // boss-side closing guard's own query (parentOnlyOpenWorkers,
+    // src/tools/relationship.ts) — `parent = "<key>" AND issuetype in
+    // (Story, Task) AND status != Done`. A loose key-extraction regex, not
+    // a real JQL parser: this fake world's job is to make the production
+    // call site's query behave like real Jira for the one shape it emits,
+    // not to be a general JQL engine.
+    search: async (jql: string) => {
+      const m = /parent\s*=\s*"([^"]+)"/.exec(jql);
+      if (!m) return {};
+      const parentKey = m[1];
+      const result = [...issues.entries()]
+        .filter(([, w]) => w.parentKey === parentKey && (w.issuetype === "Story" || w.issuetype === "Task") && w.status !== "Done")
+        .map(([key, w]) => ({ key, fields: { status: { name: w.status }, summary: w.summary ?? `${key} summary`, labels: w.labels } }));
+      return { issues: result };
+    },
     addComment: async (key: string, text: string) => {
       requireIssue(key).comments.push(text);
       return { ok: true };
@@ -448,6 +470,133 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
     expect(issues.get("BUTCHR-2")!.status).toBe("Done");
   });
 
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-909: Jira native parent / Epic-link as an equivalent boss
+// relationship, with the [butchr:missing-implements] fallback warning.
+// ---------------------------------------------------------------------------
+describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => {
+  test("1. child with Implements only — unchanged", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766" });
+    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
+  });
+
+  test("2. child with native parent only — now recognised (the FACTORY-804 repro)", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766" });
+    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
+  });
+
+  test("3. both present and AGREEING — recognised", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766", parentKey: "FACTORY-766" });
+    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
+  });
+
+  test("4. both present and DISAGREEING — Implements wins, and the disagreement is logged", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" }); // true boss (Implements)
+    addIssue("FACTORY-900", { issuetype: "Epic", project: "FACTORY" }); // merely the native parent
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766", parentKey: "FACTORY-900" });
+
+    const calls: string[] = [];
+    const spy = console.error;
+    console.error = (...a: unknown[]) => { calls.push(String(a[0])); };
+    try {
+      await startWorker(ops, "FACTORY-766", "FACTORY-804");
+      await expect(startWorker(ops, "FACTORY-900", "FACTORY-804")).rejects.toThrow(/not one of FACTORY-900's own workers/);
+    } finally {
+      console.error = spy;
+    }
+    expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
+    expect(calls.some((l) => l.includes("[relationship] Implements/parent disagreement") && l.includes("child=FACTORY-804") && l.includes("implements=FACTORY-766") && l.includes("parent=FACTORY-900"))).toBe(true);
+  });
+
+  test("5. neither present — orphan, exactly as today", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY" });
+    await expect(startWorker(ops, "FACTORY-766", "FACTORY-804")).rejects.toThrow(/no boss at all/);
+  });
+
+  test("6. Task under Story via native parent only", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766" });
+    addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-804" });
+    await startWorker(ops, "FACTORY-804", "FACTORY-805");
+    expect(issues.get("FACTORY-805")!.status).toBe("In Progress");
+  });
+
+  test("7. Story under Epic via native parent only", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766" });
+    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
+  });
+
+  test("8. a native parent of a NON-eligible type is refused, and the (B) warning path fires", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    // FACTORY-804's native parent is a Task, not a Story — not an eligible
+    // tier for a Task child (isEligibleParentTier requires Story).
+    addIssue("FACTORY-700", { issuetype: "Task", project: "FACTORY" });
+    addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-700" });
+    await expect(startWorker(ops, "FACTORY-700", "FACTORY-805")).rejects.toThrow(/not one of FACTORY-700's own workers/);
+    expect(issues.get("FACTORY-805")!.labels).toContain(MISSING_IMPLEMENTS_LABEL);
+    expect(issues.get("FACTORY-805")!.comments.some((c) => c.includes(`[${MISSING_IMPLEMENTS_LABEL}]`) && c.includes("FACTORY-700"))).toBe(true);
+  });
+
+  test("9. the [butchr:missing-implements] comment is posted EXACTLY ONCE for a given child", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-700", { issuetype: "Task", project: "FACTORY" });
+    addIssue("FACTORY-701", { issuetype: "Task", project: "FACTORY" });
+    addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-700" });
+    await expect(startWorker(ops, "FACTORY-700", "FACTORY-805")).rejects.toThrow();
+    // A second, unrelated caller hitting the SAME ineligible-parent child
+    // must not produce a second comment — the label gate is per-ticket,
+    // not per-caller.
+    await expect(startWorker(ops, "FACTORY-701", "FACTORY-805")).rejects.toThrow();
+    const missingImplementsComments = issues.get("FACTORY-805")!.comments.filter((c) => c.includes(`[${MISSING_IMPLEMENTS_LABEL}]`));
+    expect(missingImplementsComments.length).toBe(1);
+  });
+
+  test("10. boss-side guard: an Epic with a live, non-Done, parent-only child is REFUSED a close by finish_without_a_boss / submit_to_boss / finish_worker", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY", status: "In Progress" });
+    // FACTORY-804 is parent-only (no Implements link at all) — invisible to
+    // findWorkers, which is exactly the gap this guard must not miss.
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766", status: "In Progress" });
+
+    await expect(finishWithoutABoss(ops, "FACTORY-766")).rejects.toThrow(/still has open workers? it undertook to close.*FACTORY-804/s);
+    await expect(submitToBoss(ops, "FACTORY-766")).rejects.toThrow(/still has open workers? it undertook to close.*FACTORY-804/s);
+
+    // finish_worker: a grandparent Epic closing FACTORY-766 itself must see
+    // that FACTORY-766's own child FACTORY-804 (parent-only) is still open.
+    addIssue("FACTORY-900", { issuetype: "Epic", project: "FACTORY" }); // placeholder grandboss, never used to call start — Epic has no boss of its own in this fleet; exercise the guard directly via finishWorker with a stand-in caller that owns FACTORY-766 via Implements for this test's own sake.
+    issues.get("FACTORY-766")!.bossKey = "FACTORY-900";
+    await expect(finishWorker(ops, "FACTORY-900", "FACTORY-766")).rejects.toThrow(/still has open workers? it undertook to close.*FACTORY-804/s);
+
+    // Shelving the parent-only child, or finishing it for real, clears the way.
+    await ops.addLabels("FACTORY-804", [EXEMPT_LABEL]);
+    await submitToBoss(ops, "FACTORY-766");
+    expect(issues.get("FACTORY-766")!.status).toBe("In Review");
+  });
+
+  test("resolveBoss via native parent also gates finish_without_a_boss's own has-a-boss refusal", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
+    addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766" });
+    await expect(finishWithoutABoss(ops, "FACTORY-804")).rejects.toThrow(/FACTORY-804 has a boss \(FACTORY-766\)/);
+  });
 });
 
 describe("start_worker / finish_worker / adopt_worker: BUTCHR-58 — butchr:shelved means CURRENTLY shelved, so reactivating withdraws it", () => {
@@ -1979,6 +2128,118 @@ describe("finishWithoutABoss", () => {
     addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" }); // no bossKey at all
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+// ===========================================================================
+// FACTORY-849/FACTORY-852 (PR #719 review, item 1): the real write sites —
+// finishWorker/shelveWorker/submitToBoss/finishWithoutABoss actually calling
+// `recordIntentionalStop` on the real caller/worker key, and
+// startWorker/adoptWorker(kind:"start") actually calling
+// `clearIntentionalStop` — driven through the production functions with a
+// fake AtlassianOps and a temp workspace root, not just `classifyStop`
+// exercised in isolation over a hand-built record (stop-cause.test.ts
+// already covers that half, and so does the OR-logic table there). Sandboxes
+// BUTCHR_WORKSPACES exactly like the correctWorker describe block above,
+// for the same reason: workspaceRoot() defaults to a REAL `~/butchr-workspaces`.
+// ===========================================================================
+
+describe("FACTORY-849/FACTORY-852: stop-cause write sites, driven through the real relationship.ts functions", () => {
+  let workspacesRoot: string;
+  const priorEnv = process.env.BUTCHR_WORKSPACES;
+  beforeEach(() => {
+    workspacesRoot = mkdtempSync(join(tmpdir(), "stop-cause-write-site-test-"));
+    process.env.BUTCHR_WORKSPACES = workspacesRoot;
+  });
+  afterEach(() => {
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+    else process.env.BUTCHR_WORKSPACES = priorEnv;
+  });
+
+  function wsDir(key: string): string {
+    return join(workspacesRoot, "jira-work", "task", key);
+  }
+
+  test("finishWorker writes reason \"finish_worker\" on the WORKER's own on-disk workspace, after the Done transition", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_worker" });
+  });
+
+  test("shelveWorker writes reason \"shelve_worker\" on the WORKER's own on-disk workspace", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(issues.get("BUTCHR-2")!.labels).toContain(EXEMPT_LABEL);
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "shelve_worker" });
+  });
+
+  test("submitToBoss writes reason \"submit_to_boss\" on the CALLER's OWN on-disk workspace, after the In Review transition", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
+    const dir = wsDir("BUTCHR-1");
+    mkdirSync(dir, { recursive: true });
+    await submitToBoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "submit_to_boss" });
+  });
+
+  test("finishWithoutABoss writes reason \"finish_without_a_boss\" on the CALLER's OWN on-disk workspace", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey: bossless
+    const dir = wsDir("BUTCHR-1");
+    mkdirSync(dir, { recursive: true });
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_without_a_boss" });
+  });
+
+  test("startWorker clears a prior stop-cause marker on the worker it reactivates", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(workspaceStopCause(dir)).not.toBeUndefined(); // the marker shelveWorker itself just wrote
+    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+    expect(workspaceStopCause(dir)).toBeUndefined(); // superseded by reactivation
+  });
+
+  test("adoptWorker(kind: \"start\") clears a prior stop-cause marker on the ticket it adopts-and-starts", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do" });
+    const dir = wsDir("BUTCHR-9");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "shelve_worker"); // a stale marker from a PRIOR episode this adoption reactivates
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress");
+    expect(workspaceStopCause(dir)).toBeUndefined();
+  });
+
+  test("shelveWorker via adoptWorker(kind: \"shelve\") does NOT clear a marker — only the \"start\" disposition does", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do" });
+    const dir = wsDir("BUTCHR-9");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "finish_worker"); // pre-existing, unrelated to this call
+    await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_worker" }); // untouched by the shelve disposition
   });
 });
 

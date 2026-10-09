@@ -18,6 +18,8 @@
       "agentPreferences": [{ "harness": "claude", "model": "claude-sonnet-5" }],
       "linkedEventing": false,
       "mcpServerNames": [],
+      "resumeOnRespawn": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Pick up any newly assigned FACTORY ticket and get it to a reviewable PR.",
       "staffed": true,
       "whyUnstaffed": null
@@ -33,6 +35,8 @@
       "agentPreferences": [],
       "linkedEventing": false,
       "mcpServerNames": [],
+      "resumeOnRespawn": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Watch open epics and keep their task breakdown current.",
       "staffed": false,
       "whyUnstaffed": "no live agent observed for this rule this poll"
@@ -48,6 +52,8 @@
       "agentPreferences": [],
       "linkedEventing": false,
       "mcpServerNames": [],
+      "resumeOnRespawn": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Triage a newly submitted product idea.",
       "staffed": false,
       "whyUnstaffed": "disabled"

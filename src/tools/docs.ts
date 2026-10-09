@@ -212,6 +212,88 @@ export function findBossKey(issue: unknown): string | null {
   return null;
 }
 
+/**
+ * FACTORY-909: Jira's NATIVE `fields.parent` — already on `issue`'s own
+ * fetched payload (`jira.issues.getIssue`'s standard field set), never a
+ * second Jira call, same cost profile as `findBossKey`. `issuetype` is
+ * whatever the parent link stub hydrates (`fields.issuetype.name`),
+ * `undefined` when the stub didn't carry it — never guessed.
+ *
+ * NOTE ON src/workspace/registry.ts's own `PARENT` finding (BUTCHR-169):
+ * that comment records `parent` as empirically ALWAYS null for every issue
+ * in the predecessor project at the time it was written. It is no longer
+ * true today (FACTORY-908's diagnosis measured `parent` populated on dozens
+ * of live FACTORY issues) — see this ticket's own fix to that comment. Read
+ * this one, not that one, for the present-tense fact.
+ */
+export function nativeParentOf(issue: unknown): { key: string; issuetype: string | undefined } | null {
+  const parent = (issue as { fields?: { parent?: { key?: string; fields?: { issuetype?: { name?: string } } } } })?.fields?.parent;
+  if (!parent?.key) return null;
+  return { key: parent.key, issuetype: parent.fields?.issuetype?.name };
+}
+
+/**
+ * FACTORY-909: the native-parent tiers this fleet is willing to treat as an
+ * EQUIVALENT boss relationship to an `Implements` link — the same two tiers
+ * `adoptWorker` (src/tools/relationship.ts) already enforces for which
+ * issue types it can staff as a worker (Story or Task), mirrored onto which
+ * issue type each may be natively parented BY: a Story's native parent must
+ * be an Epic, a Task's native parent must be a Story. Anything else (a
+ * Task's native parent that is itself a Task, a parent of unknown type, a
+ * Bug, …) is NOT an eligible tier — resolveBoss below reports that case as
+ * `ineligibleParent` rather than silently granting boss status to a parent
+ * the rest of this fleet's hierarchy was never built to let close one.
+ */
+export function isEligibleParentTier(childIssuetype: string | undefined, parentIssuetype: string | undefined): boolean {
+  if (childIssuetype === "Story") return parentIssuetype === "Epic";
+  if (childIssuetype === "Task") return parentIssuetype === "Story";
+  return false;
+}
+
+/** `resolveBoss`'s own result shape — see that function's doc comment for what each field means and when it's set. */
+export interface BossResolution {
+  /** The resolved boss key, or `null` when there is none (today's "orphan" case, or an ineligible-parent case — see `ineligibleParent`). */
+  boss: string | null;
+  /** Which read produced `boss` — `"none"` covers both the orphan case and the ineligible-parent refusal case (both resolve `boss: null`). */
+  source: "implements" | "parent" | "none";
+  /** Set only when BOTH an Implements link and a native parent exist and DISAGREE — `boss` is still the Implements side (it always wins), this field exists purely so the caller can log the disagreement. */
+  disagreement?: { implementsBoss: string; parent: string };
+  /** Set only when there is NO Implements link, a native parent exists, but its tier is not one `isEligibleParentTier` recognises — the FACTORY-909 (B) warning-path trigger. */
+  ineligibleParent?: { key: string; issuetype: string | undefined };
+}
+
+/**
+ * FACTORY-909 (A): `findBossKey`'s own fallback — resolves a child's boss
+ * via its native Jira `parent` field whenever there is no `Implements`
+ * link, so a Story/Task filed under its Epic/Story via Jira's native
+ * parent / Epic-link field ALONE is no longer an orphan. Stays pure and
+ * I/O-free over `issue`'s own already-fetched payload, exactly like
+ * `findBossKey` — `nativeParentOf` costs nothing beyond what the caller's
+ * existing `getIssue` already paid for.
+ *
+ * PRECEDENCE, PER FACTORY-908's diagnosis: `Implements` ALWAYS wins when
+ * both exist, even when they disagree — never the other way around, and
+ * never "most recently written wins" or any other heuristic. A disagreement
+ * is reported (not thrown — this function does no I/O and refuses nothing)
+ * so the caller can log it; resolving the disagreement itself is a human or
+ * `jira_link_issues` act, not this function's.
+ */
+export function resolveBoss(issue: unknown, childIssuetype: string | undefined): BossResolution {
+  const implementsBoss = findBossKey(issue);
+  const parent = nativeParentOf(issue);
+  if (implementsBoss) {
+    return parent && parent.key !== implementsBoss
+      ? { boss: implementsBoss, source: "implements", disagreement: { implementsBoss, parent: parent.key } }
+      : { boss: implementsBoss, source: "implements" };
+  }
+  if (parent) {
+    return isEligibleParentTier(childIssuetype, parent.issuetype)
+      ? { boss: parent.key, source: "parent" }
+      : { boss: null, source: "none", ineligibleParent: parent };
+  }
+  return { boss: null, source: "none" };
+}
+
 /** One of a caller's own workers, as read off the caller's own already-fetched issue payload — never a second Jira call. `status` is whatever the link stub's own hydrated `fields.status.name` carries; a stub Jira does not hydrate (or a garbage payload) leaves it `undefined` rather than a guessed value. `summary` (BUTCHR-244) is the same stub's hydrated `fields.summary` — present in the SAME measured field set as `status` (see `findWorkers`'s own doc comment), so reading it costs nothing beyond what `status` already costs; used by `new_worker`'s idempotency check (relationship.ts's `findDuplicateWorker`) to match a retry against the caller's own not-Done children with no extra Jira call. */
 export interface WorkerRef {
   key: string;

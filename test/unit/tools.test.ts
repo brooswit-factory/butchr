@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
 import { OUTCOME_TAG } from "../../src/tools/outcome.js";
+import { workspaceStopCause } from "../../src/agents/stop-cause.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -1834,6 +1836,52 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
     const result = await tools.stand_down!.handler({}, conn);
     expect(result).toMatchObject({ ok: true, key: "KAN-7", asleep: false, watching: ["KAN-7"] });
     expect((result as { note: string }).note).toMatch(/NOT put to sleep/);
+  });
+
+  // FACTORY-849/FACTORY-852 (PR #719 review, item 1): the actual real-world
+  // write site — this handler calling `recordIntentionalStop`, not merely
+  // `classifyStop` exercised in isolation over a hand-built StopCauseRecord
+  // (stop-cause.test.ts already covers that half). Sandboxes BUTCHR_WORKSPACES
+  // to a throwaway temp dir for the same reason correctWorker's own tests do
+  // in relationship.test.ts: workspaceRoot() defaults to a REAL,
+  // populated `~/butchr-workspaces` otherwise.
+  describe("FACTORY-849/FACTORY-852: stand_down persists an intentional stop-cause marker on the caller's own on-disk workspace(s)", () => {
+    let workspacesRoot: string;
+    const priorEnv = process.env.BUTCHR_WORKSPACES;
+    beforeEach(() => {
+      workspacesRoot = mkdtempSync(join(tmpdir(), "stand-down-stop-cause-test-"));
+      process.env.BUTCHR_WORKSPACES = workspacesRoot;
+    });
+    afterEach(() => {
+      rmSync(workspacesRoot, { recursive: true, force: true });
+      if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = priorEnv;
+    });
+
+    test("a workspace on disk for the caller gets `.butchr-stop-cause.json` written with reason \"stand_down\" after a successful stand_down", async () => {
+      const dir = join(workspacesRoot, "jira-work", "task", "KAN-7");
+      mkdirSync(dir, { recursive: true });
+      const { tools } = standDownRig({
+        issue: { key: "KAN-7", fields: { issuelinks: [] } },
+        commentsByKey: { "KAN-7": [{ id: "100" }] },
+        onStandDown: () => {},
+      });
+      const conn = { headers: { "x-issue": "KAN-7" } } as any;
+      expect(workspaceStopCause(dir)).toBeUndefined();
+      const result = await tools.stand_down!.handler({}, conn);
+      expect(result).toMatchObject({ ok: true, asleep: true });
+      expect(workspaceStopCause(dir)).toEqual({ reason: "stand_down", at: expect.any(Number) });
+    });
+
+    test("no on-disk workspace for the caller: stand_down still succeeds (best-effort, never throws)", async () => {
+      const { tools } = standDownRig({
+        issue: { key: "KAN-7", fields: { issuelinks: [] } },
+        commentsByKey: { "KAN-7": [{ id: "100" }] },
+        onStandDown: () => {},
+      });
+      const conn = { headers: { "x-issue": "KAN-7" } } as any;
+      await expect(tools.stand_down!.handler({}, conn)).resolves.toMatchObject({ ok: true, asleep: true });
+    });
   });
 });
 

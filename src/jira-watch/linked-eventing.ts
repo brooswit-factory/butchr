@@ -172,7 +172,7 @@ import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
 import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
 import type { LinkStore } from "../resources/link-store.js";
-import { isDaemonLabelOnlyDiff } from "./diff.js";
+import { isDaemonLabelOnlyDiff, excludeBookkeepingComments } from "./diff.js";
 import { watchedKeys } from "./routes.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
@@ -971,7 +971,13 @@ export function createLinkedEventingState(): LinkedEventingState {
         const targets = [...byKey.keys()];
         const cursors = await mapLimit(targets, EXTERNAL_POLL_CONCURRENCY, async (key): Promise<string | null | undefined> => {
           try {
-            const comments = await deps.comments!(key);
+            // FACTORY-865: filtered the same way src/resources/issue.ts's
+            // own fetchComments is — a butchr `[butchr:*]` bookkeeping
+            // comment on a LINKED target must not move this cursor either,
+            // or it defeats the `!commentChanged && isDaemonLabelOnlyDiff(...)`
+            // gate below exactly the way it defeated the issue tier's own
+            // suppression (see diff.ts's WAKE_MARKERS doc comment).
+            const comments = excludeBookkeepingComments(await deps.comments!(key));
             return comments[0]?.id ?? null;
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] comment fetch failed for ${key}: ${(e as Error)?.message ?? e}`);

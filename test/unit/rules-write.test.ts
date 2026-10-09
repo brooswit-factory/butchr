@@ -3,7 +3,8 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rulesEtag, updateRulesFile } from "../../src/rules/write-rules.js";
-import type { RulesEnv } from "../../src/rules/rules.js";
+import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
+import { capacityRoleFor } from "../../src/agents/capacity-role.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { buildFieldsAllowedPaths } from "../../src/rules/rules-write-apply.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "../../src/rules/rules-write-registry.js";
@@ -516,6 +517,81 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const etag = rulesEtag(env());
     const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
+  });
+
+  // FACTORY-817: `role: "sentinel"` joins this gate — see `isRiskyFieldPatch`'s own doc comment (`src/rules/rules-write.ts`).
+  test("setting role: sentinel without confirm is refused, writes nothing", async () => {
+    const text = seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { role: "sentinel" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("setting role: sentinel WITH confirm succeeds", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { role: "sentinel" };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].role).toBe("sentinel");
+  });
+
+  test("setting role: worker (the default, an explicit opt-in) needs no confirm", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { role: "worker" };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("planRuleWrite: requiresConfirm with confirmReason \"capacity-sentinel\" for role: sentinel alone", async () => {
+    seed([UI_RULE]);
+    const plan = await planRuleWrite("ui-first-rule", { role: "sentinel" }, false, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("capacity-sentinel");
+    }
+  });
+
+  // FACTORY-817 criterion 4: the write must be what the ENGINE reads, not
+  // just what the stored row says — `loadRules` is the same parse the
+  // daemon runs at startup/reload, and `capacityRoleFor` (fed a
+  // `ruleRoleOf` built off its `rules`, mirroring `src/daemon/index.ts`'s
+  // own `ruleRoleOfAgent`) is the exact function the admission controller
+  // calls. Asserting through both, not just `nextDoc.rules[0].role`, is
+  // what tells this apart from a write that merely LOOKS right in the file.
+  test("round-trip through loadRules + capacityRoleFor: writing role: sentinel is what the engine's own reader sees", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { role: "sentinel" };
+    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+
+    const loaded = loadRules(env());
+    const ruleRoleOf = (id: string) => loaded.rules.find((r) => r.id === "ui-first-rule")?.role;
+    expect(capacityRoleFor("jira-work:ui-first-rule:BUTCHR-1", ruleRoleOf)).toBe("sentinel");
+  });
+
+  test("round-trip through loadRules + capacityRoleFor: an UNSET role reads as the engine's own \"worker\" default", async () => {
+    seed([UI_RULE]);
+    const loaded = loadRules(env());
+    const rule = loaded.rules.find((r) => r.id === "ui-first-rule")!;
+    expect(rule.role).toBe("worker");
+    const ruleRoleOf = (id: string) => loaded.rules.find((r) => r.id === "ui-first-rule")?.role;
+    expect(capacityRoleFor("jira-work:ui-first-rule:BUTCHR-1", ruleRoleOf)).toBe("worker");
   });
 
   test("planRuleWrite: requiresConfirm with confirmReason \"risky-permission\" for permissionMode: bypassPermissions alone", async () => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertOnlyChanged, createRulesFileExclusive, defaultIo, restoreBackup, rulesEtag, setRuleEnabled, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
+import { assertOnlyChanged, createRulesFileExclusive, defaultIo, restoreBackup, rulesEtag, setRuleEnabled, setRuleRole, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 
 let dir: string;
@@ -681,5 +681,53 @@ describe("setRuleEnabled", () => {
 
   test("invalid JSON input: throws clearly", () => {
     expect(() => setRuleEnabled("{not json", "triage", true)).toThrow(/invalid JSON/);
+  });
+});
+
+describe("setRuleRole (FACTORY-810)", () => {
+  test("a rule with no `role` field gets one inserted, as a quoted string", () => {
+    const text = doc([RULE_A, RULE_B]);
+    const next = setRuleRole(text, "triage", "sentinel");
+    const parsed = JSON.parse(next);
+    expect(parsed.rules[0].role).toBe("sentinel");
+    expect(parsed.rules[1]).toEqual(RULE_B);
+  });
+
+  test("flips an existing explicit `role` value", () => {
+    const text = doc([{ ...RULE_A, role: "worker" }]);
+    const next = setRuleRole(text, "triage", "sentinel");
+    expect(JSON.parse(next).rules[0].role).toBe("sentinel");
+  });
+
+  test("preserves 2-space indent and key order; only the target rule's role field changes, byte for byte", () => {
+    const text = `{
+  "rules": [
+    {
+      "id": "triage",
+      "resourceProvider": "jira-work",
+      "query": "project = BUTCHR",
+      "brief": "triage it",
+      "role": "worker"
+    },
+    {
+      "id": "stories",
+      "resourceProvider": "jira-work",
+      "query": "project = BUTCHR AND issuetype = Story",
+      "brief": "work the story"
+    }
+  ]
+}
+`;
+    const next = setRuleRole(text, "triage", "sentinel");
+    const expected = text.replace('"role": "worker"', '"role": "sentinel"');
+    expect(next).toBe(expected);
+  });
+
+  test("unknown id: throws clearly", () => {
+    expect(() => setRuleRole(doc([RULE_A]), "nope", "sentinel")).toThrow(/no rule with id "nope"/);
+  });
+
+  test("invalid JSON input: throws clearly", () => {
+    expect(() => setRuleRole("{not json", "triage", "sentinel")).toThrow(/invalid JSON/);
   });
 });
