@@ -32,10 +32,10 @@ import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-sc
 import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import { RESOURCE_PROVIDERS, type ResourceProvider } from "../../../src/rules/agent-key.js";
 import {
-  RateLimitError,
   type RuleAgentPreferencePatch,
   type RuleCapacityRolesCatalog,
   type RuleCreateDraft,
+  type RuleCreatePlanResult,
   type RuleFormCatalogEntry,
   type RuleWriteResult,
   type RulesApi,
@@ -51,11 +51,15 @@ export interface CreateRuleDialogProps {
   onClose: () => void;
 }
 
-/** Mirrors `RuleEditDialog.tsx`'s own `describeWriteError`. */
-function describeWriteError(e: unknown): string {
-  if (e instanceof RateLimitError && e.retryAfterSeconds !== undefined) {
-    return `Too many changes — try again in ${e.retryAfterSeconds}s`;
-  }
+/**
+ * FACTORY-927 (review round 1, item 2) — `api.createRule` never throws for
+ * an ordinary refusal any more (see `RuleCreateOutcome`'s own doc comment,
+ * `../api/rules.js`), so this only ever renders a message for a genuinely
+ * unexpected failure (a network error, a non-JSON response) that reaches
+ * this component as a thrown exception rather than a `{kind: "refused"}`
+ * result.
+ */
+function describeUnexpectedError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
@@ -71,9 +75,19 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
   const [lizardMode, setLizardMode] = useState(false);
   const [role, setRole] = useState<AgentRole>("worker");
   const [busy, setBusy] = useState(false);
+  /** A genuine refusal (collision, unmeasurable scope, rate limit, a lost race, ...) — NEVER the ordinary "please confirm" step, which only ever sets `pendingPlan` below. See `RuleCreateOutcome`'s own doc comment (`../api/rules.js`) for how the two are told apart. */
   const [error, setError] = useState<string | null>(null);
-  /** The server's own "resend with confirm: true" refusal from the first (unconfirmed) call — its message carries the dry-run scope, shown as the confirm step. `null` means no pending confirmation. */
-  const [pendingConfirmMessage, setPendingConfirmMessage] = useState<string | null>(null);
+  /**
+   * FACTORY-927 (review round 1, item 2) — set ONLY from a
+   * `{kind: "needs-confirm"}` result whose `confirmReason` is exactly
+   * `"rule-create"` (the ordinary "you haven't confirmed yet" step).
+   * `confirmReason: "unmeasurable-scope"` never reaches here — the server
+   * returns THAT one as a `{kind: "refused"}` 503 instead (see
+   * `RuleCreatePlanResult`'s own doc comment for why), which `submit()`
+   * below routes to `error`, not this field — so this dialog never shows a
+   * "confirm create" button next to a refusal it cannot actually satisfy.
+   */
+  const [pendingPlan, setPendingPlan] = useState<RuleCreatePlanResult | null>(null);
   const [created, setCreated] = useState<RuleWriteResult | null>(null);
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
   const [capacityRoles, setCapacityRoles] = useState<RuleCapacityRolesCatalog | null>(null);
@@ -113,20 +127,45 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
     return draft;
   }
 
+  /**
+   * FACTORY-927 (review round 1, items 2/3) — the one place both `submit`
+   * and `confirmCreate` route a `RuleCreateOutcome`: `"created"` finishes
+   * the flow, `"needs-confirm"` shows the confirm step ONLY when
+   * `confirmReason === "rule-create"` (the one case `createRule`/`confirm:
+   * true` can actually satisfy), and `"refused"` — every other case,
+   * including a `confirmReason: "unmeasurable-scope"` 503 — renders as a
+   * plain error with no confirm button at all, since resending with
+   * `confirm: true` cannot fix any of those.
+   */
+  function handleOutcome(outcome: Awaited<ReturnType<RulesApi["createRule"]>>) {
+    if (outcome.kind === "created") {
+      setPendingPlan(null);
+      setCreated(outcome.result);
+      onChanged();
+      return;
+    }
+    if (outcome.kind === "needs-confirm" && outcome.plan.confirmReason === "rule-create") {
+      setPendingPlan(outcome.plan);
+      return;
+    }
+    // "refused", or a "needs-confirm" whose confirmReason this dialog does
+    // not treat as confirmable (today, only "unmeasurable-scope" reaches
+    // here, and only via "refused" — kept as a fallback rather than an
+    // assumption, so an unrecognized server-added reason fails safe to a
+    // plain error too, never a confirm button for a case this dialog
+    // doesn't understand).
+    setPendingPlan(null);
+    setError(outcome.kind === "refused" ? outcome.error : `rule creation needs confirmation it cannot satisfy (${outcome.plan.confirmReason ?? "unknown reason"})`);
+  }
+
   function submit() {
     if (!canSubmit) return;
     setBusy(true);
     setError(null);
     api
       .createRule(buildDraft(), false)
-      .then((result) => {
-        // The server accepted a create with `confirm: false`? Cannot happen
-        // per the route's own unconditional confirm gate (AC5) — but handle
-        // it defensively rather than assume: treat it as done.
-        setCreated(result);
-        onChanged();
-      })
-      .catch((e: unknown) => setPendingConfirmMessage(describeWriteError(e)))
+      .then(handleOutcome)
+      .catch((e: unknown) => setError(describeUnexpectedError(e)))
       .finally(() => setBusy(false));
   }
 
@@ -135,12 +174,8 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
     setError(null);
     api
       .createRule(buildDraft(), true)
-      .then((result) => {
-        setPendingConfirmMessage(null);
-        setCreated(result);
-        onChanged();
-      })
-      .catch((e: unknown) => setError(describeWriteError(e)))
+      .then(handleOutcome)
+      .catch((e: unknown) => setError(describeUnexpectedError(e)))
       .finally(() => setBusy(false));
   }
 
@@ -338,11 +373,13 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
             <p data-testid="create-rule-capacity-default-hint">butchr's own default is "{capacityRoles.default}" (counted)</p>
           )}
 
-          {pendingConfirmMessage !== null && (
+          {pendingPlan !== null && (
             <div className="rules-view__cnc" data-testid="create-rule-confirm">
-              <p data-testid="create-rule-confirm-message">{pendingConfirmMessage}</p>
+              <p data-testid="create-rule-confirm-message">
+                this query currently matches {pendingPlan.scope ?? 0} ticket{(pendingPlan.scope ?? 0) === 1 ? "" : "s"} — the new rule is created DISABLED, so nothing is staffed yet; confirm to create it?
+              </p>
               <div className="rules-view__dialog-actions">
-                <Button variant="default" onPress={() => setPendingConfirmMessage(null)}>
+                <Button variant="default" onPress={() => setPendingPlan(null)}>
                   cancel
                 </Button>
                 <Button variant="primary" onPress={confirmCreate} data-testid="create-rule-confirm-button">

@@ -960,23 +960,40 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `onRequest`'s own prefix check), the SAME shared write-rate limit
     // every other write-shaped route uses, and the SAME `auditOutcome`
     // pipeline. `deps.rulesWrite.planCreate` is called FIRST, on every
-    // request (confirmed or not) — this never writes, but it IS where an
-    // id collision, a stale-file refusal, or an unmeasurable dry-run scope
-    // are caught, authoritatively, with their own correct status codes;
-    // those are genuine refusals of a create attempt and are audited here.
-    // A plan that comes back `ok: true` is then handed STRAIGHT to
-    // `deps.rulesWrite.create` with the plan's own freshly-computed
-    // `planHash` — never a client-supplied one (this route ignores any
-    // `planHash` field in the request body entirely: the server always
-    // computes its own, a request apart, so there is nothing for a client
-    // to track or resend) — which re-validates everything again,
-    // authoritatively, under the write lock, and is itself where the
-    // mandatory-confirm gate lives (AC5: UNCONDITIONAL for a create,
-    // independent of blast radius — see `createRule`'s own doc comment,
-    // `../rules/rules-write.ts`). Every call to `create` is audited,
-    // accepted or refused, which already covers "confirm omitted" (its own
-    // 409, naming the dry-run scope in the message) exactly like every
-    // other write route's own confirm gate is audited.
+    // request — it never writes, and is the ONE call every attempt makes
+    // regardless of `confirm`.
+    //
+    // THREE OUTCOMES (review round 1, 2026-10-09, items 2/3 — fixing an
+    // audit-noise bug: the previous version called `create` even when the
+    // plan merely reported "not yet confirmed," so every ORDINARY two-step
+    // create wrote a spurious REJECTED audit line on its first call):
+    //   1. `plan.ok === false`, OR `plan.ok === true` but the scope could
+    //      not be measured (`plan.scopeUnmeasurable`) — a genuine refusal
+    //      (collision, stale file, or a previewer that's down), audited as
+    //      rejected, same as any other write refusal. `confirmReason`
+    //      (`"unmeasurable-scope"` for the second case; absent for the
+    //      first — a collision/staleness refusal is never a "just confirm
+    //      it" situation) rides the response body verbatim, same shape
+    //      `DELETE /api/rules/:id` already returns it in.
+    //   2. `plan.ok === true`, scope WAS measured, but `confirm` was not
+    //      `true` on this call — the ORDINARY first step of the two-step
+    //      flow: returns the plan itself, 200, `requiresConfirm: true`,
+    //      `confirmReason: "rule-create"` — a real, typed response shape
+    //      (the SAME `RulesPlanResult` shape `POST /api/rules/plan`
+    //      already returns for an edit/enable dry run) carrying `scope`/
+    //      `planHash` structurally, never a string for the client to parse
+    //      a number back out of. UNAUDITED — same precedent `POST
+    //      /api/rules/plan` already sets for its own report-only dry run
+    //      (that route has no `auditOutcome` call at all): this is
+    //      exploration, not an attempted write, so it must never count
+    //      against N2's write-flood budget's own alert aggregation the way
+    //      a real rejected write does.
+    //   3. `plan.ok === true`, scope measured, AND `confirm === true` —
+    //      the real write: `create` is called (with the plan's own
+    //      just-computed `planHash` — see `createRule`'s own doc comment
+    //      for why a client-supplied one is never needed here), and its
+    //      outcome (accepted or refused) is ALWAYS audited — this is the
+    //      one call this route makes that can actually write.
     .post("/api/rules", async ({ body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
@@ -987,9 +1004,27 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") });
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
-      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      if (bad) {
+        // Review round 1, item 4 (AC7 gap): a malformed body is still a
+        // refused create ATTEMPT — audited exactly like every other
+        // validation failure below, never silently skipped just because
+        // the failure is early. No id is known yet at this point (the body
+        // never parsed far enough to have one).
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      // Best-effort id for the audit line below even when validation
+      // itself is what's about to fail — the same "name what we can" spirit
+      // every other route's own audit context already follows.
+      const rawId = body && typeof body === "object" ? (body as Record<string, unknown>).id : undefined;
+      const idsForAudit = typeof rawId === "string" ? [rawId] : [];
       const parsed = validateRuleCreateInput(body);
-      if (!parsed.ok) { set.status = 400; return { error: parsed.error }; }
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids: idsForAudit, origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
       const b = body as Record<string, unknown>;
       const confirm = b.confirm === true;
       const ids = [parsed.input.id];
@@ -999,9 +1034,24 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         set.status = plan.status;
         return { error: plan.error };
       }
+      if (plan.scopeUnmeasurable) {
+        // Same unconditional fail-closed discipline `createRule` itself
+        // documents for this case — refused here, before ever reaching the
+        // write lock, so a previewer outage never produces a confusing
+        // "needs confirm" response for a number that was never real.
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, { ok: false, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; try again` });
+        set.status = 503;
+        return { error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again`, confirmReason: plan.confirmReason };
+      }
+      if (plan.requiresConfirm) {
+        // Outcome 2 above — the ordinary "not yet confirmed" dry run.
+        // Deliberately `return plan;` verbatim, never audited: see this
+        // route's own header comment.
+        return plan;
+      }
       const outcome = await createRule(parsed.input, confirm, plan.planHash);
       auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error, ...(outcome.confirmReason ? { confirmReason: outcome.confirmReason } : {}) }; }
       return outcome;
     })
     // FACTORY-662 item 7: `POST /api/rules/:id/enabled` — the ONLY route

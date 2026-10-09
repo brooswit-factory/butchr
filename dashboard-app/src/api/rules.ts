@@ -231,6 +231,64 @@ export interface RuleCreateDraft {
 }
 
 /**
+ * FACTORY-927 (review round 1, items 2/3) — `POST /api/rules`'s own
+ * report-only dry-run shape, returned VERBATIM (200) whenever the plan
+ * succeeded but the create has not (yet) happened — either because
+ * `confirm` was not yet `true` (the ordinary first step: `confirmReason`
+ * is `"rule-create"`) or because the scope could not be measured at all
+ * (`confirmReason` is `"unmeasurable-scope"` — that case actually arrives
+ * as a 503 `RuleCreateRefusal` instead, never this shape; see
+ * `createRule`'s own doc comment below for why the two are kept distinct).
+ * A real, typed shape — `scope`/`planHash` are read as actual fields here,
+ * never parsed back out of an error string.
+ */
+export interface RuleCreatePlanResult {
+  planHash: string;
+  spawned: number;
+  stopped: number;
+  restarted: number;
+  scope: number | null;
+  scopeUnmeasurable?: boolean;
+  etag: string;
+  requiresConfirm: boolean;
+  confirmReason?: "rule-create" | "unmeasurable-scope";
+}
+
+/**
+ * FACTORY-927 (review round 1, item 2) — any OTHER refusal `POST
+ * /api/rules` can return: an id collision, a stale rules file, an
+ * unmeasurable scope (503), a validation failure (400), a rate limit
+ * (429), or a race lost at the actual write (409). `confirmReason` rides
+ * the body verbatim when the server set one (today, only
+ * `"unmeasurable-scope"` — see `RuleCreatePlanResult`'s own doc comment for
+ * why that one specific case is a REFUSAL, never the "needs confirm" shape
+ * above) — its ABSENCE is exactly how `CreateRuleDialog` tells a real
+ * refusal apart from the ordinary "please confirm" step: only
+ * `RuleCreateOutcome`'s `"needs-confirm"` kind (below) ever carries
+ * `confirmReason: "rule-create"`, and this type never does.
+ */
+export interface RuleCreateRefusal {
+  error: string;
+  confirmReason?: "unmeasurable-scope";
+  /** Parsed `Retry-After`, seconds — present only for a 429. Mirrors `RateLimitError.retryAfterSeconds`'s own meaning, as a plain field here since this whole method never throws for an ordinary refusal (see `RuleCreateOutcome`'s own doc comment). */
+  retryAfterSeconds?: number;
+}
+
+/**
+ * FACTORY-927 (review round 1, items 2/3) — `createRule`'s own return
+ * shape: a discriminated union, never a thrown exception for an ORDINARY
+ * refusal (a network-level failure can still reject the promise; this
+ * union is for every response the server actually sent back). This is
+ * what lets `CreateRuleDialog` tell "please confirm" apart from "this
+ * failed" WITHOUT parsing a human-readable message string: it checks
+ * `outcome.kind`, never `instanceof Error` or a substring match.
+ */
+export type RuleCreateOutcome =
+  | { kind: "created"; result: RuleWriteResult }
+  | { kind: "needs-confirm"; plan: RuleCreatePlanResult }
+  | ({ kind: "refused" } & RuleCreateRefusal);
+
+/**
  * `POST /api/rules/plan`'s response, named on the ticket:
  * `{planHash, spawned, stopped, restarted, etag, scopeCount?}`.
  * Report-only — computing one never changes anything. `scopeCount` is
@@ -326,17 +384,23 @@ export interface RulesApi {
   /** `PUT /api/rules/:id` — the nested allowlist edit. Same `ifMatch`/`planHash` discipline as `setEnabled`. */
   updateFields(ruleId: string, patch: RuleFieldPatch, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
-   * FACTORY-927 — `POST /api/rules`: create a new rule. No `ifMatch`/
-   * `planHash` to pass (unlike `setEnabled`/`updateFields`) — there is no
-   * prior read of a not-yet-existing rule to be stale against, and the
-   * server computes its own fresh plan hash internally on every call (see
-   * that route's own doc comment, `src/web/view.ts`); a caller never tracks
-   * one. Call with `confirm: false` first to see the dry-run scope (it
-   * comes back as the rejection's own message text, same as every other
-   * unconfirmed write on this path — `describeWriteError` below renders it
-   * verbatim), then again with `confirm: true` to actually create it.
+   * FACTORY-927 (review round 1, items 2/3) — `POST /api/rules`: create a
+   * new rule. No `ifMatch`/`planHash` to pass (unlike `setEnabled`/
+   * `updateFields`) — there is no prior read of a not-yet-existing rule to
+   * be stale against, and the server computes its own fresh plan hash
+   * internally on every call (see that route's own doc comment, `src/web/
+   * view.ts`, and `RuleCreatePlanResult`'s own comment above for the
+   * accepted binding gap this implies); a caller never tracks one. Returns
+   * a `RuleCreateOutcome`, never throwing for an ordinary refusal — call
+   * with `confirm: false` first to get back `{kind: "needs-confirm"}`
+   * carrying the real dry-run `scope`, then again with `confirm: true` to
+   * actually create it. A `{kind: "refused"}` result (an id collision, an
+   * unmeasurable scope, a rate limit, a race at the real write, ...) is a
+   * genuine failure, never one the caller should retry with `confirm: true`
+   * — see `RuleCreateOutcome`'s own doc comment for how a caller tells the
+   * two apart.
    */
-  createRule(draft: RuleCreateDraft, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
+  createRule(draft: RuleCreateDraft, confirm: boolean, signal?: AbortSignal): Promise<RuleCreateOutcome>;
   /** `POST /api/undo/:backupId` — only ever the backup id a write JUST returned; the server scopes this further (this SAME process's most recent UI write only). */
   undo(backupId: string, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
@@ -594,7 +658,38 @@ export const realRulesApi: RulesApi = {
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}/enabled`, { method: "POST", body: { enabled, ifMatch, planHash, confirm }, csrf: true, signal }),
   updateFields: (ruleId, patch, ifMatch, planHash, confirm, signal) =>
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "PUT", body: { ...patch, ifMatch, planHash, confirm }, csrf: true, signal }),
-  createRule: (draft, confirm, signal) => request<RuleWriteResult>("/api/rules", { method: "POST", body: { ...draft, confirm }, csrf: true, signal }),
+  // FACTORY-927 (review round 1, items 2/3): deliberately NOT built on the
+  // shared `request()` helper above — that helper throws a plain `Error`
+  // on any non-2xx, discarding every OTHER field the body carried
+  // (`confirmReason`, the dry-run `scope` on a 200 "needs confirm"
+  // response). This method instead reads the response status/body itself
+  // and maps it onto `RuleCreateOutcome` directly, so `confirmReason` and
+  // `scope` survive as real fields the dialog reads, never text it has to
+  // parse a number back out of.
+  createRule: async (draft, confirm, signal) => {
+    const headers: Record<string, string> = { "content-type": "application/json", [CSRF_HEADER]: await fetchCsrfToken(signal) };
+    const res = await fetch("/api/rules", { method: "POST", headers, body: JSON.stringify({ ...draft, confirm }), ...(signal ? { signal } : {}) });
+    const parsedBody: unknown = await res.json().catch(() => undefined);
+    const body = (parsedBody ?? {}) as Record<string, unknown>;
+    if (res.ok) {
+      // Two shapes share a 200: a `RuleCreatePlanResult` (the "needs
+      // confirm" dry run — has `requiresConfirm`) or a `RuleWriteResult`
+      // (the real create succeeded — has no such field). Never both.
+      if (typeof body.requiresConfirm === "boolean") {
+        return { kind: "needs-confirm", plan: body as unknown as RuleCreatePlanResult };
+      }
+      return { kind: "created", result: body as unknown as RuleWriteResult };
+    }
+    const error = typeof body.error === "string" ? body.error : `/api/rules: HTTP ${res.status}`;
+    const confirmReason = body.confirmReason === "unmeasurable-scope" ? "unmeasurable-scope" as const : undefined;
+    if (res.status === 429) {
+      const header = res.headers.get("retry-after");
+      const parsed = header !== null ? Number.parseInt(header, 10) : NaN;
+      const retryAfterSeconds = Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+      return { kind: "refused", error, ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}) };
+    }
+    return { kind: "refused", error, ...(confirmReason ? { confirmReason } : {}) };
+  },
   // `body: {}` is REQUIRED here, not cosmetic: the real merged guard
   // (`src/web/view.ts`'s `onRequest` hook, `./write-guard.ts`'s
   // `checkWriteGuard`) demands `content-type: application/json` on EVERY
@@ -1040,23 +1135,42 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       this.capabilities.write = opts.sessionOk ?? true;
       return this.capabilities;
     },
-    // FACTORY-927 — mirrors the real server's own unconditional confirm gate
-    // (`createRule`, `src/rules/rules-write.ts`): refuses an id collision
-    // (regardless of `confirm`) and refuses with no `confirm: true` at all,
-    // naming the dry-run scope in the message — the SAME two refusals a
-    // component test against the real route would see, just without a real
-    // previewer behind it (`opts.previews`/the id's own entry stand in for
-    // the dry-run scope count, defaulting to 0).
+    // FACTORY-927 (review round 1, items 2/3) — mirrors the real server's
+    // own three-outcome `POST /api/rules` (`src/web/view.ts`): a collision
+    // is `{kind: "refused"}` regardless of `confirm`; `confirm !== true`
+    // (with no collision) is `{kind: "needs-confirm"}`, carrying the
+    // dry-run scope as a real field (`opts.previews`/the id's own entry
+    // stand in for a real previewer, defaulting to 0) — never a string a
+    // caller has to parse; `confirm === true` (and no collision) is the
+    // real create, `{kind: "created"}`. Never throws for any of these
+    // three — matches `realRulesApi.createRule`'s own "never throw for an
+    // ordinary refusal" contract, so a component test against this
+    // fixture exercises the exact same `CreateRuleDialog` branches a test
+    // against the real route would.
     async createRule(draft, confirm) {
       await delay();
       maybeFail();
-      maybeFailWriteOnce();
+      // `maybeFailWriteOnce` throws (same shared helper every other write
+      // method here uses) — converted to a `{kind: "refused"}` result
+      // instead of letting it propagate, to match the REAL route's own
+      // never-throw-for-an-ordinary-refusal contract (`realRulesApi.createRule`'s
+      // own doc comment) — a 429 from the real server comes back exactly
+      // this way, non-thrown, with `retryAfterSeconds` as a plain field.
+      try {
+        maybeFailWriteOnce();
+      } catch (e) {
+        if (e instanceof RateLimitError) return { kind: "refused", error: e.message, ...(e.retryAfterSeconds !== undefined ? { retryAfterSeconds: e.retryAfterSeconds } : {}) };
+        return { kind: "refused", error: e instanceof Error ? e.message : String(e) };
+      }
       if (state.rules.some((r) => r.id === draft.id)) {
-        throw new Error(`a rule with id ${JSON.stringify(draft.id)} already exists`);
+        return { kind: "refused", error: `a rule with id ${JSON.stringify(draft.id)} already exists` };
       }
       const scopeCount = opts.previews?.[draft.id]?.total ?? 0;
       if (!confirm) {
-        throw new Error(`create rule ${JSON.stringify(draft.id)} (query: ${JSON.stringify(draft.query)}, scope: ${scopeCount} ticket(s))? resend with confirm: true to proceed`);
+        return {
+          kind: "needs-confirm",
+          plan: { planHash: `create:${draft.id}:${scopeCount}`, spawned: 0, stopped: 0, restarted: 0, scope: scopeCount, etag: state.sourceEtag, requiresConfirm: true, confirmReason: "rule-create" },
+        };
       }
       const created: RuleDto = {
         id: draft.id,
@@ -1077,7 +1191,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         staffed: false,
         reason: "disabled",
       };
-      return commitWrite([...state.rules, created], [draft.id]);
+      return { kind: "created", result: commitWrite([...state.rules, created], [draft.id]) };
     },
   };
 }

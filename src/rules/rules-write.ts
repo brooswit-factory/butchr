@@ -935,6 +935,24 @@ function buildNewRuleRecord(input: RuleCreateInput): Record<string, unknown> {
  * `scopeHashValue` treatment of an unmeasurable/non-finite scope), but with
  * no spawn/stop/restart counts to bind (a created rule is always disabled,
  * so those are always zero by construction — see `buildNewRuleRecord`).
+ *
+ * REVIEW (non-blocking, round 1): unlike `writeRuleEnabled`/`writeRuleFields`,
+ * neither `POST /api/rules` (`src/web/view.ts`) nor `createRule` below ever
+ * reads a CLIENT-supplied `planHash` for this binding — `planRuleCreate` is
+ * called fresh on every request and its own freshly-computed hash is handed
+ * straight to `createRule` in the same call, so a client's own `planHash`
+ * field (if it sends one at all) is accepted but ignored. This means the
+ * hash is not actually binding the operator's CONFIRM to the exact scope
+ * they looked at a moment earlier the way it does for enable/edit (there,
+ * confirming a STALE plan could silently approve a different blast radius
+ * than the one shown). That gap is acceptable here specifically BECAUSE a
+ * created rule is always disabled (`buildNewRuleRecord`'s own `enabled:
+ * false`, unconditionally) — there is no live blast radius a confirm could
+ * ever misbind TO: the scope shown is informational (how many tickets this
+ * query would match once enabled), never a count of agents this call is
+ * about to spawn. If a future change ever let create spawn anything
+ * directly, this hash would need the same client-echoed-planHash binding
+ * `writeRuleEnabled`/`writeRuleFields` already have.
  */
 function buildCreatePlanHash(nextText: string, scope: number | null): string {
   return sha256(JSON.stringify({ nextText, create: true, scope: scopeHashValue(scope) }));
@@ -1043,7 +1061,7 @@ export async function createRule(input: RuleCreateInput, confirm: boolean, planH
   }
   const rawScope = await scopeOf(input.id, input.query);
   if (!Number.isFinite(rawScope)) {
-    return { ok: false, status: 503, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again` };
+    return { ok: false, status: 503, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again`, confirmReason: "unmeasurable-scope" };
   }
 
   try {

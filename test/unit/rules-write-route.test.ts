@@ -837,6 +837,43 @@ describe("POST /api/rules — create a rule", () => {
     } finally { await app.stop(true); }
   });
 
+  test("missing Origin: 403, neither plan nor create called, nothing audited", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let planCalled = false, createCalled = false;
+    const audited: unknown[] = [];
+    const { app, host } = startApp(buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => { createCalled = true; return CREATED; }, audited));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules`, {
+        method: "POST", headers: { host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(403);
+      expect(planCalled).toBe(false);
+      expect(createCalled).toBe(false);
+      expect(audited.length).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  test("peer-uid check fails (other-uid peer): 403, neither plan nor create called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let planCalled = false, createCalled = false;
+    const audited: unknown[] = [];
+    const deps = buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => { createCalled = true; return CREATED; }, audited);
+    deps.peerUidCheck = () => false;
+    deps.writeGuard = writeGuardDeps(csrf, false);
+    const { app, origin, host } = startApp(deps);
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(403);
+      expect(planCalled).toBe(false);
+      expect(createCalled).toBe(false);
+      expect(audited.length).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
   test("missing CSRF header: 403, neither plan nor create called", async () => {
     const csrf = createCsrfTokenIssuer();
     let createCalled = false;
@@ -851,10 +888,13 @@ describe("POST /api/rules — create a rule", () => {
     } finally { await app.stop(true); }
   });
 
-  test("invalid body (bad id shape): 400, neither plan nor create called", async () => {
+  // Review round 1, item 4 (AC7 gap): a validation failure is still a
+  // refused create attempt — audited, same as every other refusal below.
+  test("invalid body (bad id shape): 400, neither plan nor create called, audited as rejected", async () => {
     const csrf = createCsrfTokenIssuer();
     let planCalled = false;
-    const { app, origin, host } = startApp(buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => CREATED, []));
+    const audited: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => CREATED, audited));
     try {
       const res = await fetch(`${origin}/api/rules`, {
         method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
@@ -862,10 +902,31 @@ describe("POST /api/rules — create a rule", () => {
       });
       expect(res.status).toBe(400);
       expect(planCalled).toBe(false);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string; ids: string[] }).outcome).toBe("rejected");
+      expect((audited[0] as { outcome: string; ids: string[] }).ids).toEqual(["Not A Valid Slug"]);
     } finally { await app.stop(true); }
   });
 
-  test("all guards pass, plan requires no further confirm: calls create with the plan's own fresh planHash, audits the accepted outcome", async () => {
+  // Review round 1, item 4: a malformed (oversized) body is audited too,
+  // with no id available yet — the same discipline, one step earlier.
+  test("oversized body: 413, neither plan nor create called, audited as rejected with no id", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ACCEPTED_PLAN, async () => CREATED, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ...VALID_BODY, padding: "x".repeat(BODY_CAP_BYTES + 1024) }),
+      });
+      expect(res.status).toBe(413);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string; ids: string[] }).outcome).toBe("rejected");
+      expect((audited[0] as { outcome: string; ids: string[] }).ids).toEqual([]);
+    } finally { await app.stop(true); }
+  });
+
+  test("all guards pass, plan requires no further confirm (measurable scope, confirm already true): calls create with the plan's own fresh planHash, audits the accepted outcome", async () => {
     const csrf = createCsrfTokenIssuer();
     const audited: unknown[] = [];
     let createArgs: unknown[] = [];
@@ -903,15 +964,64 @@ describe("POST /api/rules — create a rule", () => {
     } finally { await app.stop(true); }
   });
 
-  test("the plan succeeds but create itself refuses (e.g. confirm omitted, caught server-side): the rejection is audited, status/error pass through verbatim", async () => {
+  // Review round 1, items 2/3 (fixes the audit-noise bug): the ORDINARY
+  // first step of the two-step flow — plan succeeds, scope was measured,
+  // but `confirm` was never sent — must NEVER call `create` and must NEVER
+  // be audited. The route returns the plan ITSELF, 200, structurally
+  // (`requiresConfirm`/`scope`/`confirmReason`/`planHash` as real fields,
+  // never a string for the client to parse a number back out of).
+  test("plan succeeds, requiresConfirm true, confirmReason 'rule-create' (no confirm sent yet): returns the plan verbatim, 200, create never called, NOT audited", async () => {
     const csrf = createCsrfTokenIssuer();
     const audited: unknown[] = [];
-    const refusal: RulesWriteOutcome = { ok: false, status: 409, error: `create rule "new-rule" (query: "project = XYZ", scope: 5 ticket(s))? resend with confirm: true to proceed` };
-    const { app, origin, host } = startApp(buildDeps(csrf, async () => ({ ...ACCEPTED_PLAN, requiresConfirm: true, confirmReason: "rule-create" as const }), async () => refusal, audited));
+    let createCalled = false;
+    const needsConfirm: RulesPlanOutcome = { ...ACCEPTED_PLAN, requiresConfirm: true, confirmReason: "rule-create" };
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => needsConfirm, async () => { createCalled = true; return CREATED; }, audited));
     try {
       const res = await fetch(`${origin}/api/rules`, {
         method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
         body: JSON.stringify({ ...VALID_BODY, confirm: false }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(needsConfirm);
+      expect(createCalled).toBe(false);
+      expect(audited.length).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  // Review round 1, item 2: an UNMEASURABLE scope is a genuine refusal
+  // (503), never the "just needs confirm" 200 above — confirmReason
+  // distinguishes the two so the client never shows a confirm button for
+  // this one. Audited (this IS a real refused attempt, unlike the case
+  // above, which is pure exploration).
+  test("plan succeeds but scope is unmeasurable: 503 with confirmReason 'unmeasurable-scope', create never called, audited as rejected", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    let createCalled = false;
+    const unmeasurable: RulesPlanOutcome = { ...ACCEPTED_PLAN, scope: null, scopeUnmeasurable: true, requiresConfirm: true, confirmReason: "unmeasurable-scope" };
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => unmeasurable, async () => { createCalled = true; return CREATED; }, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(503);
+      const resBody = await res.json();
+      expect(resBody.confirmReason).toBe("unmeasurable-scope");
+      expect(createCalled).toBe(false);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("rejected");
+    } finally { await app.stop(true); }
+  });
+
+  test("plan succeeds, confirm already true, but create itself refuses (e.g. a race with another writer): the rejection is audited, status/error/confirmReason pass through verbatim", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    const refusal: RulesWriteOutcome = { ok: false, status: 409, error: `planHash does not match a fresh plan for this create (the file may have changed, or the plan is stale) — retry the create` };
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ACCEPTED_PLAN, async () => refusal, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
       });
       expect(res.status).toBe(409);
       expect(await res.json()).toEqual({ error: refusal.error });
