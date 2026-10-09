@@ -38,7 +38,9 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { resourceMatches, type ExecutionUnit } from "../rules/execution.js";
+import { createIdlePokeEngine, type IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
 import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../rules/capacity-role-migration.js";
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
@@ -1625,6 +1627,79 @@ const stallRemediation = createStallRemediator({
   labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
+
+// FACTORY-845: this poll's resolved idle-poke config per issue, built from
+// the rule engine's own (rule, issue) matches just before `syncLabels` runs
+// (see the `syncLabels: (matches) => ...` wiring further down this file) —
+// `syncLabels` itself only ever sees de-duplicated issues, never the match
+// list that produced them (src/rules/resource-type.ts's `uniqueIssues`
+// deliberately discards rule identity), so this is the one place that
+// association is still available. A ticket matched by more than one
+// enabled rule resolves by the most conservative reading per field,
+// independently: ANY matching rule's explicit `idlePokeEnabled: false`
+// disables the poke outright (an opt-out from one rule should never be
+// overridden by another rule's silence); among rules that leave it
+// enabled, the SMALLEST explicit `idlePokeMinutes` wins (the more urgent
+// configured interval, never the global, never an unset rule's silence);
+// the first matching rule's explicit `idlePokeMessage` wins (arbitrary but
+// deterministic — multi-rule-match on one ticket is an edge case this
+// story's acceptance criteria do not exercise, so this is a simple,
+// documented default rather than a modelled trade-off).
+const idlePokeRuleConfigByIssue = new Map<string, IdlePokeRuleConfig>();
+function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): void {
+  idlePokeRuleConfigByIssue.clear();
+  for (const m of resourceMatches(units)) {
+    if (!m.rule.enabled) continue;
+    const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
+    if (m.rule.idlePokeEnabled === false) {
+      idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
+      continue;
+    }
+    if (existing?.idlePokeEnabled === false) continue; // an earlier rule's explicit opt-out already wins
+    const idlePokeMinutes = m.rule.idlePokeMinutes !== undefined && (existing?.idlePokeMinutes === undefined || m.rule.idlePokeMinutes < existing.idlePokeMinutes) ? m.rule.idlePokeMinutes : existing?.idlePokeMinutes;
+    const idlePokeMessage = existing?.idlePokeMessage ?? m.rule.idlePokeMessage;
+    idlePokeRuleConfigByIssue.set(m.issue.key, {
+      idlePokeEnabled: true,
+      ...(idlePokeMinutes !== undefined ? { idlePokeMinutes } : {}),
+      ...(idlePokeMessage !== undefined ? { idlePokeMessage } : {}),
+    });
+  }
+}
+
+// FACTORY-845: the channel half, copying the SAME call shape every other
+// delivery seam in this file already uses (`deliverNotice`/
+// `renderNotifyDelivery`, the MCP notify call, `herd.nudge`) — an
+// EIGHTH seam in this file, which is why
+// test/unit/notify-deliver-seams.test.ts's exact-count assertions are
+// updated in this same commit (7 -> 8) — see that test file's own doc
+// comment and this story's PR body for why that is the INTENDED outcome of
+// adding a seam, not a sign anything is wrong.
+const deliverIdlePoke = async (issue: string, text: string): Promise<{ via: "channel" | "prompt" }> => {
+  const result = await deliverNotice({
+    pushChannel: () => notifyAgent(mcp, issue, issue, text),
+    nudgePrompt: () => herd.nudge(issue, text),
+  });
+  console.error(`  [notify] ${issue} ← idle-poke: ${renderNotifyDelivery(result)}`);
+  return { via: result.via };
+};
+
+// FACTORY-845: the per-rule-configurable idle poke — see src/agents/
+// idle-poke.ts's own top comment for why this is a separate, thin module
+// built on `stalled`'s own streak rather than an extension of
+// `stallRemediation` above. `undefined` when BUTCHR_IDLE_POKE_MODE=off,
+// the same disables-entirely-when-omitted shape `silentStop` above uses.
+const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngine({
+  now: () => Date.now(),
+  dryRun: config.idlePokeMode !== "live",
+  globalMinutes: config.stalledMinutes,
+  defaultMessage: DEFAULT_IDLE_POKE_MESSAGE,
+  suppressMinutes: config.idlePokeSuppressMinutes,
+  maxPokesPerPoll: config.idlePokeMaxPerPoll,
+  comments: (issue) => atlassian.comments(issue),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  deliver: deliverIdlePoke,
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
 // see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
 // every other daemon-side comment write; no second Atlassian writer.
@@ -1958,6 +2033,7 @@ const syncLabels = createLabelSync({
   stalled,
   stallRemediation,
   ...(silentStop ? { silentStop } : {}),
+  ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
@@ -2153,7 +2229,15 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
-  syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
+  syncLabels: (matches) => {
+    // FACTORY-845: refresh this poll's per-issue idle-poke rule config
+    // BEFORE calling syncLabels, from the SAME matches it is about to
+    // discard rule identity from — see `updateIdlePokeRuleConfig`'s own
+    // doc comment above for why this is the only place that association
+    // is still available.
+    if (idlePoke) updateIdlePokeRuleConfig(matches);
+    return syncLabels(uniqueIssues(matches));
+  },
   checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
