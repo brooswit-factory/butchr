@@ -1371,10 +1371,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       let issue: string;
       try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/start", action: "start", ids: [issue], origin: request.headers.get("origin") });
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/start", action: "start (as boss)", ids: [issue], origin: request.headers.get("origin") });
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = await deps.agentsWrite.start(issue);
-      auditOutcome(deps, { route: "POST /api/agents/:issue/start", action: "start", ids: [issue], origin: request.headers.get("origin") }, outcome);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/start", action: "start (as boss)", ids: [issue], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
@@ -1439,31 +1439,31 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       let issue: string;
       try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/shelve", action: "shelve", ids: [issue], origin: request.headers.get("origin") });
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") });
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
       if (bad) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
         set.status = bad.status;
         return { error: bad.error };
       }
       const parsed = validateShelveRequestBody(body);
       if (!parsed.ok) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
         set.status = 400;
         return { error: parsed.error };
       }
       if (!parsed.confirm) {
         const plan = await deps.agentsWrite.planShelve(issue, parsed.reason);
         if (!plan.ok) {
-          auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: plan.error });
+          auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: plan.error });
           set.status = plan.status;
           return { error: plan.error };
         }
         return plan; // outcome 2 — deliberately verbatim, never audited.
       }
       const outcome = await deps.agentsWrite.shelve(issue, parsed.reason);
-      auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve", ids: [issue], origin: request.headers.get("origin") }, outcome);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
@@ -1509,22 +1509,22 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       let issue: string;
       try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/prioritize", action: "prioritize", ids: [issue], origin: request.headers.get("origin") });
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") });
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
       if (bad) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
         set.status = bad.status;
         return { error: bad.error };
       }
       const parsed = validatePrioritizeRequestBody(body);
       if (!parsed.ok) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
         set.status = 400;
         return { error: parsed.error };
       }
       const outcome = await deps.agentsWrite.prioritize(issue, parsed.priority);
-      auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: `prioritize=${parsed.priority}`, ids: [issue], origin: request.headers.get("origin") }, outcome);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: `prioritize (as boss)=${parsed.priority}`, ids: [issue], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
