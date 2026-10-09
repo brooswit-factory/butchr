@@ -878,6 +878,13 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
         search: async () => [mode === "quiet" ? base_issue : { ...base_issue, updated: new Date(2026, 0, 1, 0, 0, 0, ++tick).toISOString() }],
         herd,
         notify: async () => { if (!allowNotify) throw new Error("notify blocked for test"); },
+        // FACTORY-922: decide()'s §3D fallback now ACTIVELY checks comments
+        // rather than guessing on a pure `updated` bump — a `comments` dep
+        // whose newest id moves every tick (mirroring `tick` itself) is
+        // what keeps each "changing"-mode diff CONFIRMED, so `notify` is
+        // still actually invoked (and can still actually be made to fail)
+        // every tick, exactly as this test's own comment above requires.
+        comments: async () => [{ id: String(tick), body: "x", created: "c", authorEmail: null }],
         intervalMs: 10,
         onPollSuccess: () => pollHealth.recordSuccess(),
         onNotifySuccess: () => notifyHealth.recordSuccess(),
