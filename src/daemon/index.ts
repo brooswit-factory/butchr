@@ -2143,6 +2143,9 @@ const ruleResourceType = createRuleResourceType({
   // FACTORY-922: the `/health` counter's one writer — see
   // `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
   onCommentCheckSkipped: () => { commentChecksSkipped++; },
+  // FACTORY-949: the boss-wake debounce window — see
+  // `Config.blockedWakeDebounceMinutes`'s own doc comment.
+  blockedWakeDebounceMinutes: config.blockedWakeDebounceMinutes,
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see

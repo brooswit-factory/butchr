@@ -24,11 +24,13 @@
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { AtlassianHttpError } from "../atlassian/client.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition, excludeBookkeepingComments } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, blockedTransition, prTransition, excludeBookkeepingComments } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
 import { skippedCommentCheckLine, type SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
+import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
@@ -230,6 +232,15 @@ export interface IssueResourceDeps {
    * is not incremented anywhere.
    */
   onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
+  /**
+   * FACTORY-949 (story FACTORY-948): the boss-wake debounce window, in
+   * minutes — `Config.blockedWakeDebounceMinutes`, threaded straight
+   * through. Optional; omitted, `DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES`
+   * (src/config/config.ts) is used, same value `loadConfig`'s own default
+   * already resolves to, so an existing caller/test with no config wiring
+   * at all keeps the same effective behaviour.
+   */
+  blockedWakeDebounceMinutes?: number;
 }
 
 /**
@@ -339,7 +350,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped" | "blockedWakeDebounceMinutes">): EventRules<JiraIssue> {
   // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
   // only this — never a direct `process.stdout`/`process.stderr` write. The
   // default is a fresh closure that looks up `console.error` at CALL time
@@ -380,6 +391,18 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
   // (the existing KAN-838 "fold" precedent already accepts this for other
   // arms' own cursor advances — see ledgerHitSuppressed's own doc comment).
   const pendingRecheck = new Set<string>();
+
+  // FACTORY-949 (implementing story FACTORY-948): the last wall-clock ms a
+  // boss wake actually FIRED for a ticket key — persists ACROSS polls, same
+  // in-memory-only tradeoff `commentCursor`/`pendingRecheck` above already
+  // make (lost on daemon restart; see Config.blockedWakeDebounceMinutes's
+  // own doc comment). Keyed by the blocked ticket's OWN key, never by
+  // (key, watcher): the debounce is per EPISODE of that ticket going
+  // blocked, not per boss watching it — a ticket with two bosses (not
+  // expected, but not excluded either) must still fire at most once per
+  // episode, not once per boss.
+  const blockedWakeFired = new Map<string, number>();
+  const blockedWakeDebounceMs = (deps.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedResource<JiraIssue>[], key: string) => list.find((r) => r.issue.key === key)?.issue;
@@ -430,8 +453,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // saying "not now"), never a guess; everything else (a network error,
       // any other HTTP status, or `deps.comments` simply not wired up) is
       // `failed`.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
+      // FACTORY-949: `comments` (the FULL filtered — see excludeBookkeepingComments
+      // — comment list, not just ids) is additive to this cache's pre-existing
+      // shape, read ONLY by `blockedWake` below (every pre-existing consumer
+      // here still only ever destructures `ok`/`newest`/`ids`, unaffected) —
+      // so `blockedWake`'s own marker-dedup check shares this ONE
+      // deps.comments(key) call per key per poll rather than issuing a
+      // second one, same discipline this cache's own top comment states.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[]; comments: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[]; comments: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
         let p = commentsCache.get(key);
         if (!p) {
           p = (async () => {
@@ -444,7 +474,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
               // `pendingRecheck`'s own doc comment above for why that's
               // correct, not merely convenient).
               pendingRecheck.delete(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
+              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id), comments };
             } catch (err) {
               const reason: SkippedCommentCheckReason = err instanceof AtlassianHttpError && (err.status === 429 || err.status >= 500) ? "load" : "failed";
               return { ok: false as const, reason };
@@ -453,6 +483,54 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           commentsCache.set(key, p);
         }
         return p;
+      };
+
+      // FACTORY-949 (implementing story FACTORY-948, items 4-5): whether a
+      // boss wake should actually FIRE for `key`'s blocked transition this
+      // poll — debounced per ticket (item 4) and deduped against
+      // escalate.ts's own `[butchr:blocked]` marker (item 5). Returns
+      // `false` for "do not fire" in BOTH cases, same as every suppression
+      // arm above — the caller (`decide()` below) simply falls through to
+      // the ordinary `suppressed()` stack when this returns `false`, which
+      // (being a daemon-label-only diff) suppresses it the same routine way
+      // as any other agent:* flip.
+      const blockedWake = async (key: string): Promise<boolean> => {
+        const now = Date.now();
+        const last = blockedWakeFired.get(key);
+        if (last !== undefined && now - last < blockedWakeDebounceMs) return false; // item 4: debounced
+        // item 5 ("same episode"): operationalized, per this ticket's own
+        // instruction to decide and document it, as "a `[butchr:blocked]`
+        // marker comment landed on this ticket within the window that would
+        // otherwise debounce a bare label re-flip" — i.e. the marker's own
+        // `created` timestamp falls no earlier than `now - debounceMs`. The
+        // marker is NEVER filtered out by `excludeBookkeepingComments`
+        // (WAKE_MARKERS, this file's own import from diff.ts), so the SAME
+        // `fetchComments(key)` call every other arm already shares this
+        // poll already carries it when present — no extra Jira call.
+        const result = await fetchComments(key);
+        if (result.ok) {
+          const windowStart = now - blockedWakeDebounceMs;
+          const markerAlreadyPosted = result.comments.some(
+            (c) => c.body.startsWith(BLOCKED_ESCALATION_MARKER) && Date.parse(c.created) >= windowStart,
+          );
+          if (markerAlreadyPosted) {
+            // The marker already covers this episode — record it as fired
+            // so a LATER bare label flip inside the same window still
+            // debounces against it, without this function having delivered
+            // a second, redundant wake of its own.
+            blockedWakeFired.set(key, now);
+            return false;
+          }
+        }
+        // `!result.ok` (comments unreadable, or `deps.comments` not wired):
+        // fail OPEN toward firing, not toward silence — the opposite
+        // direction every OTHER comments() consumer above fails, because
+        // THEIR default (not suppressing) already delivers via the general
+        // classifier below; this ticket's own item 1 makes THIS event's
+        // default "deliver", so an unreadable dedup check must not be the
+        // thing that silently loses it.
+        blockedWakeFired.set(key, now);
+        return true;
       };
 
       // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
@@ -893,6 +971,31 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           if (space === "primary" && watcher === key) {
             const transition = before && after ? prTransition(before, after) : null;
             if (transition) return finalize(key, watcher, { deliver: true, reason: { pr: transition } });
+          }
+          // FACTORY-949 (implementing story FACTORY-948, item 1): a
+          // ticket's agent:* label flipping to `blocked` wakes its BOSS —
+          // deliberately the MIRROR of the pr:* exception just above, never
+          // its twin: that one only ever fires on `space === "primary"`
+          // (the ticket's own agent hearing about itself); this one only
+          // ever fires on `space === "related"`. `createRelated`'s own
+          // related/watchers are built EXCLUSIVELY from `watchedKeys`
+          // (src/jira-watch/routes.ts), which only ever names a ticket's
+          // ACTUAL boss (the one with the outward Implements link to it,
+          // routes.ts's own doc comment) — never a sibling, and never the
+          // ticket's own watcher (that would require `space === "primary"`,
+          // excluded here) — so item 1's "must NOT wake the blocked
+          // ticket's own watcher, nor any sibling's watcher" holds simply
+          // by this being the related space at all; no extra check needed.
+          // Checked BEFORE `suppressed()`, same template as the pr:*
+          // exception above and for the identical reason: a pure agent:*
+          // flip is `isDaemonLabelOnlyDiff`, which `crossDaemonSuppressed`
+          // would otherwise swallow as a routine cross-daemon echo.
+          // `blockedWake(key)` itself applies the debounce (item 4) and the
+          // escalate.ts marker dedup (item 5) — a `false` here falls
+          // straight through to the ordinary `suppressed()` stack below,
+          // same as any other agent:* flip this ticket does not single out.
+          if (space === "related" && before && after && blockedTransition(before, after) && (await blockedWake(key))) {
+            return finalize(key, watcher, { deliver: true, reason: { blocked: { key } } });
           }
           // Appear/disappear (no `before` or no `after` to diff at all) is
           // still a real change and is still always delivered, unchecked —

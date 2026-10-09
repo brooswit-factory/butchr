@@ -94,6 +94,8 @@ export interface RuleResourceDeps {
    * above; omitted, no managed link is ever reconciled into a watcher.
    */
   linkStore?: LinkedEventingDeps["linkStore"];
+  /** FACTORY-949: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
+  blockedWakeDebounceMinutes?: IssueResourceDeps["blockedWakeDebounceMinutes"];
 }
 
 /**
@@ -421,6 +423,7 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         ...(deps.comments ? { comments: deps.comments } : {}),
         ...(deps.log ? { log: deps.log } : {}),
         ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+        ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
       });
       inner.set(rule.id, rules);
     }
@@ -431,6 +434,7 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.log ? { log: deps.log } : {}),
     ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+    ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
   });
   const asIssues = (related: readonly RelatedResource<ExecutionUnit<RuleMatch>>[]) =>
     related.filter((r) => r.issue.kind === "resource").map((r) => ({ issue: (r.issue as { kind: "resource"; match: RuleMatch }).match.issue, watchers: r.watchers }));

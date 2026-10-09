@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   activeKeys, changedKeys, daemonLabelsChanged, daemonLabelTransition, isDaemonLabelOnlyDiff, prTransition,
-  isBookkeepingComment, excludeBookkeepingComments, WAKE_MARKERS,
+  isBookkeepingComment, excludeBookkeepingComments, WAKE_MARKERS, blockedTransition,
 } from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
@@ -148,6 +148,41 @@ describe("daemonLabelTransition (BUTCHR-87)", () => {
     const before = iss("A", "In Progress", "s", "t1", ["agent:working", "pr:open"]);
     const after = iss("A", "In Progress", "s", "t2", ["agent:working", "pr:open"]);
     expect(daemonLabelTransition(before, after)).toBeNull();
+  });
+});
+
+describe("blockedTransition (FACTORY-949)", () => {
+  for (const from of ["agent:none", "agent:working", "agent:idle", "agent:stalled"]) {
+    test(`${from} -> agent:blocked is a transition`, () => {
+      const before = iss("A", "In Progress", "s", "t1", from === "agent:none" ? [] : [from]);
+      const after = iss("A", "In Progress", "s", "t2", ["agent:blocked"]);
+      expect(blockedTransition(before, after)).toBe(true);
+    });
+  }
+
+  test("agent:blocked -> anything is NOT a transition (the from side, not the to side)", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:blocked"]);
+    for (const to of ["agent:none", "agent:working", "agent:idle", "agent:stalled"]) {
+      const after = iss("A", "In Progress", "s", "t2", to === "agent:none" ? [] : [to]);
+      expect(blockedTransition(before, after)).toBe(false);
+    }
+  });
+
+  test("already agent:blocked on both sides is NOT a transition — no edge, just still blocked", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:blocked"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:blocked"]);
+    expect(blockedTransition(before, after)).toBe(false);
+  });
+
+  test("working <-> idle, idle <-> stalled: never a transition", () => {
+    expect(blockedTransition(iss("A", "In Progress", "s", "t1", ["agent:working"]), iss("A", "In Progress", "s", "t2", ["agent:idle"]))).toBe(false);
+    expect(blockedTransition(iss("A", "In Progress", "s", "t1", ["agent:idle"]), iss("A", "In Progress", "s", "t2", ["agent:stalled"]))).toBe(false);
+  });
+
+  test("a pr:* flip alongside an unchanged agent:* label is not a blocked transition", () => {
+    const before = iss("A", "In Progress", "s", "t1", ["agent:working", "pr:open"]);
+    const after = iss("A", "In Progress", "s", "t2", ["agent:working", "pr:approved"]);
+    expect(blockedTransition(before, after)).toBe(false);
   });
 });
 
