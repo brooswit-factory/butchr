@@ -1534,10 +1534,10 @@ export class HerdrHerd implements Herd {
     const dir = buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
     const decision = decideRespawnResume({
       dir,
-      resumeOnRespawn: spec.resumeOnRespawn,
-      resumeContextCutoff: spec.resumeContextCutoff,
-      ticketStatus: spec.ticketStatus,
-      ticketLabels: spec.ticketLabels,
+      ...(spec.resumeOnRespawn !== undefined ? { resumeOnRespawn: spec.resumeOnRespawn } : {}),
+      ...(spec.resumeContextCutoff !== undefined ? { resumeContextCutoff: spec.resumeContextCutoff } : {}),
+      ...(spec.ticketStatus !== undefined ? { ticketStatus: spec.ticketStatus } : {}),
+      ...(spec.ticketLabels !== undefined ? { ticketLabels: spec.ticketLabels } : {}),
     });
     if (!decision.resumeSessionId) {
       // Every non-resume outcome logs its one greppable reason — DoD item

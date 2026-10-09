@@ -134,6 +134,7 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
       providerOf: async () => null,
       resumeInPlace: async () => "unresumable",
       lastResumeFailureDetail: () => undefined,
+      lastFreshSpawnResumed: () => false,
     };
     const scoped = scopedHerd(full, () => true);
     const dropped = Object.keys(full).filter((k) => typeof (scoped as unknown as Record<string, unknown>)[k] !== "function");
