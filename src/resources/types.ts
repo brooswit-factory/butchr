@@ -196,7 +196,9 @@ export type NotifyReason =
   | { linked: { events: readonly LinkedChangeEvent[] } }
   | { definitionField: { brief?: string; workingDirectory?: string } }
   | { blocked: { key: string } }
-  | { stalled: { key: string } };
+  | { stalled: { key: string } }
+  | { confluencePageEdit: { from: number; to: number } }
+  | { confluencePageComment: { ids: readonly string[] } };
 
 /**
  * FACTORY-949 (implementing story FACTORY-948): `blocked` names the
@@ -225,6 +227,25 @@ export type NotifyReason =
  * as `blocked` above: `src/resources/issue.ts`'s `decide()` on the related
  * space (the boss), and `src/resources/project.ts`'s
  * `createProjectEventRules` on the primary space (the project manager).
+ */
+
+/**
+ * FACTORY-997 (story FACTORY-994, epic FACTORY-348): the ONLY two members
+ * `src/resources/confluence-page.ts`'s `createConfluencePageEventRules`
+ * ever produces — a standalone Confluence page (no owning Jira ticket) has
+ * nothing status/label/assignee-shaped to report, so it defines its own
+ * pair rather than reusing any issue-tier member above (per this union's
+ * own top doc comment: "a future type's event rules are free to ... define
+ * their own union"). `confluencePageEdit` fires when
+ * `confluencePageVersion`'s fingerprint (the page's own `version.number`)
+ * moved between two polls; `confluencePageComment` fires when the page's
+ * footer-comment id SET gained one or more members (never fewer — a
+ * shrinking set is a deletion, which this module does not classify as an
+ * event; see that module's own `diffConfluencePage` doc comment). The two
+ * are mutually exclusive within one `decide()` call — `diffConfluencePage`
+ * checks the version first and only falls through to comments when the
+ * version did not move, documented there as a deliberate simplification
+ * when both happen in the same poll.
  */
 
 /**

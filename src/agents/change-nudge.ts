@@ -62,7 +62,14 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // `changeNudge` (only Jira-issue-shaped resources call this function).
   // Folded into the same defensive fallback rather than given its own
   // clause here, for the same reason `pr`/`linked` are.
-  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
+  // FACTORY-997: `confluencePageEdit`/`confluencePageComment` are the same
+  // shape of "unreachable here in practice" as `linked`/`definitionField`
+  // above — a standalone Confluence page has no Jira-issue-shaped agent to
+  // call `changeNudge` for it (src/resources/confluence-page.ts's own
+  // event rules have no wiring into src/daemon/index.ts's issue-tier nudge
+  // path at all). Folded into the same defensive fallback for the same
+  // reason.
+  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason || "confluencePageEdit" in reason || "confluencePageComment" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
   if ("status" in reason) return `changed status from "${reason.status.from}" to "${reason.status.to}"`;
@@ -184,7 +191,16 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // holds: additive, not a meaning change to the existing shape.
   if ("comment" in reason) return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`;
   if ("blocked" in reason) return ` (blocked:${reason.blocked.key})`; // FACTORY-949
-  return ` (stalled:${reason.stalled.key})`; // "stalled" in reason — FACTORY-972
+  if ("stalled" in reason) return ` (stalled:${reason.stalled.key})`; // FACTORY-972
+  // FACTORY-997: same "unreachable via notifyRuleAgent in practice" shape
+  // as `definitionField` above — a standalone Confluence page's own event
+  // rules (src/resources/confluence-page.ts) are not wired into this tag's
+  // caller at all (no production `[notify]` line is ever produced for
+  // them yet; see that module's top comment on scope). Handled explicitly
+  // rather than folded into an untyped fallback, so a future wiring-in
+  // gets a tag "for free" rather than reopening this function.
+  if ("confluencePageEdit" in reason) return ` (confluencePageEdit:${reason.confluencePageEdit.from}→${reason.confluencePageEdit.to})`;
+  return ` (confluencePageComment:${reason.confluencePageComment.ids.length})`; // "confluencePageComment" in reason
 }
 
 /**
