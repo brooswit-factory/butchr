@@ -47,7 +47,7 @@ import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentCapacityRole } from "../agents/admission.js";
+import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
 import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
@@ -76,7 +76,7 @@ import { createStalledCheck } from "../agents/stalled.js";
 import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
+import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
@@ -429,6 +429,33 @@ const ruleLizardModeOf = (id: string): boolean =>
 // project agents, `jira-project` agents) and why issue type no longer plays
 // any part here.
 const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
+/**
+ * FACTORY-907 — same decode-then-look-up-by-rule shape as `ruleRoleOfAgent`
+ * immediately above, one field over: resolves a candidate id's own rule
+ * `maxNewPerTick`/`minSecondsBetweenAdmissions` (if either is set) for
+ * `AdmissionControllerDeps.rateLimitOf` (src/agents/admission.ts). `undefined`
+ * for anything unresolved (a legacy/bare-issue agent, a rule since removed,
+ * or a resolvable rule that sets neither field) — unlike `roleOfAgent`,
+ * there is no fail-safe-to-limited default to get wrong here: an id this
+ * cannot resolve simply keeps today's behaviour, same as a resolved rule
+ * that never sets either field (see `RuleRateLimit`'s own doc comment).
+ * BUTCHR-408's managed-session agents have no rule-engine `Rule` of their
+ * own (see `managedSessionRoles`'s own comment above) and so are never
+ * rate-limited by this — out of this ticket's scope, which wires exactly
+ * the rule-engine providers `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * validate for.
+ */
+const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
+  return {
+    ruleId: rule.id,
+    ...(rule.maxNewPerTick !== undefined ? { maxNewPerTick: rule.maxNewPerTick } : {}),
+    ...(rule.minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: rule.minSecondsBetweenAdmissions } : {}),
+  };
+};
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
@@ -702,6 +729,8 @@ const admissionController = createAdmissionController({
   // Rule for every heterogeneous definition file, so it cannot carry a
   // per-file role itself).
   roleOf: roleOfAgent,
+  // FACTORY-907: see `rateLimitOfAgent`'s own doc comment above.
+  rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
   sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
@@ -2076,6 +2105,22 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     const issue = resourceKeyOf(agent);
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-916: `herd.lastFreshSpawnResumed` told `reconcileNow` this
+  // respawn resumed its prior Claude session via an ordinary fresh spawn
+  // (never `resumeInPlace()` — that is `onResumePreserved` below), so it
+  // fires INSTEAD OF `onRespawn` above for this one respawn — see that
+  // callback's own doc comment (src/daemon/loop.ts) for why exactly one of
+  // the two always fires. Posts the third wording (`respawnResumedComment`),
+  // not `respawnComment` (wrongly says "this session is fresh") and not
+  // `resumePreservedComment` (wrongly says "your ticket has not changed" —
+  // this agent's PROCESS was actually gone, unlike `resumeInPlace()`'s).
+  onRespawnResumed: async (agent) => {
+    console.error(`  [reconcile] ${agent} respawned, resumed its prior session`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, respawnResumedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn-resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
   // FACTORY-314: a model/effort-only change resumed the SAME session —
   // distinct marker/wording from `onRespawn` above (never "re-read your

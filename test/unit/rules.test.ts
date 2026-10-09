@@ -367,6 +367,53 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
   });
 });
 
+describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-906 — admission rate limit)", () => {
+  test("both absent when omitted — no default, same as permissionMode/lizardMode", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.maxNewPerTick).toBeUndefined();
+    expect(r!.minSecondsBetweenAdmissions).toBeUndefined();
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
+  });
+
+  test("both fields accepted for every provider, independent of execution/account/role/each other", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 }] });
+      expect(r).toMatchObject({ resourceProvider, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 });
+    }
+  });
+
+  test("either field may be set without the other — independent", () => {
+    const [onlyTick] = parseRules({ rules: [{ ...minimal, maxNewPerTick: 1 }] });
+    expect(onlyTick!.maxNewPerTick).toBe(1);
+    expect(onlyTick!.minSecondsBetweenAdmissions).toBeUndefined();
+    const [onlySeconds] = parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 60 }] });
+    expect(onlySeconds!.minSecondsBetweenAdmissions).toBe(60);
+    expect(onlySeconds!.maxNewPerTick).toBeUndefined();
+  });
+
+  test("rejects a non-positive-integer maxNewPerTick, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 1.5 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: -1 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+  });
+
+  test("rejects a non-positive-integer minSecondsBetweenAdmissions, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].minSecondsBetweenAdmissions must be a positive integer");
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
+    ] as never);
+  });
+});
+
 describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
   test("both absent when omitted — no default the way execution/account/role get one", () => {
     const [r] = parseRules({ rules: [minimal] });
