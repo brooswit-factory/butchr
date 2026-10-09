@@ -59,7 +59,7 @@ describe("realAgentsApi — FACTORY-666: wire bodies match the server's own vali
     expect(wireBody).toEqual({ bossKey: "FACTORY-BOSS", disposition: "start" });
     const result = validateAdoptRequestBody(wireBody);
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.input).toEqual({ bossKey: "FACTORY-BOSS", disposition: "start", reason: undefined });
+    if (result.ok) expect(result.input).toEqual({ bossKey: "FACTORY-BOSS", disposition: "start" });
   });
 
   test("adopt's wire body (disposition: shelve, with reason) is accepted by validateAdoptRequestBody", async () => {

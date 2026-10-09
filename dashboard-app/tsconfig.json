@@ -81,6 +81,9 @@
     "../test/unit/dashboard-app-jira-connection-card.test.tsx",
     // FACTORY-927: the "create a rule" dialog's own DOM-rendering
     // component tests, same reason as the blocks above.
-    "../test/unit/dashboard-app-create-rule-dialog.test.tsx"
+    "../test/unit/dashboard-app-create-rule-dialog.test.tsx",
+    // FACTORY-666: the agent-control panel's own DOM-rendering component
+    // tests, same reason as the blocks above.
+    "../test/unit/dashboard-app-agent-control-panel.test.tsx"
   ]
 }

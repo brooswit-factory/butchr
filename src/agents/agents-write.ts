@@ -201,7 +201,9 @@ export function validateAdoptRequestBody(body: unknown): { ok: true; input: Adop
   if (typeof b.bossKey !== "string" || b.bossKey.length === 0) return { ok: false, error };
   if (b.disposition !== "start" && b.disposition !== "shelve") return { ok: false, error };
   if ("reason" in b && b.reason !== undefined && typeof b.reason !== "string") return { ok: false, error };
-  return { ok: true, input: { bossKey: b.bossKey, disposition: b.disposition, reason: typeof b.reason === "string" ? b.reason : undefined } };
+  const input: AdoptInput = { bossKey: b.bossKey, disposition: b.disposition };
+  if (typeof b.reason === "string") input.reason = b.reason;
+  return { ok: true, input };
 }
 
 export function validatePrioritizeRequestBody(body: unknown): { ok: true; priority: string } | { ok: false; error: string } {

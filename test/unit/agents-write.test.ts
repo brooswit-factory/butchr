@@ -34,7 +34,7 @@ function makeOps() {
     return i;
   }
   function addIssue(key: string, p: { issuetype: string; status?: string; labels?: string[]; bossKey?: string; summary?: string }) {
-    issues.set(key, { issuetype: p.issuetype, status: p.status ?? "To Do", labels: p.labels ?? [], bossKey: p.bossKey, summary: p.summary ?? `${key} summary` });
+    issues.set(key, { issuetype: p.issuetype, status: p.status ?? "To Do", labels: p.labels ?? [], summary: p.summary ?? `${key} summary`, ...(p.bossKey !== undefined ? { bossKey: p.bossKey } : {}) });
   }
   const notImplemented = (name: string) => async () => { throw new Error(`fake ops: ${name} not implemented (unused by agents-write tests)`); };
   const ops: AtlassianOps = {
@@ -332,7 +332,7 @@ describe("agents-write — FACTORY-666", () => {
     });
 
     test("validateAdoptRequestBody: requires bossKey + a valid disposition", () => {
-      expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "start" })).toEqual({ ok: true, input: { bossKey: "FACTORY-BOSS", disposition: "start", reason: undefined } });
+      expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "start" })).toEqual({ ok: true, input: { bossKey: "FACTORY-BOSS", disposition: "start" } });
       expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "r" })).toEqual({ ok: true, input: { bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "r" } });
       expect(validateAdoptRequestBody({ bossKey: "", disposition: "start" }).ok).toBe(false);
       expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "nope" }).ok).toBe(false);

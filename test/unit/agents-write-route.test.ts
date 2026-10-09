@@ -29,13 +29,15 @@ function writeGuardDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, peerOk =
   return { dashboardOriginGuard: { port: 0 }, peerUidCheck: () => peerOk, csrf };
 }
 
+type AgentsWriteOverrides = NonNullable<ViewDeps["agentsWrite"]>;
 const unusedFn = (name: string) => (() => { throw new Error(`unused: ${name}`); }) as any;
-function agentsWriteDeps(overrides: Partial<Record<string, (...a: unknown[]) => unknown>> = {}) {
+/** `any`-typed deliberately: these stand in for every `agentsWrite` member regardless of its own arity, so a strict `(...a: unknown[]) => unknown` would fail contravariance against e.g. `(issue: string) => ...` call sites below. Returns the NON-optional member type (`NonNullable<...>`, never `... | undefined`) — assigning an explicitly-`| undefined`-typed value to `Partial<ViewDeps>`'s own optional `agentsWrite?:` property is itself refused under `exactOptionalPropertyTypes`. */
+function agentsWriteDeps(overrides: Partial<Record<string, (...a: any[]) => any>> = {}): AgentsWriteOverrides {
   return {
     snapshot: unusedFn("snapshot"), start: unusedFn("start"), planStop: unusedFn("planStop"), stop: unusedFn("stop"),
     planShelve: unusedFn("planShelve"), shelve: unusedFn("shelve"), adopt: unusedFn("adopt"), prioritize: unusedFn("prioritize"),
     ...overrides,
-  } as ViewDeps["agentsWrite"];
+  } as AgentsWriteOverrides;
 }
 
 const STARTED: AgentWriteOutcome = { ok: true, key: "FACTORY-1", startedUnderBoss: "FACTORY-BOSS" };
