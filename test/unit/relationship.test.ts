@@ -10,6 +10,7 @@ import {
   checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE,
 } from "../../src/tools/relationship.js";
 import { EXEMPT_LABEL } from "../../src/agents/parked.js";
+import { workspaceStopCause, persistIntentionalStop } from "../../src/agents/stop-cause.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
 
@@ -1979,6 +1980,118 @@ describe("finishWithoutABoss", () => {
     addIssue("BUTCHR-1", { issuetype: "Bug", project: "BUTCHR" }); // no bossKey at all
     await finishWithoutABoss(ops, "BUTCHR-1");
     expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+  });
+});
+
+// ===========================================================================
+// FACTORY-849/FACTORY-852 (PR #719 review, item 1): the real write sites —
+// finishWorker/shelveWorker/submitToBoss/finishWithoutABoss actually calling
+// `recordIntentionalStop` on the real caller/worker key, and
+// startWorker/adoptWorker(kind:"start") actually calling
+// `clearIntentionalStop` — driven through the production functions with a
+// fake AtlassianOps and a temp workspace root, not just `classifyStop`
+// exercised in isolation over a hand-built record (stop-cause.test.ts
+// already covers that half, and so does the OR-logic table there). Sandboxes
+// BUTCHR_WORKSPACES exactly like the correctWorker describe block above,
+// for the same reason: workspaceRoot() defaults to a REAL `~/butchr-workspaces`.
+// ===========================================================================
+
+describe("FACTORY-849/FACTORY-852: stop-cause write sites, driven through the real relationship.ts functions", () => {
+  let workspacesRoot: string;
+  const priorEnv = process.env.BUTCHR_WORKSPACES;
+  beforeEach(() => {
+    workspacesRoot = mkdtempSync(join(tmpdir(), "stop-cause-write-site-test-"));
+    process.env.BUTCHR_WORKSPACES = workspacesRoot;
+  });
+  afterEach(() => {
+    rmSync(workspacesRoot, { recursive: true, force: true });
+    if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+    else process.env.BUTCHR_WORKSPACES = priorEnv;
+  });
+
+  function wsDir(key: string): string {
+    return join(workspacesRoot, "jira-work", "task", key);
+  }
+
+  test("finishWorker writes reason \"finish_worker\" on the WORKER's own on-disk workspace, after the Done transition", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await finishWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("Done");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_worker" });
+  });
+
+  test("shelveWorker writes reason \"shelve_worker\" on the WORKER's own on-disk workspace", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "In Progress" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(issues.get("BUTCHR-2")!.labels).toContain(EXEMPT_LABEL);
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "shelve_worker" });
+  });
+
+  test("submitToBoss writes reason \"submit_to_boss\" on the CALLER's OWN on-disk workspace, after the In Review transition", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Task", project: "BUTCHR", status: "In Progress" });
+    const dir = wsDir("BUTCHR-1");
+    mkdirSync(dir, { recursive: true });
+    await submitToBoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Review");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "submit_to_boss" });
+  });
+
+  test("finishWithoutABoss writes reason \"finish_without_a_boss\" on the CALLER's OWN on-disk workspace", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no bossKey: bossless
+    const dir = wsDir("BUTCHR-1");
+    mkdirSync(dir, { recursive: true });
+    await finishWithoutABoss(ops, "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.status).toBe("Done");
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_without_a_boss" });
+  });
+
+  test("startWorker clears a prior stop-cause marker on the worker it reactivates", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" });
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    await shelveWorker(ops, "BUTCHR-1", "BUTCHR-2", "waiting on a dependency");
+    expect(workspaceStopCause(dir)).not.toBeUndefined(); // the marker shelveWorker itself just wrote
+    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+    expect(workspaceStopCause(dir)).toBeUndefined(); // superseded by reactivation
+  });
+
+  test("adoptWorker(kind: \"start\") clears a prior stop-cause marker on the ticket it adopts-and-starts", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do" });
+    const dir = wsDir("BUTCHR-9");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "shelve_worker"); // a stale marker from a PRIOR episode this adoption reactivates
+    const result = await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "start" });
+    expect(result.alreadyAdopted).toBe(false);
+    expect(issues.get("BUTCHR-9")!.status).toBe("In Progress");
+    expect(workspaceStopCause(dir)).toBeUndefined();
+  });
+
+  test("shelveWorker via adoptWorker(kind: \"shelve\") does NOT clear a marker — only the \"start\" disposition does", async () => {
+    const { ops, addIssue, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-9", { issuetype: "Story", project: "BUTCHR", status: "To Do" });
+    const dir = wsDir("BUTCHR-9");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "finish_worker"); // pre-existing, unrelated to this call
+    await adoptWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9", { kind: "shelve", reason: "not ready" });
+    expect(workspaceStopCause(dir)).toMatchObject({ reason: "finish_worker" }); // untouched by the shelve disposition
   });
 });
 

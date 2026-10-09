@@ -14,6 +14,7 @@ import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
 import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
+import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
 import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "./health.js";
@@ -21,7 +22,7 @@ import { createLoopWatchdog } from "./loop-watchdog.js";
 import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
-import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { HerdrHerd } from "../agents/herd.js";
 import { reportPersistedAgentSessions } from "../agents/report-agent-sessions.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
@@ -1987,13 +1988,12 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const msg = reason && "linked" in reason ? linkedChangeNudge(issue, reason.linked.events)
     : reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
     : changeNudge(issue, aboutIssue, reason);
-  void notifyAgent(mcp, agent, aboutIssue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-  const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+  const result = await deliverNotice({
+    pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
+    nudgePrompt: () => herd.nudge(agent, msg),
+  });
   const reasonTag = notifyReasonTag(reason);
-  const promptState = outcome.refusal
-    ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
-    : outcome.delivered ? "delivered" : "refused/absent";
-  console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
+  console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
 };
 
 const ruleResourceType = createRuleResourceType({
@@ -2156,9 +2156,11 @@ startGithubIssueLoop({
   client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
@@ -2180,9 +2182,11 @@ startGithubPrLoop({
   client: githubPrs ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_PR),
@@ -2215,9 +2219,11 @@ startJiraIdeaLoop({
   } : {}),
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_IDEA),
@@ -2238,9 +2244,11 @@ startZendeskTicketLoop({
   client: zendeskTickets ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ZENDESK_TICKET),
@@ -2261,9 +2269,11 @@ startFilesystemLoop({
   rules: getRules(),
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_FILESYSTEM),
   onAdmitted: admissionController.recordSpawned,
@@ -2286,9 +2296,11 @@ startManagedSessionsLoop({
   account: accountLifecycle,
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_MANAGED_SESSIONS),
   onAdmitted: admissionController.recordSpawned,
