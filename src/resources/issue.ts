@@ -850,6 +850,21 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // reaches this predicate's input as an incoming related-space comment,
       // so it is deliberately not matched here (see this ticket's PR
       // description for the full citation).
+      //
+      // KNOWN LIMIT (review finding, FACTORY-954): `jira_add_comment`
+      // (src/tools/defs.ts) auto-tags EVERY agent-authored comment with the
+      // caller's identity, the SAME `[${key}] ` shape report_to_boss/
+      // ask_boss use — not only theirs. The self-tag check below therefore
+      // cannot distinguish a deliberate report to the boss from an
+      // incidental note `key`'s own agent left on its own ticket via the
+      // sideways jira_add_comment channel; both pass. Jira's comment body
+      // carries no signal for "which tool posted this", so this predicate
+      // has no way to tell them apart — accepted as a known limit, not
+      // fixed here. In practice this narrows the gap this ticket closes
+      // (any AGENT-authored comment on the ticket now wakes its boss, not
+      // merely a `report_to_boss`/`ask_boss` one) without reopening it
+      // fully: a HUMAN's or a PEER's comment (no self-tag, or a different
+      // one) still correctly stays silent.
       const isBossRelevantComment = (key: string, rows: readonly JiraComment[], id: string | null): boolean => {
         if (id === null) return false;
         const row = rows.find((r) => r.id === id);

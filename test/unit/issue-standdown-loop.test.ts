@@ -218,8 +218,23 @@ describe("BUTCHR-307 DoD 3(e): nothing wakes when nothing happened", () => {
   });
 });
 
-describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD waking, never silently swallows", () => {
-  test("a worker created AFTER the boss stood down (no baseline for it) wakes the boss on its first change", async () => {
+describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD waking, never silently swallows (PRIMARY space; see the FACTORY-954 narrowing note below for RELATED)", () => {
+  test("a worker created AFTER the boss stood down (no baseline for it): the change itself cannot be confirmed as boss-relevant (no `comments` dep wired, so it is `undetermined`), so FACTORY-954's related-space allowlist now keeps the boss asleep", async () => {
+    // FACTORY-954 NARROWED THIS, DELIBERATELY: before this ticket, an
+    // `undetermined` reason on a RELATED ticket still fell through to
+    // BUTCHR-307's fail-toward-waking net for an asleep watcher (same as
+    // every other non-structural reason) — this test used to pin exactly
+    // that. The related-space allowlist now requires a CONFIRMED,
+    // boss-relevant reason (a status transition to In Review/Done, or a
+    // comment this module can actually read and recognise as boss-
+    // addressed) before it will ever wake a related watcher, asleep or not
+    // — `undetermined` can never meet that bar, by definition (see
+    // `deliverToRelated`'s own doc comment, src/resources/issue.ts). This
+    // is a real narrowing of BUTCHR-307's own guarantee, scoped to
+    // `related` only: an asleep watcher of its OWN ticket (`primary`) still
+    // fails toward waking on `undetermined`, unaffected — see
+    // issue-bookkeeping-comment-suppression.test.ts and this file's own
+    // DoD 3(a)/(f) blocks, none of which exercise `related`.
     const sd = newRegistry();
     sd.standDown("KAN-1", new Map([["KAN-1", ["100"]]])); // KAN-3 did not exist yet at stand-down time
     const rules = createIssueEventRules({ standDown: sd });
@@ -230,8 +245,8 @@ describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD
       { primary: [], related: [{ issue: workerAfter, watchers: ["KAN-1"] }] },
     );
     const verdict = await poll.decide("KAN-3", "KAN-1", "related");
-    expect(verdict.deliver).toBe(true);
-    expect(sd.isAsleep("KAN-1")).toBe(false);
+    expect(verdict.deliver).toBe(false);
+    expect(sd.isAsleep("KAN-1")).toBe(true);
   });
 });
 

@@ -256,23 +256,35 @@ your pane for you.
 
 It snapshots the comment ids currently on {{KEY}} and on every story you
 currently have. **What wakes you, exactly** — this list is characterized by
-test, not aspirational:
+test, not aspirational. (FACTORY-954 narrowed the STORY half of this list —
+YOUR OWN ticket's own wake behavior is unchanged, every "always" line below
+still applies to it unconditionally.)
 
-- a **status change** on any of those tickets (your story reaching In Review
-  is the big one) — always, unconditionally;
-- a **summary edit** on any of them — always;
-- a **`pr:*` review-state transition on YOUR OWN ticket** — always;
-- a **new comment you have not already seen**, on any of them — including a
-  question, a report, or a `[butchr:blocked]` escalation on a story.
+- a **status change on {{KEY}} itself** — always, unconditionally; **a
+  story reaching In Review or Done** — always; any OTHER status change on a
+  story (e.g. To Do -> In Progress) does not wake you on its own;
+- a **summary edit on {{KEY}} itself** — always; a summary edit on a
+  story no longer wakes you on its own;
+- a **`pr:*` review-state transition on YOUR OWN ticket** — always (never
+  applicable to a story's ticket either way);
+- a **new comment you have not already seen on {{KEY}} itself** — always,
+  whatever it says; on a STORY, only a comment **addressed to you** wakes
+  you now — the story's own `report_to_boss`/`ask_boss` (tagged with its
+  own ticket key), or a `[butchr:blocked]`/`[butchr:respawn]`/
+  `[butchr:stall]`/`[butchr:unresponsive]` escalation. A routine,
+  unaddressed comment on a story no longer wakes you.
 
 **What does NOT wake you:** a daemon label change on a STORY's ticket on its
-own — its `agent:working`/`agent:idle` flips, and a `pr:*` transition on the
-STORY's ticket with no comment alongside it. That is deliberate (those flip
-constantly and would wake you for nothing), and it is why the list above
-matters: if you are waiting specifically to see a story's PR label move, you
-are waiting for something that will not wake you. In practice the events you
-actually wait for — a story reaching In Review, a story asking you something,
-an escalation — are all in the waking list.
+own — its `agent:working`/`agent:idle` flips, a `pr:*` transition on the
+STORY's ticket unaccompanied by a boss-addressed comment, and now also a
+story's summary/assignee/description/issuelinks edit, or any comment on a
+story that isn't addressed to you. That is deliberate (those flip
+constantly, or are routine child activity, and would wake you for nothing),
+and it is why the list above matters: if you are waiting specifically to see
+a story's PR label move, or expecting every comment on a story's ticket to
+wake you, you are waiting for something that will not. In practice the
+events you actually wait for — a story reaching In Review, a story asking
+you something, an escalation — are all in the waking list.
 
 A missed or wrongly-suppressed edge is
 bounded, not silent forever: you will be forced awake again after a maximum

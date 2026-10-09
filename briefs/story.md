@@ -313,21 +313,33 @@ your pane for you.
 
 It snapshots the comment ids currently on {{KEY}} and on every task you
 currently have. **What wakes you, exactly** — this list is characterized by
-test, not aspirational:
+test, not aspirational. (FACTORY-954 narrowed the TASK half of this list —
+YOUR OWN ticket's own wake behavior is unchanged, every "always" line below
+still applies to it unconditionally.)
 
-- a **status change** on any of those tickets (your task reaching In Review
-  is the big one) — always, unconditionally;
-- a **summary edit** on any of them — always;
-- a **`pr:*` review-state transition on YOUR OWN ticket** — always;
-- a **new comment you have not already seen**, on any of them — including a
-  question, a report, or a `[butchr:blocked]` escalation on a task.
+- a **status change on {{KEY}} itself** — always, unconditionally; **a
+  task reaching In Review or Done** — always; any OTHER status change on a
+  task (e.g. To Do -> In Progress) does not wake you on its own;
+- a **summary edit on {{KEY}} itself** — always; a summary edit on a
+  task no longer wakes you on its own;
+- a **`pr:*` review-state transition on YOUR OWN ticket** — always (never
+  applicable to a task's ticket either way);
+- a **new comment you have not already seen on {{KEY}} itself** — always,
+  whatever it says; on a TASK, only a comment **addressed to you** wakes
+  you now — the task's own `report_to_boss`/`ask_boss` (tagged with its own
+  ticket key), or a `[butchr:blocked]`/`[butchr:respawn]`/`[butchr:stall]`/
+  `[butchr:unresponsive]` escalation. A routine, unaddressed comment on a
+  task no longer wakes you.
 
 **What does NOT wake you:** a daemon label change on a TASK's ticket on its
-own — its `agent:working`/`agent:idle` flips, and a `pr:*` transition on the
-TASK's ticket with no comment alongside it. That is deliberate (those flip
-constantly and would wake you for nothing), and it is why the list above
-matters: if you are waiting specifically to see a task's PR label move, you
-are waiting for something that will not wake you. In practice the events you
+own — its `agent:working`/`agent:idle` flips, a `pr:*` transition on the
+TASK's ticket unaccompanied by a boss-addressed comment, and now also a
+task's summary/assignee/description/issuelinks edit, or any comment on a
+task that isn't addressed to you. That is deliberate (those flip constantly,
+or are routine child activity, and would wake you for nothing), and it is
+why the list above matters: if you are waiting specifically to see a task's
+PR label move, or expecting every comment on a task's ticket to wake you,
+you are waiting for something that will not. In practice the events you
 actually wait for — a task reaching In Review, a task asking you something,
 an escalation — are all in the waking list.
 
