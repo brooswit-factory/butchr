@@ -18,7 +18,7 @@
  *
  * Cleans up the pane and the scratch workspace afterward, even on failure.
  */
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DrovrClient } from "@brooswit/drovr";
@@ -29,6 +29,17 @@ import { spawnArgs, controlCharStartArgs } from "../src/agents/argv.js";
 // only ever looks at real issue keys) can never adopt, nudge, or respawn it.
 const THROWAWAY_KEY = "SPAWNSMOKE";
 
+// FACTORY-891 review (PR #722): the thing that makes this assertion
+// FALSIFIABLE. "a foreground process exists" is not — a pty-backed pane's
+// own interactive shell already satisfies that, whether or not herdr ever
+// spawned the stub. scripts/ci-fixtures/claude touches this exact path
+// before it sleeps, so its presence proves THIS process ran — nothing
+// weaker, and nothing that depends on how herdr reports a process's own
+// name/argv[0] (a kernel/shell detail, see that stub's own doc comment).
+const SENTINEL = process.env.BUTCHR_CI_SPAWN_SMOKE_SENTINEL;
+if (!SENTINEL) throw new Error("BUTCHR_CI_SPAWN_SMOKE_SENTINEL must be set (see .github/workflows/ci.yml, job spawn-smoke)");
+if (existsSync(SENTINEL)) unlinkSync(SENTINEL); // defend against a stale file from a previous run on a reused runner
+
 const socketPath = process.env.HERDR_SOCKET_PATH;
 const herdr = new DrovrClient(socketPath ? { socketPath } : {});
 
@@ -37,20 +48,20 @@ let workspaceId: string | undefined;
 let paneId: string | undefined;
 
 /**
- * Whether ANY foreground process is running in the pane — deliberately not
- * matched by name. The stub at scripts/ci-fixtures/claude is a shebang
- * script; whether herdr's pty reports its `comm`/`argv[0]` as "claude" or
- * as its interpreter is a kernel/shell detail this script has no need to
- * depend on. "a foreground process exists" is already the real claim this
- * script needs: herdr accepted the real kickoff argv AND actually spawned
- * something from it, not just that the RPC returned.
+ * Polls for the sentinel file the stub touches before it sleeps (see
+ * SENTINEL's own comment above for why that, and not "a foreground process
+ * exists", is the actual proof). Logs `foreground_processes` on every poll
+ * regardless of outcome — kept PERMANENTLY, not just on failure: it is the
+ * diagnostic whoever debugs this job next will want, per FACTORY-891's
+ * review.
  */
-async function pollForForegroundProcess(pane: string, timeoutMs: number): Promise<boolean> {
+async function pollForStubToRun(pane: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const r = await herdr.pane.processInfo({ pane_id: pane }).catch(() => undefined);
-    const info = (r as { process_info?: { foreground_processes?: Array<{ argv?: string[] | null; name?: string | null }> } } | undefined)?.process_info;
-    if ((info?.foreground_processes?.length ?? 0) > 0) return true;
+    const info = (r as { process_info?: { foreground_processes?: unknown[] } } | undefined)?.process_info;
+    console.log("pane.processInfo foreground_processes:", JSON.stringify(info?.foreground_processes ?? null));
+    if (existsSync(SENTINEL)) return true;
     await new Promise((res) => setTimeout(res, 500));
   }
   return false;
@@ -69,6 +80,7 @@ async function cleanup(): Promise<void> {
       });
   }
   rmSync(scratchRoot, { recursive: true, force: true });
+  if (SENTINEL && existsSync(SENTINEL)) unlinkSync(SENTINEL);
 }
 
 async function main(): Promise<void> {
@@ -100,9 +112,9 @@ async function main(): Promise<void> {
   // point of FACTORY-892 step (4).
   await herdr.agent.start({ pane_id: paneId, name: `ci-spawn-smoke-${THROWAWAY_KEY.toLowerCase()}`, kind: "claude", args });
 
-  const started = await pollForForegroundProcess(paneId, 15_000);
-  if (!started) throw new Error("agent.start accepted the argv, but no foreground process ever reported as running within 15s");
-  console.log("OK: herdr accepted the real kickoff argv and started a real process");
+  const started = await pollForStubToRun(paneId, 15_000);
+  if (!started) throw new Error(`agent.start accepted the argv, but the stub never touched its sentinel (${SENTINEL}) within 15s`);
+  console.log("OK: herdr accepted the real kickoff argv and actually ran the stub");
 }
 
 main()

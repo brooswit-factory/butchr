@@ -38,6 +38,12 @@ jobs:
     # (invalid_agent_argument), which is exactly how FACTORY-735/739 broke
     # every spawn in production. See scripts/verify-ci-spawn-smoke.ts.
     runs-on: ubuntu-latest
+    env:
+      # FACTORY-891 review: the smoke test's own "did the stub actually
+      # run" proof — see scripts/ci-fixtures/claude. Set at JOB level so
+      # both the `herdr server` process (whose env every pane it spawns
+      # inherits) and the verify script agree on the same path.
+      BUTCHR_CI_SPAWN_SMOKE_SENTINEL: /tmp/butchr-ci-spawn-smoke-claude.ran
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
