@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { isIssueKey, isProjectId } from "../../src/resources/id.js";
+import { isIssueKey, isProjectId, isConfluencePageResourceId } from "../../src/resources/id.js";
 import { JIRA_KEY_RE } from "../../src/tools/docs.js";
+import { isConfluencePageRef } from "../../src/resources/confluence-page-ref.js";
 
 // BUTCHR-71: the id predicate module. What would make each check below
 // fail, stated up front (per the ticket's own "say what would make this
@@ -66,6 +67,38 @@ describe("isIssueKey / isProjectId are mutually exclusive by construction", () =
     const cases = ["BUTCHR-71", "BUTCHR", "MY_PROJECT", "MY_PROJECT-1", "butchr", "butchr-1", "", "-", "A", "A-1", "A_B_C", "A_B_C-99"];
     for (const s of cases) {
       expect(isIssueKey(s) && isProjectId(s)).toBe(false);
+    }
+  });
+});
+
+// FACTORY-996: a managed-session agent's confluence-page resource id — a
+// bare numeric Confluence page id, carried in the same x-issue header.
+describe("isConfluencePageResourceId", () => {
+  test("delegates to the codebase's one confluence-page-ref predicate, not a retyped copy", () => {
+    for (const s of ["123456", "0", "", "not-a-number", "123abc", "-1", "/some/path", "BUTCHR-71", "BUTCHR"]) {
+      expect(isConfluencePageResourceId(s)).toBe(isConfluencePageRef(s));
+    }
+  });
+
+  test("accepts a bare numeric page id", () => {
+    expect(isConfluencePageResourceId("39518269")).toBe(true);
+  });
+
+  test("rejects a full Confluence URL — x-issue is never a URL, only the resolved bare id (unlike parseConfluencePageRef, which also accepts one for the links/ResourceRef axis)", () => {
+    expect(isConfluencePageResourceId("https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title")).toBe(false);
+  });
+
+  test("rejects anything malformed", () => {
+    for (const bad of ["", "not-a-number", "123abc", "-1", "1.5"]) expect(isConfluencePageResourceId(bad)).toBe(false);
+  });
+});
+
+describe("isConfluencePageResourceId is mutually exclusive with isIssueKey / isProjectId by construction", () => {
+  test("no string satisfies isConfluencePageResourceId and either of the other two — both require a leading [A-Z], a bare-numeric string never has one", () => {
+    const cases = ["123456", "0", "BUTCHR-71", "BUTCHR", "MY_PROJECT", "MY_PROJECT-1", "butchr-1", "", "-1", "A-1"];
+    for (const s of cases) {
+      expect(isConfluencePageResourceId(s) && isIssueKey(s)).toBe(false);
+      expect(isConfluencePageResourceId(s) && isProjectId(s)).toBe(false);
     }
   });
 });

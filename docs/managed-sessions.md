@@ -1382,6 +1382,19 @@ through an operator-configured Atlassian MCP connection, never through
 butchr's `jira_*`/`confluence_*` tools or the boss verbs — butchr's
 hierarchy verbs are for jira-work ticket agents (Epic/Story/Task) only.
 
+**One narrow, named exception (FACTORY-996, story FACTORY-993):**
+`get_my_confluence_page`/`get_my_confluence_page_comments` (`src/tools/
+defs.ts`) let a managed-session agent read — never write — its OWN
+resource page's body and comments through butchr's own MCP, but ONLY when
+that agent's own resource genuinely IS a Confluence page (a `confluence-page`
+ResourceType instance, FACTORY-992, not yet shipped as of this story) — the
+page id comes exclusively from the caller's own `x-issue`, never an
+argument, so this cannot be used to reach any OTHER page nor does it open a
+general Jira/Confluence integration for an arbitrary filesystem-backed
+managed-session agent. Every other managed-session agent (one whose
+resource is an ordinary file) still gets a refusal from both verbs, same as
+before this story — the paragraph above is otherwise unchanged.
+
 ## Escalating an unanswerable startup dialog (FACTORY-45)
 
 The daemon's existing prompt-escalation machinery (`onBlocked`,

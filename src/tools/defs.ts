@@ -1,7 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers, getConfluencePageDocById } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
@@ -9,7 +9,7 @@ import {
   checkWorker, STAFFING_PENDING,
   type Disposition, type PeerIntent,
 } from "./relationship.js";
-import { isProjectId } from "../resources/id.js";
+import { isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 import { unwrapStorageParagraph } from "./speak.js";
 import { Refusal, withOutcomeRecording } from "./outcome.js";
@@ -115,6 +115,38 @@ function requireIssueCaller(
   const who = requireCaller(c, verb);
   if (isProjectId(who)) {
     throw new Refusal(`${verb}: refusing a project caller — ${why}`);
+  }
+  return who;
+}
+
+/**
+ * FACTORY-996: the gate for the two new managed-session Confluence read
+ * verbs (`get_my_confluence_page`/`get_my_confluence_page_comments`). TAKES
+ * NO ARGUMENTS BEYOND THE CONNECTION — same shape as `requireProjectCaller`/
+ * `requireIssueCaller` above: the page id is derived EXCLUSIVELY from the
+ * caller's own `x-issue` header, never from a caller-supplied argument, so
+ * which page you get back is never expressible as an argument mistake (the
+ * design `jira_add_comment`'d to FACTORY-992 as the contract these verbs
+ * assume: a `confluence-page` resource's own `x-issue` is its bare numeric
+ * Confluence page id — see `isConfluencePageResourceId`, `src/resources/
+ * id.ts`, for the full reasoning). Refuses an `x-issue` that isn't shaped
+ * like one — a Jira issue key, a Jira project key, a filesystem path, or
+ * anything else — with a message naming what it actually is, rather than
+ * loosening what this accepts to "try to make it work".
+ */
+function requireOwnConfluencePageId(c: { headers: Record<string, string> }, verb: string): string {
+  const who = requireCaller(c, verb);
+  // A PROJECT caller is refused the same, established way every other
+  // project-refusing verb is (`refuseProjectCaller`, same message shape the
+  // BUTCHR-82 disposition enumeration's "refuses" bucket pins on): a
+  // confluence-page resource is never a project's own resource — only an
+  // issue-tier (managed-session) agent is ever spawned FOR one. This also
+  // means the shape check below only ever has to reject an ISSUE-tier
+  // caller whose own x-issue isn't a confluence-page id — the project case
+  // is already handled here.
+  refuseProjectCaller(c, verb, "a confluence-page resource is never a project's own resource — this verb only reads an issue-tier agent's own confluence-page resource, derived from its x-issue");
+  if (!isConfluencePageResourceId(who)) {
+    throw new Refusal(`${verb}: refusing — this connection's x-issue ("${who}") is not a confluence-page resource id (a bare numeric Confluence page id); this verb only reads the caller's OWN confluence-page resource, derived solely from x-issue, never from an argument`);
   }
   return who;
 }
@@ -915,6 +947,31 @@ export function atlassianTools(
         const raw = await ops.getPageComments(doc.id);
         const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
         audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
+        return comments;
+      },
+    },
+    get_my_confluence_page: {
+      description:
+        "FACTORY-996: read path for a MANAGED-SESSION agent whose own resource is a Confluence page (a future `confluence-page` ResourceType, FACTORY-992) — NOT for a Jira-ticket-bound doc, which stays on `get_doc`. TAKES NO KEY: the page id comes EXCLUSIVELY from the caller's own `x-issue` header (a bare numeric Confluence page id), never from an argument — which page you get is never expressible as an argument mistake, and there is no way to name any OTHER page through this verb. Refuses any caller whose `x-issue` isn't shaped like a confluence-page resource id (a Jira issue key, a Jira project key, a filesystem path, anything malformed) — this does not loosen `get_doc`'s own `assertValidKey` Jira-key check, it is a completely separate path for a completely different caller shape. " +
+        "BOUNDED, CALLER-CONTROLLABLE RANGE READ, SAME SHAPE AS get_doc (BUTCHR-270): `offset`/`limit` (both in characters) page through a body too large for one MCP result; `expectVersion` is REQUIRED whenever `offset` > 0 and a mismatch REFUSES rather than risking a spliced body from two versions. See get_doc's own description for the full three-arm result shape (`{found:false}` never happens here — see getConfluencePageDocById's own doc comment) and the exact pagination protocol; it is identical here.",
+      input: { offset: z.number().int().optional(), limit: z.number().int().optional(), expectVersion: z.number().int().optional() },
+      handler: async (a, c) => {
+        const { offset, limit, expectVersion } = a as { offset?: number; limit?: number; expectVersion?: number };
+        const pageId = requireOwnConfluencePageId(c, "get_my_confluence_page");
+        audit(c, `get_my_confluence_page ${pageId} (self)`);
+        return getConfluencePageDocById(ops, pageId, offset, limit, expectVersion);
+      },
+    },
+    get_my_confluence_page_comments: {
+      description:
+        "FACTORY-996: the comments counterpart to get_my_confluence_page — reads a MANAGED-SESSION agent's OWN confluence-page resource's footer comments. TAKES NO ARGUMENTS: the page id comes exclusively from the caller's own `x-issue`, same gate and same refusal shape as get_my_confluence_page; there is no key parameter, so there is no way to read any OTHER page's comments through this verb. NOT the same thing as `get_doc_comments`, which is PROJECT-CALLER-ONLY and reads a project's own root doc — this is issue-tier-only (a confluence-page-resource caller specifically), the opposite caller shape. " +
+        "Returns `{ results: [{ id, body, author?, created? }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the raw order `getPageComments` returns, same caveat `get_doc_comments` documents). `body` comes back as PLAIN TEXT: `getPageComments` itself returns raw storage-format XHTML, undone here with the same `unwrapStorageParagraph` get_doc_comments already uses (src/tools/speak.ts) — no `<p>...</p>` wrapper and no entity escaping survive.",
+      input: {},
+      handler: async (_a, c) => {
+        const pageId = requireOwnConfluencePageId(c, "get_my_confluence_page_comments");
+        const raw = await ops.getPageComments(pageId);
+        const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
+        audit(c, `get_my_confluence_page_comments ${pageId} (self) (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
         return comments;
       },
     },
