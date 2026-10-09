@@ -169,12 +169,21 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
 describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
   test("evaluated EVERY poll (fast cadence): an ordinary new episode still pokes, never suppressed as a false restart", async () => {
     let now = 0;
-    const { deps } = makeDeps({ dryRun: false, now: () => now, suppressMinutes: 5 });
+    // globalMinutes small enough that the episode becomes a candidate
+    // exactly at the final check (20m - 15m streakStart = 5m elapsed), not
+    // sooner — the loop below must reach that moment without itself
+    // poking first.
+    const { deps } = makeDeps({ dryRun: false, now: () => now, suppressMinutes: 5, globalMinutes: 5 });
     const engine = createIdlePokeEngine(deps);
-    // Simulate a ~15s poll cadence with the ticket not yet idle, then idle.
-    for (let t = 0; t < 10 * MIN; t += 15_000) {
+    // Simulate a continuous ~15s poll cadence the WHOLE way (not yet idle,
+    // then idle from t=15m) — no gap ever exceeds suppressMinutes, so
+    // guard 4's own discontinuity measurement never resets. Jumping
+    // straight from an early "not yet idle" poll to the final check (as a
+    // prior version of this test did) would itself look like a second
+    // restart and re-arm the suppression it's trying to disprove.
+    for (let t = 0; t < 20 * MIN; t += 15_000) {
       now = t;
-      await engine.check("KAN-1", { streakStart: null, status: "In Progress" });
+      await engine.check("KAN-1", { streakStart: t < 15 * MIN ? null : 15 * MIN, status: "In Progress" });
     }
     now = 20 * MIN;
     const out = await engine.check("KAN-1", { streakStart: 15 * MIN, status: "In Progress" });
@@ -200,14 +209,25 @@ describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
 
   test("a genuine restart suppresses a poke within the window, and a later poll past the window still pokes", async () => {
     let now = 0;
-    const { deps } = makeDeps({ dryRun: false, now: () => now, suppressMinutes: 5 });
+    // globalMinutes small enough that the episode is already a candidate
+    // by the "early" check — it's guard 4, not the timer, being exercised.
+    const { deps } = makeDeps({ dryRun: false, now: () => now, suppressMinutes: 5, globalMinutes: 1 });
     const engine = createIdlePokeEngine(deps);
     now = 0;
     await engine.check("KAN-1", { streakStart: null, status: "In Progress" }); // daemon start
     now = 2 * MIN;
     const early = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" }); // within suppressMinutes of start
     expect(early.kind).toBe("suppressed");
-    now = 10 * MIN;
+    // Keep polling at a realistic ~15s cadence right up to the window's
+    // edge — guard 4 only reads a gap between CONSECUTIVE invocations
+    // correctly when check() is called every poll (see this module's own
+    // doc comment); jumping straight from here to past the window would
+    // itself look like a second restart and re-arm the suppression.
+    for (let t = 2 * MIN + 15_000; t <= 5 * MIN; t += 15_000) {
+      now = t;
+      await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    }
+    now = 5 * MIN + 15_000; // just past the window
     const later = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" }); // past the window now
     expect(later.kind).toBe("poked");
   });
