@@ -270,6 +270,13 @@ export function relatedForRules(
     }];
   };
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
+  // FACTORY-952: the SAME (sourceKey, listenerKey) edge is reached from BOTH
+  // ends' own issuelinks scan below (the implementer's inward link and the
+  // boss's outward link name the identical pair) — `record`'s own `watchers`
+  // Set already absorbs that duplication for a delivered edge; a REJECTED
+  // one has no Set to land in, so this dedupes the log line the same way,
+  // by (sourceKey, live watcher key), not per scan.
+  const loggedTopologyRejections = new Set<string>();
   // BUTCHR-406: takes the WATCHER'S KEY directly (already resolved to the
   // live agent key by the caller), not a `RuleMatch` — `record` no longer
   // decides which key names the listener, `implementsEdge`/`relatesEdge` do.
@@ -304,7 +311,11 @@ export function relatedForRules(
         // mislink/stray-adoption is visible rather than indistinguishable
         // from "nothing changed".
         if (isStrayTaskToEpic(source.issue.issuetype, listener.issue.issuetype)) {
-          log?.(topologySuppressedLine(sourceKey, live, source.issue.issuetype, listener.issue.issuetype));
+          const dedupeKey = `${sourceKey}|${live}`;
+          if (!loggedTopologyRejections.has(dedupeKey)) {
+            loggedTopologyRejections.add(dedupeKey);
+            log?.(topologySuppressedLine(sourceKey, live, source.issue.issuetype, listener.issue.issuetype));
+          }
           continue;
         }
         record(sourceKey, live, source);
