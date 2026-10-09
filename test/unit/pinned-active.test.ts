@@ -326,3 +326,73 @@ describe("reconcileNow: checkPinnedActive is called with exactly desired ∩ run
     expect(herd.stopped).toEqual([]);
   });
 });
+
+// FACTORY-845: the project/manager path (src/agents/pinned-active.ts) was
+// previously unwired to any per-rule config at all — its own `minutes` dep
+// is a single number baked in at construction, shared by every id. A
+// per-rule `idlePokeMinutes` (FACTORY-844/846) must beat the global default
+// for THIS path too, same as the issue tier's idle-poke engine — this is
+// the test that would FAIL if a per-rule value for project/manager were
+// ignored in favour of the global.
+describe("createPinnedActiveDetector: FACTORY-845 — a per-id minutesFor override beats the global `minutes`", () => {
+  test("an id whose minutesFor is SHORTER than the global complains before the global threshold would", async () => {
+    let now = 0;
+    const chan = fakeChannel(() => now);
+    const det = createPinnedActiveDetector({
+      now: () => now,
+      minutes: 30, // the global default — this id must NOT have to wait for it
+      minutesFor: (id) => (id === "ACME" ? 5 : undefined),
+      agentStatuses: async () => new Map([["ACME", "idle"]]),
+      addComment: chan.addComment,
+      comments: chan.comments,
+    });
+    now = 0;
+    await det.check(["ACME"]);
+    now = 6 * MIN; // past the per-id 5m override, nowhere near the global 30m
+    await det.check(["ACME"]);
+    expect(chan.posted.length).toBe(1);
+    expect(chan.posted[0]!.text).toContain("5 minute(s)"); // the resolved per-id window, not 30
+  });
+
+  test("an id with NO minutesFor entry still uses the global `minutes`, unchanged", async () => {
+    let now = 0;
+    const chan = fakeChannel(() => now);
+    const det = createPinnedActiveDetector({
+      now: () => now,
+      minutes: 10,
+      minutesFor: () => undefined, // never resolves an override for anyone
+      agentStatuses: async () => new Map([["ACME", "idle"]]),
+      addComment: chan.addComment,
+      comments: chan.comments,
+    });
+    now = 0;
+    await det.check(["ACME"]);
+    now = 5 * MIN; // under the global 10m
+    await det.check(["ACME"]);
+    expect(chan.posted.length).toBe(0);
+    now = 11 * MIN;
+    await det.check(["ACME"]);
+    expect(chan.posted.length).toBe(1);
+  });
+
+  test("a rule's own LONGER minutesFor is honoured too — not merely the shorter direction", async () => {
+    let now = 0;
+    const chan = fakeChannel(() => now);
+    const det = createPinnedActiveDetector({
+      now: () => now,
+      minutes: 10,
+      minutesFor: (id) => (id === "ACME" ? 60 : undefined),
+      agentStatuses: async () => new Map([["ACME", "idle"]]),
+      addComment: chan.addComment,
+      comments: chan.comments,
+    });
+    now = 0;
+    await det.check(["ACME"]);
+    now = 20 * MIN; // past the global 10m, nowhere near the per-id 60m
+    await det.check(["ACME"]);
+    expect(chan.posted.length).toBe(0);
+    now = 61 * MIN;
+    await det.check(["ACME"]);
+    expect(chan.posted.length).toBe(1);
+  });
+});

@@ -1258,4 +1258,71 @@ describe("createLabelSync", () => {
       expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["agent:none", "admission:withheld"] }]);
     });
   });
+
+  // FACTORY-845: the idle-poke engine wiring — `idlePoke.check` is called
+  // every poll for every ACTIVE issue (never only when stalled), with the
+  // precise `streakStart` (not stalled.ts's own rounded elapsedMinutes),
+  // the ticket's current status, and this poll's resolved rule config;
+  // `idlePoke.forget` mirrors `stalled`/`stallRemediation`/`silentStop`'s
+  // own forget call sites exactly.
+  describe("idlePoke wiring (FACTORY-845)", () => {
+    function fakeIdlePoke() {
+      const calls: Array<{ issue: string; streakStart: number | null; status: string; ruleConfig: unknown }> = [];
+      const forgotten: string[] = [];
+      return {
+        calls,
+        forgotten,
+        beginPoll: () => {},
+        check: async (issue: string, input: { streakStart: number | null; status: string; ruleConfig?: unknown }) => {
+          calls.push({ issue, streakStart: input.streakStart, status: input.status, ruleConfig: input.ruleConfig });
+          return { kind: "not-a-candidate" as const, issue };
+        },
+        forget: (issue: string) => forgotten.push(issue),
+      };
+    }
+
+    test("called for every active issue with streakStart from stalled.streakStart, the issue's status, and the resolved rule config", async () => {
+      const idlePoke = fakeIdlePoke();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        stalled: { check: async () => false, forget: () => {}, streakStart: () => 12_345 },
+        idlePoke,
+        idlePokeRuleConfig: (issue) => (issue === "KAN-1" ? { idlePokeEnabled: true, idlePokeMinutes: 5 } : undefined),
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      expect(idlePoke.calls).toEqual([{ issue: "KAN-1", streakStart: 12_345, status: "In Progress", ruleConfig: { idlePokeEnabled: true, idlePokeMinutes: 5 } }]);
+    });
+
+    test("never called for an INACTIVE issue, and forgotten instead", async () => {
+      const idlePoke = fakeIdlePoke();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map(),
+        idlePoke,
+      });
+      await sync([iss("KAN-1", "Done", [])]);
+      expect(idlePoke.calls).toEqual([]);
+      expect(idlePoke.forgotten).toContain("KAN-1");
+    });
+
+    test("forgotten when an issue disappears from the feed entirely", async () => {
+      const idlePoke = fakeIdlePoke();
+      const sync = createLabelSync({
+        jira: fakeJira(),
+        agentStatuses: async () => new Map([["KAN-1", "idle"]]),
+        idlePoke,
+      });
+      await sync([iss("KAN-1", "In Progress", ["agent:idle"])]);
+      idlePoke.forgotten.length = 0;
+      await sync([]);
+      expect(idlePoke.forgotten).toContain("KAN-1");
+    });
+
+    test("omitting idlePoke entirely preserves ordinary syncLabels behaviour, unchanged", async () => {
+      const jira = fakeJira();
+      const sync = createLabelSync({ jira, agentStatuses: async () => new Map([["KAN-1", "idle"]]) });
+      await expect(sync([iss("KAN-1", "In Progress", ["agent:idle"])])).resolves.toBeInstanceOf(Set);
+    });
+  });
 });

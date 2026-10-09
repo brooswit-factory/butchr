@@ -4,6 +4,7 @@ import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isActiveStatusLabel
 import type { StalledCheck } from "../agents/stalled.js";
 import type { StallRemediator } from "../agents/stall-remediation.js";
 import type { SilentStopCheck } from "../agents/silent-stop.js";
+import type { IdlePokeEngine, IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
 
 export interface LabelWriter {
@@ -48,6 +49,24 @@ export interface SyncDeps {
    * checked unconditionally, every poll, for every active issue.
    */
   silentStop?: SilentStopCheck;
+  /**
+   * FACTORY-845: the per-rule-configurable idle poke — a second, independent
+   * consumer of `stalled`'s own streak (see src/agents/idle-poke.ts's own top
+   * comment for why it is a separate module from `stallRemediation` above,
+   * not an extension of it). Omitted disables idle-poke evaluation entirely,
+   * same shape as every other optional dep here.
+   */
+  idlePoke?: IdlePokeEngine;
+  /**
+   * This poll's resolved idle-poke config for one issue — built by the
+   * caller from whichever rule(s) matched this ticket (src/daemon/index.ts),
+   * since `syncLabels` itself only ever sees de-duplicated issues, not the
+   * (rule, issue) matches that produced them. Returning `undefined` means
+   * no enabled rule carries an override for this ticket; `idlePoke.check`
+   * then falls back to its own global default and `idlePokeEnabled ?? true`.
+   * Never called when `idlePoke` itself is omitted.
+   */
+  idlePokeRuleConfig?: (issue: string) => IdlePokeRuleConfig | undefined;
   /**
    * BUTCHR-352: THIS poll's admission census for the withheld set
    * (src/agents/admission.ts's `AdmissionController.census()`) — either the
@@ -172,6 +191,10 @@ export function createLabelSync(deps: SyncDeps) {
   };
 
   return async function syncLabels(issues: readonly JiraIssue[]): Promise<ReadonlySet<string>> {
+    // FACTORY-845: reset the fleet-wide per-poll poke counter ONCE per
+    // poll, before any issue's `idlePoke.check` call — see
+    // src/agents/idle-poke.ts's own `beginPoll` doc comment.
+    deps.idlePoke?.beginPoll();
     const written = new Set<string>();
     const seen = new Set(issues.map((i) => i.key));
     const agents = await deps.agentStatuses();
@@ -204,6 +227,7 @@ export function createLabelSync(deps: SyncDeps) {
         deps.stalled?.forget(issue.key);
         deps.stallRemediation?.forget(issue.key);
         deps.silentStop?.forget(issue.key);
+        deps.idlePoke?.forget(issue.key);
         agentStatus = null;
       } else {
         const observed = mapAgentStatus(agents.get(issue.key) ?? null);
@@ -297,6 +321,18 @@ export function createLabelSync(deps: SyncDeps) {
         // as "not Done" by gatherWorkerSignals, never fabricated.
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
         await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
+
+        // FACTORY-845: always evaluated, every poll, for every active
+        // issue — never only when `stalledNow`/`stalled` — so the
+        // restart/herdr-reconnect gap this engine measures off its own
+        // consecutive invocations (see idle-poke.ts's 90-second-trap
+        // comment) sees every poll, exactly like `deps.stalled`/
+        // `deps.silentStop` above.
+        await deps.idlePoke?.check(issue.key, {
+          streakStart: deps.stalled?.streakStart?.(issue.key) ?? null,
+          status: issue.status,
+          ruleConfig: deps.idlePokeRuleConfig?.(issue.key),
+        });
       }
       const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
       const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
@@ -310,6 +346,7 @@ export function createLabelSync(deps: SyncDeps) {
       deps.stalled?.forget(key);
       deps.stallRemediation?.forget(key);
       deps.silentStop?.forget(key);
+      deps.idlePoke?.forget(key);
       const current = lastLabels.get(key)!;
       // BUTCHR-352: admission:* is lifecycle-bound to active status the same
       // way agent:* is — see isActiveStatusLabel's own doc comment — so both
