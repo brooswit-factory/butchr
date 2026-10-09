@@ -964,15 +964,22 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const ledger = createOwnWriteLedger();
     const polls: JiraIssue[][] = [
       [iss("A", "In Progress")],
-      // Our own write was recorded for "t2", but by the time this poll ran,
-      // a foreign comment had ALSO landed, pushing `updated` to "t3" — a
-      // value that matches nothing in the ledger, so it must be delivered.
+      // idx1: content-identical to idx0 — `watch()`'s forced hash still
+      // calls `poll()` (so the comment-cursor baseline seeding genuinely
+      // runs and records "c0"), but `changedKeys` sees no diff at all, so
+      // `decide()` is never even consulted for "A" here.
+      [iss("A", "In Progress")],
+      // idx2: our own write was recorded for "t2", but by the time this
+      // poll ran, a foreign comment had ALSO landed, pushing `updated` to
+      // "t3" — a value that matches nothing in the ledger, so it must be
+      // delivered. The `comments` dep's newest id now genuinely differs
+      // from the "c0" baseline idx1 already established.
       [{ ...iss("A", "In Progress"), updated: "t3" }],
     ];
     ledger.record("A", "t2", "A", Date.now());
     let n = 0;
     let pollIdx = 0;
-    const comments = async () => (pollIdx === 0
+    const comments = async () => (pollIdx < 2
       ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
       : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
@@ -998,18 +1005,23 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const relOf = (updated: string) => [{ issue: { key: "T", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels: [] }, watchers: ["S"] }];
     const polls: JiraIssue[][] = [
       [iss("S", "In Progress"), iss("T", "In Progress")],
+      // idx1: content-identical to idx0 — lets `poll()` genuinely run once
+      // (the forced hash) and seed T's comment-cursor baseline ("c0")
+      // before the real write below, so that write's own confirmation has
+      // a defined baseline to move away from.
+      [iss("S", "In Progress"), iss("T", "In Progress")],
       [iss("S", "In Progress"), { ...iss("T", "In Progress"), updated: "t2" }],
     ];
-    const relatedPolls = [relOf("t"), relOf("t2")];
+    const relatedPolls = [relOf("t"), relOf("t"), relOf("t2")];
     ledger.record("T", "t2", "T", Date.now());
     let n = 0;
     let pollIdx = 0;
-    const comments = async () => (pollIdx === 0
+    const comments = async () => (pollIdx < 2
       ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
       : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n, 1)]!,
-      related: async () => { pollIdx = Math.min(n++, 1); return relatedPolls[pollIdx]!; },
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => { pollIdx = Math.min(n++, relatedPolls.length - 1); return relatedPolls[pollIdx]!; },
       herd,
       notify: (i, about) => { notified.push(`${i}<-${about}`); },
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
@@ -1179,11 +1191,14 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     stop();
     expect(notified).not.toContain("S<-S");
     expect(notified).not.toContain("E<-S");
-    // KAN-828: baseline seeding calls comments() once for S's first
-    // sighting (call 1); §3D's own active check at poll 2 makes the only
-    // other call (call 2, S's own primary path — E's related path reuses
-    // that same per-poll cache, no third call) and finds nothing moved.
-    expect(commentCalls).toBe(2);
+    // KAN-828: this diff's own `poll()` call is ALSO S's first sighting
+    // (only two polls total, so `poll()` itself never ran before this),
+    // so baseline seeding's own single comments() call happens in the SAME
+    // poll §3D's own active check reuses — no second call, and no defined
+    // pre-poll baseline to compare against either (seeding hadn't run YET
+    // when this poll started), so the active check cannot positively
+    // confirm a mover and stays silent — not a guess either way.
+    expect(commentCalls).toBe(1);
   });
 
   test("a status change alongside a label change is delivered normally, and crossDaemonSuppressed itself makes no extra call (only baseline seeding does)", async () => {
