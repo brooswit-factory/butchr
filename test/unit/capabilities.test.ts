@@ -23,8 +23,8 @@ const REF_OF: Record<(typeof CAPABILITY_PROVIDERS)[number], CapabilityRef> = {
 };
 
 describe("capabilitiesOf/supports: declaration truthfulness, one row per provider", () => {
-  test("jira-work-item: query, read, snapshot, comments and links — no createTask anywhere in this codebase", () => {
-    expect(capabilitiesOf(REF_OF["jira-work-item"])).toEqual(["query", "read", "snapshot", "comments", "links"]);
+  test("jira-work-item: query, read, comments and links — no createTask anywhere in this codebase; snapshot is false (FACTORY-27/814): createIssueEventRules is real poll/diff, but it's daemon-internal per-resource-type plumbing (EventRules<T>.poll via runResourceLoop), not a capabilities.ts-gated entry point any zero-provider-knowledge caller can invoke — same bar every other provider is held to", () => {
+    expect(capabilitiesOf(REF_OF["jira-work-item"])).toEqual(["query", "read", "comments", "links"]);
   });
   test("jira-project: query and links only — no dedicated getProject(key), no event-rules/poll wiring, no native project comments", () => {
     expect(capabilitiesOf(REF_OF["jira-project"])).toEqual(["query", "links"]);
@@ -35,10 +35,10 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   test("confluence-page: comments and links — no live query/read code, only a version-number change-token hook; comments is now wired (FACTORY-29/31) over AtlassianOps.getPageComments/commentOnPage, see comments.test.ts", () => {
     expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["comments", "links"]);
   });
-  test("github-issue: query, read, links and comments (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — no snapshot/diff wiring", () => {
+  test("github-issue: query, read, links and comments (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — createGithubIssueEventRules does real diff/notify, same shape as jira-work-item's own event rules, but same bar keeps snapshot false (FACTORY-27/814)", () => {
     expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links"]);
   });
-  test("github-pr: query, read, links and comments (FACTORY-57: mirrors github-issue's own capability row exactly) — no snapshot/diff wiring", () => {
+  test("github-pr: query, read, links and comments (FACTORY-57: mirrors github-issue's own capability row exactly) — createGithubPrEventRules likewise real but not capability-qualifying (FACTORY-27/814)", () => {
     expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "links"]);
   });
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
@@ -66,7 +66,7 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
  * and comments.test.ts); every `false` cell's reasoning is in the doc.
  */
 const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typeof CAPABILITIES)[number], boolean>> = {
-  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
+  "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
