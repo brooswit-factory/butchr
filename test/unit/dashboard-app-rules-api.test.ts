@@ -604,6 +604,26 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     }
   });
 
+  // FACTORY-846: same cross-contract proof, for the idle poke's three
+  // CONFIG-SURFACE-ONLY fields this ticket adds.
+  test("updateFields' real wire body for idlePokeMinutes/idlePokeMessage/idlePokeEnabled is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [FIRST_RULE_ID] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
+    await realRulesApi.updateFields(FIRST_RULE_ID, patch, "e1", "hash1", false);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...patch, ifMatch: "e1", planHash: "hash1", confirm: false });
+    const serverResult = validateRuleFieldPatch(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) expect(serverResult.patch).toEqual(patch);
+  });
+
   test("undo POSTs to /api/undo/:backupId with the id encoded", async () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {

@@ -137,6 +137,26 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
   // tri-state to carry here the way `permissionMode`/`model`/`effort` need —
   // the toggle always starts from the rule's own current, real value.
   const [draftRole, setDraftRole] = useState<AgentRole>(rule?.role ?? "worker");
+  // FACTORY-846 (review round 1): `RuleDto.idlePokeMinutes`/`idlePokeMessage`
+  // ARE nullable, same as `permissionMode`/`lizardMode` — `null` means this
+  // rule inherits the global `stalledMinutes`/today's existing wake text,
+  // which is NOT the same value as the epic's own 30-minute/default-text
+  // seed (`DEFAULT_IDLE_POKE_MINUTES`/`DEFAULT_IDLE_POKE_MESSAGE`,
+  // `../../../src/rules/rules.js`). So the draft starts EMPTY (never
+  // seeded with 30/the epic text) when the rule's own value is `null` —
+  // seeding it would silently pin that value on save even for an operator
+  // who touched nothing — and a `*Touched` flag (set only by this field's
+  // own `onInput`) tracks whether the operator actually typed into it, so
+  // `handleSaveIdlePoke` below sends ONLY the fields actually touched,
+  // never a value the operator never looked at.
+  const [draftIdlePokeMinutes, setDraftIdlePokeMinutes] = useState(rule?.idlePokeMinutes != null ? String(rule.idlePokeMinutes) : "");
+  const [idlePokeMinutesTouched, setIdlePokeMinutesTouched] = useState(false);
+  const [draftIdlePokeMessage, setDraftIdlePokeMessage] = useState(rule?.idlePokeMessage ?? "");
+  const [idlePokeMessageTouched, setIdlePokeMessageTouched] = useState(false);
+  // `idlePokeEnabled` is NEVER null on `RuleDto` (`parseRules` always
+  // resolves it) — no inherit-ambiguity to protect here, so it is always
+  // sent on save, same as `lizardMode` above.
+  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule?.idlePokeEnabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
@@ -259,6 +279,27 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
     if (!rule) return;
     const patch: RuleFieldPatch = { lizardMode: draftLizardMode, role: draftRole, ...(draftPermissionMode ? { permissionMode: draftPermissionMode } : {}) };
     startAction("save launch settings", patch, (planHash, confirm) => api.updateFields(rule.id, patch, sourceEtag, planHash, confirm));
+  }
+
+  /**
+   * FACTORY-846 (review round 1): the idle poke's own save button — kept
+   * SEPARATE from `handleSaveLaunchSettings` above (a different concern,
+   * permissions vs. the stall wake). `idlePokeMinutes`/`idlePokeMessage`
+   * are included ONLY when the operator actually touched that field this
+   * session (`idlePokeMinutesTouched`/`idlePokeMessageTouched`) — sending
+   * them unconditionally would silently pin the input's current value
+   * (even an untouched, empty-means-inherit one) onto the rule the moment
+   * ANY field in this section is saved, which is exactly the "saving the
+   * form pins 30 [or a stale value] silently" defect the review flagged.
+   * `idlePokeEnabled` has no inherit-ambiguity to protect (never `null` on
+   * the DTO), so it is always sent, same as `lizardMode` above.
+   */
+  function handleSaveIdlePoke() {
+    if (!rule) return;
+    const patch: RuleFieldPatch = { idlePokeEnabled: draftIdlePokeEnabled };
+    if (idlePokeMinutesTouched) patch.idlePokeMinutes = Number(draftIdlePokeMinutes);
+    if (idlePokeMessageTouched) patch.idlePokeMessage = draftIdlePokeMessage;
+    startAction("save idle poke settings", patch, (planHash, confirm) => api.updateFields(rule.id, patch, sourceEtag, planHash, confirm));
   }
 
   function handleEnable() {
@@ -558,6 +599,59 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
 
       <Button size="small" isDisabled={disabled} onPress={handleSaveLaunchSettings}>
         save launch settings
+      </Button>
+
+      <label htmlFor="first-rule-idle-poke-minutes-input">idle poke interval (minutes)</label>
+      {/* FACTORY-846 (review round 1): empty, with a placeholder, means
+          "inherits the global stalledMinutes" — the rule's real effective
+          threshold when `rule.idlePokeMinutes` is `null` — never seeded
+          with the epic's own 30, which is not that rule's effective value.
+          `onInput` also flips `idlePokeMinutesTouched`, so an operator who
+          never touches this field never has it included on save. */}
+      <input
+        id="first-rule-idle-poke-minutes-input"
+        type="number"
+        aria-label="idle poke interval (minutes)"
+        data-testid="first-rule-idle-poke-minutes-input"
+        placeholder="inherits butchr's global stall threshold"
+        value={draftIdlePokeMinutes}
+        onInput={(e) => {
+          setDraftIdlePokeMinutes((e.target as HTMLInputElement).value);
+          setIdlePokeMinutesTouched(true);
+        }}
+        disabled={disabled}
+      />
+
+      <label htmlFor="first-rule-idle-poke-message-input">idle poke message</label>
+      {/* Same inherit-via-empty-placeholder contract as the interval input above — empty means today's existing wake text applies, not the epic's own default string. */}
+      <input
+        id="first-rule-idle-poke-message-input"
+        type="text"
+        aria-label="idle poke message"
+        data-testid="first-rule-idle-poke-message-input"
+        placeholder="inherits today's existing wake text"
+        value={draftIdlePokeMessage}
+        onInput={(e) => {
+          setDraftIdlePokeMessage((e.target as HTMLInputElement).value);
+          setIdlePokeMessageTouched(true);
+        }}
+        disabled={disabled}
+      />
+
+      <label htmlFor="first-rule-idle-poke-enabled-toggle">idle poke enabled</label>
+      <span className="first-rule-idle-poke-toggle" title="whether this rule's tickets get a stall wake comment at all">
+        <Switch
+          id="first-rule-idle-poke-enabled-toggle"
+          data-testid="first-rule-idle-poke-enabled-toggle"
+          isSelected={draftIdlePokeEnabled}
+          isDisabled={disabled}
+          switchLabels={false}
+          aria-label="idle poke enabled"
+          onChange={(isSelected) => setDraftIdlePokeEnabled(isSelected)}
+        />
+      </span>
+      <Button size="small" isDisabled={disabled} onPress={handleSaveIdlePoke}>
+        save idle poke settings
       </Button>
 
       <Button size="small" variant="minimal" isDisabled={!rule || busy} onPress={() => setPreviewOpen(true)}>

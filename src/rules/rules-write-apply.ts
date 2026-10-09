@@ -115,6 +115,9 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
   if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
   if (patch.role !== undefined) next.role = patch.role;
+  if (patch.idlePokeMinutes !== undefined) next.idlePokeMinutes = patch.idlePokeMinutes;
+  if (patch.idlePokeMessage !== undefined) next.idlePokeMessage = patch.idlePokeMessage;
+  if (patch.idlePokeEnabled !== undefined) next.idlePokeEnabled = patch.idlePokeEnabled;
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {

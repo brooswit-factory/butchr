@@ -462,6 +462,20 @@ describe("writeRuleFields (PUT)", () => {
     expect(nextDoc.rules[0].permissionMode).toBe("default");
     expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
   });
+
+  test("FACTORY-846: edits idlePokeMinutes/idlePokeMessage/idlePokeEnabled, no confirm needed (never risky)", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].idlePokeMinutes).toBe(45);
+    expect(nextDoc.rules[0].idlePokeMessage).toBe("go check your ticket");
+    expect(nextDoc.rules[0].idlePokeEnabled).toBe(false);
+  });
 });
 
 describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true are never defaults — require confirm", () => {

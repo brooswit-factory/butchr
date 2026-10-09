@@ -96,6 +96,17 @@ export interface RuleDto {
   /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeContextCutoff`'s own doc comment). Display-only in this slice, same as `account`/`role` above. */
   resumeContextCutoff: number | null;
   /**
+   * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY
+   * for the idle poke. Unlike `permissionMode`/`lizardMode` above, never
+   * `null` — `Rule.idlePokeMinutes`/`idlePokeMessage`/`idlePokeEnabled` are
+   * always resolved to a concrete default server-side (see those fields'
+   * own doc comments, `../../../src/rules/rules.js`), so this DTO always
+   * carries a real value too. Nothing in the daemon reads these yet.
+   */
+  idlePokeMinutes: number;
+  idlePokeMessage: string;
+  idlePokeEnabled: boolean;
+  /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
    * `false` genuinely not staffed (`reason` says why), `null` COULD NOT
@@ -178,6 +189,10 @@ export interface RuleFieldPatch {
    */
   role?: AgentRole;
   agentPreferences?: RuleAgentPreferencePatch[];
+  /** FACTORY-846 — CONFIG SURFACE ONLY, never risky: no confirm is required for any of these three. */
+  idlePokeMinutes?: number;
+  idlePokeMessage?: string;
+  idlePokeEnabled?: boolean;
 }
 
 /** `POST /api/rules/plan`'s own patch shape — the SAME `RuleFieldPatch` plus the one extra field only the dedicated enable route (and this report-only plan) ever considers. */
@@ -424,6 +439,9 @@ interface ServerRuleEntry {
   lizardMode: boolean | null;
   resumeOnRespawn: boolean | null;
   resumeContextCutoff: number | null;
+  idlePokeMinutes: number | null;
+  idlePokeMessage: string | null;
+  idlePokeEnabled: boolean;
   staffed: boolean | null;
   whyUnstaffed: string | null;
 }
@@ -447,6 +465,9 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       lizardMode: r.lizardMode,
       resumeOnRespawn: r.resumeOnRespawn,
       resumeContextCutoff: r.resumeContextCutoff,
+      idlePokeMinutes: r.idlePokeMinutes,
+      idlePokeMessage: r.idlePokeMessage,
+      idlePokeEnabled: r.idlePokeEnabled,
       staffed: r.staffed,
       reason: r.whyUnstaffed,
     })),
@@ -619,6 +640,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: true,
         reason: null,
       },
@@ -635,6 +659,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: false,
         reason: "disabled",
       },
@@ -651,6 +678,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: true,
         resumeOnRespawn: false,
         resumeContextCutoff: 50_000,
+        idlePokeMinutes: 15,
+        idlePokeMessage: null,
+        idlePokeEnabled: false,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
@@ -667,6 +697,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
       },
@@ -899,6 +932,9 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         permissionMode: patch.permissionMode ?? rule.permissionMode,
         lizardMode: patch.lizardMode ?? rule.lizardMode,
         role: patch.role ?? rule.role,
+        idlePokeMinutes: patch.idlePokeMinutes ?? rule.idlePokeMinutes,
+        idlePokeMessage: patch.idlePokeMessage ?? rule.idlePokeMessage,
+        idlePokeEnabled: patch.idlePokeEnabled ?? rule.idlePokeEnabled,
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
