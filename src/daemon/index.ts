@@ -3234,6 +3234,16 @@ const projectType = createJiraProjectResourceType({
   comments: (key) => atlassian.comments(key),
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
+  // FACTORY-981 (story FACTORY-979): the same debounce/cap config and
+  // `/health` counters the issue tier's own `ruleResourceType` above
+  // already threads through for its blocked/stalled boss wake — one global
+  // config surface, not a second one for this provider (per the ticket's
+  // own instruction).
+  blockedWakeDebounceMinutes: config.blockedWakeDebounceMinutes,
+  stalledWakeDebounceMinutes: config.stalledWakeDebounceMinutes,
+  stalledWakeMaxPerHour: config.stalledWakeMaxPerHour,
+  onStalledWake: () => { stalledWakes++; },
+  onStalledWakeCapped: () => { stalledWakesCapped++; },
   log: (line) => console.error(`  [jira-project] ${line}`),
 });
 // FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
@@ -3257,9 +3267,14 @@ projectType.discovery.search = async () => {
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,
-  // Free-form: no notification concept (eventRules.poll always reports no
-  // changes — see jira-project-type.ts), and no respawn ticket to comment on.
-  notify: async () => {},
+  // FACTORY-981 (story FACTORY-979): `eventRules.poll` no longer always
+  // reports zero changes — it now also drives the blocked/stalled
+  // project-manager wake (jira-project-type.ts's own `toProjectResource`
+  // adapter over `createProjectEventRules`), so this is the SAME
+  // `notifyRuleAgent` the issue tier's own `ruleResourceType` wiring above
+  // uses, not a no-op. Still no respawn ticket to comment on — `onRespawn`
+  // below is unaffected.
+  notify: notifyRuleAgent,
   onRespawn: async (id, reason) => { console.error(`  [jira-project] ${id} respawned: ${reason}`); },
   // No labels to sync; the only per-poll bookkeeping is retiring MCP
   // connections for agents that dropped out of this poll's matches. The

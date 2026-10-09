@@ -1086,7 +1086,8 @@ export async function advanceProjectWatermark(
 }
 
 /** `project = "KEY-123"` -> `"KEY"`. Project keys never contain a hyphen (`PROJECT_ID_RE`, src/resources/id.ts) so the first split segment is always the whole prefix. */
-const projectKeyOfIssue = (key: string): string => key.split("-", 1)[0]!;
+/** FACTORY-981: exported so `src/rules/jira-project-type.ts` can group its own blocked/stalled JQL results per project without a second implementation of this split — the same "one reader, not two" discipline this file already applies elsewhere (e.g. `unseenIds`). */
+export const projectKeyOfIssue = (key: string): string => key.split("-", 1)[0]!;
 
 export interface ProjectResourceDeps {
   ops: AtlassianOps;
