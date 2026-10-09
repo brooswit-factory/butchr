@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createIssueEventRules, createIssueResourceType, ISSUE_ACTIVATION, ISSUE_JQL } from "../../src/resources/issue.js";
+import { AtlassianHttpError } from "../../src/atlassian/client.js";
 import { standDownSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import { createStandDownRegistry } from "../../src/agents/stand-down.js";
 import { createCrashLoopDetector } from "../../src/agents/crash-loop.js";
@@ -162,6 +163,29 @@ describe("BUTCHR-307: a rejected comments() call while asleep fails TOWARD wakin
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
     expect(verdict.deliver).toBe(true); // cannot verify "nothing new" -> wakes rather than risks a silent lost wake
+    expect(sd.isAsleep("KAN-1")).toBe(false);
+  });
+
+  // FACTORY-922 (PR #732 review round 1, non-blocking item): a DELIBERATE
+  // carve-out from "a poll that could not check must NOT notify" — that
+  // rule is scoped to an AWAKE watcher (the noise FACTORY-921 measures).
+  // An ASLEEP watcher keeps the pre-existing BUTCHR-307 fail-toward-waking
+  // contract untouched, routed through `finalize()` exactly as before this
+  // ticket — pinned here against the literal reason shape `decide()` now
+  // hands it (`{ undetermined: "check-failed" }`), for both a genuine
+  // failure and a load-shed (429) skip; both carve out the same way.
+  test("FACTORY-922: a skipped/failed §3D check while asleep still wakes, named `{ undetermined: \"check-failed\" }` — the carve-out is deliberate, not an oversight", async () => {
+    const sd = newRegistry();
+    sd.standDown("KAN-1", new Map([["KAN-1", ["100"]]]));
+    const rules = createIssueEventRules({
+      comments: async () => { throw new AtlassianHttpError(429, "GET", "/rest/api/3/issue/KAN-1/comment", "rate limited"); },
+      standDown: sd,
+    });
+    const before = issue({ updated: "2026-01-01T00:00:00.000Z" });
+    const after = issue({ updated: "2026-01-01T00:05:00.000Z" }); // only `updated` moved — no structural diff
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
+    expect(verdict).toEqual({ deliver: true, reason: { undetermined: "check-failed" } });
     expect(sd.isAsleep("KAN-1")).toBe(false);
   });
 });

@@ -1107,7 +1107,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports()),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -2031,6 +2031,10 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
 };
 
+// FACTORY-922: lifetime count of `decide()`'s skip-not-notify fallback —
+// see `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+let commentChecksSkipped = 0;
+
 const ruleResourceType = createRuleResourceType({
   rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
@@ -2043,6 +2047,9 @@ const ruleResourceType = createRuleResourceType({
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
+  // FACTORY-922: the `/health` counter's one writer — see
+  // `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+  onCommentCheckSkipped: () => { commentChecksSkipped++; },
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see
