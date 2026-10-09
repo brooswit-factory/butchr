@@ -314,11 +314,15 @@ export interface ViewDeps {
    * own read: every owner->targets entry in the butchr-managed FILE link
    * store (`../resources/link-store.ts`'s `listAllFileLinks`), parsed to
    * `ResourceRef`s. No secrets here (links are never secret-shaped), so
-   * unlike `settings` below this is never redacted. Read FRESH every
-   * request, same discipline as `configInventory`/`rulesFileState`.
-   * Optional: an omitted value makes `GET /api/links` answer 503, never
-   * open with an empty list (which would look identical to "no links
-   * exist" and silently hide a misconfiguration).
+   * unlike `settings` below this is never redacted — but a link entry can
+   * name a local filesystem path, so the ROUTE itself still sits behind the
+   * dashboard-origin + same-UID peer guard (review round 1: a config-read
+   * this sensitive never gets a looser check just because `configInventory`
+   * happens to have none). Read FRESH every request, same discipline as
+   * `configInventory`/`rulesFileState`. Optional: an omitted value makes
+   * `GET /api/links` answer 503, never open with an empty list (which
+   * would look identical to "no links exist" and silently hide a
+   * misconfiguration).
    */
   linksRead?: () => FileLinksEntry[];
   /**
@@ -1389,12 +1393,20 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       return outcome;
     })
     // FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`:
-    // every owner->targets entry in the butchr-managed link store, secrets
-    // never apply here. No write guard (a plain read, same discipline
-    // `GET /config-inventory` already follows — see `ViewDeps.linksRead`'s
-    // own doc comment).
-    .get("/api/links", ({ set }) => {
+    // every owner->targets entry in the butchr-managed link store. Same
+    // guard discipline as `GET /api/daemon/logs`/`GET /api/agents/:issue`
+    // above (dashboard-origin guard + same-UID peer check, checked BEFORE
+    // any work, `Cache-Control: no-store`) — a link entry can name a local
+    // filesystem path, so this read is at least as sensitive as those.
+    .get("/api/links", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.linksRead) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
       return {
         links: deps.linksRead().map((entry) => ({
           owner: formatResourceRef(entry.owner),

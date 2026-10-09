@@ -137,25 +137,66 @@ for (const rc of ROUTE_CASES) {
   });
 }
 
+// GET /api/links sits behind the dashboard-origin + same-UID peer guard
+// (review round 1 blocking finding 1) — NOT the full write guard (a GET has
+// no body, so no Content-Type/CSRF check applies), same discipline
+// `GET /api/daemon/logs`/`GET /api/agents/:issue` already follow.
+function readGuardDeps(peerOk = true) {
+  return { dashboardOriginGuard: { port: 0 }, peerUidCheck: () => peerOk };
+}
+
+const FAKE_LINKS_ENTRY = {
+  owner: { provider: "jira-work-item", key: "BUTCHR-1" } as any,
+  targets: [{ provider: "github-issue", owner: "o", repo: "r", number: 1 } as any],
+};
+
+describe("GET /api/links — write guard go-red cases", () => {
+  test("no Origin: 403, linksRead never called", async () => {
+    let called = false;
+    const { app, host, port } = startApp({ ...readGuardDeps(), linksRead: () => { called = true; return [FAKE_LINKS_ENTRY]; } });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/links`, { headers: { host } });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("wrong Origin (forged): 403, linksRead never called", async () => {
+    let called = false;
+    const { app, host, port } = startApp({ ...readGuardDeps(), linksRead: () => { called = true; return [FAKE_LINKS_ENTRY]; } });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/links`, { headers: { origin: "http://evil.example", host } });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("failing peer-UID check: 403, linksRead never called", async () => {
+    let called = false;
+    const { app, origin, host, port } = startApp({ ...readGuardDeps(false), linksRead: () => { called = true; return [FAKE_LINKS_ENTRY]; } });
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/links`, { headers: { origin, host } });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+});
+
 describe("GET /api/links — behavior", () => {
   test("not configured (no linksRead): 503", async () => {
-    const { app, port } = startApp({});
+    const { app, origin, host, port } = startApp(readGuardDeps());
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/links`);
+      const res = await fetch(`http://127.0.0.1:${port}/api/links`, { headers: { origin, host } });
       expect(res.status).toBe(503);
     } finally { await app.stop(true); }
   });
 
-  test("returns every owner->targets entry, formatted as canonical strings, no guard required", async () => {
-    const { app, port } = startApp({
-      linksRead: () => [{
-        owner: { provider: "jira-work-item", key: "BUTCHR-1" } as any,
-        targets: [{ provider: "github-issue", owner: "o", repo: "r", number: 1 } as any],
-      }],
-    });
+  test("all guards pass: returns every owner->targets entry, formatted as canonical strings, Cache-Control: no-store", async () => {
+    const { app, origin, host, port } = startApp({ ...readGuardDeps(), linksRead: () => [FAKE_LINKS_ENTRY] });
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/links`);
+      const res = await fetch(`http://127.0.0.1:${port}/api/links`, { headers: { origin, host } });
       expect(res.status).toBe(200);
+      expect(res.headers.get("cache-control")).toBe("no-store");
       const body = await res.json();
       expect(body).toEqual({ links: [{ owner: "jira-work-item:BUTCHR-1", targets: ["github-issue:o/r#1"] }] });
     } finally { await app.stop(true); }
@@ -418,6 +459,34 @@ describe("write rate limiting, shared across the links write routes", () => {
       expect(second.status).toBe(429);
       expect(second.headers.get("retry-after")).toBeTruthy();
       expect(readFileSync(path, "utf8")).toBe(afterFirst);
+    } finally { await app.stop(true); }
+  });
+
+  test("POST /api/links/remove: first write lands, second is 429 with Retry-After, file stays as the first write left it", async () => {
+    // Pre-seed two links directly on disk (never through the rate-limited
+    // route) so neither write below spends budget on setup.
+    writeFileSync(path, `${JSON.stringify({ v: 1, links: { "jira-work-item:BUTCHR-1": ["github-issue:owner/repo#1"], "jira-work-item:BUTCHR-2": ["webpage:https://example.com/x"] } }, null, 2)}\n`);
+    const csrf = createCsrfTokenIssuer();
+    const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
+    const { app, origin, host, port } = startApp(realDeps(csrf, writeRateLimit));
+    try {
+      const first = await fetch(`http://127.0.0.1:${port}/api/links/remove`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ resource: "jira-work-item:BUTCHR-1", target: "github-issue:owner/repo#1" }),
+      });
+      expect(first.status).toBe(200);
+      const afterFirst = readFileSync(path, "utf8");
+      expect(JSON.parse(afterFirst).links["jira-work-item:BUTCHR-1"]).toBeUndefined();
+      expect(JSON.parse(afterFirst).links["jira-work-item:BUTCHR-2"]).toEqual(["webpage:https://example.com/x"]);
+
+      // This WOULD remove the second link if the limiter were bypassed.
+      const second = await fetch(`http://127.0.0.1:${port}/api/links/remove`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ resource: "jira-work-item:BUTCHR-2", target: "webpage:https://example.com/x" }),
+      });
+      expect(second.status).toBe(429);
+      expect(second.headers.get("retry-after")).toBeTruthy();
+      expect(readFileSync(path, "utf8")).toBe(afterFirst); // BUTCHR-2's link still present, not removed
     } finally { await app.stop(true); }
   });
 
