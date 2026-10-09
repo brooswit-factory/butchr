@@ -86,7 +86,14 @@ import { RateCap, HOUR_MS, type CommentRow } from "./escalation-helper.js";
  * is not literally "In Review" but has just posted a complete status and
  * correctly parked is caught the same way) — see this story's own PR body
  * for the FACTORY-836 (23:28 status, poked 11 minutes later) fixture this
- * gate is built to suppress.
+ * gate is built to suppress. The verdict is memoized on the per-episode
+ * `Entry` (`accountedFor`) the first time it's found `true`: comments only
+ * ever accumulate within an episode, so a later poll in the SAME episode
+ * can never un-find one, and re-fetching every ~15s poll for as long as a
+ * parked ticket stays idle is exactly the mass-idle fetch cost
+ * silent-stop.ts avoids by gating BEFORE any fetch ([review]
+ * CHANGES_REQUESTED on this story's own PR). Dry-run's `would poke` log
+ * line is memoized the same way (`dryRunLogged`) for the identical reason.
  *
  * GUARD 4 (restart/herdr-reconnect suppression) and THE 90-SECOND TRAP:
  * this module keeps its OWN `lastInvokedAt`/`lastDiscontinuityAt` pair,
@@ -222,6 +229,23 @@ export function idlePokeComment(issue: string, text: string, elapsedMinutes: num
 interface Entry {
   streakStart: number;
   pokedAt?: number;
+  /**
+   * Guard 6's verdict, memoized for the episode once observed `true`
+   * (`[review] CHANGES_REQUESTED` on this story's PR — see this module's
+   * own PR body for the fix). Comments only ever ACCUMULATE within an
+   * episode (the own-identity comment this gate looks for cannot un-post
+   * itself), so once a poll finds one, every later poll in the SAME
+   * episode is accounted for too, without re-fetching. Never set `false`
+   * — only ever left `undefined` (not yet observed) or set `true`.
+   */
+  accountedFor?: true;
+  /**
+   * Guard: dry-run's `would poke` line is a per-EPISODE decision log, not
+   * a per-POLL one — without this latch, a parked (never-accounted-for)
+   * candidate logs the same line every ~15s poll for as long as it stays
+   * idle in dry-run mode (the default).
+   */
+  dryRunLogged?: true;
 }
 
 export interface IdlePokeCheckInput {
@@ -316,7 +340,15 @@ export function createIdlePokeEngine(deps: IdlePokeDeps): IdlePokeEngine {
     // predicate silent-stop.ts uses (`[${issue}] ` prefix, an unparseable
     // `created` fails toward "accounted for" — the safe direction for a
     // dry-run-first feature, same reasoning as stalled.ts/silent-stop.ts's
-    // own `catch`/`NaN` handling).
+    // own `catch`/`NaN` handling). Memoized on `e.accountedFor` once found
+    // (see Entry's own doc comment): without this, a parked ticket that
+    // already posted its own-identity comment costs one `comments()` fetch
+    // EVERY ~15s poll for as long as it stays idle — exactly the
+    // mass-idle fetch cost silent-stop.ts itself avoids by gating BEFORE
+    // any fetch (`[review] CHANGES_REQUESTED` on this PR).
+    if (e.accountedFor) {
+      return { kind: "skipped", issue, reason: "own-identity comment postdates the start of this idle episode — correctly waiting, not silent (cached)" };
+    }
     let rows: readonly CommentRow[];
     try {
       rows = await deps.comments(issue);
@@ -332,6 +364,7 @@ export function createIdlePokeEngine(deps: IdlePokeDeps): IdlePokeEngine {
       return Number.isNaN(createdAt) || createdAt >= streakStart;
     });
     if (accountedFor) {
+      e.accountedFor = true;
       return { kind: "skipped", issue, reason: "own-identity comment postdates the start of this idle episode — correctly waiting, not silent" };
     }
 
@@ -355,7 +388,14 @@ export function createIdlePokeEngine(deps: IdlePokeDeps): IdlePokeEngine {
     const text = input.ruleConfig?.idlePokeMessage ?? deps.defaultMessage;
 
     if (deps.dryRun) {
-      log(`[idle-poke] would poke ${issue} (idle ${elapsedMinutes}m, threshold ${minutes}m)`);
+      // Logged once per EPISODE (`e.dryRunLogged`), not once per poll —
+      // dry-run is the default, so without this latch a never-accounted-
+      // for candidate logs the same "would poke" line every ~15s poll for
+      // as long as it stays idle (same review comment as guard 6 above).
+      if (!e.dryRunLogged) {
+        e.dryRunLogged = true;
+        log(`[idle-poke] would poke ${issue} (idle ${elapsedMinutes}m, threshold ${minutes}m)`);
+      }
       return { kind: "suppressed", issue, reason: "dry-run" };
     }
 

@@ -164,6 +164,33 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
     const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
     expect(out.kind).toBe("poked");
   });
+
+  // [review] CHANGES_REQUESTED on this story's PR: without memoizing the
+  // verdict, a parked ticket (already accounted for) costs one
+  // `comments()` fetch EVERY poll for as long as it stays idle. Comments
+  // only ever accumulate within an episode, so the verdict can never flip
+  // back once found.
+  test("comments() is fetched once per episode, not once per poll, once accounted-for", async () => {
+    let calls = 0;
+    let now = 11 * MIN;
+    const { deps } = makeDeps({
+      dryRun: false,
+      now: () => now,
+      comments: async () => {
+        calls++;
+        return [{ id: "c1", body: "[KAN-1] status: done, links, left, next owner", created: new Date(0).toISOString() }];
+      },
+    });
+    const engine = createIdlePokeEngine(deps);
+    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    expect(first.kind).toBe("skipped");
+    expect(calls).toBe(1);
+    now = 12 * MIN;
+    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    expect(second.kind).toBe("skipped");
+    expect((second as { reason: string }).reason).toContain("cached");
+    expect(calls).toBe(1);
+  });
 });
 
 describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
@@ -283,6 +310,22 @@ describe("createIdlePokeEngine: dry-run", () => {
     const out = await engine.check("KAN-1", { streakStart: 0, status: "In Review" });
     expect(out.kind).toBe("skipped");
     expect(log.some((l) => l.includes("would poke"))).toBe(false);
+  });
+
+  // [review] CHANGES_REQUESTED on this story's PR: dry-run never latches,
+  // so a candidate re-logs "would poke" every poll for as long as it
+  // stays idle in dry-run mode (the default). The decision is per
+  // EPISODE, not per poll.
+  test("'would poke' is logged once per episode, not once per poll", async () => {
+    let now = 10 * MIN;
+    const { deps, log } = makeDeps({ dryRun: true, now: () => now });
+    const engine = createIdlePokeEngine(deps);
+    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    expect(first.kind).toBe("suppressed");
+    now = 11 * MIN;
+    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    expect(second.kind).toBe("suppressed");
+    expect(log.filter((l) => l.includes("[idle-poke] would poke KAN-1")).length).toBe(1);
   });
 });
 
