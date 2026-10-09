@@ -2812,6 +2812,70 @@ describe("resumeInPlace", () => {
     });
   });
 
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): the spawn-path
+  // resume decision, driven through the REAL `HerdrHerd.spawn()` ->
+  // `tryClaudeResume()` path — a fake herdr client only at the RPC
+  // boundary. UNLIKE the FACTORY-314 test immediately above (an ordinary
+  // fresh spawn, which DOES go through the real `ManagedHerdrLifecycle`),
+  // this path deliberately bypasses it — see `tryClaudeResume`'s own doc
+  // comment (src/agents/herd.ts) for why Drovr's own `ManagedAgentLaunch`/
+  // `buildAgentStartParams` has no session-id/resume concept at all, so
+  // `pane.processInfo` is stubbed here (not provided by the shared
+  // `fakeHerdr` fixture) for the post-launch liveness check
+  // `tryClaudeResume` performs before trusting a herdr-accepted launch.
+  test("FACTORY-916: an unintended-stop respawn with a persisted session id and its transcript under cutoff launches with --resume <id>, never rediscovers, and leaves the persisted id untouched", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-resume-"));
+      try {
+        const priorId = "prior-conversation-id";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "{}"); // pre-existing — this launch must never overwrite or discover a NEW one
+        const f = fakeHerdr([]); // no live agent — this is the respawn's own fresh launch
+        f.client.pane.processInfo = async () => ({ process_info: { pane_id: "w9:p1", foreground_processes: [{ pid: 1, argv: ["claude", "--resume", priorId], name: "claude" }] } });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).toContain("--resume");
+        expect(f.started[0]!.args[f.started[0]!.args.indexOf("--resume") + 1]).toBe(priorId);
+        expect(workspaceSessionId(cwd)).toBe(priorId); // untouched — never invalidated, never "rediscovered" into something else
+        expect(herd.lastFreshSpawnResumed(key)).toBe(true); // read-once signal the daemon's respawn-resumed comment hook relies on
+        expect(herd.lastFreshSpawnResumed(key)).toBe(false); // ...and only once
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-916: the flag-off / intentional-stop / missing-transcript /
+  // over-cutoff fallback outcomes are all covered directly against
+  // `decideRespawnResume` itself (test/unit/respawn-resume-decision.test.ts)
+  // — this is the one "does the fallback reach a REAL spawn correctly"
+  // check: no persisted session id at all is the simplest fallback to
+  // drive through the real path, and must behave EXACTLY like the
+  // pre-FACTORY-916 "no id to discover from" case the FACTORY-314 test
+  // above already covers (no `--resume`, no `--session-id`) — going through
+  // the real `ManagedHerdrLifecycle`-based `startProviders`, never
+  // `tryClaudeResume` (which returns `undefined` before touching herdr at
+  // all when `decideRespawnResume` has no id to resume with).
+  test("FACTORY-916: no persisted session id at all -> an ordinary fresh spawn, no --resume, same as pre-FACTORY-916 behaviour", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const f = fakeHerdr([]); // this launch's own discovery finds nothing — no transcript is ever written by this fake
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+      expect(f.started).toHaveLength(1);
+      expect(f.started[0]!.args).not.toContain("--resume");
+      expect(herd.lastFreshSpawnResumed(key)).toBe(false);
+    });
+  });
+
   // FACTORY-720 (PR #678 review, BLOCKING): `reportPersistedAgentSessions`
   // (./report-agent-sessions.ts) reports a persisted id to herdr only ONCE,
   // at daemon startup. Without ALSO reporting at the point `spawn()` itself

@@ -134,6 +134,7 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
       providerOf: async () => null,
       resumeInPlace: async () => "unresumable",
       lastResumeFailureDetail: () => undefined,
+      lastFreshSpawnResumed: () => false,
     };
     const scoped = scopedHerd(full, () => true);
     const dropped = Object.keys(full).filter((k) => typeof (scoped as unknown as Record<string, unknown>)[k] !== "function");
@@ -185,6 +186,43 @@ describe("reconcileNow", () => {
     expect(herd.spawned).toEqual(["NEW"]);
     expect(herd.stopped).toEqual(["OLD"]);
     expect([...herd.running].sort()).toEqual(["KEEP", "NEW"]);
+  });
+
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): `issue` here is
+  // `desired` but NOT `running` at all — the `admitted`/`plan.spawn` loop,
+  // never `plan.respawn`'s stale-argv loop (which only ever sees an agent
+  // that WAS running) — i.e. exactly the "daemon respawns a worker after an
+  // unintended stop" shape this epic's outcome describes. `onRespawnResumed`
+  // must fire from THIS loop too, not only the stale-argv one: a genuine
+  // crash-respawn that resumed its prior session would otherwise get no
+  // ticket notice at all, since this loop never calls `opts.onRespawn` in
+  // the first place (a brand-new "first ever spawn" needs no "your session
+  // was X" notice) for `onRespawnResumed` to piggyback onto.
+  test("FACTORY-916: a plain spawn (desired but not running) that resumed its prior session fires onRespawnResumed, never onRespawn", async () => {
+    const herd = fakeHerd([]) as Herd & { spawned: string[]; stopped: string[]; running: Set<string>; lastFreshSpawnResumed?: (issue: string) => boolean };
+    herd.lastFreshSpawnResumed = (issue: string) => issue === "NEW";
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const resumed: string[] = []; const respawns: Array<{ issue: string }> = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      onRespawnResumed: (issue) => { resumed.push(issue); },
+      onRespawn: (issue) => { respawns.push({ issue }); },
+    });
+    expect(herd.spawned).toEqual(["NEW"]);
+    expect(resumed).toEqual(["NEW"]);
+    expect(respawns).toEqual([]); // onRespawn is for the stale-argv loop's own respawns, never this one
+  });
+
+  test("FACTORY-916: lastFreshSpawnResumed absent (an older/fake Herd) → an ordinary spawn fires neither onRespawnResumed nor onRespawn", async () => {
+    const herd = fakeHerd([]);
+    const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
+    const resumed: string[] = []; const respawns: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      onRespawnResumed: (issue) => { resumed.push(issue); },
+      onRespawn: (issue) => { respawns.push(issue); },
+    });
+    expect(herd.spawned).toEqual(["NEW"]);
+    expect(resumed).toEqual([]);
+    expect(respawns).toEqual([]);
   });
 
   test("a stale-but-desired issue is stopped then spawned fresh, and onRespawn fires once with its reason + observed argv", async () => {
