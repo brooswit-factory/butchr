@@ -357,6 +357,29 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
   // that always delivers rather than suppresses on an unknown baseline;
   // seeding is what keeps a ledger hit from ever meeting that case.
   const commentCursor = new Map<string, string | null>();
+  // FACTORY-922 REVIEW FIX (PR #732 round 1 — BLOCKING): `commentCursor`
+  // alone does NOT retain "the snapshot" the ticket's own fix (1) promises.
+  // `decide()` is only ever invoked for a key that `changedPrimary`/
+  // `changedRelated` names, which `changedKeys` derives purely from THIS
+  // poll's own (prev, next) pair — a key whose §3D check was skipped/failed
+  // this poll, with nothing ELSE about it moving on a LATER poll, produces
+  // an IDENTICAL (prev, next) pair on that later poll (prev is literally
+  // this poll's own `next`, carried forward by the loop) and so never even
+  // reaches `decide()` again: `changedKeys` sees no diff and `commentCursor`
+  // is never consulted. A foreign comment whose check failed/was shed is
+  // therefore lost forever unless some UNRELATED field happens to change
+  // later — exactly the "lost change" fix (1) forbids, not an edge case.
+  // `pendingRecheck` closes that gap: a key added here is force-included in
+  // `changedPrimary`/`changedRelated` below on EVERY later poll (even one
+  // with an otherwise content-identical diff) until its check genuinely
+  // resolves — removed the moment ANY `fetchComments(key)` call this poll
+  // succeeds (see `fetchComments`'s own success branch), regardless of
+  // which arm made that call: a successful fetch is a fresh, authoritative
+  // read of the ticket's comments, which resolves the pending uncertainty
+  // whether or not THIS poll's own arm is the one that ends up naming it
+  // (the existing KAN-838 "fold" precedent already accepts this for other
+  // arms' own cursor advances — see ledgerHitSuppressed's own doc comment).
+  const pendingRecheck = new Set<string>();
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedResource<JiraIssue>[], key: string) => list.find((r) => r.issue.key === key)?.issue;
@@ -415,6 +438,12 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             if (!deps.comments) return { ok: false as const, reason: "failed" as const };
             try {
               const comments = excludeBookkeepingComments(await deps.comments(key));
+              // FACTORY-922 REVIEW FIX: a successful fetch is a fresh,
+              // authoritative read — it resolves `pendingRecheck` for this
+              // key regardless of which arm made the call (see
+              // `pendingRecheck`'s own doc comment above for why that's
+              // correct, not merely convenient).
+              pendingRecheck.delete(key);
               return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
             } catch (err) {
               const reason: SkippedCommentCheckReason = err instanceof AtlassianHttpError && (err.status === 429 || err.status >= 500) ? "load" : "failed";
@@ -794,9 +823,26 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         return verdict;
       };
 
+      // FACTORY-922 REVIEW FIX: force a key with an outstanding, unresolved
+      // §3D check back through `decide()` even when THIS poll's own
+      // (prev, next) pair for it shows no diff at all — see
+      // `pendingRecheck`'s own doc comment above for why `changedKeys`
+      // alone can never do this (it only ever compares one poll's own pair,
+      // and a skipped-check poll's own `next` becomes the NEXT poll's
+      // `prev` unchanged). Only a key still present in `next` is forced in:
+      // one that disappeared is already named by `changedKeys` itself
+      // (the "goneKey" branch), and `decide()`'s own `!after` early return
+      // clears `pendingRecheck` for it (see below) rather than retrying a
+      // key that no longer exists.
+      const withPendingRecheck = (changed: readonly string[], nextKeys: readonly string[]): string[] =>
+        pendingRecheck.size === 0 ? [...changed] : [...new Set([...changed, ...nextKeys.filter((k) => pendingRecheck.has(k))])].sort();
+
       return {
-        changedPrimary: changedKeys(prev.primary, next.primary),
-        changedRelated: changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)),
+        changedPrimary: withPendingRecheck(changedKeys(prev.primary, next.primary), next.primary.map((i) => i.key)),
+        changedRelated: withPendingRecheck(
+          changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)),
+          next.related.map((r) => r.issue.key),
+        ),
         async decide(key: string, watcher: string, space: "primary" | "related"): Promise<EventVerdict> {
           const before = space === "primary" ? issueOf(prev.primary, key) : relatedIssueOf(prev.related, key);
           const after = space === "primary" ? issueOf(next.primary, key) : relatedIssueOf(next.related, key);
@@ -855,7 +901,11 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // outright: there is nothing to look up, only a key's presence on
           // either side of the snapshot pair.
           if (!before) return finalize(key, watcher, { deliver: true, reason: { appeared: true } });
-          if (!after) return finalize(key, watcher, { deliver: true, reason: { disappeared: true } });
+          // FACTORY-922 REVIEW FIX: a gone key has nothing left to retry a
+          // §3D check against — clear it rather than force-including it in
+          // `changedPrimary`/`changedRelated` forever (`pendingRecheck`'s
+          // own doc comment above).
+          if (!after) { pendingRecheck.delete(key); return finalize(key, watcher, { deliver: true, reason: { disappeared: true } }); }
           const verdict = await suppressed(key, before, after, watcher);
           if (verdict.suppressed) return { deliver: false };
           // BUTCHR-87: a delivery that escaped suppression BECAUSE the
@@ -966,8 +1016,29 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           const result = await fetchComments(key);
           const asleep = Boolean(deps.standDown?.isAsleep(watcher));
           if (!result.ok) {
-            deps.onCommentCheckSkipped?.(key, result.reason);
-            log(skippedCommentCheckLine(key, result.reason));
+            // RATE-LIMITED (ticket's own item 4 wording): log/count once per
+            // UNRESOLVED EPISODE for this key, not once per (poll, watcher)
+            // pair — `pendingRecheck.has(key)` is already true for every
+            // later retry of the SAME still-failing key (including a
+            // second watcher consulting it in this SAME poll, via the
+            // shared `fetchComments` memo), so only the episode's first
+            // sighting ever logs/counts. A key that later resolves, then
+            // fails again, is a NEW episode and logs/counts again.
+            const alreadyPending = pendingRecheck.has(key);
+            // FACTORY-922 REVIEW FIX (PR #732 round 1): mark this key for a
+            // forced retry on a LATER poll even if nothing else about it
+            // ever changes again — see `pendingRecheck`'s own doc comment.
+            // Set for BOTH branches below: an asleep watcher's own
+            // fail-toward-waking wake (right below) answers "does THIS
+            // watcher need waking right now", a narrower question than
+            // "has the §3D check for this KEY actually been confirmed" —
+            // a second awake watcher of the same key (or this same watcher
+            // on a later poll) still needs the retry.
+            pendingRecheck.add(key);
+            if (!alreadyPending) {
+              deps.onCommentCheckSkipped?.(key, result.reason);
+              log(skippedCommentCheckLine(key, result.reason));
+            }
             if (!asleep) return { deliver: false };
             return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
           }

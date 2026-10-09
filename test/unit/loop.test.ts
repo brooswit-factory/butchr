@@ -2670,6 +2670,44 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
     expect(logLines.some((l) => l === "[poll] skipped-comment-check key=K reason=failed retained-snapshot")).toBe(true);
   });
 
+  // PR #732 round-1 review (BLOCKING): the test above's own idx3 carries an
+  // UNRELATED `agent:working -> agent:idle` flip, which is what actually
+  // triggers the successful re-check — it does not prove the snapshot
+  // itself was retained, only that SOME later structural change eventually
+  // reconfirms. This test is the one the review asked for: idx3 carries
+  // NO other change at all (same `updated` as idx2, nothing else moved) —
+  // `changedKeys` alone would see NO diff and never even call `decide()`
+  // again. Only `pendingRecheck` (src/resources/issue.ts) forces this key
+  // back through `decide()` on a content-identical poll; without it, this
+  // comment is lost forever, exactly the defect the review caught.
+  test("FALSIFIER (PR #732 review round 1): a skipped check's own key is force-rechecked on a LATER poll with NO other change at all — the comment is not lost", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    let pollIndex = 0;
+    const comments = async () => {
+      if (pollIndex === 1) return [comment("c0")]; // idx1: K appears, baseline seed
+      if (pollIndex === 2) throw new Error("transient Jira error"); // idx2: the check this poll genuinely fails
+      return [comment("c1"), comment("c0")]; // idx3+: the SAME real mover, at last confirmable — nothing else about K ever changes
+    };
+    // idx3 is byte-for-byte identical to idx2 (`mk("t2")` both times) — no
+    // status/label/summary/updated difference whatsoever.
+    const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")], [mk("t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // delivered exactly once, from the forced re-check — never lost, never duplicated
+  });
+
   test("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
