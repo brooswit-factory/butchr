@@ -48,6 +48,9 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     lizardMode: null,
     resumeOnRespawn: null,
     resumeContextCutoff: null,
+    idlePokeMinutes: null,
+    idlePokeMessage: null,
+    idlePokeEnabled: true,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -421,6 +424,9 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               lizardMode: true,
               resumeOnRespawn: false,
               resumeContextCutoff: 50000,
+              idlePokeMinutes: 30,
+              idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down",
+              idlePokeEnabled: true,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -437,7 +443,12 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000, staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{
+      id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [],
+      permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000,
+      idlePokeMinutes: 30, idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down", idlePokeEnabled: true,
+      staffed: false, reason: "disabled",
+    }]);
   });
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
