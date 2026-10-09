@@ -32,12 +32,22 @@ const issue = (over: Partial<JiraIssue> = {}): JiraIssue => ({
   ...over,
 });
 
-/** A tiny in-memory comment store, keyed by ticket, newest-first — enough for `deps.comments` and the stand-down registry's own reads. */
+/**
+ * A tiny in-memory comment store, keyed by ticket, newest-first — enough for
+ * `deps.comments` and the stand-down registry's own reads. `bodies` (id ->
+ * text, FACTORY-954) defaults every id to `""` exactly as before this
+ * ticket — only the one test that needs a BOSS-RELEVANT body (DoD 3(b),
+ * related-space wake-through) passes one.
+ */
 function commentStore(seed: Record<string, string[]> = {}) {
   const byKey = new Map<string, string[]>(Object.entries(seed));
+  const bodies = new Map<string, string>();
   return {
-    set: (key: string, ids: string[]) => byKey.set(key, ids),
-    comments: async (key: string) => (byKey.get(key) ?? []).map((id) => ({ id, body: "", created: "", authorEmail: null })),
+    set: (key: string, ids: string[], idBodies: Record<string, string> = {}) => {
+      byKey.set(key, ids);
+      for (const [id, body] of Object.entries(idBodies)) bodies.set(id, body);
+    },
+    comments: async (key: string) => (byKey.get(key) ?? []).map((id) => ({ id, body: bodies.get(id) ?? "", created: "", authorEmail: null })),
   };
 }
 
@@ -75,7 +85,7 @@ describe("BUTCHR-307 DoD 3(a): a comment on the issue's own ticket wakes it", ()
 });
 
 describe("BUTCHR-307 DoD 3(b): a change on a WORKER's ticket wakes its stood-down boss", () => {
-  test("an unseen comment on a related (worker) ticket wakes the boss watching it, not the worker itself", async () => {
+  test("an unseen BOSS-RELEVANT comment (FACTORY-954: the worker's own report_to_boss, tagged with its own identity) on a related (worker) ticket wakes the boss watching it, not the worker itself", async () => {
     const store = commentStore({ "KAN-2": ["200"] });
     const sd = newRegistry();
     // The boss (KAN-1) stood down watching both its own ticket and its current worker, KAN-2.
@@ -84,7 +94,12 @@ describe("BUTCHR-307 DoD 3(b): a change on a WORKER's ticket wakes its stood-dow
 
     const workerBefore = issue({ key: "KAN-2", updated: "2026-01-01T00:00:00.000Z" });
     const workerAfter = issue({ key: "KAN-2", updated: "2026-01-01T00:05:00.000Z" });
-    store.set("KAN-2", ["200", "201"]); // a new, unseen comment on the worker's ticket
+    // FACTORY-954: a related-space wake now requires a BOSS-RELEVANT comment
+    // body (the worker's own identity tag, same as report_to_boss/ask_boss
+    // post — see src/resources/issue.ts's `isBossRelevantComment`), not
+    // merely an unseen id — an arbitrary comment no longer wakes a related
+    // watcher at all (see this file's own new "routine" tests below).
+    store.set("KAN-2", ["200", "201"], { "201": "[KAN-2] reporting progress to my boss" }); // a new, unseen, BOSS-ADDRESSED comment on the worker's ticket
 
     const relBefore: RelatedResource<JiraIssue> = { issue: workerBefore, watchers: ["KAN-1"] };
     const relAfter: RelatedResource<JiraIssue> = { issue: workerAfter, watchers: ["KAN-1"] };

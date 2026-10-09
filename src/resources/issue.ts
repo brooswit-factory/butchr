@@ -24,7 +24,7 @@
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { AtlassianHttpError } from "../atlassian/client.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition, excludeBookkeepingComments } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition, excludeBookkeepingComments, WAKE_MARKERS } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
 import { skippedCommentCheckLine, type SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
@@ -34,6 +34,7 @@ import type {
   EventPoll,
   EventRules,
   EventVerdict,
+  NotifyReason,
   PollSnapshot,
   RelatedResource,
   ResourceType,
@@ -430,8 +431,14 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // saying "not now"), never a guess; everything else (a network error,
       // any other HTTP status, or `deps.comments` simply not wired up) is
       // `failed`.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
+      // FACTORY-954: `rows` (the full filtered comment list, body included)
+      // rides alongside `ids`/`newest` so the related-space boss-relevance
+      // check below (`isBossRelevantComment`) can read a flagged comment's
+      // TEXT without a second `deps.comments` call — every existing
+      // consumer here only ever destructured `ok`/`newest`/`ids`, so adding
+      // a field changes nothing for them.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[]; rows: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[]; rows: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
         let p = commentsCache.get(key);
         if (!p) {
           p = (async () => {
@@ -444,7 +451,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
               // `pendingRecheck`'s own doc comment above for why that's
               // correct, not merely convenient).
               pendingRecheck.delete(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
+              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id), rows: comments };
             } catch (err) {
               const reason: SkippedCommentCheckReason = err instanceof AtlassianHttpError && (err.status === 429 || err.status >= 500) ? "load" : "failed";
               return { ok: false as const, reason };
@@ -823,6 +830,84 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         return verdict;
       };
 
+      // FACTORY-954: whether `id`'s own comment body (looked up in `rows`,
+      // the same filtered — `excludeBookkeepingComments` already dropped
+      // bare `[butchr:*]` bookkeeping — list `fetchComments` just fetched)
+      // is a WORKER->BOSS marker: either `key`'s own identity tag
+      // (`[${key}] …`, the one shape `speakOnOwnChannel`/`tagComment`
+      // give EVERY comment `key`'s own agent posts on its own ticket —
+      // report_to_boss and ask_boss alike, see src/tools/relationship.ts/
+      // src/tools/speak.ts; `submit_to_boss` posts no comment at all, it is
+      // covered by the status-transition arm below instead), or one of the
+      // allowlisted `WAKE_MARKERS` daemon escalations (`[butchr:blocked]`
+      // and friends — src/jira-watch/diff.ts), which are agent-directed
+      // boss escalations even though daemon-authored. `id === null` (the
+      // comment-DELETION edge, see SuppressionVerdict's own doc comment) has
+      // no body to check and is never boss-relevant. A `[review]` reply was
+      // checked against this ticket's own base commit and found to travel
+      // the OPPOSITE direction only (tell_worker, boss -> worker, tagged
+      // with the BOSS's own identity — never the worker's) — it never
+      // reaches this predicate's input as an incoming related-space comment,
+      // so it is deliberately not matched here (see this ticket's PR
+      // description for the full citation).
+      const isBossRelevantComment = (key: string, rows: readonly JiraComment[], id: string | null): boolean => {
+        if (id === null) return false;
+        const row = rows.find((r) => r.id === id);
+        if (!row) return false;
+        if (row.body.startsWith(`[${key}] `)) return true;
+        for (const marker of WAKE_MARKERS) if (row.body.startsWith(marker)) return true;
+        return false;
+      };
+
+      // FACTORY-954 — THE RELATED-SPACE ALLOWLIST. `primary` space is
+      // completely untouched by this ticket (every existing `finalize(...)`
+      // call for it is unchanged); this gate sits between the classifier
+      // below and `finalize` ONLY for `space === "related"`, and gates on
+      // the VERDICT's own reason, never re-deriving one:
+      //   - a status transition TO "In Review" or "Done" (the two
+      //     transitions the Epic->Story->Task review/merge flow actually
+      //     depends on reaching the boss);
+      //   - a comment `isBossRelevantComment` above accepts.
+      // Every other reason this module's classifier can name for a related
+      // watcher (label, summary, assignee, description, issuelinks, or any
+      // comment that isn't boss-addressed) is routine child activity and
+      // returns `{ deliver: false }` OUTRIGHT — never through `finalize`,
+      // deliberately: `finalize` can WAKE a sleeping watcher as a side
+      // effect (`sd.wake`), which must never happen for an edge this gate
+      // is about to silence anyway. `appeared`/`disappeared` (existence
+      // changes, not the "any status/label/summary/assignee/description/
+      // issuelinks/comment diff" noise this ticket's own problem statement
+      // names) and the primary-only `pr:*` reason never reach this gate at
+      // all — their own `finalize(...)` call sites, above, are untouched.
+      //
+      // FACTORY-948/949 INTERACTION (per FACTORY-954's own ticket comment):
+      // a sibling story is concurrently carving an agent:*->agent:blocked
+      // daemon-label transition out of `isDaemonLabelOnlyDiff` suppression,
+      // delivered ONLY on the related edge. That carve-out is NOT present
+      // at this ticket's base commit (grepped — no `agent:blocked`/`blocked`
+      // transition anywhere in this file or diff.ts) and is therefore not
+      // specially allowed here: a `{ label: ... }` reason is "everything
+      // else" under this gate and returns `deliver: false`, INCLUDING that
+      // transition, until whichever of these two tickets lands second
+      // reconciles with the other (this ticket's PR description flags it
+      // explicitly, per the ticket's own instruction).
+      const relatedAllows = (key: string, reason: NotifyReason | undefined, rows: readonly JiraComment[]): boolean => {
+        if (!reason) return false;
+        if ("status" in reason) return reason.status.to === "In Review" || reason.status.to === "Done";
+        if ("comment" in reason) return isBossRelevantComment(key, rows, reason.comment);
+        return false;
+      };
+      const deliverToRelated = (
+        key: string,
+        watcher: string,
+        space: "primary" | "related",
+        verdict: EventVerdict,
+        rows: readonly JiraComment[] = [],
+      ): Promise<EventVerdict> => {
+        if (space !== "related" || !verdict.deliver) return finalize(key, watcher, verdict);
+        return relatedAllows(key, verdict.reason, rows) ? finalize(key, watcher, verdict) : Promise.resolve({ deliver: false });
+      };
+
       // FACTORY-922 REVIEW FIX: force a key with an outstanding, unresolved
       // §3D check back through `decide()` even when THIS poll's own
       // (prev, next) pair for it shows no diff at all — see
@@ -928,7 +1013,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // reason for what should stay non-structural. `!== undefined`
           // recovers the old `becauseComment === true` meaning on both the
           // with-id and no-id-because-deleted cases.
-          if (verdict.commentId !== undefined) return finalize(key, watcher, { deliver: true, reason: { comment: verdict.commentId } });
+          if (verdict.commentId !== undefined) {
+            // FACTORY-954: `rows` for the related-space boss-relevance check
+            // — the SAME memoized `fetchComments(key)` promise `suppressed()`
+            // (via crossDaemonSuppressed/ledgerHitSuppressed) already
+            // resolved above, so this is a cache hit, never a second Jira
+            // call.
+            const commentFetch = await fetchComments(key);
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { comment: verdict.commentId } }, commentFetch.ok ? commentFetch.rows : []);
+          }
           // The general classifier: every remaining diff the poll can name
           // from the (before, after) `JiraIssue` pair alone, no I/O. Order
           // is a deliberate, documented precedence (more than one can be
@@ -941,10 +1034,10 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // a comment this poll never learned about, a link, or a field
           // JiraIssue does not carry at all) falls through to §3(D)'s
           // fallback below.
-          if (before.status !== after.status) return finalize(key, watcher, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
+          if (before.status !== after.status) return deliverToRelated(key, watcher, space, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
           const labelTransition = daemonLabelTransition(before, after);
-          if (labelTransition) return finalize(key, watcher, { deliver: true, reason: { label: labelTransition } });
-          if (before.summary !== after.summary) return finalize(key, watcher, { deliver: true, reason: { summary: true } });
+          if (labelTransition) return deliverToRelated(key, watcher, space, { deliver: true, reason: { label: labelTransition } });
+          if (before.summary !== after.summary) return deliverToRelated(key, watcher, space, { deliver: true, reason: { summary: true } });
           // FACTORY-922 (implementing FACTORY-921's resolved decision
           // point): assignee, description, and linked-issue changes are
           // CONFIRMED diffs the (before, after) pair already carries, no
@@ -952,12 +1045,18 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // the worker, unlike a priority-only or non-daemon-label-only
           // change (neither of which `JiraIssue` even carries as a
           // trackable field — see NotifyReason's own doc comment).
-          if (before.assignee !== after.assignee) return finalize(key, watcher, { deliver: true, reason: { assignee: { from: before.assignee, to: after.assignee } } });
+          // FACTORY-954: for a RELATED watcher none of status(non-In
+          // Review/Done)/label/summary/assignee/description/issuelinks is
+          // boss-relevant — `deliverToRelated` silences all but the two
+          // status transitions the review/merge flow depends on; PRIMARY
+          // behavior is byte-identical (same verdict, just routed through
+          // one more function that is a no-op for `space === "primary"`).
+          if (before.assignee !== after.assignee) return deliverToRelated(key, watcher, space, { deliver: true, reason: { assignee: { from: before.assignee, to: after.assignee } } });
           if (before.description !== undefined && after.description !== undefined && before.description !== after.description) {
-            return finalize(key, watcher, { deliver: true, reason: { description: true } });
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { description: true } });
           }
           const linkDiff = issuelinksDiff(before, after);
-          if (linkDiff) return finalize(key, watcher, { deliver: true, reason: { issuelinks: linkDiff } });
+          if (linkDiff) return deliverToRelated(key, watcher, space, { deliver: true, reason: { issuelinks: linkDiff } });
           // FACTORY-922 (implementing story FACTORY-921 §1 — REPLACES
           // BUTCHR-350's §3D fallback below): the old fallback delivered,
           // unconditionally, on every `updated` bump this taxonomy could
@@ -1040,15 +1139,21 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
               log(skippedCommentCheckLine(key, result.reason));
             }
             if (!asleep) return { deliver: false };
-            return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
+            // FACTORY-954: "undetermined" never carries a confirmed comment
+            // body to check — not in this ticket's related-space allowlist,
+            // so a related watcher gets `deliver: false` here even while
+            // asleep (a deliberate narrowing of BUTCHR-307's fail-toward-
+            // waking net to PRIMARY space only; see `deliverToRelated`'s own
+            // doc comment).
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { undetermined: "check-failed" } });
           }
           commentCursor.set(key, result.newest);
           const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
           if (preBaseline !== undefined && result.newest !== null && result.newest !== preBaseline) {
-            return finalize(key, watcher, { deliver: true, reason: { comment: result.newest } });
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { comment: result.newest } }, result.rows);
           }
           if (!asleep) return { deliver: false };
-          return finalize(key, watcher, { deliver: true, reason: { undetermined: "checked-unchanged" } });
+          return deliverToRelated(key, watcher, space, { deliver: true, reason: { undetermined: "checked-unchanged" } });
         },
       };
     },
