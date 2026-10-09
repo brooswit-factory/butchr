@@ -138,7 +138,7 @@ import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
-import { readUnitHint } from "../web/settings-unit-hint.js";
+import { createCachedUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
 import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
 import { writeSetting } from "../settings/write-settings.js";
@@ -196,6 +196,12 @@ installLogSink();
 const settingsFileResult = loadSettingsFile(process.env);
 for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
 const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
+// FACTORY-694 item 6: ONE shared cache instance for this process's lifetime
+// — every `GET /api/settings` call (both the read path below and the
+// re-read after a settings write) shares the same ~30s TTL memo, so a burst
+// of dashboard polls spawns at most one `systemctl` child per window
+// instead of one per request. See `createCachedUnitHint`'s own doc comment.
+const cachedUnitHint = createCachedUnitHint();
 // FACTORY-665 (PR-2) — a fresh install with no Atlassian identity yet must
 // not crash at startup: it starts in SETUP MODE instead (serving only
 // `/health`, the dashboard shell, and the setup API — see
@@ -1220,7 +1226,7 @@ const { app, mcp } = buildApp({
   // was built from are passed through too, so `buildSettingEntries` can
   // report `source: "environment" | "file" | "default"` correctly for
   // every allowlisted key — see that function's own doc comment.
-  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
+  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
   // daemon's own already-loaded credentials, never anything from the
   // request itself.
@@ -1237,7 +1243,7 @@ const { app, mcp } = buildApp({
   settingsWrite: async (key, value, confirm) => {
     writeSetting(key, value, confirm);
     const fresh = loadSettingsFile(process.env);
-    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
+    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
   },
   // FACTORY-665: `POST /api/daemon/restart` — fixed-argv `systemctl --user
   // restart butchr.service`, ONLY when this daemon is actually running
