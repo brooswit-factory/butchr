@@ -188,9 +188,16 @@ function lockHolderPid(content: string): number | null {
  * The release function only unlinks the lock if it still holds this call's own
  * token, so it can never delete a lock someone else created after an operator
  * removed ours.
+ *
+ * FACTORY-667: generalized to an injectable `lockBasename` (still
+ * `".rules.lock"` for every pre-existing caller, via `acquireRulesLock`
+ * below) so `src/resources/write-json-file.ts`'s own per-directory lock
+ * (session-definition writes, `.session-definitions.lock`) reuses this
+ * EXACT same live/stale/corrupt-holder logic rather than a forked copy —
+ * only the file name differs, never the safety behaviour.
  */
-export function acquireRulesLock(dir: string): () => void {
-  const lockPath = join(dir, ".rules.lock");
+export function acquireNamedLock(dir: string, lockBasename: string): () => void {
+  const lockPath = join(dir, lockBasename);
   const token = `${process.pid}:${process.hrtime.bigint()}-${Math.random().toString(36).slice(2)}`;
   try {
     const fd = openSync(lockPath, "wx");
@@ -208,17 +215,22 @@ export function acquireRulesLock(dir: string): () => void {
   try {
     currentContent = readFileSync(lockPath, "utf8");
   } catch {
-    throw new Error(`rules file lock at ${lockPath} changed while being inspected — another writer is active or just finished; try again`);
+    throw new Error(`lock at ${lockPath} changed while being inspected — another writer is active or just finished; try again`);
   }
   const heldPid = lockHolderPid(currentContent);
   if (heldPid === null) {
-    throw new Error(`rules file lock at ${lockPath} has unreadable/corrupt content (${JSON.stringify(currentContent)}) — refusing to guess whether it is live or abandoned; remove it by hand once you've confirmed no writer holds it`);
+    throw new Error(`lock at ${lockPath} has unreadable/corrupt content (${JSON.stringify(currentContent)}) — refusing to guess whether it is live or abandoned; remove it by hand once you've confirmed no writer holds it`);
   }
   if (isPidAlive(heldPid)) {
     const ageMs = (() => { try { return Date.now() - statSync(lockPath).mtimeMs; } catch { return 0; } })();
-    throw new Error(`rules file is locked by another writer (pid ${heldPid}, held ${Math.round(ageMs / 1000)}s) at ${lockPath} — refusing to write concurrently`);
+    throw new Error(`file is locked by another writer (pid ${heldPid}, held ${Math.round(ageMs / 1000)}s) at ${lockPath} — refusing to write concurrently`);
   }
-  throw new Error(`rules file lock at ${lockPath} was left behind by pid ${heldPid}, which is no longer running (a crashed writer); butchr never reclaims a stale lock automatically. If no butchr daemon or other rules writer is running (check: systemctl --user is-active butchr.service), remove it with: rm ${lockPath} — then retry`);
+  throw new Error(`lock at ${lockPath} was left behind by pid ${heldPid}, which is no longer running (a crashed writer); butchr never reclaims a stale lock automatically. If no butchr daemon or other writer is running (check: systemctl --user is-active butchr.service), remove it with: rm ${lockPath} — then retry`);
+}
+
+/** `acquireNamedLock(dir, ".rules.lock")` — the rules file's own lock, unchanged from before FACTORY-667's generalization. */
+export function acquireRulesLock(dir: string): () => void {
+  return acquireNamedLock(dir, ".rules.lock");
 }
 
 /** The real filesystem implementation `writeRulesFile`/`updateRulesFile`/`restoreBackup`/`rulesEtag` default to. Exported for tests that need to override a single seam (e.g. `now`) while keeping every other operation real. */

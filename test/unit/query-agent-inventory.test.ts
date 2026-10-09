@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  buildQueryAgentInventory, loadRulesFileState, ruleStaffingReason,
+  buildQueryAgentInventory, loadRulesFileState, ruleHasLiveAgent, ruleStaffingReason,
   type RulesFileState,
 } from "../../src/agents/query-agent-inventory.js";
 import type { Rule } from "../../src/rules/rules.js";
@@ -154,6 +154,66 @@ describe("ruleStaffingReason — the real, computed vocabulary (FACTORY-72)", ()
     expect(result.reason).toContain("github-pr");
     expect(result.reason).not.toBe("no matching resources this poll");
     expect(result.reason).not.toContain("UNSTAFFED");
+  });
+});
+
+// ---- ruleHasLiveAgent (FACTORY-932, pinning FACTORY-731's own doc comment) --
+
+describe("ruleHasLiveAgent — DELETE /api/rules/:id's own live-agent refusal check (FACTORY-932)", () => {
+  test("a live row whose decoded key names this ruleId: true", () => {
+    const rows = [agentRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "managers", resourceId: "KAN-1" }))];
+    expect(ruleHasLiveAgent("managers", rows)).toBe(true);
+  });
+
+  test("a live query-level (persistent) row also counts: true — this check has no 'kind' distinction of its own, same as ruleStaffingReason's live set", () => {
+    const rows = [agentRow(encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" }))];
+    expect(ruleHasLiveAgent("director", rows)).toBe(true);
+  });
+
+  test("no row at all: false", () => {
+    expect(ruleHasLiveAgent("managers", [])).toBe(false);
+  });
+
+  test("a row naming a DIFFERENT ruleId: false — never matched loosely by resourceProvider alone", () => {
+    const rows = [agentRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "other-rule", resourceId: "KAN-1" }))];
+    expect(ruleHasLiveAgent("managers", rows)).toBe(false);
+  });
+
+  // The doc comment's own explicit carve-out: a withheld row is matched but
+  // NOT live (held back by the fleet-wide admission cap) — this check only
+  // ever asks "is an agent actually RUNNING against this rule right now",
+  // so it must skip a withheld row even when its decoded ruleId matches,
+  // same as `liveAndWithheldRuleKeys` keeps `live`/`withheld` as two
+  // disjoint sets rather than folding a withheld match into "has an agent".
+  test("a withheld row (kind: 'withheld') naming this ruleId is skipped: false — matched-but-withheld is not 'live'", () => {
+    const rows = [withheldRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "managers", resourceId: "KAN-1" }))];
+    expect(ruleHasLiveAgent("managers", rows)).toBe(false);
+  });
+
+  // THE DOCUMENTED RACE ITSELF, pinned rather than papered over: `rows` is
+  // a snapshot from the daemon's own periodic poll (`createDashboardFeed`),
+  // not a live, synchronous census. An agent that was spawned for this rule
+  // AFTER the snapshot `rows` was taken has no row in it yet, so this
+  // function reads it as "no live agent" — a false NEGATIVE, exactly the
+  // "could let a delete through while an agent is, in fact, about to start
+  // running" window the function's own doc comment names and accepts. This
+  // is not distinguishable, from inside `ruleHasLiveAgent`'s own signature,
+  // from the ordinary "genuinely no agent" case directly above — which is
+  // the whole point: the signal is a last-poll snapshot, never authoritative
+  // for "right now", and the test above and this one are deliberately
+  // identical in shape to pin that.
+  test("a stale/empty snapshot reads as 'no live agent' even when an agent could have been spawned for this rule since the last poll — the documented one-poll-interval false-negative race, not a bug to fix here", () => {
+    const staleSnapshotTakenBeforeTheAgentSpawned: ReturnType<typeof agentRow>[] = [];
+    expect(ruleHasLiveAgent("managers", staleSnapshotTakenBeforeTheAgentSpawned)).toBe(false);
+  });
+
+  test("a row for one ruleId plus a withheld row for another: only the genuinely live one counts", () => {
+    const rows = [
+      agentRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "managers", resourceId: "KAN-1" })),
+      withheldRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "watchers", resourceId: "KAN-2" })),
+    ];
+    expect(ruleHasLiveAgent("managers", rows)).toBe(true);
+    expect(ruleHasLiveAgent("watchers", rows)).toBe(false);
   });
 });
 

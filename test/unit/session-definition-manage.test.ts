@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
@@ -39,7 +40,8 @@ const missingRootList = async (): Promise<FilesystemResource[]> => { throw Objec
 
 describe("listSessionDefinitions — everything, not just the eligible subset", () => {
   test("a valid definition reports vendor/tier/role/execution and both freeze gates", async () => {
-    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: JSON.stringify(goodDef({ role: "sentinel", execution: "persistent" })) });
+    const text = JSON.stringify(goodDef({ role: "sentinel", execution: "persistent" }));
+    const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: text });
     const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: absPath("defs", "a.json") });
     const store = fakeStore(new Set([`butchr:${agentKey}`]));
     const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store });
@@ -49,6 +51,10 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
       account: "none", permissionMode: "default", workingDirectory: absPath("repo", "project"), mcpServerNames: [],
       manifestFrozen: false, storeFrozen: true,
       freezeControllers: [], unfreezeControllers: [],
+      // FACTORY-667: `etag` is the raw file text's own sha256 — computed
+      // here the same way `listSessionDefinitions` itself does, never a
+      // hardcoded literal that would silently stop proving anything.
+      etag: createHash("sha256").update(text, "utf8").digest("hex"),
     }]);
   });
 

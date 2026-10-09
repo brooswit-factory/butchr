@@ -83,17 +83,18 @@ export interface SettingsApi {
   restartDaemon(signal?: AbortSignal): Promise<void>;
 }
 
-const CSRF_HEADER = "x-butchr-csrf";
+export const CSRF_HEADER = "x-butchr-csrf";
 
-async function fetchCsrfToken(signal?: AbortSignal): Promise<string> {
+/** FACTORY-668 — exported so other API modules (`./daemon.js`) hit the SAME `/api/session` issuer rather than re-deriving a CSRF token fetch of their own. */
+export async function fetchCsrfToken(signal?: AbortSignal): Promise<string> {
   const res = await fetch("/api/session", signal ? { signal } : {});
   if (!res.ok) throw new Error(`/api/session: HTTP ${res.status}`);
   const body = (await res.json()) as { csrfToken: string };
   return body.csrfToken;
 }
 
-/** `res.json().error`, or a generic `<label>: HTTP <status>` when the body isn't the expected `{error: string}` shape (a non-JSON or malformed error body). */
-async function errorMessageOf(res: Response, label: string): Promise<string> {
+/** `res.json().error`, or a generic `<label>: HTTP <status>` when the body isn't the expected `{error: string}` shape (a non-JSON or malformed error body). Exported for reuse (`./daemon.js`). */
+export async function errorMessageOf(res: Response, label: string): Promise<string> {
   try {
     const body: unknown = await res.json();
     if (body && typeof body === "object" && typeof (body as { error?: unknown }).error === "string") return (body as { error: string }).error;
@@ -101,8 +102,8 @@ async function errorMessageOf(res: Response, label: string): Promise<string> {
   return `${label}: HTTP ${res.status}`;
 }
 
-/** `Retry-After` as a finite non-negative integer, or `undefined` when absent/malformed. */
-function retryAfterSecondsOf(res: Response): number | undefined {
+/** `Retry-After` as a finite non-negative integer, or `undefined` when absent/malformed. Exported for reuse (`./daemon.js`). */
+export function retryAfterSecondsOf(res: Response): number | undefined {
   const header = res.headers.get("retry-after");
   const parsed = header !== null ? Number.parseInt(header, 10) : NaN;
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;

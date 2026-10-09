@@ -35,6 +35,44 @@ import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
+/**
+ * FACTORY-927 (review round 1, item 1 — a CI failure traced to this file,
+ * not caused by that ticket's own diff, but blocking it regardless):
+ * `require.resolve(`${name}/package.json`, ...)` below ASSUMED every
+ * package's own `package.json` either has no `"exports"` map at all, or
+ * one that still exposes the bare `"./package.json"` subpath — true for
+ * most of this closure, but NOT for `@internationalized/date` (a
+ * transitive dependency of `@launchpad-ui/components`/`react-aria`/
+ * `react-aria-components`/`react-stately`, all already in this walk):
+ * its own `"exports"` map lists only `source`/`types`/`import`/`require`
+ * conditions, no `"./package.json"` entry, so Node's exports-aware
+ * resolver refuses that subpath outright (`ERR_PACKAGE_PATH_NOT_EXPORTED`)
+ * — this was observed to start failing the whole build only once bun's
+ * own `require.resolve` began enforcing that restriction as strictly as
+ * Node does (this repo pins `bun-version: latest` in CI, so a bun release
+ * can change this out from under an otherwise-unchanged lockfile/package.json,
+ * with no diff in THIS repo to point at). Falls back to resolving the
+ * package's own BARE specifier instead (which every package here still
+ * exposes, `"exports"` map or not — it's how the code that imports it
+ * actually loads it) and walking up from that resolved file to the
+ * nearest `package.json`, the same directory-walk Node's own internal
+ * resolver does — never a second, parallel resolution ALGORITHM, just a
+ * different STARTING subpath for the one case the direct subpath refuses.
+ */
+function resolvePackageDir(name: string, fromDir: string, resolve: (specifier: string, fromDir: string) => string): string {
+  try {
+    return dirname(resolve(`${name}/package.json`, fromDir));
+  } catch {
+    let dir = dirname(resolve(name, fromDir));
+    while (!existsSync(join(dir, "package.json"))) {
+      const parent = dirname(dir);
+      if (parent === dir) throw new Error(`web-notices.ts: could not find a package.json for "${name}" above ${dir}`);
+      dir = parent;
+    }
+    return dir;
+  }
+}
+
 export interface ThirdPartyPackage {
   name: string;
   version: string;
@@ -61,10 +99,9 @@ function readPackageInfo(name: string, dir: string): ThirdPartyPackage {
 /** Walks `name`'s own `dependencies` (never `devDependencies`/`peerDependencies` — those don't ship, and are exactly what this walk alone was found to miss) transitively, resolved relative to `fromDir` so hoisted layouts resolve exactly like Node/bun would at runtime. */
 function walkDeclaredClosure(name: string, fromDir: string, resolve: (specifier: string, fromDir: string) => string, seen: Map<string, ThirdPartyPackage>): void {
   if (seen.has(name)) return;
-  const pkgJsonPath = resolve(`${name}/package.json`, fromDir);
-  const dir = dirname(pkgJsonPath);
+  const dir = resolvePackageDir(name, fromDir, resolve);
   seen.set(name, readPackageInfo(name, dir));
-  const pkg = JSON.parse(readFileSync(pkgJsonPath, "utf8")) as { dependencies?: Record<string, string> };
+  const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { dependencies?: Record<string, string> };
   for (const dep of Object.keys(pkg.dependencies ?? {})) walkDeclaredClosure(dep, dir, resolve, seen);
 }
 

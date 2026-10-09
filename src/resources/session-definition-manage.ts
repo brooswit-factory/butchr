@@ -18,6 +18,7 @@
  * this CLI.
  */
 import { access, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { AccountPolicy, AgentRole, ExecutionMode } from "../rules/rules.js";
 import { builtinManagedSessionsRule } from "../rules/session-definition-type.js";
@@ -61,6 +62,8 @@ export interface SessionDefinitionListEntry {
   account?: AccountPolicy;
   /** FACTORY-72: `SessionDefinition.permissionMode` — `undefined` for an invalid definition, same reasoning as the other content fields above. */
   permissionMode?: SessionPermissionMode;
+  /** FACTORY-667: `SessionDefinition.lizardMode`, verbatim (including `undefined` when the definition itself omits it — see that field's own "absent vs explicit false" doc comment, `./session-definition.ts`) — `undefined` here is therefore ambiguous between "invalid definition" and "valid, field omitted"; callers that need to tell them apart also check `valid`. */
+  lizardMode?: boolean;
   /** FACTORY-72: `SessionDefinition.workingDirectory`, already `~`-expanded — `undefined` for an invalid definition, same reasoning as the other content fields above. */
   workingDirectory?: string;
   /**
@@ -75,6 +78,15 @@ export interface SessionDefinitionListEntry {
   mcpServerNames?: string[];
   /** `undefined` for an invalid definition — the raw `frozen` field cannot be trusted to mean anything once the document itself doesn't validate. */
   manifestFrozen?: boolean;
+  /**
+   * FACTORY-667 — sha256 hex of the raw file text, same hash
+   * `../resources/write-json-file.ts`'s own `sha256`/`jsonFileEtag` compute
+   * — what the dashboard's session-definitions write path takes as
+   * `ifMatch` for a field/freeze edit derived from THIS listing. `undefined`
+   * for an invalid definition (nothing here to safely edit against) and for
+   * the oversized-path case (no content was ever read).
+   */
+  etag?: string;
   /** BUTCHR-456: this definition's own delegated-freeze grants (`undefined` for an invalid definition, same reasoning as `manifestFrozen`). `[]` means nobody may freeze/unfreeze it via the MCP tools. */
   freezeControllers?: string[];
   unfreezeControllers?: string[];
@@ -140,7 +152,8 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
     const agentKey = sessionAgentKey(identityPath);
     const storeFrozen = await readStoreFrozen(deps.store, identityPath);
     try {
-      const definition = parseSessionDefinitionFile(await read(resource.path), resource.path);
+      const text = await read(resource.path);
+      const definition = parseSessionDefinitionFile(text, resource.path);
       out.push({
         name: resource.name, path: resource.path, agentKey, valid: true, problems: [],
         vendor: definition.vendor,
@@ -149,9 +162,11 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
         ...(definition.effort !== undefined ? { effort: definition.effort } : {}),
         role: definition.role, execution: definition.execution,
         account: definition.account, permissionMode: definition.permissionMode, workingDirectory: definition.workingDirectory,
+        ...(definition.lizardMode !== undefined ? { lizardMode: definition.lizardMode } : {}),
         mcpServerNames: (definition.mcpServers ?? []).map((s) => s.name),
         manifestFrozen: definition.frozen, storeFrozen,
         freezeControllers: definition.freezeControllers ?? [], unfreezeControllers: definition.unfreezeControllers ?? [],
+        etag: createHash("sha256").update(text, "utf8").digest("hex"),
       });
     } catch (e) {
       out.push({ name: resource.name, path: resource.path, agentKey, valid: false, problems: (e as Error).message.split("\n"), storeFrozen });

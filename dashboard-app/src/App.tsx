@@ -11,7 +11,10 @@ import { Heading } from "@launchpad-ui/components";
 import { DashboardRoute } from "./routes/DashboardRoute.js";
 import { ConfigurationsRoute } from "./routes/ConfigurationsRoute.js";
 import { RulesRoute } from "./routes/RulesRoute.js";
+import { SessionDefinitionsRoute } from "./routes/SessionDefinitionsRoute.js";
+import { LinksRoute } from "./routes/LinksRoute.js";
 import { SettingsRoute } from "./routes/SettingsRoute.js";
+import { DaemonRoute } from "./routes/DaemonRoute.js";
 import { SetupRoute } from "./routes/SetupRoute.js";
 import { realSetupApi, type SetupApi } from "./api/setup.js";
 import { useSetupGate } from "./hooks/use-setup-gate.js";
@@ -57,7 +60,10 @@ export function App({ setupApi = realSetupApi }: AppProps) {
           </NavLink>
           <NavLink to="/configurations">Configurations</NavLink>
           <NavLink to="/rules">Rules</NavLink>
+          <NavLink to="/sessions">Sessions</NavLink>
+          <NavLink to="/links">Links</NavLink>
           <NavLink to="/settings">Settings</NavLink>
+          <NavLink to="/daemon">Daemon</NavLink>
         </nav>
       </header>
       <main className="app-main">
@@ -65,7 +71,10 @@ export function App({ setupApi = realSetupApi }: AppProps) {
           <Route path="/" element={<DashboardRoute />} />
           <Route path="/configurations" element={<ConfigurationsRoute />} />
           <Route path="/rules" element={<RulesRoute />} />
+          <Route path="/sessions" element={<SessionDefinitionsRoute />} />
+          <Route path="/links" element={<LinksRoute />} />
           <Route path="/settings" element={<SettingsRoute setupApi={setupApi} />} />
+          <Route path="/daemon" element={<DaemonRoute />} />
         </Routes>
       </main>
     </div>
