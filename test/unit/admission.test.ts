@@ -1277,10 +1277,11 @@ describe("createAdmissionController with rateLimitOf (FACTORY-907, end-to-end)",
     const depsObj = {
       cap: 100,
       residency: async () => [] as readonly string[],
-      rateLimitOf: (id: string): RuleRateLimit | undefined => (id === "dummy" || id === "c1" ? { ruleId: "r1", maxNewPerTick: 1 } : undefined),
+      rateLimitOf: (id: string): RuleRateLimit | undefined => (id === "a-decoy" || id === "c1" ? { ruleId: "r1", maxNewPerTick: 1 } : undefined),
     };
     const ctrl = createAdmissionController(depsObj);
-    await ctrl.admit(["dummy", "c1"], []); // "dummy" takes r1's one slot this call; c1 is deferred BY THE RATE LIMIT (cap=100 is nowhere near binding) — c1's wait -> 1
+    // Lexicographic order (both wait 0) is ["a-decoy", "c1"] — "a-decoy" takes r1's one slot this call; c1 is deferred BY THE RATE LIMIT (cap=100 is nowhere near binding) — c1's wait -> 1
+    await ctrl.admit(["a-decoy", "c1"], []);
     expect(ctrl.snapshot().longestWait).toEqual({ id: "c1", polls: 1 });
     // c1 leaves the desired set for good (ticket closed) — it is never named in a call again, for longer than the eviction bound.
     for (let i = 0; i < LEDGER_UNSEEN_EVICTION_CALLS + 1; i++) await ctrl.admit(["OTHER"], []);
