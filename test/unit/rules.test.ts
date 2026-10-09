@@ -370,7 +370,7 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
 describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
   test("both absent when omitted — no default the way execution/account/role get one", () => {
     const [r] = parseRules({ rules: [minimal] });
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.resumeOnRespawn).toBeUndefined();
     expect(r!.resumeContextCutoff).toBeUndefined();
   });
@@ -412,7 +412,7 @@ describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, st
   test("a pre-change rules document (neither field) loads unchanged — byte-for-byte the same shape as before this ticket", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
 });
