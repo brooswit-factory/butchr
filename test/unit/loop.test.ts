@@ -8,6 +8,7 @@ import { HerdrHerd } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
+import { AtlassianHttpError } from "../../src/atlassian/client.js";
 
 function fakeHerd(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []): Herd & { spawned: string[]; stopped: string[]; running: Set<string> } {
   const running = new Set(initial);
@@ -990,24 +991,41 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toEqual([]);
   });
 
+  // FACTORY-922: decide()'s §3D fallback now ACTIVELY checks comments
+  // rather than guessing — a `comments` dep that actually confirms the
+  // foreign comment (newest id genuinely moves from the poll-0 baseline) is
+  // what makes this delivery CONFIRMED rather than merely asserted by this
+  // test's own comment text.
   test("a self-write and a foreign change landing in the same poll window (updated moves past the recorded value) is delivered", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     const ledger = createOwnWriteLedger();
     const polls: JiraIssue[][] = [
       [iss("A", "In Progress")],
-      // Our own write was recorded for "t2", but by the time this poll ran,
-      // a foreign comment had ALSO landed, pushing `updated` to "t3" — a
-      // value that matches nothing in the ledger, so it must be delivered.
+      // idx1: content-identical to idx0 — `watch()`'s forced hash still
+      // calls `poll()` (so the comment-cursor baseline seeding genuinely
+      // runs and records "c0"), but `changedKeys` sees no diff at all, so
+      // `decide()` is never even consulted for "A" here.
+      [iss("A", "In Progress")],
+      // idx2: our own write was recorded for "t2", but by the time this
+      // poll ran, a foreign comment had ALSO landed, pushing `updated` to
+      // "t3" — a value that matches nothing in the ledger, so it must be
+      // delivered. The `comments` dep's newest id now genuinely differs
+      // from the "c0" baseline idx1 already established.
       [{ ...iss("A", "In Progress"), updated: "t3" }],
     ];
     ledger.record("A", "t2", "A", Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx < 2
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      search: async () => { pollIdx = Math.min(n++, polls.length - 1); return polls[pollIdx]!; },
       herd,
       notify: (i) => { notified.push(i); },
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      comments,
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 60));
@@ -1015,6 +1033,9 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toContain("A");
   });
 
+  // FACTORY-922: §3D's fallback now ACTIVELY checks comments instead of
+  // guessing — a `comments` dep confirming T's own newest comment genuinely
+  // moved is what makes S's delivery CONFIRMED.
   test("an agent's write on its own ticket suppresses that agent alone; a watcher (via Implements) still hears it", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -1022,17 +1043,27 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const relOf = (updated: string) => [{ issue: { key: "T", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels: [] }, watchers: ["S"] }];
     const polls: JiraIssue[][] = [
       [iss("S", "In Progress"), iss("T", "In Progress")],
+      // idx1: content-identical to idx0 — lets `poll()` genuinely run once
+      // (the forced hash) and seed T's comment-cursor baseline ("c0")
+      // before the real write below, so that write's own confirmation has
+      // a defined baseline to move away from.
+      [iss("S", "In Progress"), iss("T", "In Progress")],
       [iss("S", "In Progress"), { ...iss("T", "In Progress"), updated: "t2" }],
     ];
-    const relatedPolls = [relOf("t"), relOf("t2")];
+    const relatedPolls = [relOf("t"), relOf("t"), relOf("t2")];
     ledger.record("T", "t2", "T", Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx < 2
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n, 1)]!,
-      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      related: async () => { pollIdx = Math.min(n++, relatedPolls.length - 1); return relatedPolls[pollIdx]!; },
       herd,
       notify: (i, about) => { notified.push(`${i}<-${about}`); },
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      comments,
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 60));
@@ -1041,6 +1072,10 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toContain("S<-T");     // its boss still hears it — this IS how "merged, over to you" arrives
   });
 
+  // FACTORY-922: same active-check reasoning as the test above — the
+  // `comments` dep confirms S's own newest comment genuinely moved between
+  // poll 1 and poll 2, which is what makes the poll-2 delivery to both S
+  // and E CONFIRMED rather than merely asserted by this test's own prose.
   test("a daemon label write on a story suppresses it for the story's own agent AND its epic watcher; a foreign comment in the same poll is delivered to both", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -1054,11 +1089,16 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const relatedPolls = [relOf("t"), relOf("t2"), relOf("t3")];
     ledger.record("S", "t2", DAEMON_WRITER, Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx < 2
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      search: async () => { pollIdx = Math.min(n, polls.length - 1); return polls[pollIdx]!; },
       related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
       herd,
       notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      comments,
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
       intervalMs: 10,
     });
@@ -1159,7 +1199,17 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     expect(notified.filter((x) => x === "E<-S").length).toBe(1);
   });
 
-  test("a diff touching a non-daemon (human) label is not treated as a daemon write: delivered normally, no comments() call", async () => {
+  // FACTORY-922 (replaces this test's own former expectation, deliberately,
+  // not weakened — per the resolved FACTORY-921 decision: "It does NOT
+  // include PRIORITY-only or LABEL-only changes"): a non-daemon (human)
+  // label add is still not treated as a daemon write (isDaemonLabelOnlyDiff
+  // is false, so crossDaemonSuppressed itself still never calls comments()
+  // — KAN-828's own reasoning is untouched), but it is ALSO not a field
+  // `daemonLabelTransition`/the general classifier tracks, so it now falls
+  // to §3D's own active check — which finds nothing moved (comments()
+  // returns the identical id every poll) and stays silent, exactly the
+  // noise this decision explicitly excludes.
+  test("a diff touching a non-daemon (human) label is NOT a daemon write (crossDaemonSuppressed still makes no call), and is NOT delivered either — label-only never wakes anyone", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     let commentCalls = 0;
@@ -1177,12 +1227,15 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 60));
     stop();
-    expect(notified).toContain("S<-S");
-    expect(notified).toContain("E<-S");
-    // KAN-828: baseline seeding calls comments() once for S's first sighting
-    // regardless of what kind of diff it is — this diff isn't label-only
-    // (isDaemonLabelOnlyDiff is false, "urgent" isn't daemon-owned), so
-    // crossDaemonSuppressed itself never calls comments(), but seeding does.
+    expect(notified).not.toContain("S<-S");
+    expect(notified).not.toContain("E<-S");
+    // KAN-828: this diff's own `poll()` call is ALSO S's first sighting
+    // (only two polls total, so `poll()` itself never ran before this),
+    // so baseline seeding's own single comments() call happens in the SAME
+    // poll §3D's own active check reuses — no second call, and no defined
+    // pre-poll baseline to compare against either (seeding hadn't run YET
+    // when this poll started), so the active check cannot positively
+    // confirm a mover and stays silent — not a guess either way.
     expect(commentCalls).toBe(1);
   });
 
@@ -1577,46 +1630,53 @@ describe("startLoop: every notify reason class is named, driven through the real
     expect(wEvents[0]!.reason).toEqual({ label: { prefix: "pr", from: "open", to: "approved" } });
   });
 
-  // BUTCHR-350 (§3D): with no `comments` dep at all, EVERY poll's baseline
-  // seeding still attempts `fetchComments(K)` for K (it never has anywhere
-  // to record a successful baseline, so `commentCursor.has(K)` never
-  // becomes true and seeding never stops retrying) — so `decide()`'s
-  // fallback correctly finds an ATTEMPTED-and-failed entry in this poll's
-  // shared cache, not an absent one. `check-failed`, not `unchecked`, is
-  // the honest label: this codebase's own "could not check" vocabulary
-  // (§4 OUT) covers both "the dep isn't wired" and "the call rejected" —
-  // both are, from `decide()`'s own vantage point, "tried, could not tell".
-  test("a pure `updated` bump with every other field identical, and no comments dep wired up, is reported as 'could not check' — never a guess", async () => {
+  // FACTORY-922 (implementing FACTORY-921 §1 — REPLACES this BUTCHR-350
+  // §3D test's own former expectation, deliberately, not weakened): with no
+  // `comments` dep at all, `decide()`'s §3D fallback now ACTIVELY tries
+  // `fetchComments(K)` (every poll's baseline seeding already did too, for
+  // the same "no dep" reason) and gets back `{ ok: false, reason: "failed"
+  // }` — a poll that cannot CONFIRM a diff must not notify, so this is now
+  // a SKIP (logged, counted), never a guess.
+  test("a pure `updated` bump with every other field identical, and no comments dep wired up, is SKIPPED (not notified), logged and counted as 'failed'", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
+    const logLines: string[] = [];
+    const skipped: Array<{ key: string; reason: string }> = [];
     const polls: JiraIssue[][] = [[mk({ updated: "t1" })], [mk({ updated: "t2" })]];
     let n = 0;
     const stop = startLoop({
       search: async () => polls[Math.min(n++, polls.length - 1)]!,
       herd,
       notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      log: (l) => logLines.push(l),
+      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
       // No `suppress` and no `comments` deps at all: nothing in this poll
       // could ever learn about a comment, so this must fall all the way
-      // through to the honest "could not check" fallback, never a guess.
+      // through to the honest "could not check" fallback — now a SKIP, not
+      // a guessed delivery.
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 40));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K");
-    expect(kEvents.length).toBe(1);
-    expect(kEvents[0]!.reason).toEqual({ undetermined: "check-failed" });
+    expect(kEvents.length).toBe(0);
+    expect(skipped).toEqual([{ key: "K", reason: "failed" }]);
+    expect(logLines.some((l) => l === "[poll] skipped-comment-check key=K reason=failed retained-snapshot")).toBe(true);
   });
 
-  // BUTCHR-350 (§3D): the TRUE "unchecked" case — a `comments` dep IS
-  // wired (so a check is genuinely POSSIBLE), K's baseline was already
-  // seeded on the poll it appeared (so seeding does not re-fire on a later
-  // poll), and that later poll's own diff is a pure non-structural
-  // `updated` bump with no label change (so neither crossDaemonSuppressed
-  // nor the own-write ledger ever has a reason to call fetchComments THIS
-  // poll either) — the literal mechanism behind the epic's §3(D)
-  // hypothesis: the first notify for a pure foreign comment has no I/O
-  // signal available to name it, because nothing this poll ever looked.
-  test("a pure `updated` bump with comments genuinely never consulted this poll (comments dep wired, but no arm had a reason to call it) is 'unchecked', not 'check-failed'", async () => {
+  // FACTORY-922 (implementing FACTORY-921 §1 — REPLACES this BUTCHR-350
+  // §3D test's own former expectation, deliberately, not weakened): a
+  // `comments` dep IS wired (so a check is genuinely possible), K's
+  // baseline was already seeded on the poll it appeared, and the later
+  // poll's own diff is a pure non-structural `updated` bump with no label
+  // change — the literal mechanism behind the epic's old §3(D) hypothesis.
+  // `decide()`'s fallback now ACTIVELY tries the check instead of settling
+  // for "unchecked": it succeeds, finds nothing moved (the same single
+  // comment the whole run), and stays silent — this `updated` bump is
+  // attributed to a field this classifier does not track (e.g. a priority
+  // edit), exactly the class the resolved FACTORY-921 decision says must
+  // never wake anyone.
+  test("a pure `updated` bump with comments actively checked and found unchanged produces NO second notify — not a guess, not a delivery", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
     let commentCalls = 0;
@@ -1637,15 +1697,13 @@ describe("startLoop: every notify reason class is named, driven through the real
     await new Promise((r) => setTimeout(r, 80));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K");
-    expect(kEvents.length).toBe(2);
+    expect(kEvents.length).toBe(1);
     expect(kEvents[0]!.reason).toEqual({ appeared: true });
-    expect(kEvents[1]!.reason).toEqual({ undetermined: "unchecked" });
-    // Exactly one comments() call for the whole run — the appear-poll's own
-    // baseline seed. Nothing else this test does ever has an I/O reason to
-    // call it again, which is precisely what makes idx2's own delivery
-    // "unchecked" rather than "checked-unchanged": there was genuinely no
-    // second look, not a look that found nothing.
-    expect(commentCalls).toBe(1);
+    // Two comments() calls: the appear-poll's own baseline seed, plus
+    // idx2's own ACTIVE fallback check (new behaviour — the old code never
+    // made this second call at all) — which found nothing moved and so
+    // never delivered a second event.
+    expect(commentCalls).toBe(2);
   });
 
   describe("precedence: more than one class true of the same diff (documented order — status > daemon label > summary > comment)", () => {
@@ -1717,12 +1775,12 @@ describe("startLoop: every notify reason class is named, driven through the real
   });
 });
 
-describe("startLoop §3(D): the delivered-line duplicate pair — a pure foreign comment's FIRST notify is honestly 'unchecked', and a LATER, unrelated daemon-label flip's notify carries the SAME comment id, making the pair recognisable as one change", () => {
+describe("startLoop §3(D)/FACTORY-922: the old delivered-line duplicate pair is GONE — a pure foreign-comment bump this poll's own active check cannot confirm is SKIPPED, never guessed, and a LATER, unrelated daemon-label flip's own fetch still eventually names the SAME comment id, so nothing is lost", () => {
   const mk = (labels: string[], updated: string): JiraIssue =>
     ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
   const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
 
-  test("FALSIFIER (§6 'D'): reproduces the measured incident shape — comment posted, first [notify] carries no id (honest 'unchecked'), a LATER routine agent:*-flip's [notify] carries the SAME id via `comment:<id>`", async () => {
+  test("FACTORY-922 (replaces the old BUTCHR-350 FALSIFIER, deliberately, not weakened): a pure comment bump this poll's own active check finds unchanged (the real mover hadn't landed yet) is SKIPPED silently; a LATER routine agent:*-flip's own fetch discovers the real mover and delivers `comment:<id>` exactly once", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
     let pollIndex = 0;
@@ -1734,8 +1792,8 @@ describe("startLoop §3(D): the delivered-line duplicate pair — a pure foreign
     const polls: JiraIssue[][] = [
       [],                              // idx0: silent baseline
       [mk(["agent:working"], "t1")],   // idx1: K appears, seeded on "c0"
-      [mk(["agent:working"], "t2")],   // idx2: comment "c1" landed (updated bump), NO label change — nothing this poll has an I/O reason to check
-      [mk(["agent:idle"], "t3")],      // idx3: an UNRELATED routine daemon label flip — its own crossDaemonSuppressed fetch is the first thing to actually look
+      [mk(["agent:working"], "t2")],   // idx2: an `updated` bump with NO label change and no real comment movement yet (idx2 isn't in commentsByPoll, so its own active check finds the same "c0") — decide()'s §3D fallback now actively checks, finds NOTHING moved, and stays silent
+      [mk(["agent:idle"], "t3")],      // idx3: an UNRELATED routine daemon label flip — its own crossDaemonSuppressed fetch discovers "c1" has since landed
     ];
     let n = 0;
     const stop = startLoop({
@@ -1748,19 +1806,15 @@ describe("startLoop §3(D): the delivered-line duplicate pair — a pure foreign
     await new Promise((r) => setTimeout(r, 100));
     stop();
     const kEvents = notified.filter((e) => e.issue === "K" && e.about === "K");
-    // idx1: appeared. idx2: the pure comment bump — no arm has an I/O reason
-    // to check comments this poll (K was already seeded), so this delivers
-    // honestly as "unchecked" — NOT a guess, and critically NOT the SAME
-    // text as "checked, found nothing" (§3D's own stated requirement).
-    // idx3: the routine label flip finally triggers crossDaemonSuppressed's
-    // own fetch, discovers "c1" moved since the stale "c0" baseline, and
-    // delivers `{ comment: "c1" }` — the exact id the FIRST notify could not
-    // name. A reader sees TWO notifies for (K, K) back-to-back, the second
-    // one naming "c1" — recognisable, by key+adjacency+id, as one change.
-    expect(kEvents.length).toBe(3);
+    // idx1: appeared. idx2: the active check finds nothing moved — no
+    // delivery at all now (the old code's blind "unchecked" guess is gone).
+    // idx3: the routine label flip's own fetch discovers "c1" moved since
+    // the still-retained "c0" baseline (idx2 never advanced it past "c0"
+    // either, since nothing moved there) and delivers `{ comment: "c1" }` —
+    // exactly once, never duplicated.
+    expect(kEvents.length).toBe(2);
     expect(kEvents[0]!.reason).toEqual({ appeared: true });
-    expect(kEvents[1]!.reason).toEqual({ undetermined: "unchecked" });
-    expect(kEvents[2]!.reason).toEqual({ comment: "c1" });
+    expect(kEvents[1]!.reason).toEqual({ comment: "c1" });
   });
 });
 
@@ -1808,7 +1862,13 @@ describe("startLoop §3(D) case 4: a watcher's own delivery can be honestly name
     expect(commentCalls).toBe(2); // idx1 seed + idx2 K's own arm; W added zero
   });
 
-  test("case 3: the sibling arm's fetch finds NOTHING new (the agent's own write was not itself a comment) — W's delivery is honestly 'checked-unchanged', not a guess and not 'comment'", async () => {
+  // FACTORY-922 (replaces this BUTCHR-350 "case 3" test's own former
+  // expectation, deliberately, not weakened): the sibling arm's fetch
+  // finds NOTHING new (the agent's own write at idx2 was not itself a
+  // comment) — W's `decide()` call peeks that same cached result via its
+  // own §3D fallback and, finding nothing moved, now stays SILENT rather
+  // than guessing a "checked-unchanged" delivery.
+  test("case 3: the sibling arm's fetch finds NOTHING new (the agent's own write was not itself a comment) — W gets NO second notify, not a guess and not 'comment'", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
     let pollIndex = 0;
@@ -1830,9 +1890,8 @@ describe("startLoop §3(D) case 4: a watcher's own delivery can be honestly name
     await new Promise((r) => setTimeout(r, 60));
     stop();
     const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
-    expect(wEvents.length).toBe(2);
+    expect(wEvents.length).toBe(1);
     expect(wEvents[0]!.reason).toEqual({ appeared: true });
-    expect(wEvents[1]!.reason).toEqual({ undetermined: "checked-unchanged" });
   });
 });
 
@@ -2605,5 +2664,191 @@ describe("reconcileNow: FACTORY-501 restored-pane wall-clock defer-and-escalate"
     expect(waiting).toEqual([{ issue: "M", outcome: "deferred", count: RESUME_WAITING_NOTICE_AT_POLLS }]);
     expect(deferredCalls.length).toBe(RESUME_WAITING_NOTICE_AT_POLLS + 50);
     expect(deferredCalls.every((d) => d.length === 0)).toBe(true); // never once contains "M"
+  });
+});
+
+describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify when the §3D comment fetch is skipped under load or fails outright, with a retained snapshot that re-fires the real change on a later poll", () => {
+  const mk = (updated: string, labels: string[] = ["agent:working"]): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const comment = (id: string): JiraComment => ({ id, body: "x", created: "c", authorEmail: null });
+
+  test("a comment fetch that throws (not load-shedding) is SKIPPED, logged/counted as 'failed', snapshot retained — the real mover is still discovered and delivered once a LATER poll's own check succeeds", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const logLines: string[] = [];
+    const skipped: Array<{ key: string; reason: string }> = [];
+    let pollIndex = 0;
+    const comments = async () => {
+      if (pollIndex === 1) return [comment("c0")]; // idx1: K appears, baseline seed
+      if (pollIndex === 2) throw new Error("transient Jira error"); // idx2: the check this poll genuinely fails
+      return [comment("c1"), comment("c0")]; // idx3+: the real mover, at last confirmable
+    };
+    // idx2: a pure `updated` bump, no label change — decide()'s own §3D
+    // fallback is the only thing that would call comments() this poll, and
+    // it throws. idx3: an unrelated label flip finally succeeds and finds
+    // "c1" moved since the still-retained "c0" baseline.
+    const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")], [mk("t3", ["agent:idle"])]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      comments,
+      log: (l) => logLines.push(l),
+      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // the once-skipped change, confirmed and delivered later — nothing lost
+    expect(skipped).toEqual([{ key: "K", reason: "failed" }]);
+    expect(logLines.some((l) => l === "[poll] skipped-comment-check key=K reason=failed retained-snapshot")).toBe(true);
+  });
+
+  // PR #732 round-1 review (BLOCKING): the test above's own idx3 carries an
+  // UNRELATED `agent:working -> agent:idle` flip, which is what actually
+  // triggers the successful re-check — it does not prove the snapshot
+  // itself was retained, only that SOME later structural change eventually
+  // reconfirms. This test is the one the review asked for: idx3 carries
+  // NO other change at all (same `updated` as idx2, nothing else moved) —
+  // `changedKeys` alone would see NO diff and never even call `decide()`
+  // again. Only `pendingRecheck` (src/resources/issue.ts) forces this key
+  // back through `decide()` on a content-identical poll; without it, this
+  // comment is lost forever, exactly the defect the review caught.
+  test("FALSIFIER (PR #732 review round 1): a skipped check's own key is force-rechecked on a LATER poll with NO other change at all — the comment is not lost", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    let pollIndex = 0;
+    const comments = async () => {
+      if (pollIndex === 1) return [comment("c0")]; // idx1: K appears, baseline seed
+      if (pollIndex === 2) throw new Error("transient Jira error"); // idx2: the check this poll genuinely fails
+      return [comment("c1"), comment("c0")]; // idx3+: the SAME real mover, at last confirmable — nothing else about K ever changes
+    };
+    // idx3 is byte-for-byte identical to idx2 (`mk("t2")` both times) — no
+    // status/label/summary/updated difference whatsoever.
+    const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")], [mk("t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      comments,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(2);
+    expect(kEvents[0]!.reason).toEqual({ appeared: true });
+    expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // delivered exactly once, from the forced re-check — never lost, never duplicated
+  });
+
+  test("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const skipped: Array<{ key: string; reason: string }> = [];
+    let pollIndex = 0;
+    const comments = async () => {
+      if (pollIndex === 1) return [comment("c0")];
+      throw new AtlassianHttpError(429, "GET", "/rest/api/3/issue/K/comment", "rate limited");
+    };
+    const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      comments,
+      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 60));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1); // only "appeared" — the 429'd check never delivers
+    expect(skipped).toEqual([{ key: "K", reason: "load" }]);
+  });
+});
+
+describe("startLoop FACTORY-922 (implementing FACTORY-921's resolved decision point): assignee/description/issuelinks changes are confirmed diffs that wake the worker; a non-daemon label-only change does not", () => {
+  const mk = (over: Partial<JiraIssue>): JiraIssue =>
+    ({ key: "K", status: "In Progress", summary: "s", issuetype: "Task", assignee: "a", parent: null, updated: "t1", labels: ["agent:working"], ...over });
+
+  test("a reassignment alone (no other field moved) delivers, named `assignee`", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ assignee: "alice", updated: "t1" })], [mk({ assignee: "bob", updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ assignee: { from: "alice", to: "bob" } });
+  });
+
+  test("a description edit alone delivers, named `description`", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ description: "old", updated: "t1" })], [mk({ description: "new", updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ description: true });
+  });
+
+  test("a linked issue added/removed alone delivers, named `issuelinks`", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const linksBefore = [{ type: "Relates", otherEnd: "outward" as const, key: "KAN-1" }];
+    const linksAfter = [{ type: "Relates", otherEnd: "outward" as const, key: "KAN-2" }];
+    const polls: JiraIssue[][] = [[mk({ issuelinks: linksBefore, updated: "t1" })], [mk({ issuelinks: linksAfter, updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    const kEvents = notified.filter((e) => e.issue === "K");
+    expect(kEvents.length).toBe(1);
+    expect(kEvents[0]!.reason).toEqual({ issuelinks: { added: ["KAN-2"], removed: ["KAN-1"] } });
+  });
+
+  test("a non-daemon label-only change (not agent:*/pr:*) produces NO delivery — the decision's own 'label-only does NOT' pinned", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[mk({ labels: ["triaged"], updated: "t1" })], [mk({ labels: ["needs-info"], updated: "t2" })]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
+      // No `comments` dep: the §3D fallback's own active check will fail
+      // ("failed") rather than confirm anything — either way, nothing here
+      // is EVER delivered, which is the behaviour this test pins.
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.filter((e) => e.issue === "K").length).toBe(0);
   });
 });
