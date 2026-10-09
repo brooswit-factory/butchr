@@ -1137,6 +1137,7 @@ describe("admitWithRateLimits (pure, FACTORY-907)", () => {
     const got = admitWithRateLimits(["A", "B", "C"], 1, noLimit, new Map(), 0);
     expect(got.admitted).toEqual(["A"]);
     expect(got.withheld).toEqual(["B", "C"]);
+    expect(got.rateDeferred).toEqual([]); // nothing was rate-limited — B/C are purely cap-exhausted
     expect(got.perRule.size).toBe(0);
     expect(got.admittedAt.size).toBe(0);
   });
@@ -1146,6 +1147,7 @@ describe("admitWithRateLimits (pure, FACTORY-907)", () => {
     const got = admitWithRateLimits(["A", "B", "C"], 10, rl, new Map(), 0);
     expect(got.admitted).toEqual(["A"]);
     expect(got.withheld).toEqual(["B", "C"]);
+    expect(got.rateDeferred).toEqual(["B", "C"]); // deferred BY THE RATE LIMIT, not the cap (budget=10 has plenty of headroom)
     expect(got.perRule.get("r1")).toEqual({ maxNewPerTick: 1, admitted: 1, deferred: 2 });
     expect(got.admittedAt.get("r1")).toBe(0);
   });
@@ -1180,6 +1182,8 @@ describe("admitWithRateLimits (pure, FACTORY-907)", () => {
     expect(got.withheld).toEqual(["B0", "B1"]);
     // ruleB's own candidates never reached the rate-limit check (the cap was already exhausted by A0) — no tally at all, so the rule's own rate-limit is never blamed for a cap-caused deferral.
     expect(got.perRule.has("ruleB")).toBe(false);
+    // B0/B1 are in `withheld` (the wait ledger still counts them) but NOT in `rateDeferred` — they were cap-exhausted, never rate-limited.
+    expect(got.rateDeferred).toEqual([]);
   });
 
   test("a candidate absent from rateLimitOf's own rule's prior lastAdmittedAt (never admitted before) is never blocked by minSecondsBetweenAdmissions", () => {
@@ -1282,12 +1286,26 @@ describe("createAdmissionController with rateLimitOf (FACTORY-907, end-to-end)",
     const ctrl = createAdmissionController(depsObj);
     // Lexicographic order (both wait 0) is ["a-decoy", "c1"] — "a-decoy" takes r1's one slot this call; c1 is deferred BY THE RATE LIMIT (cap=100 is nowhere near binding) — c1's wait -> 1
     await ctrl.admit(["a-decoy", "c1"], []);
-    expect(ctrl.snapshot().longestWait).toEqual({ id: "c1", polls: 1 });
+    // c1 is rate-deferred, not cap-withheld (cap=100 has plenty of headroom) — it must never surface in the CAP's own longestWait (see the dedicated test below for the full "never reported as cap-withheld" case).
+    expect(ctrl.snapshot().longestWait).toBeNull();
     // c1 leaves the desired set for good (ticket closed) — it is never named in a call again, for longer than the eviction bound.
     for (let i = 0; i < LEDGER_UNSEEN_EVICTION_CALLS + 1; i++) await ctrl.admit(["OTHER"], []);
     depsObj.cap = 1;
     // c1 reappears alongside a lexicographically-EARLIER fresh arrival: its old wait of 1 would beat that fresh arrival outright if it had survived. It did not — "1-FRESH" wins the tie at wait 0.
     expect(await ctrl.admit(["1-FRESH", "c1"], [])).toEqual(["1-FRESH"]);
+  });
+
+  test("PR #734 review: a rate-deferred id (cap headroom to spare) never appears in census()'s withheld bucket or snapshot's longestWait, while it still waits and is admitted later in order", async () => {
+    const rateLimitOf = (id: string): RuleRateLimit | undefined => (id === "a-decoy" || id === "c1" ? { ruleId: "r1", maxNewPerTick: 1 } : undefined);
+    const ctrl = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf, sources: ["issue"] });
+    // cap=100 has plenty of headroom — c1 is deferred purely by its own rule's rate limit, never by the shared cap.
+    expect(await ctrl.admit(["a-decoy", "c1"], [], "issue")).toEqual(["a-decoy"]);
+    expect(ctrl.snapshot().longestWait).toBeNull();
+    const bucket = ctrl.census().buckets.find((b) => b.source === "issue");
+    expect(bucket?.checked).toBe(true);
+    expect(bucket && bucket.checked ? bucket.withheld : null).toEqual([]);
+    // c1 still waits — admitted on the VERY NEXT call, ahead of a lexicographically-earlier fresh arrival, which only happens if its wait of 1 survived.
+    expect(await ctrl.admit(["1-FRESH", "c1"], [], "issue")).toEqual(["c1", "1-FRESH"]);
   });
 
   test("restart mid-batch re-derives from live state — a brand-new controller instance carries no limiter memory from a prior one", async () => {

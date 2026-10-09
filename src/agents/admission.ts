@@ -560,8 +560,30 @@ export interface RuleRateLimitTally {
 
 export interface RateLimitedAdmission {
   admitted: readonly string[];
-  /** Every id not admitted this call — cap-exhausted and rate-limited ids alike, feeding the SAME wait ledger `admitExclusive` already maintains for cap withholding (criterion 2: deferred candidates are retried next call, in order, never dropped or marked stalled/withheld-by-cap). */
+  /**
+   * Every id not admitted this call — cap-exhausted and rate-limited ids
+   * alike, feeding the SAME wait ledger `admitExclusive` already maintains
+   * for cap withholding (criterion 2: deferred candidates are retried next
+   * call, in order, with their wait still counting). PR #734 review: this
+   * combined set must never reach `/health`'s `longestWait`, the per-source
+   * census bucket's own `withheld`, or the `[admission2] cap=...` line's
+   * `withheld`/`wanted:` list — those are the CAP's own reporting surfaces,
+   * and a rate-limited id was never withheld BY THE CAP (it may have had
+   * cap headroom to spare). Use `rateDeferred` below to exclude it: the
+   * caller computes `withheld.filter(id => !rateDeferred.includes(id))` for
+   * every one of those three outputs, while still feeding the FULL
+   * `withheld` (this field, unfiltered) into the wait ledger.
+   */
   withheld: readonly string[];
+  /**
+   * The subset of `withheld` above that was deferred BY A RULE'S OWN RATE
+   * LIMIT specifically this call, never one merely caught by the cap
+   * running out first (see `admitWithRateLimits`'s own doc comment for why
+   * the single-pass design can tell the two apart). A caller reporting
+   * cap-withheld candidates (health, census, the cap log line) must
+   * subtract this set first — see `withheld`'s own doc comment.
+   */
+  rateDeferred: readonly string[];
   /** Per-rule tallies, keyed by `ruleId` — only rules that actually had a candidate reach the rate-limit check this call (i.e. the shared cap hadn't already run out before their turn); see `admitWithRateLimits`'s own doc comment. */
   perRule: ReadonlyMap<string, RuleRateLimitTally>;
   /** This call's fresh `minSecondsBetweenAdmissions` timestamps, one entry per rule that actually admitted a candidate this call — the caller persists these into its own across-calls ledger (`admitExclusive`'s `ruleLastAdmittedAt`); a rule absent here admitted nothing this call and its prior timestamp (if any) is unchanged. */
@@ -599,6 +621,7 @@ export function admitWithRateLimits(
   let remaining = Math.max(0, budget);
   const admitted: string[] = [];
   const withheld: string[] = [];
+  const rateDeferred: string[] = [];
   const perRule = new Map<string, RuleRateLimitTally>();
   const admittedThisCall = new Map<string, number>();
   const admittedAt = new Map<string, number>();
@@ -628,11 +651,12 @@ export function admitWithRateLimits(
       tally.admitted++;
     } else {
       withheld.push(id);
+      rateDeferred.push(id);
       tally.deferred++;
     }
     perRule.set(rl.ruleId, tally);
   }
-  return { admitted, withheld, perRule, admittedAt };
+  return { admitted, withheld, rateDeferred, perRule, admittedAt };
 }
 
 /**
@@ -949,8 +973,19 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // `rateLimitOf(id)` call returns undefined) — the "unset = unchanged,
     // byte-for-byte" requirement.
     const nowMs = now();
-    const { admitted, withheld, perRule, admittedAt } = admitWithRateLimits(ordered, budget, deps.rateLimitOf ?? (() => undefined), ruleLastAdmittedAt, nowMs);
+    const { admitted, withheld, rateDeferred, perRule, admittedAt } = admitWithRateLimits(ordered, budget, deps.rateLimitOf ?? (() => undefined), ruleLastAdmittedAt, nowMs);
     for (const [ruleId, at] of admittedAt) ruleLastAdmittedAt.set(ruleId, at);
+    // PR #734 review: `withheld` (above) still feeds the wait ledger below —
+    // both cap-exhausted AND rate-deferred ids keep their order/wait, per
+    // criterion 2 — but `capWithheld` (never `withheld`) is what reaches
+    // every CAP reporting surface (`/health`'s longestWait, the census
+    // bucket, the `[admission2] cap=...` line): a rate-deferred id was never
+    // withheld BY THE CAP (it may have had cap headroom to spare), and the
+    // ticket is explicit that it must not be marked withheld-by-cap. When no
+    // candidate is rate-limited, `rateDeferred` is empty and `capWithheld ===
+    // withheld` — the "unset = unchanged, byte-for-byte" requirement.
+    const rateDeferredSet = new Set(rateDeferred);
+    const capWithheld = withheld.filter((id) => !rateDeferredSet.has(id));
     // §A4/B1/B4: increment the wait for every candidate withheld THIS call
     // only — never an admitted one (admission is not the same event as
     // running; recordSpawned below is the only thing that ever clears an
@@ -977,7 +1012,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
         lastSeenCall.delete(id);
       }
     }
-    lastWithheld = withheld;
+    lastWithheld = capWithheld;
     // BUTCHR-320 (B/D): fires on EVERY poll that reaches this point — i.e.
     // every poll with at least one candidate, including `withheld = 0` —
     // unlike the old `[admission]` line this replaces, which only ever fired
@@ -988,7 +1023,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
     // comment for why the tag itself changed (criterion D) rather than
     // reusing `[admission]` with a wider firing condition.
     reserve(admitted, source);
-    log(admissionLine(deps.cap, observed, admitted.length, workerCandidates.length, withheld, waits, sentinelResidencyCount, occupied.size - observed));
+    log(admissionLine(deps.cap, observed, admitted.length, workerCandidates.length, capWithheld, waits, sentinelResidencyCount, occupied.size - observed));
     // FACTORY-907 (scope item 3): one line per rule that had at least one
     // candidate DEFERRED BY THE RATE LIMIT this call (never a rule that
     // merely has a limit configured but saw nothing deferred — "no log
@@ -1007,7 +1042,7 @@ export function createAdmissionController(deps: AdmissionControllerDeps): Admiss
         : 0;
       log(rateLimitLine(ruleId, tally, nextInSeconds));
     }
-    setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld });
+    setBucket({ source, checked: true, confirmedAt: new Date(now()).toISOString(), withheld: capWithheld });
     // BUTCHR-398: sentinel candidates are ALWAYS appended, unconditionally
     // admitted — never subject to `budget`/`withheld` above.
     return [...admitted, ...sentinelCandidates];
