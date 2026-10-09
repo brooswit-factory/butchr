@@ -91,7 +91,7 @@ describe("POST /api/session-definitions/:name/fields — write guard go-red case
     } finally { await app.stop(true); }
   });
 
-  test("wrong content-type: 403, write never called", async () => {
+  test("wrong content-type: 415, write never called", async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
     const { app, origin, host, port } = startApp(stubDeps(csrf, { fields: async () => { called = true; return ACCEPTED; } }));
@@ -100,7 +100,7 @@ describe("POST /api/session-definitions/:name/fields — write guard go-red case
         method: "POST", headers: { origin, host, "content-type": "text/plain", [CSRF_HEADER]: csrf.token },
         body: JSON.stringify({ patch: { modelPower: 90 }, ifMatch: "x", confirm: false }),
       });
-      expect(res.status).toBe(403);
+      expect(res.status).toBe(415);
       expect(called).toBe(false);
     } finally { await app.stop(true); }
   });
@@ -108,8 +108,13 @@ describe("POST /api/session-definitions/:name/fields — write guard go-red case
   test("failing peer-uid check: 403, write never called", async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
+    // `peerOk` is the write-guard's OWN peer check (passed into
+    // `writeGuardDeps` below) — the top-level `peerUidCheck` field on
+    // `ViewDeps` is a SEPARATE closure used only by the GET routes' own
+    // guard, so mutating it after the fact (as the top-level `peerUidCheck`
+    // literal alone) would never reach `checkWriteGuard` at all.
     const deps = stubDeps(csrf, { fields: async () => { called = true; return ACCEPTED; } });
-    deps.peerUidCheck = () => false;
+    deps.writeGuard = writeGuardDeps(csrf, false);
     const { app, origin, host, port } = startApp(deps);
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/session-definitions/a.json/fields`, {
