@@ -636,7 +636,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     const serverResult = validateRuleCreateInput(wireBody);
     expect(serverResult.ok).toBe(true);
     if (serverResult.ok) {
-      expect(serverResult.input).toEqual({ id: draft.id, resourceProvider: draft.resourceProvider, query: draft.query, permissionMode: draft.permissionMode, lizardMode: draft.lizardMode, role: draft.role, agentPreferences: draft.agentPreferences });
+      expect(serverResult.input).toEqual(draft);
     }
   });
 

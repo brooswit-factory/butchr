@@ -270,10 +270,21 @@ export interface ViewDeps {
     fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
-    /** FACTORY-927 — `POST /api/rules`'s own write (`createRule`, `../rules/rules-write.ts`). Always creates the new rule DISABLED; confirm is mandatory, independent of blast radius — see that function's own doc comment. */
-    create: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
-    /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. */
-    planCreate: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
+    /**
+     * FACTORY-927 — `POST /api/rules`'s own write (`createRule`,
+     * `../rules/rules-write.ts`). Always creates the new rule DISABLED;
+     * confirm is mandatory, independent of blast radius — see that
+     * function's own doc comment. Optional (unlike `enabled`/`fields`/
+     * `undo`/`plan` above, which predate this ticket and every existing
+     * caller of this object already supplies): an omitted `create` (or
+     * `planCreate` below) makes `POST /api/rules` answer 503, same
+     * "endpoint disabled: not configured" discipline every other optional
+     * `ViewDeps` dependency already follows — never a reason to widen every
+     * pre-existing literal of this object.
+     */
+    create?: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
+    /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. Optional — see `create`'s own doc comment immediately above. */
+    planCreate?: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -964,7 +975,9 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const createRule = deps.rulesWrite?.create;
+      const planCreateRule = deps.rulesWrite?.planCreate;
+      if (!createRule || !planCreateRule) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") });
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const bad = bodyProblem(body);
@@ -974,13 +987,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const b = body as Record<string, unknown>;
       const confirm = b.confirm === true;
       const ids = [parsed.input.id];
-      const plan = await deps.rulesWrite.planCreate(parsed.input, confirm);
+      const plan = await planCreateRule(parsed.input, confirm);
       if (!plan.ok) {
         auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, { ok: false, error: plan.error });
         set.status = plan.status;
         return { error: plan.error };
       }
-      const outcome = await deps.rulesWrite.create(parsed.input, confirm, plan.planHash);
+      const outcome = await createRule(parsed.input, confirm, plan.planHash);
       auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
