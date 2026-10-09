@@ -209,12 +209,12 @@ const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 
 // BUTCHR-149 (project.md) + BUTCHR-165 (epic.md, story.md) + FACTORY-40
 // (bug.md): all four are pure REVIEWERS of the tier below them (project
-// reviews epic's PR, epic reviews story's PR, story reviews task's PR, and
-// bug — a boss the same tier as epic, never a worker — reviews a story's
-// PR too) — none of the four merges a PR of its own (bug.md owns no repo
-// branch at all: it decomposes into Stories the same ownerless way an epic
-// does, never authoring code itself), so none belongs in
-// MERGE_INSTRUCTING_BRIEFS (that list
+// reviews epic's work, epic reviews story's PR, story reviews task's PR,
+// and bug — a boss the same tier as epic, never a worker — reviews the
+// Epic it files, FACTORY-437) — none of the four merges a PR of its own
+// (bug.md owns no repo branch at all: it decomposes into Epics the same
+// ownerless way a project decomposes into epics, never authoring code
+// itself), so none belongs in MERGE_INSTRUCTING_BRIEFS (that list
 // asserts the AUTHOR-side stale-approval check: reviews[].commit.oid,
 // last-decisive ordering, base-merge caveat). What each of these four DOES
 // carry, and must keep carrying, is a narrower reviewer-side instruction:
@@ -233,11 +233,15 @@ const BASE_MERGE_CAVEAT = /(?=[\s\S]*base-merge)(?=[\s\S]*not sufficient)/i;
 //
 // FACTORY-40: briefs/bug.md joined this list once `bug.md` was rewritten
 // from a worker-tier stub into the boss-tier brief `knownBriefTypes()`
-// already carried the key for — a Bug reviews each Story it files the same
-// way an Epic reviews each Story IT files (bug.md's own text says so
-// explicitly, close to verbatim with epic.md's), so it carries the exact
-// same reviewer-side `[review]` instruction as project/epic/story above, not
-// a Bug-specific variant of it.
+// already carried the key for. FACTORY-437: a Bug's own child became an
+// Epic, not a Story, so bug.md's own reviewer-side `[review]` instruction
+// was rephrased to match project.md's (project reviewing an epic, not
+// epic/story reviewing a PR-bearing worker below it) — the `[review]` line
+// there is conditional ("if your review of its work genuinely involves a
+// PR of the Epic's own"), since an Epic, like a Bug, never authors a PR of
+// its own; it still carries the exact same reviewer-side `[review]` line
+// shape and transcription caveat text as project/epic/story above, just
+// framed as the exceptional case rather than the ordinary one.
 const REVIEW_LINE_INSTRUCTING_BRIEFS = ["brief:Project:brief.md", "brief:Epic:brief.md", "brief:Story:brief.md", "brief:Bug:brief.md"];
 
 // ---------------------------------------------------------------------
