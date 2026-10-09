@@ -76,7 +76,7 @@ import { createStalledCheck } from "../agents/stalled.js";
 import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
+import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
@@ -2076,6 +2076,22 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     const issue = resourceKeyOf(agent);
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  // FACTORY-916: `herd.lastFreshSpawnResumed` told `reconcileNow` this
+  // respawn resumed its prior Claude session via an ordinary fresh spawn
+  // (never `resumeInPlace()` — that is `onResumePreserved` below), so it
+  // fires INSTEAD OF `onRespawn` above for this one respawn — see that
+  // callback's own doc comment (src/daemon/loop.ts) for why exactly one of
+  // the two always fires. Posts the third wording (`respawnResumedComment`),
+  // not `respawnComment` (wrongly says "this session is fresh") and not
+  // `resumePreservedComment` (wrongly says "your ticket has not changed" —
+  // this agent's PROCESS was actually gone, unlike `resumeInPlace()`'s).
+  onRespawnResumed: async (agent) => {
+    console.error(`  [reconcile] ${agent} respawned, resumed its prior session`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, respawnResumedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn-resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
   // FACTORY-314: a model/effort-only change resumed the SAME session —
   // distinct marker/wording from `onRespawn` above (never "re-read your

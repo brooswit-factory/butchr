@@ -46,6 +46,18 @@ export interface LoopDeps {
    * src/daemon/index.ts wires it through.
    */
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /**
+   * FACTORY-916 — called INSTEAD OF `onRespawn` immediately above when the
+   * respawn that just succeeded resumed its prior Claude session
+   * (`herd.lastFreshSpawnResumed`, src/agents/herd.ts) rather than starting
+   * fresh — see `reconcileNow`'s own respawn loop for exactly where this
+   * distinction is read, right after `herd.spawn(toSpawn, "respawn")`
+   * returns. Optional and additive: a caller that never wires this simply
+   * keeps getting `onRespawn` for every respawn, resumed or not — unchanged
+   * pre-FACTORY-916 behaviour (an honest, if now slightly imprecise,
+   * "This session is fresh" notice rather than a missing one).
+   */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
@@ -226,6 +238,8 @@ export const RESUME_WAITING_NOTICE_AT_POLLS = 10;
 
 export interface ReconcileOptions {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** Storm-guard state; see RespawnGuard. Defaults to a fresh (never-suppressing) instance. */
   guard?: RespawnGuard;
   /** Called, with the exact line to log, when the storm guard suppresses a would-be respawn. */
@@ -718,6 +732,21 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
           failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
         } else {
           await herd.spawn(toSpawn);
+          // FACTORY-916: THE primary case this story exists for — `issue`
+          // was `desired` but not `running` at all (this `admitted`/
+          // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
+          // below, which only ever sees an agent that WAS running) —
+          // i.e. exactly the "daemon respawns a worker after an
+          // unintended stop" shape FACTORY-843's outcome describes. Same
+          // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
+          // callback the stale-argv loop below also consults — see that
+          // loop's own comment for the full contract. Without this read
+          // HERE too, a genuine crash-respawn that resumed would get NO
+          // ticket notice at all: this loop never calls `opts.onRespawn`
+          // in the first place (a brand-new "first ever spawn" needs no
+          // "your session was X" notice), so there is no existing call
+          // this piggybacks on the way the stale-argv loop's does.
+          if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
         }
       } catch (e) {
         failures.push({ id: issue, stage: "spawn", error: e });
@@ -904,7 +933,17 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // isolation scope is herd.spawn/stop/respawn specifically (its own
     // title) — production wiring already guarantees this callback never
     // throws (see daemon/index.ts's own `.catch` around its Jira comment).
-    if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
+    // FACTORY-916: `lastFreshSpawnResumed` is READ-ONCE (cleared by this
+    // very read, `HerdrHerd`'s own doc comment) — exactly one of
+    // `onRespawnResumed`/`onRespawn` fires per respawn, never both, and
+    // never a leaked `true` read by a LATER unrelated respawn of the same
+    // issue. `reason` here is unrelated to this check: it is WHY the
+    // staleness detector wanted `issue` respawned at all (a crash, a stale
+    // argv, ...), not whether the respawn then resumed — see
+    // `onRespawnResumed`'s own doc comment (this file).
+    if (herd.lastFreshSpawnResumed?.(issue)) {
+      if (opts.onRespawnResumed) await opts.onRespawnResumed(issue);
+    } else if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
   }
   // FACTORY-501: called ONCE PER POLL, unconditionally (even with an empty
   // array) — an empty call still matters, since it is what lets the
@@ -1066,6 +1105,10 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     // compile, and this loop's own reason-string read (just above, in this
     // same function) is production's only consumer of it.
     ...(herd.lastResumeFailureDetail ? { lastResumeFailureDetail: (issue: string) => herd.lastResumeFailureDetail!(issue) } : {}),
+    // FACTORY-916: forwarded explicitly for the SAME reason `lastResumeFailureDetail`
+    // immediately above is — `reconcileNow`'s own read of this (just above,
+    // in this same function) is production's only consumer.
+    ...(herd.lastFreshSpawnResumed ? { lastFreshSpawnResumed: (issue: string) => herd.lastFreshSpawnResumed!(issue) } : {}),
   };
 }
 
@@ -1091,6 +1134,8 @@ export interface GenericLoopDeps<T> {
   ownsId: (id: string) => boolean;
   notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
@@ -1206,6 +1251,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+        ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
         ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
         ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
         ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
@@ -1382,6 +1428,7 @@ export function startLoop(deps: LoopDeps): Stop {
     ownsId: () => true,
     notify: deps.notify,
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+    ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
     ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
     ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),

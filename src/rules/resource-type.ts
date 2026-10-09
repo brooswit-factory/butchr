@@ -345,6 +345,16 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
     ...(rule.lizardMode ? { lizardMode: true } : {}),
+    // FACTORY-916: unlike the booleans above, `resumeOnRespawn` is
+    // absent-means-ON (no tri-state — `Rule.resumeOnRespawn`'s own doc
+    // comment), so an explicit `false` must still be forwarded; a truthy
+    // check here would silently drop it. `ticketStatus`/`ticketLabels` are
+    // this already-fetched `issue`'s own fields, carried through so the
+    // spawn decision's `classifyStop` call needs no Jira fetch of its own.
+    ...(rule.resumeOnRespawn !== undefined ? { resumeOnRespawn: rule.resumeOnRespawn } : {}),
+    ...(rule.resumeContextCutoff !== undefined ? { resumeContextCutoff: rule.resumeContextCutoff } : {}),
+    ticketStatus: issue.status,
+    ticketLabels: issue.labels,
   };
 }
 
