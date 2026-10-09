@@ -96,6 +96,27 @@ describe("AgentControlPanel — FACTORY-666", () => {
     await waitFor(() => expect(snapshotCalls).toBe(2));
   });
 
+  test("stop: the confirm step shows the respawn-risk note, and it persists after confirming (AC6-for-stop, review round 1 finding 2)", async () => {
+    const note = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll — shelve the ticket instead to keep it stopped";
+    let snapshotCalls = 0;
+    const api = stubApi({
+      getSnapshot: () => { snapshotCalls++; return Promise.resolve(snapshotCalls === 1 ? RUNNING_SNAPSHOT : IDLE_SNAPSHOT); },
+      stop: (_issue, confirm) => {
+        if (!confirm) return Promise.resolve({ requiresConfirm: true, confirmReason: "agent-stop", preview: { key: "FACTORY-1", pane: "pane-7", note } });
+        return Promise.resolve({ ok: true, key: "FACTORY-1", stoppedPane: "pane-7", note });
+      },
+    });
+    const { getByTestId, findByTestId } = render(<AgentControlPanel api={api} canWrite />);
+    await loadIssue(getByTestId);
+    await findByTestId("agent-control-stop-button");
+    fireEvent.click(getByTestId("agent-control-stop-button"));
+    const confirmNote = await findByTestId("agent-control-stop-confirm-note");
+    expect(confirmNote.textContent).toBe(note);
+    fireEvent.click(getByTestId("agent-control-stop-confirm-button"));
+    const postStopNote = await findByTestId("agent-control-stop-note");
+    expect(postStopNote.textContent).toBe(note);
+  });
+
   test("shelve requires a non-empty reason before the button is enabled", async () => {
     const api = stubApi({ getSnapshot: () => Promise.resolve(IDLE_SNAPSHOT) });
     const { getByTestId, findByTestId } = render(<AgentControlPanel api={api} canWrite />);

@@ -144,9 +144,38 @@ describe("agents-write — FACTORY-666", () => {
       if (plan.ok) {
         expect(plan.requiresConfirm).toBe(true);
         expect(plan.confirmReason).toBe("agent-stop");
-        expect(plan.preview).toEqual({ key: "FACTORY-1", pane: "pane-7" });
+        expect(plan.preview.key).toBe("FACTORY-1");
+        expect(plan.preview.pane).toBe("pane-7");
       }
       expect(stopped).toEqual([]);
+    });
+
+    /**
+     * Review round 1, blocking finding 2: a stop never touches Jira, so a
+     * ticket still in a `desired`-set status (e.g. In Progress under an
+     * enabled rule) is NOT removed from the fleet reconciler's desired set —
+     * killing the pane only drops it out of `running`, which moves it into
+     * `spawn = desired − running` (`desiredFrom`/`planReconcile`,
+     * `../daemon/loop.ts`), i.e. a later poll can spawn a fresh agent for it
+     * again. Both the dry-run preview and the final outcome must say so.
+     */
+    test("plan's preview and the final stop outcome both carry a note that the ticket may respawn on a later reconcile poll", async () => {
+      const world = makeOps();
+      world.addIssue("FACTORY-1", { issuetype: "Task" });
+      const { herd } = makeHerd({ "FACTORY-1": "pane-7" });
+      const plan = await planAgentStop(deps(world, herd), "FACTORY-1");
+      expect(plan.ok).toBe(true);
+      if (plan.ok) {
+        expect(typeof plan.preview.note).toBe("string");
+        expect(String(plan.preview.note)).toMatch(/respawn|reconcile/i);
+      }
+      const { herd: herd2 } = makeHerd({ "FACTORY-1": "pane-7" });
+      const outcome = await doAgentStop(deps(world, herd2), "FACTORY-1");
+      expect(outcome.ok).toBe(true);
+      if (outcome.ok) {
+        expect(typeof (outcome as { note?: unknown }).note).toBe("string");
+        expect(String((outcome as { note: string }).note)).toMatch(/respawn|reconcile/i);
+      }
     });
 
     test("doAgentStop calls Herd.stop exactly once and reports the stopped pane", async () => {

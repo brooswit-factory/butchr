@@ -68,6 +68,20 @@ function guardBattery(path: string, agentsWriteOverrides: () => Partial<Record<s
     } finally { await app.stop(true); }
   });
 
+  test(`${path}: missing Origin: 403, write never called`, async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, host } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, agentsWrite: agentsWriteDeps(wrapAll(agentsWriteOverrides(), () => { called = true; })) });
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}${path}`, {
+        method: "POST", headers: { host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
   test(`${path}: missing CSRF header: 403, write never called`, async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
@@ -143,6 +157,16 @@ describe("GET /api/agents/:issue", () => {
     const { app, origin, host } = startApp({ dashboardOriginGuard: { port: 0 }, peerUidCheck: () => false, agentsWrite: agentsWriteDeps({ snapshot: async () => { called = true; return { ok: true }; } }) });
     try {
       const res = await fetch(`${origin}/api/agents/FACTORY-1`, { headers: { origin, host } });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("missing Origin: 403, snapshot never called", async () => {
+    let called = false;
+    const { app, host } = startApp({ dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, agentsWrite: agentsWriteDeps({ snapshot: async () => { called = true; return { ok: true }; } }) });
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/agents/FACTORY-1`, { headers: { host } });
       expect(res.status).toBe(403);
       expect(called).toBe(false);
     } finally { await app.stop(true); }

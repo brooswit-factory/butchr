@@ -122,19 +122,34 @@ export async function doAgentStart(deps: AgentWriteDeps, issue: string): Promise
   }
 }
 
+/**
+ * Review finding (FACTORY-666, PR #752 round 1): `doAgentStop` touches herdr
+ * only, never Jira, so the ticket stays whatever status it already was. If
+ * that status is still a `desired`-set status (e.g. In Progress, matching an
+ * enabled rule), killing the pane does NOT remove the issue from the fleet
+ * reconciler's desired set — it only drops it out of `running`, which moves
+ * it from `respawn` candidacy into `spawn = desired − running` (`desiredFrom`/
+ * `planReconcile`, `../daemon/loop.ts`) — i.e. the very next poll can spawn a
+ * FRESH agent for it again, capacity permitting. A stop alone is therefore
+ * NOT durable; `WILL_RESPAWN_NOTE` is surfaced as a structured field on both
+ * the dry-run preview and the final outcome so the operator sees it before
+ * and after confirming, rather than discovering it when the agent reappears.
+ */
+const WILL_RESPAWN_NOTE = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll — shelve the ticket instead to keep it stopped";
+
 /** Report-only — never kills anything. `requiresConfirm: true` whenever there IS a running agent to stop (the ordinary first step); a genuine refusal (nothing running) is reported the same way a rejected write is, since there is nothing here for a client to usefully confirm into. */
 export async function planAgentStop(deps: AgentWriteDeps, issue: string): Promise<AgentWriteOutcome> {
   const pane = await deps.herd.paneFor(issue);
   if (!pane) return { ok: false, status: 409, error: `no running agent for ${issue} to stop` };
-  return { ok: true, requiresConfirm: true, confirmReason: "agent-stop", preview: { key: issue, pane } };
+  return { ok: true, requiresConfirm: true, confirmReason: "agent-stop", preview: { key: issue, pane, note: WILL_RESPAWN_NOTE } };
 }
 
-/** `Herd.stop(issue)` (`./herd.ts`) — idempotent, already the production primitive the reconcile loop itself uses before a respawn. Touches herdr only, never Jira: the worker ticket's own status/labels are whatever they already were. */
+/** `Herd.stop(issue)` (`./herd.ts`) — idempotent, already the production primitive the reconcile loop itself uses before a respawn. Touches herdr only, never Jira: the worker ticket's own status/labels are whatever they already were. See `WILL_RESPAWN_NOTE` for why that matters to the operator. */
 export async function doAgentStop(deps: AgentWriteDeps, issue: string): Promise<AgentWriteOutcome> {
   const pane = await deps.herd.paneFor(issue);
   if (!pane) return { ok: false, status: 409, error: `no running agent for ${issue} to stop` };
   await deps.herd.stop(issue);
-  return { ok: true, key: issue, stoppedPane: pane };
+  return { ok: true, key: issue, stoppedPane: pane, note: WILL_RESPAWN_NOTE };
 }
 
 /** Report-only — never writes. Refuses up front (same refusal `shelve_worker` itself throws) on an empty `reason`, and on a worker with no derivable boss, before ever naming a `confirmReason` a client could mistake for "go ahead". */

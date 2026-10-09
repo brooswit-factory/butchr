@@ -44,6 +44,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
   const [error, setError] = useState<string | null>(null);
 
   const [stopPlan, setStopPlan] = useState<AgentActionPlan | null>(null);
+  const [stopNote, setStopNote] = useState<string | null>(null);
   const [shelveReason, setShelveReason] = useState("");
   const [shelvePlan, setShelvePlan] = useState<AgentActionPlan | null>(null);
   const [adoptBossKey, setAdoptBossKey] = useState("");
@@ -82,7 +83,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
 
   function doLoad() {
     const key = issueInput.trim();
-    if (key) load(key);
+    if (key) { setStopNote(null); load(key); }
   }
 
   function doStart() {
@@ -97,6 +98,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
       (result) => {
         if (isPlan(result)) { setStopPlan(result); return; }
         setStopPlan(null);
+        setStopNote(typeof (result as { note?: unknown }).note === "string" ? (result as { note: string }).note : null);
         refresh();
       },
     );
@@ -178,6 +180,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
               ) : (
                 <div data-testid="agent-control-stop-confirm">
                   <p>confirm stop: this will close pane {String(stopPlan.preview.pane ?? "")} for {snapshot.key}</p>
+                  <p data-testid="agent-control-stop-confirm-note">{String(stopPlan.preview.note ?? "")}</p>
                   <Button variant="primary" onPress={() => doStop(true)} isDisabled={disabled} data-testid="agent-control-stop-confirm-button">
                     confirm stop
                   </Button>
@@ -187,6 +190,10 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
                 </div>
               )}
             </div>
+          )}
+
+          {stopNote !== null && (
+            <p data-testid="agent-control-stop-note">{stopNote}</p>
           )}
 
           <div>
