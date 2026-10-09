@@ -1071,6 +1071,9 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         lizardMode: draft.lizardMode ?? null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: false,
         reason: "disabled",
       };
