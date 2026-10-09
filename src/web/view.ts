@@ -20,6 +20,7 @@ import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, type RuleCreateInput } from "../rules/rules-write-registry.js";
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
+import type { SessionDefinitionsWriteOutcome } from "../resources/session-definitions-write.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -289,6 +290,21 @@ export interface ViewDeps {
     create?: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. Optional — see `create`'s own doc comment immediately above. */
     planCreate?: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
+  };
+  /**
+   * FACTORY-667 (epic FACTORY-659, slice D1) — the session-definitions
+   * write orchestration (`../resources/session-definitions-write.ts`). Same
+   * "one function per route, already does its own etag/allowlist/confirm
+   * checks, returns a tagged outcome this file maps straight to a status +
+   * body" discipline as `rulesWrite` above. Optional: an omitted value
+   * makes every `/api/session-definitions/*` write route answer 503, same
+   * "endpoint disabled: not configured" discipline every other optional
+   * `ViewDeps` write dependency already follows.
+   */
+  sessionDefinitionsWrite?: {
+    fields: (name: string, patch: Record<string, unknown>, ifMatch: string, confirm: boolean) => Promise<SessionDefinitionsWriteOutcome>;
+    frozen: (name: string, frozen: boolean, ifMatch: string) => Promise<SessionDefinitionsWriteOutcome>;
+    undo: (backupId: string) => SessionDefinitionsWriteOutcome;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -1267,6 +1283,80 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = deps.rulesWrite.undo(backupId);
       auditOutcome(deps, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-667 (epic FACTORY-659, slice D1) — `POST
+    // /api/session-definitions/:name/fields`: the low-risk/risky-confirm-
+    // gated field patch (`modelPower`/`effort`/`permissionMode`/
+    // `lizardMode`). B1: own `checkWriteGuard` call, same discipline as
+    // every other write route in this file. A `requiresConfirm: true`
+    // outcome is returned VERBATIM, never audited — see `../resources/
+    // session-definitions-write.ts`'s own header for why (mirrors `POST
+    // /api/rules/plan`'s own "report-only, no audit" shape).
+    .post("/api/session-definitions/:name/fields", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const name = decodeURIComponent(params.name);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.ifMatch !== "string" || typeof b.patch !== "object" || b.patch === null || Array.isArray(b.patch)) {
+        const error = "body must be { patch: object, ifMatch: string, confirm?: boolean }";
+        auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const confirm = b.confirm === true;
+      const outcome = await deps.sessionDefinitionsWrite.fields(name, b.patch as Record<string, unknown>, b.ifMatch, confirm);
+      if (outcome.ok && outcome.requiresConfirm) return outcome;
+      auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: `patch ${Object.keys(b.patch as Record<string, unknown>).join(",")}`, ids: [name], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-667 — `POST /api/session-definitions/:name/frozen`: the two
+    // freeze gates (`../resources/session-freeze.ts`), through this ticket's
+    // own backed-up/locked/undoable write contract. B1: own
+    // `checkWriteGuard` call, same discipline as every other write route.
+    .post("/api/session-definitions/:name/frozen", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const name = decodeURIComponent(params.name);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.frozen !== "boolean" || typeof b.ifMatch !== "string") {
+        const error = "body must be { frozen: boolean, ifMatch: string }";
+        auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.sessionDefinitionsWrite.frozen(name, b.frozen, b.ifMatch);
+      auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: `frozen=${b.frozen}`, ids: [name], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-667 — `POST /api/session-definitions/undo/:backupId`: B2
+    // scoping (own process's last UI write only, own resulting etag only)
+    // — see `../resources/session-definitions-write.ts`'s own header.
+    .post("/api/session-definitions/undo/:backupId", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const backupId = decodeURIComponent(params.backupId);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const outcome = deps.sessionDefinitionsWrite.undo(backupId);
+      auditOutcome(deps, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
