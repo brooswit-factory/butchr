@@ -65,7 +65,7 @@ import { JOURNALD_PREFIX_SRC } from "../tools/journald-prefix.js";
 /** The one tag every line this module emits carries — a NEW class, never previously written, so no existing reader can be confused by it (see AC4's own reasoning in the PR for why no *separate* tag per arm is warranted here either). */
 export const SUPPRESSED_TAG = "[notify-suppressed]";
 
-export type SuppressedArm = "agent-fold" | "stand-down" | "rate-capped";
+export type SuppressedArm = "agent-fold" | "stand-down" | "rate-capped" | "topology";
 
 /**
  * (B): the own-write ledger's AGENT arm (KAN-838) suppressed `key`'s own
@@ -134,6 +134,33 @@ export function rateCappedSuppressedLine(key: string, watcher: string, count: nu
   return (
     `${SUPPRESSED_TAG} key=${key} watcher=${watcher} arm=rate-capped count=${count} max=${max}` +
     ` msg=linked-change notify dropped this tick — sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick`
+  );
+}
+
+/**
+ * FACTORY-952: `relatedForRules`'s (src/rules/resource-type.ts) tier guard on
+ * `implementsEdge` suppressed a boss-routing edge because the IMPLEMENTER's
+ * issue-type tier is not one level below the BOSS's — specifically, a
+ * Task-tier implementer resolving to an Epic-tier boss (two hops up by the
+ * fleet's own Epic->Story->Task convention), whether that Implements link is
+ * a genuine mislink or a legitimate `adopt_worker` adoption of an otherwise
+ * bossless Task directly by an Epic (see FACTORY-955's own ticket comment
+ * for a live example of the latter — this guard rejects it either way, by
+ * design: the Epic is never one hop from a Task). Unconditional on its own
+ * trigger, same discipline as `standDownSuppressedLine`/`rateCappedSuppressedLine`
+ * above: every stray edge this guard sees logs exactly one line, every poll
+ * it is still present — NOT aggregated/deduped across polls, a deliberate,
+ * stated scope limit (this guard is a pure, stateless check over one poll's
+ * snapshot, same as `relatedForRules` itself), acceptable because a stray
+ * Task->Epic link is expected to be rare and short-lived once surfaced,
+ * never the ~100/hour volume the two OMITTED arms guard against (this
+ * module's own top comment). `implementerType`/`bossType` are issue-type
+ * NAMES ("Task"/"Epic"), never free text a caller controls.
+ */
+export function topologySuppressedLine(key: string, watcher: string, implementerType: string, bossType: string): string {
+  return (
+    `${SUPPRESSED_TAG} key=${key} watcher=${watcher} arm=topology implementer_type=${implementerType} boss_type=${bossType}` +
+    ` msg=a ${implementerType}-tier implementer's Implements link resolves directly to a ${bossType}-tier boss, skipping the Story tier in between — not routed (FACTORY-952 one-hop-only boss routing)`
   );
 }
 
