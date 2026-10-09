@@ -424,6 +424,46 @@ describe("RulesRoute — FACTORY-663: Set up your first rule", () => {
     });
   });
 
+  // FACTORY-817 (story FACTORY-756, epic FACTORY-748): "Included in
+  // capacity" toggle — exercises the real toggle/save/confirm flow through
+  // the fixtures API (not a `plans` override), same as the swarm-enable
+  // GO-RED test above.
+  test("FACTORY-817: turning off 'Included in capacity' requires an explicit confirm, and persists role: sentinel once confirmed", async () => {
+    const api = createFixturesRulesApi({ initial: defaultRulesFixture(), latencyMs: 0 });
+    const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
+    await findByTestId("first-rule-setup");
+    const toggle = await findByTestId("first-rule-capacity-toggle");
+    const input = toggle.querySelector("input")!;
+    expect(input.getAttribute("aria-checked") ?? String(input.checked)).toBe("true");
+    fireEvent.click(input);
+    expect(input.getAttribute("aria-checked") ?? String(input.checked)).toBe("false");
+    fireEvent.click(getByRole("button", { name: "save launch settings" }));
+    const confirm = await findByTestId("first-rule-confirm");
+    expect(confirm).toBeTruthy();
+
+    const stillWorker = await api.listRules();
+    expect(stillWorker.rules.find((r) => r.id === FIRST_RULE_ID)!.role).toBe("worker");
+
+    fireEvent.click(getByRole("button", { name: "confirm" }));
+    await waitFor(async () => {
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.role).toBe("sentinel");
+    });
+  });
+
+  test("FACTORY-817: a jira-project rule shows the capacity toggle disabled with an explanatory note", async () => {
+    const seeded = defaultRulesFixture();
+    const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
+    seeded.rules[idx] = { ...seeded.rules[idx]!, resourceProvider: "jira-project" as never };
+    const api = createFixturesRulesApi({ initial: seeded, latencyMs: 0 });
+    const { findByTestId } = render(<RulesRoute api={api} />);
+    await findByTestId("first-rule-setup");
+    const toggle = (await findByTestId("first-rule-capacity-toggle")) as HTMLElement;
+    const notice = await findByTestId("first-rule-capacity-manager-notice");
+    expect(notice.textContent).toContain("never consume fleet capacity");
+    expect(toggle.querySelector("input")?.hasAttribute("disabled")).toBe(true);
+  });
+
   test("stale: true disables every first-rule control and shows the reload-pending notice", async () => {
     const api = createFixturesRulesApi({ initial: { ...defaultRulesFixture(), stale: true }, latencyMs: 0 });
     const { findByTestId } = render(<RulesRoute api={api} />);
