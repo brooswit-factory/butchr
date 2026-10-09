@@ -41,12 +41,13 @@ import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-sc
 // module pulls in `node:fs`/`node:crypto` (and more), and a VALUE import of anything named from it
 // (unlike `import type`, which TypeScript erases) drags that whole graph into this Vite client bundle
 // — observed to break the build outright. See `src/rules/agent-harness.ts`'s own top comment.
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import {
   FIRST_RULE_ID,
   PLACEHOLDER_QUERY,
   RateLimitError,
   type RuleAgentPreferencePatch,
+  type RuleCapacityRolesCatalog,
   type RuleDto,
   type RuleFieldPatch,
   type RuleFormCatalogEntry,
@@ -130,6 +131,12 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
   const [draftEffort, setDraftEffort] = useState<AgentEffort | "">(rule?.agentPreferences[0]?.effort ?? "");
   const [draftPermissionMode, setDraftPermissionMode] = useState<RulePermissionMode | "">(rule?.permissionMode ?? "");
   const [draftLizardMode, setDraftLizardMode] = useState(rule?.lizardMode ?? false);
+  // FACTORY-817 — "Included in capacity": `rule.role` is always a real
+  // `AgentRole` on the wire (`Rule.role` defaults to `"worker"` at parse
+  // time, `./rules.ts`), never `null`, so there is no "butchr's default"
+  // tri-state to carry here the way `permissionMode`/`model`/`effort` need —
+  // the toggle always starts from the rule's own current, real value.
+  const [draftRole, setDraftRole] = useState<AgentRole>(rule?.role ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
@@ -143,10 +150,19 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
   // control until the first `/api/rules` poll lands anyway, so a brief
   // catalog-less render is not actionable either way).
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
+  // FACTORY-817: fetched alongside the harness catalog above (same mount,
+  // same `GET /api/rules/catalog` the server serves both fields from) —
+  // used only for the "Included in capacity" note text today (the allowed
+  // values/default are already known statically), fetched anyway so the
+  // UI never hardcodes a value the server could one day change.
+  const [capacityRoles, setCapacityRoles] = useState<RuleCapacityRolesCatalog | null>(null);
   useEffect(() => {
     let cancelled = false;
     void api.getCatalog().then((c) => {
       if (!cancelled) setCatalog(c);
+    });
+    void api.getCapacityRoles().then((c) => {
+      if (!cancelled) setCapacityRoles(c);
     });
     return () => {
       cancelled = true;
@@ -234,10 +250,14 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
    * "don't mention it" (same discipline `draftModel`/`draftEffort` already
    * follow in `handleSavePreferences` above). `lizardMode` is always sent —
    * a checkbox has no "leave unchanged" state to omit instead.
+   *
+   * FACTORY-817: `role` ("Included in capacity") joins this one save
+   * button rather than getting its own — same top-level-field bucket, same
+   * "always sent, no unchanged state to omit" discipline as `lizardMode`.
    */
   function handleSaveLaunchSettings() {
     if (!rule) return;
-    const patch: RuleFieldPatch = { lizardMode: draftLizardMode, ...(draftPermissionMode ? { permissionMode: draftPermissionMode } : {}) };
+    const patch: RuleFieldPatch = { lizardMode: draftLizardMode, role: draftRole, ...(draftPermissionMode ? { permissionMode: draftPermissionMode } : {}) };
     startAction("save launch settings", patch, (planHash, confirm) => api.updateFields(rule.id, patch, sourceEtag, planHash, confirm));
   }
 
@@ -482,8 +502,62 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
           lizard mode is never a default — saving this needs an explicit confirm
         </Text>
       )}
+
+      <label htmlFor="first-rule-capacity-toggle">Included in capacity</label>
+      {/*
+       * FACTORY-817 (story FACTORY-756, epic FACTORY-748): `role` on the
+       * wire — "worker" (ON, this toggle's checked state) counts this
+       * rule's agent(s) toward `BUTCHR_MAX_AGENTS`; "sentinel" (OFF) opts
+       * them out entirely. Default visible, not implied (criterion 3):
+       * `rule.role` is never null on the wire (`Rule.role` defaults to
+       * `"worker"` at parse time), so the toggle always renders the real
+       * current value, ON for an unset rule, with the copy below spelling
+       * out what ON means.
+       *
+       * `jira-project` rules are sentinel BY CONSTRUCTION
+       * (`src/agents/capacity-role.ts`'s own `capacityRoleFor`) — before the
+       * rule's own `role` is ever consulted, so this toggle would have no
+       * effect for one. Deliberately shown-but-disabled, with an
+       * explanatory note, rather than hidden outright: an operator who
+       * hand-edited `ui-first-rule`'s `resourceProvider` to `jira-project`
+       * should see WHY the toggle can't change anything here, not wonder
+       * where it went.
+       */}
+      <span className="first-rule-capacity-toggle" title="agents from this rule consume fleet capacity (BUTCHR_MAX_AGENTS) while this is on">
+        <Switch
+          id="first-rule-capacity-toggle"
+          data-testid="first-rule-capacity-toggle"
+          isSelected={draftRole === "worker"}
+          isDisabled={disabled || rule.resourceProvider === "jira-project"}
+          switchLabels={false}
+          aria-label="Included in capacity"
+          onChange={(isSelected) => setDraftRole(isSelected ? "worker" : "sentinel")}
+        />
+      </span>
+      {rule.resourceProvider === "jira-project" ? (
+        <Text elementType="p" size="small" className="rules-view__cnc" data-testid="first-rule-capacity-manager-notice">
+          project-manager rules never consume fleet capacity, regardless of this toggle — it has no effect here
+        </Text>
+      ) : (
+        <Text elementType="p" size="small" data-testid="first-rule-capacity-copy">
+          {draftRole === "worker"
+            ? `on: this rule's agents count toward the fleet's agent cap (today's default)`
+            : `off: this rule's agents are never withheld or counted toward the fleet's agent cap`}
+        </Text>
+      )}
+      {draftRole === "sentinel" && (
+        <Text elementType="p" size="small" className="rules-view__cnc" data-testid="first-rule-capacity-notice">
+          turning capacity off is never a default — saving this needs an explicit confirm
+        </Text>
+      )}
+      {capacityRoles && (
+        <Text elementType="p" size="small" data-testid="first-rule-capacity-default-hint">
+          butchr's own default is "{capacityRoles.default}" (counted)
+        </Text>
+      )}
+
       <Button size="small" isDisabled={disabled} onPress={handleSaveLaunchSettings}>
-        save permission mode/lizard mode
+        save launch settings
       </Button>
 
       <Button size="small" variant="minimal" isDisabled={!rule || busy} onPress={() => setPreviewOpen(true)}>

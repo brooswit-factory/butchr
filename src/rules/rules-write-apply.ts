@@ -114,6 +114,7 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   if (patch.query !== undefined) next.query = patch.query;
   if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
   if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
+  if (patch.role !== undefined) next.role = patch.role;
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {

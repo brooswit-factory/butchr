@@ -532,6 +532,73 @@ loaded `rules` list, so it works across every provider) into the single
 shared `AdmissionController` instance every rule loop's admission bucket
 already draws from.
 
+### Setting `role` from the rules API and the Rules page form (FACTORY-817, story FACTORY-756, epic FACTORY-748)
+
+Until this ticket, `role` was file-only — an operator had to hand-edit
+`rules.json` to flip a rule's capacity inclusion. It is now exposed as a
+first-class field through both the rules write surface this codebase
+already has (FACTORY-662/FACTORY-729) and the Rules page form it serves:
+
+- `GET /api/rules` includes each rule's current `role` (unchanged — it
+  already did). `GET /api/rules/catalog` additionally serves a
+  `capacityRoles: { values: ["worker", "sentinel"], default: "worker" }`
+  field alongside the per-harness catalog (`src/rules/rule-form-catalog.ts`)
+  — one global pair of values plus the engine's own default, since `role`
+  (unlike the harness/model/effort/permission-mode fields) applies
+  uniformly across every provider, not per-harness.
+- `PUT /api/rules/:id` now accepts `role` as an editable top-level field
+  (`EDITABLE_TOP_LEVEL_FIELDS`, `src/rules/rules-write-registry.ts`),
+  validated against `AGENT_ROLES`, going through the SAME catalog-validated
+  write/audit-line path every other field here does — no second validation
+  mechanism.
+- **`role: "sentinel"` requires an explicit `confirm: true`** on the write
+  that sets it, the SAME discipline `permissionMode: "bypassPermissions" |
+  "auto"` and `lizardMode: true` already carry
+  (`requireConfirmForRiskyFields`, `src/rules/rules-write.ts`) —
+  deliberately, not an oversight: opting a rule's agent(s) OUT of
+  `BUTCHR_MAX_AGENTS` entirely is exactly the kind of change that must never
+  slip in silently alongside an unrelated edit. `"worker"` (the default,
+  ON) needs no confirm. The plan route's `confirmReason` names this gate
+  `"capacity-sentinel"` when it is the reason a write requires confirm.
+- The toggle is deliberately **not a restart-triggering field** — unlike
+  `query`/`permissionMode`/`lizardMode`/`agentPreferences`, changing `role`
+  never changes an already-running agent's own launch (`SpawnSpec`); it
+  only changes a classification the admission controller reads fresh every
+  reconciliation poll (`ruleRoleOfAgent` calls `getRules()` live,
+  `src/daemon/index.ts`). `computeLocalPlanCounts` (`src/rules/rules-write.ts`)
+  does not count a `role`-only change as a restart.
+- **The Rules page form**: FACTORY-725/FACTORY-729 shipped their
+  catalog-sourced dropdowns and the lizard toggle on the first-rule setup
+  form (`FirstRuleSetup.tsx`) first. FACTORY-730 (PR #704, merged to
+  `main`) then shipped the generic existing-rule edit dialog
+  (`RuleEditDialog.tsx`, opened from the Rules table's per-row Edit
+  button), so an "Included in capacity" toggle on an already-created rule
+  is no longer a gap. FACTORY-856 (story FACTORY-756) adds that toggle to
+  `RuleEditDialog` too, in the same field-definition/validation/layout
+  pattern as its own lizard toggle (`rule-edit-capacity-toggle` /
+  `rule-edit-capacity-notice`, mirroring `rule-edit-lizard-mode-toggle` /
+  `rule-edit-lizard-notice`) — the toggle now lands on BOTH surfaces: the
+  first-rule setup form and the existing-rule edit dialog. `buildFieldsPatch`
+  sends `role` only when the draft differs from the rule's own current
+  value (the dialog's existing "only send what changed" discipline, unlike
+  `FirstRuleSetup`'s always-send). Toggling it off shows the same "never a
+  default, needs confirm" notice pattern the lizard toggle already uses,
+  and the write goes through the same catalog-validated `PUT /api/rules/:id`
+  path (`confirmReason: "capacity-sentinel"`) described above.
+- **`jira-project` rules are unaffected by this toggle** — they are
+  sentinel by construction (`capacityRoleFor` checks the resource provider
+  BEFORE ever consulting the rule's own `role`, see above), so the toggle
+  would have no effect for one. The form shows it disabled with an
+  explanatory note for a `jira-project` rule rather than implying a control
+  the engine will ignore.
+- **Operator-facing summary**: capacity inclusion is now a per-query
+  choice, made per rule, defaulting to counted ("worker") — it is no
+  longer inferred from the Jira issue type (that hardcoding was removed by
+  FACTORY-757, see above). An operator who wants a rule's agents excluded
+  from `BUTCHR_MAX_AGENTS` turns this toggle off (or sets `role: "sentinel"`
+  by hand) and confirms; leaving it on (the default) means that query's
+  agents consume fleet capacity exactly like every other worker rule.
+
 ## Upgrade migration: pre-FACTORY-757 issue-type exemption (FACTORY-810, implementing FACTORY-754, epic FACTORY-748)
 
 FACTORY-757 (above) deliberately shipped with no migration: a live
