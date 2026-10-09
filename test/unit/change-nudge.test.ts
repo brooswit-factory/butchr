@@ -105,6 +105,16 @@ describe("changeNudge", () => {
       "[butchr] Ticket KAN-1 was updated (reason not determinable from the poll) — re-read it.",
     );
   });
+
+  // FACTORY-949 (story FACTORY-948): the boss-wake nudge — always a related
+  // path in practice (issue.ts's own decide() only ever produces this on
+  // `space === "related"`), named explicitly by key rather than folded into
+  // the generic `label` clause.
+  test("blocked — the related path a boss actually receives", () => {
+    expect(changeNudge("BOSS", "TASK", { blocked: { key: "TASK" } })).toBe(
+      "[butchr] TASK (related to your BOSS) has its ticket TASK newly agent:blocked — it needs you — re-read it, then act on what changed.",
+    );
+  });
 });
 
 describe("notifyReasonTag", () => {
@@ -177,6 +187,11 @@ describe("notifyReasonTag", () => {
     expect(notifyReasonTag({ definitionField: { brief: "x" } })).toBe(" (definitionField:brief)");
     expect(notifyReasonTag({ definitionField: { workingDirectory: "/x" } })).toBe(" (definitionField:workingDirectory)");
     expect(notifyReasonTag({ definitionField: { brief: "x", workingDirectory: "/x" } })).toBe(" (definitionField:brief,workingDirectory)");
+  });
+
+  // FACTORY-949: names the blocked ticket's own key, operator-facing.
+  test("blocked names the blocked ticket's own key", () => {
+    expect(notifyReasonTag({ blocked: { key: "TASK-1" } })).toBe(" (blocked:TASK-1)");
   });
 });
 

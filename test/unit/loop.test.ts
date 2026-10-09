@@ -1410,6 +1410,155 @@ describe("startLoop task->story delivery (Part B, pinned)", () => {
   });
 });
 
+describe("FACTORY-949 (implementing story FACTORY-948): agent:blocked label transition wakes the ticket's boss (debounced, dedup'd vs escalate marker)", () => {
+  const task = (labels: string[], updated: string, status = "In Progress"): JiraIssue =>
+    ({ key: "TASK", status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const relTask = (labels: string[], updated: string, status = "In Progress") =>
+    [{ issue: task(labels, updated, status), watchers: ["BOSS"] }];
+
+  test("item 1: none/working/idle/stalled -> blocked wakes the boss, named with the blocked ticket's own key", async () => {
+    for (const from of ["agent:none", "agent:working", "agent:idle", "agent:stalled"]) {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+      const relatedPolls = [relTask([from], "t1"), relTask(["agent:blocked"], "t2")];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => [],
+        related: async () => relatedPolls[Math.min(n++, 1)]!,
+        herd,
+        notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      const bossEvents = notified.filter((e) => e.issue === "BOSS" && e.about === "TASK");
+      expect(bossEvents.length).toBe(1);
+      expect(bossEvents[0]!.reason).toEqual({ blocked: { key: "TASK" } });
+    }
+  });
+
+  test("item 1: must NOT wake the blocked ticket's own watcher (space=primary, watcher===key)", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [task(["agent:working"], "t1"), task(["agent:blocked"], "t2")].map((i) => [i]);
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "TASK" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+  });
+
+  test("item 1: a sibling task's watcher is never woken — routes.ts never puts a sibling in this ticket's watcher list", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [relTask(["agent:working"], "t1"), relTask(["agent:blocked"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "SIBLING")).toBe(false);
+  });
+
+  test("item 3: blocked -> anything, working<->idle, idle<->stalled, and every pr:* flip stay exactly as silent as today", async () => {
+    const cases: Array<[string[], string[]]> = [
+      [["agent:blocked"], ["agent:working"]],
+      [["agent:working"], ["agent:idle"]],
+      [["agent:idle"], ["agent:working"]],
+      [["agent:idle"], ["agent:stalled"]],
+      [["agent:stalled"], ["agent:idle"]],
+      [["agent:working", "pr:open"], ["agent:working", "pr:approved"]],
+    ];
+    for (const [from, to] of cases) {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+      const relatedPolls = [relTask(from, "t1"), relTask(to, "t2")];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => [],
+        related: async () => relatedPolls[Math.min(n++, 1)]!,
+        herd,
+        notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+        comments: async () => [{ id: "x", body: "b", created: "c", authorEmail: null }],
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      expect(notified.some((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+    }
+  });
+
+  test("item 4: flap blocked -> working -> blocked inside the debounce window fires exactly one event", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [
+      relTask(["agent:working"], "t1"),
+      relTask(["agent:blocked"], "t2"),
+      relTask(["agent:working"], "t3"),
+      relTask(["agent:blocked"], "t4"),
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      blockedWakeDebounceMinutes: 10,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    stop();
+    const bossEvents = notified.filter((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked);
+    expect(bossEvents.length).toBe(1);
+  });
+
+  test("item 5: an episode with escalate.ts's [butchr:blocked] marker already posted does not fire a second wake", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [relTask(["agent:working"], "t1"), relTask(["agent:blocked"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      comments: async () => [{ id: "m1", body: "[butchr:blocked] TASK is waiting on a decision:\n...", created: new Date().toISOString(), authorEmail: null }],
+      blockedWakeDebounceMinutes: 10,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+  });
+
+  test("item 2: a ticket with no boss (no related watcher at all) produces no boss wake — absence, never an error", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[task(["agent:working"], "t1")], [task(["agent:blocked"], "t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      related: async () => [],
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+  });
+});
+
 describe("startLoop: a pr:* transition wakes the ticket's own agent past both suppressions (KAN-691/819/823)", () => {
   const withPr = (labels: string[], updated: string, status = "In Progress"): JiraIssue =>
     ({ key: "K", status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
