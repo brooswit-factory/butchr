@@ -94,13 +94,27 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     expect(deliveredReason(verdict)).toEqual({ status: { from: "In Progress", to: "In Review" } });
   });
 
-  test("agent:* label change + summary change -> delivers, named by summary", async () => {
+  test("a summary change ALONE (no label change) delivers, named by summary — not suppressed", async () => {
+    // Deliberately no label change here: the general classifier's own
+    // precedence is status, then label, then summary (createIssueEventRules'
+    // own documented order) — a diff carrying BOTH a label and a summary
+    // change is named `label`, not `summary` (see the next test), so this
+    // criterion's "summary" case has to be isolated to actually observe it.
+    const rules = createIssueEventRules({ comments: commentStore().comments });
+    const before = issue({ summary: "old" });
+    const after = issue({ summary: "new", updated: "t2" });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
+    expect(deliveredReason(verdict)).toEqual({ summary: true });
+  });
+
+  test("agent:* label change + summary change in the SAME diff -> still delivers (named by label, per the classifier's documented precedence) — never suppressed as 'just label noise'", async () => {
     const rules = createIssueEventRules({ comments: commentStore().comments });
     const before = issue({ labels: ["agent:working"], summary: "old" });
     const after = issue({ labels: ["agent:idle"], summary: "new", updated: "t2" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(deliveredReason(verdict)).toEqual({ summary: true });
+    expect(deliveredReason(verdict)).toEqual({ label: { prefix: "agent", from: "working", to: "idle" } });
   });
 
   test("agent:* label change + a REAL (non-bookkeeping) comment landing in the same window -> delivers, named by comment", async () => {
