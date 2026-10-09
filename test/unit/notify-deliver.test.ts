@@ -113,7 +113,7 @@ describe("deliverNotice: acceptance C — every ambiguous/failure case falls bac
 
 describe("deliverNotice: session-limit refusal surfaces through the gate", () => {
   test("prompt fallback hits a session-limit refusal: carried on the result", async () => {
-    const refusal: NudgeResult["refusal"] = { resetsAt: 1_700_000_000_000 };
+    const refusal: NonNullable<NudgeResult["refusal"]> = { resetsAt: 1_700_000_000_000, raw: "5-hour limit reached ∙ resets 3am" };
     const result = await deliverNotice({
       pushChannel: async () => ok([]),
       nudgePrompt: async () => ({ delivered: true, refusal }),
@@ -151,14 +151,14 @@ describe("renderNotifyDelivery: acceptance F — the three distinguishable [noti
   });
 
   test("fell back into a session-limit refusal: refusal text wins over the bare delivered flag", () => {
-    const d: NotifyDelivery = { via: "prompt", fallbackReason: "no channel attached", delivered: true, refusal: { resetsAt: 1_700_000_000_000 } };
+    const d: NotifyDelivery = { via: "prompt", fallbackReason: "no channel attached", delivered: true, refusal: { resetsAt: 1_700_000_000_000, raw: "5-hour limit reached ∙ resets 3am" } };
     expect(renderNotifyDelivery(d)).toBe(
       `Claude channel unavailable (no channel attached), fell back to prompt: refused (session limit, resets ${new Date(1_700_000_000_000).toISOString()})`,
     );
   });
 
   test("fell back into a session-limit refusal with unknown reset time", () => {
-    const d: NotifyDelivery = { via: "prompt", fallbackReason: "channel push threw: boom", delivered: false, refusal: { resetsAt: null } };
+    const d: NotifyDelivery = { via: "prompt", fallbackReason: "channel push threw: boom", delivered: false, refusal: { resetsAt: null, raw: "5-hour limit reached" } };
     expect(renderNotifyDelivery(d)).toBe(
       "Claude channel unavailable (channel push threw: boom), fell back to prompt: refused (session limit, resets unknown)",
     );
