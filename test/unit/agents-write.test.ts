@@ -144,8 +144,9 @@ describe("agents-write — FACTORY-666", () => {
       if (plan.ok) {
         expect(plan.requiresConfirm).toBe(true);
         expect(plan.confirmReason).toBe("agent-stop");
-        expect(plan.preview.key).toBe("FACTORY-1");
-        expect(plan.preview.pane).toBe("pane-7");
+        const preview = plan.preview as { key: string; pane: string };
+        expect(preview.key).toBe("FACTORY-1");
+        expect(preview.pane).toBe("pane-7");
       }
       expect(stopped).toEqual([]);
     });
@@ -166,15 +167,17 @@ describe("agents-write — FACTORY-666", () => {
       const plan = await planAgentStop(deps(world, herd), "FACTORY-1");
       expect(plan.ok).toBe(true);
       if (plan.ok) {
-        expect(typeof plan.preview.note).toBe("string");
-        expect(String(plan.preview.note)).toMatch(/respawn|reconcile/i);
+        const preview = plan.preview as { note?: unknown };
+        expect(typeof preview.note).toBe("string");
+        expect(String(preview.note)).toMatch(/respawn|reconcile/i);
       }
       const { herd: herd2 } = makeHerd({ "FACTORY-1": "pane-7" });
       const outcome = await doAgentStop(deps(world, herd2), "FACTORY-1");
       expect(outcome.ok).toBe(true);
       if (outcome.ok) {
-        expect(typeof (outcome as { note?: unknown }).note).toBe("string");
-        expect(String((outcome as { note: string }).note)).toMatch(/respawn|reconcile/i);
+        const outcomeNote = (outcome as { note?: unknown }).note;
+        expect(typeof outcomeNote).toBe("string");
+        expect(String(outcomeNote)).toMatch(/respawn|reconcile/i);
       }
     });
 
