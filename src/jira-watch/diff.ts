@@ -83,6 +83,20 @@ function agentLabelValue(issue: JiraIssue): string | null {
   return values.length ? values[0]!.slice(AGENT_PREFIX.length) : null;
 }
 
+/**
+ * FACTORY-949 (implementing story FACTORY-948): true exactly when the
+ * ticket's `agent:*` label moved TO `blocked` from anything else (none,
+ * `working`, `idle`, `stalled`) between `before` -> `after`. A label that
+ * was ALREADY `blocked` on both sides (no edge — the ordinary "still
+ * blocked" case between two polls) or that leaves `blocked` for something
+ * else is deliberately NOT a transition here — this predicate names only
+ * the ONE edge FACTORY-948's behaviour spec wakes anyone for. Pure, like
+ * every other predicate in this file.
+ */
+export function blockedTransition(before: JiraIssue, after: JiraIssue): boolean {
+  return agentLabelValue(before) !== "blocked" && agentLabelValue(after) === "blocked";
+}
+
 /** Which daemon-owned namespace changed in a `daemonLabelTransition`, and its from/to values (either side may be null: no label in that namespace on that side). */
 export interface DaemonLabelTransition {
   prefix: "agent" | "pr";
