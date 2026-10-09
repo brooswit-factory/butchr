@@ -36,8 +36,12 @@ const THROWAWAY_KEY = "SPAWNSMOKE";
 // before it sleeps, so its presence proves THIS process ran — nothing
 // weaker, and nothing that depends on how herdr reports a process's own
 // name/argv[0] (a kernel/shell detail, see that stub's own doc comment).
-const SENTINEL = process.env.BUTCHR_CI_SPAWN_SMOKE_SENTINEL;
-if (!SENTINEL) throw new Error("BUTCHR_CI_SPAWN_SMOKE_SENTINEL must be set (see .github/workflows/ci.yml, job spawn-smoke)");
+const sentinelEnv = process.env.BUTCHR_CI_SPAWN_SMOKE_SENTINEL;
+if (!sentinelEnv) throw new Error("BUTCHR_CI_SPAWN_SMOKE_SENTINEL must be set (see .github/workflows/ci.yml, job spawn-smoke)");
+// Narrowed to a real `string` (not `string | undefined`) here, once — a
+// conditional narrowing above would not survive capture by the closures
+// below (pollForStubToRun, cleanup), so this const's own declared type does.
+const SENTINEL: string = sentinelEnv;
 if (existsSync(SENTINEL)) unlinkSync(SENTINEL); // defend against a stale file from a previous run on a reused runner
 
 const socketPath = process.env.HERDR_SOCKET_PATH;
@@ -80,7 +84,7 @@ async function cleanup(): Promise<void> {
       });
   }
   rmSync(scratchRoot, { recursive: true, force: true });
-  if (SENTINEL && existsSync(SENTINEL)) unlinkSync(SENTINEL);
+  if (existsSync(SENTINEL)) unlinkSync(SENTINEL);
 }
 
 async function main(): Promise<void> {
