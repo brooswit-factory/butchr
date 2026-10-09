@@ -328,11 +328,14 @@ export function createLabelSync(deps: SyncDeps) {
         // consecutive invocations (see idle-poke.ts's 90-second-trap
         // comment) sees every poll, exactly like `deps.stalled`/
         // `deps.silentStop` above.
-        await deps.idlePoke?.check(issue.key, {
-          streakStart: deps.stalled?.streakStart?.(issue.key) ?? null,
-          status: issue.status,
-          ruleConfig: deps.idlePokeRuleConfig?.(issue.key),
-        });
+        {
+          const ruleConfig = deps.idlePokeRuleConfig?.(issue.key);
+          await deps.idlePoke?.check(issue.key, {
+            streakStart: deps.stalled?.streakStart?.(issue.key) ?? null,
+            status: issue.status,
+            ...(ruleConfig !== undefined ? { ruleConfig } : {}),
+          });
+        }
       }
       const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
       const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
