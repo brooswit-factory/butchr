@@ -79,6 +79,9 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
 | `unfreezeControllers` | no | Same shape, for `unfreeze_session` — an INDEPENDENT list; a name in `freezeControllers` grants nothing here, and vice versa. |
 | `linkedEventingProjects` | no | FACTORY-52. Non-empty array of canonical `jira-project:<KEY>` references naming the Jira project(s) this definition opts into linked eventing for. See "`linkedEventingProjects`: per-definition linked-eventing project opt-in" below. |
+| `idlePokeMinutes` | no | FACTORY-926. Reuses `Rule.idlePokeMinutes`'s type/validation verbatim (positive number; no resolved default when absent). **CONFIG-ONLY / INERT** — no engine reads this field yet (see `docs/idle-poke-session-definitions.md`). |
+| `idlePokeMessage` | no | FACTORY-926. Reuses `Rule.idlePokeMessage`'s type/validation verbatim (non-empty string; no resolved default when absent). Same CONFIG-ONLY / INERT status as `idlePokeMinutes`. |
+| `idlePokeEnabled` | no | FACTORY-926. Reuses `Rule.idlePokeEnabled`'s type/validation verbatim — boolean, ALWAYS resolved (default `true`). The un-pokeable guarantee for a utility session (`dialog-monitor`/`genius`/`buddy`) is an explicit `false` here. Same CONFIG-ONLY / INERT status as `idlePokeMinutes` — see `docs/idle-poke-session-definitions.md` for the shipped per-role values and what applying them requires. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
