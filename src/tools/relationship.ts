@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
-import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, type DocResult, type WorkerRef } from "./docs.js";
+import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, resolveBoss, type DocResult, type WorkerRef } from "./docs.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
@@ -30,6 +30,20 @@ function tagComment(who: string, text: string): string {
 
 /** Marks an `ask_boss` comment as a QUESTION AWAITING AN ANSWER — distinguishes it from a plain `report_to_boss`, and lets a boss find unanswered questions without reading every comment its workers wrote. Placed right after the identity tag. STATED HERE VERBATIM because BUTCHR-30's briefs need to quote it. */
 export const ASK_MARKER = "[ask]";
+
+/**
+ * FACTORY-909 (B) — the fallback warning fired by `assertOwnWorker` (via
+ * `maybeWarnMissingImplements` below) whenever a ticket has a native Jira
+ * `parent` but NO `Implements` link, and that parent is not one of the
+ * tiers `isEligibleParentTier` (src/tools/docs.ts) recognises as an
+ * equivalent boss relationship. Registered in src/labels/registry.ts —
+ * verb-owned (this call site only), never daemon-owned, and deliberately
+ * never withdrawn: nothing in this codebase detects "the Implements link
+ * was since added", so there is no reachable moment to clear it from. A
+ * human adding the link is the fix; the stale label is harmless noise on an
+ * otherwise-healthy ticket, not a cached assertion anything else reads.
+ */
+export const MISSING_IMPLEMENTS_LABEL = "butchr:missing-implements";
 
 /**
  * The swallowed-argument shape (BUTCHR-177/BUTCHR-180): a caller's tool call
@@ -373,6 +387,32 @@ async function resolveCollisionSide<T>(read: () => Promise<T>, whatFailed: strin
  * exact project-caller analogue here: acting on a ticket that merely
  * SHARES A PROJECT with the caller).
  */
+/**
+ * FACTORY-909 (B) — the once-per-ticket, idempotent fallback warning: posts
+ * exactly ONE `[butchr:missing-implements]` comment on `workerKey` (never a
+ * second one — gated on the label already being present, read off the SAME
+ * `issue` fetch `assertOwnWorker` made, no extra Jira call for the common
+ * already-warned case) naming `parentKey` and the exact link to add, sets
+ * `MISSING_IMPLEMENTS_LABEL`, and logs `[relationship] missing Implements
+ * link child=<k> parent=<p>` — fired only when `resolveBoss` could not
+ * grant boss status via the parent (an ineligible tier), never when (A)
+ * already succeeded silently.
+ */
+async function maybeWarnMissingImplements(ops: AtlassianOps, issue: unknown, workerKey: string, parentKey: string): Promise<void> {
+  console.error(`[relationship] missing Implements link child=${workerKey} parent=${parentKey}`);
+  if (labelsOf(issue).includes(MISSING_IMPLEMENTS_LABEL)) return;
+  // Daemon-authored, not agent-authored — no caller identity to tag with
+  // (see src/daemon/index.ts's own `[butchr:resume]` comment for the same
+  // bracket-tag-without-tagComment precedent); tagComment's identity-tag
+  // idiom is for a comment an AGENT posts in its own voice, which this is
+  // not — any caller shape can trigger this same structural observation.
+  await ops.addComment(
+    workerKey,
+    `[${MISSING_IMPLEMENTS_LABEL}] ${workerKey}'s Jira parent is ${parentKey}, but there is no inward \`Implements\` link from ${workerKey} to it, and ${parentKey}'s issue type is not one this fleet treats as an equivalent boss relationship for ${workerKey}. Add the link with jira_link_issues(from: "${workerKey}", to: "${parentKey}", type: "Implements") so ${parentKey} can review, merge and finish ${workerKey}.`,
+  );
+  await ops.addLabels(workerKey, [MISSING_IMPLEMENTS_LABEL]);
+}
+
 async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(workerKey);
   if (isProjectId(callerKey)) {
@@ -386,9 +426,19 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
     }
     return issue;
   }
-  const boss = findBossKey(issue);
-  if (boss !== callerKey) {
-    throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
+  // FACTORY-909: resolve the boss via Implements first, falling back to the
+  // native Jira parent/Epic-link when there is no Implements link at all —
+  // see resolveBoss's own doc comment (src/tools/docs.ts) for precedence
+  // and the disagreement-logging contract.
+  const resolution = resolveBoss(issue, issuetypeOf(issue));
+  if (resolution.disagreement) {
+    console.error(`[relationship] Implements/parent disagreement child=${workerKey} implements=${resolution.disagreement.implementsBoss} parent=${resolution.disagreement.parent} — Implements wins`);
+  }
+  if (resolution.ineligibleParent) {
+    await maybeWarnMissingImplements(ops, issue, workerKey, resolution.ineligibleParent.key);
+  }
+  if (resolution.boss !== callerKey) {
+    throw new Refusal(`${verb}: ${workerKey} is not one of ${callerKey}'s own workers (its Implements link points to ${resolution.boss ?? "no boss at all"}, not ${callerKey}) — refusing`);
   }
   return issue;
 }
@@ -426,17 +476,69 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
  * Jira genuinely never hydrates) would be reported open on stale data even
  * though the fresh read already shows Done — a false refusal, the same
  * inversion failure the anti-inversion tests guard against elsewhere.
+ *
+ * COST UPDATE, FACTORY-909: the "zero extra reads in the common case" claim
+ * above is now narrower than it reads — this function ALSO always pays one
+ * `ops.search` for `key`'s parent-only children (see `parentOnlyOpenWorkers`
+ * below), on every call, not just the refusing path. That is a deliberate,
+ * named choice (FACTORY-908's diagnosis required one): `findWorkers`'s
+ * Implements-only view cannot see a child linked ONLY by Jira's native
+ * parent field, and silently under-counting here is exactly the "loud
+ * refusal becomes a silent premature Done" regression this ticket exists
+ * to prevent — there is no "healthy case" where skipping that query is
+ * safe, so it is not gated on `nonDone` being non-empty the way the
+ * per-worker label fetch above is.
  */
-async function openWorkers(ops: AtlassianOps, issue: unknown): Promise<WorkerRef[]> {
+async function openWorkers(ops: AtlassianOps, key: string, issue: unknown): Promise<WorkerRef[]> {
   const nonDone = findWorkers(issue).filter((w) => w.status !== "Done");
-  if (nonDone.length === 0) return [];
   const open: WorkerRef[] = [];
+  const seen = new Set<string>();
   for (const w of nonDone) {
+    seen.add(w.key);
     const full = await ops.getIssue(w.key);
     const status = statusOf(full) ?? w.status;
     if (status !== "Done" && !labelsOf(full).includes(EXEMPT_LABEL)) {
       open.push({ key: w.key, status, summary: summaryOf(full) ?? w.summary });
     }
+  }
+  open.push(...(await parentOnlyOpenWorkers(ops, key, seen)));
+  return open;
+}
+
+/**
+ * FACTORY-909 (A), boss side — THE DECISION FACTORY-908's diagnosis
+ * required be made explicit, in code, with a test. Unlike the child side
+ * (a child's own native parent is already on ITS OWN payload), a boss's
+ * parent-only children are NOT anywhere on the boss's own payload —
+ * `findWorkers` stays pure and I/O-free on purpose (see its own doc
+ * comment in docs.ts, and FACTORY-908 comment 31652's "asymmetry" point).
+ * Finding them needs a real JQL query.
+ *
+ * CHOSEN: option (i) from the ticket — an I/O-performing resolver at THIS
+ * call site only (the closing guard behind finish_worker,
+ * finish_without_a_boss, submit_to_boss), which can afford the cost.
+ * `findWorkers` itself, `new_worker`'s duplicate-child idempotency check
+ * (`findDuplicateWorker`), and `stand_down`'s watch set (src/tools/defs.ts)
+ * are UNCHANGED and remain Implements-only — a known, deliberately-scoped
+ * gap, not an oversight; see this ticket's PR body. None of those three is
+ * the specific failure this guard exists to close (a boss closing itself
+ * out from under a live, undetected child) — they are a weaker, pre-
+ * existing staleness class (a duplicate filed, a wake missed) that this
+ * change does not make any worse than it already is today.
+ *
+ * `exclude` is every key already counted from the Implements-based view
+ * above, so a child that carries BOTH a native parent pointing at `key` AND
+ * an (agreeing) Implements link is never double-reported.
+ */
+async function parentOnlyOpenWorkers(ops: AtlassianOps, key: string, exclude: ReadonlySet<string>): Promise<WorkerRef[]> {
+  const result = (await ops.search(`parent = "${key}" AND issuetype in (Story, Task) AND status != Done`, 200)) as {
+    issues?: Array<{ key?: string; fields?: { status?: { name?: string }; summary?: string; labels?: string[] } }>;
+  };
+  const open: WorkerRef[] = [];
+  for (const i of result.issues ?? []) {
+    if (!i.key || exclude.has(i.key)) continue;
+    if (i.fields?.labels?.includes(EXEMPT_LABEL)) continue;
+    open.push({ key: i.key, status: i.fields?.status?.name, summary: i.fields?.summary });
   }
   return open;
 }
@@ -1139,7 +1241,7 @@ export async function checkWorker(
  */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
-  const open = await openWorkers(ops, issue);
+  const open = await openWorkers(ops, workerKey, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_worker", workerKey, open));
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
@@ -2484,7 +2586,7 @@ export async function tellPeer(
  */
 export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
-  const open = await openWorkers(ops, issue);
+  const open = await openWorkers(ops, callerKey, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("submit_to_boss", callerKey, open));
   return ops.transition(callerKey, "In Review");
 }
@@ -2551,13 +2653,19 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
  */
 export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
-  const boss = findBossKey(issue);
-  if (boss) {
+  // FACTORY-909: resolveBoss, not plain findBossKey — a parent-only Story
+  // under an Epic (or Task under a Story) genuinely HAS a boss now, same as
+  // an Implements-linked one, and must be refused here too.
+  const resolution = resolveBoss(issue, issuetypeOf(issue));
+  if (resolution.disagreement) {
+    console.error(`[relationship] Implements/parent disagreement child=${callerKey} implements=${resolution.disagreement.implementsBoss} parent=${resolution.disagreement.parent} — Implements wins`);
+  }
+  if (resolution.boss) {
     throw new Refusal(
-      `finish_without_a_boss: ${callerKey} has a boss (${boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
+      `finish_without_a_boss: ${callerKey} has a boss (${resolution.boss}) — refusing. Use submit_to_boss to move your own ticket to In Review, then let ${resolution.boss} call finish_worker on you instead. Every Done in this system requires a second identity to have looked at the work before it closes; a ticket with a boss already has one waiting, so it can never close itself — that review hop is the point, not an inconvenience.`,
     );
   }
-  const open = await openWorkers(ops, issue);
+  const open = await openWorkers(ops, callerKey, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   return ops.transition(callerKey, "Done");
 }
