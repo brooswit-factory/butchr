@@ -2097,7 +2097,15 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
     // delivered, cursor left at "c1" (untouched). idx3: a genuine new
     // comment ("c2") since that still-"c1" baseline -> delivered.
     expect(kEvents.length).toBe(3);
-    expect(wEvents.length).toBe(3);
+    // FACTORY-954: idx2's fail-open delivery is named `{ label: ... }`, not
+    // `comment` — the rejected fetch means `verdict.commentId` is never
+    // set, so decide() falls to the general classifier, which finds the
+    // genuine agent:*-label transition (unaffected by the comment body
+    // fix above, which only matters for idx3's actual `comment` reason). A
+    // `label` reason is never in the related-space allowlist, so W does
+    // not hear idx2 — only idx1 (appear) and idx3 (the confirmed,
+    // boss-addressed comment).
+    expect(wEvents.length).toBe(2);
     expect(commentCalls).toBe(3);
   });
 

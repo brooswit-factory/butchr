@@ -93,15 +93,29 @@ describe("BUTCHR-307 DoD 3(b): a change on a WORKER's ticket wakes its stood-dow
     const rules = createIssueEventRules({ comments: store.comments, standDown: sd });
 
     const workerBefore = issue({ key: "KAN-2", updated: "2026-01-01T00:00:00.000Z" });
+    const relBefore: RelatedResource<JiraIssue> = { issue: workerBefore, watchers: ["KAN-1"] };
+    // FACTORY-954: a genuinely CONFIRMED comment-moved reason (what the
+    // related-space allowlist actually checks the body of) requires a
+    // PRIOR poll's own `preCommentCursor` baseline to compare against —
+    // the same mechanic primary space already depends on (see this
+    // module's own §3D doc comment, src/resources/issue.ts). A seed poll,
+    // run BEFORE the comment is added, establishes that baseline ("200")
+    // first — mirrors the pattern every sibling suite in this corpus uses
+    // (e.g. issue-bookkeeping-comment-suppression.test.ts).
+    await rules.poll({ primary: [], related: [] }, { primary: [], related: [relBefore] });
+
     const workerAfter = issue({ key: "KAN-2", updated: "2026-01-01T00:05:00.000Z" });
     // FACTORY-954: a related-space wake now requires a BOSS-RELEVANT comment
     // body (the worker's own identity tag, same as report_to_boss/ask_boss
     // post — see src/resources/issue.ts's `isBossRelevantComment`), not
     // merely an unseen id — an arbitrary comment no longer wakes a related
     // watcher at all (see this file's own new "routine" tests below).
-    store.set("KAN-2", ["200", "201"], { "201": "[KAN-2] reporting progress to my boss" }); // a new, unseen, BOSS-ADDRESSED comment on the worker's ticket
+    // "201" (the new, boss-addressed comment) must be FIRST — `comments[0]`
+    // is this module's own "newest" convention (comments() returns
+    // newest-first), and the §3D fallback names its reason from the
+    // NEWEST id's own body, not merely "any id changed".
+    store.set("KAN-2", ["201", "200"], { "201": "[KAN-2] reporting progress to my boss" }); // a new, unseen, BOSS-ADDRESSED comment on the worker's ticket
 
-    const relBefore: RelatedResource<JiraIssue> = { issue: workerBefore, watchers: ["KAN-1"] };
     const relAfter: RelatedResource<JiraIssue> = { issue: workerAfter, watchers: ["KAN-1"] };
     const poll = await rules.poll({ primary: [], related: [relBefore] }, { primary: [], related: [relAfter] });
     expect(poll.changedRelated).toEqual(["KAN-2"]);
