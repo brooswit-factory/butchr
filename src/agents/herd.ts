@@ -4,7 +4,7 @@ import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderO
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decideRespawnResume } from "./respawn.js";
-import { clearStopCause } from "./stop-cause.js";
+import { clearStopCause, persistIntentionalStop, workspaceStopCause } from "./stop-cause.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
@@ -1260,6 +1260,21 @@ export class HerdrHerd implements Herd {
       // line that broke a long list of pre-existing pinned exact-log-array
       // assertions having nothing to do with this story (caught by CI,
       // fixed here rather than by touching any of those assertions).
+      // FACTORY-930 review fix: snapshot this workspace's stop-cause record
+      // BEFORE anything below can clear it — both `decideRespawnResume`
+      // (called inside `tryClaudeResume`, src/agents/respawn.ts) and the
+      // non-claude branch's own `clearStopCause` immediately below clear
+      // the marker the moment a decision is MADE for this spawn() call,
+      // not once a launch actually SUCCEEDS. If every launch attempted
+      // below (a resume attempt, then the ordinary multi-provider
+      // fallback) ultimately fails, `priorStopCause` is re-persisted
+      // verbatim in the `result.status !== "success"` branch so a
+      // deliberate stand_down survives to the NEXT spawn attempt instead
+      // of being read as unintended by it — the defect this ticket exists
+      // to close. Read exactly once, here: the restore point below never
+      // re-reads current disk state, which would race a fresh marker a
+      // concurrent stand_down might have written in the meantime.
+      const priorStopCause = workspaceStopCause(workspaceDirFor(issue));
       if (this.firstProvider(spec) === "claude" && spec.ticketStatus !== undefined) {
         const paneId = await this.tryClaudeResume(spec);
         if (paneId) {
@@ -1275,12 +1290,35 @@ export class HerdrHerd implements Herd {
         // claude. The marker-staleness gap `clearStopCause`'s own doc
         // comment names is NOT Claude-specific (any butchr verb can record
         // it), only the RESUME mechanism is — so clear it here too,
-        // unconditionally: this IS a spawn actually happening for this
-        // workspace, the one precondition the doc comment requires.
+        // unconditionally: this IS a spawn decision being made for this
+        // workspace, the one precondition the doc comment requires. If the
+        // fallback spawn immediately below fails, `priorStopCause` above
+        // restores whatever this call just cleared.
         clearStopCause(workspaceDirFor(issue));
       }
-      const result = await this.startProviders(spec);
+      let result: Awaited<ReturnType<HerdrHerd["startProviders"]>>;
+      try {
+        result = await this.startProviders(spec);
+      } catch (e) {
+        // FACTORY-930: a provider rejection `startProviders`/`ManagedHerdrLifecycle.start()`
+        // does not absorb into a `{status: "failed"}` (e.g. a non-retryable
+        // `agent.start` error, see "a non-busy agent.start rejection is
+        // never retried" in test/unit/herd.test.ts) reaches here as a
+        // THROW, not a status — restore applies identically; this call
+        // never launched anything either. Rethrown unchanged so the outer
+        // catch's existing log-and-rethrow behaviour is untouched.
+        if (priorStopCause) persistIntentionalStop(workspaceDirFor(issue), priorStopCause.reason, priorStopCause.at);
+        throw e;
+      }
       if (result.status !== "success") {
+        // FACTORY-930: nothing below this point launched successfully —
+        // neither a resume attempt (if one was even made; see
+        // `priorStopCause`'s own comment above for why it is undefined
+        // whenever a resume WAS attempted) nor this fresh fallback. Put
+        // back exactly what was read before either could clear it, so a
+        // stood-down workspace's marker outlives a failed spawn instead of
+        // letting the next attempt misread it as unintended.
+        if (priorStopCause) persistIntentionalStop(workspaceDirFor(issue), priorStopCause.reason, priorStopCause.at);
         this.spawnRefusal.set(issue, result.status === "blocked" ? result.reason : "providers exhausted");
         this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
         if (result.status === "blocked") await this.clearVanishedWorker(issue, result.current?.paneId);
