@@ -1247,8 +1247,20 @@ export class HerdrHerd implements Herd {
       // the pinned 0.16.11 source). Attempted only when this spec's own
       // effective FIRST provider is claude — a rule whose ranked harness
       // preference tries something else first is unaffected, same as
-      // `resumeInPlace`'s own Claude-only limitation.
-      if (this.firstProvider(spec) === "claude") {
+      // `resumeInPlace`'s own Claude-only limitation — AND only when
+      // `spec.ticketStatus` is present, i.e. this is a ticket-backed
+      // jira-work-shaped spawn at all (`SpawnSpec.ticketStatus`'s own doc
+      // comment, src/agents/workspace.ts, names this exact discriminator).
+      // Without this second half, a managed-session or query-level agent —
+      // every `spec` throughout this codebase's EXISTING test suite
+      // included, none of which ever had a reason to set `ticketStatus` —
+      // would pay `tryClaudeResume`'s own `decideRespawnResume` call and,
+      // overwhelmingly, its "no persisted session id" log line on EVERY
+      // single ordinary spawn: harmless in production, but a noisy new
+      // line that broke a long list of pre-existing pinned exact-log-array
+      // assertions having nothing to do with this story (caught by CI,
+      // fixed here rather than by touching any of those assertions).
+      if (this.firstProvider(spec) === "claude" && spec.ticketStatus !== undefined) {
         const paneId = await this.tryClaudeResume(spec);
         if (paneId) {
           this.spawnRefusal.delete(issue);
@@ -1532,12 +1544,27 @@ export class HerdrHerd implements Herd {
     if (preference?.model) selected.model = preference.model;
     if (preference?.effort) selected.effort = preference.effort;
     const dir = buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
+    // FACTORY-916 review fix: `prepareWorkspace`/`home` MUST resolve before
+    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`/
+    // `estimateTranscriptTokens` (src/agents/workspace.ts) both resolve
+    // Claude's per-cwd project folder under `home` (defaulting to
+    // `homedir()` when absent), the SAME override `startProviders`'s own
+    // `prepare()` already threads through for its own post-launch
+    // discovery. Computing the decision against the wrong (default) home
+    // first — an earlier version of this method did exactly that — finds
+    // no transcript under the WRONG home and silently falls back to
+    // "transcript missing" even when a real one exists, caught by this
+    // method's own regression test before this fix landed.
+    const label = await this.labelFor(spec.key);
+    const prepared = await this.prepareWorkspace({ provider: "claude", cwd: dir, unattended: true });
+    const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string" ? prepared.HOME : undefined;
     const decision = decideRespawnResume({
       dir,
       ...(spec.resumeOnRespawn !== undefined ? { resumeOnRespawn: spec.resumeOnRespawn } : {}),
       ...(spec.resumeContextCutoff !== undefined ? { resumeContextCutoff: spec.resumeContextCutoff } : {}),
       ...(spec.ticketStatus !== undefined ? { ticketStatus: spec.ticketStatus } : {}),
       ...(spec.ticketLabels !== undefined ? { ticketLabels: spec.ticketLabels } : {}),
+      ...(home !== undefined ? { home } : {}),
     });
     if (!decision.resumeSessionId) {
       // Every non-resume outcome logs its one greppable reason — DoD item
@@ -1550,9 +1577,6 @@ export class HerdrHerd implements Herd {
       return undefined;
     }
     selected.resumeSessionId = decision.resumeSessionId;
-    const label = await this.labelFor(spec.key);
-    const prepared = await this.prepareWorkspace({ provider: "claude", cwd: dir, unattended: true });
-    const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string" ? prepared.HOME : undefined;
     // UNLIKE `resumeInPlaceExclusive` (which does NOT call `buildWorkspace`
     // before its relaunch, only after confirming success — a reused pane's
     // files are already on disk from an earlier launch), `buildWorkspace`
