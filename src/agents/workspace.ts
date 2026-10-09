@@ -177,6 +177,37 @@ export interface SpawnSpec {
    * behaviour exactly.
    */
   mcpServers?: readonly McpServerBinding[];
+  /**
+   * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — `Rule.resumeOnRespawn`
+   * passthrough (FACTORY-851, src/rules/rules.ts), read at the spawn
+   * decision in `HerdrHerd.startProviders` (src/agents/herd.ts) to decide
+   * whether an UNINTENDED-stop respawn may `--resume` this workspace's
+   * prior Claude session instead of starting fresh. Absent means ON, same
+   * no-tri-state contract as the rule field itself — only an explicit
+   * `false` here suppresses resume. Claude-only in effect (the Claude
+   * branch of `startProviders` is the only reader), same as
+   * `resumeSessionId` (src/agents/argv.ts) it ultimately feeds.
+   */
+  resumeOnRespawn?: boolean;
+  /**
+   * FACTORY-916 — `Rule.resumeContextCutoff` passthrough (FACTORY-851).
+   * Absent means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (src/rules/rules.ts).
+   */
+  resumeContextCutoff?: number;
+  /**
+   * FACTORY-916 — this ticket's own current Jira `status`/`labels`
+   * (`issue.status`/`issue.labels`, src/atlassian/types.ts), carried onto
+   * the spec SOLELY so `classifyStop` (src/agents/stop-cause.ts) can be
+   * called at the spawn decision without a second Jira fetch of its own —
+   * the same already-polled snapshot `specForMatch` (src/rules/resource-type.ts)
+   * builds the rest of this spec from. Absent (every non-Jira-rule-engine
+   * caller) means `classifyStop` sees `ticketStatus: ""`/`ticketLabels: []`,
+   * which cannot match `"Done"` or `EXEMPT_LABEL` — i.e. "status/labels
+   * unknown" never reads as "intentional", the same safe-direction default
+   * `classifyStop`'s own doc comment argues for an undeterminable cause.
+   */
+  ticketStatus?: string;
+  ticketLabels?: readonly string[];
 }
 
 
@@ -1388,5 +1419,54 @@ export function invalidatePersistedSessionId(dir: string): void {
  * restart) rather than resuming a nonexistent conversation.
  */
 export function claudeTranscriptExists(dir: string, sessionId: string, home?: string): boolean {
-  return existsSync(join(claudeProjectDir(dir, home), `${sessionId}.jsonl`));
+  return existsSync(claudeTranscriptPath(dir, sessionId, home));
+}
+
+/**
+ * FACTORY-916 — the path `claudeTranscriptExists` above checks, exported so
+ * `src/agents/respawn.ts` can `statSync` it directly (to ESTIMATE a
+ * token count from its byte size, for the respawn-resume context cutoff)
+ * without duplicating `claudeProjectDir`'s own encoding.
+ */
+export function claudeTranscriptPath(dir: string, sessionId: string, home?: string): string {
+  return join(claudeProjectDir(dir, home), `${sessionId}.jsonl`);
+}
+
+/**
+ * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — an ESTIMATE of
+ * `sessionId`'s transcript size in tokens, cheap enough to call on every
+ * respawn of a large (potentially many-MB) transcript: `statSync` for the
+ * byte count, never `readFileSync`/parsed JSON. The whole reason this
+ * cutoff exists is to bound the cost of resuming a LARGE transcript, so the
+ * check that enforces it must not itself pay a cost proportional to that
+ * size — see `Rule.resumeContextCutoff`'s own doc comment (src/rules/rules.ts).
+ *
+ * `BYTES_PER_TOKEN_ESTIMATE = 4`: a Claude Code `.jsonl` transcript line is
+ * mostly English prose and tool JSON, both of which sit close to OpenAI/
+ * Anthropic's own commonly-cited "~4 bytes per token" rule of thumb for
+ * English text; the surrounding JSON punctuation (quotes, braces, escaped
+ * newlines) skews slightly denser than prose alone, which makes this
+ * estimate a mild OVER-count of true tokens for a typical transcript — the
+ * safe direction for a cutoff whose entire job is to bound cost, since
+ * erring toward "estimated over cutoff, start fresh" costs nothing more
+ * than the resume this mechanism is already allowed to skip, while erring
+ * the other way (resume a transcript actually over budget) is the one
+ * outcome this field exists to prevent. Not a measured calibration against
+ * this codebase's own real transcripts — a documented rule-of-thumb
+ * constant, not a promise of accuracy; callers needing an exact count
+ * would have to parse and tokenize the file, exactly what this function is
+ * built to avoid.
+ *
+ * Returns `undefined` when the transcript cannot be stat'd at all (ENOENT —
+ * the caller's own `claudeTranscriptExists` check is expected to run
+ * first, so this is a defensive fallback, not the primary missing-
+ * transcript path) — never a thrown error for the common "file not there"
+ * case, same fail-safe shape as `workspaceSessionId`/`workspaceStopCause`.
+ */
+const BYTES_PER_TOKEN_ESTIMATE = 4;
+export function estimateTranscriptTokens(dir: string, sessionId: string, home?: string): number | undefined {
+  let size: number;
+  try { size = statSync(claudeTranscriptPath(dir, sessionId, home)).size; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  return Math.ceil(size / BYTES_PER_TOKEN_ESTIMATE);
 }

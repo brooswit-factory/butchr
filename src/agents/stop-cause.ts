@@ -72,17 +72,27 @@ export function persistIntentionalStop(dir: string, reason: StopReason, at: numb
  *
  * NOT called from `stand_down`'s own wake path: that wake is the in-memory
  * registry this module deliberately does not depend on (see this file's
- * top comment), and nothing in THIS story's scope reaches the spawn path
- * where a resumed session would otherwise clear its own prior marker (the
- * scope guard explicitly forbids wiring this story into spawn/respawn).
- * That is a NAMED, not a silently accepted, gap: a ticket that calls
- * `stand_down` and is later respawned with no intervening `start_worker`
- * (or a later intentional stop of its own, which equally supersedes the
- * old record by the plain overwrite semantics above) keeps reading
- * "intentional" until one of those happens. Closing it is FACTORY-850's
- * job — it wires stop-cause into the spawn path and is the one place that
- * can tell "a resume is actually happening" apart from every other reason
- * this workspace's files might be touched.
+ * top comment).
+ *
+ * FACTORY-850/FACTORY-916 wired this into the spawn path
+ * (`decideRespawnResume`, src/agents/respawn.ts, via `HerdrHerd.tryClaudeResume`
+ * and the non-claude branch of `HerdrHerd.spawnExclusive`, both
+ * src/agents/herd.ts) — the one place that can tell "a resume is actually
+ * happening" apart from every other reason this workspace's files might
+ * be touched. Both call sites clear the marker as soon as a spawn
+ * DECISION is made, before the launch it is deciding for has run — a
+ * narrower, separate defect FACTORY-930 found and closed: a launch that
+ * then FAILS (blocked / providers exhausted / the pane dying immediately)
+ * must not leave the marker cleared, or the NEXT spawn attempt misreads a
+ * deliberate `stand_down` as unintended and resumes it. The fix lives in
+ * `spawnExclusive` (src/agents/herd.ts), not here: it snapshots
+ * `workspaceStopCause(dir)` before either call site above can clear it,
+ * and re-persists that snapshot verbatim (`persistIntentionalStop`) if
+ * every launch attempted for that spawn() call ultimately fails. This
+ * function's own unconditional-clear-on-call contract is unchanged, and
+ * deliberately so — `test/unit/respawn-resume-decision.test.ts`'s
+ * marker-clearing tests exercise `decideRespawnResume` directly, with no
+ * notion of launch success, and must keep passing unmodified.
  */
 export function clearStopCause(dir: string): void {
   try { rmSync(join(dir, ".butchr-stop-cause.json")); }

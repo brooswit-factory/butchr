@@ -8,6 +8,7 @@ import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdr
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
+import { persistIntentionalStop, workspaceStopCause } from "../../src/agents/stop-cause.js";
 import { spawnArgs, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
@@ -2809,6 +2810,160 @@ describe("resumeInPlace", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  });
+
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): the spawn-path
+  // resume decision, driven through the REAL `HerdrHerd.spawn()` ->
+  // `tryClaudeResume()` path — a fake herdr client only at the RPC
+  // boundary. UNLIKE the FACTORY-314 test immediately above (an ordinary
+  // fresh spawn, which DOES go through the real `ManagedHerdrLifecycle`),
+  // this path deliberately bypasses it — see `tryClaudeResume`'s own doc
+  // comment (src/agents/herd.ts) for why Drovr's own `ManagedAgentLaunch`/
+  // `buildAgentStartParams` has no session-id/resume concept at all, so
+  // `pane.processInfo` is stubbed here (not provided by the shared
+  // `fakeHerdr` fixture) for the post-launch liveness check
+  // `tryClaudeResume` performs before trusting a herdr-accepted launch.
+  test("FACTORY-916: an unintended-stop respawn with a persisted session id and its transcript under cutoff launches with --resume <id>, never rediscovers, and leaves the persisted id untouched", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-resume-"));
+      try {
+        const priorId = "prior-conversation-id";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "{}"); // pre-existing — this launch must never overwrite or discover a NEW one
+        const f = fakeHerdr([]); // no live agent — this is the respawn's own fresh launch
+        f.client.pane.processInfo = async () => ({ process_info: { pane_id: "w9:p1", foreground_processes: [{ pid: 1, argv: ["claude", "--resume", priorId], name: "claude" }] } });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).toContain("--resume");
+        expect(f.started[0]!.args[f.started[0]!.args.indexOf("--resume") + 1]).toBe(priorId);
+        expect(workspaceSessionId(cwd)).toBe(priorId); // untouched — never invalidated, never "rediscovered" into something else
+        expect(herd.lastFreshSpawnResumed(key)).toBe(true); // read-once signal the daemon's respawn-resumed comment hook relies on
+        expect(herd.lastFreshSpawnResumed(key)).toBe(false); // ...and only once
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-916: the flag-off / intentional-stop / missing-transcript /
+  // over-cutoff fallback outcomes are all covered directly against
+  // `decideRespawnResume` itself (test/unit/respawn-resume-decision.test.ts)
+  // — this is the one "does the fallback reach a REAL spawn correctly"
+  // check: no persisted session id at all is the simplest fallback to
+  // drive through the real path, and must behave EXACTLY like the
+  // pre-FACTORY-916 "no id to discover from" case the FACTORY-314 test
+  // above already covers (no `--resume`, no `--session-id`) — going through
+  // the real `ManagedHerdrLifecycle`-based `startProviders`, never
+  // `tryClaudeResume` (which returns `undefined` before touching herdr at
+  // all when `decideRespawnResume` has no id to resume with).
+  test("FACTORY-916: no persisted session id at all -> an ordinary fresh spawn, no --resume, same as pre-FACTORY-916 behaviour", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const f = fakeHerdr([]); // this launch's own discovery finds nothing — no transcript is ever written by this fake
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+      expect(f.started).toHaveLength(1);
+      expect(f.started[0]!.args).not.toContain("--resume");
+      expect(herd.lastFreshSpawnResumed(key)).toBe(false);
+    });
+  });
+
+  // FACTORY-930 (epic FACTORY-843, story FACTORY-850): the defect the
+  // epic's formal review of PR #739 found — `decideRespawnResume` (called
+  // inside `tryClaudeResume`) and the non-claude branch's own
+  // `clearStopCause` both clear this workspace's stop-cause marker as soon
+  // as a spawn DECISION is made, before the launch it is deciding for has
+  // actually run. A launch that then FAILS must not leave the marker
+  // cleared — otherwise the VERY NEXT spawn attempt reads no marker at
+  // all, misclassifies as `unintended`, and resumes a session the agent
+  // deliberately stood down from, breaking `stand_down`'s own contract.
+  test("FACTORY-930: a spawn whose launch FAILS does not consume the intentional-stop marker — the next spawn attempt still starts fresh, never resuming", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-920" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-failed-spawn-"));
+      try {
+        persistIntentionalStop(cwd, "stand_down");
+        // A resumable prior session — present so that, if the bug were
+        // still live, attempt #2 below would have every ingredient it
+        // needs to WRONGLY resume once the marker is gone.
+        const priorId = "prior-conversation-that-must-not-resume";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "{}");
+
+        const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] };
+
+        // Attempt #1: the decision reads the marker above as `intentional`,
+        // so `tryClaudeResume` attempts no launch at all and this falls
+        // through to the ordinary multi-provider spawn — which FAILS
+        // outright here (a non-busy `agent.start` rejection, never
+        // retried, same shape as "a non-busy agent.start rejection is
+        // never retried" above).
+        const failingClient = {
+          agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+          workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+          pane: { close: async () => {} },
+        };
+        const herd1 = new HerdrHerd(failingClient as any, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await expect(herd1.spawn(spec)).rejects.toThrow("boom");
+
+        // The marker must still be there — nothing above ever actually
+        // launched, so nothing should have consumed it.
+        expect(workspaceStopCause(cwd)?.reason).toBe("stand_down");
+
+        // Attempt #2, a healthy fake this time: if the marker had been
+        // lost (the pre-fix behaviour), this decision would read
+        // `unintended`, find the resumable transcript above, and launch
+        // with `--resume`. With the fix, the still-present marker reads
+        // `intentional` again, so this is an ordinary FRESH launch.
+        const f2 = fakeHerdr([]);
+        const herd2 = new HerdrHerd(f2.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd2.spawn(spec);
+        expect(f2.started).toHaveLength(1);
+        expect(f2.started[0]!.args).not.toContain("--resume"); // fresh, never resumed
+        // This second attempt DID actually launch — the marker is now
+        // correctly gone, so a LATER genuine crash (no intervening
+        // start_worker) would resume instead of reading this stale record
+        // forever (the original FACTORY-852 property this story must not
+        // regress).
+        expect(workspaceStopCause(cwd)).toBeUndefined();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-930: the FACTORY-852 property this story must preserve, driven
+  // through the real `HerdrHerd.spawn()` path rather than `decideRespawnResume`
+  // directly (that half is already covered unit-level by
+  // test/unit/respawn-resume-decision.test.ts's own marker-clearing tests) —
+  // this asserts the INTEGRATION: a spawn that actually succeeds leaves the
+  // marker cleared, same as before this ticket.
+  test("FACTORY-930: a successful fresh spawn clears a stood-down marker", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-921" });
+      const cwd = workspaceDirFor(key);
+      persistIntentionalStop(cwd, "stand_down");
+      const f = fakeHerdr([]);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+      expect(f.started).toHaveLength(1);
+      expect(f.started[0]!.args).not.toContain("--resume"); // the marker correctly forced a fresh start, not a resume
+      expect(workspaceStopCause(cwd)).toBeUndefined(); // cleared by this successful spawn
     });
   });
 
