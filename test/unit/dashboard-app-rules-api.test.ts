@@ -23,9 +23,11 @@ import { validateRuleFieldPatch } from "../../src/rules/rules-write-registry.js"
 
 /**
  * A second `ui-`-prefixed rule (NOT the placeholder template) for write-flow
- * tests that need a writable rule with an already-real query —
- * `stale-github-prs`/`factory-triage`/`vip-zendesk` are deliberately NOT
- * `ui-`-prefixed (used instead to prove the 403 refusal).
+ * tests that need a writable rule with an already-real query. FACTORY-730:
+ * the fixture's own retired prefix gate means `stale-github-prs`/
+ * `factory-triage`/`vip-zendesk` (deliberately NOT `ui-`-prefixed) are now
+ * ALSO writable — this fixture rule still exists for tests that want a
+ * disabled, singleton rule with no preference slot, independent of prefix.
  *
  * `execution: "singleton"` — FACTORY-685 (item 2) now requires confirm on
  * ANY enable of a `"swarm"` rule; these write-flow tests exist to exercise
@@ -149,10 +151,17 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       await expect(api.setEnabled("does-not-exist", true, "e", "h", false)).rejects.toThrow(/unknown rule/);
     });
 
-    test("setEnabled refuses a non-ui- rule id, matching the real server's own 403 wording", async () => {
+    // FACTORY-730: the real server's route-level `ui-`-prefix gate is
+    // retired — `setEnabled` on a non-`ui-` rule id now succeeds, matching
+    // the real server's own accepted behavior (the fixture used to 403 here).
+    test("setEnabled accepts a non-ui- rule id, matching the real server's own retired prefix gate", async () => {
       const api = createFixturesRulesApi({ latencyMs: 0 });
       const before = await api.listRules();
-      await expect(api.setEnabled("factory-triage", false, before.sourceEtag, "h", false)).rejects.toThrow(/does not carry the "ui-" prefix/);
+      const plan = await api.planRule("factory-triage", { enabled: false }, true);
+      const result = await api.setEnabled("factory-triage", false, before.sourceEtag, plan.planHash, true);
+      expect(result.changedIds).toEqual(["factory-triage"]);
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "factory-triage")!.enabled).toBe(false);
     });
 
     test("planRule itself refuses enabling ui-first-rule while its query is still the placeholder, matching the real server's own check order (planRuleWrite refuses before any confirm/scope logic)", async () => {
@@ -180,13 +189,25 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       await expect(api.setEnabled("ui-demo", true, "stale-etag", "h", false)).rejects.toThrow(/etag mismatch/);
     });
 
-    test("updateFields on ui-first-rule's query succeeds while disabled, with zero blast radius (no confirm needed)", async () => {
+    // FACTORY-730 (review round 2, blocking finding — AC3): a query edit is
+    // NEVER zero-blast-radius any more — `planRule` dry-runs the NEW query
+    // and `requiresConfirm`/`confirmReason: "query-change"` regardless of
+    // `stopped`/`restarted` (both still 0 here — a disabled rule's edit
+    // trips NO OTHER gate, which is exactly the case the review found
+    // unprotected). `updateFields` refuses without `confirm: true`.
+    test("updateFields on ui-first-rule's query requires confirm (the new query's dry-run scope), even while disabled (stopped/restarted both 0)", async () => {
       const api = createFixturesRulesApi({ latencyMs: 0 });
       const before = await api.listRules();
       const plan = await api.planRule(FIRST_RULE_ID, { query: "key = XYZ-1" }, false);
       expect(plan.stopped).toBe(0);
       expect(plan.restarted).toBe(0);
-      const result = await api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, plan.planHash, false);
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("query-change");
+      await expect(api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, plan.planHash, false)).rejects.toThrow(/confirm: true/);
+
+      const confirmedPlan = await api.planRule(FIRST_RULE_ID, { query: "key = XYZ-1" }, true);
+      expect(confirmedPlan.requiresConfirm).toBe(false);
+      const result = await api.updateFields(FIRST_RULE_ID, { query: "key = XYZ-1" }, before.sourceEtag, confirmedPlan.planHash, true);
       expect(result.changedIds).toEqual([FIRST_RULE_ID]);
       const after = await api.listRules();
       expect(after.rules.find((r) => r.id === FIRST_RULE_ID)!.query).toBe("key = XYZ-1");
@@ -502,6 +523,30 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     if (serverResult.ok) {
       expect(serverResult.patch).toEqual({ permissionMode: "bypassPermissions", lizardMode: true, agentPreferences: [{ harness: "codex", model: "sonnet" }] });
     }
+  });
+
+  // FACTORY-730 (ticket requirement 7): the SAME cross-contract proof, for a
+  // `query` edit specifically — the edit dialog's own primary field — fed
+  // straight into the real server's own `validateRuleFieldPatch`, and
+  // against a NON-`ui-`-prefixed id (the route-level prefix gate is
+  // retired; this validator never looked at the id in the first place, but
+  // this proves the client doesn't invent any id-shaped assumption either).
+  test("updateFields' real wire body for a query edit on a non-ui- rule is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: "b1", etag: "e2", changedIds: ["epics"] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { query: "project = FACTORY AND type = Epic AND status != Done" };
+    await realRulesApi.updateFields("epics", patch, "e1", "hash1", true);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...patch, ifMatch: "e1", planHash: "hash1", confirm: true });
+    const serverResult = validateRuleFieldPatch(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) expect(serverResult.patch).toEqual(patch);
   });
 
   // Same cross-contract proof for `POST /api/rules/plan`'s own `patch` field (`src/web/view.ts`'s

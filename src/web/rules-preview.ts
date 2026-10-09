@@ -75,8 +75,8 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * search runs against a COPY with `enabled: true` forced, regardless of
  * the rule's real stored value. Never mutates the caller's own rule object.
  */
-async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIssue[]>): Promise<JiraIssue[]> {
-  const asEnabled: Rule = { ...rule, enabled: true };
+async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIssue[]>, queryOverride?: string): Promise<JiraIssue[]> {
+  const asEnabled: Rule = { ...rule, enabled: true, ...(queryOverride !== undefined ? { query: queryOverride } : {}) };
   if (rule.resourceProvider === "jira-work") {
     return (await searchRules({ rules: [asEnabled], search })).map((m) => m.issue);
   }
@@ -89,14 +89,23 @@ async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIs
  * closure per request would reset it every time, defeating the limit
  * entirely).
  */
-export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string) => Promise<RulesPreviewResult> {
+export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, queryOverride?: string) => Promise<RulesPreviewResult> {
   const now = deps.now ?? (() => Date.now());
   const cap = deps.cap ?? DEFAULT_PREVIEW_CAP;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_PREVIEW_TIMEOUT_MS;
   const rateLimitMs = deps.rateLimitMs ?? DEFAULT_PREVIEW_RATE_LIMIT_MS;
   const lastCallAt = new Map<string, number>();
 
-  return async function preview(id: string): Promise<RulesPreviewResult> {
+  // FACTORY-730 — `queryOverride`: dry-runs the SAME rule with a DIFFERENT
+  // (not-yet-saved) query, for the Rules-page edit dialog's own "what would
+  // this match" preview of a draft query edit, before that edit is ever
+  // applied. Rate-limited and cached under the SAME per-rule `id` key as the
+  // no-override case (deliberately NOT keyed by query text too) — this is a
+  // read-only, best-effort UI aid, not a safety gate, so reusing the
+  // existing per-rule limiter (rather than adding a second one keyed by
+  // query) is enough to keep it from becoming a free way to hammer this
+  // daemon's own Jira credentials with distinct draft strings.
+  return async function preview(id: string, queryOverride?: string): Promise<RulesPreviewResult> {
     const rule = deps.rules().find((r) => r.id === id);
     if (!rule) return { ok: false, status: 404, error: "rule not found" };
     if (!JIRA_BACKED_PROVIDERS.has(rule.resourceProvider)) {
@@ -112,7 +121,7 @@ export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string) => Pr
 
     let issues: JiraIssue[];
     try {
-      issues = await withTimeout(searchForRule(rule, deps.search), timeoutMs);
+      issues = await withTimeout(searchForRule(rule, deps.search, queryOverride), timeoutMs);
     } catch (e) {
       const timedOut = (e as Error)?.message?.startsWith("timed out after");
       // Never the real Jira error body/stack here (SPEC CHANGE (b)) — a

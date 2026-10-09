@@ -11,10 +11,11 @@
  * at wire format: every shape below is read off PR #647's own
  * `src/web/view.ts` / `src/rules/rules-write.ts` / `src/rules/
  * rules-write-registry.ts` / `src/web/csrf.ts` in the read-only reference
- * worktree this ticket names, never invented. Writes only ever reach
- * `ui-`-prefixed rule ids (`UI_EDITABLE_ID_PREFIX`) — in practice the one
- * seeded template, `FIRST_RULE_ID` (FACTORY-669) — never a generic
- * create-a-rule capability, which this slice deliberately does not build.
+ * worktree this ticket names, never invented. FACTORY-730: writes reach any
+ * EXISTING rule id (the route-level `ui-`-prefix gate was retired — the
+ * per-write field allowlist is the one remaining gate) — this module still
+ * builds no "create a new rule" capability, only edit/enable of a rule
+ * already in the file.
  *
  * READ-SIDE SHAPE IS DELIBERATELY KEPT STABLE: the real `GET /api/rules`
  * response (`RulesApiResponse` on the server) carries `path`/`valid`/
@@ -54,10 +55,7 @@ import { RULE_FORM_CATALOG, type RuleFormCatalogEntry } from "../../../src/rules
 
 export type { RuleFormCatalogEntry };
 
-/** The reserved id prefix FACTORY-669 seeds its one template rule under — see `src/rules/rules-write-registry.ts`'s own `UI_EDITABLE_ID_PREFIX` (PR #647). Only a rule whose id starts with this may ever be written by this module. */
-export const UI_EDITABLE_ID_PREFIX = "ui-";
-
-/** The one seeded template id this whole write slice ever targets (FACTORY-669). This module builds no "create a new rule" capability — see this file's own top comment. */
+/** The one seeded template id FACTORY-669's daemon-startup seed writes (`src/rules/seed-first-run.ts`). FACTORY-730: this id carries no special write-eligibility anymore (every existing rule is web-UI-writable) — it is still the one id the "Set up your first rule" flow (`FirstRuleSetup.tsx`) looks for specifically. */
 export const FIRST_RULE_ID = "ui-first-rule";
 
 /** The exact placeholder string FACTORY-669 seeds `ui-first-rule.query` with — `src/rules/rules-write-registry.ts`'s own `PLACEHOLDER_QUERY` (PR #647). The server refuses to enable a rule whose query still equals this; this constant lets the UI recognize that state without guessing. */
@@ -65,10 +63,6 @@ export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
 
 /** Mirrors `src/rules/rules-write-registry.ts`'s own `ENABLE_SCOPE_CEILING` (PR #647) for DISPLAY purposes only (e.g. "above the 25-ticket limit") — the SERVER is the authority on whether a write actually requires `confirm`; this module never enforces the ceiling itself, only echoes the server's own refusal message verbatim when it refuses one. */
 export const ENABLE_SCOPE_CEILING = 25;
-
-export function isUiEditableRuleId(id: string): boolean {
-  return id.startsWith(UI_EDITABLE_ID_PREFIX);
-}
 
 export interface RuleAgentPreferenceDto {
   harness: AgentHarness;
@@ -175,11 +169,14 @@ export interface RulePlanPatch extends RuleFieldPatch {
  * `POST /api/rules/plan`'s response, named on the ticket:
  * `{planHash, spawned, stopped, restarted, etag, scopeCount?}`.
  * Report-only — computing one never changes anything. `scopeCount` is
- * present only for a patch that would newly enable the rule (a dry-run Jira
- * ticket count); PR #647's own in-flight implementation at the time this was
- * written names this field `scope`, not `scopeCount` — `planRule` below
- * reads either key defensively (see its own comment) so a late rename on
- * that PR doesn't break this slice either way.
+ * present for a patch that would newly enable the rule (a dry-run Jira
+ * ticket count against the CURRENT query) OR — FACTORY-730 — a patch that
+ * CHANGES `query` (a dry-run against the NEW query text, regardless of the
+ * rule's enabled state; `confirmReason: "query-change"` names this case).
+ * PR #647's own in-flight implementation at the time this was written names
+ * this field `scope`, not `scopeCount` — `planRule` below reads either key
+ * defensively (see its own comment) so a late rename on that PR doesn't
+ * break this slice either way.
  */
 export interface RulePlanResponse {
   planHash: string;
@@ -202,8 +199,8 @@ export interface RulePlanResponse {
    */
   requiresConfirm: boolean;
   /** Mirrors `src/rules/rules-write.ts`'s own `RulesPlanResult.confirmReason` — present iff `requiresConfirm` is `true`. Display-only: which gate is why. */
-  /** FACTORY-729 adds `"risky-permission"` — `permissionMode: "bypassPermissions" | "auto"` or `lizardMode: true`, never a default. */
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "stop-restart" | "risky-permission";
+  /** FACTORY-729 adds `"risky-permission"` — `permissionMode: "bypassPermissions" | "auto"` or `lizardMode: true`, never a default. FACTORY-730 adds `"query-change"` — a CHANGED `query`'s own dry-run scope, regardless of the rule's enabled state. */
+  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission";
 }
 
 /** The success shape every real write route (`enabled`, `PUT`, `undo`) returns — `RulesWriteOutcome`'s `ok: true` branch, PR #647's `src/rules/rules-write.ts`, minus the `reload` field (an internal daemon detail this UI has no use for). */
@@ -238,7 +235,16 @@ export interface RulesApi {
    * a caller that wants to avoid refetching may cache the result itself).
    */
   getCatalog(signal?: AbortSignal): Promise<readonly RuleFormCatalogEntry[]>;
-  previewRule(ruleId: string, signal?: AbortSignal): Promise<RulePreviewResponse>;
+  /**
+   * FACTORY-730 — `queryOverride`, when given, dry-runs the SAME rule with a
+   * DIFFERENT (not-yet-saved) query instead of the rule's own stored one —
+   * the edit dialog's own "what would this match" preview for a draft query
+   * edit, before that edit is ever applied. `GET /api/rules/:id/preview`'s
+   * own `?query=` param (`src/web/rules-preview.ts`), the SAME dry-run
+   * mechanism `searchRules`/`searchJiraIdeaRules` already run for the
+   * no-override case — never a second preview mechanism.
+   */
+  previewRule(ruleId: string, signal?: AbortSignal, queryOverride?: string): Promise<RulePreviewResponse>;
   /** Report-only: never applies anything. */
   planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
   /** `POST /api/rules/:id/enabled` — the ONLY call that may flip `enabled`. `ifMatch` must be the rule list's own `sourceEtag` (never `fileEtag`); `planHash` must be the SAME plan just returned by `planRule` for this exact patch. */
@@ -443,8 +449,10 @@ export const realRulesApi: RulesApi = {
   // client's fixtures grew around: reading `tickets` off the real response was
   // `undefined`, and the preview dialog's `.map` crashed the whole React app to a blank
   // page in a real browser. Map at this one edge.
-  previewRule: async (ruleId, signal) =>
-    mapServerPreview(ruleId, await request<unknown>(`/api/rules/${encodeURIComponent(ruleId)}/preview`, { signal })),
+  previewRule: async (ruleId, signal, queryOverride) => {
+    const qs = queryOverride !== undefined ? `?query=${encodeURIComponent(queryOverride)}` : "";
+    return mapServerPreview(ruleId, await request<unknown>(`/api/rules/${encodeURIComponent(ruleId)}/preview${qs}`, { signal }));
+  },
   planRule: async (ruleId, patch, confirm, signal) => {
     // `csrf: true` is REQUIRED here even though this route only ever
     // reports, never writes: the real merged guard (`src/web/view.ts`'s
@@ -505,6 +513,8 @@ export interface FixturesRulesApiOptions {
   latencyMs?: number;
   /** Keyed by rule id; falls back to a trivial empty preview when absent. */
   previews?: Record<string, RulePreviewResponse>;
+  /** FACTORY-730 — keyed `${ruleId}:${queryOverride}`: a distinct scope count for a draft (not-yet-saved) query preview, consulted before `previews` whenever `previewRule` is called with a `queryOverride`. */
+  previewsByQuery?: Record<string, RulePreviewResponse>;
   /** Keyed by rule id; falls back to a plan computed from the SAME blast-radius logic the real server uses (`computeLocalPlanCounts` below) when absent. */
   plans?: Record<string, RulePlanResponse>;
   /** When set, every call rejects with this message — simulates a fixtures-mode backend error. */
@@ -675,11 +685,6 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       throw new Error(`etag mismatch — expected ${ifMatch}, the rules file is currently at ${state.sourceEtag}; reload and retry`);
     }
   };
-  const assertUiEditable = (id: string) => {
-    if (!isUiEditableRuleId(id)) {
-      throw new Error(`rule "${id}" does not carry the "ui-" prefix — only web-UI-marked rules may be written by this route`);
-    }
-  };
   const requireConfirmForBlastRadius = (counts: { spawned: number; stopped: number; restarted: number }, confirm: boolean) => {
     if ((counts.stopped > 0 || counts.restarted > 0) && !confirm) {
       throw new Error(`this change would stop ${counts.stopped} and restart ${counts.restarted} running agent(s) — retry with confirm: true to proceed`);
@@ -711,9 +716,18 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       return state;
     },
-    async previewRule(ruleId) {
+    async previewRule(ruleId, _signal, queryOverride) {
       await delay();
       maybeFail();
+      // FACTORY-730: a draft-query preview (`queryOverride`) looks up
+      // `opts.previewsByQuery` first (keyed `${ruleId}:${queryOverride}`),
+      // falling back to the ordinary `opts.previews` — lets a test fix a
+      // distinct scope count for a NOT-YET-SAVED query without needing a
+      // real previewer.
+      if (queryOverride !== undefined) {
+        const byQuery = opts.previewsByQuery?.[`${ruleId}:${queryOverride}`];
+        if (byQuery) return byQuery;
+      }
       return opts.previews?.[ruleId] ?? { ruleId, total: 0, tickets: [] };
     },
     async getCatalog() {
@@ -736,25 +750,39 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
       }
       const counts = computeLocalPlanCounts(rule.enabled, patch);
-      const scopeCount = counts.spawned > 0 ? opts.previews?.[ruleId]?.total ?? 0 : undefined;
+      // FACTORY-730 (review round 2): a CHANGED `query` is dry-run against
+      // its NEW text — regardless of `counts.spawned` (always 0 for a real
+      // field edit) — mirroring the real server's own `planRuleWrite`.
+      // `previewsByQuery` (keyed `${ruleId}:${patch.query}`) lets a test fix
+      // a distinct count for the draft text; falls back to `previews`.
+      const queryChanged = patch.query !== undefined && patch.query !== rule.query;
+      const scopeCount = counts.spawned > 0
+        ? opts.previews?.[ruleId]?.total ?? 0
+        : queryChanged
+          ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0
+          : undefined;
       // Mirrors `src/rules/rules-write.ts`'s own `planRuleWrite` gate order
       // (FACTORY-685, item 2): a swarm enable needs confirm at ANY scope,
       // not only above the ceiling.
       const rawSwarmEnable = counts.spawned > 0 && rule.execution === "swarm";
-      const rawOverCeiling = scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      const rawOverCeiling = counts.spawned > 0 && scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      // FACTORY-730: raw/unconditional, same discipline as the gates above.
+      const rawQueryChange = queryChanged;
       const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
       // FACTORY-729: mirrors the real server's own `planRuleWrite` — least-specific gate, see that function's own comment.
       const rawRiskyField = isRiskyFieldPatch(patch);
-      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
+      const requiresConfirm = (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawQueryChange && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
       const confirmReason: RulePlanResponse["confirmReason"] = !requiresConfirm
         ? undefined
         : rawOverCeiling
           ? "scope-ceiling"
           : rawSwarmEnable
             ? "swarm-enable"
-            : rawStopRestart
-              ? "stop-restart"
-              : "risky-permission";
+            : rawQueryChange
+              ? "query-change"
+              : rawStopRestart
+                ? "stop-restart"
+                : "risky-permission";
       const base: RulePlanResponse = {
         planHash: `${ruleId}:${JSON.stringify(patch)}:${confirm}:${state.sourceEtag}`,
         spawned: counts.spawned,
@@ -771,7 +799,6 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       maybeFailWriteOnce();
       const rule = findRule(ruleId);
-      assertUiEditable(ruleId);
       checkIfMatch(ifMatch);
       if (!planHash) throw new Error("planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again");
       if (enabled && rule.query === PLACEHOLDER_QUERY) {
@@ -797,12 +824,20 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       maybeFailWriteOnce();
       const rule = findRule(ruleId);
-      assertUiEditable(ruleId);
       checkIfMatch(ifMatch);
       if (!planHash) throw new Error("planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again");
       const counts = computeLocalPlanCounts(rule.enabled, patch);
       requireConfirmForBlastRadius(counts, confirm);
       requireConfirmForRiskyFields(patch, confirm);
+      // FACTORY-730 (review round 2): a CHANGED query must be confirmed —
+      // mirrors the real server's own `writeRuleFields` gate, regardless of
+      // whether `requireConfirmForBlastRadius` above already caught it
+      // (an enabled rule's query edit trips both; a disabled rule's trips
+      // only this one).
+      if (patch.query !== undefined && patch.query !== rule.query && !confirm) {
+        const scopeCount = opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0;
+        throw new Error(`editing "${ruleId}"'s query would now match ${scopeCount} ticket(s) — retry with confirm: true to proceed`);
+      }
       const updated: RuleDto = {
         ...rule,
         query: patch.query ?? rule.query,
