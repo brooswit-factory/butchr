@@ -703,6 +703,41 @@ export async function getDoc(ops: AtlassianOps, key: string, offset?: number, li
 }
 
 /**
+ * FACTORY-996: reads a Confluence page BY ITS OWN BARE ID — no `key`, no
+ * `assertValidKey` Jira-key check, no remote-link resolution. This is the
+ * managed-session agent read path: the caller already knows its own page id
+ * (its `x-issue`, validated by `isConfluencePageResourceId`,
+ * `src/resources/id.ts`, before this is ever called) and isn't naming a
+ * Jira ticket at all — `readLinkedPage` above exists specifically to invert
+ * a TICKET's remote link into a page id, which is the wrong direction here
+ * (the page id is already the input).
+ *
+ * BOUNDED/PAGINATED THE SAME WAY AS `getDoc` (BUTCHR-270) — same
+ * `GetDocResult` three-arm shape, same `buildGetDocResult`/`validateRange`/
+ * `assertVersionMatches` — so a caller that already knows how to page
+ * through `get_doc`'s output needs to learn nothing new here. Unlike
+ * `getDoc`, this never resolves `{ found: false }`: a confluence-page
+ * managed-session agent's own resource page is assumed to exist (it is
+ * the reason the session was spawned); a page deleted out from under a
+ * running session surfaces as `ops.getPage` rejecting, same as every other
+ * direct `getPage` call site in this file (`projectRootDoc` above does not
+ * special-case a missing page either).
+ */
+export async function getConfluencePageDocById(ops: AtlassianOps, pageId: string, offset?: number, limit?: number, expectVersion?: number): Promise<GetDocResult> {
+  const { offset: o, limit: l, expectVersion: v } = validateRange("get_my_confluence_page", offset, limit, expectVersion);
+  const page = (await ops.getPage(pageId)) as { title?: string; body?: { storage?: { value?: string } }; _links?: { base?: string; webui?: string }; version?: { number?: number } } | undefined;
+  const doc: VersionedDocResult = {
+    id: pageId,
+    url: `${page?._links?.base ?? ""}${page?._links?.webui ?? ""}`,
+    title: page?.title ?? "",
+    body: page?.body?.storage?.value ?? "",
+    version: page?.version?.number ?? null,
+  };
+  assertVersionMatches("get_my_confluence_page", doc, v);
+  return buildGetDocResult("get_my_confluence_page", doc, o, l);
+}
+
+/**
  * Resolves a PROJECT's doc: the page named by that project's `butchr`
  * entity property, at `rootDoc.id` — reusing `getProjectProperty`, the same
  * reader `findDoc` already calls below, rather than adding a second one.

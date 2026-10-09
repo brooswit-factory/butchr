@@ -163,6 +163,15 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
   check_in: { taught: true },
   stand_down: { taught: true },
   get_doc_comments: { taught: true },
+  get_my_confluence_page: {
+    taught: false,
+    reason:
+      "FACTORY-996: brand new as of this ticket. It serves a managed-session agent whose resource is a confluence-page (the `confluence-page` ResourceType, FACTORY-992, has not shipped yet as of this story) — no brief template exists yet for that resource kind, so there is nothing to teach this verb FROM. Flip to taught:true once FACTORY-992 ships a brief/template for a confluence-page-resource managed session that names it.",
+  },
+  get_my_confluence_page_comments: {
+    taught: false,
+    reason: "Same as get_my_confluence_page immediately above — no brief exists yet for the managed-session kind this verb serves.",
+  },
   list_peers: { taught: true },
   tell_peer: { taught: true },
   submit_to_boss: { taught: true },

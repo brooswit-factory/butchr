@@ -57,7 +57,7 @@ describe("atlassianTools", () => {
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
-      "get_doc", "get_doc_comments",
+      "get_doc", "get_doc_comments", "get_my_confluence_page", "get_my_confluence_page_comments",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
       "list_peers",
@@ -2073,6 +2073,158 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
       expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).not.toBe(original);
       expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).toBe("the arrow renders as > in storage");
     });
+  });
+});
+
+// FACTORY-996: get_my_confluence_page / get_my_confluence_page_comments, the
+// managed-session agent read path for its OWN confluence-page resource.
+// Narrow scope, called out by the epic as a security requirement: an agent
+// must be unable to read any other page, by argument, by id injection, or
+// by a non-page resource id. Failure conditions stated first, per test, same
+// discipline as get_doc_comments' own block above.
+describe("get_my_confluence_page / get_my_confluence_page_comments (FACTORY-996): managed-session agent's own Confluence page", () => {
+  function pageRig(byPage: Record<string, { title: string; body: string; version: number }>, commentsByPage: Record<string, Array<{ id: string; body: string; author?: string }>> = {}) {
+    const getPageCalls: string[] = [];
+    const getPageCommentsCalls: string[] = [];
+    const audits: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async () => ({ results: [] }),
+      search: async () => ({ issues: [] }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      // Keyed strictly by the `pageId` ARGUMENT — never the caller's x-issue
+      // directly and never a hardcoded id — so a reader that ignored the
+      // resolved page id (or leaked a DIFFERENT page's content) is visible
+      // in the assertions below, the same control discipline get_doc_comments'
+      // own rig uses for the batch-endpoint trap.
+      getPage: async (id: string) => {
+        getPageCalls.push(id);
+        const p = byPage[id];
+        if (!p) throw new Error(`pageRig: no such page ${id}`);
+        return { title: p.title, body: { storage: { value: p.body } }, version: { number: p.version }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
+      },
+      updatePage: async () => ({ ok: true, version: 1 }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async (pageId: string) => {
+        getPageCommentsCalls.push(pageId);
+        if (!(pageId in commentsByPage)) throw new Error(`pageRig: no comments seeded for page ${pageId}`);
+        return { results: commentsByPage[pageId]! };
+      },
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async () => { throw new Error("not used by this rig"); },
+      getProjectPropertyOrNull: async () => null,
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+    };
+    const tools = atlassianTools(ops, (l) => audits.push(l));
+    return { tools, getPageCalls, getPageCommentsCalls, audits };
+  }
+
+  const OWN_PAGE_CALLER = { headers: { "x-issue": "500" } } as any;
+
+  test("get_my_confluence_page's and get_my_confluence_page_comments' schemas have NO fields that could name a page — there is no key parameter to get wrong", () => {
+    const { tools } = pageRig({});
+    expect(Object.keys(tools.get_my_confluence_page!.input).sort()).toEqual(["expectVersion", "limit", "offset"]);
+    expect(Object.keys(tools.get_my_confluence_page_comments!.input)).toEqual([]);
+  });
+
+  test("get_my_confluence_page reads the CALLER'S OWN page, derived solely from x-issue", async () => {
+    const { tools, getPageCalls } = pageRig({ "500": { title: "my resource page", body: "<p>hello</p>", version: 1 } });
+    const result = (await tools.get_my_confluence_page!.handler({}, OWN_PAGE_CALLER)) as { found: boolean; id?: string; body?: string };
+    expect(getPageCalls).toEqual(["500"]);
+    expect(result).toMatchObject({ found: true, complete: true, id: "500", body: "<p>hello</p>" });
+  });
+
+  test("get_my_confluence_page_comments reads the CALLER'S OWN page's comments, derived solely from x-issue", async () => {
+    const { tools, getPageCommentsCalls } = pageRig(
+      { "500": { title: "t", body: "b", version: 1 } },
+      { "500": [{ id: "10", body: "<p>a comment</p>", author: "acc-a" }] },
+    );
+    const result = (await tools.get_my_confluence_page_comments!.handler({}, OWN_PAGE_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+    expect(getPageCommentsCalls).toEqual(["500"]);
+    expect(result.results).toEqual([{ id: "10", body: "a comment", author: "acc-a" }]); // unwrapped, plain text
+  });
+
+  // THE SECURITY REQUIREMENT (the epic's own call-out): own page readable;
+  // any attempt to name another page is impossible — there is no argument
+  // that could carry one (asserted above), so this proves the ONLY
+  // remaining route (a caller whose x-issue itself names a different page)
+  // still only ever reads THAT caller's own x-issue, never a second one.
+  test("a DIFFERENT caller's x-issue reads a DIFFERENT page — never cross-contaminated, no argument can override it", async () => {
+    const { tools, getPageCalls } = pageRig({
+      "500": { title: "page A", body: "<p>page A body</p>", version: 1 },
+      "600": { title: "page B", body: "<p>page B body — must never appear for caller 500</p>", version: 1 },
+    });
+    const resultA = (await tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": "500" } } as any)) as { id?: string; body?: string };
+    const resultB = (await tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": "600" } } as any)) as { id?: string; body?: string };
+    expect(getPageCalls).toEqual(["500", "600"]);
+    expect(resultA).toMatchObject({ id: "500", body: "<p>page A body</p>" });
+    expect(resultB).toMatchObject({ id: "600", body: "<p>page B body — must never appear for caller 500</p>" });
+  });
+
+  test("refuses a connection with no x-issue, on both verbs", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: {} } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/x-issue/);
+    await expect(tools.get_my_confluence_page_comments!.handler({}, conn)).rejects.toThrow(/x-issue/);
+  });
+
+  test("refuses a Jira ISSUE KEY caller (e.g. a jira-work agent) — not a confluence-page resource id", async () => {
+    const { tools, getPageCalls, getPageCommentsCalls } = pageRig({});
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+    await expect(tools.get_my_confluence_page_comments!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+    expect(getPageCalls).toEqual([]);
+    expect(getPageCommentsCalls).toEqual([]);
+  });
+
+  test("refuses a Jira PROJECT KEY caller (e.g. a project tier agent) — via the same refuseProjectCaller gate every other project-refusing verb uses (BUTCHR-82 disposition: \"refuses\")", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/refusing a project caller/);
+  });
+
+  test("refuses a FILESYSTEM PATH caller (e.g. a managed-session agent whose resource is a file, not yet a Confluence page)", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: { "x-issue": "/home/agent/workspace/notes.md" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+  });
+
+  test("refuses a malformed/non-numeric x-issue outright, without ever calling getPage", async () => {
+    const { tools, getPageCalls } = pageRig({});
+    // "" is excluded here — an empty x-issue hits the "no x-issue at all"
+    // refusal (requireCaller) first, tested separately above; this test is
+    // about a PRESENT but wrongly-shaped x-issue.
+    for (const bad of ["123abc", "-1", "1.5", "https://wroosbit.atlassian.net/wiki/spaces/X/pages/500/Title"]) {
+      await expect(tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": bad } } as any)).rejects.toThrow(/not a confluence-page resource id/);
+    }
+    expect(getPageCalls).toEqual([]);
+  });
+
+  test("audits the caller's own page id", async () => {
+    const { tools, audits } = pageRig({ "500": { title: "t", body: "b", version: 1 } }, { "500": [] });
+    await tools.get_my_confluence_page!.handler({}, OWN_PAGE_CALLER);
+    await tools.get_my_confluence_page_comments!.handler({}, OWN_PAGE_CALLER);
+    expect(audits.some((l) => l.includes("get_my_confluence_page 500"))).toBe(true);
+    expect(audits.some((l) => l.includes("get_my_confluence_page_comments 500"))).toBe(true);
   });
 });
 
