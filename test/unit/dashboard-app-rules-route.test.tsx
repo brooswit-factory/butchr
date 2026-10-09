@@ -21,7 +21,7 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeTokenCutoff: null,
+    resumeContextCutoff: null,
     staffed: true,
     reason: null,
     ...overrides,
@@ -42,7 +42,7 @@ describe("RulesRoute — FACTORY-661: list", () => {
     expect(getByText(/execution: singleton/)).toBeTruthy();
     expect(getByText("UNSTAFFED: disabled")).toBeTruthy();
     expect(getByText(/COULD NOT CHECK: census unavailable/)).toBeTruthy();
-    // FACTORY-851: vip-zendesk's fixture entry sets resumeOnRespawn: false, resumeTokenCutoff: 50_000.
+    // FACTORY-851: vip-zendesk's fixture entry sets resumeOnRespawn: false, resumeContextCutoff: 50_000.
     expect(getByText("resume: off (cutoff: 50000)")).toBeTruthy();
     // factory-triage's fixture entry leaves both fields absent (null).
     expect(getByText("resume: on (cutoff: default)")).toBeTruthy();

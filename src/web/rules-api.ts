@@ -78,8 +78,8 @@ export interface RulesApiRuleEntry {
   lizardMode: boolean | null;
   /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../rules/rules.ts`), never necessarily `false`. */
   resumeOnRespawn: boolean | null;
-  /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means `DEFAULT_RESUME_TOKEN_CUTOFF` applies (see `Rule.resumeTokenCutoff`'s own doc comment, `../rules/rules.ts`). */
-  resumeTokenCutoff: number | null;
+  /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see `Rule.resumeContextCutoff`'s own doc comment, `../rules/rules.ts`). */
+  resumeContextCutoff: number | null;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -149,7 +149,7 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       permissionMode: raw?.permissionMode ?? null,
       lizardMode: raw?.lizardMode ?? null,
       resumeOnRespawn: raw?.resumeOnRespawn ?? null,
-      resumeTokenCutoff: raw?.resumeTokenCutoff ?? null,
+      resumeContextCutoff: raw?.resumeContextCutoff ?? null,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,
       whyUnstaffed: entry.reason,

@@ -15,7 +15,7 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeTokenCutoff: null,
+    resumeContextCutoff: null,
     staffed: true,
     reason: null,
     ...overrides,
@@ -102,21 +102,21 @@ describe("buildRulesViewModel — FACTORY-661/FACTORY-663", () => {
   });
 });
 
-describe("resumeText — FACTORY-851 (Rule.resumeOnRespawn/Rule.resumeTokenCutoff, display wording)", () => {
+describe("resumeText — FACTORY-851 (Rule.resumeOnRespawn/Rule.resumeContextCutoff, display wording)", () => {
   test("both absent (null) renders resume: on (cutoff: default) — the schema's own absence meaning", () => {
-    expect(resumeText({ resumeOnRespawn: null, resumeTokenCutoff: null })).toBe("resume: on (cutoff: default)");
+    expect(resumeText({ resumeOnRespawn: null, resumeContextCutoff: null })).toBe("resume: on (cutoff: default)");
   });
 
   test("explicit true still renders on, same as absent", () => {
-    expect(resumeText({ resumeOnRespawn: true, resumeTokenCutoff: null })).toBe("resume: on (cutoff: default)");
+    expect(resumeText({ resumeOnRespawn: true, resumeContextCutoff: null })).toBe("resume: on (cutoff: default)");
   });
 
   test("explicit false renders off", () => {
-    expect(resumeText({ resumeOnRespawn: false, resumeTokenCutoff: null })).toBe("resume: off (cutoff: default)");
+    expect(resumeText({ resumeOnRespawn: false, resumeContextCutoff: null })).toBe("resume: off (cutoff: default)");
   });
 
   test("an explicit cutoff renders its literal value, never the server's own default number", () => {
-    expect(resumeText({ resumeOnRespawn: null, resumeTokenCutoff: 50000 })).toBe("resume: on (cutoff: 50000)");
+    expect(resumeText({ resumeOnRespawn: null, resumeContextCutoff: 50000 })).toBe("resume: on (cutoff: 50000)");
   });
 });
 

@@ -112,18 +112,18 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.permissionMode).toBeNull();
     expect(r.rules[0]!.lizardMode).toBeNull();
   });
-  test("FACTORY-851: resumeOnRespawn/resumeTokenCutoff are read off the raw Rule, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
+  test("FACTORY-851: resumeOnRespawn/resumeContextCutoff are read off the raw Rule, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({
-      rulesFile: { path: "/rules.json", rules: [rule({ resumeOnRespawn: false, resumeTokenCutoff: 50_000 })], error: null },
+      rulesFile: { path: "/rules.json", rules: [rule({ resumeOnRespawn: false, resumeContextCutoff: 50_000 })], error: null },
       mtime: null,
       sourceEtag: "deadbeef",
       fileEtag: "deadbeef",
       ruleInventory: [entry()],
     });
     expect(r.rules[0]!.resumeOnRespawn).toBe(false);
-    expect(r.rules[0]!.resumeTokenCutoff).toBe(50_000);
+    expect(r.rules[0]!.resumeContextCutoff).toBe(50_000);
   });
-  test("FACTORY-851: absent resumeOnRespawn/resumeTokenCutoff on the raw Rule read as null, never undefined or a resolved default", () => {
+  test("FACTORY-851: absent resumeOnRespawn/resumeContextCutoff on the raw Rule read as null, never undefined or a resolved default", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [rule()], error: null },
       mtime: null,
@@ -132,7 +132,7 @@ describe("buildRulesApiResponse", () => {
       ruleInventory: [entry()],
     });
     expect(r.rules[0]!.resumeOnRespawn).toBeNull();
-    expect(r.rules[0]!.resumeTokenCutoff).toBeNull();
+    expect(r.rules[0]!.resumeContextCutoff).toBeNull();
   });
   test("invalid file: valid:false, problems populated from the error message, zero rules", () => {
     const r = buildRulesApiResponse({

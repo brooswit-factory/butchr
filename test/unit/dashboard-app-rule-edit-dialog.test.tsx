@@ -29,7 +29,7 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeTokenCutoff: null,
+    resumeContextCutoff: null,
     staffed: false,
     reason: "disabled",
     ...overrides,

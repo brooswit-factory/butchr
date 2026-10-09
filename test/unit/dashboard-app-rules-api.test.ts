@@ -47,7 +47,7 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeTokenCutoff: null,
+    resumeContextCutoff: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -400,7 +400,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               permissionMode: "acceptEdits",
               lizardMode: true,
               resumeOnRespawn: false,
-              resumeTokenCutoff: 50000,
+              resumeContextCutoff: 50000,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -417,7 +417,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeTokenCutoff: 50000, staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000, staffed: false, reason: "disabled" }]);
   });
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {

@@ -470,7 +470,7 @@ export interface Rule {
    * schema, validation, and surfacing (this ticket, FACTORY-851) — nothing
    * in this daemon reads it yet. Actually wiring resume-on-respawn into the
    * spawn path (classifying intentional-vs-unintended per FACTORY-849, then
-   * honouring this flag and `resumeTokenCutoff` below) is FACTORY-850, which
+   * honouring this flag and `resumeContextCutoff` below) is FACTORY-850, which
    * this ticket's scope guard explicitly forbids touching: do not change
    * spawn, respawn, stale-argv, `resumeInPlace`, the `BUTCHR_RESTORED_RESUME`
    * policy, or the session-id store from here.
@@ -482,21 +482,26 @@ export interface Rule {
    * it would otherwise apply, falling back to a fresh start (FACTORY-850's
    * concern, not this ticket's). Bounds the token/memory cost an unattended
    * respawn can incur resuming a large transcript. Absent means
-   * `DEFAULT_RESUME_TOKEN_CUTOFF` applies (see that constant's own doc
+   * `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see that constant's own doc
    * comment for why 100,000 was chosen). Validated as a positive integer —
    * 0, negative, non-integer, and NaN are all rejected, same `isPositiveInt`
    * every other token/count field in this file already uses. Like
    * `resumeOnRespawn` above, this field is schema/validation/surfacing only;
-   * nothing reads it yet (FACTORY-850).
+   * nothing reads it yet (FACTORY-850). Named `...ContextCutoff`, not the
+   * more obvious `...TokenCutoff`: the rules API response (`../web/rules-api.ts`)
+   * applies a defensive, repo-wide redaction to any key matching
+   * `/token|secret|password|authorization/i`, and a literal `TokenCutoff`
+   * key was silently rewritten to `"[redacted]"` there — caught by this
+   * ticket's own API tests, not by inspection.
    */
-  resumeTokenCutoff?: number;
+  resumeContextCutoff?: number;
 }
 
 /**
- * FACTORY-851 — default `Rule.resumeTokenCutoff` when a rule leaves it
+ * FACTORY-851 — default `Rule.resumeContextCutoff` when a rule leaves it
  * unset. Chosen to bound the token/memory cost a respawn can incur resuming
  * a large transcript (the reason this cutoff exists at all — see
- * `Rule.resumeTokenCutoff`'s own doc comment and epic FACTORY-843) while
+ * `Rule.resumeContextCutoff`'s own doc comment and epic FACTORY-843) while
  * staying large enough that an ORDINARY worker session — the common case
  * this mechanism must not needlessly defeat — still resumes: 100,000 tokens
  * is well under a Claude context window (200,000 tokens on every model this
@@ -505,12 +510,12 @@ export interface Rule {
  * fresh conversation after a resume, while comfortably covering a typical
  * ticket's working transcript.
  */
-export const DEFAULT_RESUME_TOKEN_CUTOFF = 100_000;
+export const DEFAULT_RESUME_CONTEXT_CUTOFF = 100_000;
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeTokenCutoff",
+  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -704,9 +709,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
     if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
     // FACTORY-851: independent of every field above, same house style — no tri-state for `resumeOnRespawn` (absent or `true` both mean on; only explicit `false` means off).
-    const { resumeOnRespawn, resumeTokenCutoff } = raw;
+    const { resumeOnRespawn, resumeContextCutoff } = raw;
     if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
-    if (resumeTokenCutoff !== undefined && !isPositiveInt(resumeTokenCutoff)) errors.push(`${at}.resumeTokenCutoff must be a positive integer`);
+    if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
@@ -734,7 +739,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
       ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
-      ...(resumeTokenCutoff !== undefined ? { resumeTokenCutoff: resumeTokenCutoff as number } : {}),
+      ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
     });
   });
   for (const { at, id, provider } of refs) {

@@ -19,7 +19,7 @@
       "linkedEventing": false,
       "mcpServerNames": [],
       "resumeOnRespawn": null,
-      "resumeTokenCutoff": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Pick up any newly assigned FACTORY ticket and get it to a reviewable PR.",
       "staffed": true,
       "whyUnstaffed": null
@@ -36,7 +36,7 @@
       "linkedEventing": false,
       "mcpServerNames": [],
       "resumeOnRespawn": null,
-      "resumeTokenCutoff": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Watch open epics and keep their task breakdown current.",
       "staffed": false,
       "whyUnstaffed": "no live agent observed for this rule this poll"
@@ -53,7 +53,7 @@
       "linkedEventing": false,
       "mcpServerNames": [],
       "resumeOnRespawn": null,
-      "resumeTokenCutoff": null,
+      "resumeContextCutoff": null,
       "briefExcerpt": "Triage a newly submitted product idea.",
       "staffed": false,
       "whyUnstaffed": "disabled"
