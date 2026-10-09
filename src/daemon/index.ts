@@ -40,6 +40,7 @@ import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
 import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
+import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../rules/capacity-role-migration.js";
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
 import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
 import { reloadRules } from "../rules/reload.js";
@@ -277,6 +278,26 @@ if (firstRunSeedOutcome.kind === "seeded") {
   );
 } else if (firstRunSeedOutcome.kind === "seed-failed") {
   console.error(`WARNING: butchr: first-run seed of ${firstRunSeedOutcome.path} failed, starting with no rules as if the file were simply absent: ${firstRunSeedOutcome.error}`);
+}
+// FACTORY-810 (implementing FACTORY-754, epic FACTORY-748): runs BEFORE
+// `loadRules` below ever reads the file for real, same ordering as the
+// first-run seed just above — this migration must see an absent `role` as
+// genuinely absent (never the schema's defaulted `"worker"`), which only
+// reading the raw text (not `loadRules`'s parsed/defaulted `Rule[]`) can
+// tell it. Idempotent and existence-based (see
+// `../rules/capacity-role-migration.ts`'s own doc comment): a file with
+// nothing to migrate is never touched — no backup, no rewritten mtime — so
+// this costs nothing on every subsequent, ordinary startup.
+const capacityRoleMigrationOutcome: CapacityRoleMigrationOutcome = runCapacityRoleMigration(process.env as Record<string, string | undefined>);
+if (capacityRoleMigrationOutcome.kind === "migrated") {
+  console.error(`butchr: upgrade migration — wrote role: "sentinel" onto ${capacityRoleMigrationOutcome.migratedIds.length} jira-work rule(s) that relied on the deleted issue-type capacity exemption (FACTORY-757): ${capacityRoleMigrationOutcome.migratedIds.join(", ")}`);
+  for (const entry of capacityRoleMigrationOutcome.plan) {
+    if (entry.outcome === "skip" && entry.reason !== "not-jira-work" && entry.reason !== "already-has-role") {
+      console.error(`butchr: upgrade migration — left rule ${entry.id} untouched (${entry.reason}${entry.issueTypes ? `: ${entry.issueTypes.join(", ")}` : ""})`);
+    }
+  }
+} else if (capacityRoleMigrationOutcome.kind === "unreadable") {
+  console.error(`butchr: upgrade migration — could not read the rules file to check for a capacity-role migration (${capacityRoleMigrationOutcome.error}); proceeding to the normal rules loader, which will report any real problem with it`);
 }
 const rulesHolder = (() => {
   try {
