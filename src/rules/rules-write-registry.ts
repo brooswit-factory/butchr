@@ -40,6 +40,7 @@
 import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./rules.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
+import { RESOURCE_PROVIDERS, isRuleId, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 
 /** The id FACTORY-669's daemon-startup seed writes its one template rule under — see `../rules/seed-first-run.ts`. FACTORY-730: this id carries no special write-eligibility anymore (every rule is web-UI-writable now) — it is still the one id the "Set up your first rule" flow (`FirstRuleSetup.tsx`) looks for specifically. */
 export const FIRST_RULE_ID = "ui-first-rule";
@@ -246,4 +247,94 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }
   return { ok: true, patch };
+}
+
+/**
+ * FACTORY-927 — `POST /api/rules`'s own body shape: everything an operator
+ * may set when creating a new rule from the Rules page. Deliberately a
+ * NARROWER surface than the full `Rule` shape (`./rules.ts`): `brief`,
+ * `execution`, and `account` are never client-settable here — same
+ * discipline `PUT /api/rules/:id` already applies to `brief` (file-only).
+ * `createRule` (`./rules-write.ts`) hardcodes those three to the exact
+ * values `./seed-first-run.ts`'s own first-run template rule uses
+ * (`brief: "@builtin:task"`, `execution: "swarm"`, `account: "none"`) — a
+ * deliberate v1 scope cut, not an oversight; a later ticket can widen this
+ * if an operator needs a different brief/execution/account at create time.
+ * `enabled` is never accepted at all (the create route always creates a
+ * rule DISABLED — see `createRule`'s own doc comment).
+ */
+export interface RuleCreateInput {
+  id: string;
+  resourceProvider: ResourceProvider;
+  query: string;
+  permissionMode?: RulePermissionMode;
+  lizardMode?: boolean;
+  role?: AgentRole;
+  /** At most one entry in this v1 slice — a brand-new rule has no existing preference slot to grow, so (unlike `RuleFieldPatch.agentPreferences`, which must match an existing length) this accepts 0 or 1, never more. */
+  agentPreferences?: AgentPreferencePatch[];
+}
+
+/**
+ * Validates a `POST /api/rules` body into a `RuleCreateInput` plus the two
+ * write-flow fields (`confirm`/`planHash`) every other write route's own
+ * validator also tolerates as allowed-but-not-part-of-the-patch keys (see
+ * `validateRuleFieldPatch`'s own `allowedKeys` immediately above). Per-field
+ * validation reuses the SAME validators (`validateAgentPreferencePatch`,
+ * the `RULE_PERMISSION_MODES`/`AGENT_ROLES` checks) every other write route
+ * already goes through — a value this function accepts is always one the
+ * rest of this module's own write path would also accept for an existing
+ * rule's PUT. `id`/`resourceProvider`/`query` get only SHAPE validation here
+ * (slug shape, a known provider, a non-empty bounded string) — the
+ * provider-specific query SYNTAX (JQL vs. GitHub search syntax vs. the
+ * `jira-project` JSON shape, etc.) and the id-collision check are left to
+ * `loadRules` itself, inside the write's own lock, exactly like every other
+ * rules-document write in this codebase already relies on for that
+ * validation (see `write-rules.ts`'s own header) — never a second,
+ * independent re-implementation of `parseRules`'s per-provider rules here.
+ */
+export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleCreateInput } | { ok: false; error: string } {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return { ok: false, error: "body must be a JSON object" };
+  const b = body as Record<string, unknown>;
+  if (typeof b.id !== "string" || !isRuleId(b.id)) return { ok: false, error: `id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})` };
+  if (typeof b.resourceProvider !== "string" || !(RESOURCE_PROVIDERS as readonly string[]).includes(b.resourceProvider)) {
+    return { ok: false, error: `resourceProvider must be one of ${RESOURCE_PROVIDERS.join(", ")}` };
+  }
+  if (typeof b.query !== "string" || b.query.length === 0 || b.query.length > 10_000) return { ok: false, error: "query must be a non-empty string, at most 10000 characters" };
+  const input: RuleCreateInput = { id: b.id, resourceProvider: b.resourceProvider as ResourceProvider, query: b.query };
+  if ("permissionMode" in b) {
+    if (typeof b.permissionMode !== "string" || !(RULE_PERMISSION_MODES as readonly string[]).includes(b.permissionMode)) return { ok: false, error: `permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}` };
+    input.permissionMode = b.permissionMode as RulePermissionMode;
+  }
+  if ("lizardMode" in b) {
+    if (typeof b.lizardMode !== "boolean") return { ok: false, error: "lizardMode must be a boolean" };
+    input.lizardMode = b.lizardMode;
+  }
+  if ("role" in b) {
+    if (typeof b.role !== "string" || !(AGENT_ROLES as readonly string[]).includes(b.role)) return { ok: false, error: `role must be one of ${AGENT_ROLES.join(", ")}` };
+    input.role = b.role as AgentRole;
+  }
+  if ("agentPreferences" in b) {
+    if (!Array.isArray(b.agentPreferences) || b.agentPreferences.length > 1) return { ok: false, error: "agentPreferences must be an array of at most one entry" };
+    const entries: AgentPreferencePatch[] = [];
+    for (const entry of b.agentPreferences) {
+      const parsed = validateAgentPreferencePatch(entry);
+      if (!parsed.ok) return parsed;
+      // Unlike a PUT patch to an EXISTING rule (where `harness` may be
+      // omitted to leave an already-set value unchanged),
+      // `validateAgentPreferencePatch` itself treats every leaf as optional
+      // — there is no existing entry here to leave anything unchanged FROM,
+      // so a brand-new preference with no `harness` at all would reach
+      // `loadRules` as a malformed `AgentPreference` (`./rules.ts`'s own
+      // `parsePreferences` requires it). Caught here instead, with a
+      // message that names the actual missing field.
+      if (parsed.patch.harness === undefined) return { ok: false, error: "agentPreferences[0].harness is required when creating a rule" };
+      entries.push(parsed.patch);
+    }
+    input.agentPreferences = entries;
+  }
+  const allowedKeys = new Set(["id", "resourceProvider", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "confirm", "planHash"]);
+  for (const k of Object.keys(b)) {
+    if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not accepted when creating a rule` };
+  }
+  return { ok: true, input };
 }

@@ -41,8 +41,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { updateRulesFile, restoreBackup, rulesEtag, type WriteRulesIo, type WriteRulesResult } from "./write-rules.js";
 import { rulesPath, type RulesEnv } from "./rules.js";
-import { applyRuleFieldPatch, readRuleById, removeRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, RuleWriteApplyError } from "./rules-write-apply.js";
-import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch } from "./rules-write-registry.js";
+import { applyRuleFieldPatch, readRuleById, removeRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, ruleIdExists, appendRule, RuleWriteApplyError } from "./rules-write-apply.js";
+import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch, type RuleCreateInput } from "./rules-write-registry.js";
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -61,15 +61,19 @@ const executionOf = (raw: unknown): string => (raw === undefined ? "swarm" : Str
  * FACTORY-731 — shared across `RulesPlanResult.confirmReason` (the
  * PUT/enable plan route's own classification) and `RulesWriteOutcome`'s
  * refusal shape (every write route's own direct refusal): one vocabulary,
- * never two that could drift. `"rule-delete"` is this ticket's own NEW
+ * never two that could drift. `"rule-delete"` is FACTORY-731's own
  * dedicated value for `DELETE /api/rules/:id`'s mandatory-confirm gate —
- * the ticket's own "What already shipped" note is explicit that delete must
- * get its own value here, never overload an existing one (a delete is not a
- * stop/restart of a RUNNING agent, which `"stop-restart"` means; a delete
- * is refused outright while any agent is live — see `writeRuleDelete`'s own
- * doc comment).
+ * that ticket's own "What already shipped" note is explicit that delete
+ * must get its own value here, never overload an existing one (a delete is
+ * not a stop/restart of a RUNNING agent, which `"stop-restart"` means; a
+ * delete is refused outright while any agent is live — see
+ * `writeRuleDelete`'s own doc comment). FACTORY-927 adds `"rule-create"`,
+ * same reasoning: a create's own mandatory-confirm gate is UNCONDITIONAL,
+ * independent of blast radius (a created rule is always disabled), so it
+ * is never a real instance of any of the other reasons either — see
+ * `createRule`'s own doc comment.
  */
-export type ConfirmReason = "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "capacity-sentinel" | "rule-delete";
+export type ConfirmReason = "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "capacity-sentinel" | "rule-delete" | "rule-create";
 
 export class WriteRefusedError extends Error {
   constructor(message: string, readonly status: number, readonly confirmReason?: ConfirmReason) { super(message); }
@@ -887,4 +891,203 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
     requiresConfirm,
     ...(confirmReason ? { confirmReason } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// FACTORY-927 — create a rule from the Rules page (`POST /api/rules`).
+// ---------------------------------------------------------------------------
+
+/**
+ * The full on-disk `Rule` object a `RuleCreateInput` becomes — the ONE
+ * place `createRule`/`planRuleCreate` build it, so a plan's `nextText` and
+ * the real write's `nextText` can never drift. `brief`/`execution`/
+ * `account` are hardcoded to the exact values `./seed-first-run.ts`'s own
+ * first-run template rule uses (same precedent — see
+ * `rules-write-registry.ts`'s `RuleCreateInput` doc comment for why these
+ * three are deliberately never client-settable in this slice). `enabled` is
+ * hardcoded `false`, unconditionally — see `createRule`'s own doc comment
+ * for why this NEVER reads a client-supplied value, there being none to
+ * read in `RuleCreateInput` at all.
+ */
+function buildNewRuleRecord(input: RuleCreateInput): Record<string, unknown> {
+  const record: Record<string, unknown> = {
+    id: input.id,
+    enabled: false,
+    resourceProvider: input.resourceProvider,
+    query: input.query,
+    brief: "@builtin:task",
+    execution: "swarm",
+    account: "none",
+  };
+  if (input.role !== undefined) record.role = input.role;
+  if (input.permissionMode !== undefined) record.permissionMode = input.permissionMode;
+  if (input.lizardMode !== undefined) record.lizardMode = input.lizardMode;
+  if (input.agentPreferences !== undefined && input.agentPreferences.length > 0) {
+    record.agentPreferences = input.agentPreferences.map((p) => ({ ...p }));
+  }
+  return record;
+}
+
+/**
+ * `planRuleCreate`/`createRule`'s own plan hash: binds the exact next
+ * document text (the CURRENT file plus the new rule appended) to the
+ * evaluated dry-run scope — mirrors `buildPlanHash` above (same
+ * `scopeHashValue` treatment of an unmeasurable/non-finite scope), but with
+ * no spawn/stop/restart counts to bind (a created rule is always disabled,
+ * so those are always zero by construction — see `buildNewRuleRecord`).
+ *
+ * REVIEW (non-blocking, round 1): unlike `writeRuleEnabled`/`writeRuleFields`,
+ * neither `POST /api/rules` (`src/web/view.ts`) nor `createRule` below ever
+ * reads a CLIENT-supplied `planHash` for this binding — `planRuleCreate` is
+ * called fresh on every request and its own freshly-computed hash is handed
+ * straight to `createRule` in the same call, so a client's own `planHash`
+ * field (if it sends one at all) is accepted but ignored. This means the
+ * hash is not actually binding the operator's CONFIRM to the exact scope
+ * they looked at a moment earlier the way it does for enable/edit (there,
+ * confirming a STALE plan could silently approve a different blast radius
+ * than the one shown). That gap is acceptable here specifically BECAUSE a
+ * created rule is always disabled (`buildNewRuleRecord`'s own `enabled:
+ * false`, unconditionally) — there is no live blast radius a confirm could
+ * ever misbind TO: the scope shown is informational (how many tickets this
+ * query would match once enabled), never a count of agents this call is
+ * about to spawn. If a future change ever let create spawn anything
+ * directly, this hash would need the same client-echoed-planHash binding
+ * `writeRuleEnabled`/`writeRuleFields` already have.
+ */
+function buildCreatePlanHash(nextText: string, scope: number | null): string {
+  return sha256(JSON.stringify({ nextText, create: true, scope: scopeHashValue(scope) }));
+}
+
+/**
+ * `POST /api/rules`'s own report-only dry-run (AC5: confirm must be able to
+ * show the operator the dry-run scope BEFORE anything is written) — never
+ * writes, same contract `planRuleWrite` documents for itself. Refuses an id
+ * collision (409, the SAME check `createRule` re-runs, authoritatively,
+ * under the lock) and an unmeasurable scope (503, fails closed
+ * UNCONDITIONALLY — there is no real number for a `confirm: true` to be
+ * confirming, same discipline `writeRuleEnabled`'s own scope gate uses).
+ * `requiresConfirm` is `true` whenever `confirm` was not already `true` on
+ * this call (confirm is MANDATORY for every create, independent of blast
+ * radius — a created rule is always disabled, so there is no spawn/stop/
+ * restart count to gate on the way `planRuleWrite` does) OR whenever the
+ * scope could not be measured at all (which no `confirm: true` can satisfy).
+ */
+export async function planRuleCreate(input: RuleCreateInput, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
+  const env = deps.env ?? process.env;
+  const currentText = readCurrentRulesText(env);
+  try {
+    assertNotStale(deps, currentText);
+  } catch (e) {
+    if (e instanceof WriteRefusedError) return { ok: false, status: e.status, error: e.message };
+    throw e;
+  }
+  if (ruleIdExists(currentText, input.id)) {
+    return { ok: false, status: 409, error: `a rule with id ${JSON.stringify(input.id)} already exists` };
+  }
+  const nextText = appendRule(currentText, buildNewRuleRecord(input));
+  const etag = rulesEtag(env, deps.io);
+
+  const rawScope = await scopeOf(input.id, input.query);
+  let scope: number | null = null;
+  let scopeUnmeasurable = false;
+  if (Number.isFinite(rawScope)) {
+    scope = rawScope;
+  } else {
+    scopeUnmeasurable = true;
+  }
+
+  const requiresConfirm = scopeUnmeasurable || !confirm;
+  const planHash = buildCreatePlanHash(nextText, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
+  return {
+    ok: true,
+    planHash,
+    spawned: 0,
+    stopped: 0,
+    restarted: 0,
+    scope,
+    ...(scopeUnmeasurable ? { scopeUnmeasurable: true } : {}),
+    etag,
+    requiresConfirm,
+    ...(requiresConfirm ? { confirmReason: scopeUnmeasurable ? ("unmeasurable-scope" as const) : ("rule-create" as const) } : {}),
+  };
+}
+
+/**
+ * `POST /api/rules`'s own write — creates a brand-new rule, always
+ * DISABLED (AC4: `buildNewRuleRecord` hardcodes `enabled: false`
+ * unconditionally; `RuleCreateInput` carries no `enabled` field for a
+ * caller to even attempt to override), so a create can never staff an
+ * agent as a side effect. Refuses:
+ *
+ *   1. An id collision — checked BOTH before the lock (cheap, avoids an
+ *      unnecessary `scopeOf` network call for a doomed request — same
+ *      pre-lock-then-recheck shape `writeRuleEnabled`'s own `scopeForHash`
+ *      already uses) AND again, authoritatively, inside the lock
+ *      immediately before the write (closes the race the pre-lock check
+ *      alone cannot). 409, with a message naming the id — this is
+ *      `RuleWriteApplyError`'s own usual 400 shape deliberately NOT used
+ *      here: a collision is a conflict with existing state, not a
+ *      malformed request.
+ *   2. An unmeasurable dry-run scope — 503, UNCONDITIONAL (even with
+ *      `confirm: true`): there is no real number for a confirm to be
+ *      confirming, same discipline `writeRuleEnabled`'s own scope gate
+ *      uses.
+ *   3. A stale/tampered `planHash` — 409, same `buildCreatePlanHash`
+ *      binding `planRuleCreate` computes, recomputed fresh under the lock.
+ *   4. No `confirm: true` — 409, UNCONDITIONALLY (AC5: this is not gated on
+ *      blast radius the way `writeRuleEnabled`/`writeRuleFields`'s own
+ *      confirm gates are — a created rule's blast radius is always zero by
+ *      construction, so gating on it would mean confirm is never actually
+ *      required; the operator must still see and confirm the dry-run scope
+ *      before anything is written).
+ *
+ * On success: the whole document's shape change (a new element) is
+ * reported by `assertOnlyChanged` at the array's own path (`write-rules.ts`'s
+ * own header) — scoped here to `["rules"]`, same as `writeRuleDelete`'s own
+ * whole-array-shape change elsewhere in this codebase. Same
+ * backup-before-write/atomic-write path every other write in this module
+ * already goes through, and the SAME `LastUiWriteRef` tracking
+ * (`recordLastUiWrite`) that makes `writeUndo` able to restore this create,
+ * byte-for-byte, exactly like any other write here — undoing a create
+ * removes the rule it added, back to the exact prior file content.
+ */
+export async function createRule(input: RuleCreateInput, confirm: boolean, planHash: string, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
+  const env = deps.env ?? process.env;
+
+  // Pre-lock checks (cheap; see this function's own doc comment, points
+  // 1-2) — both are re-read, authoritatively, inside the lock below.
+  if (ruleIdExists(readCurrentRulesText(env), input.id)) {
+    return { ok: false, status: 409, error: `a rule with id ${JSON.stringify(input.id)} already exists` };
+  }
+  const rawScope = await scopeOf(input.id, input.query);
+  if (!Number.isFinite(rawScope)) {
+    return { ok: false, status: 503, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again`, confirmReason: "unmeasurable-scope" };
+  }
+
+  try {
+    const result = updateRulesFile(
+      (currentText) => {
+        assertNotStale(deps, currentText);
+        if (ruleIdExists(currentText, input.id)) {
+          throw new WriteRefusedError(`a rule with id ${JSON.stringify(input.id)} already exists`, 409);
+        }
+        const nextText = appendRule(currentText, buildNewRuleRecord(input));
+        const freshHash = buildCreatePlanHash(nextText, rawScope);
+        if (freshHash !== planHash) {
+          throw new WriteRefusedError(`planHash does not match a fresh plan for this create (the file may have changed, or the plan is stale) — retry the create`, 409);
+        }
+        if (!confirm) {
+          throw new WriteRefusedError(`create rule ${JSON.stringify(input.id)} (query: ${JSON.stringify(input.query)}, scope: ${rawScope} ticket(s))? resend with confirm: true to proceed`, 409, "rule-create");
+        }
+        return nextText;
+      },
+      env,
+      deps.io,
+      { allowedPaths: ["rules"] },
+    );
+    recordLastUiWrite(deps, result.backupId, result.etag);
+    return toOutcome(result, deps);
+  } catch (e) {
+    return refusalToOutcome(e);
+  }
 }
