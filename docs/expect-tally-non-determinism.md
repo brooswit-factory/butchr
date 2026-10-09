@@ -235,3 +235,26 @@ Guidance pointing at this document and carrying the command above is in
 `briefs/story.md` (task-PR review) and `briefs/epic.md` (story-PR review) —
 the channels a reviewing agent actually reads at the moment it would
 otherwise reach for the tally.
+
+## Addendum (FACTORY-179): a non-tally failure left no identity
+
+The falsifier runs above also hit one `1 fail` among the `0 fail` runs
+(see the `43264 expect() calls   1396 pass  1 fail` line). That failure is
+a **different defect from the tally** — pass/fail counts are the stable
+number this document trusts — but whoever ran the falsifier batch did not
+record which test failed, so the observation could not be matched against
+a future recurrence. It was filed as FACTORY-179 and **could not be
+reproduced**: the original BUTCHR-113 investigation's own 18 further runs
+of `bun test test/unit` on the same branch (6 before, 12 after that
+task's work — not this addendum) all reported `0 fail`.
+
+Rather than loop the suite further to try to catch it again (this host
+runs multiple concurrent agents and repeated full-suite runs are
+disallowed outside CI — see FACTORY-179's ticket), the CI `check` job's
+test step now always writes a per-test JUnit report
+(`bun test ... --reporter=junit --reporter-outfile=test-results/junit.xml`)
+and uploads it as a build artifact with `if: always()`, so it survives
+even when the step that generated it fails. If this failure (or any other
+non-tally one) recurs in CI, the exact test name and its failure output
+are in that artifact instead of nowhere — the next occurrence
+self-identifies without anyone having to transcribe a tally line by hand.

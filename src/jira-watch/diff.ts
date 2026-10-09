@@ -1,6 +1,7 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, isDaemonLabel, isPrLabel, PR_PREFIX } from "../labels/plan.js";
+import { DAEMON_CHATTER_PREFIX } from "../agents/stalled.js";
 
 /** Keys of issues currently in an active status. */
 export const activeKeys = (issues: readonly JiraIssue[]): string[] =>
@@ -135,4 +136,81 @@ export function prTransition(before: JiraIssue, after: JiraIssue): { from: strin
   const from = prLabelValue(before);
   if (from === to) return null;
   return { from, to };
+}
+
+/**
+ * FACTORY-865: butchr's own `[butchr:...]` markers (DAEMON_CHATTER_PREFIX)
+ * whose comment is addressed to an agent and MUST keep moving the notify
+ * comment cursor and MUST keep being able to wake a watcher, even though it
+ * is daemon-authored chatter by the `DAEMON_CHATTER_PREFIX` convention.
+ * Every other `[butchr:` comment is bare bookkeeping — the daemon narrating
+ * an observation for the ticket's own record (a human reader, or a
+ * multi-stage escalation ladder that a human ultimately resolves), never a
+ * message whose OWN delivery this specific comment is the reason for.
+ *
+ * Justification per marker, from what the code actually does with it (see
+ * this ticket's PR description for the full per-file citations):
+ * - `[butchr:blocked]` (escalate.ts): a frozen child's escalation to its
+ *   boss, posted while genuinely waiting on an ANSWER — non-negotiable.
+ * - `[butchr:respawn]` (respawn.ts): posted only when the session was LOST
+ *   (a fresh Claude session with no memory) and explicitly instructs
+ *   "re-read your ticket" — the opposite of `[butchr:resume]` below, whose
+ *   own doc comment says it deliberately never gives that instruction.
+ * - `[butchr:stall]` (stall-remediation.ts): literally the wake comment for
+ *   a stalled agent — its entire purpose is to end the stall.
+ * - `[butchr:unresponsive]` (escalation-loop.ts): a blocked-pane escalation
+ *   that, like `[butchr:blocked]`, waits on an ANSWER reply.
+ *
+ * Every other current marker (`[butchr:reconcile]`, `[butchr:crashloop]`,
+ * `[butchr:parked]`, `[butchr:abandoned]`, `[butchr:pinned]`,
+ * `[butchr:frozen]`, `[butchr:yieldloop]`, `[butchr:resume]`,
+ * `[butchr:restored-degraded]`) is bookkeeping: an observational log line
+ * for a human reader (even parked.ts's/abandoned.ts's boss-escalation
+ * stages are phrased as information, resolved by a human or a later
+ * `shelve_worker`/`finish_worker` call, never by an agent replying to THIS
+ * comment with an ANSWER) — none of these is swallowed by this change
+ * either, since a bookkeeping comment landing alone (no coinciding daemon
+ * label flip) still bumps `updated` and still delivers via the existing
+ * "could not attribute this diff" fallback (createIssueEventRules' own
+ * §3D path, out of scope for this ticket — see its own doc comment).
+ * `[butchr:credential-dead]`/`[butchr:ops-alert]` are deliberately absent
+ * from both buckets: grepped at this ticket's base commit, neither marker
+ * is ever written into a Jira comment body (`addComment`) — both are
+ * journal-only (`deps.log`) or Rocket.Chat-only — so neither can ever reach
+ * this predicate's input in the first place.
+ */
+export const WAKE_MARKERS: ReadonlySet<string> = new Set([
+  "[butchr:blocked]",
+  "[butchr:respawn]",
+  "[butchr:stall]",
+  "[butchr:unresponsive]",
+]);
+
+/**
+ * Whether `body` is one of butchr's own daemon-chatter comments
+ * (DAEMON_CHATTER_PREFIX) that must be treated as bare bookkeeping — EXCLUDED
+ * from the notify comment cursor so it can never defeat daemon-label-only
+ * suppression (FACTORY-865/FACTORY-864). `false` for a non-chatter comment
+ * (an agent's own report, a human's comment — never starts with
+ * DAEMON_CHATTER_PREFIX, see that constant's own doc comment) AND for any
+ * chatter comment whose marker is in WAKE_MARKERS. Pure; no I/O.
+ */
+export function isBookkeepingComment(body: string): boolean {
+  if (!body.startsWith(DAEMON_CHATTER_PREFIX)) return false;
+  for (const marker of WAKE_MARKERS) if (body.startsWith(marker)) return false;
+  return true;
+}
+
+/**
+ * Filters `comments` (any shape carrying a `body`, e.g. JiraComment) down to
+ * the ones the notify comment cursor must actually track — drops bookkeeping
+ * chatter (see isBookkeepingComment), keeps everything else (a real
+ * comment, or an allowlisted WAKE_MARKERS comment) in its original order.
+ * This is the one shared place both notify-suppression call sites
+ * (src/resources/issue.ts, src/jira-watch/linked-eventing.ts) must build
+ * their {newest, ids}/commentCursor from — never deps.comments()'s raw
+ * result directly.
+ */
+export function excludeBookkeepingComments<T extends { body: string }>(comments: readonly T[]): readonly T[] {
+  return comments.filter((c) => !isBookkeepingComment(c.body));
 }
