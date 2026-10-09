@@ -186,6 +186,27 @@ export interface RulePlanPatch extends RuleFieldPatch {
 }
 
 /**
+ * FACTORY-927 — `POST /api/rules`'s own body shape (minus `confirm`, which
+ * `createRule` below takes as its own separate argument, same discipline as
+ * `setEnabled`/`updateFields`). Mirrors the server's own `RuleCreateInput`
+ * (`src/rules/rules-write-registry.ts`) field-for-field: `brief`/
+ * `execution`/`account`/`enabled` are deliberately absent — there is
+ * nothing to send for them, the server hardcodes all four (a created rule
+ * is ALWAYS disabled; see that module's own doc comment for why the other
+ * three stay file-only in this v1 slice).
+ */
+export interface RuleCreateDraft {
+  id: string;
+  resourceProvider: ResourceProvider;
+  query: string;
+  permissionMode?: RulePermissionMode;
+  lizardMode?: boolean;
+  role?: AgentRole;
+  /** At most one entry — a brand-new rule has no existing slot to grow, so (unlike `RuleFieldPatch.agentPreferences`) this is 0 or 1, never more; `harness` is REQUIRED on this one entry (unlike a PUT patch to an existing rule, there is no prior value to leave unchanged). */
+  agentPreferences?: [RuleAgentPreferencePatch & { harness: AgentHarness }] | [];
+}
+
+/**
  * `POST /api/rules/plan`'s response, named on the ticket:
  * `{planHash, spawned, stopped, restarted, etag, scopeCount?}`.
  * Report-only — computing one never changes anything. `scopeCount` is
@@ -280,6 +301,18 @@ export interface RulesApi {
   setEnabled(ruleId: string, enabled: boolean, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /** `PUT /api/rules/:id` — the nested allowlist edit. Same `ifMatch`/`planHash` discipline as `setEnabled`. */
   updateFields(ruleId: string, patch: RuleFieldPatch, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
+  /**
+   * FACTORY-927 — `POST /api/rules`: create a new rule. No `ifMatch`/
+   * `planHash` to pass (unlike `setEnabled`/`updateFields`) — there is no
+   * prior read of a not-yet-existing rule to be stale against, and the
+   * server computes its own fresh plan hash internally on every call (see
+   * that route's own doc comment, `src/web/view.ts`); a caller never tracks
+   * one. Call with `confirm: false` first to see the dry-run scope (it
+   * comes back as the rejection's own message text, same as every other
+   * unconfirmed write on this path — `describeWriteError` below renders it
+   * verbatim), then again with `confirm: true` to actually create it.
+   */
+  createRule(draft: RuleCreateDraft, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /** `POST /api/undo/:backupId` — only ever the backup id a write JUST returned; the server scopes this further (this SAME process's most recent UI write only). */
   undo(backupId: string, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
@@ -520,6 +553,7 @@ export const realRulesApi: RulesApi = {
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}/enabled`, { method: "POST", body: { enabled, ifMatch, planHash, confirm }, csrf: true, signal }),
   updateFields: (ruleId, patch, ifMatch, planHash, confirm, signal) =>
     request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "PUT", body: { ...patch, ifMatch, planHash, confirm }, csrf: true, signal }),
+  createRule: (draft, confirm, signal) => request<RuleWriteResult>("/api/rules", { method: "POST", body: { ...draft, confirm }, csrf: true, signal }),
   // `body: {}` is REQUIRED here, not cosmetic: the real merged guard
   // (`src/web/view.ts`'s `onRequest` hook, `./write-guard.ts`'s
   // `checkWriteGuard`) demands `content-type: application/json` on EVERY
@@ -926,6 +960,42 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       await delay();
       this.capabilities.write = opts.sessionOk ?? true;
       return this.capabilities;
+    },
+    // FACTORY-927 — mirrors the real server's own unconditional confirm gate
+    // (`createRule`, `src/rules/rules-write.ts`): refuses an id collision
+    // (regardless of `confirm`) and refuses with no `confirm: true` at all,
+    // naming the dry-run scope in the message — the SAME two refusals a
+    // component test against the real route would see, just without a real
+    // previewer behind it (`opts.previews`/the id's own entry stand in for
+    // the dry-run scope count, defaulting to 0).
+    async createRule(draft, confirm) {
+      await delay();
+      maybeFail();
+      maybeFailWriteOnce();
+      if (state.rules.some((r) => r.id === draft.id)) {
+        throw new Error(`a rule with id ${JSON.stringify(draft.id)} already exists`);
+      }
+      const scopeCount = opts.previews?.[draft.id]?.total ?? 0;
+      if (!confirm) {
+        throw new Error(`create rule ${JSON.stringify(draft.id)} (query: ${JSON.stringify(draft.query)}, scope: ${scopeCount} ticket(s))? resend with confirm: true to proceed`);
+      }
+      const created: RuleDto = {
+        id: draft.id,
+        resourceProvider: draft.resourceProvider,
+        query: draft.query,
+        enabled: false,
+        execution: "swarm",
+        account: "none",
+        role: draft.role ?? "worker",
+        agentPreferences: draft.agentPreferences ?? [],
+        permissionMode: draft.permissionMode ?? null,
+        lizardMode: draft.lizardMode ?? null,
+        resumeOnRespawn: null,
+        resumeContextCutoff: null,
+        staffed: false,
+        reason: "disabled",
+      };
+      return commitWrite([...state.rules, created], [draft.id]);
     },
   };
 }

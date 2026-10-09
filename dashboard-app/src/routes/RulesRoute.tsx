@@ -21,6 +21,7 @@ import { RulesTable } from "../components/RulesTable.js";
 import { RulePreviewDialog } from "../components/RulePreviewDialog.js";
 import { RuleToggleConfirmDialog } from "../components/RuleToggleConfirmDialog.js";
 import { RuleEditDialog } from "../components/RuleEditDialog.js";
+import { CreateRuleDialog } from "../components/CreateRuleDialog.js";
 import { FirstRuleSetup } from "../components/FirstRuleSetup.js";
 import { buildRulesViewModel, type RuleRowView } from "../view-model/rules-view.js";
 import "../components/RulesView.css";
@@ -45,6 +46,8 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
   const [toggleError, setToggleError] = useState<string | null>(null);
   /** FACTORY-730 — the rule currently open in `RuleEditDialog`, or `null` when no edit dialog is open. */
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
+  /** FACTORY-927 — whether `CreateRuleDialog` is open. */
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
   // FACTORY-663: the real `realRulesApi` starts with `capabilities.write ===
   // false` (no network call has happened yet) — probing `GET /api/session`
   // once on mount is what flips it `true` against a daemon that actually
@@ -122,6 +125,12 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
       <Heading id="rules-heading" size="small">
         Rules
       </Heading>
+      {/* FACTORY-927 — always visible (not only in the empty state below):
+          creating additional rules is a normal, repeated operation, not a
+          first-run-only affordance. */}
+      <Button size="small" isDisabled={!api.capabilities.write} data-testid="create-rule-open" onPress={() => setCreateDialogOpen(true)}>
+        Create rule
+      </Button>
       {toggleError !== null && (
         <Alert status="error" data-testid="rule-toggle-error">
           <AlertText>could not change this rule — {toggleError}</AlertText>
@@ -160,9 +169,9 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
                   <Text elementType="p">
                     Butchr found no rules file, so nothing is staffed right now. Create one to start matching tickets to agents.
                   </Text>
-                  <span title="needs slice U2 (the create/edit form)">
-                    <Button isDisabled>Add your first rule</Button>
-                  </span>
+                  <Button isDisabled={!api.capabilities.write} onPress={() => setCreateDialogOpen(true)}>
+                    Add your first rule
+                  </Button>
                 </EmptyState>
               ) : (
                 <RulesTable
@@ -199,6 +208,16 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
                     />
                   );
                 })()}
+              {/* FACTORY-927 — same reactivity reasoning as `RuleEditDialog` above: rendered here so `stale` always reflects the LATEST poll. */}
+              {createDialogOpen && (
+                <CreateRuleDialog
+                  api={api}
+                  canWrite={api.capabilities.write}
+                  stale={vm.stale}
+                  onChanged={() => undefined}
+                  onClose={() => setCreateDialogOpen(false)}
+                />
+              )}
             </>
           );
         }}

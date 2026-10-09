@@ -595,6 +595,167 @@ describe("POST /api/rules/plan — report-only", () => {
   });
 });
 
+describe("POST /api/rules — create a rule", () => {
+  const ACCEPTED_PLAN: RulesPlanOutcome = { ok: true, planHash: "create-hash-1", spawned: 0, stopped: 0, restarted: 0, scope: 5, etag: "etag-1", requiresConfirm: false };
+  const CREATED: RulesWriteOutcome = { ok: true, backupId: "20261009T000000Z", etag: "etag-next", changedIds: ["new-rule"], reload: { applied: true, problems: [] } };
+
+  function buildDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, onPlanCreate: (...a: unknown[]) => Promise<RulesPlanOutcome>, onCreate: (...a: unknown[]) => Promise<RulesWriteOutcome>, audited: unknown[]) {
+    return {
+      csrf,
+      writeGuard: writeGuardDeps(csrf),
+      dashboardOriginGuard: { port: 0 },
+      peerUidCheck: () => true,
+      rulesWrite: {
+        enabled: (() => { throw new Error("unused"); }) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (() => { throw new Error("unused"); }) as any,
+        create: onCreate as any,
+        planCreate: onPlanCreate as any,
+      },
+      auditWrite: (e: unknown) => { audited.push(e); },
+    };
+  }
+
+  const VALID_BODY = { id: "new-rule", resourceProvider: "jira-work", query: "project = XYZ", confirm: true };
+
+  test("forged Origin: 403, neither plan nor create called, nothing audited", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let planCalled = false, createCalled = false;
+    const audited: unknown[] = [];
+    const { app, host } = startApp(buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => { createCalled = true; return CREATED; }, audited));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules`, {
+        method: "POST", headers: { origin: "http://evil.example", host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(403);
+      expect(planCalled).toBe(false);
+      expect(createCalled).toBe(false);
+      expect(audited.length).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  test("missing CSRF header: 403, neither plan nor create called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let createCalled = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ACCEPTED_PLAN, async () => { createCalled = true; return CREATED; }, []));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json" },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(403);
+      expect(createCalled).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("invalid body (bad id shape): 400, neither plan nor create called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let planCalled = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => CREATED, []));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ id: "Not A Valid Slug", resourceProvider: "jira-work", query: "x" }),
+      });
+      expect(res.status).toBe(400);
+      expect(planCalled).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("all guards pass, plan requires no further confirm: calls create with the plan's own fresh planHash, audits the accepted outcome", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    let createArgs: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ACCEPTED_PLAN, async (...a) => { createArgs = a; return CREATED; }, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual(CREATED);
+      expect(createArgs[2]).toBe(ACCEPTED_PLAN.planHash); // the route's own planHash, never a client-supplied one
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
+    } finally { await app.stop(true); }
+  });
+
+  test("the plan itself refuses (e.g. id collision): create is never called, the refusal is audited as rejected, file untouched by this route's own contract", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    let createCalled = false;
+    const refusal: RulesPlanOutcome = { ok: false, status: 409, error: `a rule with id "new-rule" already exists` };
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => refusal, async () => { createCalled = true; return CREATED; }, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: refusal.error });
+      expect(createCalled).toBe(false);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string; reason?: string }).outcome).toBe("rejected");
+      expect((audited[0] as { outcome: string; reason?: string }).reason).toBe(refusal.error);
+    } finally { await app.stop(true); }
+  });
+
+  test("the plan succeeds but create itself refuses (e.g. confirm omitted, caught server-side): the rejection is audited, status/error pass through verbatim", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    const refusal: RulesWriteOutcome = { ok: false, status: 409, error: `create rule "new-rule" (query: "project = XYZ", scope: 5 ticket(s))? resend with confirm: true to proceed` };
+    const { app, origin, host } = startApp(buildDeps(csrf, async () => ({ ...ACCEPTED_PLAN, requiresConfirm: true, confirmReason: "rule-create" as const }), async () => refusal, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ...VALID_BODY, confirm: false }),
+      });
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: refusal.error });
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("rejected");
+    } finally { await app.stop(true); }
+  });
+
+  test("503 when rulesWrite is not configured at all", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const { app, origin, host } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true });
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(503);
+    } finally { await app.stop(true); }
+  });
+
+  // N2 (FACTORY-678): this route shares the SAME per-client write rate
+  // limit as every other write-shaped route — a dedicated proof, since this
+  // is a NEW route the shared limiter must cover without a second scheme.
+  test("shares the generic write rate limit: a limited request never reaches plan or create, and IS audited as rejected through the same pipeline", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const audited: unknown[] = [];
+    let planCalled = false;
+    const limiter = createWriteRateLimiter({ windowMs: 60_000, max: 0 });
+    const { app, origin, host } = startApp({
+      ...buildDeps(csrf, async () => { planCalled = true; return ACCEPTED_PLAN; }, async () => CREATED, audited),
+      writeRateLimit: limiter,
+    });
+    try {
+      const res = await fetch(`${origin}/api/rules`, {
+        method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify(VALID_BODY),
+      });
+      expect(res.status).toBe(429);
+      expect(planCalled).toBe(false);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("rejected");
+    } finally { await app.stop(true); }
+  });
+});
+
 // AGENTSAFETY FIRST-PASS FINDING B1 (SHIP-BLOCKER, 2026-10-06): a trailing
 // slash (or other path variant) on a write route previously bypassed the
 // guard entirely and returned 200 with NO Origin, CSRF, or peer check —

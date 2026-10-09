@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { rulesEtag, updateRulesFile } from "../../src/rules/write-rules.js";
 import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
 import { capacityRoleFor } from "../../src/agents/capacity-role.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, planRuleCreate, createRule, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { buildFieldsAllowedPaths } from "../../src/rules/rules-write-apply.js";
-import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "../../src/rules/rules-write-registry.js";
+import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch, type RuleCreateInput } from "../../src/rules/rules-write-registry.js";
 import { createRulesPreviewer, DEFAULT_PREVIEW_RATE_LIMIT_MS } from "../../src/web/rules-preview.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import type { Rule } from "../../src/rules/rules.js";
@@ -1439,5 +1439,190 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
       expect(await cached("ui-first-rule", "project = A")).toBe(2); // fresh call despite being well within the TTL
       expect(calls).toBe(2);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FACTORY-927 — create a rule from the Rules page.
+// ---------------------------------------------------------------------------
+
+const NEW_RULE_INPUT: RuleCreateInput = { id: "new-rule", resourceProvider: "jira-work", query: "project = XYZ" };
+
+/** Mirrors `planHashFor` above, for the create flow: throws if the plan itself was refused. */
+async function createPlanHashFor(input: RuleCreateInput, confirm: boolean, scopeOf: (id: string, q: string) => Promise<number>, deps: RulesWriteDeps): Promise<string> {
+  const plan = await planRuleCreate(input, confirm, scopeOf, deps);
+  if (!plan.ok) throw new Error(`expected a successful plan, got: ${plan.error}`);
+  return plan.planHash;
+}
+
+describe("planRuleCreate (report-only)", () => {
+  test("never writes anything, regardless of confirm", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const plan = await planRuleCreate(NEW_RULE_INPUT, true, noScope, { env: env() });
+    expect(plan.ok).toBe(true);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("refuses an id collision (409), writes nothing", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const plan = await planRuleCreate({ ...NEW_RULE_INPUT, id: "managers" }, true, noScope, { env: env() });
+    expect(plan.ok).toBe(false);
+    if (!plan.ok) {
+      expect(plan.status).toBe(409);
+      expect(plan.error).toContain("managers");
+      expect(plan.error).toContain("already exists");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("confirm: false — requiresConfirm is true, confirmReason is rule-create, scope is reported", async () => {
+    seed([MANAGERS_RULE]);
+    const plan = await planRuleCreate(NEW_RULE_INPUT, false, async () => 7, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("rule-create");
+      expect(plan.scope).toBe(7);
+    }
+  });
+
+  test("confirm: true with a measurable scope — requiresConfirm is false", async () => {
+    seed([MANAGERS_RULE]);
+    const plan = await planRuleCreate(NEW_RULE_INPUT, true, async () => 3, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(false);
+      expect(plan.confirmReason).toBeUndefined();
+    }
+  });
+
+  test("an unmeasurable scope: requiresConfirm is true EVEN with confirm: true — fails closed unconditionally", async () => {
+    seed([MANAGERS_RULE]);
+    const plan = await planRuleCreate(NEW_RULE_INPUT, true, async () => Number.POSITIVE_INFINITY, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.requiresConfirm).toBe(true);
+      expect(plan.confirmReason).toBe("unmeasurable-scope");
+      expect(plan.scope).toBeNull();
+      expect(plan.scopeUnmeasurable).toBe(true);
+    }
+  });
+});
+
+describe("createRule", () => {
+  test("creates the rule DISABLED regardless of what was asked (there is no enabled field to even pass)", async () => {
+    seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, true, noScope, deps);
+    const outcome = await createRule(NEW_RULE_INPUT, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.changedIds).toEqual(["new-rule"]);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    const created = nextDoc.rules.find((r: { id: string }) => r.id === "new-rule");
+    expect(created).toBeDefined();
+    expect(created.enabled).toBe(false);
+    expect(created.resourceProvider).toBe("jira-work");
+    expect(created.query).toBe("project = XYZ");
+    // File-only defaults (AC: brief/execution/account are never client-settable here).
+    expect(created.brief).toBe("@builtin:task");
+    expect(created.execution).toBe("swarm");
+    expect(created.account).toBe("none");
+  });
+
+  test("refuses an id collision, writes nothing", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const colliding = { ...NEW_RULE_INPUT, id: "managers" };
+    // A plan for a colliding id is itself refused — build a syntactically-plausible
+    // (but necessarily stale/wrong) hash so the create call reaches ITS OWN
+    // collision check rather than short-circuiting on a plan failure upstream.
+    const outcome = await createRule(colliding, true, "irrelevant-hash", noScope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toContain("managers");
+      expect(outcome.error).toContain("already exists");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("confirm omitted (false): refused with the dry-run scope in the message, writes nothing", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, false, async () => 9, deps);
+    const outcome = await createRule(NEW_RULE_INPUT, false, planHash, async () => 9, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toContain("confirm: true");
+      expect(outcome.error).toContain("9");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("a stale planHash (file changed since the plan) is refused, writes nothing", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, true, noScope, deps);
+    // Something else lands on the file between the plan and the apply.
+    const { writeFileSync: wfs } = require("node:fs") as typeof import("node:fs");
+    wfs(rulesFilePath(), JSON.stringify({ rules: [MANAGERS_RULE, { ...MANAGERS_RULE, id: "another" }] }, null, 2) + "\n");
+    const outcome = await createRule(NEW_RULE_INPUT, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+  });
+
+  test("an unmeasurable scope refuses closed EVEN with confirm: true, writes nothing", async () => {
+    const text = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const unmeasurable = async () => Number.POSITIVE_INFINITY;
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, true, unmeasurable, deps);
+    const outcome = await createRule(NEW_RULE_INPUT, true, planHash, unmeasurable, deps);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(503);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("confirm: true, measurable scope: succeeds, with a backup taken and an atomic write", async () => {
+    const original = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, true, async () => 2, deps);
+    const outcome = await createRule(NEW_RULE_INPUT, true, planHash, async () => 2, deps);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.backupId).not.toBeNull();
+    const after = readFileSync(rulesFilePath(), "utf8");
+    expect(after).not.toBe(original);
+    const backups = readdirSync(join(dir, "butchr")).filter((n) => n.includes(".bak-"));
+    expect(backups.length).toBe(1);
+    expect(readFileSync(join(dir, "butchr", backups[0]!), "utf8")).toBe(original);
+  });
+
+  test("undo restores the pre-create file byte-for-byte, removing the rule it added", async () => {
+    const original = seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const planHash = await createPlanHashFor(NEW_RULE_INPUT, true, async () => 2, deps);
+    const created = await createRule(NEW_RULE_INPUT, true, planHash, async () => 2, deps);
+    expect(created.ok).toBe(true);
+    if (!created.ok || !created.backupId) throw new Error("expected a backup id");
+    const afterCreate = readFileSync(rulesFilePath(), "utf8");
+    expect(afterCreate).not.toBe(original);
+    const undone = writeUndo(created.backupId, deps);
+    expect(undone.ok).toBe(true);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(original);
+  });
+
+  test("with an agentPreferences entry: writes harness/model through untouched", async () => {
+    seed([MANAGERS_RULE]);
+    const deps = { env: env() };
+    const input: RuleCreateInput = { ...NEW_RULE_INPUT, id: "new-rule-2", agentPreferences: [{ harness: "claude", model: "sonnet" }], permissionMode: "acceptEdits", lizardMode: true, role: "sentinel" };
+    const planHash = await createPlanHashFor(input, true, noScope, deps);
+    const outcome = await createRule(input, true, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    const created = nextDoc.rules.find((r: { id: string }) => r.id === "new-rule-2");
+    expect(created.agentPreferences).toEqual([{ harness: "claude", model: "sonnet" }]);
+    expect(created.permissionMode).toBe("acceptEdits");
+    expect(created.lizardMode).toBe(true);
+    expect(created.role).toBe("sentinel");
   });
 });

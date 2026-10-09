@@ -12,6 +12,7 @@ import {
   type RuleFieldPatch,
   type RuleFormCatalogEntry,
   type RulesListResponse,
+  type RuleCreateDraft,
 } from "../../dashboard-app/src/api/rules.js";
 // FACTORY-729 (FACTORY-725 review, comment 30291): this epic was bitten once
 // by a client/route contract mismatch that only the fixtures-mode API
@@ -19,7 +20,7 @@ import {
 // patch} — a silent 400 on every REAL call). The tests below feed the
 // bytes `realRulesApi` actually sends over the wire straight into the REAL
 // server's own validator, never a hand-typed guess at either shape.
-import { validateRuleFieldPatch } from "../../src/rules/rules-write-registry.js";
+import { validateRuleFieldPatch, validateRuleCreateInput } from "../../src/rules/rules-write-registry.js";
 
 /**
  * A second `ui-`-prefixed rule (NOT the placeholder template) for write-flow
@@ -602,6 +603,61 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     if (serverResult.ok) {
       expect(serverResult.patch).toEqual(patch);
     }
+  });
+
+  // FACTORY-927 (AC9) — the same cross-contract proof, for the NEW
+  // `createRule` method / `POST /api/rules` route: the exact bytes
+  // `realRulesApi.createRule` puts on the wire, fed straight into the
+  // real server's own `validateRuleCreateInput` (`src/rules/
+  // rules-write-registry.ts`) — this is the exact failure mode that once
+  // shipped the plan route unreachable from the real UI (a client/route
+  // body-shape mismatch caught by nothing but this kind of test).
+  test("createRule's real wire body is accepted verbatim by the server's own validateRuleCreateInput", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: "b1", etag: "e2", changedIds: ["new-rule"] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const draft: RuleCreateDraft = {
+      id: "new-rule",
+      resourceProvider: "jira-work",
+      query: "project = FACTORY AND status != Done",
+      permissionMode: "acceptEdits",
+      lizardMode: true,
+      role: "sentinel",
+      agentPreferences: [{ harness: "claude", model: "sonnet" }],
+    };
+    await realRulesApi.createRule(draft, true);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...draft, confirm: true });
+    const serverResult = validateRuleCreateInput(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) {
+      expect(serverResult.input).toEqual({ id: draft.id, resourceProvider: draft.resourceProvider, query: draft.query, permissionMode: draft.permissionMode, lizardMode: draft.lizardMode, role: draft.role, agentPreferences: draft.agentPreferences });
+    }
+  });
+
+  // FACTORY-927 — a minimal create body (no optional fields at all) is
+  // ALSO accepted verbatim; proves the optional fields are genuinely
+  // optional on both sides, not merely untested when present.
+  test("createRule's minimal wire body (id/resourceProvider/query only) is accepted verbatim by the server's own validateRuleCreateInput", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: ["new-rule"] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const draft = { id: "new-rule", resourceProvider: "jira-work" as const, query: "project = FACTORY" };
+    await realRulesApi.createRule(draft, false);
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...draft, confirm: false });
+    const serverResult = validateRuleCreateInput(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) expect(serverResult.input).toEqual(draft);
   });
 
   test("undo POSTs to /api/undo/:backupId with the id encoded", async () => {

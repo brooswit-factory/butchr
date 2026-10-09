@@ -136,7 +136,7 @@ import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache, createRule, planRuleCreate } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { readUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
@@ -1201,6 +1201,11 @@ const { app, mcp } = buildApp({
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+    // FACTORY-927: the SAME shared `scopeOf`/`rulesWriteDeps` every other
+    // rules write above reuses — `createRule`'s own reload-on-success and
+    // stale-file refusal ride the identical wiring, never a second copy.
+    create: (input, confirm, planHash) => createRule(input, confirm, planHash, scopeOf, rulesWriteDeps),
+    planCreate: (input, confirm) => planRuleCreate(input, confirm, scopeOf, rulesWriteDeps),
   },
   auditWrite,
   writeRateLimit,

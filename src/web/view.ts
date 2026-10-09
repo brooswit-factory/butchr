@@ -17,7 +17,7 @@ import type { RulesPreviewResult } from "./rules-preview.js";
 import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps, type WriteGuardRequest } from "./write-guard.js";
 import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
-import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
+import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, type RuleCreateInput } from "../rules/rules-write-registry.js";
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
@@ -270,6 +270,10 @@ export interface ViewDeps {
     fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
+    /** FACTORY-927 — `POST /api/rules`'s own write (`createRule`, `../rules/rules-write.ts`). Always creates the new rule DISABLED; confirm is mandatory, independent of blast radius — see that function's own doc comment. */
+    create: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
+    /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. */
+    planCreate: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -932,6 +936,54 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.csrf) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
       return { csrfToken: deps.csrf.token };
+    })
+    // FACTORY-927 — `POST /api/rules`: create a new rule from the Rules
+    // page. Own `checkWriteGuard` call (see the enable route's own comment
+    // below for why that's load-bearing, not merely redundant with
+    // `onRequest`'s own prefix check), the SAME shared write-rate limit
+    // every other write-shaped route uses, and the SAME `auditOutcome`
+    // pipeline. `deps.rulesWrite.planCreate` is called FIRST, on every
+    // request (confirmed or not) — this never writes, but it IS where an
+    // id collision, a stale-file refusal, or an unmeasurable dry-run scope
+    // are caught, authoritatively, with their own correct status codes;
+    // those are genuine refusals of a create attempt and are audited here.
+    // A plan that comes back `ok: true` is then handed STRAIGHT to
+    // `deps.rulesWrite.create` with the plan's own freshly-computed
+    // `planHash` — never a client-supplied one (this route ignores any
+    // `planHash` field in the request body entirely: the server always
+    // computes its own, a request apart, so there is nothing for a client
+    // to track or resend) — which re-validates everything again,
+    // authoritatively, under the write lock, and is itself where the
+    // mandatory-confirm gate lives (AC5: UNCONDITIONAL for a create,
+    // independent of blast radius — see `createRule`'s own doc comment,
+    // `../rules/rules-write.ts`). Every call to `create` is audited,
+    // accepted or refused, which already covers "confirm omitted" (its own
+    // 409, naming the dry-run scope in the message) exactly like every
+    // other write route's own confirm gate is audited.
+    .post("/api/rules", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const parsed = validateRuleCreateInput(body);
+      if (!parsed.ok) { set.status = 400; return { error: parsed.error }; }
+      const b = body as Record<string, unknown>;
+      const confirm = b.confirm === true;
+      const ids = [parsed.input.id];
+      const plan = await deps.rulesWrite.planCreate(parsed.input, confirm);
+      if (!plan.ok) {
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, { ok: false, error: plan.error });
+        set.status = plan.status;
+        return { error: plan.error };
+      }
+      const outcome = await deps.rulesWrite.create(parsed.input, confirm, plan.planHash);
+      auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
     })
     // FACTORY-662 item 7: `POST /api/rules/:id/enabled` — the ONLY route
     // that may flip `enabled`, for exactly the "ui-" marked rules, gated by
