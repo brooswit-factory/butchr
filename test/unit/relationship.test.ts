@@ -35,7 +35,6 @@ const ROLES = { story: "acct-story", task: "acct-task", epic: "acct-epic" };
  */
 function makeWorld() {
   let nextIssueId = 100;
-  let nextPageId = 900;
   const issues = new Map<
     string,
     {
@@ -49,7 +48,7 @@ function makeWorld() {
       summary?: string;
     }
   >();
-  const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
+  const pages = new Map<string, { title: string; body: string; version: number }>();
   const projectProperties = new Map<string, unknown>();
 
   function addIssue(key: string, p: { issuetype: string; project: string; status?: string; labels?: string[]; bossKey?: string; assignee?: string; description?: unknown; summary?: string }) {
@@ -61,9 +60,6 @@ function makeWorld() {
   }
   function setProjectProperty(projectKey: string, value: unknown) {
     projectProperties.set(projectKey, value);
-  }
-  function pageUrl(id: string) {
-    return `https://fake.atlassian.net/wiki/pages/${id}`;
   }
   function requireIssue(key: string) {
     const i = issues.get(key);
@@ -172,19 +168,6 @@ function makeWorld() {
     upsertRemoteLink: async (key: string, _g: string, _r: string, object: { title: string; url: string }) => {
       requireIssue(key).remoteLink = { ...object };
       return { id: 1 };
-    },
-    getChildPages: async (parentId: string, cursor?: string) => {
-      const all = [...pages.entries()].filter(([, p]) => p.parentId === parentId).map(([id]) => id);
-      const start = cursor ? Number(cursor) : 0;
-      return { results: all.slice(start).map((id) => ({ id, title: pages.get(id)!.title })) };
-    },
-    getPageLabels: async (pageId: string) => pages.get(pageId)?.labels ?? [],
-    createPageWithLabel: async (p) => {
-      const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
-      if (titleTaken) throw new Error("title collision");
-      const id = String(nextPageId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-      return { id, title: p.title, url: pageUrl(id) };
     },
     addLabels: async (key: string, labels: readonly string[]) => {
       const i = requireIssue(key);
@@ -2489,7 +2472,7 @@ describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not
   test("reportToBoss posts a Confluence footer comment on the project's root doc, identity-tagged, never ops.addComment", async () => {
     const { ops, issues, pages, addIssue, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [], version: 1 });
+    pages.set(ROOT_DOC_ID, { title: "root doc", body: "<p>hi</p>", version: 1 });
     let commentedPageId: string | undefined;
     let commentedBody: string | undefined;
     const spied: AtlassianOps = {
@@ -2506,7 +2489,7 @@ describe("reportToBoss / askBoss: PROJECT caller speaks on its own ROOT DOC, not
   test("askBoss carries the SAME [ask] marker convention onto the project's root doc", async () => {
     const { ops, pages, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
-    pages.set(ROOT_DOC_ID, { parentId: "", title: "root doc", body: "<p>hi</p>", labels: [], version: 1 });
+    pages.set(ROOT_DOC_ID, { title: "root doc", body: "<p>hi</p>", version: 1 });
     let commentedBody: string | undefined;
     const spied: AtlassianOps = { ...ops, commentOnPage: async (_id: string, body: string) => { commentedBody = body; return { ok: true }; } };
     await askBoss(spied, "BUTCHR", "which approach?");

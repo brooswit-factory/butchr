@@ -165,9 +165,6 @@ function fakeWorld(opts: {
     listSpaces: unimplemented("listSpaces"),
     getRemoteLink: unimplemented("getRemoteLink"),
     upsertRemoteLink: unimplemented("upsertRemoteLink"),
-    getChildPages: unimplemented("getChildPages"),
-    getPageLabels: unimplemented("getPageLabels"),
-    createPageWithLabel: unimplemented("createPageWithLabel"),
     addLabels: unimplemented("addLabels"),
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
@@ -715,9 +712,6 @@ describe("SECTION 6b — THE check_in SEAM: the REAL handler (src/tools/defs.ts)
       listSpaces: unimplemented("listSpaces"),
       getRemoteLink: unimplemented("getRemoteLink"),
       upsertRemoteLink: unimplemented("upsertRemoteLink"),
-      getChildPages: unimplemented("getChildPages"),
-      getPageLabels: unimplemented("getPageLabels"),
-      createPageWithLabel: unimplemented("createPageWithLabel"),
       addLabels: unimplemented("addLabels"),
       removeLabels: unimplemented("removeLabels"),
       deleteIssue: unimplemented("deleteIssue"),
@@ -811,12 +805,16 @@ describe("SECTION 7 — the pagination blind spot, CLOSED per axis (BUTCHR-309)"
   // never a hand-typed `expect(true).toBe(true)` (that shape was already
   // rejected once at review — see git history on this exact test).
   //
+  // The sibling comparison this test used to make against `getChildPages`
+  // no longer applies: FACTORY-94 removed that op (and `getPageLabels`,
+  // `createPageWithLabel`) from `AtlassianOps` entirely as dead code once
+  // FACTORY-84/FACTORY-86 removed its only caller (docs.ts's retired
+  // per-ticket page auto-creation) — there is no sibling left to compare to.
+  //
   // FALSIFIER: if `getPageComments`'s call site ever LOSES its `limit`
-  // argument or its `_links.next`/cursor follow, OR if the sibling
-  // `getChildPages` in the same file ever loses its own pagination follow,
-  // this test must fail — either change would mean the fix this ticket made
-  // has regressed.
-  test("ROOT-DOC AXIS: getPageComments now passes a `limit` and follows `_links.next`'s cursor, matching the sibling getChildPages in the same file — the asymmetry this section used to report is gone", () => {
+  // argument or its `_links.next`/cursor follow, this test must fail — that
+  // would mean the fix this ticket made has regressed.
+  test("ROOT-DOC AXIS: getPageComments passes a `limit` and follows `_links.next`'s cursor", () => {
     const source = readFileSync(join(import.meta.dir, "..", "..", "src", "tools", "atlassian-real.ts"), "utf8");
     const getPageCommentsBody = source.slice(source.indexOf("getPageComments:"), source.indexOf("searchProjects:"));
     // (1) a `limit` argument is now present on the root-doc comment read's
@@ -826,12 +824,6 @@ describe("SECTION 7 — the pagination blind spot, CLOSED per axis (BUTCHR-309)"
     // body.
     expect(getPageCommentsBody).toContain("_links");
     expect(getPageCommentsBody).toContain("cursor");
-    // (3) the sibling getChildPages, in the SAME file, still paginates the
-    // same way — the two are no longer asymmetric.
-    const getChildPagesBody = source.slice(source.indexOf("getChildPages:"), source.indexOf("getChildPages:") + 400);
-    expect(getChildPagesBody).toContain("limit: 50");
-    expect(getChildPagesBody).toContain("_links?.next");
-    expect(getChildPagesBody).toContain("cursor");
   });
 
   // MUTATION CHECK (DoD 6(b)): this is the source-reading half's own
