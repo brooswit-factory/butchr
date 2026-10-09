@@ -84,15 +84,15 @@ describe("parseRules", () => {
       { ...other, enabled: true, execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
-  test("omitted optionals stay absent; enabled/execution/account/role/idlePoke* default to true/swarm/none/worker/30min+default-text+on", () => {
+  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker; idlePokeEnabled defaults to on, but idlePokeMinutes/idlePokeMessage stay absent (the true fallback is today's existing global stalledMinutes/wake text, unchanged)", () => {
     const [r] = parseRules({ rules: [minimal] });
     expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.enabled).toBe(true);
     expect(r!.execution).toBe("swarm");
     expect(r!.account).toBe("none");
     expect(r!.role).toBe("worker");
-    expect(r!.idlePokeMinutes).toBe(DEFAULT_IDLE_POKE_MINUTES);
-    expect(r!.idlePokeMessage).toBe(DEFAULT_IDLE_POKE_MESSAGE);
+    expect(r!.idlePokeMinutes).toBeUndefined();
+    expect(r!.idlePokeMessage).toBeUndefined();
     expect(r!.idlePokeEnabled).toBe(true);
   });
   test("rejects a non-document", () => {
