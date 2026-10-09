@@ -500,8 +500,11 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
   exactly like any other rule, unless it explicitly sets `role: "sentinel"`
   itself. This is a deliberate behaviour change — a live rules file that
   relied on the old issue-type exemption now needs to add `role: "sentinel"`
-  to each rule it wants exempt (no migration ships with this change; see
-  this ticket, FACTORY-757, for why).
+  to each rule it wants exempt. **FACTORY-757 itself shipped this
+  migration-free** (see `changelog.d/FACTORY-757.md`'s "No migration and no
+  UI ship with this change"); FACTORY-810 (implementing FACTORY-754, epic
+  FACTORY-748) closed that gap with an upgrade-time migration — see
+  "Upgrade migration: pre-FACTORY-757 issue-type exemption" below.
 - **`jira-project` is still always a sentinel** (BUTCHR-425), unconditionally
   — `capacityRoleFor` checks the resource provider before ever consulting
   the rule's own `role` field. Free-form project managers are
@@ -607,6 +610,132 @@ Example:
 — admits at most 2 new `triage` agents per poll, and never more than one
 every 30 seconds, regardless of how many tickets a lowered priority filter
 just made eligible all at once.
+### Setting `role` from the rules API and the Rules page form (FACTORY-817, story FACTORY-756, epic FACTORY-748)
+
+Until this ticket, `role` was file-only — an operator had to hand-edit
+`rules.json` to flip a rule's capacity inclusion. It is now exposed as a
+first-class field through both the rules write surface this codebase
+already has (FACTORY-662/FACTORY-729) and the Rules page form it serves:
+
+- `GET /api/rules` includes each rule's current `role` (unchanged — it
+  already did). `GET /api/rules/catalog` additionally serves a
+  `capacityRoles: { values: ["worker", "sentinel"], default: "worker" }`
+  field alongside the per-harness catalog (`src/rules/rule-form-catalog.ts`)
+  — one global pair of values plus the engine's own default, since `role`
+  (unlike the harness/model/effort/permission-mode fields) applies
+  uniformly across every provider, not per-harness.
+- `PUT /api/rules/:id` now accepts `role` as an editable top-level field
+  (`EDITABLE_TOP_LEVEL_FIELDS`, `src/rules/rules-write-registry.ts`),
+  validated against `AGENT_ROLES`, going through the SAME catalog-validated
+  write/audit-line path every other field here does — no second validation
+  mechanism.
+- **`role: "sentinel"` requires an explicit `confirm: true`** on the write
+  that sets it, the SAME discipline `permissionMode: "bypassPermissions" |
+  "auto"` and `lizardMode: true` already carry
+  (`requireConfirmForRiskyFields`, `src/rules/rules-write.ts`) —
+  deliberately, not an oversight: opting a rule's agent(s) OUT of
+  `BUTCHR_MAX_AGENTS` entirely is exactly the kind of change that must never
+  slip in silently alongside an unrelated edit. `"worker"` (the default,
+  ON) needs no confirm. The plan route's `confirmReason` names this gate
+  `"capacity-sentinel"` when it is the reason a write requires confirm.
+- The toggle is deliberately **not a restart-triggering field** — unlike
+  `query`/`permissionMode`/`lizardMode`/`agentPreferences`, changing `role`
+  never changes an already-running agent's own launch (`SpawnSpec`); it
+  only changes a classification the admission controller reads fresh every
+  reconciliation poll (`ruleRoleOfAgent` calls `getRules()` live,
+  `src/daemon/index.ts`). `computeLocalPlanCounts` (`src/rules/rules-write.ts`)
+  does not count a `role`-only change as a restart.
+- **The Rules page form**: FACTORY-725/FACTORY-729 shipped their
+  catalog-sourced dropdowns and the lizard toggle on the first-rule setup
+  form (`FirstRuleSetup.tsx`) first. FACTORY-730 (PR #704, merged to
+  `main`) then shipped the generic existing-rule edit dialog
+  (`RuleEditDialog.tsx`, opened from the Rules table's per-row Edit
+  button), so an "Included in capacity" toggle on an already-created rule
+  is no longer a gap. FACTORY-856 (story FACTORY-756) adds that toggle to
+  `RuleEditDialog` too, in the same field-definition/validation/layout
+  pattern as its own lizard toggle (`rule-edit-capacity-toggle` /
+  `rule-edit-capacity-notice`, mirroring `rule-edit-lizard-mode-toggle` /
+  `rule-edit-lizard-notice`) — the toggle now lands on BOTH surfaces: the
+  first-rule setup form and the existing-rule edit dialog. `buildFieldsPatch`
+  sends `role` only when the draft differs from the rule's own current
+  value (the dialog's existing "only send what changed" discipline, unlike
+  `FirstRuleSetup`'s always-send). Toggling it off shows the same "never a
+  default, needs confirm" notice pattern the lizard toggle already uses,
+  and the write goes through the same catalog-validated `PUT /api/rules/:id`
+  path (`confirmReason: "capacity-sentinel"`) described above.
+- **`jira-project` rules are unaffected by this toggle** — they are
+  sentinel by construction (`capacityRoleFor` checks the resource provider
+  BEFORE ever consulting the rule's own `role`, see above), so the toggle
+  would have no effect for one. The form shows it disabled with an
+  explanatory note for a `jira-project` rule rather than implying a control
+  the engine will ignore.
+- **Operator-facing summary**: capacity inclusion is now a per-query
+  choice, made per rule, defaulting to counted ("worker") — it is no
+  longer inferred from the Jira issue type (that hardcoding was removed by
+  FACTORY-757, see above). An operator who wants a rule's agents excluded
+  from `BUTCHR_MAX_AGENTS` turns this toggle off (or sets `role: "sentinel"`
+  by hand) and confirms; leaving it on (the default) means that query's
+  agents consume fleet capacity exactly like every other worker rule.
+
+## Upgrade migration: pre-FACTORY-757 issue-type exemption (FACTORY-810, implementing FACTORY-754, epic FACTORY-748)
+
+FACTORY-757 (above) deliberately shipped with no migration: a live
+`jira-work` rule whose JQL relied on the deleted Epic/Story/Bug issue-type
+exemption would silently start counting toward `BUTCHR_MAX_AGENTS` the
+moment that code ran, unless an operator had already added `role:
+"sentinel"` itself. FACTORY-810 closes that gap with an upgrade-time
+migration (`src/rules/capacity-role-migration.ts`), run once at daemon
+startup — same convention `../agents/workspace-migration.ts` and
+`../rules/seed-first-run.ts` already use: existence-based, idempotent, and
+run BEFORE `loadRules` reads the file for the daemon's own real startup.
+
+**What gets migrated, and why nothing else does** — restated from
+FACTORY-754's own corrected description, since it is easy to over-scope:
+
+1. **`jira-work` rules whose query relies on the deleted exemption** — the
+   only real target. Written with `role: "sentinel"` so each one's
+   post-upgrade counting decision stays identical to its pre-upgrade one.
+2. **`jira-work` task/subtask rules** — already counted before and after
+   (the schema default); writing `role: "worker"` would be a redundant
+   no-op, so these are left untouched.
+3. **`jira-project` (manager) rules, and bare project-tier ids** — sentinel
+   by construction (`capacityRoleFor` checks this before ever consulting a
+   rule's `role` — see "Fleet capacity role" above); writing `role` onto
+   one would be config the capacity path never reads, so these are never
+   even classified.
+4. **`github-issue`/`github-pr`/`zendesk-ticket`/`filesystem` rules** — the
+   pre-FACTORY-757 exemption never covered a non-Jira provider; these were
+   always counted and still are, so nothing is written.
+
+**How a rule's issue-type restriction is recognised**: `jira-work`'s
+`query` is a plain JQL string with no structured representation anywhere
+in this codebase (`searchRules`, `src/rules/resource-type.ts`, hands it to
+Jira verbatim). `classifyJqlQuery` (`src/rules/capacity-role-migration.ts`)
+recognises exactly the canonical shape `docs/rules.example.json` uses — a
+single, top-level, AND-ed, non-negated `issuetype = X` or `issuetype IN
+(X, Y, …)` clause — and REFUSES to guess about anything looser: zero or
+multiple top-level `issuetype` clauses, a clause joined by a top-level
+`OR`, a negated operator (`!=`, `NOT IN`), or unbalanced parens/quotes all
+classify as "skip, cannot classify" rather than a guess in either
+direction. A query this function cannot classify is left untouched and
+logged at startup (`butchr: upgrade migration — left rule <id> untouched
+(<reason>)`) — the safe default stays "counted" (today's new behaviour),
+never a wrongly-granted exemption.
+
+**Idempotency** (a hard requirement, since the epic's own interim
+mitigation — admin-assembly setting `role` by hand ahead of the code
+landing — may already have run): a rule that already carries an explicit
+`role` in the raw JSON, `"sentinel"` or `"worker"` alike, is never even
+classified, let alone overwritten. `runCapacityRoleMigration` goes one
+step further than "the field doesn't change" — when its plan has nothing
+to migrate, it never calls the rules writer at all, so a second (or every
+subsequent) run performs zero filesystem writes: no new backup, no touched
+mtime, a genuine no-op rather than a written-but-unchanged file. The write
+itself, when one is needed, goes through `setRuleRole`
+(`src/rules/write-rules.ts`) — the same surgical, formatting-preserving
+text editor `setRuleEnabled` already established for its own field, so
+every other rule, field, and byte of whitespace in the file survives
+untouched.
 
 ## Herdr workspace labels: short display ids, collisions, and full-key metadata (FACTORY-95, implementing FACTORY-90, epic FACTORY-83)
 

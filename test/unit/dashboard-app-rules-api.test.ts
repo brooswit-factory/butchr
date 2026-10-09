@@ -46,6 +46,8 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     agentPreferences: [],
     permissionMode: null,
     lizardMode: null,
+    resumeOnRespawn: null,
+    resumeContextCutoff: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -250,6 +252,26 @@ describe("createFixturesRulesApi — FACTORY-661/FACTORY-663", () => {
       expect(result.changedIds).toEqual(["ui-demo"]);
     });
 
+    test("FACTORY-817: role: sentinel without confirm is refused; role: worker needs no confirm", async () => {
+      const api = createFixturesRulesApi({ initial: withUiDemo(), latencyMs: 0 });
+      const before = await api.listRules();
+      expect(before.rules.find((r) => r.id === "ui-demo")!.role).toBe("worker");
+
+      const riskyPlan = await api.planRule("ui-demo", { role: "sentinel" }, false);
+      expect(riskyPlan.requiresConfirm).toBe(true);
+      expect(riskyPlan.confirmReason).toBe("capacity-sentinel");
+      await expect(api.updateFields("ui-demo", { role: "sentinel" }, before.sourceEtag, riskyPlan.planHash, false)).rejects.toThrow(/never a default/);
+
+      const confirmedPlan = await api.planRule("ui-demo", { role: "sentinel" }, true);
+      const result = await api.updateFields("ui-demo", { role: "sentinel" }, before.sourceEtag, confirmedPlan.planHash, true);
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "ui-demo")!.role).toBe("sentinel");
+      expect(result.changedIds).toEqual(["ui-demo"]);
+
+      const safePlan = await api.planRule("ui-demo", { role: "worker" }, false);
+      expect(safePlan.requiresConfirm).toBe(false);
+    });
+
     test("enabling over the scope ceiling without confirm is refused with the server's own wording; confirm:true succeeds", async () => {
       const seeded = defaultRulesFixture();
       const idx = seeded.rules.findIndex((r) => r.id === FIRST_RULE_ID);
@@ -397,6 +419,8 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               mcpServerNames: [],
               permissionMode: "acceptEdits",
               lizardMode: true,
+              resumeOnRespawn: false,
+              resumeContextCutoff: 50000,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -413,7 +437,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000, staffed: false, reason: "disabled" }]);
   });
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
@@ -426,6 +450,18 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     const result = await realRulesApi.getCatalog();
     expect(calledUrl).toBe("/api/rules/catalog");
     expect(result).toEqual(fakeHarnesses);
+  });
+
+  test("FACTORY-817: getCapacityRoles calls GET /api/rules/catalog and returns the capacityRoles field verbatim", async () => {
+    let calledUrl: string | undefined;
+    const fakeCapacityRoles = { values: ["worker", "sentinel"], default: "worker" } as const;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+      calledUrl = String(input);
+      return new Response(JSON.stringify({ harnesses: [], capacityRoles: fakeCapacityRoles }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const result = await realRulesApi.getCapacityRoles();
+    expect(calledUrl).toBe("/api/rules/catalog");
+    expect(result).toEqual(fakeCapacityRoles);
   });
 
   test("previewRule calls GET /api/rules/:id/preview with the id encoded", async () => {
@@ -492,13 +528,13 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
   });
 
   // FACTORY-729 (FACTORY-725 review, comment 30291): the exact bytes
-  // `realRulesApi.updateFields` puts on the wire for the three fields this
-  // ticket adds (agentPreferences[].harness, permissionMode, lizardMode),
-  // fed straight into the REAL server's own `validateRuleFieldPatch`
-  // (`src/rules/rules-write-registry.ts`) — proving the client and the
-  // route agree on field names/shape, not just that each compiles against
-  // its own typed seam.
-  test("updateFields' real wire body for harness/permissionMode/lizardMode is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+  // `realRulesApi.updateFields` puts on the wire for the fields this and
+  // FACTORY-817 add (agentPreferences[].harness, permissionMode,
+  // lizardMode, role), fed straight into the REAL server's own
+  // `validateRuleFieldPatch` (`src/rules/rules-write-registry.ts`) —
+  // proving the client and the route agree on field names/shape, not just
+  // that each compiles against its own typed seam.
+  test("updateFields' real wire body for harness/permissionMode/lizardMode/role is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
     let sentBody: string | undefined;
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
       const url = String(input);
@@ -506,7 +542,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
       sentBody = String(init?.body);
       return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [FIRST_RULE_ID] }), { status: 200, headers: { "content-type": "application/json" } });
     }) as unknown as typeof fetch;
-    const patch: RuleFieldPatch = { permissionMode: "bypassPermissions", lizardMode: true, agentPreferences: [{ harness: "codex", model: "sonnet" }] };
+    const patch: RuleFieldPatch = { permissionMode: "bypassPermissions", lizardMode: true, role: "sentinel", agentPreferences: [{ harness: "codex", model: "sonnet" }] };
     await realRulesApi.updateFields(FIRST_RULE_ID, patch, "e1", "hash1", true);
     expect(sentBody).toBeDefined();
     const wireBody = JSON.parse(sentBody!);
@@ -521,7 +557,7 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     const serverResult = validateRuleFieldPatch(wireBody);
     expect(serverResult.ok).toBe(true);
     if (serverResult.ok) {
-      expect(serverResult.patch).toEqual({ permissionMode: "bypassPermissions", lizardMode: true, agentPreferences: [{ harness: "codex", model: "sonnet" }] });
+      expect(serverResult.patch).toEqual({ permissionMode: "bypassPermissions", lizardMode: true, role: "sentinel", agentPreferences: [{ harness: "codex", model: "sonnet" }] });
     }
   });
 

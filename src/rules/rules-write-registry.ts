@@ -9,8 +9,12 @@
  * leaf's own comment on `EDITABLE_AGENT_PREFERENCE_LEAVES` below for why it
  * is now deliberately allowed) join `query`/`agentPreferences[i].model/
  * effort/modelPower/effortPower` as editable. `execution`, `account`,
- * `role`, `mcpServers`, `mcpConfigFile`, `brief` remain fixed — still
- * refused for free, same mechanism, just a shorter list of what's fixed.
+ * `mcpServers`, `mcpConfigFile`, `brief` remain fixed — still refused for
+ * free, same mechanism, just a shorter list of what's fixed.
+ *
+ * FACTORY-817 (story FACTORY-756, epic FACTORY-748) widens the row again:
+ * `role` ("Included in capacity" on the rule form) joins the editable
+ * top-level fields — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
  *
  * FACTORY-730 retires the `UI_EDITABLE_ID_PREFIX`/`isUiEditableRuleId` route-
  * level gate this header used to describe as "gate 2": a write to ANY
@@ -33,7 +37,7 @@
  *   `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
  *   builders use — never consulted directly by `assertOnlyChanged`.
  */
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "./rules.js";
+import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./rules.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
 
@@ -67,8 +71,13 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * the patch. `enabled` is deliberately absent (that field's own dedicated
  * route, `POST /api/rules/:id/enabled`, owns it — see `validateRuleFieldPatch`'s
  * own explicit rejection of it on this route).
+ *
+ * FACTORY-817: `role` joins this list — the "Included in capacity" toggle
+ * on the rule form. Previously fixed (refused for free, like `execution`/
+ * `account` still are); now explicit, validated against `AGENT_ROLES`
+ * below, same discipline every other leaf here already has.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role"];
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -77,7 +86,10 @@ export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissio
  * dangerous-permission launches must be an opt-in a human visibly confirmed,
  * not a value that slipped in alongside an unrelated edit. `lizardMode: true`
  * carries the same requirement unconditionally (there is no "safe" value of
- * it to exempt).
+ * it to exempt). FACTORY-817: `role: "sentinel"` carries the same
+ * requirement too — see `requireConfirmForRiskyFields`'s own doc comment
+ * (`../rules/rules-write.ts`) for why opting a rule OUT of the fleet
+ * capacity cap gets the same explicit-confirm treatment as these.
  */
 export const RISKY_PERMISSION_MODES: ReadonlySet<RulePermissionMode> = new Set(["bypassPermissions", "auto"]);
 
@@ -161,6 +173,16 @@ export interface RuleFieldPatch {
   permissionMode?: RulePermissionMode;
   /** FACTORY-729 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. `true` additionally requires `confirm: true` on the write itself (`../rules/rules-write.ts`) — never a default. */
   lizardMode?: boolean;
+  /**
+   * FACTORY-817 — the "Included in capacity" toggle: `"worker"` (ON, the
+   * default — see `./rules.ts`'s own `Rule.role` doc comment) counts this
+   * rule's agent(s) toward `BUTCHR_MAX_AGENTS`; `"sentinel"` (OFF) opts them
+   * OUT entirely. Validated against `AGENT_ROLES` below. Setting `"sentinel"`
+   * additionally requires `confirm: true` on the write itself (`../rules/
+   * rules-write.ts`) — never a default, same discipline as `lizardMode:
+   * true`/a risky `permissionMode`.
+   */
+  role?: AgentRole;
   /** Must be the SAME LENGTH as the rule's current `agentPreferences` (see `RULES_V1_ALLOWED_PATHS`'s own doc comment on why an array-length change is never permitted) — one entry per existing preference, in order. */
   agentPreferences?: AgentPreferencePatch[];
 }
@@ -186,6 +208,10 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.lizardMode !== "boolean") return { ok: false, error: "lizardMode must be a boolean" };
     patch.lizardMode = b.lizardMode;
   }
+  if ("role" in b) {
+    if (typeof b.role !== "string" || !(AGENT_ROLES as readonly string[]).includes(b.role)) return { ok: false, error: `role must be one of ${AGENT_ROLES.join(", ")}` };
+    patch.role = b.role as AgentRole;
+  }
   if ("agentPreferences" in b) {
     if (!Array.isArray(b.agentPreferences)) return { ok: false, error: "agentPreferences must be an array" };
     const entries: AgentPreferencePatch[] = [];
@@ -196,7 +222,7 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     }
     patch.agentPreferences = entries;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "agentPreferences", "ifMatch", "confirm", "planHash"]);
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }

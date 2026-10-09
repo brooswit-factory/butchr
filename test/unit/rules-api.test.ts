@@ -112,6 +112,28 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.permissionMode).toBeNull();
     expect(r.rules[0]!.lizardMode).toBeNull();
   });
+  test("FACTORY-851: resumeOnRespawn/resumeContextCutoff are read off the raw Rule, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule({ resumeOnRespawn: false, resumeContextCutoff: 50_000 })], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.resumeOnRespawn).toBe(false);
+    expect(r.rules[0]!.resumeContextCutoff).toBe(50_000);
+  });
+  test("FACTORY-851: absent resumeOnRespawn/resumeContextCutoff on the raw Rule read as null, never undefined or a resolved default", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule()], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.resumeOnRespawn).toBeNull();
+    expect(r.rules[0]!.resumeContextCutoff).toBeNull();
+  });
   test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [rule({ maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 })], error: null },

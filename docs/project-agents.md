@@ -48,7 +48,14 @@ construction-level exception, kept deliberately — FACTORY-757 removed the
 equivalent issue-type hardcoding for `jira-work` rules (Epic/Story/Bug now
 count by default, like any other rule), but left this one in place so no
 live `jira-project` rule needs a config change to keep its current
-behaviour.
+behaviour. A `jira-work` rule is not so lucky — an `epics`/`stories`/`bugs`-
+shaped one that relied on the old issue-type exemption DOES need an explicit
+`role: "sentinel"` now, which is exactly what FACTORY-810's upgrade-time
+migration writes once, automatically, for any such EXISTING rule it can
+recognise (never for a `jira-project` rule — this migration only ever
+classifies `jira-work` rules, since `jira-project`'s `role` is never read
+to begin with). See `docs/execution-modes.md`'s "Upgrade migration" section
+for exactly what it migrates and what it leaves alone.
 
 ## Optional external tools and messages
 
