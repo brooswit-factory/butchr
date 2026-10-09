@@ -138,7 +138,7 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
       writeGuard: writeGuardDeps(csrf),
       dashboardOriginGuard: { port: 0 },
       peerUidCheck: () => true,
-      rulesWrite: { enabled: onEnabled as any, fields: (() => { throw new Error("unused"); }) as any, undo: (() => { throw new Error("unused"); }) as any, plan: (() => { throw new Error("unused"); }) as any },
+      rulesWrite: { enabled: onEnabled as any, fields: (() => { throw new Error("unused"); }) as any, undo: (() => { throw new Error("unused"); }) as any, plan: (() => { throw new Error("unused"); }) as any, delete: (() => { throw new Error("unused"); }) as any },
       auditWrite: (e: unknown) => { audited.push(e); },
     };
   }
@@ -322,7 +322,7 @@ describe("PUT /api/rules/:id", () => {
       writeGuard: writeGuardDeps(csrf),
       dashboardOriginGuard: { port: 0 },
       peerUidCheck: () => true,
-      rulesWrite: { enabled: (() => { throw new Error("unused"); }) as any, fields: onFields as any, undo: (() => { throw new Error("unused"); }) as any, plan: (() => { throw new Error("unused"); }) as any },
+      rulesWrite: { enabled: (() => { throw new Error("unused"); }) as any, fields: onFields as any, undo: (() => { throw new Error("unused"); }) as any, plan: (() => { throw new Error("unused"); }) as any, delete: (() => { throw new Error("unused"); }) as any },
     };
   }
 
@@ -478,6 +478,7 @@ describe("PUT /api/rules/:id", () => {
           fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => writeRuleFields(id, patch as any, ifMatch, confirm, planHash, noScope, writeDeps)) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
+          delete: (() => { throw new Error("unused"); }) as any,
         },
         auditWrite: (e: unknown) => { audited.push(e); },
       });
@@ -489,6 +490,203 @@ describe("PUT /api/rules/:id", () => {
         expect(res.status).toBe(200);
         const nextDoc = JSON.parse(readFileSync(rulesFilePath, "utf8"));
         expect(nextDoc.rules[0].query).toBe("project = CHANGED");
+        const entries = readdirSync(join(dir, "butchr"));
+        expect(entries.some((e) => e.includes(".bak-"))).toBe(true);
+        expect(audited).toHaveLength(1);
+        expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe("DELETE /api/rules/:id (FACTORY-731) — write guard go-red cases", () => {
+  function buildDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, onDelete: (...a: unknown[]) => RulesWriteOutcome, audited: unknown[] = []) {
+    return {
+      csrf,
+      writeGuard: writeGuardDeps(csrf),
+      dashboardOriginGuard: { port: 0 },
+      peerUidCheck: () => true,
+      rulesWrite: {
+        enabled: (() => { throw new Error("unused"); }) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (() => { throw new Error("unused"); }) as any,
+        delete: onDelete as any,
+      },
+      auditWrite: (e: unknown) => { audited.push(e); },
+    };
+  }
+
+  // Review bar: "Guard chain proven by tests that a no-Origin and a
+  // wrong-Origin delete are both refused."
+  test("forged Origin: 403, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const audited: unknown[] = [];
+    const { app, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }, audited));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules/managers`, {
+        method: "DELETE", headers: { origin: "http://evil.example", host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", confirm: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+      expect(audited.length).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  test("missing Origin: 403, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/rules/managers`, {
+        method: "DELETE", headers: { host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", confirm: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("missing CSRF header: 403, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json" },
+        body: JSON.stringify({ ifMatch: "x", confirm: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("wrong CSRF header: 403, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: "0".repeat(csrf.token.length) },
+        body: JSON.stringify({ ifMatch: "x", confirm: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("peer-uid check fails: 403, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const deps = buildDeps(csrf, () => { called = true; return ACCEPTED; });
+    deps.peerUidCheck = () => false;
+    deps.writeGuard = writeGuardDeps(csrf, false);
+    const { app, origin, host } = startApp(deps);
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", confirm: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("missing ifMatch in body: 400, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ confirm: true }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("all guards pass: 200, write called with the parsed args, response audited as accepted", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let receivedArgs: unknown[] = [];
+    const audited: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, (...a) => { receivedArgs = a; return ACCEPTED; }, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "etag-1", confirm: true }),
+      });
+      expect(res.status).toBe(200);
+      expect(receivedArgs).toEqual(["managers", "etag-1", true]);
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
+    } finally { await app.stop(true); }
+  });
+
+  // The route forwards `confirmReason` structurally (not only in the
+  // message string) so a UI caller can classify the refusal without
+  // parsing text — see `writeRuleDelete`'s own `confirmReason: "rule-delete"`.
+  test("a mandatory-confirm refusal (ok: false, confirmReason: 'rule-delete') reaches the response body's own confirmReason field", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const REFUSED: RulesWriteOutcome = { ok: false, status: 409, error: `delete rule "managers" (query: "x")? resend with confirm: true to proceed`, confirmReason: "rule-delete" };
+    const audited: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, () => REFUSED, audited));
+    try {
+      const res = await fetch(`${origin}/api/rules/managers`, {
+        method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "etag-1", confirm: false }),
+      });
+      expect(res.status).toBe(409);
+      const body = (await res.json()) as { error: string; confirmReason?: string };
+      expect(body.confirmReason).toBe("rule-delete");
+      expect(body.error).toContain("managers");
+      expect(audited).toHaveLength(1);
+      expect((audited[0] as { outcome: string }).outcome).toBe("rejected");
+    } finally { await app.stop(true); }
+  });
+
+  // FACTORY-731 (ticket's own review bar): a full-stack DELETE through the
+  // REAL `writeRuleDelete` (not a mocked outcome) writes atomically with a
+  // backup taken first, and the route audits the accepted write — same
+  // precedent as the PUT route's own "a real PUT edit... writes atomically
+  // with a backup, and is audited" test just above.
+  test("a real DELETE of a disabled, non-ui- rule writes atomically with a backup, and is audited", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rules-write-route-"));
+    try {
+      const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
+      mkdirSync(join(dir, "butchr"), { recursive: true });
+      const rulesFilePath = join(dir, "butchr", "rules.json");
+      const originalText = JSON.stringify({ rules: [{ id: "managers", resourceProvider: "jira-work", query: "project = BUTCHR AND role = manager", brief: "manage it", enabled: false }] }, null, 2) + "\n";
+      writeFileSync(rulesFilePath, originalText);
+      const writeDeps = { env: envDeps };
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const audited: unknown[] = [];
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+        rulesWrite: {
+          enabled: (() => { throw new Error("unused"); }) as any,
+          fields: (() => { throw new Error("unused"); }) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+          delete: ((id: string, ifMatch: string, confirm: boolean) => {
+            const { writeRuleDelete } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
+            return writeRuleDelete(id, ifMatch, confirm, () => false, writeDeps);
+          }) as any,
+        },
+        auditWrite: (e: unknown) => { audited.push(e); },
+      });
+      try {
+        const res = await fetch(`${origin}/api/rules/managers`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, confirm: true }),
+        });
+        expect(res.status).toBe(200);
+        const nextDoc = JSON.parse(readFileSync(rulesFilePath, "utf8"));
+        expect(nextDoc.rules).toEqual([]);
         const entries = readdirSync(join(dir, "butchr"));
         expect(entries.some((e) => e.includes(".bak-"))).toBe(true);
         expect(audited).toHaveLength(1);
@@ -510,6 +708,7 @@ describe("POST /api/undo/:backupId", () => {
         fields: (() => { throw new Error("unused"); }) as any,
         undo: ((backupId: string) => { receivedId = backupId; return ACCEPTED; }) as any,
         plan: (() => { throw new Error("unused"); }) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
       },
       auditWrite: (e: unknown) => { audited.push(e); },
     });
@@ -529,7 +728,7 @@ describe("POST /api/undo/:backupId", () => {
     let called = false;
     const { app, host } = startApp({
       csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
-      rulesWrite: { enabled: (() => { throw new Error("unused"); }) as any, fields: (() => { throw new Error("unused"); }) as any, undo: (() => { called = true; return ACCEPTED; }) as any, plan: (() => { throw new Error("unused"); }) as any },
+      rulesWrite: { enabled: (() => { throw new Error("unused"); }) as any, fields: (() => { throw new Error("unused"); }) as any, undo: (() => { called = true; return ACCEPTED; }) as any, plan: (() => { throw new Error("unused"); }) as any, delete: (() => { throw new Error("unused"); }) as any },
     });
     try {
       const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/undo/20261005T180000Z`, {
@@ -553,6 +752,7 @@ describe("POST /api/rules/plan — report-only", () => {
         fields: (() => { throw new Error("unused"); }) as any,
         undo: (() => { throw new Error("unused"); }) as any,
         plan: (async () => planResult) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
       },
     });
     try {
@@ -584,7 +784,7 @@ describe("B1 — path-shape bypass is closed for every write route", () => {
     `${base}%2f`, // encoded slash appended
   ];
 
-  function buildRefusingDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, called: { enabled: boolean; fields: boolean; undo: boolean }) {
+  function buildRefusingDeps(csrf: ReturnType<typeof createCsrfTokenIssuer>, called: { enabled: boolean; fields: boolean; undo: boolean; delete?: boolean }) {
     return {
       csrf,
       writeGuard: writeGuardDeps(csrf),
@@ -595,6 +795,7 @@ describe("B1 — path-shape bypass is closed for every write route", () => {
         fields: (() => { called.fields = true; return ACCEPTED; }) as any,
         undo: (() => { called.undo = true; return ACCEPTED; }) as any,
         plan: (async () => ({ ok: true, planHash: "h", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "e", requiresConfirm: false })) as any,
+        delete: (() => { called.delete = true; return ACCEPTED; }) as any,
       },
     };
   }
@@ -654,6 +855,21 @@ describe("B1 — path-shape bypass is closed for every write route", () => {
     } finally { await app.stop(true); }
   });
 
+  test("DELETE /api/rules/:id path variants, with NO Origin/CSRF at all: never 200, delete never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const called = { enabled: false, fields: false, undo: false, delete: false };
+    const { app, port } = startApp(buildRefusingDeps(csrf, called));
+    try {
+      for (const path of PATH_VARIANTS("/api/rules/managers")) {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+          method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ ifMatch: "x", confirm: true }),
+        });
+        expect(res.status).not.toBe(200);
+      }
+      expect(called.delete).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
   test("a totally unmapped non-GET path under /api/ is still refused (403), not a bare 404 that would reveal route existence", async () => {
     const csrf = createCsrfTokenIssuer();
     const { app, port } = startApp({ csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true });
@@ -677,6 +893,7 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
         fields: (() => { throw new Error("unused"); }) as any,
         undo: (() => { throw new Error("unused"); }) as any,
         plan: (async () => ({ ok: true, planHash: "h", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "e", requiresConfirm: false })) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
       },
       auditWrite: (e: unknown) => { audited.push(e); },
     };
@@ -743,6 +960,7 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
           fields: (() => { throw new Error("unused"); }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
+          delete: (() => { throw new Error("unused"); }) as any,
         },
       });
       try {
@@ -801,6 +1019,7 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
         fields: (() => { throw new Error("unused"); }) as any,
         undo: (() => { throw new Error("unused"); }) as any,
         plan: (() => { throw new Error("unused"); }) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
       },
     });
     try {
@@ -830,6 +1049,7 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
         fields: (() => { throw new Error("unused"); }) as any,
         undo: (() => { throw new Error("unused"); }) as any,
         plan: (async () => planResult) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
       },
     });
     try {
@@ -878,6 +1098,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
+          delete: (() => { throw new Error("unused"); }) as any,
         },
       });
       try {
@@ -915,6 +1136,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
+          delete: (() => { throw new Error("unused"); }) as any,
         },
       });
       try {

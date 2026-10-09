@@ -580,6 +580,49 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(calls).toContain(`/api/undo/${encodeURIComponent("a/b")}`);
   });
 
+  // FACTORY-731: DELETE /api/rules/:id — same wire shape as setEnabled's own
+  // test above (flat body, CSRF header fetched from /api/session), proving
+  // `deleteRule` never invents a different endpoint or method.
+  test("deleteRule DELETEs to /api/rules/:id with a flat {ifMatch, confirm} body, and the CSRF header fetched from /api/session", async () => {
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ backupId: "b1", etag: "e2", changedIds: ["triage"] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const result = await realRulesApi.deleteRule("triage", "e1", true);
+    expect(result).toEqual({ backupId: "b1", etag: "e2", changedIds: ["triage"] });
+    const writeCall = calls.find((c) => c.url === "/api/rules/triage")!;
+    expect(writeCall.init?.method).toBe("DELETE");
+    expect(JSON.parse(String(writeCall.init?.body))).toEqual({ ifMatch: "e1", confirm: true });
+    expect((writeCall.init?.headers as Record<string, string>)["x-butchr-csrf"]).toBe("tok");
+  });
+
+  // FACTORY-731 (ticket requirement 8, same precedent as FACTORY-725/730
+  // above): the exact bytes `realRulesApi.deleteRule` puts on the wire,
+  // fed straight into the real server's own inline body check
+  // (`src/web/view.ts`'s `DELETE /api/rules/:id` handler: `typeof
+  // b.ifMatch !== "string"`) — there is no separate `validateRuleFieldPatch`-
+  // shaped validator for delete (its body is just `{ifMatch, confirm}`, no
+  // nested patch), so this proves the client and the route agree on THAT
+  // shape instead: a string `ifMatch` and a `confirm` the route reads via
+  // `=== true` (so any JSON value, not only a boolean, is accepted — the
+  // route's own discipline, mirrored here rather than re-invented).
+  test("deleteRule's real wire body is accepted verbatim by the server's own DELETE /api/rules/:id body check", async () => {
+    let wireBody: unknown;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      wireBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    await realRulesApi.deleteRule(FIRST_RULE_ID, "e1", true);
+    const b = wireBody as Record<string, unknown>;
+    expect(typeof b.ifMatch).toBe("string");
+    expect(b.confirm === true).toBe(true);
+  });
+
   test("capabilities.write starts false — the Rules page must render every write control disabled until refreshCapabilities succeeds", () => {
     expect(realRulesApi.capabilities.write).toBe(false);
   });

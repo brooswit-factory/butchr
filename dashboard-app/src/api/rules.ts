@@ -254,6 +254,17 @@ export interface RulesApi {
   /** `POST /api/undo/:backupId` — only ever the backup id a write JUST returned; the server scopes this further (this SAME process's most recent UI write only). */
   undo(backupId: string, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
+   * FACTORY-731 — `DELETE /api/rules/:id`. `confirm` is ALWAYS required by
+   * the server (`writeRuleDelete`'s own unconditional confirm gate) — there
+   * is no plan-then-apply step for delete the way `setEnabled`/
+   * `updateFields` have (no blast-radius count to preview; the server's
+   * refusal, naming the rule's id and query, is itself what a caller shows
+   * before resending with `confirm: true`). Refused (independent of
+   * `confirm`) while the rule is enabled or has a live agent — see
+   * `writeRuleDelete`'s own doc comment.
+   */
+  deleteRule(ruleId: string, ifMatch: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
+  /**
    * Probes `GET /api/session` and updates `capabilities.write` IN PLACE
    * (mutating the SAME object `capabilities` already points at, never
    * reassigning it) before resolving with it. `realRulesApi`: `true` only on
@@ -495,6 +506,8 @@ export const realRulesApi: RulesApi = {
   // real undo call. Confirmed against `test/unit/rules-write-route.test.ts`
   // on `main`, which sends the same `content-type` + `body: "{}"` here.
   undo: (backupId, signal) => request<RuleWriteResult>(`/api/undo/${encodeURIComponent(backupId)}`, { method: "POST", body: {}, csrf: true, signal }),
+  deleteRule: (ruleId, ifMatch, confirm, signal) =>
+    request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "DELETE", body: { ifMatch, confirm }, csrf: true, signal }),
   async refreshCapabilities(signal) {
     try {
       await fetchCsrfToken(signal);
@@ -847,6 +860,27 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
       return commitWrite(state.rules.map((r) => (r.id === ruleId ? updated : r)), [ruleId]);
+    },
+    async deleteRule(ruleId, ifMatch, confirm) {
+      await delay();
+      maybeFail();
+      maybeFailWriteOnce();
+      const rule = findRule(ruleId);
+      checkIfMatch(ifMatch);
+      if (rule.enabled) {
+        throw new Error(`rule "${ruleId}" cannot be deleted while it is enabled — disable it first`);
+      }
+      // Mirrors the real server's `hasLiveAgents` gate (`writeRuleDelete`,
+      // `src/rules/rules-write.ts`) as best a fixture can: `staffed ===
+      // true` is the SAME tri-state fact `GET /api/rules` already reports
+      // for this rule, never a second signal invented here.
+      if (rule.staffed === true) {
+        throw new Error(`rule "${ruleId}" cannot be deleted while it has live agent(s) running — wait for them to finish or stop them first`);
+      }
+      if (!confirm) {
+        throw new Error(`delete rule "${ruleId}" (query: ${JSON.stringify(rule.query)})? resend with confirm: true to proceed`);
+      }
+      return commitWrite(state.rules.filter((r) => r.id !== ruleId), [ruleId]);
     },
     async undo(backupId) {
       await delay();
