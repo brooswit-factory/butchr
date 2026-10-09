@@ -20,7 +20,7 @@ function healthFetch(status: HealthStatus): typeof fetch {
 const HEALTHY: HealthStatus = {
   ok: true,
   components: [{ name: "poll-loop", ok: true, state: "ok", lastSuccessAt: "2026-01-01T00:00:00.000Z", staleForMs: 0 }],
-  build: { sha: "abc1234", shaProvenance: "git-at-start", shaDirty: false, shaUnknownReason: null, version: "1.0.1+204", versionProvenance: "package-json", versionUnknownReason: null, startedAt: "2026-01-01T00:00:00.000Z", pid: 123, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" } as unknown as HealthStatus["build"],
+  build: { sha: "abc1234", shaProvenance: "git-at-start", shaDirty: false, shaUnknownReason: null, version: "1.0.1+204", versionProvenance: "package-json", versionUnknownReason: null, startedAt: "2026-01-01T00:00:00.000Z", pid: 123, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" },
 };
 
 describe("DaemonRoute — FACTORY-668", () => {
@@ -48,7 +48,7 @@ describe("DaemonRoute — FACTORY-668", () => {
 
   test("reload button: success updates the status line with what changed", async () => {
     globalThis.fetch = healthFetch(HEALTHY);
-    const daemonApi = createFixturesDaemonApi({ nextReloadResult: { ok: true, path: "/x/rules.json", added: ["r1"], removed: [], changed: [] } });
+    const daemonApi = createFixturesDaemonApi({ nextReloadResult: { ok: true, path: "/x/rules.json", added: ["r1"], removed: [], changed: [], problems: [] } });
     const settingsApi = createFixturesSettingsApi();
     const { getByTestId } = render(<DaemonRoute api={daemonApi} settingsApi={settingsApi} />);
 
