@@ -51,12 +51,13 @@ describe("LABEL_REGISTRY contents (verified against the code that writes each la
   test("the admission:* family — the one AdmissionLabel value (BUTCHR-352)", () => {
     expect(LABEL_REGISTRY["admission:withheld"]).toBeDefined();
   });
-  test("the two verb-owned labels", () => {
+  test("the three verb-owned labels", () => {
     expect(LABEL_REGISTRY["butchr:shelved"]).toBeDefined();
     expect(LABEL_REGISTRY["butchr:orphan"]).toBeDefined();
+    expect(LABEL_REGISTRY["butchr:missing-implements"]).toBeDefined();
   });
-  test("exactly 12 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
-    expect(REGISTERED_LABELS.size).toBe(12);
+  test("exactly 13 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
+    expect(REGISTERED_LABELS.size).toBe(13);
   });
   // AC-6: this registry describes labels butchr writes; it must never become
   // a list of labels butchr enforces onto tickets it doesn't own.
