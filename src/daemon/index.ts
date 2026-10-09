@@ -47,7 +47,7 @@ import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentCapacityRole } from "../agents/admission.js";
+import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
 import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
@@ -429,6 +429,33 @@ const ruleLizardModeOf = (id: string): boolean =>
 // project agents, `jira-project` agents) and why issue type no longer plays
 // any part here.
 const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
+/**
+ * FACTORY-907 — same decode-then-look-up-by-rule shape as `ruleRoleOfAgent`
+ * immediately above, one field over: resolves a candidate id's own rule
+ * `maxNewPerTick`/`minSecondsBetweenAdmissions` (if either is set) for
+ * `AdmissionControllerDeps.rateLimitOf` (src/agents/admission.ts). `undefined`
+ * for anything unresolved (a legacy/bare-issue agent, a rule since removed,
+ * or a resolvable rule that sets neither field) — unlike `roleOfAgent`,
+ * there is no fail-safe-to-limited default to get wrong here: an id this
+ * cannot resolve simply keeps today's behaviour, same as a resolved rule
+ * that never sets either field (see `RuleRateLimit`'s own doc comment).
+ * BUTCHR-408's managed-session agents have no rule-engine `Rule` of their
+ * own (see `managedSessionRoles`'s own comment above) and so are never
+ * rate-limited by this — out of this ticket's scope, which wires exactly
+ * the rule-engine providers `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * validate for.
+ */
+const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
+  return {
+    ruleId: rule.id,
+    ...(rule.maxNewPerTick !== undefined ? { maxNewPerTick: rule.maxNewPerTick } : {}),
+    ...(rule.minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: rule.minSecondsBetweenAdmissions } : {}),
+  };
+};
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
@@ -702,6 +729,8 @@ const admissionController = createAdmissionController({
   // Rule for every heterogeneous definition file, so it cannot carry a
   // per-file role itself).
   roleOf: roleOfAgent,
+  // FACTORY-907: see `rateLimitOfAgent`'s own doc comment above.
+  rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
   sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
