@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addLink, createLinkStore, listLinks, removeLink, type LinkStore } from "../../src/resources/link-store.js";
+import { addLink, createLinkStore, listAllFileLinks, listLinks, removeLink, type LinkStore } from "../../src/resources/link-store.js";
 import { canonicalKey, parseResourceRef } from "../../src/resources/resource-ref.js";
 
 const ref = (s: string) => parseResourceRef(s);
@@ -128,5 +128,29 @@ describe("unknown-provider entries: preserve-and-ignore", () => {
     await addLink(store, ref("jira-project:FACTORY"), ref("confluence-page:1"));
     const raw = JSON.parse(readFileSync(file, "utf8"));
     expect(raw.links["jira-project:BUTCHR"]).toEqual(["zendesk-ticket:acme#1"]);
+  });
+});
+
+describe("listAllFileLinks (FACTORY-962 — the dashboard links page's bulk read)", () => {
+  test("a missing file reports no entries, never throws", () => {
+    expect(listAllFileLinks(file)).toEqual([]);
+  });
+
+  test("every owner->targets entry is reported, parsed to ResourceRefs", async () => {
+    await addLink(store, ref("jira-work-item:BUTCHR-1"), ref("github-issue:owner/repo#1"));
+    await addLink(store, ref("jira-work-item:BUTCHR-2"), ref("webpage:https://example.com/x"));
+    const entries = listAllFileLinks(file);
+    expect(entries).toHaveLength(2);
+    const byOwner = Object.fromEntries(entries.map((e) => [canonicalKey(e.owner), e.targets]));
+    expect(byOwner["jira-work-item:BUTCHR-1"]).toEqual([ref("github-issue:owner/repo#1")]);
+    expect(byOwner["jira-work-item:BUTCHR-2"]).toEqual([ref("webpage:https://example.com/x")]);
+  });
+
+  test("an owner key or target this build cannot parse is silently omitted, not an error", () => {
+    writeFileSync(file, JSON.stringify({ v: 1, links: { "not-a-real-provider:X": ["confluence-page:1"], "jira-work-item:BUTCHR-1": ["zendesk-ticket:acme#1", "confluence-page:2"] } }));
+    const entries = listAllFileLinks(file);
+    expect(entries).toHaveLength(1);
+    expect(canonicalKey(entries[0]!.owner)).toBe("jira-work-item:BUTCHR-1");
+    expect(entries[0]!.targets).toEqual([ref("confluence-page:2")]);
   });
 });

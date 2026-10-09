@@ -113,6 +113,8 @@ import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
 import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessionDefinitionUndo, type LastUiWriteRef as SessionDefinitionLastUiWriteRef } from "../resources/session-definitions-write.js";
+import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
+import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
@@ -1061,6 +1063,16 @@ const sessionDefinitionsWriteDeps = {
   lastUiWrite: { value: null } as SessionDefinitionLastUiWriteRef,
 };
 
+// FACTORY-962 (epic FACTORY-659, slice D1 follow-up): the links write
+// path's own deps — `path` is the SAME `defaultLinksStorePath()` the
+// `butchr link` CLI and `resourceLinkTools` already read/write, never a
+// second resolution. `lastUiWrite` is its OWN ref (undo scoped to THIS
+// write path only, never shared with `sessionDefinitionsWriteDeps.lastUiWrite`).
+const linksWriteDeps = {
+  path: () => defaultLinksStorePath(),
+  lastUiWrite: { value: null } as LastLinksUiWrite,
+};
+
 // FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
 // caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
 // HTTP exposure of the SAME trigger) are literally the same function —
@@ -1273,6 +1285,19 @@ const { app, mcp } = buildApp({
     fields: (name, patch, ifMatch, confirm) => writeSessionDefinitionFields(sessionDefinitionsWriteDeps, name, patch, ifMatch, confirm),
     frozen: (name, frozen, ifMatch) => writeSessionDefinitionFrozen(sessionDefinitionsWriteDeps, name, frozen, ifMatch),
     undo: (backupId) => writeSessionDefinitionUndo(sessionDefinitionsWriteDeps, backupId),
+  },
+  // FACTORY-962 (epic FACTORY-659, slice D1 follow-up): `GET /api/links`'s
+  // own read — the file-backed link store only (see `listAllFileLinks`'s
+  // own header for why a jira-project-owned link can't be enumerated this
+  // way), read fresh every request, same discipline as `configInventory`.
+  linksRead: () => listAllFileLinks(defaultLinksStorePath()),
+  // FACTORY-962: the links write orchestration (`../resources/links-write.ts`)
+  // — reuses this daemon's own already-constructed `linksWriteDeps` above,
+  // never a second path resolution.
+  linksWrite: {
+    add: (resource, target) => writeLinkAdd(linksWriteDeps, resource, target),
+    remove: (resource, target) => writeLinkRemove(linksWriteDeps, resource, target),
+    undo: (backupId) => writeLinkUndo(linksWriteDeps, backupId),
   },
   auditWrite,
   writeRateLimit,

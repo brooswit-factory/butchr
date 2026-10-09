@@ -21,6 +21,9 @@ import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, t
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import type { SessionDefinitionsWriteOutcome } from "../resources/session-definitions-write.js";
+import type { LinksWriteOutcome } from "../resources/links-write.js";
+import type { FileLinksEntry } from "../resources/link-store.js";
+import { formatResourceRef } from "../resources/resource-ref.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -305,6 +308,35 @@ export interface ViewDeps {
     fields: (name: string, patch: Record<string, unknown>, ifMatch: string, confirm: boolean) => Promise<SessionDefinitionsWriteOutcome>;
     frozen: (name: string, frozen: boolean, ifMatch: string) => Promise<SessionDefinitionsWriteOutcome>;
     undo: (backupId: string) => SessionDefinitionsWriteOutcome;
+  };
+  /**
+   * FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`'s
+   * own read: every owner->targets entry in the butchr-managed FILE link
+   * store (`../resources/link-store.ts`'s `listAllFileLinks`), parsed to
+   * `ResourceRef`s. No secrets here (links are never secret-shaped), so
+   * unlike `settings` below this is never redacted — but a link entry can
+   * name a local filesystem path, so the ROUTE itself still sits behind the
+   * dashboard-origin + same-UID peer guard (review round 1: a config-read
+   * this sensitive never gets a looser check just because `configInventory`
+   * happens to have none). Read FRESH every request, same discipline as
+   * `configInventory`/`rulesFileState`. Optional: an omitted value makes
+   * `GET /api/links` answer 503, never open with an empty list (which
+   * would look identical to "no links exist" and silently hide a
+   * misconfiguration).
+   */
+  linksRead?: () => FileLinksEntry[];
+  /**
+   * FACTORY-962 — the links write orchestration
+   * (`../resources/links-write.ts`). Same "one function per route, already
+   * does its own validation/idempotency/lock checks, returns a tagged
+   * outcome this file maps straight to a status + body" discipline as
+   * `sessionDefinitionsWrite` above. Optional: an omitted value makes every
+   * `/api/links/*` write route answer 503.
+   */
+  linksWrite?: {
+    add: (resource: string, target: string) => Promise<LinksWriteOutcome>;
+    remove: (resource: string, target: string) => Promise<LinksWriteOutcome>;
+    undo: (backupId: string) => LinksWriteOutcome;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -1357,6 +1389,95 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = deps.sessionDefinitionsWrite.undo(backupId);
       auditOutcome(deps, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`:
+    // every owner->targets entry in the butchr-managed link store. Same
+    // guard discipline as `GET /api/daemon/logs`/`GET /api/agents/:issue`
+    // above (dashboard-origin guard + same-UID peer check, checked BEFORE
+    // any work, `Cache-Control: no-store`) — a link entry can name a local
+    // filesystem path, so this read is at least as sensitive as those.
+    .get("/api/links", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.linksRead) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return {
+        links: deps.linksRead().map((entry) => ({
+          owner: formatResourceRef(entry.owner),
+          targets: entry.targets.map((t) => formatResourceRef(t)),
+        })),
+      };
+    })
+    // FACTORY-962 — `POST /api/links/add`: adds `target` to `resource`'s
+    // managed link list. Full write guard chain + shared write rate limit,
+    // same discipline as every other write route in this file.
+    // `../resources/links-write.ts`'s `writeLinkAdd` owns reference
+    // validation, self-link refusal, the jira-project-owner refusal, and
+    // idempotency (already-present is reported, not audited as a
+    // rejected write — it never reaches the backup/lock/write path at all).
+    .post("/api/links/add", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.resource !== "string" || typeof b.target !== "string") {
+        const error = "body must be { resource: string, target: string }";
+        auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.linksWrite.add(b.resource, b.target);
+      auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 — `POST /api/links/remove`: symmetric with `/add` above.
+    .post("/api/links/remove", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.resource !== "string" || typeof b.target !== "string") {
+        const error = "body must be { resource: string, target: string }";
+        auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.linksWrite.remove(b.resource, b.target);
+      auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 — `POST /api/links/undo/:backupId`: B2 scoping, same as
+    // `/api/session-definitions/undo/:backupId` above (own process's last
+    // UI write only, own resulting etag only) — see
+    // `../resources/links-write.ts`'s own header.
+    .post("/api/links/undo/:backupId", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const backupId = decodeURIComponent(params.backupId);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const outcome = deps.linksWrite.undo(backupId);
+      auditOutcome(deps, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })

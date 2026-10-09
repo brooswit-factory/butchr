@@ -62,23 +62,24 @@ export function defaultLinksStorePath(): string {
   return process.env.BUTCHR_LINKS_STORE_FILE?.trim() || join(workspaceRoot(), ".links.json");
 }
 
-interface LinksFile {
+export interface LinksFile {
   v: number;
   links: Record<string, string[]>;
 }
 
-function emptyFile(): LinksFile {
+export function emptyLinksFile(): LinksFile {
   return { v: LINKS_STORE_VERSION, links: {} };
 }
 
-function readFile(path: string): LinksFile {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === "ENOENT") return emptyFile();
-    throw e;
-  }
+/**
+ * The shape-validation half of `readFile` below, pulled out so a caller that
+ * already has the raw text in hand (FACTORY-962's web write path, which
+ * reads it once inside `write-json-file.ts`'s own lock) can validate it
+ * without a second `readFileSync` of the same path — never a second,
+ * drifted copy of what counts as a well-formed links file. Throws on any
+ * malformed input; `emptyFile()`'s own shape always passes.
+ */
+export function parseLinksFileText(raw: string, path: string): LinksFile {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -102,6 +103,17 @@ function readFile(path: string): LinksFile {
     out[owner] = targets as string[];
   }
   return { v, links: out };
+}
+
+function readFile(path: string): LinksFile {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return emptyLinksFile();
+    throw e;
+  }
+  return parseLinksFileText(raw, path);
 }
 
 function writeFile(path: string, file: LinksFile): void {
@@ -185,4 +197,40 @@ export async function removeLink(store: LinkStore, resource: ResourceRef, target
   const targetKey = canonicalKey(target);
   const removed = await store.remove(ownerKey, targetKey);
   return removed ? { ok: true, removed: true } : { ok: true, removed: false, reason: "not-present" };
+}
+
+export interface FileLinksEntry {
+  owner: ResourceRef;
+  targets: ResourceRef[];
+}
+
+/**
+ * FACTORY-962 — the dashboard links page's own read: every owner->targets
+ * entry currently in the FILE-backed store, parsed to `ResourceRef`s.
+ * Deliberately reads `path` directly rather than going through a
+ * `LinkStore` (whose `list(ownerKey)` interface has no "list every owner"
+ * method, by design — see this module's header): there is no existing
+ * precedent anywhere in this codebase (CLI included) for enumerating every
+ * owner across BOTH the file store and the Jira-project-property store
+ * (`./jira-project-link-store.ts`), since the latter has no "list all
+ * projects with links" Jira call to begin with. This function is therefore
+ * scoped to the file store only, same scope `./links-write.ts`'s write path
+ * already documents for the same reason. An owner key or target string this
+ * build's `resource-ref.ts` can't parse is silently omitted (not an error),
+ * same discipline `listLinks` above already applies per-entry.
+ */
+export function listAllFileLinks(path: string): FileLinksEntry[] {
+  const file = readFile(path);
+  const out: FileLinksEntry[] = [];
+  for (const [ownerKey, targetKeys] of Object.entries(file.links)) {
+    const owner = tryParseResourceRef(ownerKey);
+    if (!owner) continue;
+    const targets: ResourceRef[] = [];
+    for (const t of targetKeys) {
+      const parsed = tryParseResourceRef(t);
+      if (parsed) targets.push(parsed);
+    }
+    out.push({ owner, targets });
+  }
+  return out;
 }
