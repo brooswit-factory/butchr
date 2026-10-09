@@ -145,6 +145,23 @@ describe("the wake matrix a stood-down agent is PROMISED (stand_down's descripti
     expect(asleepAfter).toBe(true);
   });
 
+  // FACTORY-948/949/964: the ONE exception carved back into the "a worker's
+  // agent:* flip alone does not wake you" promise just above — a flip
+  // specifically TO `agent:blocked` is never routine child activity, and
+  // FACTORY-964 folded it into the related-space allowlist (src/resources/
+  // issue.ts's `relatedAllows`) as an explicitly allowed case rather than
+  // leaving it to fall into "everything else". stand_down's own tool
+  // description and this file's top comment now make this a documented
+  // promise too — if this ever goes red because the boss did NOT wake, the
+  // description must be narrowed back, not this assertion weakened.
+  test("WAKES (as of FACTORY-948/949/964): a worker's agent:* flip specifically TO agent:blocked", async () => {
+    const { asleepBefore, asleepAfter } = await bossSleepsThen((store) => {
+      store[WORKER] = { ...store[WORKER]!, labels: ["agent:blocked", "pr:open"], updated: "2026-09-11T02:00:00.000Z" };
+    });
+    expect(asleepBefore).toBe(true);
+    expect(asleepAfter).toBe(false);
+  });
+
   test("WAKES: a worker's status change — the event a waiting boss actually cares about (reaching In Review)", async () => {
     const { asleepBefore, asleepAfter } = await bossSleepsThen((store) => {
       store[WORKER] = { ...store[WORKER]!, status: "In Review", updated: "2026-09-11T02:00:00.000Z" };

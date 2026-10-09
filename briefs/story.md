@@ -320,6 +320,11 @@ still applies to it unconditionally.)
 - a **status change on {{KEY}} itself** — always, unconditionally; **a
   task reaching In Review or Done** — always; any OTHER status change on a
   task (e.g. To Do -> In Progress) does not wake you on its own;
+- a **task's `agent:*` label flipping specifically TO `agent:blocked`** —
+  always (debounced per ticket, deduped against the daemon's own
+  `[butchr:blocked]` marker for the same episode); every OTHER `agent:*`
+  flip on a task (idle/working/stalled, or unblocking back out of
+  `agent:blocked`) does not wake you on its own;
 - a **summary edit on {{KEY}} itself** — always; a summary edit on a
   task no longer wakes you on its own;
 - a **`pr:*` review-state transition on YOUR OWN ticket** — always (never
@@ -332,7 +337,8 @@ still applies to it unconditionally.)
   task no longer wakes you.
 
 **What does NOT wake you:** a daemon label change on a TASK's ticket on its
-own — its `agent:working`/`agent:idle` flips, a `pr:*` transition on the
+own, EXCEPT the `agent:blocked` flip named above — every other `agent:*`
+flip (its `agent:working`/`agent:idle` states), a `pr:*` transition on the
 TASK's ticket unaccompanied by a boss-addressed comment, and now also a
 task's summary/assignee/description/issuelinks edit, or any comment on a
 task that isn't addressed to you. That is deliberate (those flip constantly,
@@ -340,8 +346,8 @@ or are routine child activity, and would wake you for nothing), and it is
 why the list above matters: if you are waiting specifically to see a task's
 PR label move, or expecting every comment on a task's ticket to wake you,
 you are waiting for something that will not. In practice the events you
-actually wait for — a task reaching In Review, a task asking you something,
-an escalation — are all in the waking list.
+actually wait for — a task reaching In Review, a task going blocked, a task
+asking you something, an escalation — are all in the waking list.
 
 A missed or wrongly-suppressed edge is
 bounded, not silent forever: you will be forced awake again after a maximum

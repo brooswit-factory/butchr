@@ -202,14 +202,12 @@ describe("FACTORY-954 table 6: routine non-comment diffs never reach the Story b
   // the general classifier directly, which checks `label` BEFORE `summary`
   // (this module's own documented precedence) — so this is the one case
   // this ticket's own gate, not the pre-existing suppression stack, is what
-  // actually blocks delivery for `related`. THE FACTORY-948/949 INTERACTION
-  // (per FACTORY-954's own ticket comment): a sibling story is concurrently
-  // carving an agent:*->agent:blocked transition out of suppression for
-  // delivery on this exact edge; that carve-out is NOT present at this
-  // ticket's base commit (grepped — see src/resources/issue.ts's own
-  // `deliverToRelated` doc comment) so it is NOT specially allowed here
-  // either, by design, until whichever of these two tickets lands second
-  // reconciles with the other.
+  // actually blocks delivery for `related`. This is a routine agent:working
+  // -> agent:idle flip, NOT the agent:*->agent:blocked transition — that one
+  // is FACTORY-948/949's carve-out, folded into `relatedAllows` as an
+  // explicitly allowed `blocked` case by FACTORY-964 (see the "FACTORY-964:
+  // the folded-in blockedWake carve-out" block below) and reached via its
+  // own dedicated `decide()` branch, never via this general-classifier path.
   test("a label transition that escapes suppression (paired with a summary change) still -> nobody for related — the classifier names it `label`, checked before `summary`", async () => {
     const store = commentStore();
     const before = issue({ key: "TASK-1", labels: ["agent:working"], summary: "old", updated: "t0" });
@@ -280,5 +278,109 @@ describe("FACTORY-954: primary space stays byte-identical — every reason this 
     const after = issue({ key: "TASK-1", updated: "t1" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     expect((await poll.decide("TASK-1", "TASK-1", "primary")).deliver).toBe(true);
+  });
+});
+
+/**
+ * FACTORY-964: the folded-in blockedWake carve-out. FACTORY-948/949 added an
+ * agent:*->agent:blocked daemon-label transition that wakes the immediate
+ * boss on the RELATED edge only, outside this allowlist (it bypassed
+ * `deliverToRelated` entirely via a direct `finalize` call, because at
+ * FACTORY-949's own base commit this allowlist did not exist yet).
+ * FACTORY-951's own related-space allowlist (table 6 above) was built
+ * against an OLDER main that predates FACTORY-949, so without this fold-in
+ * a blocked transition falls into "everything else" under `relatedAllows`
+ * and silently regresses to `deliver: false` — exactly the regression
+ * FACTORY-947 flagged on PR #762. This block pins: the allowlist now names
+ * `{ blocked }` as an explicitly allowed case (not a bypass), the immediate
+ * boss still gets woken, a routine (non-blocked) agent:* flip and an
+ * unblocking flip both stay silent, and the primary space never sees the
+ * blocked reason at all — table-driven per the ticket's own instruction,
+ * sharing the `setupRelated`/`issue` fixtures table 1-7 already use above.
+ */
+describe("FACTORY-964: the blockedWake carve-out is folded into the related-space allowlist as an explicit case", () => {
+  test("agent:working -> agent:blocked on the related edge wakes the immediate boss, named by `blocked`", async () => {
+    const store = commentStore();
+    const before = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t0" });
+    const after = issue({ key: "TASK-1", labels: ["agent:blocked"], updated: "t1" });
+    const { poll } = await setupRelated(store, "STORY-1", "TASK-1", before, after);
+    const verdict = await poll.decide("TASK-1", "STORY-1", "related");
+    expect(verdict).toEqual({ deliver: true, reason: { blocked: { key: "TASK-1" } } });
+  });
+
+  test("no agent:* label (none) -> agent:blocked on the related edge also wakes the immediate boss", async () => {
+    const store = commentStore();
+    const before = issue({ key: "TASK-1", labels: [], updated: "t0" });
+    const after = issue({ key: "TASK-1", labels: ["agent:blocked"], updated: "t1" });
+    const { poll } = await setupRelated(store, "STORY-1", "TASK-1", before, after);
+    const verdict = await poll.decide("TASK-1", "STORY-1", "related");
+    expect(verdict).toEqual({ deliver: true, reason: { blocked: { key: "TASK-1" } } });
+  });
+
+  test("agent:blocked -> agent:working (unblocking) on the related edge stays silent — blockedTransition only fires moving INTO blocked", async () => {
+    const store = commentStore();
+    const before = issue({ key: "TASK-1", labels: ["agent:blocked"], updated: "t0" });
+    const after = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t1" });
+    const { poll } = await setupRelated(store, "STORY-1", "TASK-1", before, after);
+    expect((await poll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false);
+  });
+
+  test("agent:idle -> agent:working (routine, never touching blocked) on the related edge stays silent", async () => {
+    const store = commentStore();
+    const before = issue({ key: "TASK-1", labels: ["agent:idle"], updated: "t0" });
+    const after = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t1" });
+    const { poll } = await setupRelated(store, "STORY-1", "TASK-1", before, after);
+    expect((await poll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false);
+  });
+
+  test("the SAME agent:*->agent:blocked transition on the primary edge never fires the blocked reason — blockedWake is gated to space===\"related\" only", async () => {
+    const store = commentStore();
+    const rules = createIssueEventRules({ comments: store.comments });
+    const before = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t0" });
+    const seed = await rules.poll({ primary: [], related: [] }, { primary: [before], related: [] });
+    await seed.decide("TASK-1", "TASK-1", "primary");
+    const after = issue({ key: "TASK-1", labels: ["agent:blocked"], updated: "t1" });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("TASK-1", "TASK-1", "primary");
+    expect(verdict.deliver).toBe(false);
+    if (verdict.deliver) expect(verdict.reason).not.toEqual({ blocked: { key: "TASK-1" } });
+  });
+
+  test("a Story's agent:*->agent:blocked transition wakes its Epic boss too — same decide(), one tier up", async () => {
+    const store = commentStore();
+    const before = issue({ key: "STORY-1", issuetype: "Story", labels: ["agent:working"], updated: "t0" });
+    const after = issue({ key: "STORY-1", issuetype: "Story", labels: ["agent:blocked"], updated: "t1" });
+    const { poll } = await setupRelated(store, "EPIC-1", "STORY-1", before, after);
+    const verdict = await poll.decide("STORY-1", "EPIC-1", "related");
+    expect(verdict).toEqual({ deliver: true, reason: { blocked: { key: "STORY-1" } } });
+  });
+
+  test("debounce: a re-flip into blocked within the debounce window does not re-fire a second wake on the related edge", async () => {
+    const store = commentStore();
+    const rules = createIssueEventRules({ comments: store.comments, blockedWakeDebounceMinutes: 10 });
+    const bossIssue = issue({ key: "STORY-1" });
+    const working = issue({ key: "TASK-1", labels: ["agent:working"] });
+    const blocked = issue({ key: "TASK-1", labels: ["agent:blocked"] });
+    const relWorking = { issue: working, watchers: ["STORY-1"] };
+    const relBlocked = { issue: blocked, watchers: ["STORY-1"] };
+    await rules.poll({ primary: [], related: [] }, { primary: [bossIssue], related: [relWorking] });
+    const firstPoll = await rules.poll({ primary: [bossIssue], related: [relWorking] }, { primary: [bossIssue], related: [relBlocked] });
+    const firstVerdict = await firstPoll.decide("TASK-1", "STORY-1", "related");
+    expect(firstVerdict).toEqual({ deliver: true, reason: { blocked: { key: "TASK-1" } } });
+
+    // Flap: blocked -> working -> blocked again, inside the debounce window.
+    const secondPoll = await rules.poll({ primary: [bossIssue], related: [relBlocked] }, { primary: [bossIssue], related: [relWorking] });
+    expect((await secondPoll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false);
+    const thirdPoll = await rules.poll({ primary: [bossIssue], related: [relWorking] }, { primary: [bossIssue], related: [relBlocked] });
+    expect((await thirdPoll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false); // same episode, inside the window
+  });
+
+  test("dedup: a [butchr:blocked] marker already posted for this episode suppresses the related-edge wake too", async () => {
+    const postedAt = new Date().toISOString();
+    const store = commentStore({ "TASK-1": [row("m1", "[butchr:blocked] TASK-1 is waiting on a decision:\n...", postedAt)] });
+    const before = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t0" });
+    const after = issue({ key: "TASK-1", labels: ["agent:blocked"], updated: "t1" });
+    const { poll } = await setupRelated(store, "STORY-1", "TASK-1", before, after);
+    expect((await poll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false);
   });
 });
