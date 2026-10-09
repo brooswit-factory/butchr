@@ -24,6 +24,7 @@ import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discove
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
 import { createLinkedEventingState, effectiveMaxLinkedItems, type LinkedEventingDeps, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
+import { topologySuppressedLine } from "../jira-watch/suppressed-log.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -204,11 +205,35 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
  * BUTCHR-390: that tiebreak is arbitrary and only becomes visible the day a
  * fleet runs overlapping rules; it is tracked there, not settled here.
  */
+/**
+ * FACTORY-947/952: a Task-tier implementer's `Implements` link must stop at
+ * its immediate boss (a Story) — it may never be routed straight to an
+ * Epic, two tiers up by this fleet's Epic->Story->Task convention. Measured
+ * live on this fleet (FACTORY-955's own ticket comment carries the journal
+ * line): a Task adopted directly by an Epic via `adopt_worker`, because the
+ * Task had no Story boss to adopt it, produces EXACTLY the same link shape
+ * as a genuine mislink — `implementsEdge` below cannot (and is not asked to)
+ * tell the two apart, and rejects both the same way, by design: whatever
+ * created the link, an Epic hearing a Task's routine/marker events directly
+ * is the two-hop leak this ticket exists to close.
+ *
+ * Deliberately NARROW, not a general N-tier hierarchy validator: Jira's own
+ * `hierarchyLevel` cannot distinguish Story from Task (both report `0` on
+ * this fleet's issue types; only Epic reports `1`), so this checks the
+ * issue-type NAME directly, and only for the one pair FACTORY-947 actually
+ * measured. A Bug or Sub-task implementing anything, or a Story/Epic pair,
+ * is untouched — out of this ticket's scope, not evaluated here either way.
+ */
+function isStrayTaskToEpic(implementerType: string, bossType: string): boolean {
+  return implementerType === "Task" && bossType === "Epic";
+}
+
 export function relatedForRules(
   rules: readonly Rule[],
   matches: readonly RuleMatch[],
   active: readonly string[],
   foreign: readonly JiraIssue[] = [],
+  log?: (line: string) => void,
 ): RelatedResource<RuleMatch>[] {
   const activeSet = new Set(active);
   const byId = new Map(rules.map((r) => [r.id, r]));
@@ -247,6 +272,13 @@ export function relatedForRules(
     }];
   };
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
+  // FACTORY-952: the SAME (sourceKey, listenerKey) edge is reached from BOTH
+  // ends' own issuelinks scan below (the implementer's inward link and the
+  // boss's outward link name the identical pair) — `record`'s own `watchers`
+  // Set already absorbs that duplication for a delivered edge; a REJECTED
+  // one has no Set to land in, so this dedupes the log line the same way,
+  // by (sourceKey, live watcher key), not per scan.
+  const loggedTopologyRejections = new Set<string>();
   // BUTCHR-406: takes the WATCHER'S KEY directly (already resolved to the
   // live agent key by the caller), not a `RuleMatch` — `record` no longer
   // decides which key names the listener, `implementsEdge`/`relatesEdge` do.
@@ -275,7 +307,21 @@ export function relatedForRules(
     for (const listener of byIssue.get(listenerKey) ?? []) {
       const live = liveAgentKeyFor(listener);
       if (!activeSet.has(listener.agentKey) && !activeSet.has(live)) continue;
-      for (const source of sourcesFor(sourceKey, listener)) record(sourceKey, live, source);
+      for (const source of sourcesFor(sourceKey, listener)) {
+        // FACTORY-952: one-hop-only boss routing — see isStrayTaskToEpic's
+        // own doc comment. Rejected, not silently dropped: logged so the
+        // mislink/stray-adoption is visible rather than indistinguishable
+        // from "nothing changed".
+        if (isStrayTaskToEpic(source.issue.issuetype, listener.issue.issuetype)) {
+          const dedupeKey = `${sourceKey}|${live}`;
+          if (!loggedTopologyRejections.has(dedupeKey)) {
+            loggedTopologyRejections.add(dedupeKey);
+            log?.(topologySuppressedLine(sourceKey, live, source.issue.issuetype, listener.issue.issuetype));
+          }
+          continue;
+        }
+        record(sourceKey, live, source);
+      }
     }
   };
   /** `Relates` is symmetric in Jira, so ONLY configuration decides direction across it — unchanged (BUTCHR-406: same live-key fix as `implementsEdge` above). */
@@ -554,7 +600,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
             deps.log?.(`  WARNING: [related] cross-rule fetch failed for ${wanted.length} key(s), hearing same-rule tickets only this poll: ${(e as Error)?.message ?? e}`);
           }
         }
-        const crossRule = relatedForRules(deps.rules, latest, active, foreign);
+        const crossRule = relatedForRules(deps.rules, latest, active, foreign, deps.log);
         const wrap = (rs: readonly RelatedResource<RuleMatch>[]): RelatedResource<ExecutionUnit<RuleMatch>>[] =>
           rs.map((r) => ({ issue: { kind: "resource" as const, match: r.issue }, watchers: r.watchers }));
         // BUTCHR-436: linked-change eventing runs here — AFTER `reconcileNow`
