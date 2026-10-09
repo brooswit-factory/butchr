@@ -496,6 +496,7 @@ export interface Rule {
    * Absent: today's behaviour exactly, unchanged.
    */
   minSecondsBetweenAdmissions?: number;
+  /**
    * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — opts this rule's
    * agent(s) into resuming their prior Claude session on a respawn that
    * follows an UNINTENDED stop (crash, daemon restart, wedge, pane death),
