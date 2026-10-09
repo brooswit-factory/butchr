@@ -62,7 +62,7 @@ function sliceAfter(marker: string, length = 600): string {
 
 describe("named per-seam checks", () => {
   test("jira-work rule engine (notifyRuleAgent)", () => {
-    const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1100);
+    const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1300);
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
