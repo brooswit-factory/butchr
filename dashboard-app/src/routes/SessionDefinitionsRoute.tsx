@@ -150,7 +150,7 @@ export function SessionDefinitionsRoute({ api = sessionDefinitionsApi }: Session
                         {entry.manifestFrozen ? "Unfreeze" : "Freeze"}
                       </Button>
                       {rowError[entry.name] ? (
-                        <Alert variant="error">
+                        <Alert status="error">
                           <AlertText>{rowError[entry.name]}</AlertText>
                         </Alert>
                       ) : null}

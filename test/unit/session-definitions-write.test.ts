@@ -191,7 +191,7 @@ describe("writeSessionDefinitionFrozen — two freeze gates, order, and the writ
     const path = join(dir, "a.json");
     const etag = jsonFileEtag(path);
     const outcome = await writeSessionDefinitionFrozen(deps(), "a.json", true, etag);
-    expect(outcome.ok && outcome.backupId).toBeTruthy();
+    expect(outcome.ok && !outcome.requiresConfirm && outcome.backupId).toBeTruthy();
   });
 });
 
