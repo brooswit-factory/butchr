@@ -9,8 +9,8 @@ import type { GithubIssue } from "../../src/resources/github-issue.js";
 
 /**
  * FACTORY-865/FACTORY-866 (ticket scope item H): "every provider" from
- * FACTORY-864's own text is vacuous for three of four — butchr's agent:*/pr:*
- * label sync writes through a Jira-only writer (SyncDeps.jira,
+ * FACTORY-864's own text is vacuous for three of four — butchr's agent:* and
+ * pr:* label sync writes through a Jira-only writer (SyncDeps.jira,
  * src/labels/sync.ts), so those labels exist ONLY on Jira issues; GitHub
  * label changes are a human/external act and MUST keep firing; Zendesk and
  * filesystem resources have no label dimension at all. This file PINS that
@@ -22,7 +22,7 @@ import type { GithubIssue } from "../../src/resources/github-issue.js";
  * What would make each half of this file FAIL, stated up front:
  * - The SyncDeps test fails the moment a second label-writing dependency
  *   (github/zendesk/filesystem) is added to SyncDeps in src/labels/sync.ts,
- *   which is exactly the change that would make an agent:*/pr:* label
+ *   which is exactly the change that would make an agent:* or pr:* label
  *   writable on a non-Jira provider.
  * - The GitHub test fails if `createGithubIssueEventRules`' own label-change
  *   detection stops firing — e.g. if a future change folded GitHub's own

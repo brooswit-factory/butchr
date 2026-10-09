@@ -5,7 +5,7 @@ import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
 
 /**
  * FACTORY-865/FACTORY-866: butchr's own `[butchr:*]` bookkeeping comments
- * must not defeat daemon-label-only (agent:*/pr:*) notify suppression on
+ * must not defeat daemon-label-only (agent:* / pr:*) notify suppression on
  * the Jira issue tier (`createIssueEventRules`, src/resources/issue.ts).
  *
  * Criterion B is THE regression test: a bare agent:*-label-only diff is
