@@ -37,9 +37,11 @@ export interface RulesTableProps {
   onToggle: (row: RuleRowView) => void;
   /** FACTORY-730 — opens the generic edit dialog (`RuleEditDialog.tsx`) for this row's rule. */
   onEdit: (row: RuleRowView) => void;
+  /** FACTORY-731 — opens `RuleDeleteConfirmDialog.tsx` for this row's rule. Server-enforced refusals (enabled, live agent) are the authority; the button is only disabled here as a courtesy — see `title` below. */
+  onDelete: (row: RuleRowView) => void;
 }
 
-export function RulesTable({ rows, canWrite, onPreview, onToggle, onEdit }: RulesTableProps) {
+export function RulesTable({ rows, canWrite, onPreview, onToggle, onEdit, onDelete }: RulesTableProps) {
   return (
     <div className="rules-table" role="table" aria-label="rules">
       {rows.map((row) => {
@@ -79,6 +81,11 @@ export function RulesTable({ rows, canWrite, onPreview, onToggle, onEdit }: Rule
               <span title={!canWrite ? "needs the write API" : undefined}>
                 <Button size="small" variant="minimal" isDisabled={!canWrite} onPress={() => onEdit(row)}>
                   Edit
+                </Button>
+              </span>
+              <span title={!canWrite ? "needs the write API" : row.rule.enabled ? "disable this rule first" : row.rule.staffed === true ? "wait for its live agent(s) to finish or stop them first" : undefined}>
+                <Button size="small" variant="minimal" isDisabled={!canWrite || row.rule.enabled || row.rule.staffed === true} onPress={() => onDelete(row)}>
+                  Delete
                 </Button>
               </span>
               <span className="rules-table__toggle" title={toggleTitle}>

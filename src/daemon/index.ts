@@ -112,7 +112,7 @@ import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
-import { buildQueryAgentInventory } from "../agents/query-agent-inventory.js";
+import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
@@ -136,7 +136,7 @@ import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { readUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
@@ -1078,7 +1078,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports()),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1201,6 +1201,12 @@ const { app, mcp } = buildApp({
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+    // FACTORY-731: `hasLiveAgents` reads the SAME poll-fed
+    // `dashboardFeed.snapshot().rows` every other "is this rule staffed"
+    // check in this daemon already reads (`ruleHasLiveAgent`'s own doc
+    // comment, `../agents/query-agent-inventory.ts`, names the exact race
+    // this accepts) — never a fresh census of its own.
+    delete: (id, ifMatch, confirm) => writeRuleDelete(id, ifMatch, confirm, (ruleId) => ruleHasLiveAgent(ruleId, dashboardFeed.snapshot().rows), rulesWriteDeps),
   },
   auditWrite,
   writeRateLimit,
@@ -1996,6 +2002,10 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
 };
 
+// FACTORY-922: lifetime count of `decide()`'s skip-not-notify fallback —
+// see `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+let commentChecksSkipped = 0;
+
 const ruleResourceType = createRuleResourceType({
   rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
@@ -2008,6 +2018,9 @@ const ruleResourceType = createRuleResourceType({
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
+  // FACTORY-922: the `/health` counter's one writer — see
+  // `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+  onCommentCheckSkipped: () => { commentChecksSkipped++; },
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see

@@ -5,6 +5,7 @@ import type { Herd, SpawnSpec } from "../agents/herd.js";
 import { RESTORED_PANE_STALE_REASON_PREFIX } from "../agents/herd.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
+import type { SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
 import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
@@ -75,6 +76,8 @@ export interface LoopDeps {
   comments?: (key: string) => Promise<readonly JiraComment[]>;
   /** Free-text daemon log line, e.g. the storm guard's suppression WARNING. Optional; omitted, that line is simply never emitted. */
   log?: (line: string) => void;
+  /** FACTORY-922: threaded straight through to `createIssueEventRules` — see `IssueResourceDeps.onCommentCheckSkipped`'s own doc comment. */
+  onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
   /**
@@ -1357,6 +1360,7 @@ export function startLoop(deps: LoopDeps): Stop {
       // and lets a test spy on `deps.log` to assert on suppression lines
       // the same way it already can for every other daemon log line.
       ...(deps.log ? { log: deps.log } : {}),
+      ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
     }),
     spawnConfig: ISSUE_SPAWN_CONFIG,
   };
