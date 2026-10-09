@@ -350,7 +350,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped" | "blockedWakeDebounceMinutes">): EventRules<JiraIssue> {
   // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
   // only this — never a direct `process.stdout`/`process.stderr` write. The
   // default is a fresh closure that looks up `console.error` at CALL time

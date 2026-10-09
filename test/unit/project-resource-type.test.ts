@@ -1232,8 +1232,7 @@ describe("FACTORY-949: the project's manager wakes on a ticket's agent:blocked t
     const after = project({ observedVersion: 6, observedBlockedKeys: ["ACME-1"] }); // same blocked key, but version moved
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict.deliver).toBe(true); // via projectVerdict's versionBehind axis, not the blocked axis
-    expect(verdict.reason).toBeUndefined();
+    expect(verdict).toEqual({ deliver: true }); // via projectVerdict's versionBehind axis, not the blocked axis — no reason attached
   });
 });
 
