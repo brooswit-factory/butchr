@@ -1174,7 +1174,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -2224,6 +2224,11 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
 // see `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
 let commentChecksSkipped = 0;
 
+// FACTORY-972: lifetime counts of the `agent:stalled` boss wake — see
+// `stalledWakes`/`stalledWakesCapped`'s own doc comments (src/daemon/health.ts).
+let stalledWakes = 0;
+let stalledWakesCapped = 0;
+
 const ruleResourceType = createRuleResourceType({
   rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
@@ -2242,6 +2247,15 @@ const ruleResourceType = createRuleResourceType({
   // FACTORY-949: the boss-wake debounce window — see
   // `Config.blockedWakeDebounceMinutes`'s own doc comment.
   blockedWakeDebounceMinutes: config.blockedWakeDebounceMinutes,
+  // FACTORY-972: the boss stalled-wake debounce/cap — see
+  // `Config.stalledWakeDebounceMinutes`/`stalledWakeMaxPerHour`'s own doc
+  // comments.
+  stalledWakeDebounceMinutes: config.stalledWakeDebounceMinutes,
+  stalledWakeMaxPerHour: config.stalledWakeMaxPerHour,
+  // FACTORY-972: the `/health` counters' one writer each — see
+  // `stalledWakes`/`stalledWakesCapped`'s own doc comments (src/daemon/health.ts).
+  onStalledWake: () => { stalledWakes++; },
+  onStalledWakeCapped: () => { stalledWakesCapped++; },
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see

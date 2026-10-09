@@ -195,7 +195,8 @@ export type NotifyReason =
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
   | { linked: { events: readonly LinkedChangeEvent[] } }
   | { definitionField: { brief?: string; workingDirectory?: string } }
-  | { blocked: { key: string } };
+  | { blocked: { key: string } }
+  | { stalled: { key: string } };
 
 /**
  * FACTORY-949 (implementing story FACTORY-948): `blocked` names the
@@ -214,6 +215,16 @@ export type NotifyReason =
  *   PROJECT, never the blocked ticket) — `key` is the only way this
  *   delivery can name WHICH of the project's tickets just went
  *   `agent:blocked`.
+ */
+
+/**
+ * FACTORY-972 (story FACTORY-971, extending `blocked` above): `stalled`
+ * names the SPECIFIC ticket (`key`) whose `agent:*` label just transitioned
+ * to `agent:stalled` — same two producers, same two audiences, same reason
+ * `key` is always named explicitly (never relied on the `about` argument)
+ * as `blocked` above: `src/resources/issue.ts`'s `decide()` on the related
+ * space (the boss), and `src/resources/project.ts`'s
+ * `createProjectEventRules` on the primary space (the project manager).
  */
 
 /**

@@ -129,6 +129,7 @@ function project(overrides: Partial<ProjectResource> = {}): ProjectResource {
     observedCommentIds,
     watermark,
     observedBlockedKeys: overrides.observedBlockedKeys ?? [],
+    observedStalledKeys: overrides.observedStalledKeys ?? [],
     ...overrides,
   };
 }

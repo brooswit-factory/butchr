@@ -85,6 +85,21 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
   });
 
+  test("FACTORY-972: stalledWakeDebounceMinutes defaults to 30, honours BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).stalledWakeDebounceMinutes).toBe(30);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "45" }, noRead).stalledWakeDebounceMinutes).toBe(45);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES/);
+  });
+
+  test("FACTORY-972: stalledWakeMaxPerHour defaults to 6, honours BUTCHR_STALLED_WAKE_MAX_PER_HOUR, and rejects a non-positive or fractional value", () => {
+    expect(loadConfig(base, noRead).stalledWakeMaxPerHour).toBe(6);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "3" }, noRead).stalledWakeMaxPerHour).toBe(3);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "0" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "1.5" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+  });
+
   test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
     expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
     expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");

@@ -97,6 +97,14 @@ export interface RuleResourceDeps {
   linkStore?: LinkedEventingDeps["linkStore"];
   /** FACTORY-949: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
   blockedWakeDebounceMinutes?: IssueResourceDeps["blockedWakeDebounceMinutes"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.stalledWakeDebounceMinutes`'s own doc comment. */
+  stalledWakeDebounceMinutes?: IssueResourceDeps["stalledWakeDebounceMinutes"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment. */
+  stalledWakeMaxPerHour?: IssueResourceDeps["stalledWakeMaxPerHour"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onStalledWake`'s own doc comment. */
+  onStalledWake?: IssueResourceDeps["onStalledWake"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onStalledWakeCapped`'s own doc comment. */
+  onStalledWakeCapped?: IssueResourceDeps["onStalledWakeCapped"];
 }
 
 /**
@@ -470,6 +478,10 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         ...(deps.log ? { log: deps.log } : {}),
         ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
         ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
+        ...(deps.stalledWakeDebounceMinutes !== undefined ? { stalledWakeDebounceMinutes: deps.stalledWakeDebounceMinutes } : {}),
+        ...(deps.stalledWakeMaxPerHour !== undefined ? { stalledWakeMaxPerHour: deps.stalledWakeMaxPerHour } : {}),
+        ...(deps.onStalledWake ? { onStalledWake: deps.onStalledWake } : {}),
+        ...(deps.onStalledWakeCapped ? { onStalledWakeCapped: deps.onStalledWakeCapped } : {}),
       });
       inner.set(rule.id, rules);
     }

@@ -97,6 +97,18 @@ export function blockedTransition(before: JiraIssue, after: JiraIssue): boolean 
   return agentLabelValue(before) !== "blocked" && agentLabelValue(after) === "blocked";
 }
 
+/**
+ * FACTORY-972 (story FACTORY-971, extending FACTORY-949's blockedTransition
+ * above): true exactly when the ticket's `agent:*` label moved TO `stalled`
+ * from anything else (none, `working`, `idle`, `blocked`) between `before` ->
+ * `after`. Same "one named edge only" shape as `blockedTransition` — already
+ * `stalled` on both sides, or `stalled` leaving for something else, is
+ * deliberately NOT a transition here. Pure.
+ */
+export function stalledTransition(before: JiraIssue, after: JiraIssue): boolean {
+  return agentLabelValue(before) !== "stalled" && agentLabelValue(after) === "stalled";
+}
+
 /** Which daemon-owned namespace changed in a `daemonLabelTransition`, and its from/to values (either side may be null: no label in that namespace on that side). */
 export interface DaemonLabelTransition {
   prefix: "agent" | "pr";

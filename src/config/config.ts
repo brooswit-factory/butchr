@@ -51,6 +51,31 @@ export const HERDR_CALL_TIMEOUT_MS_CEILING = 300_000;
 export const DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES = 10;
 
 /**
+ * FACTORY-972 (story FACTORY-971, extending FACTORY-949/951): the single
+ * source of the "30" default for `Config.stalledWakeDebounceMinutes` —
+ * same "referenced by name, never re-literaled" contract
+ * `DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES` above already has, now also by
+ * `createProjectEventRules`'s stalled-wake axis. Deliberately a different
+ * default from the blocked debounce's 10: this ticket's filing-time
+ * measurement (~11 of 21 live agents Stalled) found `agent:stalled` far
+ * noisier than `agent:blocked`, so a longer window is the starting point —
+ * see this ticket's own PR description for the measured projection.
+ */
+export const DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES = 30;
+
+/**
+ * FACTORY-972: the single source of the "6" default for
+ * `Config.stalledWakeMaxPerHour` — the hard per-recipient cap
+ * `createHourlyRateCap` (src/jira-watch/wake-rate-cap.ts) enforces on top
+ * of the per-ticket debounce above. No precedent default to reuse in this
+ * codebase (see that module's own doc comment); chosen as a round number
+ * comfortably above a quiet recipient's steady state but well below the
+ * filing-time measurement's worst observed burst, pending the DoD 6
+ * measurement this ticket's own PR posts.
+ */
+export const DEFAULT_STALLED_WAKE_MAX_PER_HOUR = 6;
+
+/**
  * Butchr's configuration, parsed from the environment once at startup.
  *
  * The Atlassian credential is a classic API token used as HTTP Basic auth
@@ -237,6 +262,27 @@ export interface Config {
    * Default 10, same family as `stalledMinutes`/`parkedMinutes` above.
    */
   blockedWakeDebounceMinutes: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * blockedWakeDebounceMinutes above): the SAME debounce shape, for the
+   * `agent:stalled` transition instead — a re-flip into `agent:stalled` for
+   * the SAME ticket within this many minutes of the last FIRED wake for
+   * that ticket does not re-fire. In-memory only, same tradeoff. Default 30
+   * (`DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES` above) — deliberately longer
+   * than the blocked default: see that constant's own doc comment.
+   */
+  stalledWakeDebounceMinutes: number;
+  /**
+   * FACTORY-972: the hard per-recipient hourly cap on DELIVERED
+   * `agent:stalled` wakes (boss and project manager each capped
+   * separately) — see `createHourlyRateCap`'s own doc comment
+   * (src/jira-watch/wake-rate-cap.ts) for why this is a SEPARATE axis from
+   * `stalledWakeDebounceMinutes` above, not a replacement for it. A wake
+   * that would exceed this cap is counted (`/health`'s `stalledWakesCapped`)
+   * and logged, never delivered. Default 6
+   * (`DEFAULT_STALLED_WAKE_MAX_PER_HOUR` above).
+   */
+  stalledWakeMaxPerHour: number;
   /**
    * FACTORY-740: the silent-stop detector's mode. `"off"` runs nothing at
    * all (today's behaviour, pre-FACTORY-740). `"dry-run"` — the default —
@@ -711,6 +757,8 @@ export interface ConfigEnv {
   BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
+  BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
+  BUTCHR_STALLED_WAKE_MAX_PER_HOUR?: string | undefined;
   BUTCHR_SILENT_STOP_MODE?: string | undefined;
   BUTCHR_SILENT_STOP_SUPPRESS_MINUTES?: string | undefined;
   BUTCHR_IDLE_POKE_MODE?: string | undefined;
@@ -884,6 +932,15 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const blockedWakeDebounceMinutes = env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES ? Number(env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES) : DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES;
   if (!Number.isFinite(blockedWakeDebounceMinutes) || blockedWakeDebounceMinutes <= 0) throw new Error(`BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES is not a positive number: ${env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES}`);
 
+  const stalledWakeDebounceMinutes = env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES ? Number(env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES) : DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES;
+  if (!Number.isFinite(stalledWakeDebounceMinutes) || stalledWakeDebounceMinutes <= 0) throw new Error(`BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES is not a positive number: ${env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES}`);
+
+  // FACTORY-972: a COUNT (wakes per hour), same Number.isInteger discipline
+  // BUTCHR_MAX_AGENTS/BUTCHR_IDLE_POKE_MAX_PER_POLL already use below for the
+  // same reason — a fractional cap is meaningless, not merely harmless.
+  const stalledWakeMaxPerHour = env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR ? Number(env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR) : DEFAULT_STALLED_WAKE_MAX_PER_HOUR;
+  if (!Number.isInteger(stalledWakeMaxPerHour) || stalledWakeMaxPerHour <= 0) throw new Error(`BUTCHR_STALLED_WAKE_MAX_PER_HOUR is not a positive integer: ${env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR}`);
+
   const silentStopModeRaw = env.BUTCHR_SILENT_STOP_MODE?.trim();
   if (silentStopModeRaw !== undefined && silentStopModeRaw !== "" && silentStopModeRaw !== "off" && silentStopModeRaw !== "dry-run") {
     throw new Error(`BUTCHR_SILENT_STOP_MODE must be "off" or "dry-run": ${env.BUTCHR_SILENT_STOP_MODE}`);
@@ -980,6 +1037,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     port,
     stalledMinutes,
     blockedWakeDebounceMinutes,
+    stalledWakeDebounceMinutes,
+    stalledWakeMaxPerHour,
     silentStopMode,
     silentStopSuppressMinutes,
     idlePokeMode,
@@ -1188,7 +1247,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
+  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
