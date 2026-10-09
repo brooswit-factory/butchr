@@ -48,6 +48,9 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     lizardMode: null,
     resumeOnRespawn: null,
     resumeContextCutoff: null,
+    idlePokeMinutes: null,
+    idlePokeMessage: null,
+    idlePokeEnabled: true,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -421,6 +424,9 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               lizardMode: true,
               resumeOnRespawn: false,
               resumeContextCutoff: 50000,
+              idlePokeMinutes: 30,
+              idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down",
+              idlePokeEnabled: true,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -437,7 +443,12 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000, staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{
+      id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [],
+      permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000,
+      idlePokeMinutes: 30, idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down", idlePokeEnabled: true,
+      staffed: false, reason: "disabled",
+    }]);
   });
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
@@ -602,6 +613,26 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     if (serverResult.ok) {
       expect(serverResult.patch).toEqual(patch);
     }
+  });
+
+  // FACTORY-846: same cross-contract proof, for the idle poke's three
+  // CONFIG-SURFACE-ONLY fields this ticket adds.
+  test("updateFields' real wire body for idlePokeMinutes/idlePokeMessage/idlePokeEnabled is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [FIRST_RULE_ID] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
+    await realRulesApi.updateFields(FIRST_RULE_ID, patch, "e1", "hash1", false);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...patch, ifMatch: "e1", planHash: "hash1", confirm: false });
+    const serverResult = validateRuleFieldPatch(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) expect(serverResult.patch).toEqual(patch);
   });
 
   test("undo POSTs to /api/undo/:backupId with the id encoded", async () => {
