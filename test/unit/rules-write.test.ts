@@ -526,7 +526,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { role: "sentinel" };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(false);
     if (!outcome.ok) expect(outcome.status).toBe(409);
     expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
@@ -538,7 +538,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { role: "sentinel" };
     const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].role).toBe("sentinel");
@@ -550,7 +550,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { role: "worker" };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
   });
 
@@ -577,7 +577,7 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     const patch: RuleFieldPatch = { role: "sentinel" };
     const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, true, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
 
     const loaded = loadRules(env());
