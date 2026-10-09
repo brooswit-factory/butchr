@@ -1417,13 +1417,26 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
   // above) so a regression that let a 429'd request slip past the limiter
   // and reach the real write path would actually mutate the file — a
   // mocked `delete` dep could never catch that class of bug.
+  // Review round 1 (PR #749 @ 41d747d5) flagged the first draft of this
+  // test: both the accepted and the refused request targeted the SAME rule
+  // id, so even a limiter bypass would have hit a real "already deleted"
+  // refusal from `writeRuleDelete` itself and left the file byte-identical
+  // regardless — the assertion could not actually detect the regression it
+  // claimed to. Fixed by seeding TWO rules and pointing the refused request
+  // at the one the first request never touched: a limiter bypass would now
+  // actually delete "b" and change the file, giving this test a real tooth.
   test("a 429'd DELETE wrote NOTHING — the rules file is byte-for-byte unchanged, not merely a 429 status", async () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-rules-write-route-"));
     try {
       const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
       mkdirSync(join(dir, "butchr"), { recursive: true });
       const rulesFilePath = join(dir, "butchr", "rules.json");
-      const originalText = JSON.stringify({ rules: [{ id: "managers", resourceProvider: "jira-work", query: "project = BUTCHR AND role = manager", brief: "manage it", enabled: false }] }, null, 2) + "\n";
+      const originalText = JSON.stringify({
+        rules: [
+          { id: "a", resourceProvider: "jira-work", query: "project = BUTCHR AND role = a", brief: "rule a", enabled: false },
+          { id: "b", resourceProvider: "jira-work", query: "project = BUTCHR AND role = b", brief: "rule b", enabled: false },
+        ],
+      }, null, 2) + "\n";
       writeFileSync(rulesFilePath, originalText);
       const writeDeps = { env: envDeps };
       const etag = rulesEtag(envDeps);
@@ -1441,18 +1454,28 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
         },
       });
       try {
-        const body = JSON.stringify({ ifMatch: etag, confirm: true });
-        const first = await fetch(`${origin}/api/rules/managers`, { method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
-        expect(first.status).toBe(200); // consumes the budget (max: 1); the rule IS deleted
+        const first = await fetch(`${origin}/api/rules/a`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, confirm: true }),
+        });
+        expect(first.status).toBe(200); // consumes the budget (max: 1); "a" IS deleted
         const beforeSecond = readFileSync(rulesFilePath, "utf8");
-        const second = await fetch(`${origin}/api/rules/managers`, { method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
+        const etagAfterFirst = rulesEtag(envDeps); // a valid, current ifMatch for "b" — the 429 must come from the limiter, not a stale-etag 409
+        const second = await fetch(`${origin}/api/rules/b`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etagAfterFirst, confirm: true }),
+        });
         expect(second.status).toBe(429);
-        // The limiter must refuse BEFORE `writeRuleDelete` runs again —
-        // assert byte-for-byte file identity across the refused attempt,
-        // not merely that the rule stays absent (which a second real
-        // delete of an already-gone rule would also leave true).
+        // The limiter must refuse BEFORE `writeRuleDelete` runs again. "b"
+        // is still present and the file is byte-for-byte unchanged since
+        // the first write — if the limiter were bypassed, this real
+        // writeRuleDelete call WOULD have removed "b" and changed the
+        // file, so this assertion actually has teeth (unlike targeting the
+        // already-deleted "a" again, which would pass even on a bypass).
         const afterSecond = readFileSync(rulesFilePath, "utf8");
         expect(afterSecond).toBe(beforeSecond);
+        const stillB = JSON.parse(afterSecond);
+        expect(stillB.rules.map((r: { id: string }) => r.id)).toEqual(["b"]);
       } finally { await app.stop(true); }
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
