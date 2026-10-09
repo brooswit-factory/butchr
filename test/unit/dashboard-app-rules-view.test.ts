@@ -73,11 +73,13 @@ describe("buildRulesViewModel — FACTORY-661/FACTORY-663", () => {
     expect(vm.rows[0]!.staffed).toEqual({ text: "UNSTAFFED: disabled", cls: "cnc" });
   });
 
-  test("uiEditable is true only for a ui--prefixed rule id (FACTORY-663 review follow-up — per-row toggle disable)", () => {
+  // FACTORY-730: the route-level `ui-`-prefix write gate is retired, so this
+  // view-model no longer computes a per-row `uiEditable` flag at all — every
+  // row (a `ui-`-prefixed id or not) is carried through identically.
+  test("FACTORY-730: rows carry every rule id unchanged, with no uiEditable gating", () => {
     const vm = buildRulesViewModel(response({ rules: [rule({ id: "factory-triage" }), rule({ id: FIRST_RULE_ID }), rule({ id: "ui-custom" })] }));
-    expect(vm.rows[0]!.uiEditable).toBe(false);
-    expect(vm.rows[1]!.uiEditable).toBe(true);
-    expect(vm.rows[2]!.uiEditable).toBe(true);
+    expect(vm.rows.map((r) => r.rule.id)).toEqual(["factory-triage", FIRST_RULE_ID, "ui-custom"]);
+    expect(vm.rows[0]).not.toHaveProperty("uiEditable");
   });
 
   test("sourceEtag and stale pass through verbatim — the ONLY values a write's ifMatch/disabled-state ever read", () => {

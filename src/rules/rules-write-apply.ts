@@ -37,7 +37,7 @@ function parseRulesDoc(currentText: string | undefined): { doc: unknown; rules: 
  * FACTORY-662): `assertOnlyChanged`'s allowlist patterns are ARRAY-INDEX
  * based, and `*` matches ANY index — so an allowlist built once, statically,
  * as `"rules.*.enabled"` permits a write to ANY rule's `enabled`, not just
- * the one this route is checking `isUiEditableRuleId` against. The fix is
+ * the one targeted by id. The fix is
  * this function: read the index fresh, from the SAME locked `currentText`
  * the mutator already has in hand, and build an allowlist that names that
  * literal index — never a wildcard. Throws if `id` is not found.
