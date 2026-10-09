@@ -466,6 +466,37 @@ export interface Rule {
    */
   lizardMode?: boolean;
   /**
+   * FACTORY-907 (epic FACTORY-906) — gentles a rule's own lane of
+   * admissions: at most this many NEW agents (desired but not yet running —
+   * see `src/agents/admission.ts`'s own "WITHHOLDING, NOT DROPPING" header)
+   * are admitted for THIS rule per `admit()` call. Independent of
+   * `resourceProvider`/`execution`/`account`/`role`, same house style as
+   * every other independently-optional knob above. Absent: today's
+   * behaviour exactly — unchanged, byte-for-byte, down to the log line (see
+   * `minSecondsBetweenAdmissions` immediately below for the shared
+   * rationale). Never affects an ALREADY-RUNNING agent, and never raises
+   * `BUTCHR_MAX_AGENTS`'s own fleet-wide cap — this only ever narrows how
+   * much of that cap one rule's lane may claim on a single poll; a
+   * candidate this defers is retried on the next poll, in the same
+   * wait-ordered position it would have had anyway, never dropped or marked
+   * stalled/blocked/withheld-by-cap.
+   */
+  maxNewPerTick?: number;
+  /**
+   * FACTORY-907 — companion to `maxNewPerTick` immediately above: at most
+   * one new admission for THIS rule every this-many seconds, wall-clock
+   * (`AdmissionControllerDeps.now`, src/agents/admission.ts — injectable for
+   * tests, `Date.now` in production). When BOTH fields are set on the same
+   * rule, BOTH must allow an admission for it to proceed — neither alone
+   * overrides the other. Rationale (the ticket's own problem statement):
+   * lowering a rule's priority filter can land a whole batch of workers on
+   * one poll, and four cores can't absorb that burst (measured: load5 49 in
+   * 4 minutes at 21:50 PDT) — these two fields are the rule-level throttle
+   * that makes each step gentle, independent of `BUTCHR_MAX_AGENTS` itself.
+   * Absent: today's behaviour exactly, unchanged.
+   */
+  minSecondsBetweenAdmissions?: number;
+  /**
    * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — opts this rule's
    * agent(s) into resuming their prior Claude session on a respawn that
    * follows an UNINTENDED stop (crash, daemon restart, wedge, pane death),
@@ -606,7 +637,7 @@ export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your tic
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
+  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -799,6 +830,10 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const { permissionMode, lizardMode } = raw;
     if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
     if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
+    // FACTORY-907: same independently-optional house style as every field above — independent of resourceProvider/execution/account/role/linked-eventing/permissionMode/lizardMode.
+    const { maxNewPerTick, minSecondsBetweenAdmissions } = raw;
+    if (maxNewPerTick !== undefined && !isPositiveInt(maxNewPerTick)) errors.push(`${at}.maxNewPerTick must be a positive integer`);
+    if (minSecondsBetweenAdmissions !== undefined && !isPositiveInt(minSecondsBetweenAdmissions)) errors.push(`${at}.minSecondsBetweenAdmissions must be a positive integer`);
     // FACTORY-851: independent of every field above, same house style — no tri-state for `resumeOnRespawn` (absent or `true` both mean on; only explicit `false` means off).
     const { resumeOnRespawn, resumeContextCutoff } = raw;
     if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
@@ -841,6 +876,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
       ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
       ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
+      ...(maxNewPerTick !== undefined ? { maxNewPerTick: maxNewPerTick as number } : {}),
+      ...(minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: minSecondsBetweenAdmissions as number } : {}),
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
       ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),

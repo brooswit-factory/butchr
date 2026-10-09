@@ -1054,9 +1054,17 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     ledger.record("T", "t2", "T", Date.now());
     let n = 0;
     let pollIdx = 0;
+    // FACTORY-954: the real comment (id "c1") is given T's own identity tag
+    // (`[T] ...`, the exact shape `report_to_boss` produces) rather than a
+    // generic body — this test's own point is per-WATCHER own-write-ledger
+    // isolation (T suppressed, its boss S still hears a REAL change), not
+    // comment routing, so the comment it hangs that real change on must be
+    // one the new related-space allowlist actually accepts, or S's own
+    // assertion below would be testing a case this ticket deliberately
+    // silences instead.
     const comments = async () => (pollIdx < 2
       ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
-      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
+      : [{ id: "c1", body: "[T] status update", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
       search: async () => polls[Math.min(n, polls.length - 1)]!,
       related: async () => { pollIdx = Math.min(n++, relatedPolls.length - 1); return relatedPolls[pollIdx]!; },
@@ -1090,9 +1098,16 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     ledger.record("S", "t2", DAEMON_WRITER, Date.now());
     let n = 0;
     let pollIdx = 0;
+    // FACTORY-954: the "foreign comment" (id "c1") is given S's own
+    // identity tag (`[S] ...`) rather than a generic body — this test's
+    // own point is that the daemon's own write stays suppressed while a
+    // REAL subsequent change still reaches both S and its epic watcher E;
+    // under the new related-space allowlist, a generic (non-boss-addressed)
+    // comment would no longer reach E at all, which would test the wrong
+    // thing here.
     const comments = async () => (pollIdx < 2
       ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
-      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
+      : [{ id: "c1", body: "[S] status update", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
       search: async () => { pollIdx = Math.min(n, polls.length - 1); return polls[pollIdx]!; },
       related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
@@ -1115,6 +1130,14 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
   const relOf = (labels: string[], updated: string, status = "In Progress", summary = "s") =>
     [{ issue: story(labels, updated, status, summary), watchers: ["E"] }];
   const oneComment = (id: string): JiraComment[] => [{ id, body: "x", created: "c", authorEmail: null }];
+  // FACTORY-954: the SAME shape, but body-addressed to S's own boss — the
+  // one shape `report_to_boss`/`ask_boss` actually produce (`[<key>] ...`).
+  // Used wherever a test's own point is "this comment id escapes
+  // suppression and is delivered", which — for a RELATED watcher, since
+  // this ticket — now also requires the comment to be boss-relevant; a
+  // bare `oneComment` body is deliberately NOT, so these tests would
+  // otherwise assert a watcher delivery the new allowlist no longer makes.
+  const bossComment = (id: string): JiraComment[] => [{ id, body: "[S] status update", created: "c", authorEmail: null }];
 
   test("a label-only daemon-namespaced diff on a key's first sighting is suppressed by the KAN-828 seed (seeding wins the race for a baseline before this branch ever sees 'unknown'), still exactly one comments() call", async () => {
     const herd = fakeHerd();
@@ -1176,7 +1199,7 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
   test("a label-only diff whose newest comment id is newer than the recorded baseline is delivered", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
-    const responses = [oneComment("5"), oneComment("6")];
+    const responses = [oneComment("5"), bossComment("6")];
     let commentCalls = 0;
     const comments = async () => { const r = responses[Math.min(commentCalls, 1)]!; commentCalls++; return r; };
     const polls = [[story(["agent:working"], "t")], [story(["agent:idle"], "t2")], [story(["agent:working"], "t3")]];
@@ -1298,7 +1321,15 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     // matching baseline and suppresses, rather than delivering on "unknown"
     // as it did pre-KAN-828.
     expect(notified.filter((x) => x === "S<-S").length).toBe(1);
-    expect(notified.filter((x) => x === "E<-S").length).toBe(1);
+    // FACTORY-954: poll 1's fail-open delivery is named `{ label: ... }`
+    // (a pure agent:*-label diff, same as every other test in this
+    // describe block) — never a comment, since the fetch REJECTED rather
+    // than confirming one. A `label` reason is never in the related-space
+    // allowlist regardless of why suppression let it through, so E (the
+    // boss) no longer hears it — unlike before this ticket, when every
+    // reason reaching this point delivered to a related watcher
+    // unconditionally. `primary` (S<-S, above) is completely unaffected.
+    expect(notified.filter((x) => x === "E<-S").length).toBe(0);
   });
 
   test("an appearing/disappearing key is never checked against the label-only rule at all: no comments() call, always delivered", async () => {
@@ -1376,6 +1407,155 @@ describe("startLoop task->story delivery (Part B, pinned)", () => {
     stop();
     expect(notified).toContain("KAN-STORY<-KAN-TASK");
     expect(notified).not.toContain("KAN-EPIC<-KAN-TASK");
+  });
+});
+
+describe("FACTORY-949 (implementing story FACTORY-948): agent:blocked label transition wakes the ticket's boss (debounced, dedup'd vs escalate marker)", () => {
+  const task = (labels: string[], updated: string, status = "In Progress"): JiraIssue =>
+    ({ key: "TASK", status, summary: "s", issuetype: "Task", assignee: "a", parent: null, updated, labels });
+  const relTask = (labels: string[], updated: string, status = "In Progress") =>
+    [{ issue: task(labels, updated, status), watchers: ["BOSS"] }];
+
+  test("item 1: none/working/idle/stalled -> blocked wakes the boss, named with the blocked ticket's own key", async () => {
+    for (const from of ["agent:none", "agent:working", "agent:idle", "agent:stalled"]) {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+      const relatedPolls = [relTask([from], "t1"), relTask(["agent:blocked"], "t2")];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => [],
+        related: async () => relatedPolls[Math.min(n++, 1)]!,
+        herd,
+        notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      const bossEvents = notified.filter((e) => e.issue === "BOSS" && e.about === "TASK");
+      expect(bossEvents.length).toBe(1);
+      expect(bossEvents[0]!.reason).toEqual({ blocked: { key: "TASK" } });
+    }
+  });
+
+  test("item 1: must NOT wake the blocked ticket's own watcher (space=primary, watcher===key)", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [task(["agent:working"], "t1"), task(["agent:blocked"], "t2")].map((i) => [i]);
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "TASK" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+  });
+
+  test("item 1: a sibling task's watcher is never woken — routes.ts never puts a sibling in this ticket's watcher list", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [relTask(["agent:working"], "t1"), relTask(["agent:blocked"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "SIBLING")).toBe(false);
+  });
+
+  test("item 3: blocked -> anything, working<->idle, idle<->stalled, and every pr:* flip stay exactly as silent as today", async () => {
+    const cases: Array<[string[], string[]]> = [
+      [["agent:blocked"], ["agent:working"]],
+      [["agent:working"], ["agent:idle"]],
+      [["agent:idle"], ["agent:working"]],
+      [["agent:idle"], ["agent:stalled"]],
+      [["agent:stalled"], ["agent:idle"]],
+      [["agent:working", "pr:open"], ["agent:working", "pr:approved"]],
+    ];
+    for (const [from, to] of cases) {
+      const herd = fakeHerd();
+      const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+      const relatedPolls = [relTask(from, "t1"), relTask(to, "t2")];
+      let n = 0;
+      const stop = startLoop({
+        search: async () => [],
+        related: async () => relatedPolls[Math.min(n++, 1)]!,
+        herd,
+        notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+        comments: async () => [{ id: "x", body: "b", created: "c", authorEmail: null }],
+        intervalMs: 10,
+      });
+      await new Promise((r) => setTimeout(r, 40));
+      stop();
+      expect(notified.some((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+    }
+  });
+
+  test("item 4: flap blocked -> working -> blocked inside the debounce window fires exactly one event", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [
+      relTask(["agent:working"], "t1"),
+      relTask(["agent:blocked"], "t2"),
+      relTask(["agent:working"], "t3"),
+      relTask(["agent:blocked"], "t4"),
+    ];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      blockedWakeDebounceMinutes: 10,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    stop();
+    const bossEvents = notified.filter((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked);
+    expect(bossEvents.length).toBe(1);
+  });
+
+  test("item 5: an episode with escalate.ts's [butchr:blocked] marker already posted does not fire a second wake", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const relatedPolls = [relTask(["agent:working"], "t1"), relTask(["agent:blocked"], "t2")];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => [],
+      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      comments: async () => [{ id: "m1", body: "[butchr:blocked] TASK is waiting on a decision:\n...", created: new Date().toISOString(), authorEmail: null }],
+      blockedWakeDebounceMinutes: 10,
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => e.issue === "BOSS" && (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
+  });
+
+  test("item 2: a ticket with no boss (no related watcher at all) produces no boss wake — absence, never an error", async () => {
+    const herd = fakeHerd();
+    const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
+    const polls: JiraIssue[][] = [[task(["agent:working"], "t1")], [task(["agent:blocked"], "t2")]];
+    let n = 0;
+    const stop = startLoop({
+      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      related: async () => [],
+      herd,
+      notify: (issue, about, reason) => { notified.push({ issue, about, reason }); },
+      intervalMs: 10,
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+    expect(notified.some((e) => (e.reason as { blocked?: unknown })?.blocked)).toBe(false);
   });
 });
 
@@ -1608,7 +1788,17 @@ describe("startLoop: every notify reason class is named, driven through the real
     expect(kEvents[1]!.reason).toEqual({ disappeared: true });
   });
 
-  test("a pr:* label transition on a RELATED (watcher) path is named as a label transition, NOT the self-only pr reason — a boss must never be told 'your PR' about its implementer's PR", async () => {
+  // FACTORY-954: before this ticket, a pr:* label transition on a RELATED
+  // path was classified as `{ label: ... }` (never the self-only `pr`
+  // reason, same conclusion this test's own title states) and THEN
+  // delivered to the watcher with that label reason. The related-space
+  // allowlist now silences a `label` reason outright for `related` — so
+  // the stronger, current guarantee is that a boss is never told ANYTHING
+  // about its implementer's PR label flipping, not merely never told it
+  // under the wrong name. The misnaming this test used to pin is no longer
+  // observable (nothing is ever delivered to check the name of), so this
+  // now asserts the no-delivery outcome instead.
+  test("a pr:* label transition on a RELATED (watcher) path never reaches the boss at all — a boss must never be told anything about its implementer's PR", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
     const relPolls = [
@@ -1626,8 +1816,7 @@ describe("startLoop: every notify reason class is named, driven through the real
     await new Promise((r) => setTimeout(r, 40));
     stop();
     const wEvents = notified.filter((e) => e.issue === "W" && e.about === "K");
-    expect(wEvents.length).toBe(1);
-    expect(wEvents[0]!.reason).toEqual({ label: { prefix: "pr", from: "open", to: "approved" } });
+    expect(wEvents.length).toBe(0);
   });
 
   // FACTORY-922 (implementing FACTORY-921 §1 — REPLACES this BUTCHR-350
@@ -1829,9 +2018,15 @@ describe("startLoop §3(D) case 4: a watcher's own delivery can be honestly name
     const notified: Array<{ issue: string; about: string; reason: unknown }> = [];
     let pollIndex = 0;
     let commentCalls = 0;
+    // FACTORY-954: "c2" (K's own new comment) carries K's own identity tag
+    // — this test's own point is the SHARED per-poll fetch cache (W's
+    // delivery costs no second Jira call), not comment content, and "c2"
+    // really is K's own report_to_boss-shaped comment in this scenario —
+    // so it must be a comment the related-space allowlist actually
+    // accepts, or W's own assertion below would no longer hold.
     const commentsByPoll: Record<number, JiraComment[]> = {
-      1: [comment("c1")],               // idx1: K appears, seeded on "c1"
-      2: [comment("c2"), comment("c1")], // idx2: K's own agent posts "c2" — no label change
+      1: [comment("c1")],                                                              // idx1: K appears, seeded on "c1"
+      2: [{ id: "c2", body: "[K] status update", created: "c", authorEmail: null }, comment("c1")], // idx2: K's own agent posts "c2" — no label change
     };
     const comments = async () => { commentCalls++; return commentsByPoll[pollIndex] ?? commentsByPoll[1]!; };
     const polls: JiraIssue[][] = [[], [withLabels(["agent:working"], "t1")], [withLabels(["agent:working"], "t2")]];
@@ -1941,7 +2136,13 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
   test("(a) THE RACE: a foreign comment folded into a daemon label write's read-back is delivered once the newest comment id has moved, to both K's own agent and its watcher", async () => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string }> = [];
-    const responses = [[comment("c1")], [comment("c2"), comment("c1")]];
+    // FACTORY-954: "c2" (the foreign comment that moved the newest id)
+    // carries K's own identity tag — this test's own point is the RACE
+    // mechanics (a foreign comment folding into a daemon label write's
+    // read-back), not comment content, so it must be a comment the
+    // related-space allowlist actually accepts for W's own assertion below
+    // to still hold.
+    const responses = [[comment("c1")], [{ id: "c2", body: "[K] status update", created: "c", authorEmail: null }, comment("c1")]];
     let commentCalls = 0;
     const comments = async () => { const r = responses[Math.min(commentCalls, responses.length - 1)]!; commentCalls++; return r; };
     // idx0: silent baseline (K absent — watch()'s first fetch never invokes
@@ -2012,10 +2213,13 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
     // call 1 (idx1 seed): succeeds, "c1". call 2 (idx2 ledger hit): REJECTS.
     // call 3 (idx3 ledger hit): succeeds, "c2" — genuinely new since the
     // STILL-"c1" baseline (idx2's rejection never touched the cursor).
+    // FACTORY-954: "c2" carries K's own identity tag so W's own delivery
+    // assertion below still holds under the related-space allowlist (same
+    // reasoning as test (a) above).
     const comments = async () => {
       commentCalls++;
       if (commentCalls === 2) throw new Error("503 unavailable");
-      return commentCalls < 3 ? [comment("c1")] : [comment("c2"), comment("c1")];
+      return commentCalls < 3 ? [comment("c1")] : [{ id: "c2", body: "[K] status update", created: "c", authorEmail: null }, comment("c1")];
     };
     const polls: JiraIssue[][] = [
       [],
@@ -2042,7 +2246,15 @@ describe("startLoop DAEMON_WRITER ledger-hit comment-cursor discriminator (KAN-8
     // delivered, cursor left at "c1" (untouched). idx3: a genuine new
     // comment ("c2") since that still-"c1" baseline -> delivered.
     expect(kEvents.length).toBe(3);
-    expect(wEvents.length).toBe(3);
+    // FACTORY-954: idx2's fail-open delivery is named `{ label: ... }`, not
+    // `comment` — the rejected fetch means `verdict.commentId` is never
+    // set, so decide() falls to the general classifier, which finds the
+    // genuine agent:*-label transition (unaffected by the comment body
+    // fix above, which only matters for idx3's actual `comment` reason). A
+    // `label` reason is never in the related-space allowlist, so W does
+    // not hear idx2 — only idx1 (appear) and idx3 (the confirmed,
+    // boss-addressed comment).
+    expect(wEvents.length).toBe(2);
     expect(commentCalls).toBe(3);
   });
 
@@ -2144,10 +2356,15 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
     // `pollIndex` — independent of how many times (0 or 1) our code under
     // test actually calls it that poll, so this fixture is valid whether or
     // not the fix is applied yet.
+    // FACTORY-954: "c2" (the agent's OWN comment) carries K's own identity
+    // tag — exactly the shape `report_to_boss` actually produces, and
+    // genuinely true to this test's own narrative ("the agent's OWN
+    // comment") — so W's "boss still hears it" assertion below continues to
+    // hold under the related-space allowlist.
     const commentsByPoll: Record<number, JiraComment[]> = {
-      1: [comment("c1")],               // idx1: K appears — baseline seed sees "c1"
-      2: [comment("c2"), comment("c1")], // idx2: the agent's OWN comment "c2" just landed
-      3: [comment("c2"), comment("c1")], // idx3: unchanged since idx2 — no genuinely new comment
+      1: [comment("c1")],                                                                 // idx1: K appears — baseline seed sees "c1"
+      2: [{ id: "c2", body: "[K] status update", created: "c", authorEmail: null }, comment("c1")], // idx2: the agent's OWN comment "c2" just landed
+      3: [{ id: "c2", body: "[K] status update", created: "c", authorEmail: null }, comment("c1")], // idx3: unchanged since idx2 — no genuinely new comment
     };
     const comments = async () => { commentCalls++; return commentsByPoll[pollIndex] ?? [comment("c1")]; };
     const polls: JiraIssue[][] = [
@@ -2210,15 +2427,23 @@ describe("startLoop KAN-838: agent-writer arm must advance the comment cursor (r
     const notified: Array<{ issue: string; about: string }> = [];
     const logLines: string[] = [];
     let pollIndex = 0;
+    // FACTORY-954: "f1" (the foreign comment, the TRUE newest) carries a
+    // WAKE_MARKERS escalation body — a foreign comment reaching this
+    // window landing as a `[butchr:blocked]`-style escalation is exactly
+    // the shape this test's own "stated residual"/fold-detector narrative
+    // is about, and it must be boss-relevant for W's own assertion below to
+    // keep holding under the related-space allowlist. "c2" (the agent's
+    // own, separately-suppressed write) can stay a plain body — it is
+    // never the one W's delivery is named after here.
     const commentsByPoll: Record<number, JiraComment[]> = {
       1: [comment("c1")],
       // idx2: BOTH the agent's own comment "c2" AND a foreign comment "f1"
       // landed in the same read-back window — "f1" is the true newest.
-      2: [comment("f1"), comment("c2"), comment("c1")],
+      2: [{ id: "f1", body: "[butchr:blocked] escalating to my boss", created: "c", authorEmail: null }, comment("c2"), comment("c1")],
       // idx3: nothing new since idx2 (still "f1" newest) — a correct cursor
       // must recognize this as "no new comment", not just compare against
       // the agent's own "c2".
-      3: [comment("f1"), comment("c2"), comment("c1")],
+      3: [{ id: "f1", body: "[butchr:blocked] escalating to my boss", created: "c", authorEmail: null }, comment("c2"), comment("c1")],
     };
     const comments = async () => commentsByPoll[pollIndex] ?? [comment("c1")];
     const polls: JiraIssue[][] = [

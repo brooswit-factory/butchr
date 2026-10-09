@@ -126,6 +126,23 @@ export interface StalledCheck {
    * stall remediator) must use optional chaining and its own fallback.
    */
   elapsedMinutes?: (issue: string) => number | null;
+
+  /**
+   * FACTORY-845: exposes `StalledTracker.streakStart` (the precise instant
+   * the current idle/done streak began — not `elapsedMinutes`'s rounded
+   * duration) to a SECOND consumer: the idle-poke engine
+   * (src/agents/idle-poke.ts), which identifies an idle "episode" by this
+   * exact instant rather than reconstructing it from a rounded minute
+   * count (which would make two episodes separated by under a minute
+   * indistinguishable). OPTIONAL, appended last for the same
+   * binary-compatibility reason `elapsedMinutes` above already is — no
+   * existing bare `{ check, forget }` fixture needs to grow a member just
+   * to keep compiling. Deliberately NOT a new detector or a new floor:
+   * this is the SAME streak `stalled.check()` already measures, merely
+   * surfaced at full precision for a caller that needs to detect "this is
+   * a new episode" rather than "the label should apply yet".
+   */
+  streakStart?: (issue: string) => number | null;
 }
 
 /**
@@ -255,5 +272,6 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
     },
     forget: (issue) => { tracker.forget(issue); declineLogged.delete(issue); },
     elapsedMinutes: (issue) => tracker.elapsedMinutes(issue),
+    streakStart: (issue) => tracker.streakStart(issue),
   };
 }

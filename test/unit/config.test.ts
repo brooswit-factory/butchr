@@ -78,6 +78,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("FACTORY-949: blockedWakeDebounceMinutes defaults to 10, honours BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).blockedWakeDebounceMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "20" }, noRead).blockedWakeDebounceMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+  });
+
   test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
     expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
     expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");
@@ -90,6 +97,28 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "15" }, noRead).silentStopSuppressMinutes).toBe(15);
     expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
     expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+  });
+
+  test("FACTORY-845: idlePokeMode defaults to dry-run (same precedent as silentStopMode), honours off/live, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).idlePokeMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "off" }, noRead).idlePokeMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "dry-run" }, noRead).idlePokeMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "live" }, noRead).idlePokeMode).toBe("live");
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MODE/);
+  });
+
+  test("FACTORY-845: idlePokeSuppressMinutes defaults to 5, honours BUTCHR_IDLE_POKE_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).idlePokeSuppressMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "15" }, noRead).idlePokeSuppressMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_SUPPRESS_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_SUPPRESS_MINUTES/);
+  });
+
+  test("FACTORY-845: idlePokeMaxPerPoll defaults to 3, honours BUTCHR_IDLE_POKE_MAX_PER_POLL, and rejects a non-positive or fractional value", () => {
+    expect(loadConfig(base, noRead).idlePokeMaxPerPoll).toBe(3);
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "10" }, noRead).idlePokeMaxPerPoll).toBe(10);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "0" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MAX_PER_POLL/);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "1.5" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MAX_PER_POLL/);
   });
 
   test("abandonedMinutes defaults to 30, honours BUTCHR_ABANDONED_MINUTES, and rejects a non-positive value", () => {

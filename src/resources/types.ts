@@ -194,7 +194,27 @@ export type NotifyReason =
   | { comment: string | null }
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
   | { linked: { events: readonly LinkedChangeEvent[] } }
-  | { definitionField: { brief?: string; workingDirectory?: string } };
+  | { definitionField: { brief?: string; workingDirectory?: string } }
+  | { blocked: { key: string } };
+
+/**
+ * FACTORY-949 (implementing story FACTORY-948): `blocked` names the
+ * SPECIFIC ticket (`key`) whose `agent:*` label just transitioned to
+ * `agent:blocked` — produced by TWO different callers, for two different
+ * audiences, which is why `key` is always named explicitly rather than
+ * relying on the `about` argument `deps.notify` already carries:
+ * - `src/resources/issue.ts`'s `decide()`, on the RELATED space only (never
+ *   primary/self — see that function's own comment for why), where `key`
+ *   happens to equal the `about` argument already (the blocked ticket IS
+ *   the related resource); redundant there, but naming it explicitly keeps
+ *   this one shape correct for the second producer below without the
+ *   reader having to know which caller produced a given verdict.
+ * - `src/resources/project.ts`'s `createProjectEventRules`, on the PRIMARY
+ *   space (the project's own key, i.e. `about === key` there is the
+ *   PROJECT, never the blocked ticket) — `key` is the only way this
+ *   delivery can name WHICH of the project's tickets just went
+ *   `agent:blocked`.
+ */
 
 /**
  * BUTCHR-436 (epic BUTCHR-421, story 2/4): one line of a coalesced

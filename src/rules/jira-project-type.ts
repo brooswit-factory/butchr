@@ -10,6 +10,32 @@ export interface ProjectMatch { agentKey: string; rule: Rule; project: JiraProje
 export const ownsJiraProjectAgent = (id: string) => decodeAnyAgentKey(id)?.resourceProvider === 'jira-project';
 /** FACTORY-95: `jira-project`'s own short herdr-workspace-label id — the operator's spec names this case as "the project key", and a `jira-project` resourceId already IS that key (`encodeAgentKey`'s `resourceId`, set from `project.key` below), so this is the identity function — see `jiraWorkShortDisplayId` (src/rules/resource-type.ts) for why every provider keeps its own named export rather than sharing one. */
 export const jiraProjectShortDisplayId = (resourceId: string): string => resourceId;
+
+/**
+ * FACTORY-941: per-agentKey pinned-active minutes override, resolved fresh
+ * from one poll's own `ProjectMatch[]` — reuses the SAME `idlePokeMinutes`
+ * `Rule` field the issue tier's idle-poke engine reads (src/agents/
+ * idle-poke.ts), applied here to `jira-project` rules instead (never a
+ * second, pinned-active-only config field — see
+ * `PinnedActiveDetectorDeps.minutesFor`'s own doc comment, src/agents/
+ * pinned-active.ts, for the contract this feeds). Unlike the issue tier's
+ * own `idlePokeRuleConfigByIssue` (src/daemon/index.ts), no "smallest
+ * explicit value wins" multi-rule resolution is needed: a `ProjectMatch
+ * .agentKey` already encodes the ONE rule that matched it (`encodeAgentKey`'s
+ * own `ruleId` component above) — two rules matching the same project
+ * produce two DIFFERENT agentKeys, never one agentKey with two candidate
+ * rules to arbitrate between. A disabled rule, or one that leaves
+ * `idlePokeMinutes` unset, simply has no entry — the caller's own fallback
+ * (the global `minutes`) applies exactly as it does for any other id.
+ */
+export function pinnedActiveMinutesFor(matches: readonly ProjectMatch[]): ReadonlyMap<string, number> {
+  const result = new Map<string, number>();
+  for (const m of matches) {
+    if (!m.rule.enabled) continue;
+    if (m.rule.idlePokeMinutes !== undefined) result.set(m.agentKey, m.rule.idlePokeMinutes);
+  }
+  return result;
+}
 export function specForProject(m: ProjectMatch): SpawnSpec {
  return m.spec ?? { key:m.agentKey,resource:m.project.key,issuetype:'project',summary:m.project.name,parent:null,brief:m.rule.brief,
  ...(m.rule.agentPreferences ? {agents:m.rule.agentPreferences}:{}), ...(m.rule.mcpConfigFile ? {mcpConfigFile:m.rule.mcpConfigFile}: {}),

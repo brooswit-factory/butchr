@@ -367,6 +367,53 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
   });
 });
 
+describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-906 — admission rate limit)", () => {
+  test("both absent when omitted — no default, same as permissionMode/lizardMode", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.maxNewPerTick).toBeUndefined();
+    expect(r!.minSecondsBetweenAdmissions).toBeUndefined();
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
+  });
+
+  test("both fields accepted for every provider, independent of execution/account/role/each other", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 }] });
+      expect(r).toMatchObject({ resourceProvider, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 });
+    }
+  });
+
+  test("either field may be set without the other — independent", () => {
+    const [onlyTick] = parseRules({ rules: [{ ...minimal, maxNewPerTick: 1 }] });
+    expect(onlyTick!.maxNewPerTick).toBe(1);
+    expect(onlyTick!.minSecondsBetweenAdmissions).toBeUndefined();
+    const [onlySeconds] = parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 60 }] });
+    expect(onlySeconds!.minSecondsBetweenAdmissions).toBe(60);
+    expect(onlySeconds!.maxNewPerTick).toBeUndefined();
+  });
+
+  test("rejects a non-positive-integer maxNewPerTick, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 1.5 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: -1 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+  });
+
+  test("rejects a non-positive-integer minSecondsBetweenAdmissions, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].minSecondsBetweenAdmissions must be a positive integer");
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
+    ] as never);
+  });
+});
+
 describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
   test("both absent when omitted — no default the way execution/account/role get one", () => {
     const [r] = parseRules({ rules: [minimal] });
@@ -660,6 +707,66 @@ describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour cha
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false }] });
       expect(r).toMatchObject({ resourceProvider, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false });
     }
+  });
+});
+
+/**
+ * FACTORY-842 (epic FACTORY-836, story FACTORY-839) — per-role idle-poke
+ * DEFAULTS on top of FACTORY-846's config surface. There is no separate
+ * "role default" storage in the schema: shipping a role default means
+ * seeding that value into `docs/rules.example.json` for that role's rule
+ * (see `test/unit/rules-example.test.ts`); overriding it means an operator
+ * editing that SAME field on their own copy of the rule in their live
+ * `rules.json`. These tests prove: (1) a rule-level value — whether it is
+ * the shipped role default or an operator's own edit — always wins over the
+ * absent-field fallback, and (2) the `jira-work` role defaults the epic
+ * names resolve to the minutes the epic actually asked for. What these
+ * tests do NOT prove (FACTORY-845 does not exist yet): that an override
+ * changes real poke TIMING in a running agent — only that `parseRules`
+ * loads/validates the intended value, per FACTORY-836's own instruction not
+ * to claim engine behaviour this PR does not implement.
+ */
+describe("per-role idle-poke defaults (FACTORY-842 — config/resolution only, no engine)", () => {
+  test("a rule's own idlePokeMinutes always wins, whether it's a shipped role default or an operator's own override of it — same field, no separate layer", () => {
+    // Shipped role default for "tasks" is 10 (docs/rules.example.json). An operator who disagrees edits
+    // the SAME field on their own copy of the rule — there is no second "role default" value to reconcile.
+    const shipped = parseRules({ rules: [{ ...minimal, id: "tasks", idlePokeMinutes: 10 }] })[0]!;
+    const overridden = parseRules({ rules: [{ ...minimal, id: "tasks", idlePokeMinutes: 5 }] })[0]!;
+    expect(shipped.idlePokeMinutes).toBe(10);
+    expect(overridden.idlePokeMinutes).toBe(5);
+  });
+
+  test("a rule with no idlePokeMinutes at all falls back to the global stalledMinutes default (10) — never the epic's 30, per FACTORY-844/846's decision", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.idlePokeMinutes).toBeUndefined(); // the true fallback lives outside Rule — see config.ts's stalledMinutes (default 10), not read here
+  });
+
+  test("the epic's named jira-work role defaults, as this ticket ships them in docs/rules.example.json", () => {
+    const byRole: Record<string, number> = { epics: 240, stories: 60, tasks: 10 };
+    for (const [id, idlePokeMinutes] of Object.entries(byRole)) {
+      const [r] = parseRules({ rules: [{ ...minimal, id, idlePokeMinutes }] });
+      expect(r!.idlePokeMinutes).toBe(idlePokeMinutes);
+    }
+  });
+
+  /**
+   * project/manager (epic group 2): a `Rule` CAN carry idlePokeMinutes for a
+   * `jira-project` resource exactly like a `jira-work` one — the field is
+   * provider-generic (see the "every valid value is accepted for every
+   * provider" test above). This is NOT shipped inside docs/rules.example.json
+   * (BUTCHR-400 fixes that file to one jira-work rule per ticket-worker
+   * role only — see that file's own test); it is documented separately in
+   * docs/idle-poke-role-defaults.md as its own example. This test proves
+   * only that the shape in that doc actually parses/validates — not that
+   * anything reads it yet: `src/agents/pinned-active.ts` (the project-tier's
+   * own stall mechanism) is wired to the GLOBAL `stalledMinutes` only, so
+   * this value is INERT until FACTORY-845 wires a per-rule read for the
+   * project tier.
+   */
+  test("a jira-project (project/manager) rule example carries idlePokeMinutes=720 (12h), parses cleanly — inert until FACTORY-845", () => {
+    const projectManagerExample = { id: "project-managers", resourceProvider: "jira-project" as const, query: '{"leadAccountId":"me"}', brief: "@builtin:project", idlePokeMinutes: 720 };
+    const [r] = parseRules({ rules: [projectManagerExample] });
+    expect(r).toMatchObject({ resourceProvider: "jira-project", idlePokeMinutes: 720, idlePokeEnabled: true });
   });
 });
 

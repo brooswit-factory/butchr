@@ -83,6 +83,12 @@ function reasonClause(reason: NotifyReason | undefined): string {
     if (removed.length) parts.push(`unlinked from ${removed.join(", ")}`);
     return `had its linked issues changed (${parts.join("; ")})`;
   }
+  // FACTORY-949: named explicitly (never folded into the `label` clause
+  // above) since the TWO producers of this reason (issue.ts's boss wake,
+  // project.ts's manager wake) need the SAME wording whether `about` is the
+  // blocked ticket itself or the project that owns it — see NotifyReason's
+  // own doc comment.
+  if ("blocked" in reason) return `has its ticket ${reason.blocked.key} newly agent:blocked — it needs you`;
   // BUTCHR-351: `reason.comment === null` means the mover was a comment
   // DELETION, not an addition (see NotifyReason's own doc comment) —
   // "got a new comment" would be actively wrong there.
@@ -173,7 +179,8 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // would produce. Still a `(comment:` PREFIX, so AC4's own reasoning for
   // why no distinct tag is warranted (this module's top comment) still
   // holds: additive, not a meaning change to the existing shape.
-  return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`; // "comment" in reason
+  if ("comment" in reason) return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`;
+  return ` (blocked:${reason.blocked.key})`; // "blocked" in reason — FACTORY-949
 }
 
 /**

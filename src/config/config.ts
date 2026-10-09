@@ -41,6 +41,16 @@ const CLEAVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleo
 export const HERDR_CALL_TIMEOUT_MS_CEILING = 300_000;
 
 /**
+ * FACTORY-949 (story FACTORY-948): the single source of the "10" default
+ * for `Config.blockedWakeDebounceMinutes` below — referenced by name, never
+ * re-literaled, by `createIssueEventRules`/`createProjectEventRules`
+ * (src/resources/issue.ts, src/resources/project.ts) when a caller omits
+ * `blockedWakeDebounceMinutes` from their deps (every existing test/caller
+ * built before this ticket).
+ */
+export const DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES = 10;
+
+/**
  * Butchr's configuration, parsed from the environment once at startup.
  *
  * The Atlassian credential is a classic API token used as HTTP Basic auth
@@ -216,6 +226,18 @@ export interface Config {
    */
   stalledMinutes: number;
   /**
+   * FACTORY-949 (story FACTORY-948): the debounce window for the
+   * agent:blocked-transition wake (boss + project manager) — a re-flip into
+   * `agent:blocked` for the SAME ticket within this many minutes of the
+   * last FIRED wake for that ticket does not re-fire (`blocked -> working ->
+   * blocked` inside the window is exactly one event). In-memory only, same
+   * as every other piece of `createIssueEventRules`'s own cross-poll state
+   * (`commentCursor`, `pendingRecheck`) — lost on daemon restart, which is
+   * an accepted tradeoff this ticket shares with those, not a new one.
+   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above.
+   */
+  blockedWakeDebounceMinutes: number;
+  /**
    * FACTORY-740: the silent-stop detector's mode. `"off"` runs nothing at
    * all (today's behaviour, pre-FACTORY-740). `"dry-run"` — the default —
    * runs src/agents/silent-stop.ts's detector but ONLY logs
@@ -240,6 +262,48 @@ export interface Config {
    * window itself never meaningfully shrinks the data collected.
    */
   silentStopSuppressMinutes: number;
+  /**
+   * FACTORY-845: the per-rule-configurable idle poke's mode. `"off"` runs
+   * nothing (src/agents/idle-poke.ts is never constructed). `"dry-run"` —
+   * the default, same precedent FACTORY-738/740 set for silentStopMode
+   * above and for the same reason: the first-enable-burst and the
+   * resident-and-idle population this story's ticket measured (~23 of a
+   * 24-slot admission cap) mean a live default could mass-poke on day one
+   * of a bare merge — runs every guard and logs every outcome
+   * (`[idle-poke] would poke KEY ...` / skipped / suppressed) but never
+   * calls `addComment` or the channel/prompt delivery gate. `"live"` is the
+   * only mode that actually pokes. Deliberately does NOT affect the
+   * EXISTING global stall wake (src/agents/stall-remediation.ts), which
+   * stays live regardless of this setting — see idle-poke.ts's own top
+   * comment for why the two are independent mechanisms on independent
+   * clocks.
+   */
+  idlePokeMode: "off" | "dry-run" | "live";
+  /**
+   * FACTORY-845: minutes after a daemon start or a detected herdr-reconnect
+   * gap during which the idle-poke engine suppresses a poke — same
+   * DISCONTINUITY_GAP_MS shape as silentStopSuppressMinutes above, but a
+   * SEPARATE knob and a separate in-memory gap tracker (src/agents/
+   * idle-poke.ts keeps its own `lastInvokedAt`/`lastDiscontinuityAt`,
+   * independent of silent-stop.ts's): the module-boundary instruction on
+   * this ticket forbids sharing mutable state with silent-stop.ts. Default
+   * 5, matching silentStopSuppressMinutes's own default and rationale.
+   */
+  idlePokeSuppressMinutes: number;
+  /**
+   * FACTORY-845: the first-enable-burst guard — a hard cap on how many
+   * tickets the idle-poke engine will actually poke (not merely evaluate)
+   * in a single ~15s poll, across the whole fleet. Sized well under the
+   * measured ~23-of-24 resident-and-idle population this story's ticket
+   * reports: a cap of 3 drains a 23-ticket cold-start burst over roughly 2
+   * minutes (23/3 * 15s) rather than poking all 23 in one tick, while a
+   * steady-state fleet (a handful of newly-idle
+   * tickets per poll under ordinary operation) is never meaningfully
+   * delayed by it. See idle-poke.ts's own top comment for the alternative
+   * (baseline-on-first-observation) this story considered and did not
+   * choose, and why.
+   */
+  idlePokeMaxPerPoll: number;
   /**
    * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
    * a live (In Progress) boss before the parked-ticket detector's stage 1
@@ -646,8 +710,12 @@ export interface ConfigEnv {
   BUTCHR_OPS_ALERT_DEDUP_MINUTES?: string | undefined;
   BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
   BUTCHR_SILENT_STOP_MODE?: string | undefined;
   BUTCHR_SILENT_STOP_SUPPRESS_MINUTES?: string | undefined;
+  BUTCHR_IDLE_POKE_MODE?: string | undefined;
+  BUTCHR_IDLE_POKE_SUPPRESS_MINUTES?: string | undefined;
+  BUTCHR_IDLE_POKE_MAX_PER_POLL?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
@@ -813,6 +881,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
 
+  const blockedWakeDebounceMinutes = env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES ? Number(env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES) : DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES;
+  if (!Number.isFinite(blockedWakeDebounceMinutes) || blockedWakeDebounceMinutes <= 0) throw new Error(`BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES is not a positive number: ${env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES}`);
+
   const silentStopModeRaw = env.BUTCHR_SILENT_STOP_MODE?.trim();
   if (silentStopModeRaw !== undefined && silentStopModeRaw !== "" && silentStopModeRaw !== "off" && silentStopModeRaw !== "dry-run") {
     throw new Error(`BUTCHR_SILENT_STOP_MODE must be "off" or "dry-run": ${env.BUTCHR_SILENT_STOP_MODE}`);
@@ -821,6 +892,18 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
 
   const silentStopSuppressMinutes = env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES ? Number(env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES) : 5;
   if (!Number.isFinite(silentStopSuppressMinutes) || silentStopSuppressMinutes <= 0) throw new Error(`BUTCHR_SILENT_STOP_SUPPRESS_MINUTES is not a positive number: ${env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES}`);
+
+  const idlePokeModeRaw = env.BUTCHR_IDLE_POKE_MODE?.trim();
+  if (idlePokeModeRaw !== undefined && idlePokeModeRaw !== "" && idlePokeModeRaw !== "off" && idlePokeModeRaw !== "dry-run" && idlePokeModeRaw !== "live") {
+    throw new Error(`BUTCHR_IDLE_POKE_MODE must be "off", "dry-run" or "live": ${env.BUTCHR_IDLE_POKE_MODE}`);
+  }
+  const idlePokeMode: "off" | "dry-run" | "live" = idlePokeModeRaw === "off" ? "off" : idlePokeModeRaw === "live" ? "live" : "dry-run";
+
+  const idlePokeSuppressMinutes = env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES ? Number(env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES) : 5;
+  if (!Number.isFinite(idlePokeSuppressMinutes) || idlePokeSuppressMinutes <= 0) throw new Error(`BUTCHR_IDLE_POKE_SUPPRESS_MINUTES is not a positive number: ${env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES}`);
+
+  const idlePokeMaxPerPoll = env.BUTCHR_IDLE_POKE_MAX_PER_POLL ? Number(env.BUTCHR_IDLE_POKE_MAX_PER_POLL) : 3;
+  if (!Number.isInteger(idlePokeMaxPerPoll) || idlePokeMaxPerPoll <= 0) throw new Error(`BUTCHR_IDLE_POKE_MAX_PER_POLL is not a positive integer: ${env.BUTCHR_IDLE_POKE_MAX_PER_POLL}`);
 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
@@ -896,8 +979,12 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
+    blockedWakeDebounceMinutes,
     silentStopMode,
     silentStopSuppressMinutes,
+    idlePokeMode,
+    idlePokeSuppressMinutes,
+    idlePokeMaxPerPoll,
     parkedMinutes,
     abandonedMinutes,
     atRestMinutes,
@@ -1101,7 +1188,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
+  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +

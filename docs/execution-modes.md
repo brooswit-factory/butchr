@@ -532,6 +532,84 @@ loaded `rules` list, so it works across every provider) into the single
 shared `AdmissionController` instance every rule loop's admission bucket
 already draws from.
 
+## Per-rule admission rate limiting: `maxNewPerTick` / `minSecondsBetweenAdmissions` (FACTORY-907, epic FACTORY-906)
+
+**Rationale**: lowering a rule's priority filter can land a whole batch of
+workers on one poll — 4 cores can't absorb that; measured live, load5 hit
+49 within 4 minutes at 21:50 PDT. The fleet-wide cap (`BUTCHR_MAX_AGENTS`,
+`src/agents/admission.ts`) bounds how many agents are RESIDENT at once, but
+says nothing about how FAST one rule's own lane may claim that cap on a
+single poll. These two fields are that per-rule throttle:
+
+- **`maxNewPerTick?: number` (integer ≥ 1)**: at most this many NEW agents
+  (desired but not yet running) are admitted for this rule per `admit()`
+  call.
+- **`minSecondsBetweenAdmissions?: number` (integer ≥ 1)**: at most one new
+  admission for this rule every this-many seconds, wall-clock.
+- **Both set**: both must allow — neither field overrides the other.
+  `minSecondsBetweenAdmissions` can still block a second admission within
+  one call even when `maxNewPerTick` alone would have allowed it.
+- **Absent (either or both)**: today's behaviour exactly, byte-for-byte —
+  no log line changes, no ordering changes, nothing.
+- **Never affects an already-running agent**, and **never raises the fleet
+  cap** — this only ever narrows how much of that cap one rule's lane may
+  claim on one poll. The shared cap still applies on top: a candidate this
+  limiter would allow can still be cap-withheld, and that is logged and
+  counted as a CAP withholding, never a rate-limit one (see
+  `admitWithRateLimits`'s own doc comment, `src/agents/admission.ts`, for
+  why the two are computed in one pass rather than two, to keep that
+  distinction honest).
+- **Deferred, never dropped, and never reported as cap-withheld**: a
+  candidate the rate limit holds back this poll is retried on the next one,
+  in the SAME wait-ordered position (`orderByWait`) it would have had
+  anyway, and shares the exact wait ledger a cap-withheld candidate already
+  uses for that ordering — a candidate that leaves `desired` for good
+  (ticket closed) is reclaimed by the same evict-after-unseen bound
+  (`LEDGER_UNSEEN_EVICTION_CALLS`) cap-withholding already relies on. But a
+  rate-deferred id is explicitly EXCLUDED (PR #734 review) from every one of
+  the cap's own reporting surfaces — `/health`'s `longestWait`, the
+  per-source admission census bucket (and so the `admission:withheld` Jira
+  label it feeds), and the `[admission2] cap=... withheld N/M wanted: ...`
+  line's own count and id list — because it was never withheld BY THE CAP
+  (it may have had cap headroom to spare). Those three only ever report a
+  candidate the SHARED CAP actually ran out on; a rate limiter's own
+  deferral is visible exclusively through the distinct `rate-limit` line
+  below.
+- **No persisted state**: both counters (this call's admission count per
+  rule, and each rule's last-admitted wall-clock time) live only in the
+  `AdmissionController` instance's own memory. A daemon restart starts
+  fresh and re-derives purely from live state — there is nothing to
+  migrate or clean up on disk.
+- **Reporting**: a deferral fires `[admission2] rate-limit rule=<id>
+  admitted=<a> deferred=<d> maxNewPerTick=<n> minSeconds=<m> next-in=<s>s`
+  — a DISTINCT line from the ordinary `[admission2] cap=... admitted=...
+  withheld ...` line (same `[admission2]` tag, extended, never a silently
+  reinterpreted shape), one per rule that actually had a candidate deferred
+  by its own rate limit this call, throttled to at most once per rule per
+  60 seconds so a saturated rule's own deferral cannot spam every poll. A
+  field this rule left unset prints `-`, never a number that would
+  misreport it as configured.
+- **Read-only in the rules API/preview** (`GET /api/rules`) as
+  `maxNewPerTick`/`minSecondsBetweenAdmissions`, `null` when unset — not yet
+  on the web write surface (a later story, same discipline as every other
+  read-only-for-now field this endpoint already carries).
+
+Example:
+
+```json
+{
+  "id": "triage",
+  "resourceProvider": "jira-work",
+  "query": "project = FACTORY AND status = \"To Do\"",
+  "brief": "Pick up a newly assigned ticket.",
+  "maxNewPerTick": 2,
+  "minSecondsBetweenAdmissions": 30
+}
+```
+
+— admits at most 2 new `triage` agents per poll, and never more than one
+every 30 seconds, regardless of how many tickets a lowered priority filter
+just made eligible all at once.
 ### Setting `role` from the rules API and the Rules page form (FACTORY-817, story FACTORY-756, epic FACTORY-748)
 
 Until this ticket, `role` was file-only — an operator had to hand-edit

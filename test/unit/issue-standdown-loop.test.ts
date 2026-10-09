@@ -32,12 +32,22 @@ const issue = (over: Partial<JiraIssue> = {}): JiraIssue => ({
   ...over,
 });
 
-/** A tiny in-memory comment store, keyed by ticket, newest-first — enough for `deps.comments` and the stand-down registry's own reads. */
+/**
+ * A tiny in-memory comment store, keyed by ticket, newest-first — enough for
+ * `deps.comments` and the stand-down registry's own reads. `bodies` (id ->
+ * text, FACTORY-954) defaults every id to `""` exactly as before this
+ * ticket — only the one test that needs a BOSS-RELEVANT body (DoD 3(b),
+ * related-space wake-through) passes one.
+ */
 function commentStore(seed: Record<string, string[]> = {}) {
   const byKey = new Map<string, string[]>(Object.entries(seed));
+  const bodies = new Map<string, string>();
   return {
-    set: (key: string, ids: string[]) => byKey.set(key, ids),
-    comments: async (key: string) => (byKey.get(key) ?? []).map((id) => ({ id, body: "", created: "", authorEmail: null })),
+    set: (key: string, ids: string[], idBodies: Record<string, string> = {}) => {
+      byKey.set(key, ids);
+      for (const [id, body] of Object.entries(idBodies)) bodies.set(id, body);
+    },
+    comments: async (key: string) => (byKey.get(key) ?? []).map((id) => ({ id, body: bodies.get(id) ?? "", created: "", authorEmail: null })),
   };
 }
 
@@ -75,7 +85,7 @@ describe("BUTCHR-307 DoD 3(a): a comment on the issue's own ticket wakes it", ()
 });
 
 describe("BUTCHR-307 DoD 3(b): a change on a WORKER's ticket wakes its stood-down boss", () => {
-  test("an unseen comment on a related (worker) ticket wakes the boss watching it, not the worker itself", async () => {
+  test("an unseen BOSS-RELEVANT comment (FACTORY-954: the worker's own report_to_boss, tagged with its own identity) on a related (worker) ticket wakes the boss watching it, not the worker itself", async () => {
     const store = commentStore({ "KAN-2": ["200"] });
     const sd = newRegistry();
     // The boss (KAN-1) stood down watching both its own ticket and its current worker, KAN-2.
@@ -83,10 +93,29 @@ describe("BUTCHR-307 DoD 3(b): a change on a WORKER's ticket wakes its stood-dow
     const rules = createIssueEventRules({ comments: store.comments, standDown: sd });
 
     const workerBefore = issue({ key: "KAN-2", updated: "2026-01-01T00:00:00.000Z" });
-    const workerAfter = issue({ key: "KAN-2", updated: "2026-01-01T00:05:00.000Z" });
-    store.set("KAN-2", ["200", "201"]); // a new, unseen comment on the worker's ticket
-
     const relBefore: RelatedResource<JiraIssue> = { issue: workerBefore, watchers: ["KAN-1"] };
+    // FACTORY-954: a genuinely CONFIRMED comment-moved reason (what the
+    // related-space allowlist actually checks the body of) requires a
+    // PRIOR poll's own `preCommentCursor` baseline to compare against —
+    // the same mechanic primary space already depends on (see this
+    // module's own §3D doc comment, src/resources/issue.ts). A seed poll,
+    // run BEFORE the comment is added, establishes that baseline ("200")
+    // first — mirrors the pattern every sibling suite in this corpus uses
+    // (e.g. issue-bookkeeping-comment-suppression.test.ts).
+    await rules.poll({ primary: [], related: [] }, { primary: [], related: [relBefore] });
+
+    const workerAfter = issue({ key: "KAN-2", updated: "2026-01-01T00:05:00.000Z" });
+    // FACTORY-954: a related-space wake now requires a BOSS-RELEVANT comment
+    // body (the worker's own identity tag, same as report_to_boss/ask_boss
+    // post — see src/resources/issue.ts's `isBossRelevantComment`), not
+    // merely an unseen id — an arbitrary comment no longer wakes a related
+    // watcher at all (see this file's own new "routine" tests below).
+    // "201" (the new, boss-addressed comment) must be FIRST — `comments[0]`
+    // is this module's own "newest" convention (comments() returns
+    // newest-first), and the §3D fallback names its reason from the
+    // NEWEST id's own body, not merely "any id changed".
+    store.set("KAN-2", ["201", "200"], { "201": "[KAN-2] reporting progress to my boss" }); // a new, unseen, BOSS-ADDRESSED comment on the worker's ticket
+
     const relAfter: RelatedResource<JiraIssue> = { issue: workerAfter, watchers: ["KAN-1"] };
     const poll = await rules.poll({ primary: [], related: [relBefore] }, { primary: [], related: [relAfter] });
     expect(poll.changedRelated).toEqual(["KAN-2"]);
@@ -203,8 +232,23 @@ describe("BUTCHR-307 DoD 3(e): nothing wakes when nothing happened", () => {
   });
 });
 
-describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD waking, never silently swallows", () => {
-  test("a worker created AFTER the boss stood down (no baseline for it) wakes the boss on its first change", async () => {
+describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD waking, never silently swallows (PRIMARY space; see the FACTORY-954 narrowing note below for RELATED)", () => {
+  test("a worker created AFTER the boss stood down (no baseline for it): the change itself cannot be confirmed as boss-relevant (no `comments` dep wired, so it is `undetermined`), so FACTORY-954's related-space allowlist now keeps the boss asleep", async () => {
+    // FACTORY-954 NARROWED THIS, DELIBERATELY: before this ticket, an
+    // `undetermined` reason on a RELATED ticket still fell through to
+    // BUTCHR-307's fail-toward-waking net for an asleep watcher (same as
+    // every other non-structural reason) — this test used to pin exactly
+    // that. The related-space allowlist now requires a CONFIRMED,
+    // boss-relevant reason (a status transition to In Review/Done, or a
+    // comment this module can actually read and recognise as boss-
+    // addressed) before it will ever wake a related watcher, asleep or not
+    // — `undetermined` can never meet that bar, by definition (see
+    // `deliverToRelated`'s own doc comment, src/resources/issue.ts). This
+    // is a real narrowing of BUTCHR-307's own guarantee, scoped to
+    // `related` only: an asleep watcher of its OWN ticket (`primary`) still
+    // fails toward waking on `undetermined`, unaffected — see
+    // issue-bookkeeping-comment-suppression.test.ts and this file's own
+    // DoD 3(a)/(f) blocks, none of which exercise `related`.
     const sd = newRegistry();
     sd.standDown("KAN-1", new Map([["KAN-1", ["100"]]])); // KAN-3 did not exist yet at stand-down time
     const rules = createIssueEventRules({ standDown: sd });
@@ -215,8 +259,8 @@ describe("BUTCHR-307: a watcher with NO recorded baseline for a key fails TOWARD
       { primary: [], related: [{ issue: workerAfter, watchers: ["KAN-1"] }] },
     );
     const verdict = await poll.decide("KAN-3", "KAN-1", "related");
-    expect(verdict.deliver).toBe(true);
-    expect(sd.isAsleep("KAN-1")).toBe(false);
+    expect(verdict.deliver).toBe(false);
+    expect(sd.isAsleep("KAN-1")).toBe(true);
   });
 });
 

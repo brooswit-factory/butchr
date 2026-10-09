@@ -1,6 +1,6 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
-import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
+import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
@@ -38,7 +38,9 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { resourceMatches, type ExecutionUnit } from "../rules/execution.js";
+import { createIdlePokeEngine, type IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
 import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../rules/capacity-role-migration.js";
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
@@ -47,7 +49,7 @@ import { reloadRules } from "../rules/reload.js";
 import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentCapacityRole } from "../agents/admission.js";
+import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
 import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
@@ -76,6 +78,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -441,6 +444,33 @@ const ruleLizardModeOf = (id: string): boolean =>
 // project agents, `jira-project` agents) and why issue type no longer plays
 // any part here.
 const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
+/**
+ * FACTORY-907 — same decode-then-look-up-by-rule shape as `ruleRoleOfAgent`
+ * immediately above, one field over: resolves a candidate id's own rule
+ * `maxNewPerTick`/`minSecondsBetweenAdmissions` (if either is set) for
+ * `AdmissionControllerDeps.rateLimitOf` (src/agents/admission.ts). `undefined`
+ * for anything unresolved (a legacy/bare-issue agent, a rule since removed,
+ * or a resolvable rule that sets neither field) — unlike `roleOfAgent`,
+ * there is no fail-safe-to-limited default to get wrong here: an id this
+ * cannot resolve simply keeps today's behaviour, same as a resolved rule
+ * that never sets either field (see `RuleRateLimit`'s own doc comment).
+ * BUTCHR-408's managed-session agents have no rule-engine `Rule` of their
+ * own (see `managedSessionRoles`'s own comment above) and so are never
+ * rate-limited by this — out of this ticket's scope, which wires exactly
+ * the rule-engine providers `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * validate for.
+ */
+const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
+  return {
+    ruleId: rule.id,
+    ...(rule.maxNewPerTick !== undefined ? { maxNewPerTick: rule.maxNewPerTick } : {}),
+    ...(rule.minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: rule.minSecondsBetweenAdmissions } : {}),
+  };
+};
 
 // BUTCHR-405: logged once per unresolved reference at startup, from this
 // boot's own rules. /health (see combineHealth call below) recomputes this
@@ -714,6 +744,8 @@ const admissionController = createAdmissionController({
   // Rule for every heterogeneous definition file, so it cannot carry a
   // per-file role itself).
   roleOf: roleOfAgent,
+  // FACTORY-907: see `rateLimitOfAgent`'s own doc comment above.
+  rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
   sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
@@ -1522,12 +1554,11 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
-// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
-// `pinnedActiveDetector` further down (project loop only) share the SAME
-// herdr.agent.list() read rather than each defining its own — "wire from the
-// existing seam, do not add a second reader". Behaviour-preserving: this is
-// the exact closure `syncLabels` was already given, moved to a name instead
-// of an inline argument.
+// BUTCHR-305/BUTCHR-238: extracted so this closure is importable by name
+// rather than reproduced inline — `createLabelSync` below has since moved to
+// its own `agentStatusesFeedingDashboard` tee (FACTORY-407, see that
+// closure's own doc comment), so the one live consumer of THIS closure today
+// is `pinnedActiveDetector` further down (project loop only, FACTORY-941).
 /**
  * The ticket a pane's workspace works, for rule-engine workspaces only — a
  * legacy workspace is never attributed to its ticket.
@@ -1575,9 +1606,18 @@ const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<str
   }
   return m;
 };
+// FACTORY-941: keyed by the FULL agentKey (`dashboardAgentOfCwd`, both
+// `jira-work` and `jira-project` providers — see `cwdAgentResolvers`'s own
+// doc comment, src/agents/dashboard.ts), never the bare key `resourceOfCwd`
+// produces: `pinnedActiveDetector`'s ids are `ProjectMatch.agentKey`
+// (`desiredFrom`'s `discovery.idOf` for the project resource type —
+// src/rules/jira-project-type.ts), which `resourceOfCwd` would always
+// resolve to `null` for (it is DELIBERATELY gated to `ownsRuleAgent` —
+// see `ownedAgentOfCwd`'s own doc comment above), making this map
+// structurally incapable of matching a project id if built that way.
 const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
   const { agents } = await herdr.agent.list();
-  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })));
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: dashboardAgentOfCwd(a.cwd) })));
 };
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
@@ -1690,6 +1730,87 @@ const stallRemediation = createStallRemediator({
   // non-Done worker, only on the one poll that is actually about to post a
   // wake comment — see stall-remediation.ts's own cost-bound doc comment.
   labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
+  log: (line) => console.error(`  ${line}`),
+});
+
+// FACTORY-845: this poll's resolved idle-poke config per issue, built from
+// the rule engine's own (rule, issue) matches just before `syncLabels` runs
+// (see the `syncLabels: (matches) => ...` wiring further down this file) —
+// `syncLabels` itself only ever sees de-duplicated issues, never the match
+// list that produced them (src/rules/resource-type.ts's `uniqueIssues`
+// deliberately discards rule identity), so this is the one place that
+// association is still available. A ticket matched by more than one
+// enabled rule resolves by the most conservative reading per field,
+// independently: ANY matching rule's explicit `idlePokeEnabled: false`
+// disables the poke outright (an opt-out from one rule should never be
+// overridden by another rule's silence); among rules that leave it
+// enabled, the SMALLEST explicit `idlePokeMinutes` wins (the more urgent
+// configured interval, never the global, never an unset rule's silence);
+// the first matching rule's explicit `idlePokeMessage` wins (arbitrary but
+// deterministic — multi-rule-match on one ticket is an edge case this
+// story's acceptance criteria do not exercise, so this is a simple,
+// documented default rather than a modelled trade-off).
+const idlePokeRuleConfigByIssue = new Map<string, IdlePokeRuleConfig>();
+function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): void {
+  idlePokeRuleConfigByIssue.clear();
+  for (const m of resourceMatches(units)) {
+    if (!m.rule.enabled) continue;
+    const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
+    if (m.rule.idlePokeEnabled === false) {
+      idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
+      continue;
+    }
+    if (existing?.idlePokeEnabled === false) continue; // an earlier rule's explicit opt-out already wins
+    const idlePokeMinutes = m.rule.idlePokeMinutes !== undefined && (existing?.idlePokeMinutes === undefined || m.rule.idlePokeMinutes < existing.idlePokeMinutes) ? m.rule.idlePokeMinutes : existing?.idlePokeMinutes;
+    const idlePokeMessage = existing?.idlePokeMessage ?? m.rule.idlePokeMessage;
+    idlePokeRuleConfigByIssue.set(m.issue.key, {
+      idlePokeEnabled: true,
+      ...(idlePokeMinutes !== undefined ? { idlePokeMinutes } : {}),
+      ...(idlePokeMessage !== undefined ? { idlePokeMessage } : {}),
+    });
+  }
+}
+
+// FACTORY-941: this poll's resolved pinned-active minutes override per
+// jira-project agentKey — `pinnedActiveMinutesFor` (src/rules/
+// jira-project-type.ts, exported there so its resolution logic is directly
+// unit-testable without importing this module) rebuilds this fresh from
+// each poll's own matches; see the `projectType.discovery.search` wrap
+// further down for exactly where/why.
+let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
+
+// FACTORY-845: the channel half, copying the SAME call shape every other
+// delivery seam in this file already uses (`deliverNotice`/
+// `renderNotifyDelivery`, the MCP notify call, `herd.nudge`) — an
+// EIGHTH seam in this file, which is why
+// test/unit/notify-deliver-seams.test.ts's exact-count assertions are
+// updated in this same commit (7 -> 8) — see that test file's own doc
+// comment and this story's PR body for why that is the INTENDED outcome of
+// adding a seam, not a sign anything is wrong.
+const deliverIdlePoke = async (issue: string, text: string): Promise<{ via: "channel" | "prompt" }> => {
+  const result = await deliverNotice({
+    pushChannel: () => notifyAgent(mcp, issue, issue, text),
+    nudgePrompt: () => herd.nudge(issue, text),
+  });
+  console.error(`  [notify] ${issue} ← idle-poke: ${renderNotifyDelivery(result)}`);
+  return { via: result.via };
+};
+
+// FACTORY-845: the per-rule-configurable idle poke — see src/agents/
+// idle-poke.ts's own top comment for why this is a separate, thin module
+// built on `stalled`'s own streak rather than an extension of
+// `stallRemediation` above. `undefined` when BUTCHR_IDLE_POKE_MODE=off,
+// the same disables-entirely-when-omitted shape `silentStop` above uses.
+const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngine({
+  now: () => Date.now(),
+  dryRun: config.idlePokeMode !== "live",
+  globalMinutes: config.stalledMinutes,
+  defaultMessage: DEFAULT_IDLE_POKE_MESSAGE,
+  suppressMinutes: config.idlePokeSuppressMinutes,
+  maxPokesPerPoll: config.idlePokeMaxPerPoll,
+  comments: (issue) => atlassian.comments(issue),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  deliver: deliverIdlePoke,
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
@@ -2025,6 +2146,7 @@ const syncLabels = createLabelSync({
   stalled,
   stallRemediation,
   ...(silentStop ? { silentStop } : {}),
+  ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
@@ -2117,6 +2239,9 @@ const ruleResourceType = createRuleResourceType({
   // FACTORY-922: the `/health` counter's one writer — see
   // `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
   onCommentCheckSkipped: () => { commentChecksSkipped++; },
+  // FACTORY-949: the boss-wake debounce window — see
+  // `Config.blockedWakeDebounceMinutes`'s own doc comment.
+  blockedWakeDebounceMinutes: config.blockedWakeDebounceMinutes,
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see
@@ -2220,7 +2345,15 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
-  syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
+  syncLabels: (matches) => {
+    // FACTORY-845: refresh this poll's per-issue idle-poke rule config
+    // BEFORE calling syncLabels, from the SAME matches it is about to
+    // discard rule identity from — see `updateIdlePokeRuleConfig`'s own
+    // doc comment above for why this is the only place that association
+    // is still available.
+    if (idlePoke) updateIdlePokeRuleConfig(matches);
+    return syncLabels(uniqueIssues(matches));
+  },
   checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
@@ -3040,6 +3173,33 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
+// BUTCHR-305/BUTCHR-238/FACTORY-941: audible-only pinned-active detection
+// for the project/manager tier — see src/agents/pinned-active.ts's own top
+// comment for the full derivation of why this shape (a resource both
+// `desired` "active" and `running`, with its agent stopped acting) is
+// invisible to every other detector, and why it is wired into the PROJECT
+// loop only (the issue tier already covers the same phenomenon via
+// `syncLabels`/`stallRemediation` above). `minutesFor` resolves per-id from
+// `pinnedActiveMinutesByProject`, refreshed each poll by the
+// `projectType.discovery.search` wrap further down (see that wrap's own
+// comment for why NOT `syncLabels`, unlike the issue tier's
+// `updateIdlePokeRuleConfig`). `addComment`/
+// `comments` decode `id` (a full `ProjectMatch.agentKey`) to its bare
+// project key via `resourceKeyOf` before reaching Jira/Confluence — neither
+// `speakOnOwnChannel` nor `ownChannelComments` understands an encoded
+// agentKey (see `issueCrashLoopDetector`'s own identical `resourceKeyOf`
+// wrapping above for the established precedent).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  minutesFor: (id) => pinnedActiveMinutesByProject.get(id),
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  quotaBlocked: (id) => herd.resourceQuotaBlocked(resourceKeyOf(id)) || quotaGate.blockedIds().some((qid) => resourceKeyOf(qid) === resourceKeyOf(id)),
+  log: (line) => console.error(`  [pinned-active] ${line}`),
+});
+
 // Free-form jira-project resource agents (BUTCHR-425): no ticket, Confluence,
 // or boss/worker workflow — just discovery (matching Jira projects), spawn,
 // and residency/admission, sharing the same host cap and herd namespace as
@@ -3062,6 +3222,24 @@ const projectType = createJiraProjectResourceType({
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
 });
+// FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
+// matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
+// `reconcileNow`/`checkPinnedActive` above — `discovery.search()` is the
+// first thing each poll calls (ahead of `reconcileNow`, which in turn runs
+// ahead of `syncLabels` — see that file's own call order), so wrapping it
+// here, rather than updating from `syncLabels` the way
+// `updateIdlePokeRuleConfig` does for the issue tier, is what keeps this
+// map current for the SAME poll's `checkPinnedActive` call rather than one
+// poll stale. `pinnedActiveMinutesFor` itself lives in jira-project-type.ts
+// (exported there, unit-tested directly) — this wrap is only the glue that
+// refreshes the module-level binding `pinnedActiveDetector.minutesFor`
+// reads above.
+const projectDiscoverySearch = projectType.discovery.search;
+projectType.discovery.search = async () => {
+  const matches = await projectDiscoverySearch();
+  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  return matches;
+};
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,
@@ -3070,8 +3248,13 @@ runResourceLoop(projectType, {
   notify: async () => {},
   onRespawn: async (id, reason) => { console.error(`  [jira-project] ${id} respawned: ${reason}`); },
   // No labels to sync; the only per-poll bookkeeping is retiring MCP
-  // connections for agents that dropped out of this poll's matches.
+  // connections for agents that dropped out of this poll's matches. The
+  // pinned-active minutes refresh (FACTORY-941) is NOT done here: `syncLabels`
+  // runs AFTER `reconcileNow` (src/daemon/loop.ts's own call order), which is
+  // too late for `checkPinnedActive` below to see this poll's rule matches —
+  // see the `projectType.discovery.search` wrap above instead.
   syncLabels: async (matches) => { await resourceConnections.retain(new Set(matches.map((m) => m.agentKey))); return new Set<string>(); },
+  checkPinnedActive: pinnedActiveDetector.check,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_PROJECT),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_PROJECT),
