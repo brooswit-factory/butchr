@@ -76,6 +76,10 @@ export interface RulesApiRuleEntry {
   permissionMode: RulePermissionMode | null;
   /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (today's "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts` — not necessarily `false`). */
   lizardMode: boolean | null;
+  /** FACTORY-907: read-only for now (see `Rule.maxNewPerTick`'s own doc comment, `../rules/rules.ts`) — same "read off the raw `Rule`, `null` when absent/unmatched" shape `permissionMode`/`lizardMode` already use; never added to the web write surface this Story. */
+  maxNewPerTick: number | null;
+  /** FACTORY-907: companion to `maxNewPerTick` immediately above — see `Rule.minSecondsBetweenAdmissions`'s own doc comment. */
+  minSecondsBetweenAdmissions: number | null;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -144,6 +148,8 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       mcpServerNames: entry.mcpServerNames,
       permissionMode: raw?.permissionMode ?? null,
       lizardMode: raw?.lizardMode ?? null,
+      maxNewPerTick: raw?.maxNewPerTick ?? null,
+      minSecondsBetweenAdmissions: raw?.minSecondsBetweenAdmissions ?? null,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,
       whyUnstaffed: entry.reason,

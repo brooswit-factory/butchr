@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { admitWithinBudget, admissionLine, admissionFailSafeLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, orderByWait } from "../../src/agents/admission.js";
-import type { AgentCapacityRole } from "../../src/agents/admission.js";
+import { admitWithinBudget, admitWithRateLimits, admissionLine, admissionFailSafeLine, rateLimitLine, ADMISSION2_TAG, createAdmissionController, DEFAULT_ADMISSION_SOURCE, ImplausibleZeroGuard, LEDGER_UNSEEN_EVICTION_CALLS, MAX_IMPLAUSIBLE_POLLS, RATE_LIMIT_LOG_WINDOW_MS, orderByWait } from "../../src/agents/admission.js";
+import type { AgentCapacityRole, RuleRateLimit } from "../../src/agents/admission.js";
 import { reconcileNow, scopedHerd } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 
@@ -1127,5 +1127,174 @@ describe("shared cap across rule loops — in-flight reservations", () => {
     await new Promise((r) => setTimeout(r, 0));
     answer([]);
     expect(await next).toEqual(["jira-idea-1"]);
+  });
+});
+
+describe("admitWithRateLimits (pure, FACTORY-907)", () => {
+  const noLimit = () => undefined as RuleRateLimit | undefined;
+
+  test("no candidate's rule sets a limit: identical split to admitWithinBudget — unset = unchanged, byte-for-byte", () => {
+    const got = admitWithRateLimits(["A", "B", "C"], 1, noLimit, new Map(), 0);
+    expect(got.admitted).toEqual(["A"]);
+    expect(got.withheld).toEqual(["B", "C"]);
+    expect(got.perRule.size).toBe(0);
+    expect(got.admittedAt.size).toBe(0);
+  });
+
+  test("maxNewPerTick=1: only the first candidate of the rate-limited rule is admitted this call, the rest deferred (tallied, not dropped)", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 1 });
+    const got = admitWithRateLimits(["A", "B", "C"], 10, rl, new Map(), 0);
+    expect(got.admitted).toEqual(["A"]);
+    expect(got.withheld).toEqual(["B", "C"]);
+    expect(got.perRule.get("r1")).toEqual({ maxNewPerTick: 1, minSecondsBetweenAdmissions: undefined, admitted: 1, deferred: 2 });
+    expect(got.admittedAt.get("r1")).toBe(0);
+  });
+
+  test("minSecondsBetweenAdmissions: at most one admission per call once the window hasn't elapsed, even with no maxNewPerTick", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", minSecondsBetweenAdmissions: 30 });
+    const got = admitWithRateLimits(["A", "B", "C"], 10, rl, new Map(), 0);
+    expect(got.admitted).toEqual(["A"]);
+    expect(got.withheld).toEqual(["B", "C"]);
+  });
+
+  test("minSecondsBetweenAdmissions: a prior admission from a previous call still blocks until the window elapses", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", minSecondsBetweenAdmissions: 30 });
+    const lastAdmittedAt = new Map([["r1", 0]]);
+    expect(admitWithRateLimits(["A"], 10, rl, lastAdmittedAt, 29_999).withheld).toEqual(["A"]);
+    expect(admitWithRateLimits(["A"], 10, rl, lastAdmittedAt, 30_000).admitted).toEqual(["A"]);
+  });
+
+  test("both set: minSecondsBetweenAdmissions still blocks a second admission even though maxNewPerTick alone would allow it", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 2, minSecondsBetweenAdmissions: 100 });
+    const got = admitWithRateLimits(["A", "B", "C"], 10, rl, new Map(), 0);
+    expect(got.admitted).toEqual(["A"]);
+    expect(got.withheld).toEqual(["B", "C"]);
+    expect(got.perRule.get("r1")!.admitted).toBe(1);
+    expect(got.perRule.get("r1")!.deferred).toBe(2);
+  });
+
+  test("interplay with the global cap: a candidate withheld because the SHARED cap ran out is never counted as rate-limited", () => {
+    const rl = (id: string): RuleRateLimit | undefined => (id === "B0" || id === "B1" ? { ruleId: "ruleB", maxNewPerTick: 5 } : undefined);
+    const got = admitWithRateLimits(["A0", "B0", "B1"], 1, rl, new Map(), 0);
+    expect(got.admitted).toEqual(["A0"]);
+    expect(got.withheld).toEqual(["B0", "B1"]);
+    // ruleB's own candidates never reached the rate-limit check (the cap was already exhausted by A0) — no tally at all, so the rule's own rate-limit is never blamed for a cap-caused deferral.
+    expect(got.perRule.has("ruleB")).toBe(false);
+  });
+
+  test("a candidate absent from rateLimitOf's own rule's prior lastAdmittedAt (never admitted before) is never blocked by minSecondsBetweenAdmissions", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", minSecondsBetweenAdmissions: 1000 });
+    expect(admitWithRateLimits(["A"], 10, rl, new Map(), 999_999).admitted).toEqual(["A"]);
+  });
+
+  test("zero/negative budget: every candidate cap-withheld, never reaching a rule's own rate-limit check", () => {
+    const rl = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 5 });
+    const got = admitWithRateLimits(["A", "B"], 0, rl, new Map(), 0);
+    expect(got.admitted).toEqual([]);
+    expect(got.withheld).toEqual(["A", "B"]);
+    expect(got.perRule.size).toBe(0);
+  });
+});
+
+describe("rateLimitLine (FACTORY-907)", () => {
+  test("formats both fields when set", () => {
+    expect(rateLimitLine("r1", { maxNewPerTick: 2, minSecondsBetweenAdmissions: 30, admitted: 1, deferred: 3 }, 12))
+      .toBe(`${ADMISSION2_TAG} rate-limit rule=r1 admitted=1 deferred=3 maxNewPerTick=2 minSeconds=30 next-in=12s`);
+  });
+  test("prints '-' for a field the rule left unset", () => {
+    expect(rateLimitLine("r1", { maxNewPerTick: 1, admitted: 1, deferred: 1 }, 0))
+      .toBe(`${ADMISSION2_TAG} rate-limit rule=r1 admitted=1 deferred=1 maxNewPerTick=1 minSeconds=- next-in=0s`);
+    expect(rateLimitLine("r1", { minSecondsBetweenAdmissions: 30, admitted: 0, deferred: 1 }, 5))
+      .toBe(`${ADMISSION2_TAG} rate-limit rule=r1 admitted=0 deferred=1 maxNewPerTick=- minSeconds=30 next-in=5s`);
+  });
+});
+
+describe("createAdmissionController with rateLimitOf (FACTORY-907, end-to-end)", () => {
+  test("unset = unchanged, byte-for-byte: no rateLimitOf at all produces no rate-limit line, admission order/log untouched", async () => {
+    const lines: string[] = [];
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [], log: (l) => lines.push(l) });
+    expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
+    expect(lines.some((l) => l.includes("rate-limit"))).toBe(false);
+  });
+
+  test("a resolvable rule that sets neither field behaves exactly as unset — rateLimitOf returning a shape with both fields undefined never limits", async () => {
+    const lines: string[] = [];
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1" });
+    const ctrl = createAdmissionController({ cap: 5, residency: async () => [], rateLimitOf, log: (l) => lines.push(l) });
+    expect(await ctrl.admit(["A", "B"], [])).toEqual(["A", "B"]);
+    expect(lines.some((l) => l.includes("rate-limit"))).toBe(false);
+  });
+
+  test("maxNewPerTick=1 over a 10-candidate batch admits exactly one per call across 10 calls, in stable (wait DESC, key ASC) order — deferred candidates are retried, never dropped", async () => {
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 1 });
+    const ctrl = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf });
+    let remaining = Array.from({ length: 10 }, (_, i) => `c${i}`);
+    const admittedOrder: string[] = [];
+    for (let tick = 0; tick < 10; tick++) {
+      const admitted = await ctrl.admit(remaining, []);
+      expect(admitted.length).toBe(1);
+      admittedOrder.push(admitted[0]!);
+      remaining = remaining.filter((id) => !admitted.includes(id));
+    }
+    expect(remaining).toEqual([]);
+    expect(admittedOrder).toEqual(Array.from({ length: 10 }, (_, i) => `c${i}`));
+  });
+
+  test("minSecondsBetweenAdmissions with a fake clock: a second candidate from the same rule waits out the window across calls", async () => {
+    let nowMs = 0;
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1", minSecondsBetweenAdmissions: 30 });
+    const ctrl = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf, now: () => nowMs });
+    expect(await ctrl.admit(["c0", "c1"], [])).toEqual(["c0"]);
+    nowMs = 29_999;
+    expect(await ctrl.admit(["c1"], [])).toEqual([]); // still withheld — 29.999s < 30s
+    nowMs = 30_000;
+    expect(await ctrl.admit(["c1"], [])).toEqual(["c1"]); // window elapsed
+  });
+
+  test("the rate-limit log line fires once per rule per deferral, throttled — not on every call (RATE_LIMIT_LOG_WINDOW_MS)", async () => {
+    let nowMs = 0;
+    const lines: string[] = [];
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 1 });
+    const ctrl = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf, now: () => nowMs, log: (l) => lines.push(l) });
+    await ctrl.admit(["c0", "c1"], []); // defers c1 — first ever rate-limit line for r1
+    nowMs += 1_000; // well within RATE_LIMIT_LOG_WINDOW_MS of the first line
+    await ctrl.admit(["c0", "c1"], []);
+    const rateLimitLines = lines.filter((l) => l.includes("rate-limit"));
+    expect(rateLimitLines.length).toBe(1);
+    nowMs += RATE_LIMIT_LOG_WINDOW_MS;
+    await ctrl.admit(["c0", "c1"], []);
+    expect(lines.filter((l) => l.includes("rate-limit")).length).toBe(2);
+  });
+
+  test("interplay with the global cap: the fleet cap still binds even when a rule's own rate limit would allow more", async () => {
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1", maxNewPerTick: 5 });
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => [], rateLimitOf });
+    // maxNewPerTick=5 would allow both, but the fleet-wide cap of 1 still only ever admits one — the limiter only defers, never raises the cap.
+    expect(await ctrl.admit(["c0", "c1"], [])).toEqual(["c0"]);
+  });
+
+  test("a candidate rate-limit-deferred, then no longer desired, is dropped cleanly from the wait ledger — reappearing later starts fresh, never resuming its old count or reading as stalled/withheld-by-cap", async () => {
+    const depsObj = {
+      cap: 100,
+      residency: async () => [] as readonly string[],
+      rateLimitOf: (id: string): RuleRateLimit | undefined => (id === "dummy" || id === "c1" ? { ruleId: "r1", maxNewPerTick: 1 } : undefined),
+    };
+    const ctrl = createAdmissionController(depsObj);
+    await ctrl.admit(["dummy", "c1"], []); // "dummy" takes r1's one slot this call; c1 is deferred BY THE RATE LIMIT (cap=100 is nowhere near binding) — c1's wait -> 1
+    expect(ctrl.snapshot().longestWait).toEqual({ id: "c1", polls: 1 });
+    // c1 leaves the desired set for good (ticket closed) — it is never named in a call again, for longer than the eviction bound.
+    for (let i = 0; i < LEDGER_UNSEEN_EVICTION_CALLS + 1; i++) await ctrl.admit(["OTHER"], []);
+    depsObj.cap = 1;
+    // c1 reappears alongside a lexicographically-EARLIER fresh arrival: its old wait of 1 would beat that fresh arrival outright if it had survived. It did not — "1-FRESH" wins the tie at wait 0.
+    expect(await ctrl.admit(["1-FRESH", "c1"], [])).toEqual(["1-FRESH"]);
+  });
+
+  test("restart mid-batch re-derives from live state — a brand-new controller instance carries no limiter memory from a prior one", async () => {
+    const rateLimitOf = (): RuleRateLimit => ({ ruleId: "r1", minSecondsBetweenAdmissions: 10_000 });
+    const before = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf, now: () => 0 });
+    expect(await before.admit(["c0"], [])).toEqual(["c0"]); // r1 "just admitted" at t=0
+    // Daemon restart: a FRESH controller, same rule, same moment in wall-clock time — no persisted file, nothing shared.
+    const after = createAdmissionController({ cap: 100, residency: async () => [], rateLimitOf, now: () => 1 });
+    expect(await after.admit(["c1"], [])).toEqual(["c1"]); // unblocked — the fresh instance never saw `before`'s admission
   });
 });
