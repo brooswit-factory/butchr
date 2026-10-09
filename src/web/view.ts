@@ -270,6 +270,8 @@ export interface ViewDeps {
     fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
+    /** FACTORY-731 — `DELETE /api/rules/:id`. See `../rules/rules-write.ts`'s `writeRuleDelete` for the full gate list (unknown id, stale etag, enabled, live agents, missing confirm). */
+    delete: (id: string, ifMatch: string, confirm: boolean) => RulesWriteOutcome;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -994,6 +996,32 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const outcome = await deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
       auditOutcome(deps, { route: "PUT /api/rules/:id", action: buildFieldDiffSummary(ruleBeforeWrite, parsed.patch), ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-731: `DELETE /api/rules/:id` — see `../rules/rules-write.ts`'s
+    // `writeRuleDelete` for the full gate list. B1: own `checkWriteGuard`
+    // call, same discipline as every other write route in this file (see
+    // the enable route's own comment above for why this is load-bearing,
+    // not merely redundant with `onRequest`'s own prefix gate).
+    .delete("/api/rules/:id", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.rulesWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const id = decodeURIComponent(params.id);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "DELETE /api/rules/:id", action: "delete", ids: [id], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.ifMatch !== "string") { set.status = 400; return { error: "body must include ifMatch: string" }; }
+      const confirm = b.confirm === true;
+      const outcome = deps.rulesWrite.delete(id, b.ifMatch, confirm);
+      auditOutcome(deps, { route: "DELETE /api/rules/:id", action: "delete", ids: [id], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) {
+        set.status = outcome.status;
+        return { error: outcome.error, ...(outcome.confirmReason ? { confirmReason: outcome.confirmReason } : {}) };
+      }
       return outcome;
     })
     // FACTORY-662 item 5 (DECISION ADDED): `POST /api/rules/plan` —
