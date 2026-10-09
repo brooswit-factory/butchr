@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createIssueEventRules } from "../../src/resources/issue.js";
 import { WAKE_MARKERS } from "../../src/jira-watch/diff.js";
 import type { JiraIssue, JiraComment } from "../../src/atlassian/types.js";
+import type { EventVerdict } from "../../src/resources/types.js";
 
 /**
  * FACTORY-865/FACTORY-866: butchr's own `[butchr:*]` bookkeeping comments
@@ -44,6 +45,13 @@ const bookkeeping = (id: string, created = "t"): JiraComment => ({ id, body: "[b
 const real = (id: string, created = "t"): JiraComment => ({ id, body: "a genuine human/agent comment", created, authorEmail: null });
 const wake = (marker: string, id: string, created = "t"): JiraComment => ({ id, body: `${marker} agent-directed text`, created, authorEmail: null });
 
+/** Asserts `deliver: true` and narrows to the reason — EventVerdict is a discriminated union ({deliver:false} | {deliver:true; reason?}), so `.reason` is a type error without this narrowing. */
+function deliveredReason(v: EventVerdict) {
+  expect(v.deliver).toBe(true);
+  if (!v.deliver) throw new Error("unreachable: deliver was asserted true above");
+  return v.reason;
+}
+
 describe("FACTORY-865 criterion A: a pure agent:*-label-only diff is suppressed (baseline, pre-existing behavior)", () => {
   test("no change event, no wake", async () => {
     const store = commentStore({ "KAN-1": [real("c0")] });
@@ -83,8 +91,7 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     const after = issue({ labels: ["agent:idle"], status: "In Review", updated: "t2" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(verdict.deliver).toBe(true);
-    expect(verdict.reason).toEqual({ status: { from: "In Progress", to: "In Review" } });
+    expect(deliveredReason(verdict)).toEqual({ status: { from: "In Progress", to: "In Review" } });
   });
 
   test("agent:* label change + summary change -> delivers, named by summary", async () => {
@@ -93,8 +100,7 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     const after = issue({ labels: ["agent:idle"], summary: "new", updated: "t2" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(verdict.deliver).toBe(true);
-    expect(verdict.reason).toEqual({ summary: true });
+    expect(deliveredReason(verdict)).toEqual({ summary: true });
   });
 
   test("agent:* label change + a REAL (non-bookkeeping) comment landing in the same window -> delivers, named by comment", async () => {
@@ -108,8 +114,7 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     const after = issue({ labels: ["agent:idle"], updated: "t2" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(verdict.deliver).toBe(true);
-    expect(verdict.reason).toEqual({ comment: "c1" });
+    expect(deliveredReason(verdict)).toEqual({ comment: "c1" });
   });
 
   test("a link-change-shaped diff (summary unchanged, status unchanged, only `updated` moves, nothing the issue model tracks changed) still falls through to the honest fallback, never suppressed", async () => {
@@ -128,8 +133,7 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     const after = issue({ updated: "t2" }); // no label change at all -> isDaemonLabelOnlyDiff never even applies
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(verdict.deliver).toBe(true);
-    expect(verdict.reason).toEqual({ undetermined: "unchecked" });
+    expect(deliveredReason(verdict)).toEqual({ undetermined: "unchecked" });
   });
 });
 
@@ -146,8 +150,7 @@ describe("FACTORY-865 criterion D: every allowlisted WAKE marker still wakes, on
       const after = issue({ labels: ["agent:idle"], updated: "t2" });
       const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
       const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-      expect(verdict.deliver).toBe(true); // the marker's own comment still moved the cursor -> not suppressed
-      expect(verdict.reason).toEqual({ comment: "c1" });
+      expect(deliveredReason(verdict)).toEqual({ comment: "c1" }); // the marker's own comment still moved the cursor -> not suppressed
     });
   }
 });
@@ -159,8 +162,7 @@ describe("FACTORY-865 criterion E: pr:* transitions deliver exactly as before, u
     const after = issue({ labels: ["pr:approved"], updated: "t2" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(verdict.deliver).toBe(true);
-    expect(verdict.reason).toEqual({ pr: { from: "open", to: "approved" } });
+    expect(deliveredReason(verdict)).toEqual({ pr: { from: "open", to: "approved" } });
   });
 });
 
