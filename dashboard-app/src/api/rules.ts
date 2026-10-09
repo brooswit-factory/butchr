@@ -70,6 +70,29 @@ export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
 /** Mirrors `src/rules/rules-write-registry.ts`'s own `ENABLE_SCOPE_CEILING` (PR #647) for DISPLAY purposes only (e.g. "above the 25-ticket limit") — the SERVER is the authority on whether a write actually requires `confirm`; this module never enforces the ceiling itself, only echoes the server's own refusal message verbatim when it refuses one. */
 export const ENABLE_SCOPE_CEILING = 25;
 
+/**
+ * FACTORY-927 (review round 1, item 1 — a real build-breaking bug this
+ * fixes, not a display nicety) — mirrors `src/rules/agent-key.ts`'s own
+ * `RESOURCE_PROVIDERS` as a literal VALUE, duplicated rather than
+ * re-exported: that module imports `isFilesystemResourceId` from
+ * `../resources/filesystem-ref.ts`, which imports `{ posix, win32 }` from
+ * `node:path` — a plain VALUE import of anything from `agent-key.ts`
+ * (`import type` is erased; `import { RESOURCE_PROVIDERS }` is not) drags
+ * that whole graph into the Vite dashboard bundle, which has no browser
+ * stub for `node:path`'s named `posix`/`win32` exports and hard-fails the
+ * build (`"posix" is not exported by "__vite-browser-external"`) —
+ * observed taking down `dashboard-app-base-path.test.ts`'s real `vite
+ * build()` the moment `CreateRuleDialog.tsx` first imported
+ * `RESOURCE_PROVIDERS` straight from `agent-key.js`. Same "leaf module
+ * only" discipline `agent-harness.ts`'s own header documents for
+ * `AGENT_HARNESSES`/`RULE_PERMISSION_MODES` — this constant just isn't
+ * worth splitting a dedicated leaf module out for, so it's duplicated
+ * here instead (seven tightly-pinned provider names that already require
+ * a matching server-side change — `resourceProvider`'s own validation,
+ * `./rule-form-catalog.ts`-style wiring — whenever they'd ever change).
+ */
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const satisfies readonly ResourceProvider[];
+
 export interface RuleAgentPreferenceDto {
   harness: AgentHarness;
   model?: string;

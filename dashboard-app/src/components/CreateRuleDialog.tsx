@@ -30,8 +30,9 @@ import { Button, Dialog, Modal, ModalOverlay, Switch } from "@launchpad-ui/compo
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
 // Imported from the LEAF module, never `../../../src/rules/rules.js` directly — see `FirstRuleSetup.tsx`'s own top comment for why a VALUE import from that module breaks the Vite client bundle.
 import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
-import { RESOURCE_PROVIDERS, type ResourceProvider } from "../../../src/rules/agent-key.js";
+import type { ResourceProvider } from "../../../src/rules/agent-key.js";
 import {
+  RESOURCE_PROVIDERS,
   type RuleAgentPreferencePatch,
   type RuleCapacityRolesCatalog,
   type RuleCreateDraft,
