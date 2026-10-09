@@ -29,6 +29,7 @@ import type { SettingsApiResponse } from "./settings-api.js";
 import type { JiraTestResult } from "./jira-connection-test.js";
 import { SettingProvidedByEnvironmentError } from "../settings/write-settings.js";
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
+import type { DaemonLogsResult } from "./daemon-logs.js";
 import type { SetupStatusResponse, JiraWriteRequestOutcome, RateGate } from "./setup-api.js";
 import { validateStopRequestBody, validateShelveRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody, type AgentWriteOutcome, type AdoptInput } from "../agents/agents-write.js";
 
@@ -372,6 +373,23 @@ export interface ViewDeps {
    * never a reason to refuse a restart that would otherwise be allowed.
    */
   daemonRestartRateLimit?: () => WriteRateLimitOutcome;
+  /**
+   * FACTORY-668 (C1, read) — `GET /api/daemon/logs`'s own data
+   * (`./daemon-logs.ts`'s `readDaemonLogs`, already bound to this process's
+   * own `currentSystemdInfo()` and bounds). Optional: an omitted value
+   * makes the route unreachable (503), never open.
+   */
+  daemonLogs?: () => Promise<DaemonLogsResult>;
+  /**
+   * FACTORY-668 (C2, write) — `POST /api/daemon/reload`'s own logic:
+   * literally `deps.reloadRulesNow` (above) re-exposed over HTTP for the
+   * first time — the SAME `reloadRules(rulesHolder)` SIGHUP already calls,
+   * never a second reload code path. Non-destructive (a reload never kills
+   * a running agent mid-ticket, see `reloadRules`'s own doc comment), so
+   * unlike `daemonRestart` this is NOT confirm-gated. Optional: an omitted
+   * value makes the route unreachable (503).
+   */
+  daemonReload?: () => ReloadResult;
   /**
    * FACTORY-665 (PR-2) — `GET /api/setup/status`'s own data: whether the
    * daemon is fully configured (Atlassian identity present) or running in
@@ -1328,6 +1346,52 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       auditOutcome(deps, { route: "POST /api/daemon/restart", action: "restart", ids: [], origin: request.headers.get("origin") }, outcome.ok ? { ok: true } : { ok: false, error: outcome.error });
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
+    })
+    // FACTORY-668 (C1, read) — `GET /api/daemon/logs`: a bounded, redacted
+    // tail of this daemon's own journal (`./daemon-logs.ts`). Same guard
+    // discipline as `GET /api/agents/:issue`/`GET /api/rules` above
+    // (dashboard-origin guard + same-UID peer check, checked BEFORE any
+    // work, `Cache-Control: no-store`) — a log viewer is at least as
+    // sensitive as those reads, so it never gets a looser check just
+    // because today's `/health`/`/state` happen to have none.
+    .get("/api/daemon/logs", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.daemonLogs) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      const result = await deps.daemonLogs();
+      if (!result.ok) { set.status = 503; return { error: result.error }; }
+      return result;
+    })
+    // FACTORY-668 (C2, write) — `POST /api/daemon/reload`: re-reads
+    // rules.json in-process (`deps.daemonReload`, literally
+    // `reloadRules(rulesHolder)` — the SAME function SIGHUP and the rules
+    // write path already call). Full write-guard chain + the shared write
+    // rate limit, same as every other write route in this file. NOT
+    // confirm-gated, unlike `POST /api/daemon/restart`: a reload never
+    // takes the daemon down or kills a running agent mid-ticket (see
+    // `reloadRules`'s own doc comment) — every attempt, accepted or
+    // refused (a parse/validation problem in rules.json), is still
+    // audited.
+    .post("/api/daemon/reload", async ({ set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.daemonReload) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const result = deps.daemonReload();
+      auditOutcome(deps, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.problems.join("; ") || "reload failed" });
+      if (!result.ok) { set.status = 409; return { error: result.problems.join("; ") || "reload failed", path: result.path }; }
+      return result;
     })
     .get("/agents", () => mcp.connections.list().map((c) => ({ id: c.id, issue: c.headers["x-issue"] ?? null, connectedAt: c.connectedAt })))
     .post("/agents/:issue/open", async ({ params, set }) => {

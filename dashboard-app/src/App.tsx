@@ -12,6 +12,7 @@ import { DashboardRoute } from "./routes/DashboardRoute.js";
 import { ConfigurationsRoute } from "./routes/ConfigurationsRoute.js";
 import { RulesRoute } from "./routes/RulesRoute.js";
 import { SettingsRoute } from "./routes/SettingsRoute.js";
+import { DaemonRoute } from "./routes/DaemonRoute.js";
 import { SetupRoute } from "./routes/SetupRoute.js";
 import { realSetupApi, type SetupApi } from "./api/setup.js";
 import { useSetupGate } from "./hooks/use-setup-gate.js";
@@ -58,6 +59,7 @@ export function App({ setupApi = realSetupApi }: AppProps) {
           <NavLink to="/configurations">Configurations</NavLink>
           <NavLink to="/rules">Rules</NavLink>
           <NavLink to="/settings">Settings</NavLink>
+          <NavLink to="/daemon">Daemon</NavLink>
         </nav>
       </header>
       <main className="app-main">
@@ -66,6 +68,7 @@ export function App({ setupApi = realSetupApi }: AppProps) {
           <Route path="/configurations" element={<ConfigurationsRoute />} />
           <Route path="/rules" element={<RulesRoute />} />
           <Route path="/settings" element={<SettingsRoute setupApi={setupApi} />} />
+          <Route path="/daemon" element={<DaemonRoute />} />
         </Routes>
       </main>
     </div>

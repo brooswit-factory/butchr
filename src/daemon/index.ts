@@ -144,6 +144,8 @@ import { testJiraConnection } from "../web/jira-connection-test.js";
 import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
 import { writeSetting } from "../settings/write-settings.js";
 import { restartDaemon } from "../web/daemon-restart.js";
+import { readDaemonLogs, DEFAULT_DAEMON_LOGS_MAX_LINES, DEFAULT_DAEMON_LOGS_MAX_BYTES } from "../web/daemon-logs.js";
+import { currentSystemdInfo } from "../agents/ground-truth.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -1047,14 +1049,23 @@ const rulesWriteDeps = {
 // never a second type).
 const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
 
+// FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
+// caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
+// HTTP exposure of the SAME trigger) are literally the same function —
+// defined once here so the two call sites can never drift from each other
+// or from `SIGHUP`'s own handler below, which also calls `reloadRules`
+// directly against this one `rulesHolder`.
+const reloadRulesInProcess = () => {
+  const result = reloadRules(rulesHolder);
+  scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
+  return result;
+};
+
 const { app, mcp } = buildApp({
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
-  reloadRulesNow: () => {
-    const result = reloadRules(rulesHolder);
-    scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
-    return result;
-  },
+  reloadRulesNow: reloadRulesInProcess,
+  daemonReload: reloadRulesInProcess,
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -1278,6 +1289,11 @@ const { app, mcp } = buildApp({
   // under that unit (see `../web/daemon-restart.ts`'s own header).
   daemonRestart: () => restartDaemon(),
   daemonRestartRateLimit,
+  // FACTORY-668 (C1, read): `currentSystemdInfo()` is this process's OWN
+  // measured identity — the SAME derivation `ENVIRONMENT.md`'s "ground
+  // truth" and `/health`'s `build.unit`/`build.journalctl` already use —
+  // never a guessed unit name.
+  daemonLogs: () => readDaemonLogs(currentSystemdInfo(), { maxLines: DEFAULT_DAEMON_LOGS_MAX_LINES, maxBytes: DEFAULT_DAEMON_LOGS_MAX_BYTES }),
   // FACTORY-665 (PR-2): this daemon is already configured, so `GET
   // /api/setup/status` always reports `configured: true` here — the
   // dashboard's Setup page never shows once this is wired (setup mode,
