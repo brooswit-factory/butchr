@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -56,6 +56,44 @@ describe("FACTORY-849/FACTORY-852: workspaceStopCause / persistIntentionalStop /
     try {
       expect(() => clearStopCause(root)).not.toThrow();
       expect(workspaceStopCause(root)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // PR #719 review, item 2: `workspaceStopCause`'s doc comment claims "never
+  // throws", but the original implementation only caught ENOENT — a corrupt
+  // or torn-write file (a plain `SyntaxError` from `JSON.parse`) escaped
+  // uncaught. The brief requires the read half to fail safe, exactly like
+  // the ENOENT case, so a half-written record must resolve to `undefined`,
+  // not throw.
+  test("workspaceStopCause fails safe to undefined on a garbage (non-JSON) file — never throws", () => {
+    const root = mkdtempSync(join(tmpdir(), "bw-stop-cause-corrupt-"));
+    try {
+      writeFileSync(join(root, ".butchr-stop-cause.json"), "{not valid json, this is a torn write");
+      expect(() => workspaceStopCause(root)).not.toThrow();
+      expect(workspaceStopCause(root)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("workspaceStopCause fails safe to undefined on a truncated-mid-write file (valid JSON prefix, cut off)", () => {
+    const root = mkdtempSync(join(tmpdir(), "bw-stop-cause-truncated-"));
+    try {
+      writeFileSync(join(root, ".butchr-stop-cause.json"), '{"reason":"stand_down","a');
+      expect(workspaceStopCause(root)).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("persistIntentionalStop leaves no stray temp file behind after a successful write (atomic rename, not an in-place write)", () => {
+    const root = mkdtempSync(join(tmpdir(), "bw-stop-cause-atomic-"));
+    try {
+      persistIntentionalStop(root, "finish_worker", 1);
+      const entries = readdirSync(root);
+      expect(entries).toEqual([".butchr-stop-cause.json"]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

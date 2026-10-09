@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { workspaceDirsForResource } from "./workspace.js";
 import { EXEMPT_LABEL } from "./parked.js";
@@ -29,17 +29,23 @@ export interface StopCauseRecord {
   at: number;
 }
 
-/** This workspace's own persisted stop-cause record (`.butchr-stop-cause.json`), or `undefined` for a workspace with none recorded yet, or whose record was cleared — see `clearStopCause`. Never throws: an ENOENT (no record) and any other read failure are indistinguishable from "nothing recorded" to this call's caller, the same fail-safe discipline `workspaceSessionId`/`workspaceModel`/`workspaceEffort` already use for their own missing file. */
+/** This workspace's own persisted stop-cause record (`.butchr-stop-cause.json`), or `undefined` for a workspace with none recorded yet, or whose record was cleared — see `clearStopCause`. Never throws: an ENOENT (no record) and a corrupt/partial file (a `SyntaxError` from `JSON.parse` — e.g. a write torn by a crash mid-`writeFileSync`) are BOTH indistinguishable from "nothing recorded" to this call's caller — the brief's fail-safe-to-`undefined` requirement covers more than the missing-file case `workspaceSessionId`/`workspaceModel`/`workspaceEffort` guard against, because this file, unlike theirs, is read on the "was my last stop intentional" path where a wrongly-thrown exception is worse than a wrongly-unintended verdict (see `classifyStop`'s own doc comment for why unintended is the cheap direction to be wrong in). Any OTHER read failure (e.g. EACCES) still throws — not a shape this story's fail-safe contract was asked to cover. */
 export function workspaceStopCause(dir: string): StopCauseRecord | undefined {
-  try { return JSON.parse(readFileSync(join(dir, ".butchr-stop-cause.json"), "utf8")); }
+  let raw: string;
+  try { raw = readFileSync(join(dir, ".butchr-stop-cause.json"), "utf8"); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  try { return JSON.parse(raw); }
+  catch (e) { if (e instanceof SyntaxError) return undefined; throw e; }
 }
 
-/** Persists `reason` as this workspace's stop cause — the write half of `workspaceStopCause`. A REPLACE, not an append: a later call (a later intentional stop) simply overwrites the previous record, which is one half of this story's "clear/supersede" requirement — see `clearStopCause`'s own doc comment for the other half. */
+/** Persists `reason` as this workspace's stop cause — the write half of `workspaceStopCause`. A REPLACE, not an append: a later call (a later intentional stop) simply overwrites the previous record, which is one half of this story's "clear/supersede" requirement — see `clearStopCause`'s own doc comment for the other half. Writes to a sibling temp file and renames over the target (same-directory `rename` is atomic on POSIX) rather than writing the target in place, so a reader can never observe the half-written state a plain `writeFileSync` would otherwise expose — the exact corruption shape `workspaceStopCause`'s own fail-safe parse guard above exists to tolerate if it ever happens anyway (a concurrent write from another process, say). */
 export function persistIntentionalStop(dir: string, reason: StopReason, at: number = Date.now()): void {
   mkdirSync(dir, { recursive: true });
   const record: StopCauseRecord = { reason, at };
-  writeFileSync(join(dir, ".butchr-stop-cause.json"), JSON.stringify(record));
+  const target = join(dir, ".butchr-stop-cause.json");
+  const tmp = join(dir, `.butchr-stop-cause.json.${process.pid}.${Date.now()}.tmp`);
+  writeFileSync(tmp, JSON.stringify(record));
+  renameSync(tmp, target);
 }
 
 /**
