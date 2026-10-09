@@ -501,6 +501,69 @@ export interface Rule {
    * ticket's own API tests, not by inspection.
    */
   resumeContextCutoff?: number;
+  /**
+   * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY —
+   * this EXTENDS the existing global `stalledMinutes` (src/config/config.ts,
+   * env `BUTCHR_STALLED_MINUTES`, default 10) instead of adding a parallel
+   * idle-poke threshold. Nothing in the daemon reads this field yet —
+   * wiring a per-rule override into `StalledTracker` (src/agents/
+   * stalled.ts) and the wake-comment remediator (src/agents/stall-
+   * remediation.ts) is FACTORY-845's job, which this ticket's text names
+   * as the engine story reading these field names; this field only
+   * describes what a rule WOULD want once that wiring exists. When
+   * ABSENT — unlike `execution`/`account`/`role` above — there is
+   * deliberately NO default resolved here: the rule simply inherits the
+   * global `stalledMinutes` as it already does today, so an install that
+   * configures nothing keeps its existing 10-minute threshold unchanged.
+   * The epic's own "30 min" default is achieved by a rule (or the global
+   * config) explicitly setting it, not by this field silently resolving
+   * to 30 for everyone — see FACTORY-844's ticket comment for why:
+   * flipping every install from 10 to 30 by default would be a behaviour
+   * change dressed as a config addition. Same "positive number"
+   * validation idiom as `stalledMinutes`.
+   */
+  idlePokeMinutes?: number;
+  /**
+   * FACTORY-846: per-rule override of the wake comment's own closing
+   * sentence (`DEFAULT_TAIL` in src/agents/stall-remediation.ts's
+   * `wakeComment`). Nothing reads this yet — see `idlePokeMinutes`'s own
+   * doc comment above for the FACTORY-845 split. Once wired, this is
+   * intended to REPLACE that sentence for a plain stall wake on this
+   * rule's tickets — never appended alongside it, which would be the
+   * "doubling pokes" outcome FACTORY-844 rules out — and never applied to
+   * BUTCHR-353's "correctly waiting" branch (`correctlyWaitingTail`): that
+   * text is safety advice (don't close/transition a ticket that's
+   * correctly waiting on a worker) and must not be silently swapped out by
+   * an arbitrary per-rule string. ABSENT means today's existing wake text
+   * is sent unchanged — there is no new default value resolved here, mirror
+   * of `idlePokeMinutes` above for the same reason. When PRESENT, must be
+   * non-empty: an empty string means "no text", which would silently do
+   * nothing useful, so it is REJECTED rather than treated as valid — use
+   * `idlePokeEnabled: false` to silence the poke for this rule instead.
+   */
+  idlePokeMessage?: string;
+  /**
+   * FACTORY-846: opt this rule's tickets OUT of the stall wake comment
+   * (src/agents/stall-remediation.ts) entirely, once FACTORY-845 wires a
+   * per-rule read into that path — `agent:stalled` detection itself
+   * (src/agents/stalled.ts) is untouched either way, since this is CONFIG
+   * SURFACE for the REMEDIATION (delivery) half, not a second detector.
+   * Defaults to `true` (on) when absent — unlike `idlePokeMinutes`/
+   * `idlePokeMessage` above, "on" is already today's unconditional
+   * behaviour for every rule, so resolving this to `true` here changes
+   * nothing for an install that sets nothing, and `parseRules` always
+   * resolves it to an explicit boolean rather than leaving it absent.
+   *
+   * Still typed OPTIONAL on `Rule` itself, same as `execution`/`account`/
+   * `role` (which `parseRules` ALSO always resolves): this interface
+   * doubles as a literal-object shape at many call sites across the
+   * codebase (tests, fixtures) that build a `Rule` directly without going
+   * through `parseRules`, and a required field here would force every one
+   * of those to pick a value. A caller that needs the resolved,
+   * always-true-when-absent reading does `rule.idlePokeEnabled ?? true`,
+   * same as `../web/rules-api.ts`.
+   */
+  idlePokeEnabled?: boolean;
 }
 
 /**
@@ -518,10 +581,32 @@ export interface Rule {
  */
 export const DEFAULT_RESUME_CONTEXT_CUTOFF = 100_000;
 
+/**
+ * FACTORY-846: the epic's own declared idle-poke interval (30 minutes) — NOT
+ * the value `Rule.idlePokeMinutes` silently resolves to when a rule sets
+ * nothing (see that field's own doc comment above: resolving to this here
+ * would be the "silently change every install's stall threshold from 10 to
+ * 30" behaviour the epic explicitly rules out; the true fallback for an
+ * unset rule is today's global `stalledMinutes`). Exported for callers that
+ * want a concrete seed/display value for a rule that has not opted in yet —
+ * `../web/rules-api.ts`'s API response and the Rules page form in
+ * `dashboard-app` both show this as the starting value before a rule sets
+ * its own.
+ */
+export const DEFAULT_IDLE_POKE_MINUTES = 30;
+/**
+ * FACTORY-846: the epic's own declared idle-poke message text, reusing the
+ * FACTORY-735 "before you stop" wording. Same "seed/display value, not an
+ * auto-resolved default" caveat as `DEFAULT_IDLE_POKE_MINUTES` above — the
+ * true fallback for a rule that sets nothing is today's existing wake text
+ * already sent by `src/agents/stall-remediation.ts`, unchanged.
+ */
+export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down";
+
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff",
+  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -718,6 +803,18 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const { resumeOnRespawn, resumeContextCutoff } = raw;
     if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
     if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
+    // FACTORY-846: idlePokeMinutes/idlePokeMessage stay OPTIONAL — same
+    // absent-means-absent style as permissionMode/lizardMode immediately
+    // above, deliberately NOT the always-defaulted execution/account/role
+    // style, because resolving either to a brand-new default here would be
+    // exactly the "silently change every install" conflict FACTORY-844
+    // calls out (see Rule.idlePokeMinutes/idlePokeMessage's own doc
+    // comments). idlePokeEnabled DOES get an always-resolved default
+    // (true), because "on" is already today's unconditional behaviour.
+    const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
+    if (idlePokeMinutes !== undefined && (!Number.isFinite(idlePokeMinutes) || (idlePokeMinutes as number) <= 0)) errors.push(`${at}.idlePokeMinutes must be a positive number`);
+    if (idlePokeMessage !== undefined && !nonEmpty(idlePokeMessage)) errors.push(`${at}.idlePokeMessage must be a non-empty string`);
+    if (idlePokeEnabled !== undefined && typeof idlePokeEnabled !== "boolean") errors.push(`${at}.idlePokeEnabled must be a boolean`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
@@ -746,6 +843,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
       ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
+      ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),
+      ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
+      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
     });
   });
   for (const { at, id, provider } of refs) {

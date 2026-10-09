@@ -43,6 +43,8 @@ export interface RuleResourceDeps {
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   comments?: IssueResourceDeps["comments"];
   log?: (line: string) => void;
+  /** FACTORY-922: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onCommentCheckSkipped`'s own doc comment. */
+  onCommentCheckSkipped?: IssueResourceDeps["onCommentCheckSkipped"];
   /**
    * BUTCHR-398: this provider's own currently-running herd ids (already
    * scoped — a caller passes `herd.runningIssues()` filtered by
@@ -343,6 +345,16 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
     ...(rule.lizardMode ? { lizardMode: true } : {}),
+    // FACTORY-916: unlike the booleans above, `resumeOnRespawn` is
+    // absent-means-ON (no tri-state — `Rule.resumeOnRespawn`'s own doc
+    // comment), so an explicit `false` must still be forwarded; a truthy
+    // check here would silently drop it. `ticketStatus`/`ticketLabels` are
+    // this already-fetched `issue`'s own fields, carried through so the
+    // spawn decision's `classifyStop` call needs no Jira fetch of its own.
+    ...(rule.resumeOnRespawn !== undefined ? { resumeOnRespawn: rule.resumeOnRespawn } : {}),
+    ...(rule.resumeContextCutoff !== undefined ? { resumeContextCutoff: rule.resumeContextCutoff } : {}),
+    ticketStatus: issue.status,
+    ticketLabels: issue.labels,
   };
 }
 
@@ -408,6 +420,7 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         ...(deps.suppress ? { suppress: (key: string, updated: string, watcher: string) => deps.suppress!(key, updated, agentOf(watcher)) } : {}),
         ...(deps.comments ? { comments: deps.comments } : {}),
         ...(deps.log ? { log: deps.log } : {}),
+        ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
       });
       inner.set(rule.id, rules);
     }
@@ -417,6 +430,7 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
   });
   const asIssues = (related: readonly RelatedResource<ExecutionUnit<RuleMatch>>[]) =>
     related.filter((r) => r.issue.kind === "resource").map((r) => ({ issue: (r.issue as { kind: "resource"; match: RuleMatch }).match.issue, watchers: r.watchers }));

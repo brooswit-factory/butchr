@@ -19,7 +19,8 @@
       "brief": "@builtin:task",
       "linkedEventing": true,
       "maxLinkedTurnsPerHour": 2,
-      "maxLinkedItems": 25
+      "maxLinkedItems": 25,
+      "idlePokeMinutes": 15
     },
     {
       "id": "bugs",

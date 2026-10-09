@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { rulesEtag, updateRulesFile } from "../../src/rules/write-rules.js";
 import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
 import { capacityRoleFor } from "../../src/agents/capacity-role.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { buildFieldsAllowedPaths } from "../../src/rules/rules-write-apply.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch } from "../../src/rules/rules-write-registry.js";
 import { createRulesPreviewer, DEFAULT_PREVIEW_RATE_LIMIT_MS } from "../../src/web/rules-preview.js";
@@ -462,6 +462,20 @@ describe("writeRuleFields (PUT)", () => {
     expect(nextDoc.rules[0].permissionMode).toBe("default");
     expect(nextDoc.rules[0].agentPreferences[0].harness).toBe("codex");
   });
+
+  test("FACTORY-846: edits idlePokeMinutes/idlePokeMessage/idlePokeEnabled, no confirm needed (never risky)", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+    const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
+    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+    const etag = rulesEtag(env());
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+    expect(outcome.ok).toBe(true);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules[0].idlePokeMinutes).toBe(45);
+    expect(nextDoc.rules[0].idlePokeMessage).toBe("go check your ticket");
+    expect(nextDoc.rules[0].idlePokeEnabled).toBe(false);
+  });
 });
 
 describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true are never defaults — require confirm", () => {
@@ -612,6 +626,136 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
       expect(plan.requiresConfirm).toBe(false);
       expect(plan.confirmReason).toBeUndefined();
     }
+  });
+});
+
+const noLiveAgents = () => false;
+const alwaysLiveAgents = () => true;
+
+describe("writeRuleDelete (FACTORY-731)", () => {
+  test("FACTORY-730: deletes a non-ui- rule (e.g. managers) when disabled, with confirm: true", async () => {
+    seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("managers", etag, true, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.changedIds).toEqual(["managers"]);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules).toEqual([]);
+  });
+
+  test("unknown id: 400, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("no-such-rule", etag, true, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(400);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("refuses a stale ifMatch, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const outcome = writeRuleDelete("managers", "stale-etag", true, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  // Review bar: "Enabled-rule and live-agent refusals each proven to write
+  // NOTHING (assert file content unchanged, not just error status)." Both
+  // below assert the full file byte-for-byte, not merely the status, and
+  // both pass `confirm: true` to prove this gate is UNCONDITIONAL —
+  // never bypassable the way a blast-radius confirm is.
+  test("refuses deleting an ENABLED rule, even with confirm: true, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: true }]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("managers", etag, true, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toContain("disable it first");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  test("refuses deleting a rule with a LIVE AGENT, even with confirm: true and even while disabled, writes nothing", async () => {
+    const text = seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("managers", etag, true, alwaysLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.error).toContain("wait for them to finish or stop them first");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  // Review bar: "Confirm requirement proven server-side on a request
+  // omitting confirm entirely, file unchanged."
+  test("refuses with NO confirm at all (omitted -> false), names the rule's id and query, dedicated confirmReason, writes nothing", async () => {
+    const rule = { ...MANAGERS_RULE, enabled: false, query: "project = BUTCHR AND role = manager" };
+    const text = seed([rule]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("managers", etag, false, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.status).toBe(409);
+      expect(outcome.confirmReason).toBe("rule-delete");
+      expect(outcome.error).toContain("managers");
+      expect(outcome.error).toContain(rule.query);
+      expect(outcome.error).not.toBe("are you sure?");
+    }
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
+  });
+
+  // Review bar: "Deleting a rule at an arbitrary index in the rules array,
+  // not only first/last."
+  test("deletes a rule at an arbitrary (middle) index, leaving every other rule untouched and in order", async () => {
+    const first = { ...MANAGERS_RULE, id: "first", enabled: false };
+    const middle = { ...MANAGERS_RULE, id: "middle", enabled: false };
+    const last = { ...MANAGERS_RULE, id: "last", enabled: false };
+    seed([first, middle, last]);
+    const etag = rulesEtag(env());
+    const outcome = writeRuleDelete("middle", etag, true, noLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) expect(outcome.changedIds).toEqual(["middle"]);
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules).toEqual([first, last]);
+  });
+
+  // Review bar: "Undo proven byte-for-byte against an arbitrary non-`ui-`
+  // rule" — this ticket's own "most important test" (delete, undo, assert
+  // file content equals original), end to end through the real
+  // `writeUndo` path (B2), never a separate/weaker undo mechanism for
+  // delete.
+  test("undoing a delete restores the file byte-for-byte, including the deleted rule", async () => {
+    const first = { ...MANAGERS_RULE, id: "first", enabled: false };
+    const middle = { ...MANAGERS_RULE, id: "middle", enabled: false };
+    const last = { ...MANAGERS_RULE, id: "last", enabled: false };
+    const original = seed([first, middle, last]);
+    const deps = { env: env() };
+    const etag = rulesEtag(env());
+    const deleted = writeRuleDelete("middle", etag, true, noLiveAgents, deps);
+    expect(deleted.ok).toBe(true);
+    if (!deleted.ok || !deleted.backupId) throw new Error("expected a backup id");
+    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
+    expect(nextDoc.rules).toEqual([first, last]);
+    const undone = writeUndo(deleted.backupId, deps);
+    expect(undone.ok).toBe(true);
+    expect(readFileSync(rulesFilePath(), "utf8")).toBe(original);
+  });
+
+  test("a hasLiveAgents false-to-true race between the pre-lock check and the lock is still caught (checked again inside the lock)", async () => {
+    seed([{ ...MANAGERS_RULE, enabled: false }]);
+    const etag = rulesEtag(env());
+    let calls = 0;
+    const flakyLiveAgents = () => {
+      calls++;
+      return calls > 1; // false on the pre-lock check, true on the in-lock recheck
+    };
+    const outcome = writeRuleDelete("managers", etag, true, flakyLiveAgents, { env: env() });
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.status).toBe(409);
+    expect(calls).toBeGreaterThan(1);
   });
 });
 

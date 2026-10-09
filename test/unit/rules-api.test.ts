@@ -134,6 +134,31 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.resumeOnRespawn).toBeNull();
     expect(r.rules[0]!.resumeContextCutoff).toBeNull();
   });
+  test("FACTORY-846 (review round 1): idlePokeMinutes/idlePokeMessage are read off the raw Rule when set, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule({ idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false })], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.idlePokeMinutes).toBe(45);
+    expect(r.rules[0]!.idlePokeMessage).toBe("go check your ticket");
+    expect(r.rules[0]!.idlePokeEnabled).toBe(false);
+  });
+  test("FACTORY-846 (review round 1): absent idlePokeMinutes/idlePokeMessage on the raw Rule read as null, NEVER DEFAULT_IDLE_POKE_MINUTES/DEFAULT_IDLE_POKE_MESSAGE — this rule's real effective threshold/text is today's global stalledMinutes/wake text, not the epic's own seed values, and reporting the seed here would be the exact 10-vs-30 confusion the review caught", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule()], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.idlePokeMinutes).toBeNull();
+    expect(r.rules[0]!.idlePokeMessage).toBeNull();
+    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null.
+    expect(r.rules[0]!.idlePokeEnabled).toBe(true);
+  });
   test("invalid file: valid:false, problems populated from the error message, zero rules", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [], error: { path: "/rules.json", message: "line 1 is bad\nline 2 is also bad" } },
