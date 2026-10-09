@@ -341,11 +341,64 @@ export interface SessionDefinition {
    * docs/managed-sessions.md).
    */
   linkedEventingProjects?: string[];
+  /**
+   * FACTORY-926 (epic FACTORY-836) — REUSED VERBATIM from `Rule.idlePokeMinutes`
+   * (src/rules/rules.ts): same optional number, same "positive number"
+   * validation, same NO-resolved-default-when-absent semantics. A
+   * SessionDefinition agent (director/advisors/admins/dialog-monitor/
+   * genius/buddy) is deliberately NOT a `Rule` resource (see
+   * `Rule.idlePokeMinutes`'s own doc comment for why a resolved default
+   * here would be a behaviour change dressed as config) — it has no
+   * Jira-issue-keyed global
+   * `stalledMinutes` fallback to inherit at all, because no path from the
+   * idle-poke engine (`src/agents/idle-poke.ts`, wired only into the
+   * ISSUE-tier loop via `syncLabels`, src/labels/sync.ts) ever reaches a
+   * managed-session agent today — verified at FACTORY-942's own ticket
+   * comment with code evidence, and see `docs/idle-poke-role-defaults.md`'s
+   * "director, advisors, admins, utility sessions (epic group 3)" section
+   * for the same finding independently reached by FACTORY-842. This field
+   * is therefore CONFIG-ONLY / INERT exactly like the `jira-project`
+   * (group 2) case that same doc describes: present so an operator's
+   * manifest can CARRY the value and so a future engine change has a field
+   * to read with the right name already chosen, but nothing in this
+   * daemon reads it yet. See `docs/idle-poke-session-definitions.md` for
+   * the shipped per-role values and what applying them to a live fleet
+   * requires.
+   */
+  idlePokeMinutes?: number;
+  /**
+   * REUSED VERBATIM from `Rule.idlePokeMessage` — same optional non-empty
+   * string, same rejection of an empty string (use `idlePokeEnabled: false`
+   * instead), same no-resolved-default-when-absent semantics. Same
+   * CONFIG-ONLY / INERT status as `idlePokeMinutes` above — see that
+   * field's own doc comment.
+   */
+  idlePokeMessage?: string;
+  /**
+   * REUSED VERBATIM from `Rule.idlePokeEnabled` — same optional boolean,
+   * ALWAYS resolved by `parseSessionDefinition` (default `true`, mirroring
+   * `parseRules`'s own always-resolved convention for this field — see
+   * `Rule.idlePokeEnabled`'s own doc comment for why: "on" is already
+   * today's behaviour for the engine's only reachable resource type, a
+   * `Rule`, so resolving absent to `true` here changes nothing for an
+   * install that sets nothing). THE UN-POKEABLE GUARANTEE for group 3 is
+   * expressed through THIS field, set to an explicit `false` on every
+   * shipped utility-session definition (dialog-monitor/genius/buddy and
+   * equivalents) — never through a code special case, and never by
+   * relying on today's structural unreachability persisting by accident.
+   * Still CONFIG-ONLY today for the same reason as `idlePokeMinutes` above:
+   * no engine path reads this field yet, so setting it `true` grants no
+   * new reachability either — see
+   * `test/unit/session-definition-idle-poke.test.ts`'s "un-pokeable"
+   * describe block, which asserts this directly against the daemon's own
+   * wiring rather than trusting the field's mere presence.
+   */
+  idlePokeEnabled?: boolean;
 }
 
 const DEFINITION_FIELDS = new Set([
   "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "lizardMode", "execution", "account", "role", "frozen",
-  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects",
+  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 
 const MAX_CONTROLLERS_PER_FIELD = 100;
@@ -490,6 +543,12 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.freezeControllers !== undefined) problems.push(...controllerListProblems(doc.freezeControllers, `${at}.freezeControllers`));
   if (doc.unfreezeControllers !== undefined) problems.push(...controllerListProblems(doc.unfreezeControllers, `${at}.unfreezeControllers`));
   if (doc.linkedEventingProjects !== undefined) problems.push(...linkedEventingProjectsProblems(doc.linkedEventingProjects, `${at}.linkedEventingProjects`));
+  // FACTORY-926: same field names, same validation idiom as `Rule`'s own
+  // `idlePokeMinutes`/`idlePokeMessage`/`idlePokeEnabled` (src/rules/rules.ts)
+  // — see this interface's own doc comments on these three fields for why.
+  if (doc.idlePokeMinutes !== undefined && (!Number.isFinite(doc.idlePokeMinutes) || (doc.idlePokeMinutes as number) <= 0)) problems.push(`${at}.idlePokeMinutes must be a positive number`);
+  if (doc.idlePokeMessage !== undefined && !nonEmpty(doc.idlePokeMessage)) problems.push(`${at}.idlePokeMessage must be a non-empty string`);
+  if (doc.idlePokeEnabled !== undefined && typeof doc.idlePokeEnabled !== "boolean") problems.push(`${at}.idlePokeEnabled must be a boolean`);
   return problems;
 }
 
@@ -518,6 +577,9 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     ...(d.linkedEventingProjects !== undefined
       ? { linkedEventingProjects: (d.linkedEventingProjects as string[]).map((s) => formatResourceRef(parseResourceRef(s.trim()))) }
       : {}),
+    ...(d.idlePokeMinutes !== undefined ? { idlePokeMinutes: d.idlePokeMinutes as number } : {}),
+    ...(typeof d.idlePokeMessage === "string" ? { idlePokeMessage: d.idlePokeMessage.trim() } : {}),
+    idlePokeEnabled: (d.idlePokeEnabled as boolean | undefined) ?? true,
   };
 }
 
