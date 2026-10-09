@@ -22,10 +22,12 @@
  *   off `SpawnSpec.issuetype` exactly as today.
  */
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
+import { AtlassianHttpError } from "../atlassian/client.js";
 import { isActive } from "../reconcile/plan.js";
 import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition, excludeBookkeepingComments } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
+import { skippedCommentCheckLine, type SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
 import type {
   Activation,
@@ -154,6 +156,26 @@ export function bossKeyFrom(issue: JiraIssue): string | null {
   return issue.issuelinks?.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
 }
 
+/**
+ * FACTORY-922 (implementing FACTORY-921's resolved decision point): which
+ * issue keys were added/removed between `before.issuelinks` and
+ * `after.issuelinks` — `null` when there is nothing to report, either
+ * because neither key set changed or because EITHER side is `undefined`
+ * ("unknown", per `JiraIssue.issuelinks`'s own doc comment — never silently
+ * treated as "confirmed empty", which would manufacture a diff out of
+ * missing information rather than a real one). Pure, no I/O — the same
+ * (before, after) pair `decide()` already has in hand.
+ */
+function issuelinksDiff(before: JiraIssue, after: JiraIssue): { added: readonly string[]; removed: readonly string[] } | null {
+  if (!before.issuelinks || !after.issuelinks) return null;
+  const beforeKeys = new Set(before.issuelinks.map((l) => l.key));
+  const afterKeys = new Set(after.issuelinks.map((l) => l.key));
+  const added = [...afterKeys].filter((k) => !beforeKeys.has(k));
+  const removed = [...beforeKeys].filter((k) => !afterKeys.has(k));
+  if (!added.length && !removed.length) return null;
+  return { added, removed };
+}
+
 /** SPAWN CONFIG: the SpawnSpec fields the existing shared spawn machinery reads — see this module's top comment. */
 export const ISSUE_SPAWN_CONFIG: SpawnConfig<JiraIssue> = {
   specFor: (issue) => ({ key: issue.key, issuetype: issue.issuetype, summary: issue.summary, parent: bossKeyFrom(issue) }),
@@ -199,6 +221,15 @@ export interface IssueResourceDeps {
    * src/daemon/log-sink.ts's own doc comment for why that matters — AC1).
    */
   log?: (line: string) => void;
+  /**
+   * FACTORY-922 (implementing story FACTORY-921): called once per key whose
+   * comment fetch could not confirm a diff this poll (§3D fallback in
+   * `decide()` below) — the counter a `/health` consumer surfaces as
+   * `commentChecksSkipped` (src/daemon/health.ts). Optional; omitted, the
+   * skip still happens and is still logged (`deps.log`), only the counter
+   * is not incremented anywhere.
+   */
+  onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
 }
 
 /**
@@ -308,7 +339,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped">): EventRules<JiraIssue> {
   // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
   // only this — never a direct `process.stdout`/`process.stderr` write. The
   // default is a fresh closure that looks up `console.error` at CALL time
@@ -367,17 +398,27 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // suppression. See diff.ts's own doc comment on WAKE_MARKERS for why
       // this is still exactly right for an allowlisted agent-directed
       // marker (it is never filtered out in the first place).
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }> => {
+      // FACTORY-922: the `ok: false` branch now carries WHY, so `decide()`'s
+      // own §3D fallback (the only consumer that cares — every other
+      // consumer here only ever checked `!result.ok`, unaffected by the
+      // added field) can log/count `load` vs `failed` distinctly instead of
+      // collapsing both into one undifferentiated "could not check". `load`
+      // is a real Atlassian signal (429, or a 5xx — the server itself
+      // saying "not now"), never a guess; everything else (a network error,
+      // any other HTTP status, or `deps.comments` simply not wired up) is
+      // `failed`.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
         let p = commentsCache.get(key);
         if (!p) {
           p = (async () => {
-            if (!deps.comments) return { ok: false as const };
+            if (!deps.comments) return { ok: false as const, reason: "failed" as const };
             try {
               const comments = excludeBookkeepingComments(await deps.comments(key));
               return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
-            } catch {
-              return { ok: false as const };
+            } catch (err) {
+              const reason: SkippedCommentCheckReason = err instanceof AtlassianHttpError && (err.status === 429 || err.status >= 500) ? "load" : "failed";
+              return { ok: false as const, reason };
             }
           })();
           commentsCache.set(key, p);
@@ -854,61 +895,69 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           const labelTransition = daemonLabelTransition(before, after);
           if (labelTransition) return finalize(key, watcher, { deliver: true, reason: { label: labelTransition } });
           if (before.summary !== after.summary) return finalize(key, watcher, { deliver: true, reason: { summary: true } });
-          // BUTCHR-350 (§3D): the honest "looked, could not (from the
-          // taxonomy above) tell" fallback — REPLACES the old bare `{
-          // deliver: true }` (no `reason` at all). Confirmed at this commit
-          // (the epic's own hypothesis in the ticket, and its own follow-up
-          // comment's structural-constraint finding): a `{ comment: ... }`
-          // reason is reachable ONLY via `verdict.commentId` above, which is
-          // reachable ONLY through crossDaemonSuppressed/ledgerHitSuppressed,
-          // both gated on a daemon-label change being present in THIS
-          // poll's OWN (before, after) diff. A pure foreign-comment bump
-          // (nothing else changed) never reaches that gate, so its FIRST
-          // delivery always fell through to here with no way to name a
-          // comment — not a race, structural, exactly as hypothesised.
-          //
-          // Do NOT change delivery here (§3D's own explicit constraint) —
-          // every branch below still returns `deliver: true`, unconditionally,
-          // exactly as the old bare fallback did. What's added is READING
-          // (never fetching new) already-available per-poll comments()
-          // state to give the REASON three honest, distinguishable shapes
-          // instead of one collapsed "not determinable":
-          //   - `commentsCache` (this poll's shared fetchComments memo) has
-          //     NO entry for `key` at all: no arm had an I/O reason to check
-          //     comments for this key this poll — "unchecked", the common
-          //     case, and the literal mechanism behind §3D's duplicate-notify
-          //     pair (this delivery, then a LATER poll whose daemon-label
-          //     flip finally triggers the check and names `comment`).
-          //   - an entry exists but its fetch failed: "check-failed" — a
-          //     real, different fact from "unchecked" (reuses this
-          //     codebase's existing "could not check" vocabulary — §4 OUT).
-          //   - an entry exists, succeeded, and its `newest` genuinely
-          //     matches `preCommentCursor`'s pre-THIS-poll baseline: comments
-          //     were consulted and POSITIVELY ruled out — "checked-unchanged".
-          //   - an entry exists, succeeded, and `newest` differs from the
-          //     pre-poll baseline (and is non-null): this delivery genuinely
-          //     IS comment-caused, discovered via a DIFFERENT arm's already-
-          //     paid-for fetch this same poll (e.g. a sibling watcher's
-          //     ledger/crossDaemon check on the same key) — named `comment`
-          //     directly, same as `verdict.commentId` above, not a fourth
-          //     `undetermined` shape. STATED RESIDUAL: if an untracked field
-          //     (not status/summary/label/comment — e.g. assignee) is what
-          //     actually bumped `updated` for THIS key, and a genuinely
-          //     unrelated comment happens to have landed in the same window
-          //     AND some other arm happened to have already fetched this
-          //     poll, this could attribute the delivery to that coincidental
-          //     comment. Strictly better than the prior "never even try",
-          //     not a claim of perfect causal precision — see this module's
-          //     own PR description and Confluence doc.
-          const cached = commentsCache.get(key);
-          if (!cached) return finalize(key, watcher, { deliver: true, reason: { undetermined: "unchecked" } });
-          const peeked = await cached;
-          if (!peeked.ok) return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
-          const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
-          if (preBaseline !== undefined && peeked.newest !== null && peeked.newest !== preBaseline) {
-            return finalize(key, watcher, { deliver: true, reason: { comment: peeked.newest } });
+          // FACTORY-922 (implementing FACTORY-921's resolved decision
+          // point): assignee, description, and linked-issue changes are
+          // CONFIRMED diffs the (before, after) pair already carries, no
+          // extra I/O needed — the decision explicitly says these must wake
+          // the worker, unlike a priority-only or non-daemon-label-only
+          // change (neither of which `JiraIssue` even carries as a
+          // trackable field — see NotifyReason's own doc comment).
+          if (before.assignee !== after.assignee) return finalize(key, watcher, { deliver: true, reason: { assignee: { from: before.assignee, to: after.assignee } } });
+          if (before.description !== undefined && after.description !== undefined && before.description !== after.description) {
+            return finalize(key, watcher, { deliver: true, reason: { description: true } });
           }
-          return finalize(key, watcher, { deliver: true, reason: { undetermined: "checked-unchanged" } });
+          const linkDiff = issuelinksDiff(before, after);
+          if (linkDiff) return finalize(key, watcher, { deliver: true, reason: { issuelinks: linkDiff } });
+          // FACTORY-922 (implementing story FACTORY-921 §1 — REPLACES
+          // BUTCHR-350's §3D fallback below): the old fallback delivered,
+          // unconditionally, on every `updated` bump this taxonomy could
+          // not explain — even the "unchecked" case, where NOTHING this
+          // poll had even tried to look at comments for this key. Measured
+          // on this fleet (see FACTORY-921's own evidence): that is the
+          // ~2-wakes/min/daemon noise this ticket removes. A poll that
+          // cannot CONFIRM a diff must not notify.
+          //
+          // So this fallback now ACTIVELY tries the comment fetch for `key`
+          // — the SAME shared per-poll memo every other arm above already
+          // uses (`fetchComments`): if a sibling arm already called it this
+          // poll (the old "checked-unchanged"/"comment" cases), this reuses
+          // that exact promise, no second Jira call; if nothing had a
+          // reason to yet (the old "unchecked" case), this is the first and
+          // only call for this key this poll.
+          //
+          // Three honest outcomes, nothing guessed:
+          //   - the fetch could not be trusted at all (`!result.ok` — load-
+          //     shed or genuinely failed, see `fetchComments`'s own doc
+          //     comment): do NOT notify, and leave `commentCursor` for `key`
+          //     UNTOUCHED (never advanced) so the identical comparison
+          //     re-runs next poll — no lost change, no blind wake. Logged
+          //     and counted (`skippedCommentCheckLine`/`onCommentCheckSkipped`)
+          //     so an operator can see this is happening, distinctly from
+          //     every `[notify-suppressed]` class above (none of which this
+          //     is — those all learned a real diff existed first).
+          //   - the fetch succeeded and `newest` genuinely moved since
+          //     `preCommentCursor`'s pre-THIS-poll baseline: a real, CONFIRMED
+          //     comment — deliver, named `comment:<id>` exactly as the old
+          //     `verdict.commentId`/"checked, found one" paths already do.
+          //   - the fetch succeeded and nothing moved: this `updated` bump
+          //     is attributed to a field this classifier does not track
+          //     (e.g. a priority or non-daemon label edit — exactly the
+          //     class the resolved FACTORY-921 decision says must NOT wake
+          //     anyone). Advance the snapshot (this poll positively
+          //     observed the newest id, so the NEXT poll must compare
+          //     against it, not a stale one) and stay silent.
+          const result = await fetchComments(key);
+          if (!result.ok) {
+            deps.onCommentCheckSkipped?.(key, result.reason);
+            log(skippedCommentCheckLine(key, result.reason));
+            return { deliver: false };
+          }
+          commentCursor.set(key, result.newest);
+          const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
+          if (preBaseline !== undefined && result.newest !== null && result.newest !== preBaseline) {
+            return finalize(key, watcher, { deliver: true, reason: { comment: result.newest } });
+          }
+          return { deliver: false };
         },
       };
     },

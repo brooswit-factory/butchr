@@ -131,12 +131,16 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     expect(deliveredReason(verdict)).toEqual({ comment: "c1" });
   });
 
-  test("a link-change-shaped diff (summary unchanged, status unchanged, only `updated` moves, nothing the issue model tracks changed) still falls through to the honest fallback, never suppressed", async () => {
-    // A baseline must already exist from a PRIOR poll (so THIS poll's own
-    // baseline-seeding pre-pass skips re-fetching it) and no label change
-    // must occur this poll (so no suppression arm calls fetchComments
-    // either) — only then does nothing this poll ever call comments(),
-    // reaching the "unchecked" fallback rather than "checked-unchanged".
+  // FACTORY-922 (replaces this test's own former expectation, deliberately,
+  // not weakened): the fallback now ACTIVELY checks instead of guessing — a
+  // baseline must already exist from a PRIOR poll (so THIS poll's own
+  // baseline-seeding pre-pass skips re-fetching it) and no label change
+  // must occur this poll (so no suppression arm calls fetchComments
+  // either), so the fallback's own active check is the ONLY comments()
+  // call this poll makes. It finds nothing moved (store unchanged since
+  // the seed) and stays silent — never suppressed in the sense of a
+  // discarded confirmed change; simply nothing confirmed to deliver.
+  test("an untracked-field-shaped diff (summary unchanged, status unchanged, only `updated` moves, nothing the issue model tracks changed) is actively checked, found unchanged, and produces NO delivery", async () => {
     const store = commentStore({ "KAN-1": [real("c0")] });
     const rules = createIssueEventRules({ comments: store.comments });
     const seedIssue = issue();
@@ -147,7 +151,7 @@ describe("FACTORY-865 criterion C: mixed diffs still fire — a label change alo
     const after = issue({ updated: "t2" }); // no label change at all -> isDaemonLabelOnlyDiff never even applies
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("KAN-1", "KAN-1", "primary");
-    expect(deliveredReason(verdict)).toEqual({ undetermined: "unchecked" });
+    expect(verdict.deliver).toBe(false);
   });
 });
 
