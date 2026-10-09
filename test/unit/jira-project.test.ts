@@ -66,7 +66,16 @@ test('project discovery deduplicates, skips archived, preserves empty results an
  const type=createJiraProjectResourceType({rules,search:async()=>{calls++;return [{id:'1',key:'PROJ',name:'Project'},{id:'1',key:'PROJ',name:'Project'},{id:'2',key:'OLD',name:'Old',archived:true}];},prepare:async s=>({...s,summary:'prepared'})});
  const matches=await type.discovery.search();expect(calls).toBe(1);expect(matches).toHaveLength(1);expect(type.spawnConfig.specFor(matches[0]!).summary).toBe('prepared');
  expect(type.activation.verdictFor(matches[0]!)).toBe('active');
- const poll=await type.eventRules.poll({primary:[],related:[]},{primary:matches,related:[]});expect(poll.changedPrimary).toEqual([]);expect(await poll.decide('x','x','primary')).toEqual({deliver:false});
+ // FACTORY-981: eventRules is no longer the always-`{deliver:false}` stub —
+ // a project appearing for the first time (empty `prev`) now genuinely
+ // registers in `changedPrimary` (the SAME "new, so changed" rule
+ // `createProjectEventRules`'s own `changed()` applies for every other
+ // resource type), but still never actually fires a notify: nothing is
+ // blocked/stalled, and every version/comment/epic axis is pinned to its
+ // own never-behind baseline (this provider has none of those), so
+ // `decide()` for the match's OWN key still answers `deliver:false` — only
+ // a real `x`/wrong key, which was never a real case, would too.
+ const poll=await type.eventRules.poll({primary:[],related:[]},{primary:matches,related:[]});expect(poll.changedPrimary).toEqual([matches[0]!.agentKey]);expect(await poll.decide(matches[0]!.agentKey,matches[0]!.agentKey,'primary')).toEqual({deliver:false});expect(await poll.decide('x','x','primary')).toEqual({deliver:false});
  const bad=createJiraProjectResourceType({rules,search:async()=>{throw Error('offline')}});await expect(bad.discovery.search()).rejects.toThrow('offline');
  expect(await createJiraProjectResourceType({rules:[],search:async()=>{throw Error('must not search')}}).discovery.search()).toEqual([]);
  expect(specForProject({...matches[0]!,spec:undefined} as any).brief).toBe(rule.brief);
@@ -98,26 +107,39 @@ test('linked-eventing wiring: related() is a no-op with neither/either dep omitt
  expect(await halfWired.discovery.related!([])).toEqual([]);
  expect(notified).toHaveLength(0);
 
- // Both wired, but the rule (Codey's exact live shape) has no linkedEventing field: zero member searches.
+ // Both wired, but the rule (Codey's exact live shape) has no linkedEventing field: zero MEMBER searches
+ // from related()'s own linked-eventing seam. FACTORY-981: discovery.search()
+ // itself now ALSO calls searchIssues unconditionally — the new, separate
+ // blocked/stalled manager-wake read, never gated by `linkedEventing` (every
+ // jira-project rule gets it) — exactly 2 calls (one agent:blocked, one
+ // agent:stalled JQL, batched once per poll), counted here BEFORE related()
+ // runs so the two features' call counts stay distinguishable.
  let searchIssueCalls = 0;
  const full = createJiraProjectResourceType({
    rules, search, notify: async (a, b, r) => { notified.push([a, b, r]); },
    searchIssues: async () => { searchIssueCalls++; return []; },
  });
  await full.discovery.search();
+ expect(searchIssueCalls).toBe(2);
  expect(await full.discovery.related!([])).toEqual([]);
- expect(searchIssueCalls).toBe(0);
+ expect(searchIssueCalls).toBe(2); // related()'s own member search added zero more.
  expect(notified).toHaveLength(0);
 
- // A rule that DOES opt in, with a `searchIssues` that always throws: fails
- // open per linked-eventing.ts's own discipline (logged, no throw out of
- // `related()`) — proven end-to-end through this resource type's wiring,
- // not just in linked-eventing.test.ts's own direct unit tests.
+ // A rule that DOES opt in, with a `searchIssues` that throws for its OWN
+ // member-discovery JQL shape: fails open per linked-eventing.ts's own
+ // discipline (logged, no throw out of `related()`) — proven end-to-end
+ // through this resource type's wiring, not just in linked-eventing.test.ts's
+ // own direct unit tests. FACTORY-981: scoped to the member-discovery shape
+ // specifically (never the `labels = "agent:..."` shape discovery.search's
+ // OWN blocked/stalled read now also sends) — that read's failure mode is
+ // the opposite (propagate and fail the whole poll, same as loadProjects'
+ // own documented discipline in project.ts), a DIFFERENT, deliberate
+ // behaviour this test does not exercise.
  const optedRules = parseRules({ rules: [{ ...rule, linkedEventing: true }] });
  const logs: string[] = [];
  const throwing = createJiraProjectResourceType({
    rules: optedRules, search,
-   notify: async () => {}, searchIssues: async () => { throw new Error('offline'); },
+   notify: async () => {}, searchIssues: async (jql) => { if (jql.includes('labels = ')) return []; throw new Error('offline'); },
    log: (l) => logs.push(l),
  });
  await throwing.discovery.search();
