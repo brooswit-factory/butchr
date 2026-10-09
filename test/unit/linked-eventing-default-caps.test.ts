@@ -209,6 +209,11 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
     const logs: string[] = [];
     const searchIssues = async (jql: string): Promise<JiraIssue[]> => {
+      // FACTORY-981: discovery.search's own blocked/stalled manager-wake
+      // read, unrelated to this describe block's own linked-eventing
+      // caps — none of this file's fixtures carry agent:blocked/agent:stalled
+      // tickets, so empty is always correct here.
+      if (jql.includes('labels = "agent:blocked"') || jql.includes('labels = "agent:stalled"')) return [];
       const keyIn = /^key in \((.*)\)$/.exec(jql);
       if (keyIn) return keyIn[1]!.split(",").map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
       const proj = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updated ASC$/.exec(jql);
@@ -320,6 +325,11 @@ describe("BUTCHR-471: default caps for a managed session, through createManagedS
     const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
     const logs: string[] = [];
     const searchIssues = async (jql: string): Promise<JiraIssue[]> => {
+      // FACTORY-981: discovery.search's own blocked/stalled manager-wake
+      // read, unrelated to this describe block's own linked-eventing
+      // caps — none of this file's fixtures carry agent:blocked/agent:stalled
+      // tickets, so empty is always correct here.
+      if (jql.includes('labels = "agent:blocked"') || jql.includes('labels = "agent:stalled"')) return [];
       const keyIn = /^key in \((.*)\)$/.exec(jql);
       if (keyIn) return keyIn[1]!.split(",").map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
       const proj = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updated ASC$/.exec(jql);
