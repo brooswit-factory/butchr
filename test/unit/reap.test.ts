@@ -60,7 +60,7 @@ describe("strandedCandidates", () => {
   });
 
   test("FACTORY-92: label is human-readable AND the pane cwd is a foreign (non-butchr) directory — never a candidate", () => {
-    const workspaces = [{ workspace_id: "w1", label: "FACTORY-51 · jira-work" }] as any[];
+    const workspaces = [{ workspace_id: "w1", label: "jira-work · FACTORY-51" }] as any[];
     const panes = [{ pane_id: "w1:p1", workspace_id: "w1", cwd: "/home/someone/some-other-project" }] as any[];
     expect(strandedCandidates(workspaces, panes, [], root)).toEqual([]);
   });
