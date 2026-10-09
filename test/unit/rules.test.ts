@@ -372,7 +372,7 @@ describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-9
     const [r] = parseRules({ rules: [minimal] });
     expect(r!.maxNewPerTick).toBeUndefined();
     expect(r!.minSecondsBetweenAdmissions).toBeUndefined();
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
   });
 
   test("both fields accepted for every provider, independent of execution/account/role/each other", () => {
@@ -409,7 +409,7 @@ describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-9
   test("a pre-change rules document (neither field) loads unchanged", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
 });
