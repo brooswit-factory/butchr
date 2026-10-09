@@ -165,6 +165,21 @@ export interface Activation<T> {
  * race). Every OTHER definition-field change (`vendor`, `tier`, `modelPower`,
  * `permissionMode`, …) still delivers with no `reason` at all, exactly as
  * before this ticket — this member is additive, not a replacement.
+ *
+ * FACTORY-922 (implementing story FACTORY-921, resolved decision point):
+ * `assignee`/`description`/`issuelinks` are the three further fields
+ * `decide()` (src/resources/issue.ts) now names explicitly, per the
+ * director's resolved decision on FACTORY-921: a reassignment, a
+ * description/brief edit, or a link added/removed must still wake the
+ * worker, same as status/label/summary always have — only a PRIORITY-only
+ * or (non-daemon) LABEL-only change is deliberately excluded (and neither
+ * ever reaches `decide()` as a distinguishable fact: `JiraIssue` carries no
+ * `priority` field at all, and a non-`agent:*`/`pr:*` label is invisible to
+ * `daemonLabelTransition`, so both already fall through to "nothing this
+ * classifier tracks moved" with no code path needed to special-case them).
+ * `issuelinks` only fires when BOTH sides of the diff carried the field
+ * (`undefined` means "unknown", never "confirmed empty" — see `JiraIssue`'s
+ * own doc comment); an unknown side is silently not diffed, never guessed.
  */
 export type NotifyReason =
   | { pr: { from: string | null; to: string } }
@@ -173,6 +188,9 @@ export type NotifyReason =
   | { status: { from: string; to: string } }
   | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
   | { summary: true }
+  | { assignee: { from: string | null; to: string | null } }
+  | { description: true }
+  | { issuelinks: { added: readonly string[]; removed: readonly string[] } }
   | { comment: string | null }
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
   | { linked: { events: readonly LinkedChangeEvent[] } }

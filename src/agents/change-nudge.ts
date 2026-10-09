@@ -71,6 +71,18 @@ function reasonClause(reason: NotifyReason | undefined): string {
     return `changed its ${prefix}:* label from ${prefix}:${from ?? "none"} to ${prefix}:${to ?? "none"}`;
   }
   if ("summary" in reason) return "had its summary edited";
+  // FACTORY-922: assignee/description/issuelinks are the three further
+  // confirmed-diff classes the resolved FACTORY-921 decision adds — see
+  // NotifyReason's own doc comment.
+  if ("assignee" in reason) return `was reassigned from ${reason.assignee.from ?? "unassigned"} to ${reason.assignee.to ?? "unassigned"}`;
+  if ("description" in reason) return "had its description edited";
+  if ("issuelinks" in reason) {
+    const { added, removed } = reason.issuelinks;
+    const parts: string[] = [];
+    if (added.length) parts.push(`linked to ${added.join(", ")}`);
+    if (removed.length) parts.push(`unlinked from ${removed.join(", ")}`);
+    return `had its linked issues changed (${parts.join("; ")})`;
+  }
   // BUTCHR-351: `reason.comment === null` means the mover was a comment
   // DELETION, not an addition (see NotifyReason's own doc comment) —
   // "got a new comment" would be actively wrong there.
@@ -147,6 +159,9 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if ("status" in reason) return ` (status:${reason.status.from}→${reason.status.to})`;
   if ("label" in reason) return ` (${reason.label.prefix}:${reason.label.from ?? "none"}→${reason.label.prefix}:${reason.label.to ?? "none"})`;
   if ("summary" in reason) return " (summary changed)";
+  if ("assignee" in reason) return ` (assignee:${reason.assignee.from ?? "none"}→${reason.assignee.to ?? "none"})`;
+  if ("description" in reason) return " (description changed)";
+  if ("issuelinks" in reason) return ` (issuelinks:+${reason.issuelinks.added.length}/-${reason.issuelinks.removed.length})`;
   if ("undetermined" in reason) {
     if (reason.undetermined === "check-failed") return " (reason: could not check — comments fetch failed)";
     if (reason.undetermined === "checked-unchanged") return " (reason: not determinable — checked comments, unchanged)";
