@@ -250,6 +250,23 @@ export interface HealthStatus {
    * unaffected by this addition).
    */
   commentChecksSkipped?: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, item 5): lifetime count of DELIVERED
+   * `agent:stalled` boss wakes (`createIssueEventRules`'s `decide()`,
+   * src/resources/issue.ts) — a TENTH sibling, same "additive, never flips
+   * `ok`" shape `commentChecksSkipped` above already is. Monotonically
+   * increasing for the daemon's lifetime, same convention as every other
+   * lifetime count here — watch its RATE, not its absolute value. Absent
+   * entirely when the caller doesn't pass one to `combineHealth`.
+   */
+  stalledWakes?: number;
+  /**
+   * FACTORY-972 (item 4/5): lifetime count of `agent:stalled` wakes the
+   * per-recipient hourly rate cap REJECTED — counted and logged, never
+   * delivered, so this counter and `stalledWakes` above never double-count
+   * the same event. Same lifetime-monotonic, additive-only shape.
+   */
+  stalledWakesCapped?: number;
 }
 
 /**
@@ -334,6 +351,8 @@ export const combineHealth = (
   dashboardApp?: { built: boolean; path: string },
   loopWatchdog?: readonly LoopWatchdogReport[],
   commentChecksSkipped?: number,
+  stalledWakes?: number,
+  stalledWakesCapped?: number,
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -353,6 +372,8 @@ export const combineHealth = (
     ...(dashboardApp ? { dashboardApp } : {}),
     ...(loopWatchdog && loopWatchdog.length ? { loopWatchdog: [...loopWatchdog] } : {}),
     ...(commentChecksSkipped !== undefined ? { commentChecksSkipped } : {}),
+    ...(stalledWakes !== undefined ? { stalledWakes } : {}),
+    ...(stalledWakesCapped !== undefined ? { stalledWakesCapped } : {}),
   };
 };
 

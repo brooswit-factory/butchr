@@ -201,7 +201,8 @@
 import type { AtlassianOps } from "../tools/atlassian.js";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
-import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
+import { RateCap, HOUR_MS } from "../agents/escalation-helper.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_MAX_PER_HOUR } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
@@ -213,6 +214,19 @@ import type {
 } from "./types.js";
 
 const PROPERTY_KEY = "butchr";
+
+/**
+ * FACTORY-972: deliberately NOT `import { MARKER } from
+ * "../agents/stall-remediation.js"` — that module imports
+ * src/tools/relationship.ts, which imports THIS module
+ * (`resolveEligibleProjects`/`advanceProjectWatermark`), so pulling it in
+ * here would be a genuine import cycle (project.ts -> stall-remediation.ts
+ * -> relationship.ts -> project.ts), unlike `BLOCKED_ESCALATION_MARKER`'s
+ * import above (escalate.ts has no such chain). Duplicated as a literal
+ * instead — the SAME precedent src/jira-watch/diff.ts's own `WAKE_MARKERS`
+ * already sets for this exact string, rather than importing it.
+ */
+const STALL_MARKER = "[butchr:stall]";
 
 /**
  * BUTCHR-227 DoD #9 / §6: the space ceiling on a Jira project entity
@@ -532,6 +546,18 @@ export interface ProjectResource {
    * chosen instead, and what that tradeoff costs.
    */
   observedBlockedKeys: readonly string[];
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * observedBlockedKeys above): the SAME shape — every ticket key in this
+   * project currently carrying `agent:stalled`, project-wide, including an
+   * orphan task — for the manager's own stalled-wake axis
+   * (`createProjectEventRules` below). A SEPARATE field, never merged with
+   * `observedBlockedKeys`: a ticket can only ever carry one `agent:*`
+   * label value at a time, so the two sets are always disjoint, but kept
+   * apart anyway so each axis's own candidate/debounce bookkeeping reads
+   * its own field rather than re-filtering a merged one by label value.
+   */
+  observedStalledKeys: readonly string[];
 }
 
 export const projectIdOf = (p: ProjectResource): string => p.key;
@@ -1138,6 +1164,14 @@ export interface ProjectResourceDeps {
   comments?: (key: string) => Promise<readonly JiraComment[]>;
   /** FACTORY-949: the boss/manager-wake debounce window — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
   blockedWakeDebounceMinutes?: number;
+  /** FACTORY-972: the manager stalled-wake debounce window — see `IssueResourceDeps.stalledWakeDebounceMinutes`'s own doc comment. */
+  stalledWakeDebounceMinutes?: number;
+  /** FACTORY-972: the manager's own hourly rate cap on delivered stalled wakes — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment. */
+  stalledWakeMaxPerHour?: number;
+  /** FACTORY-972: the `/health` counter writer for a delivered manager stalled wake — see `IssueResourceDeps.onStalledWake`'s own doc comment. */
+  onStalledWake?: (recipient: string) => void;
+  /** FACTORY-972: the `/health` counter writer for a manager stalled wake the hourly cap rejected — see `IssueResourceDeps.onStalledWakeCapped`'s own doc comment. */
+  onStalledWakeCapped?: (recipient: string) => void;
 }
 
 /** One project this codebase has decided is a peer — see `resolveEligibleProjects`'s own doc comment. `rootDocId`/`wake` are internal fields `loadProjects` needs to build a full `ProjectResource`; the `list_peers` MCP verb (src/tools/defs.ts) reads only `key`/`name` off this and must NOT surface `rootDocId` (BUTCHR-188: a page id captured in a listing can go stale between the listing and a later send — resolve it fresh at send time instead). */
@@ -1275,6 +1309,17 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     (blockedKeysByProject.get(key) ?? blockedKeysByProject.set(key, []).get(key)!).push(t.key);
   }
 
+  // FACTORY-972 (story FACTORY-971, extending FACTORY-949's blockedTickets
+  // search above): the SAME project-wide (not epic-scoped), orphan-task-
+  // inclusive search, for `agent:stalled` instead — see
+  // `ProjectResource.observedStalledKeys`'s own doc comment.
+  const stalledTickets = eligibleKeys.length ? await deps.search(`project IN (${eligibleKeys.join(",")}) AND labels = "agent:stalled"`) : [];
+  const stalledKeysByProject = new Map<string, string[]>();
+  for (const t of stalledTickets) {
+    const key = projectKeyOfIssue(t.key);
+    (stalledKeysByProject.get(key) ?? stalledKeysByProject.set(key, []).get(key)!).push(t.key);
+  }
+
   const ineligible: ProjectResource[] = admitted
     .filter((p) => !eligible.some((e) => e.key === p.key))
     .map((p) => ({
@@ -1289,6 +1334,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       unseenEpicCommentIds: {},
       watermark: EMPTY_WATERMARK,
       observedBlockedKeys: [],
+      observedStalledKeys: [],
     }));
 
   const resolved: ProjectResource[] = await Promise.all(
@@ -1343,6 +1389,7 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
         unseenEpicCommentIds,
         watermark,
         observedBlockedKeys: blockedKeysByProject.get(p.key) ?? [],
+        observedStalledKeys: stalledKeysByProject.get(p.key) ?? [],
       };
     }),
   );
@@ -1388,6 +1435,9 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
   // could return it in a different array order with nothing having
   // actually changed.
   if (!sameIdSet(prev.observedBlockedKeys, next.observedBlockedKeys)) return true;
+  // FACTORY-972: same SET-equality reasoning as `observedBlockedKeys` just
+  // above, for its stalled twin.
+  if (!sameIdSet(prev.observedStalledKeys, next.observedStalledKeys)) return true;
   const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.commentIds]));
   return next.observedEpics.some((e) => {
     const before = prevEpics.get(e.key);
@@ -1432,12 +1482,23 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
  * poll and fires there instead, one at a time — the project tier's own poll
  * cadence (`PROJECT_POLL_INTERVAL_MS`) is the only delay this adds.
  */
-export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "comments" | "blockedWakeDebounceMinutes">): EventRules<ProjectResource> {
+export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "comments" | "blockedWakeDebounceMinutes" | "stalledWakeDebounceMinutes" | "stalledWakeMaxPerHour" | "onStalledWake" | "onStalledWakeCapped">): EventRules<ProjectResource> {
   // Persists ACROSS polls — same cross-poll, in-memory-only shape
   // `createIssueEventRules`'s `blockedWakeFired` already is; see this
   // function's own top comment for why no persistent watermark is used here.
   const blockedWakeFired = new Map<string, number>();
   const blockedWakeDebounceMs = (deps?.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
+
+  // FACTORY-972 (story FACTORY-971): the stalled-wake twin of
+  // `blockedWakeFired`/`blockedWakeDebounceMs` above, plus its own
+  // per-recipient (here, the PROJECT's own key — the manager) hourly rate
+  // cap — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment
+  // (src/resources/issue.ts) for why this is a separate axis from the
+  // debounce, and `RateCap`/`HOUR_MS` (src/agents/escalation-helper.ts) for
+  // the shared primitive both this module and issue.ts reuse.
+  const stalledWakeFired = new Map<string, number>();
+  const stalledWakeDebounceMs = (deps?.stalledWakeDebounceMinutes ?? DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES) * 60_000;
+  const stalledWakeRateCap = new RateCap(deps?.stalledWakeMaxPerHour ?? DEFAULT_STALLED_WAKE_MAX_PER_HOUR, HOUR_MS);
 
   // Same shape/reasoning as `createIssueEventRules`'s own `blockedWake` —
   // see that function's own doc comment (src/resources/issue.ts) for the
@@ -1471,6 +1532,32 @@ export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "commen
     return true;
   };
 
+  // FACTORY-972 (story FACTORY-971): `blockedWake`'s own twin, for the
+  // `agent:stalled` episode instead — same debounce/marker-dedup shape
+  // (against STALL_MARKER, `[butchr:stall]`, already in WAKE_MARKERS).
+  const stalledWake = async (key: string): Promise<boolean> => {
+    const now = Date.now();
+    const last = stalledWakeFired.get(key);
+    if (last !== undefined && now - last < stalledWakeDebounceMs) return false;
+    if (deps?.comments) {
+      try {
+        const comments = await deps.comments(key);
+        const windowStart = now - stalledWakeDebounceMs;
+        const markerAlreadyPosted = comments.some((c) => c.body.startsWith(STALL_MARKER) && Date.parse(c.created) >= windowStart);
+        if (markerAlreadyPosted) {
+          stalledWakeFired.set(key, now);
+          return false;
+        }
+      } catch {
+        // Fail OPEN toward firing — see issue.ts's `blockedWake`'s own doc
+        // comment for why an unreadable dedup check must not be the thing
+        // that silently loses this event.
+      }
+    }
+    stalledWakeFired.set(key, now);
+    return true;
+  };
+
   return {
     async poll(prev: PollSnapshot<ProjectResource>, next: PollSnapshot<ProjectResource>): Promise<EventPoll> {
       const prevByKey = new Map(prev.primary.map((p) => [p.key, p]));
@@ -1501,6 +1588,30 @@ export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "commen
           const candidates = [...p.observedBlockedKeys].filter((k) => !prevBlockedSet.has(k)).sort();
           for (const k of candidates) {
             if (await blockedWake(k)) return { deliver: true, reason: { blocked: { key: k } } };
+          }
+          // FACTORY-972 (story FACTORY-971): the stalled-wake twin of the
+          // blocked candidate loop just above — same "newly present since
+          // last poll, sorted, one per poll" shape (this function's own
+          // top comment, "STATED LIMIT"). Unlike `blockedWake`, a `true`
+          // from `stalledWake` here still passes through the hourly rate
+          // cap (item 4) — keyed by `key` (the PROJECT's own id: the
+          // recipient is the manager, the project's own agent) — before
+          // this poll actually delivers; a capped candidate is counted/
+          // logged and NOT delivered, but its own `stalledWakeFired` entry
+          // is already set by `stalledWake` above either way, so a later
+          // re-flip inside the same debounce window does not ask the cap
+          // again for the SAME episode.
+          const prevStalledSet = new Set(before?.observedStalledKeys ?? []);
+          const stalledCandidates = [...p.observedStalledKeys].filter((k) => !prevStalledSet.has(k)).sort();
+          for (const k of stalledCandidates) {
+            if (!(await stalledWake(k))) continue;
+            if (!stalledWakeRateCap.allow(key, Date.now())) {
+              deps?.onStalledWakeCapped?.(key);
+              continue;
+            }
+            stalledWakeRateCap.record(key, Date.now());
+            deps?.onStalledWake?.(key);
+            return { deliver: true, reason: { stalled: { key: k } } };
           }
           // Reuses `projectVerdict` rather than a second decision mechanism
           // (per this file's top comment): a change that is already fully

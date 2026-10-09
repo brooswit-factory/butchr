@@ -89,6 +89,9 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // blocked ticket itself or the project that owns it — see NotifyReason's
   // own doc comment.
   if ("blocked" in reason) return `has its ticket ${reason.blocked.key} newly agent:blocked — it needs you`;
+  // FACTORY-972: same "named explicitly, same wording for both producers"
+  // reasoning as `blocked` just above — see NotifyReason's own doc comment.
+  if ("stalled" in reason) return `has its ticket ${reason.stalled.key} newly agent:stalled — it needs you`;
   // BUTCHR-351: `reason.comment === null` means the mover was a comment
   // DELETION, not an addition (see NotifyReason's own doc comment) —
   // "got a new comment" would be actively wrong there.
@@ -180,7 +183,8 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // why no distinct tag is warranted (this module's top comment) still
   // holds: additive, not a meaning change to the existing shape.
   if ("comment" in reason) return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`;
-  return ` (blocked:${reason.blocked.key})`; // "blocked" in reason — FACTORY-949
+  if ("blocked" in reason) return ` (blocked:${reason.blocked.key})`; // FACTORY-949
+  return ` (stalled:${reason.stalled.key})`; // "stalled" in reason — FACTORY-972
 }
 
 /**

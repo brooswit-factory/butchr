@@ -67,6 +67,7 @@ function project(overrides: Partial<ProjectResource> = {}): ProjectResource {
     observedCommentIds,
     watermark,
     observedBlockedKeys: overrides.observedBlockedKeys ?? [],
+    observedStalledKeys: overrides.observedStalledKeys ?? [],
     ...overrides,
   };
 }
@@ -455,6 +456,8 @@ function fakeWorld(opts: {
   epicsInReview?: JiraIssue[];
   /** FACTORY-949: tickets this fixture's fake `search` returns for the project-wide `labels = "agent:blocked"` JQL — kept SEPARATE from `epicsInReview` so the two axes never cross-contaminate a test that sets one but not the other. */
   blockedTickets?: JiraIssue[];
+  /** FACTORY-972: the `agent:stalled` twin of `blockedTickets` above — kept SEPARATE for the same reason. */
+  stalledTickets?: JiraIssue[];
   epicComments?: Record<string, Array<{ id: string }>>;
   // BUTCHR-91/BUTCHR-68: defaults to admitting every project passed in
   // `projects` — every PRE-EXISTING test in this file constructs a
@@ -546,7 +549,9 @@ function fakeWorld(opts: {
     ops,
     search: async (jql: string) => {
       calls.search.push(jql);
-      return jql.includes("agent:blocked") ? opts.blockedTickets ?? [] : opts.epicsInReview ?? [];
+      if (jql.includes("agent:blocked")) return opts.blockedTickets ?? [];
+      if (jql.includes("agent:stalled")) return opts.stalledTickets ?? [];
+      return opts.epicsInReview ?? [];
     },
     allowlist: new Set(opts.allowlist ?? opts.projects.map((p) => p.key)),
   };
@@ -772,7 +777,9 @@ describe("discovery — call-count budget (batching)", () => {
     // FACTORY-949: ONE extra search call for the project-wide agent:blocked
     // axis (item 2) — see the "blocked tickets" describe block below for its
     // own dedicated coverage; this test's own job stays scoped to rule 3.
-    expect(w.calls.search.length).toBe(2);
+    // FACTORY-972: a SECOND extra call for the analogous agent:stalled axis
+    // — see the "stalled tickets" describe block below.
+    expect(w.calls.search.length).toBe(3);
     const epicsCall = w.calls.search.find((jql) => jql.includes("issuetype = Epic"));
     expect(epicsCall).toContain("project IN (ACME,BETA)");
     expect(epicsCall).toContain('issuetype = Epic AND status = "In Review"');
@@ -792,6 +799,44 @@ describe("discovery — call-count budget (batching)", () => {
     const blockedCall = w.calls.search.find((jql) => jql.includes("agent:blocked"));
     expect(blockedCall).toContain("project IN (ACME,BETA)");
     expect(blockedCall).toContain('labels = "agent:blocked"');
+  });
+
+  test("FACTORY-972: project-wide agent:stalled tickets are fetched in ONE JQL call across all eligible projects, no per-epic scoping", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "ACME", name: "Acme", leadAccountId: "acct-A" },
+        { key: "BETA", name: "Beta", leadAccountId: "acct-A" },
+      ],
+      properties: { ACME: PROPERTY_A, BETA: PROPERTY_B },
+      pageVersions: { "doc-A": 1, "doc-B": 1 },
+    });
+    await createProjectResourceType(w.deps).discovery.search();
+    const stalledCall = w.calls.search.find((jql) => jql.includes("agent:stalled"));
+    expect(stalledCall).toContain("project IN (ACME,BETA)");
+    expect(stalledCall).toContain('labels = "agent:stalled"');
+  });
+
+  test("FACTORY-972: observedStalledKeys is grouped per project, separately from observedBlockedKeys", async () => {
+    const w = fakeWorld({
+      myAccountId: "acct-A",
+      projects: [
+        { key: "ACME", name: "Acme", leadAccountId: "acct-A" },
+        { key: "BETA", name: "Beta", leadAccountId: "acct-A" },
+      ],
+      properties: { ACME: PROPERTY_A, BETA: PROPERTY_B },
+      pageVersions: { "doc-A": 1, "doc-B": 1 },
+      blockedTickets: [{ key: "ACME-1", summary: "", status: "In Progress", issuetype: "Task", assignee: null, parent: null, updated: "", labels: ["agent:blocked"] }],
+      stalledTickets: [
+        { key: "ACME-2", summary: "", status: "In Progress", issuetype: "Task", assignee: null, parent: null, updated: "", labels: ["agent:stalled"] },
+        { key: "BETA-3", summary: "", status: "In Progress", issuetype: "Task", assignee: null, parent: null, updated: "", labels: ["agent:stalled"] },
+      ],
+    });
+    const [acme, beta] = await createProjectResourceType(w.deps).discovery.search();
+    expect(acme!.observedBlockedKeys).toEqual(["ACME-1"]);
+    expect(acme!.observedStalledKeys).toEqual(["ACME-2"]);
+    expect(beta!.observedBlockedKeys).toEqual([]);
+    expect(beta!.observedStalledKeys).toEqual(["BETA-3"]);
   });
 });
 
@@ -1233,6 +1278,112 @@ describe("FACTORY-949: the project's manager wakes on a ticket's agent:blocked t
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("ACME", "ACME", "primary");
     expect(verdict).toEqual({ deliver: true }); // via projectVerdict's versionBehind axis, not the blocked axis — no reason attached
+  });
+});
+
+/**
+ * FACTORY-972 (story FACTORY-971): the stalled-wake twin of the blocked
+ * describe block just above — same debounce/dedup/fallback shape, PLUS the
+ * NEW hourly rate cap (item 4) this ticket adds that `blockedWake` has no
+ * equivalent of. The project tier models no boss/Implements-chain concept
+ * at all (this file's own top comment, DECLARATION note) — every test here
+ * is already "a ticket with no boss wakes only the manager", since the
+ * manager wake never consults anything boss-shaped to begin with.
+ */
+describe("FACTORY-972: the project's manager wakes on a ticket's agent:stalled transition", () => {
+  test("a ticket newly present in observedStalledKeys wakes the manager with the stalled reason", async () => {
+    const rules = createProjectEventRules();
+    const before = project({ observedStalledKeys: [] });
+    const after = project({ observedStalledKeys: ["ACME-1"] });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    expect(poll.changedPrimary).toEqual(["ACME"]);
+    const verdict = await poll.decide("ACME", "ACME", "primary");
+    expect(verdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
+  });
+
+  test("a ticket STILL present in observedStalledKeys from the previous poll (no new transition) does not re-fire", async () => {
+    const rules = createProjectEventRules();
+    const p = project({ observedStalledKeys: ["ACME-1"] });
+    const poll = await rules.poll({ primary: [p], related: [] }, { primary: [p], related: [] });
+    const verdict = await poll.decide("ACME", "ACME", "primary");
+    expect(verdict.deliver).toBe(false);
+  });
+
+  test("debounce: a re-flip into stalled within the debounce window does not re-fire a second wake (idle<->stalled flap = one event)", async () => {
+    const rules = createProjectEventRules({ stalledWakeDebounceMinutes: 10 });
+    const noneStalled = project({ observedStalledKeys: [] });
+    const stalled = project({ observedStalledKeys: ["ACME-1"] });
+    const firstPoll = await rules.poll({ primary: [noneStalled], related: [] }, { primary: [stalled], related: [] });
+    const firstVerdict = await firstPoll.decide("ACME", "ACME", "primary");
+    expect(firstVerdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
+
+    // Flap: stalled -> none -> stalled again, inside the debounce window.
+    const secondPoll = await rules.poll({ primary: [stalled], related: [] }, { primary: [noneStalled], related: [] });
+    expect((await secondPoll.decide("ACME", "ACME", "primary")).deliver).toBe(false);
+    const thirdPoll = await rules.poll({ primary: [noneStalled], related: [] }, { primary: [stalled], related: [] });
+    const thirdVerdict = await thirdPoll.decide("ACME", "ACME", "primary");
+    expect(thirdVerdict.deliver).toBe(false); // same episode, inside the window — exactly one event total
+  });
+
+  test("dedup: a [butchr:stall] marker already posted for this episode suppresses the manager wake too", async () => {
+    const postedAt = new Date().toISOString();
+    const rules = createProjectEventRules({
+      stalledWakeDebounceMinutes: 10,
+      comments: async (key) => (key === "ACME-1" ? [{ id: "c1", body: "[butchr:stall] ACME-1 has read agent:stalled, continuously, for 30 minute(s): ...", created: postedAt, authorEmail: null }] : []),
+    });
+    const before = project({ observedStalledKeys: [] });
+    const after = project({ observedStalledKeys: ["ACME-1"] });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("ACME", "ACME", "primary");
+    expect(verdict.deliver).toBe(false);
+  });
+
+  test("an unreadable comments() fetch fails OPEN toward firing, not toward silence", async () => {
+    const rules = createProjectEventRules({
+      stalledWakeDebounceMinutes: 10,
+      comments: async () => { throw new Error("transient"); },
+    });
+    const before = project({ observedStalledKeys: [] });
+    const after = project({ observedStalledKeys: ["ACME-1"] });
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("ACME", "ACME", "primary");
+    expect(verdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
+  });
+
+  test("falls back to projectVerdict's own watermark comparison once no stalled-key candidate qualifies", async () => {
+    const rules = createProjectEventRules();
+    const before = project({ observedVersion: 5, observedStalledKeys: ["ACME-1"] });
+    const after = project({ observedVersion: 6, observedStalledKeys: ["ACME-1"] }); // same stalled key, but version moved
+    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const verdict = await poll.decide("ACME", "ACME", "primary");
+    expect(verdict).toEqual({ deliver: true }); // via projectVerdict's versionBehind axis, not the stalled axis — no reason attached
+  });
+
+  // item 4: the hourly rate cap, a NEW axis blockedWake has no equivalent of.
+  test("the hourly cap is enforced once exceeded, and the excess is counted via onStalledWakeCapped — never delivered", async () => {
+    const capped: string[] = [];
+    const delivered: string[] = [];
+    const rules = createProjectEventRules({
+      stalledWakeMaxPerHour: 1,
+      onStalledWake: (r) => delivered.push(r),
+      onStalledWakeCapped: (r) => capped.push(r),
+    });
+    const none = project({ observedStalledKeys: [] });
+    const one = project({ observedStalledKeys: ["ACME-1"] });
+    const poll1 = await rules.poll({ primary: [none], related: [] }, { primary: [one], related: [] });
+    expect(await poll1.decide("ACME", "ACME", "primary")).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
+
+    // A second, DIFFERENT ticket in the SAME project going stalled in the
+    // same poll window — same recipient (the manager, keyed by the
+    // project's own key "ACME") — exceeds the cap of 1/hour and must be
+    // counted, not delivered, even though it is a genuinely NEW episode
+    // (never debounced on its own ticket-key axis).
+    const two = project({ observedStalledKeys: ["ACME-1", "ACME-2"] });
+    const poll2 = await rules.poll({ primary: [one], related: [] }, { primary: [two], related: [] });
+    const verdict2 = await poll2.decide("ACME", "ACME", "primary");
+    expect(verdict2.deliver).toBe(false);
+    expect(capped).toEqual(["ACME"]);
+    expect(delivered).toEqual(["ACME"]);
   });
 });
 
