@@ -23,7 +23,7 @@
  */
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition, excludeBookkeepingComments } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
@@ -356,6 +356,17 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // second `deps.comments(key)` call for the same key/poll. Every
       // existing consumer here only ever destructured `ok`/`newest`, so
       // adding a field changes nothing for them.
+      //
+      // FACTORY-865: `newest`/`ids` are computed from `excludeBookkeepingComments`'s
+      // result, never the raw fetch — every downstream consumer of this
+      // cursor (baseline seeding, crossDaemonSuppressed, ledgerHitSuppressed,
+      // the stand-down unseen-ids check, and the undetermined-reason
+      // fallback's `preCommentCursor` comparison) therefore only ever sees
+      // butchr's own `[butchr:*]` bookkeeping chatter as if it were never
+      // posted at all, so it can no longer defeat daemon-label-only
+      // suppression. See diff.ts's own doc comment on WAKE_MARKERS for why
+      // this is still exactly right for an allowlisted agent-directed
+      // marker (it is never filtered out in the first place).
       const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }>>();
       const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }> => {
         let p = commentsCache.get(key);
@@ -363,7 +374,7 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           p = (async () => {
             if (!deps.comments) return { ok: false as const };
             try {
-              const comments = await deps.comments(key);
+              const comments = excludeBookkeepingComments(await deps.comments(key));
               return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
             } catch {
               return { ok: false as const };
@@ -437,7 +448,33 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             const hadBaseline = commentCursor.has(key);
             const baseline = commentCursor.get(key) ?? null;
             commentCursor.set(key, result.newest);
-            if (!hadBaseline) return { suppressed: false }; // unknown baseline: never suppress
+            // FACTORY-865 (ticket scope item 3): a daemon-label-ONLY diff
+            // (the only way this branch is ever reached — see the
+            // `isDaemonLabelOnlyDiff` guard above) can never itself be a
+            // reason to wake anyone, so an unknown baseline is no longer
+            // the "cannot know -> deliver" case it used to be: it is
+            // suppressed, same as a genuine echo. STATED LIMIT on how often
+            // this branch is actually the one that fires rather than the
+            // echo check just below it: baseline seeding (this module's own
+            // top-of-file comment) already seeds every key in THIS poll's
+            // own seenKeys before any decide() call runs, from the EXACT
+            // SAME memoized `fetchComments` promise this line also reads —
+            // so a seeding fetch that SUCCEEDS has already set the baseline
+            // by the time this runs (making `result.newest === baseline`
+            // below the one that actually suppresses), and a seeding fetch
+            // that FAILS yields the identical cached failure here, hitting
+            // the `!result.ok` return above before ever reaching this line.
+            // This `!hadBaseline` branch is therefore DEFENSIVE under this
+            // module's current invariants, not demonstrated to be live —
+            // kept (rather than left as dead code) because the contract it
+            // states is correct on its own terms regardless of whether
+            // today's seeding order keeps it from ever actually firing, and
+            // because a future change to that order must not silently
+            // reopen the fail-open hole this closes. The cursor is still
+            // seeded, just above, from THIS successful fetch either way —
+            // fail-open discipline is unaffected: nothing is suppressed on a
+            // FAILED fetch, only on a SUCCESSFUL one.
+            if (!hadBaseline) return { suppressed: true };
             if (result.newest === baseline) return { suppressed: true }; // arm 3 echo — no line, see above
             // A mover is now established (`result.newest !== baseline`,
             // both checks above already ruled out). `result.newest` is only

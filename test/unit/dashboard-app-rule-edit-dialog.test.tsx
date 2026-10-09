@@ -12,6 +12,7 @@ import { withDom } from "../setup/happy-dom.js";
 import { RuleEditDialog } from "../../dashboard-app/src/components/RuleEditDialog.js";
 import { createFixturesRulesApi } from "../../dashboard-app/src/api/rules.js";
 import type { RuleDto } from "../../dashboard-app/src/api/rules.js";
+import { capacityRoleFor } from "../../src/agents/capacity-role.js";
 
 withDom();
 afterEach(cleanup);
@@ -28,6 +29,8 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
     permissionMode: null,
     lizardMode: null,
+    resumeOnRespawn: null,
+    resumeContextCutoff: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -177,5 +180,120 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     const input = (await findByTestId("rule-edit-query-input")) as HTMLInputElement;
     expect(input.disabled).toBe(true);
     expect(await findByTestId("rule-edit-stale")).toBeTruthy();
+  });
+
+  // FACTORY-856 (story FACTORY-756, epic FACTORY-748): "Included in
+  // capacity" toggle, existing-rule edit dialog surface. Epic review on PR
+  // 715 (comment on FACTORY-856) requires criterion 4 to owe a form
+  // round-trip on an EXISTING rule, asserted via the engine's own reader
+  // (`capacityRoleFor` fed a `ruleRoleOf` built from the reloaded rules),
+  // not just the raw stored field — the same discipline
+  // `test/unit/rules-write.test.ts` already applies server-side for
+  // `ui-first-rule`.
+  describe("FACTORY-856: 'Included in capacity' toggle", () => {
+    test("renders at the rule's current role — unset (role: worker) is ON", async () => {
+      const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+      const { findByTestId } = render(
+        <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = (await findByTestId("rule-edit-capacity-toggle")) as HTMLElement;
+      const input = toggle.querySelector("input")!;
+      expect(input.getAttribute("aria-checked") ?? String(input.checked)).toBe("true");
+      expect(await findByTestId("rule-edit-capacity-copy")).toBeTruthy();
+    });
+
+    test("renders OFF for a rule already saved with role: sentinel", async () => {
+      const sentinelRule = rule({ role: "sentinel" });
+      const api = createFixturesRulesApi({ initial: { rules: [sentinelRule], errors: [] }, latencyMs: 0 });
+      const { findByTestId } = render(
+        <RuleEditDialog api={api} rule={sentinelRule} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = (await findByTestId("rule-edit-capacity-toggle")) as HTMLElement;
+      const input = toggle.querySelector("input")!;
+      expect(input.getAttribute("aria-checked") ?? String(input.checked)).toBe("false");
+    });
+
+    test("a jira-project rule shows the toggle disabled with an explanatory note", async () => {
+      const managerRule = rule({ resourceProvider: "jira-project" });
+      const api = createFixturesRulesApi({ initial: { rules: [managerRule], errors: [] }, latencyMs: 0 });
+      const { findByTestId } = render(
+        <RuleEditDialog api={api} rule={managerRule} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = (await findByTestId("rule-edit-capacity-toggle")) as HTMLElement;
+      expect(toggle.querySelector("input")?.hasAttribute("disabled")).toBe(true);
+      const notice = await findByTestId("rule-edit-capacity-manager-notice");
+      expect(notice.textContent).toContain("never consume fleet capacity");
+    });
+
+    // buildFieldsPatch discipline (epic review item 1): `role` is sent ONLY
+    // when the draft differs from the rule's own saved value — unlike
+    // `FirstRuleSetup`'s always-send. Toggling then toggling back must
+    // produce an EMPTY patch, i.e. Save does nothing (no plan/write call at
+    // all) rather than round-tripping the unchanged value through the wire.
+    test("toggling off then back on sends no role patch at all (buildFieldsPatch discipline)", async () => {
+      const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+      const { findByTestId, getByRole } = render(
+        <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = await findByTestId("rule-edit-capacity-toggle");
+      const input = toggle.querySelector("input")!;
+      fireEvent.click(input);
+      expect(await findByTestId("rule-edit-capacity-notice")).toBeTruthy();
+      fireEvent.click(input);
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      // No confirm step appears and the rule is untouched — an unchanged
+      // draft produces an empty patch, so `handleSave` is a no-op.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(document.querySelector('[data-testid="rule-edit-confirm"]')).toBeNull();
+      const after = await api.listRules();
+      expect(after.rules.find((r) => r.id === "epics")!.role).toBe("worker");
+    });
+
+    test("turning capacity off requires an explicit confirm, and round-trips through the engine's own capacityRoleFor reader", async () => {
+      const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+      const { findByTestId, getByRole } = render(
+        <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = await findByTestId("rule-edit-capacity-toggle");
+      const input = toggle.querySelector("input")!;
+      fireEvent.click(input);
+      expect(await findByTestId("rule-edit-capacity-notice")).toBeTruthy();
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      expect(await findByTestId("rule-edit-confirm")).toBeTruthy();
+
+      const stillWorker = await api.listRules();
+      expect(stillWorker.rules.find((r) => r.id === "epics")!.role).toBe("worker");
+
+      fireEvent.click(getByRole("button", { name: "confirm" }));
+      await waitFor(async () => {
+        const after = await api.listRules();
+        expect(after.rules.find((r) => r.id === "epics")!.role).toBe("sentinel");
+      });
+
+      // Criterion 4 / epic review item 2: assert via the engine's own
+      // reader, fed the RELOADED rules — not the raw field on the response
+      // — mirroring `src/daemon/index.ts`'s own `ruleRoleOfAgent`.
+      const reloaded = await api.listRules();
+      const ruleRoleOf = (_id: string) => reloaded.rules.find((r) => r.id === "epics")?.role;
+      expect(capacityRoleFor("jira-work:epics:BUTCHR-1", ruleRoleOf)).toBe("sentinel");
+    });
+
+    test("saving role: worker (toggling an already-sentinel rule back on) needs no confirm", async () => {
+      const sentinelRule = rule({ role: "sentinel" });
+      const api = createFixturesRulesApi({ initial: { rules: [sentinelRule], errors: [] }, latencyMs: 0 });
+      const { findByTestId, getByRole } = render(
+        <RuleEditDialog api={api} rule={sentinelRule} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const toggle = await findByTestId("rule-edit-capacity-toggle");
+      fireEvent.click(toggle.querySelector("input")!);
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      await waitFor(async () => {
+        const after = await api.listRules();
+        expect(after.rules.find((r) => r.id === "epics")!.role).toBe("worker");
+      });
+      const reloaded = await api.listRules();
+      const ruleRoleOf = (_id: string) => reloaded.rules.find((r) => r.id === "epics")?.role;
+      expect(capacityRoleFor("jira-work:epics:BUTCHR-1", ruleRoleOf)).toBe("worker");
+    });
   });
 });

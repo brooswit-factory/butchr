@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ApiError } from "confluence.js/core";
-import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET } from "../../src/tools/docs.js";
+import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET, nativeParentOf, isEligibleParentTier, resolveBoss } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
@@ -1314,5 +1314,56 @@ describe("docs.ts: labelForKey / JIRA_KEY_RE", () => {
     expect(() => labelForKey("lowercase-1")).toThrow();
     expect(JIRA_KEY_RE.test("BUTCHR-27")).toBe(true);
     expect(JIRA_KEY_RE.test("butchr-27")).toBe(false);
+  });
+});
+
+describe("docs.ts: FACTORY-909 — nativeParentOf / isEligibleParentTier / resolveBoss (pure, I/O-free)", () => {
+  function issueWith(opts: { implementsBoss?: string; parentKey?: string; parentIssuetype?: string }) {
+    return {
+      fields: {
+        issuelinks: opts.implementsBoss ? [{ type: { name: "Implements" }, inwardIssue: { key: opts.implementsBoss } }] : [],
+        ...(opts.parentKey ? { parent: { key: opts.parentKey, fields: { issuetype: { name: opts.parentIssuetype } } } } : {}),
+      },
+    };
+  }
+
+  test("nativeParentOf reads fields.parent.key/issuetype, null when absent", () => {
+    expect(nativeParentOf(issueWith({ parentKey: "FACTORY-766", parentIssuetype: "Epic" }))).toEqual({ key: "FACTORY-766", issuetype: "Epic" });
+    expect(nativeParentOf(issueWith({}))).toBeNull();
+    expect(nativeParentOf({})).toBeNull();
+    expect(nativeParentOf(null)).toBeNull();
+  });
+
+  test("isEligibleParentTier: Story<-Epic and Task<-Story are eligible; everything else is not", () => {
+    expect(isEligibleParentTier("Story", "Epic")).toBe(true);
+    expect(isEligibleParentTier("Task", "Story")).toBe(true);
+    expect(isEligibleParentTier("Task", "Epic")).toBe(false);
+    expect(isEligibleParentTier("Story", "Story")).toBe(false);
+    expect(isEligibleParentTier("Task", "Task")).toBe(false);
+    expect(isEligibleParentTier("Story", undefined)).toBe(false);
+    expect(isEligibleParentTier(undefined, "Epic")).toBe(false);
+  });
+
+  test("resolveBoss: table-driven over the FACTORY-909 acceptance-criteria cases", () => {
+    // 1. Implements only.
+    expect(resolveBoss(issueWith({ implementsBoss: "FACTORY-766" }), "Story")).toEqual({ boss: "FACTORY-766", source: "implements" });
+    // 2. parent only, eligible tier.
+    expect(resolveBoss(issueWith({ parentKey: "FACTORY-766", parentIssuetype: "Epic" }), "Story")).toEqual({ boss: "FACTORY-766", source: "parent" });
+    // 3. both, agreeing.
+    expect(resolveBoss(issueWith({ implementsBoss: "FACTORY-766", parentKey: "FACTORY-766", parentIssuetype: "Epic" }), "Story")).toEqual({ boss: "FACTORY-766", source: "implements" });
+    // 4. both, disagreeing — Implements wins, disagreement reported.
+    expect(resolveBoss(issueWith({ implementsBoss: "FACTORY-766", parentKey: "FACTORY-900", parentIssuetype: "Epic" }), "Story")).toEqual({
+      boss: "FACTORY-766", source: "implements", disagreement: { implementsBoss: "FACTORY-766", parent: "FACTORY-900" },
+    });
+    // 5. neither — orphan.
+    expect(resolveBoss(issueWith({}), "Story")).toEqual({ boss: null, source: "none" });
+    // 6. Task under Story.
+    expect(resolveBoss(issueWith({ parentKey: "FACTORY-804", parentIssuetype: "Story" }), "Task")).toEqual({ boss: "FACTORY-804", source: "parent" });
+    // 7. Story under Epic.
+    expect(resolveBoss(issueWith({ parentKey: "FACTORY-766", parentIssuetype: "Epic" }), "Story")).toEqual({ boss: "FACTORY-766", source: "parent" });
+    // 8. parent of a non-eligible type — refused, ineligibleParent reported.
+    expect(resolveBoss(issueWith({ parentKey: "FACTORY-700", parentIssuetype: "Task" }), "Task")).toEqual({
+      boss: null, source: "none", ineligibleParent: { key: "FACTORY-700", issuetype: "Task" },
+    });
   });
 });

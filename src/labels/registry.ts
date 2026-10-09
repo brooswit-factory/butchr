@@ -1,6 +1,6 @@
 import { ADMISSION_PREFIX, AGENT_PREFIX, PR_PREFIX, type AdmissionLabel, type AgentLabel, type PrState } from "./plan.js";
 import { EXEMPT_LABEL } from "../agents/parked.js";
-import { ORPHAN_LABEL } from "../tools/relationship.js";
+import { ORPHAN_LABEL, MISSING_IMPLEMENTS_LABEL } from "../tools/relationship.js";
 
 /**
  * BUTCHR-133/BUTCHR-143: the one place every label butchr writes under its
@@ -191,8 +191,8 @@ type AgentLabelKey = `${typeof AGENT_PREFIX}${AgentLabel}`;
 type PrLabelKey = `${typeof PR_PREFIX}${NonNullable<PrState>}`;
 /** BUTCHR-352: `admission:withheld` today — grows automatically if `AdmissionLabel` grows. A deliberately SEPARATE namespace from `agent:*` — see `./plan.ts`'s `ADMISSION_PREFIX` doc comment for the mixed-build hazard that rules out folding this into `AgentLabelKey`. */
 type AdmissionLabelKey = `${typeof ADMISSION_PREFIX}${AdmissionLabel}`;
-/** The two verb-owned labels that live outside the daemon's own prefix machinery — see `./plan.ts`'s `isDaemonLabel` comment for why they're a separate category. */
-type VerbLabelKey = typeof EXEMPT_LABEL | typeof ORPHAN_LABEL;
+/** The verb-owned labels that live outside the daemon's own prefix machinery — see `./plan.ts`'s `isDaemonLabel` comment for why they're a separate category. */
+type VerbLabelKey = typeof EXEMPT_LABEL | typeof ORPHAN_LABEL | typeof MISSING_IMPLEMENTS_LABEL;
 
 /** Every label string this registry declares. The type-level door: this is a CLOSED union, not `string` — see this file's header. */
 export type RegisteredLabel = AgentLabelKey | PrLabelKey | AdmissionLabelKey | VerbLabelKey;
@@ -281,6 +281,15 @@ export const LABEL_REGISTRY: Readonly<Record<RegisteredLabel, LabelRegistryEntry
       "BUTCHR-108/BUTCHR-137: deliberately NOT daemon-owned, same category and same test as butchr:shelved above (an explicit, agent-invoked relationship verb owns its lifecycle, not the daemon's poll/sweep machinery). Means UNDIRECTED, not shelved — a materially different thing from EXEMPT_LABEL, so its withdrawal shape differs from EXEMPT_LABEL's on purpose (see withdrawnBy).",
     withdrawnBy:
       "adopt_worker — on BOTH the issue-caller path (adoptWorker) and the project-caller path (adoptProjectWorker), for BOTH dispositions (\"start\" AND \"shelve\"), unlike EXEMPT_LABEL above: a shelve-adopted ticket is exactly as directed as a start-adopted one (it now has a boss, a link, and a recorded decision either way), so both dispositions clear it. NOT gated on the alreadyAdopted idempotence check — a plain re-adoption clears a stale label even when nothing else about the call is new, which is the only reachable remedy for a ticket adopted before BUTCHR-108/BUTCHR-137, since no verb in this system removes a label from an existing issue outside adopt_worker. The project-caller (adoptProjectWorker) site is declared defence-in-depth, not a reachable-bug fix: file_where_it_belongs can only ever create a Story or a Task, so an orphan Epic cannot arrive through this codebase's own write path today — the clear is there for symmetry and for a label landing on an Epic by some other route, at zero extra cost (it reuses a fetch the idempotence check already makes).",
+  },
+  [MISSING_IMPLEMENTS_LABEL]: {
+    appliedBy:
+      "FACTORY-909: assertOwnWorker's maybeWarnMissingImplements (src/tools/relationship.ts) — fired whenever resolveBoss (src/tools/docs.ts) finds a native Jira parent with NO Implements link from the child, and that parent's issue type is not one isEligibleParentTier recognises as an equivalent boss relationship (the (B) fallback for when (A)'s parent-as-boss resolution cannot apply). Applied together with one idempotent comment on the child naming the parent and the exact jira_link_issues call to add, and a `[relationship] missing Implements link child=<k> parent=<p>` log line.",
+    notes:
+      "Deliberately NOT daemon-owned — same category as EXEMPT_LABEL/ORPHAN_LABEL above, an explicit relationship-verb call site, not the daemon's poll/sweep machinery. Gates the comment's idempotence too: maybeWarnMissingImplements checks for this label on the SAME `issue` fetch assertOwnWorker already made before posting a second comment, so a ticket that keeps triggering this path (repeated start_worker/tell_worker/etc. calls from the would-be boss) gets exactly one comment, not one per call.",
+    withdrawnBy: null,
+    neverWithdrawnReason:
+      "Nothing in this codebase detects \"the missing Implements link was since added\" — there is no poll, sweep, or verb that re-checks a ticket already carrying this label and notices the fix landed. A human adding the link (or re-filing under an eligible parent tier) resolves the underlying relationship; the stale label itself is inert afterward — nothing reads it to gate behaviour, unlike EXEMPT_LABEL/ORPHAN_LABEL above, so leaving it is harmless noise rather than a cached assertion that could mislead a later reader.",
   },
 };
 

@@ -13,6 +13,42 @@ import {
 import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 
 /**
+ * FACTORY-892: herdr's `agent.start` rejects any start argument containing a
+ * control character (C0 U+0000-U+001F or C1 U+007F-U+009F, matching
+ * Rust's `char::is_control`) BEFORE it ever tries to shell-quote it —
+ * observed as `invalid_agent_argument` / "agent arguments cannot be encoded
+ * safely for the target shell". FACTORY-735/739 regressed exactly this: a
+ * literal `\n\n` landed in the kickoff prompt, which is `args[0]` of every
+ * `agent.start` call (`@brooswit/drovr`'s `buildAgentStartParams`). See
+ * `kickoffFor` and `assertSafeStartArgv` below for where this is now
+ * enforced butchr-side, before `agent.start` is ever called.
+ */
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Every control character in `args`, by index — empty when `args` is safe to hand to `agent.start`. */
+export function controlCharStartArgs(args: readonly string[]): Array<{ index: number; value: string }> {
+  return args.flatMap((value, index) => (CONTROL_CHAR_PATTERN.test(value) ? [{ index, value }] : []));
+}
+
+/**
+ * The butchr-side pre-flight guard FACTORY-892 asks for: fails loudly, with
+ * butchr's own message, instead of letting a control character reach herdr
+ * and come back as an opaque `invalid_agent_argument` 4xx. Deliberately a
+ * NEW function, not a change to `checkArgv`'s (`checkManagedAgentArgv`'s)
+ * contract below — that one compares expected-vs-observed argv for
+ * staleness and is not a validator; see its own re-export doc comment.
+ */
+export function assertSafeStartArgv(args: readonly string[]): void {
+  const bad = controlCharStartArgs(args);
+  if (bad.length === 0) return;
+  const detail = bad.map(({ index, value }) => `args[${index}]=${JSON.stringify(value)}`).join(", ");
+  throw new Error(`refusing to start agent: control character(s) in start argv — herdr rejects these before shell-quoting (${detail})`);
+}
+
+/** Collapses all whitespace (including newlines) to single spaces, so the result is always safe as ONE start argument. */
+const flattenToSingleLine = (text: string): string => text.trim().replace(/\s+/g, " ");
+
+/**
  * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
  * every kickoff prompt below, so it is in context from the agent's very
  * first turn — not just inside `brief.md` (which a long session's own
@@ -22,13 +58,19 @@ import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "tex
  * `BEFORE_YOU_STOP_INCLUDE_MARKER` resolves into every `briefs/*.md`
  * template — this is the SECOND of the two places FACTORY-735 requires the
  * text to land, not a competing copy of it.
+ *
+ * FACTORY-892: flattened to one line (`flattenToSingleLine`, not just
+ * `.trim()`) — `briefs/_before-you-stop.md` is hand-wrapped Markdown with
+ * real newlines mid-sentence, and a multi-line kickoff is exactly the
+ * regression this ticket fixes. See `CONTROL_CHAR_PATTERN`'s own doc
+ * comment above for why.
  */
-const KICKOFF_REMINDER = BEFORE_YOU_STOP.trim();
+const KICKOFF_REMINDER = flattenToSingleLine(BEFORE_YOU_STOP);
 
-/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
-export const KICKOFF_PROMPT = `follow your CLAUDE.md\n\n${KICKOFF_REMINDER}`;
-/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above, same reminder appended. */
-export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md\n\n${KICKOFF_REMINDER}`;
+/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. ONE LINE — see FACTORY-892 above. */
+export const KICKOFF_PROMPT = `follow your CLAUDE.md. ${KICKOFF_REMINDER}`;
+/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above, same reminder appended. ONE LINE — see FACTORY-892 above. */
+export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md. ${KICKOFF_REMINDER}`;
 /**
  * FACTORY-127/FACTORY-138 (operator decision, FACTORY-67 director comment
  * 2026-09-26 22:24Z): butchr's own default for a Claude launch whose spec
@@ -125,10 +167,26 @@ export function inventoryCodexMcp(
  * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
  * PROJECT's own file (if any), never butchr's generated one, and the
  * definition's `brief` would never reach the agent at all.
+ *
+ * FACTORY-892: this is the ONE function every start path (the real spawn
+ * path's `kickoff` callback into `ManagedHerdrLifecycle.start()`, and
+ * `agentStartParams`/`spawnArgs` below) calls to get the prompt that becomes
+ * `args[0]` of `agent.start`. `spec.brief` is operator/rule-authored and can
+ * be multi-line — the SAME class of break the two KICKOFF_PROMPT constants
+ * had, just latent until a multi-line brief is used — so it is flattened
+ * here too, and the result is asserted safe before it ever leaves this
+ * function, as a backstop for any control character flattening doesn't
+ * catch (e.g. a bare `\0`, which is not whitespace).
  */
 export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
-  if (spec?.cwd && spec.brief) return `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${spec.brief}`;
-  return provider === "claude" ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
+  const prompt =
+    spec?.cwd && spec.brief
+      ? `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${flattenToSingleLine(spec.brief)}`
+      : provider === "claude"
+        ? KICKOFF_PROMPT
+        : AGENTS_KICKOFF_PROMPT;
+  assertSafeStartArgv([prompt]);
+  return prompt;
 };
 
 /**
@@ -333,6 +391,12 @@ export function agentStartParams(
   if (agent.provider === "claude" && agent.resumeSessionId) {
     params.args = [...(params.args ?? []), "--resume", agent.resumeSessionId];
   }
+  // FACTORY-892: belt-and-suspenders over the FULL argv, not just the
+  // prompt `kickoffFor` already checked — every other value here is an
+  // internal constant/enum today, never multi-line, but this is what makes
+  // the guard cover "every start argument" as the ticket asks, not just the
+  // one argument that happened to regress.
+  assertSafeStartArgv(params.args ?? []);
   return params;
 }
 
