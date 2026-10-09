@@ -240,7 +240,7 @@ export interface ViewDeps {
    * caller so its per-rule rate-limit state persists across requests —
    * never rebuilt per request here).
    */
-  rulesPreview?: (id: string) => Promise<RulesPreviewResult>;
+  rulesPreview?: (id: string, queryOverride?: string) => Promise<RulesPreviewResult>;
   /**
    * FACTORY-662 — this process's one CSRF token issuer (`./csrf.ts`),
    * handed out by `GET /api/session` and checked by every write route's
@@ -260,13 +260,14 @@ export interface ViewDeps {
   writeGuard?: WriteGuardDeps;
   /**
    * FACTORY-662 — the rules write orchestration (`../rules/rules-write.ts`).
-   * One function per route; each already does its own ui-prefix/etag/
-   * placeholder/allowlist checks and returns a tagged outcome this file
-   * maps straight to a status + body, never re-deciding anything here.
+   * One function per route; each already does its own etag/placeholder/
+   * allowlist checks (FACTORY-730: the route-level `ui-`-prefix check is
+   * retired) and returns a tagged outcome this file maps straight to a
+   * status + body, never re-deciding anything here.
    */
   rulesWrite?: {
     enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
-    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => RulesWriteOutcome;
+    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
@@ -764,7 +765,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `params.id` is caller-controlled URL-encoded text — a malformed `%`
     // escape makes `decodeURIComponent` THROW, which must become a 400 JSON
     // error, never an uncaught 500.
-    .get("/api/rules/:id/preview", async ({ params, request, server, set }) => {
+    .get("/api/rules/:id/preview", async ({ params, query, request, server, set }) => {
       if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
@@ -780,7 +781,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         return { error: "malformed rule id" };
       }
       set.headers["cache-control"] = "no-store";
-      const result = await deps.rulesPreview(id);
+      // FACTORY-730 — `?query=`: the edit dialog's own draft-query dry-run,
+      // never persisted and never the rule's own stored query (`deps.rulesPreview`
+      // reads that fresh on every call regardless of this override).
+      const queryOverride = typeof query?.query === "string" ? query.query : undefined;
+      const result = await deps.rulesPreview(id, queryOverride);
       if (!result.ok) { set.status = result.status; return { error: result.error }; }
       const { ok, ...body } = result;
       return body;
@@ -986,7 +991,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // summary's "old" side must be the PRE-write value, never the
       // just-written one a read taken after would see.
       const ruleBeforeWrite = deps.getRules?.()?.find((r) => r.id === id);
-      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
+      const outcome = await deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
       auditOutcome(deps, { route: "PUT /api/rules/:id", action: buildFieldDiffSummary(ruleBeforeWrite, parsed.patch), ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;

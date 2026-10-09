@@ -20,6 +20,7 @@ import { PollStatusView } from "../components/PollStatusView.js";
 import { RulesTable } from "../components/RulesTable.js";
 import { RulePreviewDialog } from "../components/RulePreviewDialog.js";
 import { RuleToggleConfirmDialog } from "../components/RuleToggleConfirmDialog.js";
+import { RuleEditDialog } from "../components/RuleEditDialog.js";
 import { FirstRuleSetup } from "../components/FirstRuleSetup.js";
 import { buildRulesViewModel, type RuleRowView } from "../view-model/rules-view.js";
 import "../components/RulesView.css";
@@ -42,6 +43,8 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
   const [previewProvider, setPreviewProvider] = useState<string | null>(null);
   const [pendingToggle, setPendingToggle] = useState<PendingToggle | null>(null);
   const [toggleError, setToggleError] = useState<string | null>(null);
+  /** FACTORY-730 — the rule currently open in `RuleEditDialog`, or `null` when no edit dialog is open. */
+  const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   // FACTORY-663: the real `realRulesApi` starts with `capabilities.write ===
   // false` (no network call has happened yet) — probing `GET /api/session`
   // once on mount is what flips it `true` against a daemon that actually
@@ -171,8 +174,31 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
                     setPreviewRuleId(ruleId);
                   }}
                   onToggle={startToggle}
+                  onEdit={(row) => setEditingRuleId(row.rule.id)}
                 />
               )}
+              {/* FACTORY-730 — rendered inside this render-prop (not alongside the
+                  other dialogs below) so it always reads the LATEST polled rule
+                  (`vm.rows`)/`vm.sourceEtag`/`vm.stale`, same reactivity
+                  `FirstRuleSetup` above already relies on; `onChanged` is a
+                  no-op for the same reason that one's own is — `useRules`'s own
+                  poll picks up a successful write's new fields on its next tick. */}
+              {editingRuleId !== null &&
+                (() => {
+                  const row = vm.rows.find((r) => r.rule.id === editingRuleId);
+                  if (!row) return null;
+                  return (
+                    <RuleEditDialog
+                      api={api}
+                      rule={row.rule}
+                      sourceEtag={vm.sourceEtag}
+                      stale={vm.stale}
+                      canWrite={api.capabilities.write}
+                      onChanged={() => undefined}
+                      onClose={() => setEditingRuleId(null)}
+                    />
+                  );
+                })()}
             </>
           );
         }}

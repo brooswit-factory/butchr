@@ -435,6 +435,44 @@ describe("GET /api/rules/:id/preview", () => {
     } finally { await app.stop(true); }
   });
 
+  // FACTORY-730 (ticket item 3): the edit dialog's draft-query dry-run — a
+  // `?query=` param is decoded and passed through to `deps.rulesPreview` as
+  // its own `queryOverride` argument, never read off the rule's saved query.
+  test("FACTORY-730: a ?query= param is passed through to rulesPreview as queryOverride", async () => {
+    const guard = { port: 0 };
+    let receivedOverride: string | undefined;
+    const { app, headers } = startApp({
+      dashboardOriginGuard: guard,
+      peerUidCheck: () => true,
+      rulesPreview: async (id, queryOverride) => {
+        receivedOverride = queryOverride;
+        return { ok: true, keys: [], total: 0, cap: 50, warning: null };
+      },
+    });
+    try {
+      const res = await fetch(`${headers.origin}/api/rules/triage/preview?query=${encodeURIComponent("project = NEW")}`, { headers });
+      expect(res.status).toBe(200);
+      expect(receivedOverride).toBe("project = NEW");
+    } finally { await app.stop(true); }
+  });
+
+  test("no ?query= param: queryOverride is undefined", async () => {
+    const guard = { port: 0 };
+    let receivedOverride: string | undefined = "not called";
+    const { app, headers } = startApp({
+      dashboardOriginGuard: guard,
+      peerUidCheck: () => true,
+      rulesPreview: async (id, queryOverride) => {
+        receivedOverride = queryOverride;
+        return { ok: true, keys: [], total: 0, cap: 50, warning: null };
+      },
+    });
+    try {
+      await fetch(`${headers.origin}/api/rules/triage/preview`, { headers });
+      expect(receivedOverride).toBeUndefined();
+    } finally { await app.stop(true); }
+  });
+
   test("preview refusal (e.g. rate limited) maps status and error through", async () => {
     const guard = { port: 0 };
     const { app, headers } = startApp({
