@@ -14,6 +14,7 @@ import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { EXECUTION_MODES, parseRules, type Rule } from "../../src/rules/rules.js";
 import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, specForRuleQuery, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import { parseSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
@@ -380,6 +381,75 @@ describe("rule relationships", () => {
     // Only the boss ticket's agents watch, so dropping BOTH of them leaves nothing.
     const noBossAgents = keys(ms).filter((k) => !k.endsWith(":BUTCHR-1"));
     expect(relatedForRules(ruleSet, ms, noBossAgents)).toEqual([]);
+  });
+
+  // FACTORY-947/952: a Task's events must never reach its Epic — enforced as
+  // an issue-type TIER check at the point `implementsEdge` would otherwise
+  // record a boss-routing edge, not a chain-walking change (routing has
+  // always been, and stays, strictly one hop: see this file's own
+  // BUTCHR-388 describe block). Confirmed live on the fleet this ticket was
+  // filed against: an Epic adopting an otherwise-bossless Task directly via
+  // `adopt_worker` produces the exact same Implements-link shape as a
+  // genuine mislink, and both are rejected the same way — see FACTORY-955's
+  // own ticket comment for the journal line this test is modeled on.
+  describe("FACTORY-952: one-hop-only boss routing (a Task's Implements link must resolve to a Story, never an Epic)", () => {
+    const plain = rules({ id: "a", query: "q1" }, { id: "b", query: "q2" });
+    const ruleA = byId(plain, "a");
+    const ruleB = byId(plain, "b");
+
+    test("a Task implementing an Epic directly: not routed, and logged as a topology rejection", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, task)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([]);
+      expect(logs).toHaveLength(1);
+      expect(parseSuppressedLine(logs[0]!)).toMatchObject({
+        key: "BUTCHR-2",
+        watcher: "jira-work:a:BUTCHR-1",
+        arm: "topology",
+        fields: { implementer_type: "Task", boss_type: "Epic" },
+      });
+    });
+
+    test("the same stray Task->Epic link, supplied as a cross-daemon foreign implementer, is rejected identically", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const foreignTask = issue("BUTCHR-2", { issuetype: "Task" });
+      const ms = [match(ruleA, epic)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [foreignTask], (l) => logs.push(l))).toEqual([]);
+      expect(logs).toHaveLength(1);
+      expect(parseSuppressedLine(logs[0]!)?.arm).toBe("topology");
+    });
+
+    test("regression: a Story implementing an Epic still routes normally (the ordinary one-hop case)", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const story = issue("BUTCHR-2", { issuetype: "Story", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, story)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:a:BUTCHR-1"] },
+      ]);
+      expect(logs).toEqual([]);
+    });
+
+    test("regression: a Task implementing its Story still routes normally (the ordinary one-hop case)", () => {
+      const story = issue("BUTCHR-1", { issuetype: "Story", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, story), match(ruleB, task)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:a:BUTCHR-1"] },
+      ]);
+      expect(logs).toEqual([]);
+    });
+
+    test("no `log` dep wired: the stray edge is still rejected, just silently (never throws)", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, task)];
+      expect(relatedForRules(plain, ms, keys(ms))).toEqual([]);
+    });
   });
 
   test("an inward connection rule hears the connecting rule's ticket over Relates; the link is read from either end", () => {
