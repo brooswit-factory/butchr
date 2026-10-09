@@ -1005,7 +1005,7 @@ describe("POST /api/rules — create a rule", () => {
         body: JSON.stringify(VALID_BODY),
       });
       expect(res.status).toBe(503);
-      const resBody = await res.json();
+      const resBody = (await res.json()) as { error: string; confirmReason?: string };
       expect(resBody.confirmReason).toBe("unmeasurable-scope");
       expect(createCalled).toBe(false);
       expect(audited).toHaveLength(1);
