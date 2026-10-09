@@ -500,8 +500,11 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
   exactly like any other rule, unless it explicitly sets `role: "sentinel"`
   itself. This is a deliberate behaviour change — a live rules file that
   relied on the old issue-type exemption now needs to add `role: "sentinel"`
-  to each rule it wants exempt (no migration ships with this change; see
-  this ticket, FACTORY-757, for why).
+  to each rule it wants exempt. **FACTORY-757 itself shipped this
+  migration-free** (see `changelog.d/FACTORY-757.md`'s "No migration and no
+  UI ship with this change"); FACTORY-810 (implementing FACTORY-754, epic
+  FACTORY-748) closed that gap with an upgrade-time migration — see
+  "Upgrade migration: pre-FACTORY-757 issue-type exemption" below.
 - **`jira-project` is still always a sentinel** (BUTCHR-425), unconditionally
   — `capacityRoleFor` checks the resource provider before ever consulting
   the rule's own `role` field. Free-form project managers are
@@ -528,6 +531,66 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
 loaded `rules` list, so it works across every provider) into the single
 shared `AdmissionController` instance every rule loop's admission bucket
 already draws from.
+
+## Upgrade migration: pre-FACTORY-757 issue-type exemption (FACTORY-810, implementing FACTORY-754, epic FACTORY-748)
+
+FACTORY-757 (above) deliberately shipped with no migration: a live
+`jira-work` rule whose JQL relied on the deleted Epic/Story/Bug issue-type
+exemption would silently start counting toward `BUTCHR_MAX_AGENTS` the
+moment that code ran, unless an operator had already added `role:
+"sentinel"` itself. FACTORY-810 closes that gap with an upgrade-time
+migration (`src/rules/capacity-role-migration.ts`), run once at daemon
+startup — same convention `../agents/workspace-migration.ts` and
+`../rules/seed-first-run.ts` already use: existence-based, idempotent, and
+run BEFORE `loadRules` reads the file for the daemon's own real startup.
+
+**What gets migrated, and why nothing else does** — restated from
+FACTORY-754's own corrected description, since it is easy to over-scope:
+
+1. **`jira-work` rules whose query relies on the deleted exemption** — the
+   only real target. Written with `role: "sentinel"` so each one's
+   post-upgrade counting decision stays identical to its pre-upgrade one.
+2. **`jira-work` task/subtask rules** — already counted before and after
+   (the schema default); writing `role: "worker"` would be a redundant
+   no-op, so these are left untouched.
+3. **`jira-project` (manager) rules, and bare project-tier ids** — sentinel
+   by construction (`capacityRoleFor` checks this before ever consulting a
+   rule's `role` — see "Fleet capacity role" above); writing `role` onto
+   one would be config the capacity path never reads, so these are never
+   even classified.
+4. **`github-issue`/`github-pr`/`zendesk-ticket`/`filesystem` rules** — the
+   pre-FACTORY-757 exemption never covered a non-Jira provider; these were
+   always counted and still are, so nothing is written.
+
+**How a rule's issue-type restriction is recognised**: `jira-work`'s
+`query` is a plain JQL string with no structured representation anywhere
+in this codebase (`searchRules`, `src/rules/resource-type.ts`, hands it to
+Jira verbatim). `classifyJqlQuery` (`src/rules/capacity-role-migration.ts`)
+recognises exactly the canonical shape `docs/rules.example.json` uses — a
+single, top-level, AND-ed, non-negated `issuetype = X` or `issuetype IN
+(X, Y, …)` clause — and REFUSES to guess about anything looser: zero or
+multiple top-level `issuetype` clauses, a clause joined by a top-level
+`OR`, a negated operator (`!=`, `NOT IN`), or unbalanced parens/quotes all
+classify as "skip, cannot classify" rather than a guess in either
+direction. A query this function cannot classify is left untouched and
+logged at startup (`butchr: upgrade migration — left rule <id> untouched
+(<reason>)`) — the safe default stays "counted" (today's new behaviour),
+never a wrongly-granted exemption.
+
+**Idempotency** (a hard requirement, since the epic's own interim
+mitigation — admin-assembly setting `role` by hand ahead of the code
+landing — may already have run): a rule that already carries an explicit
+`role` in the raw JSON, `"sentinel"` or `"worker"` alike, is never even
+classified, let alone overwritten. `runCapacityRoleMigration` goes one
+step further than "the field doesn't change" — when its plan has nothing
+to migrate, it never calls the rules writer at all, so a second (or every
+subsequent) run performs zero filesystem writes: no new backup, no touched
+mtime, a genuine no-op rather than a written-but-unchanged file. The write
+itself, when one is needed, goes through `setRuleRole`
+(`src/rules/write-rules.ts`) — the same surgical, formatting-preserving
+text editor `setRuleEnabled` already established for its own field, so
+every other rule, field, and byte of whitespace in the file survives
+untouched.
 
 ## Herdr workspace labels: short display ids, collisions, and full-key metadata (FACTORY-95, implementing FACTORY-90, epic FACTORY-83)
 
