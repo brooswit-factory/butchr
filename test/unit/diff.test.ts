@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { activeKeys, changedKeys, daemonLabelsChanged, daemonLabelTransition, isDaemonLabelOnlyDiff, prTransition } from "../../src/jira-watch/diff.js";
+import {
+  activeKeys, changedKeys, daemonLabelsChanged, daemonLabelTransition, isDaemonLabelOnlyDiff, prTransition,
+  isBookkeepingComment, excludeBookkeepingComments, WAKE_MARKERS,
+} from "../../src/jira-watch/diff.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 const iss = (key: string, status = "In Progress", summary = "s", updated = "t", labels: string[] = []): JiraIssue =>
@@ -181,5 +184,58 @@ describe("prTransition", () => {
     const before = iss("A", "In Progress", "s", "t1", ["pr:open"]);
     const after = iss("A", "In Review", "s", "t2", ["pr:approved"]);
     expect(prTransition(before, after)).toEqual({ from: "open", to: "approved" });
+  });
+});
+
+// FACTORY-865: the whole point of this predicate is that butchr's own
+// bookkeeping chatter must stop defeating daemon-label-only suppression
+// while four specific agent-directed markers keep moving the cursor.
+describe("isBookkeepingComment / WAKE_MARKERS (FACTORY-865)", () => {
+  test("a non-daemon comment (no [butchr: prefix at all) is never bookkeeping", () => {
+    expect(isBookkeepingComment("just a normal human/agent comment")).toBe(false);
+    expect(isBookkeepingComment("[KAN-1] a report_to_boss-style identity-tagged comment")).toBe(false);
+  });
+
+  test("every current PROBABLY-BOOKKEEPING marker is bookkeeping", () => {
+    for (const body of [
+      "[butchr:reconcile] X's reconcile has failed",
+      "[butchr:crashloop] X has been spawned 5 times",
+      "[butchr:parked] X has been assigned and linked",
+      "[butchr:abandoned] X is still open",
+      "[butchr:pinned] X has read ACTIVE",
+      "[butchr:frozen] X has read asleep",
+      "[butchr:yieldloop] X has woken from stand_down",
+      "[butchr:resume] X's agent was relaunched",
+      "[butchr:restored-degraded] X has been unable to take butchr's full flag set",
+    ]) {
+      expect(isBookkeepingComment(body)).toBe(true);
+    }
+  });
+
+  test("every allowlisted WAKE marker is NOT bookkeeping, even though it starts with the daemon-chatter prefix", () => {
+    for (const marker of WAKE_MARKERS) expect(isBookkeepingComment(`${marker} some agent-directed text`)).toBe(false);
+  });
+
+  test("WAKE_MARKERS is exactly the four agent-directed markers this ticket names", () => {
+    expect([...WAKE_MARKERS].sort()).toEqual(["[butchr:blocked]", "[butchr:respawn]", "[butchr:stall]", "[butchr:unresponsive]"]);
+  });
+
+  test("matching is prefix-based on the REAL marker text, not substring — a marker name appearing mid-sentence in an otherwise-bookkeeping comment does not exempt it", () => {
+    expect(isBookkeepingComment("[butchr:parked] mentions [butchr:blocked] only in passing")).toBe(true);
+  });
+});
+
+describe("excludeBookkeepingComments (FACTORY-865)", () => {
+  test("drops bookkeeping comments, keeps real and allowlisted ones, preserves order", () => {
+    const rows = [
+      { id: "3", body: "[butchr:parked] noise" },
+      { id: "2", body: "[butchr:blocked] waiting on a decision" },
+      { id: "1", body: "a real human comment" },
+    ];
+    expect(excludeBookkeepingComments(rows).map((r) => r.id)).toEqual(["2", "1"]);
+  });
+
+  test("an all-bookkeeping list filters down to empty", () => {
+    expect(excludeBookkeepingComments([{ id: "1", body: "[butchr:crashloop] x" }])).toEqual([]);
   });
 });
