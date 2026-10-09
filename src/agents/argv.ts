@@ -45,8 +45,17 @@ export function assertSafeStartArgv(args: readonly string[]): void {
   throw new Error(`refusing to start agent: control character(s) in start argv — herdr rejects these before shell-quoting (${detail})`);
 }
 
+/**
+ * FACTORY-940: `briefs/_before-you-stop.md` (and any other hand-written
+ * Markdown source this feeds) opens with a `#`-style heading — stripped here
+ * so it never survives flattening as a literal `##` sitting mid-sentence.
+ * Only a LEADING marker is touched; the rest of the text is untouched.
+ */
+const MARKDOWN_LEADING_LINE_MARKER = /^(?:#{1,6}|>+|[-*+]|\d+\.)\s+/;
+
 /** Collapses all whitespace (including newlines) to single spaces, so the result is always safe as ONE start argument. */
-const flattenToSingleLine = (text: string): string => text.trim().replace(/\s+/g, " ");
+const flattenToSingleLine = (text: string): string =>
+  text.trim().replace(MARKDOWN_LEADING_LINE_MARKER, "").replace(/\s+/g, " ");
 
 /**
  * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
