@@ -112,6 +112,28 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.permissionMode).toBeNull();
     expect(r.rules[0]!.lizardMode).toBeNull();
   });
+  test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule({ maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 })], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.maxNewPerTick).toBe(2);
+    expect(r.rules[0]!.minSecondsBetweenAdmissions).toBe(30);
+  });
+  test("FACTORY-907: absent maxNewPerTick/minSecondsBetweenAdmissions on the raw Rule read as null", () => {
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [rule()], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]!.maxNewPerTick).toBeNull();
+    expect(r.rules[0]!.minSecondsBetweenAdmissions).toBeNull();
+  });
   test("invalid file: valid:false, problems populated from the error message, zero rules", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [], error: { path: "/rules.json", message: "line 1 is bad\nline 2 is also bad" } },
