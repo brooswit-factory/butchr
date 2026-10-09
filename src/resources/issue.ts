@@ -946,18 +946,38 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           //     anyone). Advance the snapshot (this poll positively
           //     observed the newest id, so the NEXT poll must compare
           //     against it, not a stale one) and stay silent.
+          // BUTCHR-307 INTERACTION (not addressed by FACTORY-921's own text,
+          // reconciled here): a SLEEPING watcher's fail-toward-waking
+          // contract is independent of this fallback's new skip-not-notify
+          // discipline and must survive it untouched — `finalize()`'s own
+          // per-watcher `unseenFor` check (and its own fetchComments
+          // fail-open) is a SEPARATE, more precise safety net than this
+          // fallback's commentCursor comparison, and the old code relied on
+          // ALWAYS handing it a `deliver: true` verdict for every
+          // non-structural uncertain case specifically so THAT check, not
+          // this one, decides whether a sleeping watcher actually wakes.
+          // Collapsing straight to `{ deliver: false }` here for an asleep
+          // watcher would silently reopen the exact "stays asleep on an
+          // unverifiable fetch" hazard BUTCHR-307 exists to close. So: an
+          // AWAKE watcher (the common case, and the one FACTORY-921's noise
+          // measurement is actually about) gets the new behaviour straight;
+          // an ASLEEP watcher is routed through `finalize()` exactly as
+          // before this ticket, unaffected by anything above.
           const result = await fetchComments(key);
+          const asleep = Boolean(deps.standDown?.isAsleep(watcher));
           if (!result.ok) {
             deps.onCommentCheckSkipped?.(key, result.reason);
             log(skippedCommentCheckLine(key, result.reason));
-            return { deliver: false };
+            if (!asleep) return { deliver: false };
+            return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
           }
           commentCursor.set(key, result.newest);
           const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
           if (preBaseline !== undefined && result.newest !== null && result.newest !== preBaseline) {
             return finalize(key, watcher, { deliver: true, reason: { comment: result.newest } });
           }
-          return { deliver: false };
+          if (!asleep) return { deliver: false };
+          return finalize(key, watcher, { deliver: true, reason: { undetermined: "checked-unchanged" } });
         },
       };
     },

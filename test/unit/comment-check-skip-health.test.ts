@@ -13,6 +13,7 @@ import { skippedCommentCheckLine } from "../../src/jira-watch/skipped-comment-ch
  */
 describe("combineHealth FACTORY-922: commentChecksSkipped", () => {
   const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 10_000 });
+  poll.recordSuccess();
 
   test("absent entirely when the caller passes none — never a bare 0", () => {
     expect("commentChecksSkipped" in combineHealth([poll])).toBe(false);

@@ -953,6 +953,11 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toEqual([]);
   });
 
+  // FACTORY-922: decide()'s §3D fallback now ACTIVELY checks comments
+  // rather than guessing — a `comments` dep that actually confirms the
+  // foreign comment (newest id genuinely moves from the poll-0 baseline) is
+  // what makes this delivery CONFIRMED rather than merely asserted by this
+  // test's own comment text.
   test("a self-write and a foreign change landing in the same poll window (updated moves past the recorded value) is delivered", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -966,11 +971,16 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     ];
     ledger.record("A", "t2", "A", Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx === 0
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n++, polls.length - 1)]!,
+      search: async () => { pollIdx = Math.min(n++, polls.length - 1); return polls[pollIdx]!; },
       herd,
       notify: (i) => { notified.push(i); },
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      comments,
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 60));
@@ -978,6 +988,9 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toContain("A");
   });
 
+  // FACTORY-922: §3D's fallback now ACTIVELY checks comments instead of
+  // guessing — a `comments` dep confirming T's own newest comment genuinely
+  // moved is what makes S's delivery CONFIRMED.
   test("an agent's write on its own ticket suppresses that agent alone; a watcher (via Implements) still hears it", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -990,12 +1003,17 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const relatedPolls = [relOf("t"), relOf("t2")];
     ledger.record("T", "t2", "T", Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx === 0
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
       search: async () => polls[Math.min(n, 1)]!,
-      related: async () => relatedPolls[Math.min(n++, 1)]!,
+      related: async () => { pollIdx = Math.min(n++, 1); return relatedPolls[pollIdx]!; },
       herd,
       notify: (i, about) => { notified.push(`${i}<-${about}`); },
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
+      comments,
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 60));
@@ -1004,6 +1022,10 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     expect(notified).toContain("S<-T");     // its boss still hears it — this IS how "merged, over to you" arrives
   });
 
+  // FACTORY-922: same active-check reasoning as the test above — the
+  // `comments` dep confirms S's own newest comment genuinely moved between
+  // poll 1 and poll 2, which is what makes the poll-2 delivery to both S
+  // and E CONFIRMED rather than merely asserted by this test's own prose.
   test("a daemon label write on a story suppresses it for the story's own agent AND its epic watcher; a foreign comment in the same poll is delivered to both", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
@@ -1017,11 +1039,16 @@ describe("startLoop own-write ledger suppression (Part A)", () => {
     const relatedPolls = [relOf("t"), relOf("t2"), relOf("t3")];
     ledger.record("S", "t2", DAEMON_WRITER, Date.now());
     let n = 0;
+    let pollIdx = 0;
+    const comments = async () => (pollIdx < 2
+      ? [{ id: "c0", body: "x", created: "c", authorEmail: null }]
+      : [{ id: "c1", body: "x", created: "c", authorEmail: null }, { id: "c0", body: "x", created: "c", authorEmail: null }]);
     const stop = startLoop({
-      search: async () => polls[Math.min(n, polls.length - 1)]!,
+      search: async () => { pollIdx = Math.min(n, polls.length - 1); return polls[pollIdx]!; },
       related: async () => relatedPolls[Math.min(n++, relatedPolls.length - 1)]!,
       herd,
       notify: (i, about) => { notified.push(`${i}<-${about}`); },
+      comments,
       suppress: (key, updated, watcher) => ledger.shouldSuppress(key, updated, watcher, Date.now()),
       intervalMs: 10,
     });
@@ -1122,7 +1149,17 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     expect(notified.filter((x) => x === "E<-S").length).toBe(1);
   });
 
-  test("a diff touching a non-daemon (human) label is not treated as a daemon write: delivered normally, no comments() call", async () => {
+  // FACTORY-922 (replaces this test's own former expectation, deliberately,
+  // not weakened — per the resolved FACTORY-921 decision: "It does NOT
+  // include PRIORITY-only or LABEL-only changes"): a non-daemon (human)
+  // label add is still not treated as a daemon write (isDaemonLabelOnlyDiff
+  // is false, so crossDaemonSuppressed itself still never calls comments()
+  // — KAN-828's own reasoning is untouched), but it is ALSO not a field
+  // `daemonLabelTransition`/the general classifier tracks, so it now falls
+  // to §3D's own active check — which finds nothing moved (comments()
+  // returns the identical id every poll) and stays silent, exactly the
+  // noise this decision explicitly excludes.
+  test("a diff touching a non-daemon (human) label is NOT a daemon write (crossDaemonSuppressed still makes no call), and is NOT delivered either — label-only never wakes anyone", async () => {
     const herd = fakeHerd();
     const notified: string[] = [];
     let commentCalls = 0;
@@ -1140,13 +1177,13 @@ describe("startLoop cross-daemon label-only echo (A6)", () => {
     });
     await new Promise((r) => setTimeout(r, 60));
     stop();
-    expect(notified).toContain("S<-S");
-    expect(notified).toContain("E<-S");
-    // KAN-828: baseline seeding calls comments() once for S's first sighting
-    // regardless of what kind of diff it is — this diff isn't label-only
-    // (isDaemonLabelOnlyDiff is false, "urgent" isn't daemon-owned), so
-    // crossDaemonSuppressed itself never calls comments(), but seeding does.
-    expect(commentCalls).toBe(1);
+    expect(notified).not.toContain("S<-S");
+    expect(notified).not.toContain("E<-S");
+    // KAN-828: baseline seeding calls comments() once for S's first
+    // sighting (call 1); §3D's own active check at poll 2 makes the only
+    // other call (call 2, S's own primary path — E's related path reuses
+    // that same per-poll cache, no third call) and finds nothing moved.
+    expect(commentCalls).toBe(2);
   });
 
   test("a status change alongside a label change is delivered normally, and crossDaemonSuppressed itself makes no extra call (only baseline seeding does)", async () => {
