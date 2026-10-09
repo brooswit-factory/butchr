@@ -3,7 +3,10 @@
  * provider, query, `execution` — display-only this slice, see
  * `api/rules.ts`'s own `RuleDto.execution` doc comment — why-unstaffed, a
  * Preview button, and (FACTORY-730) an Edit button opening `RuleEditDialog.tsx`
- * for that row's rule). Plain token-styled markup, same "no dedicated
+ * for that row's rule). FACTORY-851 adds a display-only `resume: on/off
+ * (cutoff: ...)` cell, worded by `view-model/rules-view.ts`'s own
+ * `resumeText` — same "every rendering decision lives in the view-model"
+ * discipline `execution`'s own cell already follows. Plain token-styled markup, same "no dedicated
  * Card/Badge component in @launchpad-ui/components@0.25.0" discipline
  * `AgentRowCard.tsx`/`StatusPill.tsx` already settled on.
  *
@@ -62,6 +65,9 @@ export function RulesTable({ rows, canWrite, onPreview, onToggle, onEdit }: Rule
             </Text>
             <Text elementType="span" size="small" role="cell" className="rules-table__cell">
               {row.preferencesText}
+            </Text>
+            <Text elementType="span" size="small" role="cell" className="rules-table__cell">
+              {row.resumeText}
             </Text>
             <Text elementType="span" size="small" role="cell" data-testid="rule-staffed" className={row.staffed.cls === "known" ? "rules-table__known" : "rules-table__cnc"}>
               {row.staffed.text}

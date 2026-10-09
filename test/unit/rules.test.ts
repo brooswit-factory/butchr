@@ -362,6 +362,56 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
   });
 });
 
+describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
+  test("both absent when omitted — no default the way execution/account/role get one", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(r!.resumeOnRespawn).toBeUndefined();
+    expect(r!.resumeContextCutoff).toBeUndefined();
+  });
+
+  test("both values and every provider accept the field, independent of execution/account/role/each other — same house style as permissionMode/lizardMode", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      for (const resumeOnRespawn of [true, false]) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, resumeOnRespawn, resumeContextCutoff: 50_000 }] });
+        expect(r).toMatchObject({ resourceProvider, resumeOnRespawn, resumeContextCutoff: 50_000 });
+      }
+    }
+  });
+
+  test("resumeContextCutoff may be set without resumeOnRespawn, and vice versa — the two fields are independent", () => {
+    const [onlyCutoff] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
+    expect(onlyCutoff!.resumeContextCutoff).toBe(1);
+    expect(onlyCutoff!.resumeOnRespawn).toBeUndefined();
+    const [onlyFlag] = parseRules({ rules: [{ ...minimal, resumeOnRespawn: false }] });
+    expect(onlyFlag!.resumeOnRespawn).toBe(false);
+    expect(onlyFlag!.resumeContextCutoff).toBeUndefined();
+  });
+
+  test("rejects a non-boolean resumeOnRespawn, naming the rule and field — no tri-state", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, resumeOnRespawn: "yes" }] }, "f.json"))
+      .toThrow("f.json: rules[0].resumeOnRespawn must be a boolean");
+  });
+
+  test.each([0, -1, 1.5, NaN, "100000", null])("rejects resumeContextCutoff %p as not a positive integer, naming the rule and field", (bad) => {
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: bad }] }, "f.json"))
+      .toThrow("f.json: rules[0].resumeContextCutoff must be a positive integer");
+  });
+
+  test("a positive integer resumeContextCutoff is accepted, including 1", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
+    expect(r!.resumeContextCutoff).toBe(1);
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged — byte-for-byte the same shape as before this ticket", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+    ] as never);
+  });
+});
+
 describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a rule)", () => {
   const mud = { name: "mud", type: "http", url: "https://mud.example/mcp", channel: true };
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { withDom } from "../setup/happy-dom.js";
 import { RulesRoute } from "../../dashboard-app/src/routes/RulesRoute.js";
 import { createFixturesRulesApi, defaultRulesFixture, FIRST_RULE_ID, PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING } from "../../dashboard-app/src/api/rules.js";
@@ -20,6 +20,8 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     agentPreferences: [],
     permissionMode: null,
     lizardMode: null,
+    resumeOnRespawn: null,
+    resumeContextCutoff: null,
     staffed: true,
     reason: null,
     ...overrides,
@@ -40,6 +42,10 @@ describe("RulesRoute — FACTORY-661: list", () => {
     expect(getByText(/execution: singleton/)).toBeTruthy();
     expect(getByText("UNSTAFFED: disabled")).toBeTruthy();
     expect(getByText(/COULD NOT CHECK: census unavailable/)).toBeTruthy();
+    // FACTORY-851: vip-zendesk's fixture entry sets resumeOnRespawn: false, resumeContextCutoff: 50_000 — the only row with this exact text, so a page-wide getByText is unambiguous.
+    expect(getByText("resume: off (cutoff: 50000)")).toBeTruthy();
+    // factory-triage's fixture entry leaves both fields absent (null) — but so do two OTHER rows (stale-github-prs, ui-first-rule), so this text is NOT unique page-wide; scope to factory-triage's own row (rows[0], same fixture order asserted above) rather than a bare getByText, which would throw on multiple matches.
+    expect(within(rows[0]!).getByText("resume: on (cutoff: default)")).toBeTruthy();
   });
 
   test("a validation-problems banner renders when the rules file is invalid, independent of whether any rules also loaded", async () => {
