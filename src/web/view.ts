@@ -454,6 +454,10 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   if (patch.permissionMode !== undefined) parts.push(`permissionMode: ${show(current?.permissionMode)} -> ${show(patch.permissionMode)}`);
   if (patch.lizardMode !== undefined) parts.push(`lizardMode: ${show(current?.lizardMode)} -> ${show(patch.lizardMode)}`);
   if (patch.role !== undefined) parts.push(`role: ${show(current?.role)} -> ${show(patch.role)}`);
+  // FACTORY-846: same one-line-per-changed-field treatment as permissionMode/lizardMode above.
+  if (patch.idlePokeMinutes !== undefined) parts.push(`idlePokeMinutes: ${show(current?.idlePokeMinutes)} -> ${show(patch.idlePokeMinutes)}`);
+  if (patch.idlePokeMessage !== undefined) parts.push(`idlePokeMessage: ${show(current?.idlePokeMessage)} -> ${show(patch.idlePokeMessage)}`);
+  if (patch.idlePokeEnabled !== undefined) parts.push(`idlePokeEnabled: ${show(current?.idlePokeEnabled)} -> ${show(patch.idlePokeEnabled)}`);
   if (patch.agentPreferences !== undefined) {
     patch.agentPreferences.forEach((p, i) => {
       const cur = current?.agentPreferences?.[i] as Record<string, unknown> | undefined;

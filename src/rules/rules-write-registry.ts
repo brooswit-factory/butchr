@@ -77,7 +77,7 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * `account` still are); now explicit, validated against `AGENT_ROLES`
  * below, same discipline every other leaf here already has.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled"];
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -185,6 +185,12 @@ export interface RuleFieldPatch {
   role?: AgentRole;
   /** Must be the SAME LENGTH as the rule's current `agentPreferences` (see `RULES_V1_ALLOWED_PATHS`'s own doc comment on why an array-length change is never permitted) — one entry per existing preference, in order. */
   agentPreferences?: AgentPreferencePatch[];
+  /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. CONFIG SURFACE ONLY: never risky, never requires `confirm`. */
+  idlePokeMinutes?: number;
+  /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
+  idlePokeMessage?: string;
+  /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
+  idlePokeEnabled?: boolean;
 }
 
 /** `patch`'s own shape, independent of what the CURRENT rule looks like (that comparison — e.g. the length match above — happens where the current rule is in hand, in `./write-rules.ts`'s caller). `__proto__`/prototype-pollution bodies are rejected here: a `JSON.parse`'d `__proto__` key never becomes an OWN enumerable property, so `Object.keys`/`in` checks below never see it either way, but every value is read by EXPLICIT key name below, never spread or `Object.assign`-merged onto a trusted object, which is what actually matters for this module's own output never carrying one. */
@@ -222,7 +228,20 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     }
     patch.agentPreferences = entries;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "ifMatch", "confirm", "planHash"]);
+  // FACTORY-846: CONFIG SURFACE ONLY — same validation idiom as `./rules.ts`'s own `parseRules` for these three.
+  if ("idlePokeMinutes" in b) {
+    if (typeof b.idlePokeMinutes !== "number" || !Number.isFinite(b.idlePokeMinutes) || b.idlePokeMinutes <= 0) return { ok: false, error: "idlePokeMinutes must be a positive number" };
+    patch.idlePokeMinutes = b.idlePokeMinutes;
+  }
+  if ("idlePokeMessage" in b) {
+    if (typeof b.idlePokeMessage !== "string" || b.idlePokeMessage.trim() === "") return { ok: false, error: "idlePokeMessage must be a non-empty string" };
+    patch.idlePokeMessage = b.idlePokeMessage.trim();
+  }
+  if ("idlePokeEnabled" in b) {
+    if (typeof b.idlePokeEnabled !== "boolean") return { ok: false, error: "idlePokeEnabled must be a boolean" };
+    patch.idlePokeEnabled = b.idlePokeEnabled;
+  }
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }
