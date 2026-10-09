@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# FACTORY-892 (4): stand-in for the real Claude Code CLI in the `spawn-smoke`
+# CI job (.github/workflows/ci.yml) — CI has no Claude account to sign in
+# with, and this smoke test only needs herdr to accept and start a real
+# process with butchr's real kickoff argv, never a real agent session. It
+# ignores every argument (so a future control-character regression in that
+# argv still reaches herdr's own validation, unmunged) and just stays alive
+# long enough for scripts/verify-ci-spawn-smoke.ts to observe it running.
+sleep 60
