@@ -1146,7 +1146,7 @@ describe("admitWithRateLimits (pure, FACTORY-907)", () => {
     const got = admitWithRateLimits(["A", "B", "C"], 10, rl, new Map(), 0);
     expect(got.admitted).toEqual(["A"]);
     expect(got.withheld).toEqual(["B", "C"]);
-    expect(got.perRule.get("r1")).toEqual({ maxNewPerTick: 1, minSecondsBetweenAdmissions: undefined, admitted: 1, deferred: 2 });
+    expect(got.perRule.get("r1")).toEqual({ maxNewPerTick: 1, admitted: 1, deferred: 2 });
     expect(got.admittedAt.get("r1")).toBe(0);
   });
 
