@@ -29,7 +29,11 @@ describe("readDaemonLogs", () => {
   });
 
   test("bounded by byte cap: stops adding lines once the cap would be exceeded and reports truncated", async () => {
-    const io: DaemonLogsExecIo = { run: async () => "a".repeat(50) + "\n" + "b".repeat(50) + "\n" + "c".repeat(50) + "\n" };
+    // Each line is a run of SHORT words (never 32+ contiguous alnum chars),
+    // so `redact()`'s opaque-blob catch-all never fires and shortens the
+    // line out from under this test's own byte-count math.
+    const line = "word ".repeat(10).trimEnd(); // 49 bytes
+    const io: DaemonLogsExecIo = { run: async () => `${line}\n${line}\n${line}\n` };
     const result = await readDaemonLogs(USER_UNIT, { maxLines: 100, maxBytes: 110 }, io);
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("unreachable");

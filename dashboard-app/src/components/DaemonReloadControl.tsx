@@ -10,7 +10,8 @@
  */
 import { useState } from "react";
 import { Button, Text } from "@launchpad-ui/components";
-import { DaemonReloadFailedError, RateLimitError, type DaemonReloadResult } from "../api/daemon.js";
+import { DaemonReloadFailedError, type DaemonReloadResult } from "../api/daemon.js";
+import { RateLimitError } from "../api/settings.js";
 
 export interface DaemonReloadControlProps {
   reload: () => Promise<DaemonReloadResult>;
