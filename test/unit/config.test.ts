@@ -78,6 +78,13 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
   });
 
+  test("FACTORY-949: blockedWakeDebounceMinutes defaults to 10, honours BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).blockedWakeDebounceMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "20" }, noRead).blockedWakeDebounceMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+  });
+
   test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
     expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
     expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");

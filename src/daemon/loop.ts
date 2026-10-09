@@ -90,6 +90,8 @@ export interface LoopDeps {
   log?: (line: string) => void;
   /** FACTORY-922: threaded straight through to `createIssueEventRules` — see `IssueResourceDeps.onCommentCheckSkipped`'s own doc comment. */
   onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
+  /** FACTORY-949: threaded straight through to `createIssueEventRules` — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
+  blockedWakeDebounceMinutes?: number;
   intervalMs: number;
   onError?: (error: unknown) => void;
   /**
@@ -1407,6 +1409,7 @@ export function startLoop(deps: LoopDeps): Stop {
       // the same way it already can for every other daemon log line.
       ...(deps.log ? { log: deps.log } : {}),
       ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+      ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
     }),
     spawnConfig: ISSUE_SPAWN_CONFIG,
   };
