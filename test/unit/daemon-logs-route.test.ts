@@ -135,6 +135,22 @@ describe("POST /api/daemon/reload", () => {
     } finally { await app.stop(true); }
   });
 
+  test("no Origin: 403, daemonReload never called (no GET-only fallback for a write)", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+      daemonReload: () => { called = true; return RELOAD_OK; },
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${(app.server as any).port}/api/daemon/reload`, {
+        method: "POST", headers: { host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: "{}",
+      });
+      expect(res.status).toBe(403);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
   test("peer-uid check fails: 403, daemonReload never called", async () => {
     const csrf = createCsrfTokenIssuer();
     let called = false;
