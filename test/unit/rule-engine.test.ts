@@ -720,10 +720,18 @@ describe("rule relationships", () => {
     const ev = await events.poll(snap(before), snap(after));
     expect(ev.changedRelated).toEqual([heard]);
     expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { stalled: { key: "BUTCHR-2" } } });
-    // Every rule on the boss ticket hears it; no agent on the WORKER ticket
-    // does, and a sibling rule's agent key that is NOT actually one of this
-    // entry's watchers gets nothing either.
-    expect(await ev.decide(heard, "jira-work:review:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { stalled: { key: "BUTCHR-2" } } });
+    // `stalledWake`'s own debounce (like `blockedWake`'s — see
+    // `blockedWakeFired`'s own doc comment in issue.ts) is keyed by the
+    // STALLED TICKET, not by (ticket, watcher): "a ticket with two bosses
+    // ... must still fire at most once per episode, not once per boss."
+    // "review" also matches the boss ticket here (this file's own "every
+    // rule on the boss ticket hears it" guarantee for an ORDINARY change),
+    // but asking it about the SAME already-fired episode in the SAME poll
+    // correctly gets nothing more — the episode already fired, to whichever
+    // watcher asked first.
+    expect((await ev.decide(heard, "jira-work:review:BUTCHR-1", "related")).deliver).toBe(false);
+    // No agent on the WORKER ticket itself, and a sibling rule's agent key
+    // that is NOT actually one of this entry's watchers, gets anything.
     for (const other of ["jira-work:story:BUTCHR-2", "jira-work:review:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
       expect(await ev.decide(heard, other, "related")).toEqual({ deliver: false });
     }
