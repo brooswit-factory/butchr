@@ -128,6 +128,7 @@ function project(overrides: Partial<ProjectResource> = {}): ProjectResource {
       Object.fromEntries(observedEpics.map((e) => [e.key, e.commentIds.filter((id) => !(watermark.epicsSeen[e.key] ?? []).includes(id))])),
     observedCommentIds,
     watermark,
+    observedBlockedKeys: overrides.observedBlockedKeys ?? [],
     ...overrides,
   };
 }
