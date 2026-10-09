@@ -24,6 +24,8 @@ import { useDashboard } from "../hooks/use-dashboard.js";
 import { useHealth } from "../hooks/use-health.js";
 import { PollStatusView } from "../components/PollStatusView.js";
 import { DashboardView } from "../components/DashboardView.js";
+import { AgentControlPanel } from "../components/AgentControlPanel.js";
+import { realAgentsApi } from "../api/agents.js";
 import { buildDashboardViewModel, type DashboardHeaderInfo } from "../view-model/dashboard-view.js";
 import type { PollState } from "../view-model/poll-state.js";
 import type { HealthStatus } from "../../../src/daemon/health.js";
@@ -62,6 +64,7 @@ export function DashboardRoute() {
           return <DashboardView vm={vm} />;
         }}
       </PollStatusView>
+      <AgentControlPanel api={realAgentsApi} canWrite />
     </section>
   );
 }
