@@ -229,6 +229,27 @@ export interface HealthStatus {
    * fixture in this file's own test suite, unaffected by this addition).
    */
   loopWatchdog?: LoopWatchdogReport[];
+  /**
+   * FACTORY-922 (implementing story FACTORY-921): how many times
+   * `createIssueEventRules`'s `decide()` (src/resources/issue.ts) could not
+   * confirm whether a pure `updated` bump was a real change — its comment
+   * fetch was skipped under load or failed outright — and chose not to
+   * notify rather than guess (see that module's own §3D fallback comment).
+   * A NINTH sibling, same "additive, never flips `ok`" reasoning as every
+   * sibling above: a skipped comment check is an EXTERNAL Atlassian
+   * degradation (or load-shedding), already logged
+   * (`skippedCommentCheckLine`, src/jira-watch/skipped-comment-check-log.ts)
+   * — not a liveness failure of this daemon's own poll loop, which keeps
+   * ticking fine; the retained snapshot means the diff simply re-fires on a
+   * later poll, no change lost. Monotonically increasing for the daemon's
+   * lifetime (never reset), same convention as every other lifetime count
+   * in this codebase (e.g. `AdmissionSnapshot`'s own counters) — a consumer
+   * graphing this over time watches its RATE, not its absolute value.
+   * Absent entirely when the caller doesn't pass one to `combineHealth`
+   * (e.g. every existing test fixture in this file's own test suite,
+   * unaffected by this addition).
+   */
+  commentChecksSkipped?: number;
 }
 
 /**
@@ -312,6 +333,7 @@ export const combineHealth = (
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
   dashboardApp?: { built: boolean; path: string },
   loopWatchdog?: readonly LoopWatchdogReport[],
+  commentChecksSkipped?: number,
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -330,6 +352,7 @@ export const combineHealth = (
       : {}),
     ...(dashboardApp ? { dashboardApp } : {}),
     ...(loopWatchdog && loopWatchdog.length ? { loopWatchdog: [...loopWatchdog] } : {}),
+    ...(commentChecksSkipped !== undefined ? { commentChecksSkipped } : {}),
   };
 };
 

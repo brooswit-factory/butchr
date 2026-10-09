@@ -91,6 +91,20 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   // always starts from the rule's own current, real value, no "butchr's
   // default" tri-state needed.
   const [draftRole, setDraftRole] = useState<AgentRole>(rule.role ?? "worker");
+  // FACTORY-846 (epic FACTORY-836, story FACTORY-844) — same inherit-via-
+  // empty contract as `FirstRuleSetup.tsx`'s own `draftIdlePoke*`:
+  // `rule.idlePokeMinutes`/`idlePokeMessage` are nullable (`null` means
+  // this rule inherits the global `stalledMinutes`/today's existing wake
+  // text — NOT the epic's own 30/default-text seed), so the draft starts
+  // EMPTY, never seeded with that epic default, when the rule's own value
+  // is `null`. `buildFieldsPatch` below only includes a field when its
+  // draft actually differs from the rule's current value (the same
+  // diff-based pattern every other field here already uses), so clicking
+  // Save never pins an untouched inherited field to a concrete number.
+  const [draftIdlePokeMinutes, setDraftIdlePokeMinutes] = useState(rule.idlePokeMinutes != null ? String(rule.idlePokeMinutes) : "");
+  const [draftIdlePokeMessage, setDraftIdlePokeMessage] = useState(rule.idlePokeMessage ?? "");
+  // `idlePokeEnabled` is never `null` on `RuleDto` (`parseRules` always resolves it) — no inherit-ambiguity to protect, same as `lizardMode`.
+  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule.idlePokeEnabled ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
@@ -175,6 +189,17 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
     if (draftPermissionMode !== (rule.permissionMode ?? "")) patch.permissionMode = draftPermissionMode || undefined;
     if (draftLizardMode !== (rule.lizardMode ?? false)) patch.lizardMode = draftLizardMode;
     if (draftRole !== (rule.role ?? "worker")) patch.role = draftRole;
+    // FACTORY-846: diff against the rule's current (possibly-null) value —
+    // an EMPTY draft (never touched, or cleared back to empty) never sends
+    // a field, since `RuleFieldPatch.idlePokeMinutes`/`idlePokeMessage`
+    // have no "clear back to inherit" encoding (same limitation
+    // `permissionMode` already has above — there is no way to unset it
+    // back to "butchr's default" through this dialog either).
+    const currentIdlePokeMinutesStr = rule.idlePokeMinutes != null ? String(rule.idlePokeMinutes) : "";
+    if (draftIdlePokeMinutes !== currentIdlePokeMinutesStr && draftIdlePokeMinutes !== "") patch.idlePokeMinutes = Number(draftIdlePokeMinutes);
+    const currentIdlePokeMessage = rule.idlePokeMessage ?? "";
+    if (draftIdlePokeMessage !== currentIdlePokeMessage && draftIdlePokeMessage !== "") patch.idlePokeMessage = draftIdlePokeMessage;
+    if (draftIdlePokeEnabled !== (rule.idlePokeEnabled ?? true)) patch.idlePokeEnabled = draftIdlePokeEnabled;
     if (canEditPreferences(rule)) {
       const entry: RuleAgentPreferencePatch = { harness: draftHarness };
       if (draftModel) entry.model = draftModel;
@@ -418,6 +443,44 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
           {capacityRoles && (
             <p data-testid="rule-edit-capacity-default-hint">butchr's own default is "{capacityRoles.default}" (counted)</p>
           )}
+
+          <label htmlFor="rule-edit-idle-poke-minutes-input">idle poke interval (minutes)</label>
+          {/* FACTORY-846: empty, with a placeholder, means "inherits butchr's global stall threshold" — this rule's real effective value when `rule.idlePokeMinutes` is `null`, never the epic's own 30. */}
+          <input
+            id="rule-edit-idle-poke-minutes-input"
+            type="number"
+            aria-label="idle poke interval (minutes)"
+            data-testid="rule-edit-idle-poke-minutes-input"
+            placeholder="inherits butchr's global stall threshold"
+            value={draftIdlePokeMinutes}
+            onInput={(e) => setDraftIdlePokeMinutes((e.target as HTMLInputElement).value)}
+            disabled={disabled}
+          />
+
+          <label htmlFor="rule-edit-idle-poke-message-input">idle poke message</label>
+          <input
+            id="rule-edit-idle-poke-message-input"
+            type="text"
+            aria-label="idle poke message"
+            data-testid="rule-edit-idle-poke-message-input"
+            placeholder="inherits today's existing wake text"
+            value={draftIdlePokeMessage}
+            onInput={(e) => setDraftIdlePokeMessage((e.target as HTMLInputElement).value)}
+            disabled={disabled}
+          />
+
+          <label htmlFor="rule-edit-idle-poke-enabled-toggle">idle poke enabled</label>
+          <span className="first-rule-idle-poke-toggle" title="whether this rule's tickets get a stall wake comment at all">
+            <Switch
+              id="rule-edit-idle-poke-enabled-toggle"
+              data-testid="rule-edit-idle-poke-enabled-toggle"
+              isSelected={draftIdlePokeEnabled}
+              isDisabled={disabled}
+              switchLabels={false}
+              aria-label="idle poke enabled"
+              onChange={(isSelected) => setDraftIdlePokeEnabled(isSelected)}
+            />
+          </span>
 
           {pendingAction && (
             <div className="rules-view__cnc" data-testid="rule-edit-confirm">

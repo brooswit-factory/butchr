@@ -41,7 +41,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { updateRulesFile, restoreBackup, rulesEtag, type WriteRulesIo, type WriteRulesResult } from "./write-rules.js";
 import { rulesPath, type RulesEnv } from "./rules.js";
-import { applyRuleFieldPatch, readRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, ruleIdExists, appendRule, RuleWriteApplyError } from "./rules-write-apply.js";
+import { applyRuleFieldPatch, readRuleById, removeRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, ruleIdExists, appendRule, RuleWriteApplyError } from "./rules-write-apply.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch, type RuleCreateInput } from "./rules-write-registry.js";
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
@@ -57,8 +57,26 @@ const sha256 = (text: string): string => createHash("sha256").update(text, "utf8
  */
 const executionOf = (raw: unknown): string => (raw === undefined ? "swarm" : String(raw));
 
+/**
+ * FACTORY-731 — shared across `RulesPlanResult.confirmReason` (the
+ * PUT/enable plan route's own classification) and `RulesWriteOutcome`'s
+ * refusal shape (every write route's own direct refusal): one vocabulary,
+ * never two that could drift. `"rule-delete"` is FACTORY-731's own
+ * dedicated value for `DELETE /api/rules/:id`'s mandatory-confirm gate —
+ * that ticket's own "What already shipped" note is explicit that delete
+ * must get its own value here, never overload an existing one (a delete is
+ * not a stop/restart of a RUNNING agent, which `"stop-restart"` means; a
+ * delete is refused outright while any agent is live — see
+ * `writeRuleDelete`'s own doc comment). FACTORY-927 adds `"rule-create"`,
+ * same reasoning: a create's own mandatory-confirm gate is UNCONDITIONAL,
+ * independent of blast radius (a created rule is always disabled), so it
+ * is never a real instance of any of the other reasons either — see
+ * `createRule`'s own doc comment.
+ */
+export type ConfirmReason = "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "capacity-sentinel" | "rule-delete" | "rule-create";
+
 export class WriteRefusedError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number, readonly confirmReason?: ConfirmReason) { super(message); }
 }
 
 /** B2's own tracking ref — mutated by `writeRuleEnabled`/`writeRuleFields` on success, consulted (and cleared) by `writeUndo`. The SAME object must be passed on every call for a given daemon process (see `RulesWriteDeps.lastUiWrite`'s own doc comment) — a fresh ref (as a test that doesn't care about undo gets by default) means undo is refused until a write happens through that exact ref. */
@@ -118,7 +136,15 @@ function assertNotStale(deps: RulesWriteDeps, currentText: string | undefined): 
 
 export type RulesWriteOutcome =
   | { ok: true; backupId: string | null; etag: string; changedIds: string[]; reload: { applied: boolean; problems: string[] } }
-  | { ok: false; status: number; error: string };
+  /**
+   * FACTORY-731: `confirmReason` is additive and OPTIONAL — present only
+   * when this refusal is specifically "resend with confirm: true" (today,
+   * only `writeRuleDelete`'s own mandatory-confirm gate sets it); every
+   * pre-existing refusal (stale etag, unknown id, placeholder query, ...)
+   * keeps omitting it exactly as before, so no existing reader of this
+   * union needs to change.
+   */
+  | { ok: false; status: number; error: string; confirmReason?: ConfirmReason };
 
 const defaultReload = (): { applied: boolean; problems: string[] } => ({ applied: true, problems: [] });
 
@@ -135,7 +161,7 @@ function toOutcome(result: WriteRulesResult, deps: RulesWriteDeps): RulesWriteOu
 }
 
 function refusalToOutcome(e: unknown): RulesWriteOutcome {
-  if (e instanceof WriteRefusedError) return { ok: false, status: e.status, error: e.message };
+  if (e instanceof WriteRefusedError) return { ok: false, status: e.status, error: e.message, ...(e.confirmReason ? { confirmReason: e.confirmReason } : {}) };
   if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
   const message = (e as Error)?.message ?? String(e);
   // `assertOnlyChanged`'s own throw shape (FACTORY-658) — a change outside
@@ -565,6 +591,84 @@ export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch
 }
 
 /**
+ * FACTORY-731 — `DELETE /api/rules/:id`'s own write. Deletion is the most
+ * destructive op on this path (undo, B2 above, is the only way back), so
+ * every gate here is UNCONDITIONAL — none is bypassable with `confirm:
+ * true`, unlike `writeRuleEnabled`/`writeRuleFields`'s own blast-radius
+ * gates:
+ *
+ *   1. Unknown id -> 400 (via `readRuleById`/`RuleWriteApplyError`).
+ *   2. Stale `ifMatch` -> 409 (same `checkIfMatch` every other write uses).
+ *   3. `rule.enabled === true` -> 409, naming the rule and what to do first
+ *      ("disable it first") — never confirmable: an enabled rule's query is
+ *      actively being staffed against, and deleting it out from under a
+ *      live reconcile loop is not a decision a `confirm: true` flag should
+ *      be able to wave through.
+ *   4. `hasLiveAgents(id)` -> 409, naming the rule and what to do first
+ *      ("wait for them to finish or stop them first") — see
+ *      `ruleHasLiveAgent`'s own doc comment (`../agents/query-agent-
+ *      inventory.ts`) for the exact signal this reads and the race it
+ *      cannot fully close. Checked BOTH before the lock (cheap, avoids
+ *      taking the lock for a doomed call) and again inside it, immediately
+ *      before the actual splice — the second check is authoritative; the
+ *      first is purely an optimization, same "pre-lock-then-recheck"
+ *      shape `writeRuleEnabled`'s own `scopeForHash` already uses for its
+ *      own non-file-derived signal.
+ *   5. No `confirm: true` -> 409 with a DEDICATED `confirmReason:
+ *      "rule-delete"` (this ticket's own new value — see `ConfirmReason`'s
+ *      own doc comment for why it is not folded into `"stop-restart"`), and
+ *      a message that NAMES the rule's id and query — never a bare "are you
+ *      sure" (this is the one gate `confirm: true` DOES satisfy; it exists
+ *      to require an explicit, informed opt-in, not to block delete
+ *      outright the way gates 3/4 do).
+ *
+ * On success: removes the rule from the array (`removeRuleById`), scoped by
+ * `assertOnlyChanged` to `["rules"]` (an array-length change is reported at
+ * the array's own path — see `write-rules.ts`'s own header), same
+ * backup-before-write/atomic-write/audit-line path every other write in
+ * this module already goes through, and the SAME `LastUiWriteRef` tracking
+ * (`recordLastUiWrite`) that makes `writeUndo` able to restore THIS delete,
+ * byte-for-byte, exactly like any other write here.
+ */
+export function writeRuleDelete(id: string, ifMatch: string, confirm: boolean, hasLiveAgents: (id: string) => boolean, deps: RulesWriteDeps): RulesWriteOutcome {
+  const env = deps.env ?? process.env;
+
+  // Pre-lock check (cheap; see this function's own doc comment, point 4) —
+  // the SAME synchronous signal is re-read, authoritatively, inside the
+  // lock below.
+  if (hasLiveAgents(id)) {
+    return { ok: false, status: 409, error: `rule "${id}" cannot be deleted while it has live agent(s) running — wait for them to finish or stop them first` };
+  }
+
+  try {
+    const result = updateRulesFile(
+      (currentText) => {
+        checkIfMatch(currentText, ifMatch);
+        assertNotStale(deps, currentText);
+        const rule = readRuleById(currentText, id); // throws RuleWriteApplyError (-> 400) for an unknown id
+        if (rule.enabled === true) {
+          throw new WriteRefusedError(`rule "${id}" cannot be deleted while it is enabled — disable it first`, 409);
+        }
+        if (hasLiveAgents(id)) {
+          throw new WriteRefusedError(`rule "${id}" cannot be deleted while it has live agent(s) running — wait for them to finish or stop them first`, 409);
+        }
+        if (!confirm) {
+          throw new WriteRefusedError(`delete rule "${id}" (query: ${JSON.stringify(String(rule.query ?? ""))})? resend with confirm: true to proceed`, 409, "rule-delete");
+        }
+        return removeRuleById(currentText, id);
+      },
+      env,
+      deps.io,
+      { allowedPaths: ["rules"] },
+    );
+    recordLastUiWrite(deps, result.backupId, result.etag);
+    return toOutcome(result, deps);
+  } catch (e) {
+    return refusalToOutcome(e);
+  }
+}
+
+/**
  * `POST /api/undo/:backupId` (B2) — restores a backup through the SAME
  * validated/atomic/backed-up path every other write uses (`restoreBackup`,
  * FACTORY-658), but ONLY the backup this SAME process's most recent
@@ -650,13 +754,7 @@ export interface RulesPlanResult {
    * already reads it — renaming it is a breaking change to a live client
    * for no behavioral gain, so this field is additive instead.
    */
-  // FACTORY-927 adds `"rule-create"` — the UNCONDITIONAL confirm gate
-  // `planRuleCreate`/`createRule` apply to every creation, independent of
-  // blast radius (a newly-created rule is always disabled — see
-  // `createRule`'s own doc comment — so none of the other reasons above,
-  // all of which are about an EXISTING rule's blast radius, can ever apply
-  // to a create).
-  confirmReason?: "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "capacity-sentinel" | "rule-create";
+  confirmReason?: ConfirmReason;
 }
 export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; error: string };
 
@@ -961,7 +1059,7 @@ export async function createRule(input: RuleCreateInput, confirm: boolean, planH
           throw new WriteRefusedError(`planHash does not match a fresh plan for this create (the file may have changed, or the plan is stale) — retry the create`, 409);
         }
         if (!confirm) {
-          throw new WriteRefusedError(`create rule ${JSON.stringify(input.id)} (query: ${JSON.stringify(input.query)}, scope: ${rawScope} ticket(s))? resend with confirm: true to proceed`, 409);
+          throw new WriteRefusedError(`create rule ${JSON.stringify(input.id)} (query: ${JSON.stringify(input.query)}, scope: ${rawScope} ticket(s))? resend with confirm: true to proceed`, 409, "rule-create");
         }
         return nextText;
       },

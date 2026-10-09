@@ -21,6 +21,7 @@ import { RulesTable } from "../components/RulesTable.js";
 import { RulePreviewDialog } from "../components/RulePreviewDialog.js";
 import { RuleToggleConfirmDialog } from "../components/RuleToggleConfirmDialog.js";
 import { RuleEditDialog } from "../components/RuleEditDialog.js";
+import { RuleDeleteConfirmDialog } from "../components/RuleDeleteConfirmDialog.js";
 import { CreateRuleDialog } from "../components/CreateRuleDialog.js";
 import { FirstRuleSetup } from "../components/FirstRuleSetup.js";
 import { buildRulesViewModel, type RuleRowView } from "../view-model/rules-view.js";
@@ -44,6 +45,9 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
   const [previewProvider, setPreviewProvider] = useState<string | null>(null);
   const [pendingToggle, setPendingToggle] = useState<PendingToggle | null>(null);
   const [toggleError, setToggleError] = useState<string | null>(null);
+  /** FACTORY-731 — the rule pending `RuleDeleteConfirmDialog`'s confirm, or `null` when none is open. */
+  const [pendingDelete, setPendingDelete] = useState<RuleDto | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   /** FACTORY-730 — the rule currently open in `RuleEditDialog`, or `null` when no edit dialog is open. */
   const [editingRuleId, setEditingRuleId] = useState<string | null>(null);
   /** FACTORY-927 — whether `CreateRuleDialog` is open. */
@@ -120,6 +124,26 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
     }
   }
 
+  // FACTORY-731 — unlike `startToggle` above, delete's confirm is
+  // UNCONDITIONAL (`writeRuleDelete`'s own gate), so there is no
+  // plan-then-maybe-confirm branch: opening `RuleDeleteConfirmDialog`
+  // always precedes the real `confirm: true` call.
+  function startDelete(row: RuleRowView) {
+    setDeleteError(null);
+    setPendingDelete(row.rule);
+  }
+
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    const rule = pendingDelete;
+    setPendingDelete(null);
+    try {
+      await api.deleteRule(rule.id, currentSourceEtag, true);
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   return (
     <section aria-labelledby="rules-heading">
       <Heading id="rules-heading" size="small">
@@ -134,6 +158,11 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
       {toggleError !== null && (
         <Alert status="error" data-testid="rule-toggle-error">
           <AlertText>could not change this rule — {toggleError}</AlertText>
+        </Alert>
+      )}
+      {deleteError !== null && (
+        <Alert status="error" data-testid="rule-delete-error">
+          <AlertText>could not delete this rule — {deleteError}</AlertText>
         </Alert>
       )}
       <PollStatusView state={state} label="/api/rules">
@@ -184,6 +213,7 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
                   }}
                   onToggle={startToggle}
                   onEdit={(row) => setEditingRuleId(row.rule.id)}
+                  onDelete={startDelete}
                 />
               )}
               {/* FACTORY-730 — rendered inside this render-prop (not alongside the
@@ -231,6 +261,14 @@ export function RulesRoute({ api = rulesApi }: RulesRouteProps) {
             setPreviewRuleId(null);
             setPreviewProvider(null);
           }}
+        />
+      )}
+      {pendingDelete !== null && (
+        <RuleDeleteConfirmDialog
+          ruleId={pendingDelete.id}
+          query={pendingDelete.query}
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
         />
       )}
       {pendingToggle !== null && (

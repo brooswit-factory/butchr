@@ -96,6 +96,26 @@ export interface RuleDto {
   /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeContextCutoff`'s own doc comment). Display-only in this slice, same as `account`/`role` above. */
   resumeContextCutoff: number | null;
   /**
+   * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY
+   * for the idle poke. `idlePokeMinutes`/`idlePokeMessage`, like
+   * `permissionMode`/`lizardMode` above, are `null` when absent on the raw
+   * `Rule` — and `null` here means something specific: this rule's real
+   * EFFECTIVE threshold/text is today's global `stalledMinutes`/existing
+   * wake text, NOT the epic's own 30-minute/default-text seed
+   * (`DEFAULT_IDLE_POKE_MINUTES`/`DEFAULT_IDLE_POKE_MESSAGE`,
+   * `../../../src/rules/rules.js`) — review round 1 caught an earlier
+   * version of this DTO defaulting to that seed here, which misreported a
+   * rule's real threshold as 30 when it was actually inheriting the
+   * global 10. `idlePokeEnabled` has no such inherit-ambiguity —
+   * `Rule.idlePokeEnabled` is always resolved server-side (see that
+   * field's own doc comment) — so it is never `null`, same as it is
+   * always a real boolean for a rule that matched. Nothing in the daemon
+   * reads any of these three yet.
+   */
+  idlePokeMinutes: number | null;
+  idlePokeMessage: string | null;
+  idlePokeEnabled: boolean;
+  /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
    * `false` genuinely not staffed (`reason` says why), `null` COULD NOT
@@ -178,6 +198,10 @@ export interface RuleFieldPatch {
    */
   role?: AgentRole;
   agentPreferences?: RuleAgentPreferencePatch[];
+  /** FACTORY-846 — CONFIG SURFACE ONLY, never risky: no confirm is required for any of these three. */
+  idlePokeMinutes?: number;
+  idlePokeMessage?: string;
+  idlePokeEnabled?: boolean;
 }
 
 /** `POST /api/rules/plan`'s own patch shape — the SAME `RuleFieldPatch` plus the one extra field only the dedicated enable route (and this report-only plan) ever considers. */
@@ -315,6 +339,17 @@ export interface RulesApi {
   createRule(draft: RuleCreateDraft, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /** `POST /api/undo/:backupId` — only ever the backup id a write JUST returned; the server scopes this further (this SAME process's most recent UI write only). */
   undo(backupId: string, signal?: AbortSignal): Promise<RuleWriteResult>;
+  /**
+   * FACTORY-731 — `DELETE /api/rules/:id`. `confirm` is ALWAYS required by
+   * the server (`writeRuleDelete`'s own unconditional confirm gate) — there
+   * is no plan-then-apply step for delete the way `setEnabled`/
+   * `updateFields` have (no blast-radius count to preview; the server's
+   * refusal, naming the rule's id and query, is itself what a caller shows
+   * before resending with `confirm: true`). Refused (independent of
+   * `confirm`) while the rule is enabled or has a live agent — see
+   * `writeRuleDelete`'s own doc comment.
+   */
+  deleteRule(ruleId: string, ifMatch: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /**
    * Probes `GET /api/session` and updates `capabilities.write` IN PLACE
    * (mutating the SAME object `capabilities` already points at, never
@@ -457,6 +492,9 @@ interface ServerRuleEntry {
   lizardMode: boolean | null;
   resumeOnRespawn: boolean | null;
   resumeContextCutoff: number | null;
+  idlePokeMinutes: number | null;
+  idlePokeMessage: string | null;
+  idlePokeEnabled: boolean;
   staffed: boolean | null;
   whyUnstaffed: string | null;
 }
@@ -480,6 +518,9 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       lizardMode: r.lizardMode,
       resumeOnRespawn: r.resumeOnRespawn,
       resumeContextCutoff: r.resumeContextCutoff,
+      idlePokeMinutes: r.idlePokeMinutes,
+      idlePokeMessage: r.idlePokeMessage,
+      idlePokeEnabled: r.idlePokeEnabled,
       staffed: r.staffed,
       reason: r.whyUnstaffed,
     })),
@@ -563,6 +604,8 @@ export const realRulesApi: RulesApi = {
   // real undo call. Confirmed against `test/unit/rules-write-route.test.ts`
   // on `main`, which sends the same `content-type` + `body: "{}"` here.
   undo: (backupId, signal) => request<RuleWriteResult>(`/api/undo/${encodeURIComponent(backupId)}`, { method: "POST", body: {}, csrf: true, signal }),
+  deleteRule: (ruleId, ifMatch, confirm, signal) =>
+    request<RuleWriteResult>(`/api/rules/${encodeURIComponent(ruleId)}`, { method: "DELETE", body: { ifMatch, confirm }, csrf: true, signal }),
   async refreshCapabilities(signal) {
     try {
       await fetchCsrfToken(signal);
@@ -653,6 +696,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: true,
         reason: null,
       },
@@ -669,6 +715,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: false,
         reason: "disabled",
       },
@@ -685,6 +734,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: true,
         resumeOnRespawn: false,
         resumeContextCutoff: 50_000,
+        idlePokeMinutes: 15,
+        idlePokeMessage: null,
+        idlePokeEnabled: false,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
@@ -701,6 +753,9 @@ export function defaultRulesFixture(): RulesListResponse {
         lizardMode: null,
         resumeOnRespawn: null,
         resumeContextCutoff: null,
+        idlePokeMinutes: null,
+        idlePokeMessage: null,
+        idlePokeEnabled: true,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
       },
@@ -933,10 +988,34 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         permissionMode: patch.permissionMode ?? rule.permissionMode,
         lizardMode: patch.lizardMode ?? rule.lizardMode,
         role: patch.role ?? rule.role,
+        idlePokeMinutes: patch.idlePokeMinutes ?? rule.idlePokeMinutes,
+        idlePokeMessage: patch.idlePokeMessage ?? rule.idlePokeMessage,
+        idlePokeEnabled: patch.idlePokeEnabled ?? rule.idlePokeEnabled,
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
       return commitWrite(state.rules.map((r) => (r.id === ruleId ? updated : r)), [ruleId]);
+    },
+    async deleteRule(ruleId, ifMatch, confirm) {
+      await delay();
+      maybeFail();
+      maybeFailWriteOnce();
+      const rule = findRule(ruleId);
+      checkIfMatch(ifMatch);
+      if (rule.enabled) {
+        throw new Error(`rule "${ruleId}" cannot be deleted while it is enabled — disable it first`);
+      }
+      // Mirrors the real server's `hasLiveAgents` gate (`writeRuleDelete`,
+      // `src/rules/rules-write.ts`) as best a fixture can: `staffed ===
+      // true` is the SAME tri-state fact `GET /api/rules` already reports
+      // for this rule, never a second signal invented here.
+      if (rule.staffed === true) {
+        throw new Error(`rule "${ruleId}" cannot be deleted while it has live agent(s) running — wait for them to finish or stop them first`);
+      }
+      if (!confirm) {
+        throw new Error(`delete rule "${ruleId}" (query: ${JSON.stringify(rule.query)})? resend with confirm: true to proceed`);
+      }
+      return commitWrite(state.rules.filter((r) => r.id !== ruleId), [ruleId]);
     },
     async undo(backupId) {
       await delay();

@@ -3,10 +3,12 @@ import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { decideRespawnResume } from "./respawn.js";
+import { clearStopCause, persistIntentionalStop, workspaceStopCause } from "./stop-cause.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
-import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig, type RestoredResumePolicy } from "./argv.js";
+import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig, type AgentProvider, type RestoredResumePolicy } from "./argv.js";
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
 import type { SessionLimitRefusal } from "./session-limit.js";
 import { strandedCandidates, type StrandedCandidate } from "./reap.js";
@@ -224,6 +226,20 @@ export interface Herd {
    * merely loses the extra detail, never the underlying respawn behaviour.
    */
   lastResumeFailureDetail?(issue: string): string | undefined;
+
+  /**
+   * FACTORY-916 — whether `issue`'s most recent successful `spawn()`
+   * `--resume`d its prior Claude session instead of starting fresh (an
+   * ordinary fresh spawn that happened to resume, NOT `resumeInPlace()` —
+   * see `HerdrHerd.lastFreshSpawnResumed`'s own doc comment for the full
+   * contract). Read-once (`false` once already read, same shape as
+   * `lastResumeFailureDetail` above). Optional for the same reason that
+   * field is: only `HerdrHerd` populates it, and a fake `Herd` with no
+   * interest in this detail can simply omit it — its caller in
+   * `src/daemon/loop.ts` falls back to the ordinary respawn comment
+   * whenever this accessor is absent or returns `false`.
+   */
+  lastFreshSpawnResumed?(issue: string): boolean;
 }
 
 export interface ManagedHerdAgent {
@@ -614,6 +630,11 @@ export type SpawnOrigin = "spawn" | "respawn";
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   private readonly freezeWatches = new Map<string, ReturnType<typeof watchInstanceFreeze>>();
+  /** Extracted out of `startProviders` (unchanged behaviour) so `tryClaudeResume` — which never calls `startProviders` at all — gets the SAME freeze gate/watch. */
+  private async ensureFreezeWatch(key: string): Promise<void> {
+    await instanceFreezeStore.assertRunnable(`butchr:${key}`);
+    if (!this.freezeWatches.has(key)) this.freezeWatches.set(key, watchInstanceFreeze(`butchr:${key}`, () => this.stop(key), { onError: e => this.log?.(String(e)) }));
+  }
   async frozen(ids: readonly string[]): Promise<ReadonlySet<string>> {
     const frozen = new Set<string>();
     for(const id of ids) { try { if((await instanceFreezeStore.read(`butchr:${id}`)).frozen) frozen.add(id); }
@@ -658,6 +679,28 @@ export class HerdrHerd implements Herd {
    */
   lastSpawnRefusal(issue: string): string | undefined {
     return this.spawnRefusal.get(issue);
+  }
+
+  /**
+   * FACTORY-916 — issues whose MOST RECENT successful `spawn()` attempt
+   * used `--resume` on an ordinary fresh spawn (as opposed to
+   * `resumeInPlace()`'s own same-pane relaunch) — set in `startProviders`'s
+   * success branch, read-once like `lastResumeFailureDetail` above (the
+   * same "nothing here is meant to be polled" contract). The reconcile
+   * loop's respawn path (`src/daemon/loop.ts`) reads this immediately after
+   * `herd.spawn(toSpawn, "respawn")` returns, to choose `respawnResumedComment`
+   * over the ordinary `respawnComment` (both src/agents/respawn.ts) — see
+   * that call site for why a boolean accessor, not a reason string, is
+   * the right shape here: UNLIKE a resume's reason for FAILING (one of a
+   * small closed set of English strings safe to surface directly), a
+   * reason the PRIOR respawn-staleness decision wanted this issue
+   * respawned at all is an unrelated concern already carried by `reason`/
+   * `info.reason` in that loop — this accessor only needs to add "and by
+   * the way, it came back resumed" on top of that, never replace it.
+   */
+  private readonly freshSpawnResumed = new Set<string>();
+  lastFreshSpawnResumed(issue: string): boolean {
+    return this.freshSpawnResumed.delete(issue);
   }
 
   constructor(
@@ -1194,8 +1237,88 @@ export class HerdrHerd implements Herd {
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
       }
-      const result = await this.startProviders(spec);
+      // FACTORY-916 (epic FACTORY-843, story FACTORY-850) — try resuming
+      // this issue's prior Claude session BEFORE the ordinary multi-provider
+      // spawn below. See `tryClaudeResume`'s own doc comment for why this
+      // cannot live inside `startProviders`'s `prepare()` callback (the
+      // ONLY place `AgentConfig.resumeSessionId` is consulted at all,
+      // Drovr's own `ManagedAgentLaunch`/`buildAgentStartParams`, has no
+      // session-id/resume concept for Claude whatsoever — verified against
+      // the pinned 0.16.11 source). Attempted only when this spec's own
+      // effective FIRST provider is claude — a rule whose ranked harness
+      // preference tries something else first is unaffected, same as
+      // `resumeInPlace`'s own Claude-only limitation — AND only when
+      // `spec.ticketStatus` is present, i.e. this is a ticket-backed
+      // jira-work-shaped spawn at all (`SpawnSpec.ticketStatus`'s own doc
+      // comment, src/agents/workspace.ts, names this exact discriminator).
+      // Without this second half, a managed-session or query-level agent —
+      // every `spec` throughout this codebase's EXISTING test suite
+      // included, none of which ever had a reason to set `ticketStatus` —
+      // would pay `tryClaudeResume`'s own `decideRespawnResume` call and,
+      // overwhelmingly, its "no persisted session id" log line on EVERY
+      // single ordinary spawn: harmless in production, but a noisy new
+      // line that broke a long list of pre-existing pinned exact-log-array
+      // assertions having nothing to do with this story (caught by CI,
+      // fixed here rather than by touching any of those assertions).
+      // FACTORY-930 review fix: snapshot this workspace's stop-cause record
+      // BEFORE anything below can clear it — both `decideRespawnResume`
+      // (called inside `tryClaudeResume`, src/agents/respawn.ts) and the
+      // non-claude branch's own `clearStopCause` immediately below clear
+      // the marker the moment a decision is MADE for this spawn() call,
+      // not once a launch actually SUCCEEDS. If every launch attempted
+      // below (a resume attempt, then the ordinary multi-provider
+      // fallback) ultimately fails, `priorStopCause` is re-persisted
+      // verbatim in the `result.status !== "success"` branch so a
+      // deliberate stand_down survives to the NEXT spawn attempt instead
+      // of being read as unintended by it — the defect this ticket exists
+      // to close. Read exactly once, here: the restore point below never
+      // re-reads current disk state, which would race a fresh marker a
+      // concurrent stand_down might have written in the meantime.
+      const priorStopCause = workspaceStopCause(workspaceDirFor(issue));
+      if (this.firstProvider(spec) === "claude" && spec.ticketStatus !== undefined) {
+        const paneId = await this.tryClaudeResume(spec);
+        if (paneId) {
+          this.spawnRefusal.delete(issue);
+          this.log?.(`${SPAWN_TAG} ${issue} succeeded — pane ${paneId} origin=${origin} resumed=true`);
+          return;
+        }
+      } else {
+        // FACTORY-916 step 6: `tryClaudeResume` above already reads-then-
+        // clears this workspace's stop-cause marker as part of ITS OWN
+        // decision (`decideRespawnResume`, src/agents/respawn.ts) — but it
+        // is never called at all for a spec whose first provider isn't
+        // claude. The marker-staleness gap `clearStopCause`'s own doc
+        // comment names is NOT Claude-specific (any butchr verb can record
+        // it), only the RESUME mechanism is — so clear it here too,
+        // unconditionally: this IS a spawn decision being made for this
+        // workspace, the one precondition the doc comment requires. If the
+        // fallback spawn immediately below fails, `priorStopCause` above
+        // restores whatever this call just cleared.
+        clearStopCause(workspaceDirFor(issue));
+      }
+      let result: Awaited<ReturnType<HerdrHerd["startProviders"]>>;
+      try {
+        result = await this.startProviders(spec);
+      } catch (e) {
+        // FACTORY-930: a provider rejection `startProviders`/`ManagedHerdrLifecycle.start()`
+        // does not absorb into a `{status: "failed"}` (e.g. a non-retryable
+        // `agent.start` error, see "a non-busy agent.start rejection is
+        // never retried" in test/unit/herd.test.ts) reaches here as a
+        // THROW, not a status — restore applies identically; this call
+        // never launched anything either. Rethrown unchanged so the outer
+        // catch's existing log-and-rethrow behaviour is untouched.
+        if (priorStopCause) persistIntentionalStop(workspaceDirFor(issue), priorStopCause.reason, priorStopCause.at);
+        throw e;
+      }
       if (result.status !== "success") {
+        // FACTORY-930: nothing below this point launched successfully —
+        // neither a resume attempt (if one was even made; see
+        // `priorStopCause`'s own comment above for why it is undefined
+        // whenever a resume WAS attempted) nor this fresh fallback. Put
+        // back exactly what was read before either could clear it, so a
+        // stood-down workspace's marker outlives a failed spawn instead of
+        // letting the next attempt misread it as unintended.
+        if (priorStopCause) persistIntentionalStop(workspaceDirFor(issue), priorStopCause.reason, priorStopCause.at);
         this.spawnRefusal.set(issue, result.status === "blocked" ? result.reason : "providers exhausted");
         this.log?.(`${SPAWN_TAG} ${issue} waiting - ${result.status === "blocked" ? "handoff blocked" : "providers exhausted"} origin=${origin}`);
         if (result.status === "blocked") await this.clearVanishedWorker(issue, result.current?.paneId);
@@ -1401,9 +1524,152 @@ export class HerdrHerd implements Herd {
     return labels.get(key) ?? key;
   }
 
+  /** The provider `startProviders`' own `priority` list would try FIRST for `spec` — the exact precedence `providerOrder`/`spec.agents` already establish there, read-only here. */
+  private firstProvider(spec: SpawnSpec): AgentProvider {
+    const priority = spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype);
+    return priority[0] ?? this.agent.provider;
+  }
+
+  /**
+   * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — the spawn-path
+   * resume attempt: `--resume <id>` onto a BRAND-NEW pane, for an issue
+   * `decideRespawnResume` (src/agents/respawn.ts) cleared to resume.
+   * Returns the new pane id on success, `undefined` on every other
+   * outcome (the caller then falls through to the ordinary multi-provider
+   * `startProviders` — ALWAYS a safe fallback: nothing here mutates
+   * anything `startProviders` depends on until the real launch succeeds).
+   *
+   * WHY THIS CANNOT LIVE INSIDE `startProviders`'s OWN `prepare()`
+   * CALLBACK, verified against the pinned `@brooswit/drovr` 0.16.11
+   * source rather than assumed: `prepare()` returns `{launch:
+   * ManagedAgentLaunch, env?, home?}`, and `ManagedHerdrLifecycle.start()`
+   * feeds that `launch` straight into Drovr's OWN `buildAgentStartParams()`
+   * (never butchr's `agentStartParams`, src/agents/argv.ts, which is the
+   * ONLY function that reads `AgentConfig.resumeSessionId` at all). Drovr's
+   * `ClaudeAgentLaunch` type has no session/resume field whatsoever, and
+   * its `buildAgentStartParams` builds Claude's `args` from exactly
+   * `[prompt, --model, --effort, --permission-mode, ...channels]` — no
+   * unknown field on the launch object survives that translation. Setting
+   * `AgentConfig.resumeSessionId` and returning it from `prepare()` (an
+   * earlier version of this change did exactly that) compiles, but is a
+   * complete no-op: the flag never reaches real argv. The ONLY existing
+   * mechanism in this codebase that puts `--resume` on real argv is
+   * `agentStartParams()` + raw `startManagedAgent()` — exactly what
+   * `resumeInPlaceExclusive` (below in this file) already uses, bypassing
+   * `ManagedHerdrLifecycle` entirely for the SAME reason. This method
+   * reuses that SAME pair, for a NEW pane instead of `resumeInPlace`'s
+   * reused one (a genuine crash/respawn has no live pane left to reuse).
+   *
+   * SAFE TO BYPASS `ManagedHerdrLifecycle` HERE, independently verified
+   * against the pinned source rather than assumed: `resolveCurrent()`
+   * (the class's own identity resolver) falls back to scanning
+   * `agent.list()` for any agent at `this.options.cwd` whenever its
+   * cached `active` identity is unset, and ADOPTS whatever single agent it
+   * finds there as the new `active` — the same self-healing path that
+   * already covers a fresh daemon start discovering agents it never
+   * itself spawned. So a LATER `stop()`/`resolveCurrent()`/`resumeInPlace()`
+   * call against this issue's cached `this.lifecycles` instance correctly
+   * rediscovers the pane this method creates, with no bookkeeping of its
+   * own required. (This also means the ordinary respawn loop's prior
+   * `herd.stop(issue)` — always called before `herd.spawn(toSpawn,
+   * "respawn")`, see `reconcileNow`, src/daemon/loop.ts — has already
+   * cleared any stale `active` identity before this method ever runs.)
+   */
+  private async tryClaudeResume(spec: SpawnSpec): Promise<string | undefined> {
+    await this.ensureFreezeWatch(spec.key);
+    const selected: AgentConfig = { ...this.agent, provider: "claude" };
+    const preference = spec.agents?.find((p) => p.harness === "claude");
+    if (preference?.model) selected.model = preference.model;
+    if (preference?.effort) selected.effort = preference.effort;
+    const dir = buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
+    // FACTORY-916 review fix: `prepareWorkspace`/`home` MUST resolve before
+    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`/
+    // `estimateTranscriptTokens` (src/agents/workspace.ts) both resolve
+    // Claude's per-cwd project folder under `home` (defaulting to
+    // `homedir()` when absent), the SAME override `startProviders`'s own
+    // `prepare()` already threads through for its own post-launch
+    // discovery. Computing the decision against the wrong (default) home
+    // first — an earlier version of this method did exactly that — finds
+    // no transcript under the WRONG home and silently falls back to
+    // "transcript missing" even when a real one exists, caught by this
+    // method's own regression test before this fix landed.
+    const label = await this.labelFor(spec.key);
+    const prepared = await this.prepareWorkspace({ provider: "claude", cwd: dir, unattended: true });
+    const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string" ? prepared.HOME : undefined;
+    const decision = decideRespawnResume({
+      dir,
+      ...(spec.resumeOnRespawn !== undefined ? { resumeOnRespawn: spec.resumeOnRespawn } : {}),
+      ...(spec.resumeContextCutoff !== undefined ? { resumeContextCutoff: spec.resumeContextCutoff } : {}),
+      ...(spec.ticketStatus !== undefined ? { ticketStatus: spec.ticketStatus } : {}),
+      ...(spec.ticketLabels !== undefined ? { ticketLabels: spec.ticketLabels } : {}),
+      ...(home !== undefined ? { home } : {}),
+    });
+    if (!decision.resumeSessionId) {
+      // Every non-resume outcome logs its one greppable reason — DoD item
+      // 3. `buildWorkspace` just above already wrote this workspace's
+      // ordinary files (CLAUDE.md/brief.md/mcp.json/...) regardless of
+      // this decision — the SAME call `startProviders`'s own `prepare()`
+      // makes for every spawn attempt, resumed or not — so falling through
+      // to the ordinary flow below costs nothing extra here.
+      this.log?.(`${RESUME_TAG} ${spec.key} respawn-fresh — ${decision.reason}`);
+      return undefined;
+    }
+    selected.resumeSessionId = decision.resumeSessionId;
+    // UNLIKE `resumeInPlaceExclusive` (which does NOT call `buildWorkspace`
+    // before its relaunch, only after confirming success — a reused pane's
+    // files are already on disk from an earlier launch), `buildWorkspace`
+    // above already wrote mcp.json and installed the veto hook as part of
+    // its own ordinary full write — this IS a brand-new workspace, so
+    // there is nothing stale to refresh a second time before launching.
+    let paneId: string | undefined;
+    try {
+      const created = await this.herdr.workspace.create({ label, cwd: dir, ...(home ? { env: { HOME: home } } : {}) });
+      const root = created.root_pane;
+      paneId = typeof root === "string" ? root : root?.pane_id;
+    } catch (e) {
+      this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — workspace create: ${(e as Error)?.message ?? e}`);
+      return undefined;
+    }
+    if (!paneId) {
+      this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — workspace create returned no pane`);
+      return undefined;
+    }
+    const params = agentStartParams(spec, dir, paneId, nameFor(spec.key), selected, this.mcpUrl);
+    try {
+      await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
+    } catch (e) {
+      await this.closePaneDefensively(paneId);
+      this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — ${(e as Error)?.message ?? e}`);
+      return undefined;
+    }
+    // Same post-launch liveness check `resumeInPlaceExclusive` uses before
+    // trusting a herdr-accepted launch — herdr accepting a start only means
+    // the process BEGAN; Claude can still exit immediately (an unavailable
+    // model, a bad flag).
+    await this.wait(RESUME_LAUNCH_VERIFY_MS);
+    const launched = await this.providerOfPane(paneId);
+    if (!launched || launched.provider !== "claude") {
+      await this.closePaneDefensively(paneId);
+      this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — no exit status captured`);
+      return undefined;
+    }
+    this.refused.delete(spec.key);
+    await this.reportFullAgentKey(spec.key);
+    // The SAME id, on a BRAND-NEW pane — herdr's own pane-to-session
+    // bookkeeping (see `startProviders`'s own `reportAgentSession` call,
+    // FACTORY-720's doc comment) needs this new pairing exactly as much as
+    // a freshly-discovered id would. `.butchr-session-id.json` itself is
+    // deliberately left untouched: `decideRespawnResume` already read the
+    // SAME id this launch just used, and a `--resume` relaunch keeps it
+    // by definition — nothing to invalidate or rediscover (`resumeInPlaceExclusive`'s
+    // own identical reasoning).
+    await reportAgentSession({ herdr: this.herdr, log: this.log }, paneId, "claude", decision.resumeSessionId);
+    this.freshSpawnResumed.add(spec.key);
+    return paneId;
+  }
+
   private async startProviders(spec: SpawnSpec, refusedPane?: string) {
-    await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);
-    if(!this.freezeWatches.has(spec.key)) this.freezeWatches.set(spec.key,watchInstanceFreeze(`butchr:${spec.key}`,()=>this.stop(spec.key),{onError:e=>this.log?.(String(e))}));
+    await this.ensureFreezeWatch(spec.key);
     const label = await this.labelFor(spec.key);
     // FACTORY-314 (PR #513 review fix): captured by `prepare()` below, purely
     // so a SUCCESSFUL Claude launch can discover its REAL session id

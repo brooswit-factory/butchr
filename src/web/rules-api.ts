@@ -80,6 +80,25 @@ export interface RulesApiRuleEntry {
   resumeOnRespawn: boolean | null;
   /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see `Rule.resumeContextCutoff`'s own doc comment, `../rules/rules.ts`). */
   resumeContextCutoff: number | null;
+  /**
+   * FACTORY-846: CONFIG SURFACE ONLY for the idle poke — read off the raw
+   * `Rule` the SAME WAY as `permissionMode`/`lizardMode`/`resumeOnRespawn`
+   * above: `null` means absent. For `idlePokeMinutes`, absent means the
+   * EFFECTIVE threshold for this rule's tickets is today's global
+   * `stalledMinutes` (`BUTCHR_STALLED_MINUTES`, default 10) — NOT the
+   * epic's 30-minute figure — so this is never defaulted to
+   * `DEFAULT_IDLE_POKE_MINUTES` here; doing that would show a reader a
+   * number that is not the rule's real effective threshold (the exact
+   * 10-vs-30 confusion FACTORY-844 must not create). Same reasoning for
+   * `idlePokeMessage`: absent means today's existing wake text applies,
+   * not the epic's default string. `idlePokeEnabled` is the one exception
+   * — `Rule.idlePokeEnabled` is always resolved by `parseRules` (never
+   * optional in effect), so it is never `null` here, same as it is always
+   * `true`/`false` for a rule that matched.
+   */
+  idlePokeMinutes: number | null;
+  idlePokeMessage: string | null;
+  idlePokeEnabled: boolean;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -150,6 +169,9 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       lizardMode: raw?.lizardMode ?? null,
       resumeOnRespawn: raw?.resumeOnRespawn ?? null,
       resumeContextCutoff: raw?.resumeContextCutoff ?? null,
+      idlePokeMinutes: raw?.idlePokeMinutes ?? null,
+      idlePokeMessage: raw?.idlePokeMessage ?? null,
+      idlePokeEnabled: raw?.idlePokeEnabled ?? true,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,
       whyUnstaffed: entry.reason,

@@ -49,6 +49,9 @@ function uiDemoRule(overrides: Partial<RuleDto> = {}): RuleDto {
     lizardMode: null,
     resumeOnRespawn: null,
     resumeContextCutoff: null,
+    idlePokeMinutes: null,
+    idlePokeMessage: null,
+    idlePokeEnabled: true,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -422,6 +425,9 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
               lizardMode: true,
               resumeOnRespawn: false,
               resumeContextCutoff: 50000,
+              idlePokeMinutes: 30,
+              idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down",
+              idlePokeEnabled: true,
               briefExcerpt: "",
               staffed: false,
               whyUnstaffed: "disabled",
@@ -438,7 +444,12 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     expect(result.fileEtag).toBe("f1");
     expect(result.stale).toBe(true);
     expect(result.errors).toEqual([{ path: "/x/rules.json", message: "boom" }]);
-    expect(result.rules).toEqual([{ id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000, staffed: false, reason: "disabled" }]);
+    expect(result.rules).toEqual([{
+      id: "r1", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [],
+      permissionMode: "acceptEdits", lizardMode: true, resumeOnRespawn: false, resumeContextCutoff: 50000,
+      idlePokeMinutes: 30, idlePokeMessage: "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down", idlePokeEnabled: true,
+      staffed: false, reason: "disabled",
+    }]);
   });
 
   test("getCatalog calls GET /api/rules/catalog and returns the harnesses array verbatim", async () => {
@@ -660,6 +671,26 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     if (serverResult.ok) expect(serverResult.input).toEqual(draft);
   });
 
+  // FACTORY-846: same cross-contract proof, for the idle poke's three
+  // CONFIG-SURFACE-ONLY fields this ticket adds.
+  test("updateFields' real wire body for idlePokeMinutes/idlePokeMessage/idlePokeEnabled is accepted verbatim by the server's own validateRuleFieldPatch", async () => {
+    let sentBody: string | undefined;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      sentBody = String(init?.body);
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [FIRST_RULE_ID] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
+    await realRulesApi.updateFields(FIRST_RULE_ID, patch, "e1", "hash1", false);
+    expect(sentBody).toBeDefined();
+    const wireBody = JSON.parse(sentBody!);
+    expect(wireBody).toEqual({ ...patch, ifMatch: "e1", planHash: "hash1", confirm: false });
+    const serverResult = validateRuleFieldPatch(wireBody);
+    expect(serverResult.ok).toBe(true);
+    if (serverResult.ok) expect(serverResult.patch).toEqual(patch);
+  });
+
   test("undo POSTs to /api/undo/:backupId with the id encoded", async () => {
     const calls: string[] = [];
     globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
@@ -670,6 +701,49 @@ describe("realRulesApi — FACTORY-661/FACTORY-663: never invents an endpoint", 
     }) as unknown as typeof fetch;
     await realRulesApi.undo("a/b");
     expect(calls).toContain(`/api/undo/${encodeURIComponent("a/b")}`);
+  });
+
+  // FACTORY-731: DELETE /api/rules/:id — same wire shape as setEnabled's own
+  // test above (flat body, CSRF header fetched from /api/session), proving
+  // `deleteRule` never invents a different endpoint or method.
+  test("deleteRule DELETEs to /api/rules/:id with a flat {ifMatch, confirm} body, and the CSRF header fetched from /api/session", async () => {
+    const calls: { url: string; init: RequestInit | undefined }[] = [];
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      return new Response(JSON.stringify({ backupId: "b1", etag: "e2", changedIds: ["triage"] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    const result = await realRulesApi.deleteRule("triage", "e1", true);
+    expect(result).toEqual({ backupId: "b1", etag: "e2", changedIds: ["triage"] });
+    const writeCall = calls.find((c) => c.url === "/api/rules/triage")!;
+    expect(writeCall.init?.method).toBe("DELETE");
+    expect(JSON.parse(String(writeCall.init?.body))).toEqual({ ifMatch: "e1", confirm: true });
+    expect((writeCall.init?.headers as Record<string, string>)["x-butchr-csrf"]).toBe("tok");
+  });
+
+  // FACTORY-731 (ticket requirement 8, same precedent as FACTORY-725/730
+  // above): the exact bytes `realRulesApi.deleteRule` puts on the wire,
+  // fed straight into the real server's own inline body check
+  // (`src/web/view.ts`'s `DELETE /api/rules/:id` handler: `typeof
+  // b.ifMatch !== "string"`) — there is no separate `validateRuleFieldPatch`-
+  // shaped validator for delete (its body is just `{ifMatch, confirm}`, no
+  // nested patch), so this proves the client and the route agree on THAT
+  // shape instead: a string `ifMatch` and a `confirm` the route reads via
+  // `=== true` (so any JSON value, not only a boolean, is accepted — the
+  // route's own discipline, mirrored here rather than re-invented).
+  test("deleteRule's real wire body is accepted verbatim by the server's own DELETE /api/rules/:id body check", async () => {
+    let wireBody: unknown;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/session") return new Response(JSON.stringify({ csrfToken: "tok" }), { status: 200, headers: { "content-type": "application/json" } });
+      wireBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ backupId: null, etag: "e2", changedIds: [] }), { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    await realRulesApi.deleteRule(FIRST_RULE_ID, "e1", true);
+    const b = wireBody as Record<string, unknown>;
+    expect(typeof b.ifMatch).toBe("string");
+    expect(b.confirm === true).toBe(true);
   });
 
   test("capabilities.write starts false — the Rules page must render every write control disabled until refreshCapabilities succeeds", () => {

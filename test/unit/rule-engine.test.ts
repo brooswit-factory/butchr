@@ -86,6 +86,11 @@ describe("rule discovery", () => {
     expect(spec).toEqual({
       key: "jira-work:task:BUTCHR-7", resource: "BUTCHR-7", issuetype: "Task", summary: "summary of BUTCHR-7", parent: "BUTCHR-1",
       brief: "do it", agents: [{ harness: "codex", model: "gpt-5" }, { harness: "claude", effort: "max" }],
+      // FACTORY-916: `specForMatch` now always carries the already-fetched
+      // issue's own status/labels, so the spawn decision's `classifyStop`
+      // call needs no second Jira fetch — see that field's own doc comment
+      // (src/agents/workspace.ts, `SpawnSpec.ticketStatus`).
+      ticketStatus: "In Progress", ticketLabels: [],
     });
   });
 
@@ -115,6 +120,29 @@ describe("rule discovery", () => {
     const querySpec = specForRuleQuery(lizardRule!, "jira-work:manual:%40query");
     expect(querySpec.permissionMode).toBe("default");
     expect(querySpec.lizardMode).toBe(true);
+  });
+
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): `resumeOnRespawn`/
+  // `resumeContextCutoff` (FACTORY-851) are forwarded the same way, EXCEPT
+  // `resumeOnRespawn` is absent-means-ON (no tri-state), so an explicit
+  // `false` must still reach the spec — a truthy-only forward (the shape
+  // `lizardMode` above uses) would silently drop it. `ticketStatus`/
+  // `ticketLabels` are always present — this already-fetched issue's own
+  // fields, never conditional on the rule.
+  test("FACTORY-916: resumeOnRespawn/resumeContextCutoff are forwarded (including an explicit false), and ticketStatus/ticketLabels always ride along", () => {
+    const [rule] = rules({ id: "resume", query: "q", resumeOnRespawn: false, resumeContextCutoff: 5000 });
+    const spec = specForMatch({ agentKey: "jira-work:resume:BUTCHR-7", rule: rule!, issue: issue("BUTCHR-7", { status: "In Review", labels: ["a", "b"] }) });
+    expect(spec.resumeOnRespawn).toBe(false);
+    expect(spec.resumeContextCutoff).toBe(5000);
+    expect(spec.ticketStatus).toBe("In Review");
+    expect(spec.ticketLabels).toEqual(["a", "b"]);
+
+    const [plainRule] = rules({ id: "plain2", query: "q" });
+    const plainSpec = specForMatch({ agentKey: "jira-work:plain2:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") });
+    expect(plainSpec).not.toHaveProperty("resumeOnRespawn");
+    expect(plainSpec).not.toHaveProperty("resumeContextCutoff");
+    expect(plainSpec.ticketStatus).toBe("In Progress"); // issue()'s own default
+    expect(plainSpec.ticketLabels).toEqual([]);
   });
 });
 

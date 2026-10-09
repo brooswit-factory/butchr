@@ -31,6 +31,9 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     lizardMode: null,
     resumeOnRespawn: null,
     resumeContextCutoff: null,
+    idlePokeMinutes: null,
+    idlePokeMessage: null,
+    idlePokeEnabled: true,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -151,6 +154,52 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     await waitFor(async () => {
       const after = await api.listRules();
       expect(after.rules.find((r) => r.id === "epics")!.permissionMode).toBe("bypassPermissions");
+    });
+  });
+
+  // FACTORY-846 (review round 1): no confirm needed (CONFIG SURFACE ONLY,
+  // never risky) — unlike the permissionMode test above.
+  test("editing idlePokeMinutes/idlePokeMessage/idlePokeEnabled saves without a confirm step", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+    const { findByTestId, getByRole } = render(
+      <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+    );
+    const minutesInput = (await findByTestId("rule-edit-idle-poke-minutes-input")) as HTMLInputElement;
+    const messageInput = (await findByTestId("rule-edit-idle-poke-message-input")) as HTMLInputElement;
+    expect(minutesInput.value).toBe("");
+    expect(messageInput.value).toBe("");
+    fireEvent.input(minutesInput, { target: { value: "45" } });
+    fireEvent.input(messageInput, { target: { value: "go check your ticket" } });
+    const toggle = await findByTestId("rule-edit-idle-poke-enabled-toggle");
+    fireEvent.click(toggle.querySelector("input")!);
+    fireEvent.click(getByRole("button", { name: "Save" }));
+    await waitFor(async () => {
+      const after = await api.listRules();
+      const saved = after.rules.find((r) => r.id === "epics")!;
+      expect(saved.idlePokeMinutes).toBe(45);
+      expect(saved.idlePokeMessage).toBe("go check your ticket");
+      expect(saved.idlePokeEnabled).toBe(false);
+    });
+  });
+
+  // FACTORY-846 (review round 1): an UNTOUCHED, empty (null-backed) idle-poke
+  // field must never be sent on save — the exact "saving pins a seeded
+  // value" defect the review flagged. Here only idlePokeEnabled changes, so
+  // idlePokeMinutes/idlePokeMessage must stay null (not get pinned to "").
+  test("saving only idlePokeEnabled leaves idlePokeMinutes/idlePokeMessage null — an untouched empty field is never sent", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+    const { findByTestId, getByRole } = render(
+      <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+    );
+    const toggle = await findByTestId("rule-edit-idle-poke-enabled-toggle");
+    fireEvent.click(toggle.querySelector("input")!);
+    fireEvent.click(getByRole("button", { name: "Save" }));
+    await waitFor(async () => {
+      const after = await api.listRules();
+      const saved = after.rules.find((r) => r.id === "epics")!;
+      expect(saved.idlePokeEnabled).toBe(false);
+      expect(saved.idlePokeMinutes).toBeNull();
+      expect(saved.idlePokeMessage).toBeNull();
     });
   });
 

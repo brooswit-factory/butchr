@@ -124,6 +124,26 @@ export function appendRule(currentText: string | undefined, newRule: Record<stri
 }
 
 /**
+ * FACTORY-731 — `DELETE /api/rules/:id`'s own next-document builder:
+ * removes rule `id` from the `rules` array entirely and returns the whole
+ * document's text, same `JSON.stringify(doc, null, 2) + "\n"` shape
+ * `applyRuleFieldPatch` produces (never a text splice — contrast
+ * `write-rules.ts`'s own `setRuleEnabled`, which exists only to preserve a
+ * hand-edited file's exact byte formatting for a single-field flip; a
+ * removal changes the array's own shape regardless, so there is no
+ * "formatting preserved" property to protect here). Throws
+ * `RuleWriteApplyError` on a malformed current document or an unknown id —
+ * same mapping to 400 every other function in this module already gets.
+ */
+export function removeRuleById(currentText: string | undefined, id: string): string {
+  const { doc, rules } = parseRulesDoc(currentText);
+  const idx = findRuleIndex(rules, id);
+  if (idx === -1) throw new RuleWriteApplyError(`no rule with id ${JSON.stringify(id)}`);
+  rules.splice(idx, 1);
+  return JSON.stringify(doc, null, 2) + "\n";
+}
+
+/**
  * Applies `patch` to rule `id` in `currentText`, returning the whole next
  * document's text. Throws `RuleWriteApplyError` (never a generic `Error`,
  * so callers can map it to a 400 without guessing) on: malformed current
@@ -143,6 +163,9 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
   if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
   if (patch.role !== undefined) next.role = patch.role;
+  if (patch.idlePokeMinutes !== undefined) next.idlePokeMinutes = patch.idlePokeMinutes;
+  if (patch.idlePokeMessage !== undefined) next.idlePokeMessage = patch.idlePokeMessage;
+  if (patch.idlePokeEnabled !== undefined) next.idlePokeEnabled = patch.idlePokeEnabled;
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {
