@@ -191,6 +191,46 @@ export interface QueryAgentInventory {
 const ruleCorrelationKey = (resourceProvider: ResourceProvider, ruleId: string): string => `${resourceProvider}:${ruleId}`;
 
 /**
+ * FACTORY-731 — `DELETE /api/rules/:id`'s own "does this rule currently have
+ * a live agent" check: whether `rows` (the SAME poll-fed `DashboardResponse.
+ * rows` every staffing check in this module already reads — see this
+ * module's own top comment) carries at least one row for `ruleId`, decoded
+ * via `decodeAnyAgentKey` (`../rules/agent-key.ts`), that is NOT a withheld
+ * row. A rule id is validated unique across the whole rules document at load
+ * time (`rules.ts`'s own duplicate-id check), so matching on `ruleId` alone
+ * (never pairing it with `resourceProvider`, unlike `ruleCorrelationKey`
+ * above) is unambiguous here — this call site does not have a `Rule` object
+ * in hand to read `resourceProvider` off of, only the bare id a `DELETE`
+ * path segment names.
+ *
+ * KNOWN RACE, DELIBERATELY ACCEPTED, NEVER PAPERED OVER: `rows` is a
+ * SNAPSHOT from the daemon's own periodic poll (`createDashboardFeed`), not
+ * a live, real-time query — so this can be WRONG in both directions between
+ * polls. A false POSITIVE (an agent that finished seconds ago still shows as
+ * live) only makes a delete attempt bounce and need a retry — annoying, not
+ * unsafe. A false NEGATIVE (an agent spawned since the last poll is not yet
+ * in `rows`) is the dangerous direction: it could let a delete through while
+ * an agent is, in fact, about to start running against the just-deleted
+ * rule's id. This check narrows that window to one poll interval; it cannot
+ * close it to zero without a synchronous, on-demand census this daemon does
+ * not have today. The write path's own `enabled === false` requirement
+ * (checked separately, inside the write lock) is the deeper mitigation: a
+ * rule has to be disabled before it can be deleted, and a disabled rule's
+ * running agents are stopped by the reconciler's own ordinary stop/reap path
+ * on an upcoming poll (same as any other disable) — the live-agent check
+ * here exists to catch the WINDOW between "just disabled" and "the
+ * reconciler has actually reaped it", not to replace that path.
+ */
+export function ruleHasLiveAgent(ruleId: string, rows: readonly DashboardRow[]): boolean {
+  for (const row of rows) {
+    if (row.kind === "withheld") continue;
+    const decoded = decodeAnyAgentKey(row.resourceKey);
+    if (decoded && decoded.ruleId === ruleId) return true;
+  }
+  return false;
+}
+
+/**
  * Every rule key (`resourceProvider:ruleId`) with at least one row in `rows`
  * — split into `live` (an ordinary `AgentDashboardRow`: a real running agent)
  * and `withheld` (a `WithheldDashboardRow`: matched but held back by the

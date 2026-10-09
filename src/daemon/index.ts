@@ -112,7 +112,7 @@ import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
-import { buildQueryAgentInventory } from "../agents/query-agent-inventory.js";
+import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
@@ -136,7 +136,7 @@ import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { readUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
@@ -1230,6 +1230,12 @@ const { app, mcp } = buildApp({
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
     plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+    // FACTORY-731: `hasLiveAgents` reads the SAME poll-fed
+    // `dashboardFeed.snapshot().rows` every other "is this rule staffed"
+    // check in this daemon already reads (`ruleHasLiveAgent`'s own doc
+    // comment, `../agents/query-agent-inventory.ts`, names the exact race
+    // this accepts) — never a fresh census of its own.
+    delete: (id, ifMatch, confirm) => writeRuleDelete(id, ifMatch, confirm, (ruleId) => ruleHasLiveAgent(ruleId, dashboardFeed.snapshot().rows), rulesWriteDeps),
   },
   auditWrite,
   writeRateLimit,
