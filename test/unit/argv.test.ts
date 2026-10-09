@@ -245,6 +245,17 @@ describe("FACTORY-892: control-character pre-flight guard", () => {
     }
   });
 
+  // FACTORY-940: briefs/_before-you-stop.md starts with a Markdown `##`
+  // heading; flattening to one line must strip that marker rather than just
+  // collapsing the newlines around it, or the kickoff reads literally as
+  // "follow your CLAUDE.md. ## Before you stop or go idle Before you stop …".
+  test("FACTORY-940: KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT never carry a leading Markdown heading marker from the shared section", () => {
+    for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      expect(prompt).not.toContain("##");
+      expect(prompt).not.toMatch(/(^|\s)#{1,6}\s/);
+    }
+  });
+
   // The latent case FACTORY-891's review flagged: kickoffFor's second
   // branch (spec.cwd + spec.brief) builds its own prompt string, independent
   // of the two KICKOFF_PROMPT constants above, and must flatten/guard it too.
