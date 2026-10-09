@@ -80,6 +80,37 @@ describe("createRulesPreviewer", () => {
     if (r.ok) expect(r.keys).toEqual(["IDEA-1"]);
   });
 
+  // FACTORY-730 (ticket item 3): the edit dialog's own "what would this
+  // CHANGED query match" dry-run, before that query is ever saved — dry-runs
+  // the rule with `queryOverride` substituted for its own stored `query`,
+  // never the rule's saved query, and never persists anything.
+  test("FACTORY-730: queryOverride dry-runs a DIFFERENT (not-yet-saved) query, never the rule's own stored query", async () => {
+    let seenJql: string | undefined;
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ query: "project = OLD" })],
+      search: async (jql) => {
+        seenJql = jql;
+        return jql === "project = NEW" ? [issue("F-1"), issue("F-2")] : [issue("F-0")];
+      },
+      maxAgents: 5,
+    });
+    const r = await preview("triage", "project = NEW");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.total).toBe(2);
+    expect(seenJql).toBe("project = NEW");
+  });
+
+  test("FACTORY-730: a disabled rule's draft query still dry-runs as if enabled (same B5c discipline as the no-override case)", async () => {
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ enabled: false, query: "project = OLD" })],
+      search: async () => [issue("F-1")],
+      maxAgents: 5,
+    });
+    const r = await preview("triage", "project = NEW");
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.total).toBe(1);
+  });
+
   test("rate limited: a second call within rateLimitMs for the SAME rule is refused (429), without calling search again", async () => {
     let calls = 0;
     let now = 0;

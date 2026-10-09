@@ -122,6 +122,45 @@ describe("listSessionDefinitions — everything, not just the eligible subset", 
     expect(entries.map((e) => e.name)).toEqual(["good.json"]);
   });
 
+  test("FACTORY-755: a byte-identical *.json.bak-* backup is never listed, even though it is a byte-identical valid manifest — only the real .json is", async () => {
+    const body = JSON.stringify(goodDef());
+    const { list, read } = fakeFiles({
+      [absPath("defs", "admin-agentsafety.json")]: body,
+      [absPath("defs", "admin-agentsafety.json.bak-1008")]: body,
+    });
+    const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store: fakeStore() });
+    expect(entries.map((e) => e.name)).toEqual(["admin-agentsafety.json"]);
+  });
+
+  test("FACTORY-755: a plain non-definition file (notes.txt) is never listed", async () => {
+    const { list, read } = fakeFiles({
+      [absPath("defs", "notes.txt")]: "just some notes",
+      [absPath("defs", "good.json")]: JSON.stringify(goodDef()),
+    });
+    const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store: fakeStore() });
+    expect(entries.map((e) => e.name)).toEqual(["good.json"]);
+  });
+
+  test("FACTORY-755: a genuinely malformed .json file is STILL listed as invalid — the new filter only excludes non-.json basenames, never a bad .json", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", "broken.json")]: "{not json" });
+    const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store: fakeStore() });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.name).toBe("broken.json");
+    expect(entries[0]!.valid).toBe(false);
+  });
+
+  test("FACTORY-755: uppercase .JSON is NOT accepted (case-sensitive extension match, decided+pinned here) — never listed", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", "weird.JSON")]: JSON.stringify(goodDef()) });
+    const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store: fakeStore() });
+    expect(entries).toEqual([]);
+  });
+
+  test("FACTORY-755: a bare basename of literally \".json\" is dot-prefixed, so it hits the hidden-file gate first, not the new extension filter — never listed", async () => {
+    const { list, read } = fakeFiles({ [absPath("defs", ".json")]: JSON.stringify(goodDef()) });
+    const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store: fakeStore() });
+    expect(entries).toEqual([]);
+  });
+
   test("a mix of valid, invalid and frozen definitions all appear, none hidden", async () => {
     const { list, read } = fakeFiles({
       [absPath("defs", "good.json")]: JSON.stringify(goodDef()),

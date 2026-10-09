@@ -569,3 +569,34 @@ export function sessionDefinitionsPath(env: SessionDefinitionsEnv = process.env)
 export function isHiddenDefinitionFile(basename: string): boolean {
   return basename.startsWith(".");
 }
+
+/**
+ * FACTORY-755 — positive allowlist: a candidate is a definition file only
+ * when its basename ends in exactly `.json`. Before this, eligibility was
+ * decided purely by CONTENT (`parseSessionDefinitionFile` either parses or
+ * it doesn't), so a byte-identical `*.json.bak-*` copy of a real manifest
+ * parsed as valid and got its OWN agent key (derived from its own path),
+ * staffing a duplicate agent unrelated to the real definition's identity or
+ * freeze state — seen live as `admin-agentsafety.json.bak-1008` spawning a
+ * duplicate pane. A denylist of known backup suffixes (`.bak`, `~`, `.orig`,
+ * ...) would only ever cover suffixes someone thought to list; the allowlist
+ * instead makes `.json` the one shape that is ever a candidate at all.
+ *
+ * Case-sensitive, deliberately: `.JSON` does NOT match. The alternative
+ * (case-insensitive matching, e.g. to mirror a case-insensitive filesystem)
+ * would make eligibility depend on which OS/filesystem the daemon happens to
+ * run on for the exact same file content — this keeps it deterministic
+ * everywhere, at the cost of never staffing a real `.JSON`-suffixed
+ * manifest (which — being equally skipped and logged, never silently
+ * dropped, via `onceSkippedNonDefinitionFile` — is at worst a visible
+ * surprise, not a silent one).
+ *
+ * Checked SEPARATELY from, and always AFTER, `isHiddenDefinitionFile` at
+ * every call site — never folded into it, never replacing it. A dot-prefixed
+ * basename (even one literally named `.json`) is caught by the hidden-file
+ * gate FIRST and takes that silent, never-logged path; this function is only
+ * ever reached for a basename that already cleared the hidden-file check.
+ */
+export function isDefinitionJsonFile(basename: string): boolean {
+  return basename.endsWith(".json");
+}

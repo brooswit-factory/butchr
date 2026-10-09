@@ -36,8 +36,15 @@
  * event-triggered answer and the periodic sweep both funnel through the
  * exact same `runPermissionAnswerTick` call and the exact same `inFlight`
  * flag `startPermissionAnswerLoop` already uses for the sweep-only case —
- * they can never run concurrently against the same pane set. A `fire()`
- * that arrives while a tick is already running does NOT drop the request:
+ * they can never run concurrently against the same pane set. This
+ * invariant also holds across a watchdog-forced restart (FACTORY-776): the
+ * watchdog's own recovery bumps a tick-generation counter before clearing
+ * `inFlight` and firing a fresh tick, so a wedged tick's eventual, late
+ * `.finally()` — which `fire()`'s own closure captured BEFORE the
+ * watchdog ever ran — sees it has been superseded and becomes a no-op
+ * instead of clearing `inFlight` out from under whatever tick the
+ * watchdog already started; see `fire()`'s own comment for the mechanics.
+ * A `fire()` that arrives while a tick is already running does NOT drop the request:
  * it sets a `pending` flag, and the in-flight tick's own completion runs
  * exactly one more tick before going idle. This matters for the exact case
  * this ticket exists for — a tool-heavy agent whose OWN next tool call goes
@@ -99,15 +106,33 @@ export interface PermissionAnswerWatchDeps extends PermissionAnswerLoopDeps {
    * UNCONSUMED this long means no tick has scanned it since — the exact
    * "a never-settling herdr await stalls everything that serializes on it"
    * shape the wedge incident this ticket closes was named for, independent
-   * of whatever root cause produced it this time. `runPermissionAnswerTick`
-   * deletes a pane's entry on every tick that scans it (answered, skipped,
-   * or failed — see `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc
-   * comment), so a surviving entry past this threshold is unambiguous: the
-   * tick itself has not run, not merely that one pane's own attempt failed.
-   * Default 5 minutes (the incident's own evidence: FACTORY-722's wedge
-   * journal measured panes blocked for tens of minutes before anyone
-   * noticed). `0` disables the watchdog entirely (tests that don't want its
-   * timer running).
+   * of whatever root cause produced it this time. FACTORY-776 fixed the
+   * two paths that used to strand an entry forever despite a perfectly
+   * healthy tick loop: `runPermissionAnswerTick` now reaps a pane's entry
+   * as soon as it is no longer in the current eligible set (covers both an
+   * empty eligible set and a pane that simply left it), and otherwise
+   * deletes it on every tick that scans it (answered, skipped, or failed —
+   * see `PermissionAnswerLoopDeps.fastPathTriggers`'s own doc comment).
+   * This comment used to claim NEITHER of those could ever happen; false,
+   * now fixed.
+   *
+   * One path is DELIBERATELY NOT covered by that in-tick reap, and still
+   * relies on THIS watchdog: a rejecting `agent.list()` call (a deadline,
+   * not a hang) skips the reap and the consumption loop alike, since both
+   * sit after the `await` that rejected — the tick never even learns an
+   * eligible set to reap against. So a surviving entry past this threshold
+   * means one of two things: a genuinely wedged tick (never reaches its
+   * own `agent.list()`-returning scan at all — the hang this watchdog was
+   * built for), OR a tick whose `agent.list()` keeps rejecting (settles
+   * quickly, but with nothing to reap against). Either way, this watchdog
+   * firing and clearing the entry is what bounds it: one trip for the
+   * reject case (not unbounded re-tripping, since the trip itself clears
+   * the entry this timer fired on), indefinite re-tripping only for a
+   * genuinely wedged tick that never recovers on its own. Default 5
+   * minutes (the incident's own evidence: FACTORY-722's wedge journal
+   * measured panes blocked for tens of minutes before anyone noticed). `0`
+   * disables the watchdog entirely (tests that don't want its timer
+   * running).
    */
   watchdogThresholdMs?: number;
   /** How often the watchdog above checks. Default 30s — far below `watchdogThresholdMs`, so a trip is noticed promptly once the threshold passes, without re-checking so often it costs anything measurable. */
@@ -162,6 +187,16 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
   // already-superseded pane-id set (or after stop()) never acts on frames it
   // reads, and never schedules its own reconnect.
   let generation = 0;
+  // FACTORY-776 (b): a SEPARATE counter from `generation` above — that one
+  // tracks subscription identity (bumped on every resubscribe, which the
+  // ordinary eligible-pane-set churn triggers often and which has nothing to
+  // do with tick identity); this one tracks which `fire()` call's tick is
+  // the current one, bumped only when a NEW tick actually starts (inside
+  // `fire()`) or when the watchdog forces a reset. Reusing `generation`
+  // would make every ordinary resubscribe also invalidate an in-flight
+  // tick's own `.finally()` — wrong, since a resubscribe alone never means
+  // the tick itself was superseded.
+  let tickGeneration = 0;
 
   // FACTORY-145: `pane_id -> the monotonic instant its own `blocked` push
   // frame was received`, consumed (deleted) by `runPermissionAnswerTick`
@@ -187,7 +222,16 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
     if (stopped) return;
     if (inFlight) { pending = true; return; }
     inFlight = true;
+    const myTickGeneration = ++tickGeneration;
     void runPermissionAnswerTick(tickDeps).finally(() => {
+      // FACTORY-776 (b): if the watchdog force-reset `tickGeneration` while
+      // this tick was still in flight, a LATER tick is already running (or
+      // about to) under a newer generation — this `.finally()` belongs to a
+      // superseded tick and must not touch `inFlight`/`pending` at all,
+      // or it would clear the flag out from under that later tick and let
+      // a third one start concurrently with it (the exact bug this guard
+      // exists to close).
+      if (myTickGeneration !== tickGeneration) return;
       inFlight = false;
       if (pending && !stopped) { pending = false; fire(); }
     });
@@ -268,6 +312,21 @@ export function startPermissionAnswerWatch(deps: PermissionAnswerWatchDeps, inte
       if (stuck.length === 0) return;
       log(`[watchdog] restarted permission-answer — ${stuck.length} pane(s) blocked with a push trigger unconsumed for over ${Math.round(watchdogThresholdMs / 1000)}s: ${stuck.join(", ")}`);
       try { deps.onWatchdogTripped?.(stuck); } catch { /* never allowed to affect recovery below */ }
+      // FACTORY-776 (a): clear exactly the entries this trip fired on. A
+      // trip means no tick has reached its own scan of that pane in over
+      // `watchdogThresholdMs` (see `watchdogThresholdMs`'s own doc comment)
+      // — leaving the entry in place would just re-trip every
+      // `watchdogCheckIntervalMs` forever even once a fresh tick below gets
+      // the loop healthy again, since nothing else ever revisits an entry
+      // for a pane outside what that NEW tick's own eligible set happens to
+      // be yet.
+      for (const id of stuck) fastPathTriggers.delete(id);
+      // FACTORY-776 (b): bump `tickGeneration` BEFORE clearing `inFlight` —
+      // this makes the wedged tick's own eventual `.finally()` (captured
+      // against the OLD generation) a no-op when it finally settles, so it
+      // can never clear `inFlight` out from under the fresh tick `fire()`
+      // starts below. See `fire()`'s own comment for the full mechanics.
+      tickGeneration++;
       // Force recovery rather than merely reporting: a tick that has not
       // consumed a trigger in this long is not merely slow (the client-side
       // deadlines elsewhere in this ticket's fix bound every herdr call this

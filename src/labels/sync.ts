@@ -3,6 +3,7 @@ import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isActiveStatusLabel, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 import type { StallRemediator } from "../agents/stall-remediation.js";
+import type { SilentStopCheck } from "../agents/silent-stop.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
 
 export interface LabelWriter {
@@ -39,6 +40,14 @@ export interface SyncDeps {
    * ledger hazard that module documents in full.
    */
   stallRemediation?: StallRemediator;
+  /**
+   * FACTORY-740: the "would flag" dry-run detector — logs ONLY, never a
+   * Jira write of any kind (no comment/label/transition/escalation/wake),
+   * same disables-entirely-when-omitted shape as `stalled`/`stallRemediation`
+   * above. See src/agents/silent-stop.ts's own top comment for why this is
+   * checked unconditionally, every poll, for every active issue.
+   */
+  silentStop?: SilentStopCheck;
   /**
    * BUTCHR-352: THIS poll's admission census for the withheld set
    * (src/agents/admission.ts's `AdmissionController.census()`) — either the
@@ -173,13 +182,38 @@ export function createLabelSync(deps: SyncDeps) {
     for (const issue of issues) {
       let agentStatus: string | null;
       let stalled = false;
+      // KAN-824: epics never have a branch, so a search for one can only ever
+      // miss — skip the call entirely rather than let it burn a GitHub
+      // search. Computed here (ahead of the active/inactive branch below,
+      // not after it as before FACTORY-740) so `silentStop`'s dry-run log
+      // line can cite the SAME lookup for context — never a second search.
+      // `prTrackingApplies` is kept SEPARATE from `prState` itself: `prState`
+      // stays `null` whenever tracking doesn't apply here (unchanged from
+      // before FACTORY-740 — desiredLabels' own `null` vs `"unknown"`
+      // distinction below must not shift), but `silentStop`'s `prOpen`
+      // context needs a THIRD distinction `PrLookup` doesn't carry: "tracking
+      // doesn't apply/isn't configured at all" (genuinely unknown, logged as
+      // such) versus "tracking applies and confirmed there's no PR" (a real
+      // `false`) — collapsing those into the same `null` would silently
+      // mislabel every PR-less or non-PR-capable ticket's dry-run line as
+      // "pr open=no" instead of "unknown".
+      const prTrackingApplies = !!deps.prState && canHavePr(issue.issuetype);
+      const prState = prTrackingApplies ? await deps.prState!(issue.key) : null;
       if (!isActive(issue.status)) {
         stabilizer.clear(issue.key);
         deps.stalled?.forget(issue.key);
         deps.stallRemediation?.forget(issue.key);
+        deps.silentStop?.forget(issue.key);
         agentStatus = null;
       } else {
         const observed = mapAgentStatus(agents.get(issue.key) ?? null);
+        // FACTORY-740: dry-run only, logs-only, never gates anything below —
+        // see src/agents/silent-stop.ts's own top comment. Always observed
+        // (same "every poll, not just the interesting ones" discipline
+        // `deps.stalled` uses just below), so its own dedup/suppression
+        // bookkeeping sees every transition.
+        const prOpen = !prTrackingApplies || prState === "unknown" ? undefined : prState === "open" || prState === "approved" || prState === "changes-requested";
+        await deps.silentStop?.check(issue.key, observed, { ...(prOpen !== undefined ? { prOpen } : {}) });
         // Always observed (even when not idle), so the tracker's "since
         // spawn, continuously idle" streak sees every poll, not just the
         // ones where the result might matter.
@@ -264,9 +298,6 @@ export function createLabelSync(deps: SyncDeps) {
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
         await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
       }
-      // KAN-824: epics never have a branch, so a search for one can only ever
-      // miss — skip the call entirely rather than let it burn a GitHub search.
-      const prState = deps.prState && canHavePr(issue.issuetype) ? await deps.prState(issue.key) : null;
       const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
       const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
       const ok = await write(written, issue.key, issue.labels, desired);
@@ -278,6 +309,7 @@ export function createLabelSync(deps: SyncDeps) {
       stabilizer.clear(key);
       deps.stalled?.forget(key);
       deps.stallRemediation?.forget(key);
+      deps.silentStop?.forget(key);
       const current = lastLabels.get(key)!;
       // BUTCHR-352: admission:* is lifecycle-bound to active status the same
       // way agent:* is — see isActiveStatusLabel's own doc comment — so both

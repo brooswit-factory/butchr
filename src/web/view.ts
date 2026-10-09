@@ -18,6 +18,7 @@ import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type Writ
 import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
+import type { RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
@@ -223,12 +224,23 @@ export interface ViewDeps {
    */
   rulesFileState?: () => Promise<RulesFileState & { mtime: string | null; fileEtag: string }>;
   /**
+   * FACTORY-729: `GET /api/rules/catalog`'s own data — the rule form's
+   * harness/model/effort/permission-mode catalog (`../rules/rule-form-
+   * catalog.js`'s `RULE_FORM_CATALOG`), pure constants with no I/O, behind
+   * the SAME dashboard-origin + same-UID peer guard as `GET /api/rules`
+   * above (this ticket's own instruction) — never a looser check just
+   * because this route happens to do no disk/network I/O of its own.
+   * Optional, same "absent means disabled" discipline as every other guard
+   * dep in this file.
+   */
+  rulesCatalog?: () => readonly RuleFormCatalogEntry[];
+  /**
    * FACTORY-660: `GET /api/rules/:id/preview`'s own dry-run
    * (`./rules-preview.ts`'s `createRulesPreviewer`, built once by the
    * caller so its per-rule rate-limit state persists across requests —
    * never rebuilt per request here).
    */
-  rulesPreview?: (id: string) => Promise<RulesPreviewResult>;
+  rulesPreview?: (id: string, queryOverride?: string) => Promise<RulesPreviewResult>;
   /**
    * FACTORY-662 — this process's one CSRF token issuer (`./csrf.ts`),
    * handed out by `GET /api/session` and checked by every write route's
@@ -248,13 +260,14 @@ export interface ViewDeps {
   writeGuard?: WriteGuardDeps;
   /**
    * FACTORY-662 — the rules write orchestration (`../rules/rules-write.ts`).
-   * One function per route; each already does its own ui-prefix/etag/
-   * placeholder/allowlist checks and returns a tagged outcome this file
-   * maps straight to a status + body, never re-deciding anything here.
+   * One function per route; each already does its own etag/placeholder/
+   * allowlist checks (FACTORY-730: the route-level `ui-`-prefix check is
+   * retired) and returns a tagged outcome this file maps straight to a
+   * status + body, never re-deciding anything here.
    */
   rulesWrite?: {
     enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
-    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => RulesWriteOutcome;
+    fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
   };
@@ -421,6 +434,33 @@ function jiraRateGate(deps: ViewDeps, clientKey: string): RateGate {
     if (write && !write.ok) return { ok: false, error: `rate limited: too many token writes this hour — retry after ${write.retryAfterSeconds}s`, retryAfterSeconds: write.retryAfterSeconds };
     return { ok: true };
   };
+}
+
+/**
+ * FACTORY-729 — one audit line per CHANGED field, old -> new, for `PUT
+ * /api/rules/:id` (the ticket's own instruction). `current` is this
+ * daemon's own already-loaded rule (`deps.getRules()`, no second read) —
+ * `undefined` only when that dep is absent or the id is unknown, in which
+ * case a field's "old" value reads as `null` rather than failing the audit
+ * line entirely (this is a best-effort annotation on top of an outcome the
+ * route already computed; it must never block or alter that outcome).
+ */
+function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch): string {
+  const parts: string[] = [];
+  const show = (v: unknown): string => JSON.stringify(v === undefined ? null : v);
+  if (patch.query !== undefined) parts.push(`query: ${show(current?.query)} -> ${show(patch.query)}`);
+  if (patch.permissionMode !== undefined) parts.push(`permissionMode: ${show(current?.permissionMode)} -> ${show(patch.permissionMode)}`);
+  if (patch.lizardMode !== undefined) parts.push(`lizardMode: ${show(current?.lizardMode)} -> ${show(patch.lizardMode)}`);
+  if (patch.agentPreferences !== undefined) {
+    patch.agentPreferences.forEach((p, i) => {
+      const cur = current?.agentPreferences?.[i] as Record<string, unknown> | undefined;
+      for (const leaf of ["harness", "model", "effort", "modelPower", "effortPower"] as const) {
+        const v = (p as Record<string, unknown>)[leaf];
+        if (v !== undefined) parts.push(`agentPreferences[${i}].${leaf}: ${show(cur?.[leaf])} -> ${show(v)}`);
+      }
+    });
+  }
+  return parts.length ? parts.join("; ") : "edit";
 }
 
 function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null }, outcome: { ok: boolean; error?: string }): void {
@@ -698,6 +738,24 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const response: RulesApiResponse = buildRulesApiResponse({ rulesFile, mtime: rulesFile.mtime, sourceEtag, fileEtag: rulesFile.fileEtag, ruleInventory: inventory.rules });
       return response;
     })
+    // FACTORY-729 — the rule form's own catalog: one entry per harness
+    // naming the shipped models/efforts/permission-modes the UI's
+    // provider/model/effort/mode dropdowns and lizard-mode toggle should
+    // offer, plus whether a custom model id is allowed. Pure constants, no
+    // I/O at all — still behind the SAME dashboard-origin + same-UID peer
+    // guard `GET /api/rules` uses (this ticket's own instruction), never a
+    // looser check just because there's nothing to protect on disk here.
+    .get("/api/rules/catalog", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.rulesCatalog) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return { harnesses: deps.rulesCatalog() };
+    })
     // FACTORY-660 — the rules page's read-only dry-run preview. A GET that
     // DOES do outbound Jira reads (SPEC CHANGE (b): counts and ticket keys
     // only, never Jira's own error body), so it carries BOTH guards: the
@@ -707,7 +765,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // `params.id` is caller-controlled URL-encoded text — a malformed `%`
     // escape makes `decodeURIComponent` THROW, which must become a 400 JSON
     // error, never an uncaught 500.
-    .get("/api/rules/:id/preview", async ({ params, request, server, set }) => {
+    .get("/api/rules/:id/preview", async ({ params, query, request, server, set }) => {
       if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
@@ -723,7 +781,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         return { error: "malformed rule id" };
       }
       set.headers["cache-control"] = "no-store";
-      const result = await deps.rulesPreview(id);
+      // FACTORY-730 — `?query=`: the edit dialog's own draft-query dry-run,
+      // never persisted and never the rule's own stored query (`deps.rulesPreview`
+      // reads that fresh on every call regardless of this override).
+      const queryOverride = typeof query?.query === "string" ? query.query : undefined;
+      const result = await deps.rulesPreview(id, queryOverride);
       if (!result.ok) { set.status = result.status; return { error: result.error }; }
       const { ok, ...body } = result;
       return body;
@@ -924,8 +986,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
         return { error: parsed.error };
       }
       const confirm = b.confirm === true;
-      const outcome = deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
-      auditOutcome(deps, { route: "PUT /api/rules/:id", action: `edit ${Object.keys(parsed.patch).join(",")}`, ids: [id], origin: request.headers.get("origin") }, outcome);
+      // Read BEFORE the write (which reloads the live holder in place on
+      // success, `rulesWriteDeps.reload`, `../daemon/index.ts`) — the diff
+      // summary's "old" side must be the PRE-write value, never the
+      // just-written one a read taken after would see.
+      const ruleBeforeWrite = deps.getRules?.()?.find((r) => r.id === id);
+      const outcome = await deps.rulesWrite.fields(id, parsed.patch, b.ifMatch, confirm, b.planHash);
+      auditOutcome(deps, { route: "PUT /api/rules/:id", action: buildFieldDiffSummary(ruleBeforeWrite, parsed.patch), ids: [id], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })

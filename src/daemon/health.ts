@@ -211,6 +211,42 @@ export interface HealthStatus {
    * fixture in this file's own test suite, unaffected by this addition).
    */
   dashboardApp?: { built: boolean; path: string };
+  /**
+   * FACTORY-772: per-loop restart history recorded by the issue-loop
+   * watchdog (src/daemon/loop-watchdog.ts) — an EIGHTH sibling, same
+   * "additive, never flips `ok`" reasoning as every sibling above: a
+   * restart already having happened is reported here for an operator to
+   * SEE, but `ok` must keep meaning only "is a loop currently fresh" —
+   * folding a past restart into that AND would make a daemon that has
+   * already self-healed read as unhealthy forever, which is backwards (the
+   * whole point of the watchdog is that it fixes the problem, not merely
+   * flags it). This is the surface that answers "did this restart silently
+   * and come back, with no trace?" — the failure mode `ComponentHealth`'s
+   * `state` flipping from `"stale"` back to `"ok"` on its own cannot answer,
+   * since a bare `"ok"` looks identical whether the loop was always healthy
+   * or was just force-restarted a moment ago. ABSENT (no key at all), never
+   * an empty array, when no watchdog is wired in (e.g. every existing test
+   * fixture in this file's own test suite, unaffected by this addition).
+   */
+  loopWatchdog?: LoopWatchdogReport[];
+}
+
+/**
+ * FACTORY-772: one named loop's restart history, as tracked by
+ * `createLoopWatchdog` (src/daemon/loop-watchdog.ts). `restartCount` and
+ * `lastRestartAt` are watchdog-forced restarts ONLY — an ordinary successful
+ * poll never touches either field, so a reader can tell "healthy the whole
+ * time" (`restartCount` 0) apart from "healthy again, but only because the
+ * watchdog intervened" (`restartCount` > 0) — the exact distinction a bare
+ * `ComponentHealth.state` of `"ok"` cannot make on its own.
+ */
+export interface LoopWatchdogReport {
+  /** The `ComponentHealth.name` this restart history is for (e.g. "pollLoop", "notify"). */
+  name: string;
+  /** How many times the watchdog has forced a restart of this loop since the daemon started. */
+  restartCount: number;
+  /** ISO timestamp of the most recent watchdog-forced restart, or null if it has never fired. */
+  lastRestartAt: string | null;
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -275,6 +311,7 @@ export const combineHealth = (
   credentialDeathAlert?: CredentialDeathAlert,
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
   dashboardApp?: { built: boolean; path: string },
+  loopWatchdog?: readonly LoopWatchdogReport[],
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -292,6 +329,7 @@ export const combineHealth = (
       ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
       : {}),
     ...(dashboardApp ? { dashboardApp } : {}),
+    ...(loopWatchdog && loopWatchdog.length ? { loopWatchdog: [...loopWatchdog] } : {}),
   };
 };
 
@@ -348,6 +386,81 @@ export function createLoopHealth(opts: LoopHealthOptions): LoopHealth {
     stop() {
       clearInterval(timer);
     },
+  };
+}
+
+/**
+ * FACTORY-752 (FACTORY-746 (c)): a liveness component — same `components[]`
+ * AND-gating contract as `createLoopHealth` — that ALSO distinguishes a tick
+ * that REJECTED from one that simply completed with nothing to do.
+ *
+ * EXPLICIT DESIGN DECISION (argued here, restated in the PR description):
+ * this rides in `components[]`, NOT in the `resourceLoops[]` sibling array
+ * `createResourceLoopHealth` already feeds. `createResourceLoopHealth`
+ * tracks the identical recordSuccess/recordError pair, but its own doc
+ * comment on `HealthStatus.resourceLoops` explains why THOSE stay siblings:
+ * a GitHub/Jira/Zendesk poll failing is an EXTERNAL degradation, already
+ * logged, that a daemon restart cannot fix — folding it into `ok` would
+ * make an uptime checker cry "restart me" for a condition restarting does
+ * nothing about. The permission-answer tick is a different case: FACTORY-746's
+ * 10-08 incident was precisely a LIVENESS blind spot of this daemon's own —
+ * a wedged in-process loop going unnoticed for ~50 minutes, the same class
+ * of failure `pollLoop`/`notify` already gate `ok` on. So this component
+ * asserts the permission-answer tick IS a liveness signal of the daemon,
+ * joining the AND, same as its two `components[]` siblings — not an
+ * external-degradation sibling like the resource loops.
+ *
+ * `recordSuccess()` must be called once per tick that COMPLETED, whether or
+ * not it found anything eligible — an idle tick is exactly the case this
+ * exists to make indistinguishable from "stale" only once it has genuinely
+ * been too long (`thresholdMs`), never on every idle pass. `recordError()`
+ * is called once per tick that REJECTED (e.g. the `agent.list()` failure
+ * path in `runPermissionAnswerTick`, src/agents/permission-answer-loop.ts) —
+ * it does NOT advance `lastSuccessAt`/`staleForMs` on its own (a run of
+ * rejections alone still goes stale on schedule, which is the point), it
+ * only records `lastErrorAt`/`consecutiveFailures` so a reader can tell "has
+ * not ticked in a while, and the last attempt rejected" apart from "has not
+ * ticked in a while, with no rejection ever logged" (the original incident's
+ * own silence: two rejections, THEN nothing at all — this field is what
+ * would have let a reader tell those two shapes of silence apart).
+ */
+export interface TickHealthReport extends ComponentHealth {
+  /** ISO timestamp of the most recent tick that REJECTED, or null if none ever has. */
+  lastErrorAt: string | null;
+  /** Ticks that have rejected since the last success (reset to 0 by `recordSuccess()`, same convention as `ResourceLoopReport.consecutiveFailures`). */
+  consecutiveFailures: number;
+}
+
+export interface TickHealth extends LoopHealth {
+  /** Call once per tick that rejected (e.g. a failed `agent.list()`) — distinct from, and never a substitute for, `recordSuccess()`. */
+  recordError(error: unknown): void;
+  status(): { ok: boolean; components: TickHealthReport[] };
+}
+
+export function createTickHealth(opts: LoopHealthOptions): TickHealth {
+  const heartbeat = createLoopHealth(opts);
+  const now = opts.now ?? Date.now;
+  let lastErrorAt: number | null = null;
+  let consecutiveFailures = 0;
+  return {
+    recordSuccess() {
+      consecutiveFailures = 0;
+      heartbeat.recordSuccess();
+    },
+    recordError(_error: unknown) {
+      consecutiveFailures++;
+      lastErrorAt = now();
+    },
+    status() {
+      const [component] = heartbeat.status().components;
+      const report: TickHealthReport = {
+        ...component!,
+        lastErrorAt: lastErrorAt === null ? null : new Date(lastErrorAt).toISOString(),
+        consecutiveFailures,
+      };
+      return { ok: report.ok, components: [report] };
+    },
+    stop: () => heartbeat.stop(),
   };
 }
 
