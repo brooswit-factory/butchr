@@ -13,6 +13,7 @@ import { isProjectId } from "../resources/id.js";
 import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 import { unwrapStorageParagraph } from "./speak.js";
 import { Refusal, withOutcomeRecording } from "./outcome.js";
+import { recordIntentionalStop } from "../agents/stop-cause.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -890,6 +891,13 @@ export function atlassianTools(
           return { ok: true, key: who, asleep: false, watching: keys, note: "stand_down is not available for this agent: you were NOT put to sleep and your session was NOT released. Stay in this session; changes to your ticket still reach you as messages." };
         }
         standDown(who, seen);
+        // FACTORY-849/FACTORY-852: recorded AFTER the in-memory sleep is
+        // declared, never before — same "don't claim a durable fact until
+        // the thing it describes actually happened" ordering as every
+        // other write in this handler. Best-effort, never throws (see
+        // `recordIntentionalStop`'s own doc comment); a filesystem problem
+        // here must not undo the sleep this call already put the caller in.
+        recordIntentionalStop(who, "stand_down");
         return { ok: true, key: who, asleep: true, watching: keys };
       },
     },
