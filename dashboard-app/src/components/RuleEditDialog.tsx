@@ -31,11 +31,12 @@ import { useEffect, useState } from "react";
 import { Button, Dialog, Modal, ModalOverlay, Switch } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
 // Imported from the LEAF module, never `../../../src/rules/rules.js` directly — see `FirstRuleSetup.tsx`'s own top comment for why a VALUE import from that module breaks the Vite client bundle.
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import {
   PLACEHOLDER_QUERY,
   RateLimitError,
   type RuleAgentPreferencePatch,
+  type RuleCapacityRolesCatalog,
   type RuleDto,
   type RuleFieldPatch,
   type RuleFormCatalogEntry,
@@ -84,16 +85,30 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   const [draftEffort, setDraftEffort] = useState<AgentEffort | "">(rule.agentPreferences[0]?.effort ?? "");
   const [draftPermissionMode, setDraftPermissionMode] = useState<RulePermissionMode | "">(rule.permissionMode ?? "");
   const [draftLizardMode, setDraftLizardMode] = useState(rule.lizardMode ?? false);
+  // FACTORY-856 (story FACTORY-756) — "Included in capacity": `rule.role` is
+  // never null on the wire (`Rule.role` defaults to `"worker"` at parse
+  // time), so — same as `FirstRuleSetup.tsx`'s own `draftRole` — the toggle
+  // always starts from the rule's own current, real value, no "butchr's
+  // default" tri-state needed.
+  const [draftRole, setDraftRole] = useState<AgentRole>(rule.role ?? "worker");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
   const [pendingAction, setPendingAction] = useState<PendingAction | null>(null);
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
+  // FACTORY-856: fetched alongside the harness catalog above (same mount,
+  // same `GET /api/rules/catalog` the server serves both fields from) —
+  // used only for the "Included in capacity" default-hint copy, mirroring
+  // `FirstRuleSetup.tsx`'s own `capacityRoles`.
+  const [capacityRoles, setCapacityRoles] = useState<RuleCapacityRolesCatalog | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     void api.getCatalog().then((c) => {
       if (!cancelled) setCatalog(c);
+    });
+    void api.getCapacityRoles().then((c) => {
+      if (!cancelled) setCapacityRoles(c);
     });
     return () => {
       cancelled = true;
@@ -159,6 +174,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
     if (draftQuery !== rule.query) patch.query = draftQuery;
     if (draftPermissionMode !== (rule.permissionMode ?? "")) patch.permissionMode = draftPermissionMode || undefined;
     if (draftLizardMode !== (rule.lizardMode ?? false)) patch.lizardMode = draftLizardMode;
+    if (draftRole !== (rule.role ?? "worker")) patch.role = draftRole;
     if (canEditPreferences(rule)) {
       const entry: RuleAgentPreferencePatch = { harness: draftHarness };
       if (draftModel) entry.model = draftModel;
@@ -358,6 +374,49 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
             <p className="rules-view__cnc" data-testid="rule-edit-lizard-notice">
               lizard mode is never a default — saving this needs an explicit confirm
             </p>
+          )}
+
+          <label htmlFor="rule-edit-capacity-toggle">Included in capacity</label>
+          {/*
+           * FACTORY-856 (story FACTORY-756, epic FACTORY-748) — mirrors
+           * `FirstRuleSetup.tsx`'s own "Included in capacity" toggle
+           * verbatim: `role` on the wire — "worker" (ON, this toggle's
+           * checked state) counts this rule's agent(s) toward
+           * `BUTCHR_MAX_AGENTS`; "sentinel" (OFF) opts them out entirely,
+           * and requires an explicit confirm to save. `jira-project` rules
+           * are sentinel BY CONSTRUCTION (`src/agents/capacity-role.ts`'s
+           * own `capacityRoleFor`), so the toggle is shown-but-disabled
+           * with an explanatory note rather than hidden outright.
+           */}
+          <span className="first-rule-capacity-toggle" title="agents from this rule consume fleet capacity (BUTCHR_MAX_AGENTS) while this is on">
+            <Switch
+              id="rule-edit-capacity-toggle"
+              data-testid="rule-edit-capacity-toggle"
+              isSelected={draftRole === "worker"}
+              isDisabled={disabled || rule.resourceProvider === "jira-project"}
+              switchLabels={false}
+              aria-label="Included in capacity"
+              onChange={(isSelected) => setDraftRole(isSelected ? "worker" : "sentinel")}
+            />
+          </span>
+          {rule.resourceProvider === "jira-project" ? (
+            <p className="rules-view__cnc" data-testid="rule-edit-capacity-manager-notice">
+              project-manager rules never consume fleet capacity, regardless of this toggle — it has no effect here
+            </p>
+          ) : (
+            <p data-testid="rule-edit-capacity-copy">
+              {draftRole === "worker"
+                ? `on: this rule's agents count toward the fleet's agent cap (today's default)`
+                : `off: this rule's agents are never withheld or counted toward the fleet's agent cap`}
+            </p>
+          )}
+          {draftRole === "sentinel" && (
+            <p className="rules-view__cnc" data-testid="rule-edit-capacity-notice">
+              turning capacity off is never a default — saving this needs an explicit confirm
+            </p>
+          )}
+          {capacityRoles && (
+            <p data-testid="rule-edit-capacity-default-hint">butchr's own default is "{capacityRoles.default}" (counted)</p>
           )}
 
           {pendingAction && (

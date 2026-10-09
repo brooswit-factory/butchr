@@ -564,18 +564,24 @@ already has (FACTORY-662/FACTORY-729) and the Rules page form it serves:
   reconciliation poll (`ruleRoleOfAgent` calls `getRules()` live,
   `src/daemon/index.ts`). `computeLocalPlanCounts` (`src/rules/rules-write.ts`)
   does not count a `role`-only change as a restart.
-- **The Rules page form**: FACTORY-725/FACTORY-729 ship their
-  catalog-sourced dropdowns and the lizard toggle only on the first-rule
-  setup form (`FirstRuleSetup.tsx`) — editing an EXISTING rule's form is
-  FACTORY-730 (corrected from an earlier, wrong "FACTORY-726" citation —
-  see FACTORY-748's 2026-10-08 correction comment on FACTORY-756), a
-  different epic, actively in flight as of this writing (PR #704, OPEN
-  with CHANGES_REQUESTED). The "Included in capacity" toggle lands on
-  that same `FirstRuleSetup` surface, in the same
-  field-definition/validation/layout pattern as the lizard toggle, and
-  nowhere else — there is no existing-rule edit form to add it to yet.
-  Toggling it off shows the same "never a default, needs confirm" notice
-  pattern the lizard toggle already uses.
+- **The Rules page form**: FACTORY-725/FACTORY-729 shipped their
+  catalog-sourced dropdowns and the lizard toggle on the first-rule setup
+  form (`FirstRuleSetup.tsx`) first. FACTORY-730 (PR #704, merged to
+  `main`) then shipped the generic existing-rule edit dialog
+  (`RuleEditDialog.tsx`, opened from the Rules table's per-row Edit
+  button), so an "Included in capacity" toggle on an already-created rule
+  is no longer a gap. FACTORY-856 (story FACTORY-756) adds that toggle to
+  `RuleEditDialog` too, in the same field-definition/validation/layout
+  pattern as its own lizard toggle (`rule-edit-capacity-toggle` /
+  `rule-edit-capacity-notice`, mirroring `rule-edit-lizard-mode-toggle` /
+  `rule-edit-lizard-notice`) — the toggle now lands on BOTH surfaces: the
+  first-rule setup form and the existing-rule edit dialog. `buildFieldsPatch`
+  sends `role` only when the draft differs from the rule's own current
+  value (the dialog's existing "only send what changed" discipline, unlike
+  `FirstRuleSetup`'s always-send). Toggling it off shows the same "never a
+  default, needs confirm" notice pattern the lizard toggle already uses,
+  and the write goes through the same catalog-validated `PUT /api/rules/:id`
+  path (`confirmReason: "capacity-sentinel"`) described above.
 - **`jira-project` rules are unaffected by this toggle** — they are
   sentinel by construction (`capacityRoleFor` checks the resource provider
   BEFORE ever consulting the rule's own `role`, see above), so the toggle
