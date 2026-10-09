@@ -57,14 +57,31 @@ describe("RulesRoute — FACTORY-661: list", () => {
     expect(banner.textContent).toContain("rules.json");
   });
 
-  test("empty state (no rules, no errors) explains why and shows a disabled 'Add your first rule' button, alongside the first-rule-missing snippet", async () => {
+  // FACTORY-927: "Add your first rule" is no longer a permanently-disabled
+  // placeholder (slice U2, the create form, has landed) — it now opens
+  // `CreateRuleDialog`, same as the Rules page's own always-visible
+  // "Create rule" button. Still disabled only while `capabilities.write`
+  // is false (no session check has succeeded yet), exactly like every
+  // other write control on this page.
+  test("empty state (no rules, no errors) explains why and its 'Add your first rule' button opens the create-rule dialog, alongside the first-rule-missing snippet", async () => {
     const api = createFixturesRulesApi({ initial: response(), latencyMs: 0 });
     const { findByTestId, getByRole } = render(<RulesRoute api={api} />);
     const empty = await findByTestId("rules-empty-state");
     expect(empty.textContent).toContain("No rules file");
     const button = getByRole("button", { name: "Add your first rule" });
-    expect(button.hasAttribute("disabled")).toBe(true);
+    expect(button.hasAttribute("disabled")).toBe(false);
     expect(await findByTestId("first-rule-missing")).toBeTruthy();
+    fireEvent.click(button);
+    expect(await findByTestId("create-rule-dialog")).toBeTruthy();
+  });
+
+  test("the always-visible 'Create rule' button is disabled while capabilities.write is false", async () => {
+    const api = createFixturesRulesApi({ initial: defaultRulesFixture(), latencyMs: 0, sessionOk: false });
+    api.capabilities.write = false;
+    const { findAllByTestId, getByTestId } = render(<RulesRoute api={api} />);
+    await findAllByTestId("rule-row");
+    await waitFor(() => expect(api.capabilities.write).toBe(false));
+    expect(getByTestId("create-rule-open").hasAttribute("disabled")).toBe(true);
   });
 
   test("the toggle is disabled with a 'needs the write API' explanation when capabilities.write is false (simulating the real implementation before a session check succeeds)", async () => {
