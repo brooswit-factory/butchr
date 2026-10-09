@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
+import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT, kickoffFor, controlCharStartArgs, assertSafeStartArgv } from "../../src/agents/argv.js";
 import { SESSION_PERMISSION_MODES } from "../../src/resources/session-definition.js";
 import { RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
@@ -200,6 +200,98 @@ describe("checkArgv", () => {
     const check = checkArgv(expected, observed);
     expect(check.ok).toBe(false);
     if (!check.ok) expect(check.reason).toBe("argv lacks --mcp-config /w/KAN-783/mcp.json");
+  });
+});
+
+// FACTORY-892: herdr's agent.start rejects any start argument containing a
+// control character before it ever tries to shell-quote it. FACTORY-735/739
+// regressed this by making the kickoff prompt multi-line. These tests cover
+// the pre-flight guard (controlCharStartArgs/assertSafeStartArgv), that the
+// real kickoff constants and kickoffFor's second branch are now clean, and
+// that the guard is actually wired into the real argv-building paths —
+// table-driven over every provider and both spec shapes the ticket names.
+describe("FACTORY-892: control-character pre-flight guard", () => {
+  test("controlCharStartArgs finds nothing in ordinary argv", () => {
+    expect(controlCharStartArgs(["claude", "--model", "sonnet"])).toEqual([]);
+  });
+
+  test("controlCharStartArgs reports the index and value of every offending argument", () => {
+    const found = controlCharStartArgs(["ok", "bad\nline", "also\rbad", "\0", "fine"]);
+    expect(found).toEqual([
+      { index: 1, value: "bad\nline" },
+      { index: 2, value: "also\rbad" },
+      { index: 3, value: "\0" },
+    ]);
+  });
+
+  test("assertSafeStartArgv does not throw on clean argv", () => {
+    expect(() => assertSafeStartArgv(["claude", "--model", "sonnet"])).not.toThrow();
+  });
+
+  test("assertSafeStartArgv throws with a butchr-authored message naming every offending argument, never a bare herdr-shaped 4xx", () => {
+    expect(() => assertSafeStartArgv(["ok", "bad\nline"])).toThrow(/control character.*args\[1\]/s);
+  });
+
+  test("every C0/C1 control character trips the guard, including tab (Rust's char::is_control is true for it too) — an ordinary space does not", () => {
+    for (const bad of ["\n", "\r", "\0", "\t", "\x1b", "\x7f"]) expect(controlCharStartArgs([bad])).toHaveLength(1);
+    for (const ok of [" ", "hello world", ""]) expect(controlCharStartArgs([ok])).toEqual([]);
+  });
+
+  test("KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT are one line each, with the required reminder text, and pass the guard", () => {
+    for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      expect(prompt).not.toContain("\n");
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+      expect(() => assertSafeStartArgv([prompt])).not.toThrow();
+    }
+  });
+
+  // The latent case FACTORY-891's review flagged: kickoffFor's second
+  // branch (spec.cwd + spec.brief) builds its own prompt string, independent
+  // of the two KICKOFF_PROMPT constants above, and must flatten/guard it too.
+  test("kickoffFor flattens a multi-line spec.brief to one line and the result passes the guard — table-driven over every provider", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Line one.\nLine two.\r\nLine three." };
+    for (const provider of ["claude", "codex", "agy"] as const) {
+      const prompt = kickoffFor(provider, cwdSpec);
+      expect(prompt).not.toContain("\n");
+      expect(prompt).not.toContain("\r");
+      expect(prompt).toContain("Line one. Line two. Line three.");
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+    }
+  });
+
+  test("kickoffFor without cwd/brief still returns the ordinary single-line kickoff for every provider", () => {
+    for (const provider of ["claude", "codex", "agy"] as const) {
+      const prompt = kickoffFor(provider, spec);
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+    }
+  });
+
+  // The guard is a BACKSTOP, not just a flattening exercise: a control
+  // character that flattening's \s+ collapse does not touch (a bare NUL is
+  // not whitespace) must still surface as a loud butchr-side error here,
+  // not an opaque herdr invalid_agent_argument 4xx three layers down.
+  test("kickoffFor throws butchr's own error for a spec.brief control character that flattening cannot remove", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "before\0after" };
+    expect(() => kickoffFor("claude", cwdSpec)).toThrow(/control character/);
+  });
+
+  // Table-driven over every provider AND both spec shapes the ticket names
+  // (plain, and cwd+brief), through the REAL argv-building paths —
+  // spawnArgs()/agentStartParams() — not just kickoffFor in isolation.
+  describe("the real argv-building paths never produce a control character, for any provider or spec shape", () => {
+    const specsByName: Record<string, typeof spec & { cwd?: string; brief?: string }> = {
+      "plain spec": spec,
+      "spec with cwd+brief": { ...spec, cwd: "/repo/some-project", brief: "Multi-line.\nBrief text.\r\nThird line." },
+    };
+    for (const [specName, s] of Object.entries(specsByName)) {
+      for (const provider of ["claude", "codex", "agy"] as const) {
+        test(`${provider} / ${specName}`, () => {
+          const args = spawnArgs(s, "/w/KAN-783", { provider });
+          expect(controlCharStartArgs(args)).toEqual([]);
+          expect(() => assertSafeStartArgv(args)).not.toThrow();
+        });
+      }
+    }
   });
 });
 

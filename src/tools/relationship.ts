@@ -11,6 +11,7 @@ import { ruleBriefHeader, workspaceDirsForResource, agentIdOfWorkspacePath, type
 import { decodeAgentKey } from "../rules/agent-key.js";
 import { ADMISSION_PREFIX, AGENT_PREFIX } from "../labels/plan.js";
 import { Refusal } from "./outcome.js";
+import { recordIntentionalStop, clearIntentionalStop } from "../agents/stop-cause.js";
 
 /** Role -> Atlassian accountId, the same shape `jira_create_issue` staffs by (src/tools/defs.ts's `AssigneeRoles`). Duplicated here as a structural type, not imported, so this module has no runtime dependency on defs.ts (which imports THIS module to wire the tools) — see defs.ts for the wiring direction. `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts — the same per-call-refusal-when-unset shape `story`/`task` already have. */
 export interface Roles {
@@ -829,6 +830,15 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
+  // FACTORY-849/FACTORY-852: clears any stop-cause marker the worker left
+  // on itself (shelve_worker, submit_to_boss, …) — same ordering/reasoning
+  // as the EXEMPT_LABEL clear immediately above: reactivating a worker
+  // (a shelved one, or an In Review one sent back for another round — see
+  // this function's own doc comment) is the one write site this story's
+  // scope reaches where a PRIOR intentional-stop record is provably about
+  // to go stale, so it is superseded here rather than left to misclassify
+  // a later, genuinely unintended stop. Best-effort, never throws.
+  clearIntentionalStop(workerKey);
   return ops.transition(workerKey, "In Progress");
 }
 
@@ -1144,7 +1154,13 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
   if (labelsOf(issue).includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
-  return ops.transition(workerKey, "Done");
+  const result = await ops.transition(workerKey, "Done");
+  // FACTORY-849/FACTORY-852: the worker's work just ended BY butchr's OWN
+  // act, not by the worker's own stand_down/submit_to_boss — record it on
+  // the worker's own workspace, after the transition that makes it true.
+  // Best-effort, never throws.
+  recordIntentionalStop(workerKey, "finish_worker");
+  return result;
 }
 
 /**
@@ -1167,6 +1183,12 @@ export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerK
   await ops.addLabels(workerKey, [EXEMPT_LABEL]);
   await ops.transition(workerKey, "To Do");
   await ops.addComment(workerKey, tagComment(callerKey, reason));
+  // FACTORY-849/FACTORY-852: recorded last, after every Jira write above
+  // has landed — a shelve is already, independently, intentional via
+  // EXEMPT_LABEL at classify time (see classifyStop, src/agents/stop-cause.ts),
+  // so this record is belt-and-suspenders for a reader that only has the
+  // marker (e.g. the label was since stripped by hand). Best-effort, never throws.
+  recordIntentionalStop(workerKey, "shelve_worker");
 }
 
 export interface AdoptWorkerResult {
@@ -1372,6 +1394,9 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
+  // FACTORY-849/FACTORY-852: same reactivation-clears-the-marker reasoning
+  // as startWorker's own clearIntentionalStop call, for the same disposition.
+  if (disposition.kind === "start") clearIntentionalStop(workerKey);
 
   // NOTE: the reason comment for "shelve" is posted whenever this call is
   // doing ANY real adoption work (!alreadyAdopted) — NOT gated on
@@ -1509,6 +1534,8 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
     await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
   }
+  // FACTORY-849/FACTORY-852: same reactivation-clears-the-marker reasoning as the issue-caller path above.
+  if (disposition.kind === "start") clearIntentionalStop(workerKey);
 
   if (!alreadyAdopted) {
     if (disposition.kind === "start") {
@@ -2486,7 +2513,13 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
   const issue = await ops.getIssue(callerKey);
   const open = await openWorkers(ops, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("submit_to_boss", callerKey, open));
-  return ops.transition(callerKey, "In Review");
+  const result = await ops.transition(callerKey, "In Review");
+  // FACTORY-849/FACTORY-852: the caller's own turn ends here, after moving
+  // its own ticket to In Review — one of the two "finished its turn" write
+  // sites FACTORY-849 names explicitly. Recorded on the CALLER'S OWN
+  // workspace, after the transition. Best-effort, never throws.
+  recordIntentionalStop(callerKey, "submit_to_boss");
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -2559,7 +2592,15 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
   }
   const open = await openWorkers(ops, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_without_a_boss", callerKey, open));
-  return ops.transition(callerKey, "Done");
+  const result = await ops.transition(callerKey, "Done");
+  // FACTORY-849/FACTORY-852: the OTHER "finished its turn" write site
+  // FACTORY-849 names explicitly (moving its own ticket to Done). Already
+  // independently intentional via ticketStatus === "Done" at classify time
+  // (see classifyStop, src/agents/stop-cause.ts) — this record is
+  // belt-and-suspenders, same reasoning as shelveWorker's own. Best-effort,
+  // never throws.
+  recordIntentionalStop(callerKey, "finish_without_a_boss");
+  return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -47,7 +47,7 @@ export interface ResourcesForUrlResponse {
   agents: ResourceForUrlAgent[];
 }
 
-/** Rule id + resource id, joined the same way an agent key's own components are (`:`) — deliberately NOT `display-label.ts`'s `baseDisplayLabel` (which fetches nothing itself either, but combines short-id and rule id in the OTHER order, and special-cases managed sessions) — this is its own, narrower "no title fetch" format, not a second implementation of that one. */
+/** Rule id + resource id, joined the same way an agent key's own components are (`:`) — deliberately NOT `display-label.ts`'s `baseDisplayLabel` (which fetches nothing itself either, but combines rule id and short-id with a middle-dot separator rather than `:`, and special-cases managed sessions) — this is its own, narrower "no title fetch" format, not a second implementation of that one. */
 const agentLabel = (ruleId: string, resourceId: string): string => `${ruleId}:${resourceId}`;
 
 /**

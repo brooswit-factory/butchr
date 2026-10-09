@@ -585,13 +585,13 @@ information, unlike an arbitrary filesystem resource where the parent is
 exactly what disambiguates "which `rinth` is this." `display-label.ts`'s one
 dispatch point tells the two apart by **rule id**
 (`MANAGED_SESSIONS_RULE_ID`), never by provider alone. A managed session's
-label also has no `· <ruleId>` suffix — every session shares the same
+label also has no `<ruleId> · ` prefix — every session shares the same
 reserved rule id, so appending it would be pure noise.
 
 ### Combining a short id with the rule id
 
-An ordinary resource agent displays `"<shortId> · <ruleId>"`, e.g.
-`"FACTORY-51 · jira-work"`.
+An ordinary resource agent displays `"<ruleId> · <shortId>"`, e.g.
+`"jira-work · FACTORY-51"`.
 
 ### Collisions: deterministic and loud
 
@@ -752,7 +752,7 @@ after via the bookkeeping stamp described in `docs/workspace-layout.md`.
 Three points worth knowing without opening that doc:
 
 1. **The leaf is the provider's short id alone**, never combined with the
-   rule id the way a herdr LABEL combines it (`"<shortId> · <ruleId>"`) — a
+   rule id the way a herdr LABEL combines it (`"<ruleId> · <shortId>"`) — a
    workspace path already carries the rule id as its own separate directory
    segment (`<provider>/<ruleId>/<leaf>`), so appending it into the leaf too
    would duplicate it. `jira-work`/`jira-idea`/`jira-project`'s identity
