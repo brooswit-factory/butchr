@@ -28,6 +28,8 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
     permissionMode: null,
     lizardMode: null,
+    resumeOnRespawn: null,
+    resumeTokenCutoff: null,
     staffed: false,
     reason: "disabled",
     ...overrides,

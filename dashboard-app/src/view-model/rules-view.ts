@@ -31,6 +31,24 @@ export interface RuleRowView {
   rule: RuleDto;
   staffed: StaffedView;
   preferencesText: string;
+  /** FACTORY-851: `Rule.resumeOnRespawn`/`Rule.resumeTokenCutoff`, rendered — see `resumeText` below for the exact wording rule. */
+  resumeText: string;
+}
+
+/**
+ * FACTORY-851 — `resumeOnRespawn`/`resumeTokenCutoff`'s display wording:
+ * `null` on either field means absent, which this ticket's own schema
+ * defines as "resume on" / "the daemon's own default cutoff" respectively
+ * (see `Rule.resumeOnRespawn`/`Rule.resumeTokenCutoff`'s own doc comments,
+ * `../../../src/rules/rules.js`) — never rendered as a literal number here,
+ * since the actual default value lives server-side
+ * (`DEFAULT_RESUME_TOKEN_CUTOFF`) and this module must not hand-maintain a
+ * second copy of it.
+ */
+export function resumeText(rule: Pick<RuleDto, "resumeOnRespawn" | "resumeTokenCutoff">): string {
+  const resume = rule.resumeOnRespawn === false ? "off" : "on";
+  const cutoff = rule.resumeTokenCutoff === null ? "default" : String(rule.resumeTokenCutoff);
+  return `resume: ${resume} (cutoff: ${cutoff})`;
 }
 
 export interface RulesPageViewModel {
@@ -59,6 +77,7 @@ export function buildRulesViewModel(data: RulesListResponse): RulesPageViewModel
     rule,
     staffed: renderStaffed(rule),
     preferencesText: rule.agentPreferences.length === 0 ? "butchr's global agent config" : rule.agentPreferences.map(preferenceText).join(", "),
+    resumeText: resumeText(rule),
   }));
   return {
     rows,

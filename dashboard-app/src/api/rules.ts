@@ -85,6 +85,10 @@ export interface RuleDto {
   permissionMode: RulePermissionMode | null;
   /** FACTORY-729 — `null` when absent (the "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment). */
   lizardMode: boolean | null;
+  /** FACTORY-851 — `null` when absent; means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`). Display-only in this slice, same as `account`/`role` above. */
+  resumeOnRespawn: boolean | null;
+  /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeTokenCutoff`'s own doc comment). Display-only in this slice, same as `account`/`role` above. */
+  resumeTokenCutoff: number | null;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
@@ -393,6 +397,8 @@ interface ServerRuleEntry {
   agentPreferences: RuleAgentPreferenceDto[];
   permissionMode: RulePermissionMode | null;
   lizardMode: boolean | null;
+  resumeOnRespawn: boolean | null;
+  resumeTokenCutoff: number | null;
   staffed: boolean | null;
   whyUnstaffed: string | null;
 }
@@ -414,6 +420,8 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       agentPreferences: r.agentPreferences,
       permissionMode: r.permissionMode,
       lizardMode: r.lizardMode,
+      resumeOnRespawn: r.resumeOnRespawn,
+      resumeTokenCutoff: r.resumeTokenCutoff,
       staffed: r.staffed,
       reason: r.whyUnstaffed,
     })),
@@ -581,6 +589,8 @@ export function defaultRulesFixture(): RulesListResponse {
         agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
         permissionMode: null,
         lizardMode: null,
+        resumeOnRespawn: null,
+        resumeTokenCutoff: null,
         staffed: true,
         reason: null,
       },
@@ -595,6 +605,8 @@ export function defaultRulesFixture(): RulesListResponse {
         agentPreferences: [],
         permissionMode: null,
         lizardMode: null,
+        resumeOnRespawn: null,
+        resumeTokenCutoff: null,
         staffed: false,
         reason: "disabled",
       },
@@ -609,6 +621,8 @@ export function defaultRulesFixture(): RulesListResponse {
         agentPreferences: [{ harness: "claude", effort: "high" }],
         permissionMode: "default",
         lizardMode: true,
+        resumeOnRespawn: false,
+        resumeTokenCutoff: 50_000,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
@@ -623,6 +637,8 @@ export function defaultRulesFixture(): RulesListResponse {
         agentPreferences: [],
         permissionMode: null,
         lizardMode: null,
+        resumeOnRespawn: null,
+        resumeTokenCutoff: null,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
       },
