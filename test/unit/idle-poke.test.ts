@@ -13,12 +13,17 @@ function makeDeps(overrides: Partial<Parameters<typeof createIdlePokeEngine>[0]>
     dryRun: true,
     globalMinutes: 10,
     defaultMessage: "default message",
-    // 0 by default: with a FROZEN mock clock, the engine's own construction
-    // and a test's first `check()` call see the identical instant, which
-    // would otherwise make guard 4 (restart/reconnect suppression, below)
-    // spuriously fire on every test that isn't exercising it. The "guard 4
-    // and the 90-second trap" tests override this explicitly.
-    suppressMinutes: 0,
+    // Negative by default: with a FROZEN mock clock, the engine's own
+    // construction and a test's first `check()` call see the identical
+    // instant (diff 0), and the guard-4 window below is an INCLUSIVE `<=`
+    // (by design — see idle-poke.ts's own ACCEPTANCE-7 slow-cadence case,
+    // which depends on that inclusivity at an exact boundary). 0 would
+    // still match `0 <= 0`, so every test not exercising guard 4 would be
+    // spuriously suppressed as "just restarted". A negative window can
+    // never contain a non-negative diff, which is the only value this
+    // ever computes. The "guard 4 and the 90-second trap" tests override
+    // this explicitly.
+    suppressMinutes: -1,
     maxPokesPerPoll: 10,
     comments: async () => [] as readonly { id: string; body: string; created: string }[],
     addComment: async (issue: string, text: string) => { addComments.push({ issue, text }); },
