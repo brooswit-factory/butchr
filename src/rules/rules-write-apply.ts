@@ -15,7 +15,7 @@
  * keeps `assertOnlyChanged`'s allowlist (scoped to "any rule", in the
  * abstract) from actually reaching any rule but this one in practice.
  */
-import { EDITABLE_AGENT_PREFERENCE_LEAVES, type RuleFieldPatch } from "./rules-write-registry.js";
+import { EDITABLE_AGENT_PREFERENCE_LEAVES, EDITABLE_TOP_LEVEL_FIELDS, type RuleFieldPatch } from "./rules-write-registry.js";
 
 export class RuleWriteApplyError extends Error {}
 
@@ -37,7 +37,7 @@ function parseRulesDoc(currentText: string | undefined): { doc: unknown; rules: 
  * FACTORY-662): `assertOnlyChanged`'s allowlist patterns are ARRAY-INDEX
  * based, and `*` matches ANY index — so an allowlist built once, statically,
  * as `"rules.*.enabled"` permits a write to ANY rule's `enabled`, not just
- * the one this route is checking `isUiEditableRuleId` against. The fix is
+ * the one targeted by id. The fix is
  * this function: read the index fresh, from the SAME locked `currentText`
  * the mutator already has in hand, and build an allowlist that names that
  * literal index — never a wildcard. Throws if `id` is not found.
@@ -60,15 +60,23 @@ export function buildEnabledAllowedPaths(currentText: string | undefined, id: st
  * indices — never a wildcard, and never the array's own path (so an
  * element COUNT change, which `diffPaths` reports at the array's own path,
  * matches no pattern here and is refused exactly as `rules-write-
- * registry.ts`'s own header already documents). LEAF paths only
- * (`.model`/`.effort`/`.modelPower`/`.effortPower`), never
- * `rules.<idx>.agentPreferences.<m>` bare — a PREFIX match on that bare
- * path would also permit `harness` (agentsafety's finding (ii)).
+ * registry.ts`'s own header already documents). Top-level leaves come from
+ * `EDITABLE_TOP_LEVEL_FIELDS` (FACTORY-729: `query`/`permissionMode`/
+ * `lizardMode`), only for whichever of those names is actually PRESENT in
+ * `patch` — an absent field in the patch never earns an allowed path for
+ * itself. `agentPreferences` leaves (`EDITABLE_AGENT_PREFERENCE_LEAVES`,
+ * which now includes `harness` — FACTORY-729, see that constant's own doc
+ * comment) stay LEAF paths only, never `rules.<idx>.agentPreferences.<m>`
+ * bare — a PREFIX match on that bare path would also permit adding or
+ * removing a key on the element itself.
  */
 export function buildFieldsAllowedPaths(currentText: string | undefined, id: string, patch: RuleFieldPatch): string[] {
   const idx = ruleIndexById(currentText, id);
   const paths: string[] = [];
-  if (patch.query !== undefined) paths.push(`rules.${idx}.query`);
+  const patchRecord = patch as unknown as Record<string, unknown>;
+  for (const field of EDITABLE_TOP_LEVEL_FIELDS) {
+    if (patchRecord[field] !== undefined) paths.push(`rules.${idx}.${field}`);
+  }
   if (patch.agentPreferences !== undefined) {
     const rule = readRuleById(currentText, id);
     const currentPrefs = Array.isArray(rule.agentPreferences) ? rule.agentPreferences : [];
@@ -104,6 +112,8 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
 
   if (patch.enabled !== undefined) next.enabled = patch.enabled;
   if (patch.query !== undefined) next.query = patch.query;
+  if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
+  if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {

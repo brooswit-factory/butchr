@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpHandle } from "@brooswit/thatch";
 import { liveView, type ViewDeps } from "../../src/web/view.js";
 import { createCsrfTokenIssuer } from "../../src/web/csrf.js";
 import { CSRF_HEADER, BODY_CAP_BYTES } from "../../src/web/write-guard.js";
-import { writeRuleEnabled, planRuleWrite, type RulesWriteOutcome, type RulesPlanOutcome } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, planRuleWrite, type RulesWriteOutcome, type RulesPlanOutcome } from "../../src/rules/rules-write.js";
 import { rulesEtag } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 import { createWriteRateLimiter } from "../../src/web/write-rate-limit.js";
@@ -277,10 +277,15 @@ describe("POST /api/rules/:id/enabled — write guard go-red cases", () => {
     } finally { await app.stop(true); }
   });
 
-  test("rulesWrite.enabled refuses (e.g. non-ui- id): status/error pass through, and the REJECTED outcome is audited", async () => {
+  // The exact refusal string below is an arbitrary example (FACTORY-730
+  // retired the route's own `ui-` prefix gate this test originally named) —
+  // this test only proves the ROUTE passes an arbitrary `rulesWrite.enabled`
+  // refusal through verbatim and audits it; it never exercises the real
+  // prefix check itself (see `rules-write.test.ts` for that).
+  test("rulesWrite.enabled refuses: status/error pass through, and the REJECTED outcome is audited", async () => {
     const csrf = createCsrfTokenIssuer();
     const audited: unknown[] = [];
-    const refusal: RulesWriteOutcome = { ok: false, status: 403, error: `rule "managers" does not carry the "ui-" prefix` };
+    const refusal: RulesWriteOutcome = { ok: false, status: 403, error: `rule "managers" is missing a required field` };
     const { app, origin, host } = startApp(buildDeps(csrf, async () => refusal, audited));
     try {
       const res = await fetch(`${origin}/api/rules/managers/enabled`, {
@@ -361,6 +366,135 @@ describe("PUT /api/rules/:id", () => {
       expect(res.status).toBe(200);
       expect(receivedArgs).toEqual(["ui-first-rule", { query: "project = X" }, "etag-1", false, "hash-1"]);
     } finally { await app.stop(true); }
+  });
+
+  // FACTORY-729: permissionMode/lizardMode (top-level) and
+  // agentPreferences[i].harness are now editable.
+  test("valid permissionMode + lizardMode + agentPreferences.harness edit: 200, write called with the parsed patch", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let receivedArgs: unknown[] = [];
+    const { app, origin, host } = startApp(buildDeps(csrf, (...a) => { receivedArgs = a; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({
+          ifMatch: "etag-1", planHash: "hash-1", confirm: true,
+          permissionMode: "default", lizardMode: true,
+          agentPreferences: [{ harness: "codex", model: "gpt-5.6-sol" }],
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(receivedArgs).toEqual([
+        "ui-first-rule",
+        { permissionMode: "default", lizardMode: true, agentPreferences: [{ harness: "codex", model: "gpt-5.6-sol" }] },
+        "etag-1", true, "hash-1",
+      ]);
+    } finally { await app.stop(true); }
+  });
+
+  test("invalid permissionMode value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", permissionMode: "not-a-real-mode" }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("invalid agentPreferences.harness value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ harness: "not-a-real-harness" }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("agentPreferences.model with a shell-metacharacter value: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ model: "sonnet; rm -rf /" }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  test("setting both model and modelPower on one preference entry: 400, write never called", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let called = false;
+    const { app, origin, host } = startApp(buildDeps(csrf, () => { called = true; return ACCEPTED; }));
+    try {
+      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
+        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+        body: JSON.stringify({ ifMatch: "x", planHash: "h", agentPreferences: [{ model: "sonnet", modelPower: 50 }] }),
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+    } finally { await app.stop(true); }
+  });
+
+  // FACTORY-730 (requirement 6, verifying existing behavior against a
+  // non-`ui-` rule id): a full-stack PUT through the REAL `writeRuleFields`
+  // (not a mocked outcome) writes atomically with a backup taken first,
+  // and the route audits the accepted write — all unconditional on prefix.
+  test("FACTORY-730: a real PUT edit to a non-ui- rule writes atomically with a backup, and is audited", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rules-write-route-"));
+    try {
+      const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
+      mkdirSync(join(dir, "butchr"), { recursive: true });
+      const rulesFilePath = join(dir, "butchr", "rules.json");
+      const originalText = JSON.stringify({ rules: [{ id: "managers", resourceProvider: "jira-work", query: "project = BUTCHR AND role = manager", brief: "manage it", enabled: false }] }, null, 2) + "\n";
+      writeFileSync(rulesFilePath, originalText);
+      const writeDeps = { env: envDeps };
+      const noScope = async () => 0;
+      // FACTORY-730 (review round 2): any query change now requires
+      // confirm (dry-run scope) — unrelated to what THIS test means to
+      // prove (atomic write + backup + audit), so it just supplies it.
+      const plan = await planRuleWrite("managers", { query: "project = CHANGED" }, true, noScope, writeDeps);
+      if (!plan.ok) throw new Error("expected a successful plan");
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const audited: unknown[] = [];
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+        rulesWrite: {
+          enabled: (() => { throw new Error("unused"); }) as any,
+          fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => writeRuleFields(id, patch as any, ifMatch, confirm, planHash, noScope, writeDeps)) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+        },
+        auditWrite: (e: unknown) => { audited.push(e); },
+      });
+      try {
+        const res = await fetch(`${origin}/api/rules/managers`, {
+          method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, planHash: plan.planHash, query: "project = CHANGED", confirm: true }),
+        });
+        expect(res.status).toBe(200);
+        const nextDoc = JSON.parse(readFileSync(rulesFilePath, "utf8"));
+        expect(nextDoc.rules[0].query).toBe("project = CHANGED");
+        const entries = readdirSync(join(dir, "butchr"));
+        expect(entries.some((e) => e.includes(".bak-"))).toBe(true);
+        expect(audited).toHaveLength(1);
+        expect((audited[0] as { outcome: string }).outcome).toBe("accepted");
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
@@ -740,7 +874,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           enabled: (() => { throw new Error("unused"); }) as any,
           fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
             const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
-            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, scopeOf, writeDeps);
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,
@@ -777,7 +911,7 @@ describe("N3 (FACTORY-678): stale-lock refusal reaches the HTTP response BODY, w
           enabled: (() => { throw new Error("unused"); }) as any,
           fields: ((id: string, patch: unknown, ifMatch: string, confirm: boolean, planHash: string) => {
             const { writeRuleFields } = require("../../src/rules/rules-write.js") as typeof import("../../src/rules/rules-write.js");
-            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, writeDeps);
+            return writeRuleFields(id, patch as any, ifMatch, confirm, planHash, scopeOf, writeDeps);
           }) as any,
           undo: (() => { throw new Error("unused"); }) as any,
           plan: (() => { throw new Error("unused"); }) as any,

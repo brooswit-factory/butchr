@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { combineHealth, createLoopHealth, createResourceLoopHealth } from "../../src/daemon/health.js";
+import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "../../src/daemon/health.js";
 
 describe("resource loop health", () => {
   test("starting, then failing past the threshold, then recovering", () => {
@@ -59,6 +59,53 @@ describe("resource loop health", () => {
     expect("managedSessionEscalations" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
     expect("managedSessionEscalations" in combineHealth([poll])).toBe(false);
     poll.stop();
+  });
+
+  test("FACTORY-752: a completed tick with nothing eligible advances lastSuccessAt — the exact blindness the new field exists to remove", () => {
+    let t = 0;
+    const h = createTickHealth({ name: "permissionAnswer", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    // PRE-FIX CONTRAST: before any recordSuccess, the component is indistinguishable
+    // from "never ticked at all" — this is the exact shape the 10-08 incident's
+    // own silence had (an idle tick that updates nothing looks identical to a
+    // tick that never ran).
+    expect(h.status().components[0]).toMatchObject({ state: "starting", lastSuccessAt: null });
+
+    t = 100;
+    h.recordSuccess(); // an idle tick: nothing eligible, but the tick itself completed
+    expect(h.status().components[0]).toMatchObject({ ok: true, state: "ok", lastSuccessAt: new Date(100).toISOString(), staleForMs: 0, consecutiveFailures: 0, lastErrorAt: null });
+
+    t = 2_000; // past thresholdMs with no further tick at all — genuinely stale, correctly flips ok false
+    expect(h.status().components[0]).toMatchObject({ ok: false, state: "stale" });
+    h.stop();
+  });
+
+  test("FACTORY-752: a rejected tick is reported distinguishably from a succeeded one, via lastErrorAt/consecutiveFailures, without itself advancing lastSuccessAt", () => {
+    let t = 0;
+    const h = createTickHealth({ name: "permissionAnswer", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+
+    t = 100; h.recordError(new Error("cannot connect"));
+    expect(h.status().components[0]).toMatchObject({ lastSuccessAt: null, lastErrorAt: new Date(100).toISOString(), consecutiveFailures: 1 });
+
+    t = 200; h.recordError(new Error("cannot connect"));
+    expect(h.status().components[0]).toMatchObject({ lastErrorAt: new Date(200).toISOString(), consecutiveFailures: 2 });
+
+    t = 300; h.recordSuccess();
+    expect(h.status().components[0]).toMatchObject({ ok: true, lastSuccessAt: new Date(300).toISOString(), consecutiveFailures: 0, lastErrorAt: new Date(200).toISOString() });
+    h.stop();
+  });
+
+  test("FACTORY-752: permissionAnswer rides INSIDE components[] (the liveness AND), not beside it — a stale tick DOES flip ok false, unlike a resourceLoops sibling", () => {
+    let t = 0;
+    const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    const permissionAnswer = createTickHealth({ name: "permissionAnswer", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
+    t = 100; poll.recordSuccess(); permissionAnswer.recordSuccess();
+    t = 2_000; // only poll ticks again; permissionAnswer goes stale
+    poll.recordSuccess();
+
+    const health = combineHealth([poll, permissionAnswer]);
+    expect(health.components.map((c) => c.name)).toEqual(["pollLoop", "permissionAnswer"]);
+    expect(health.ok).toBe(false); // the stale permissionAnswer component drags the whole AND down
+    poll.stop(); permissionAnswer.stop();
   });
 
   test("FACTORY-647: dashboardApp rides beside the liveness components, absent when not passed, and never flips ok", () => {

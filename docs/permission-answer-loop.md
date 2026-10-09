@@ -13,6 +13,25 @@
 > subscription, kicks a fresh tick — logging `[watchdog] restarted
 > permission-answer` and raising an ops alert. See `permission-answer-watch.ts`'s
 > own header and `PermissionAnswerWatchDeps.watchdogThresholdMs`'s doc comment.
+>
+> **FACTORY-751/FACTORY-775: the subscribe deadline wrapper above could not
+> abort a herdr that accepted the connection and never acked, so each
+> retry (`scheduleReconnect`, default every ~`herdrCallTimeoutMs +
+> resubscribeDelayMs`) opened another raw socket nobody ever closed.**
+> `@brooswit/herdr-sdk` exposes no way to abort an in-flight `subscribe()`,
+> so the daemon-side wrapper (`subscribeAgentStatus`, `src/daemon/index.ts`)
+> now tracks the one outstanding raw attempt and will not start a second
+> one while the first has neither settled nor been closed — at most one
+> socket is ever outstanding past this fix, not zero: a herdr that never
+> acks at all still holds that one connection open forever (the SDK gives
+> no way to reclaim it), but no additional connections pile up behind it.
+> The cost of that trade: while the one outstanding slot is pinned by such
+> a herdr, push resubscription is effectively disabled — every later
+> attempt just times out against the guard — until that raw attempt
+> settles on its own or the daemon restarts.
+> `BUTCHR_HERDR_TIMEOUT_MS` also gained an upper bound (300000ms / 5
+> minutes) — see `Config.herdrCallTimeoutMs`'s own doc comment for why a
+> larger value made this knob mean its own opposite.
 
 > **FACTORY-145: every `answered:` journal line and audit record now carries
 > a `trigger` (`"fast"` or `"sweep"`), plus a `latencyMs` number when

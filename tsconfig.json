@@ -42,6 +42,7 @@
     "test/unit/dashboard-app-withheld-row-card.test.tsx",
     "test/unit/dashboard-app-dashboard-route.test.tsx",
     "test/unit/dashboard-app-rules-route.test.tsx",
+    "test/unit/dashboard-app-rule-edit-dialog.test.tsx",
     "test/unit/dashboard-app-setup-route.test.tsx",
     "test/unit/dashboard-app-jira-connection-card.test.tsx"
   ]

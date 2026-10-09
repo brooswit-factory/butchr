@@ -2,10 +2,11 @@
  * FACTORY-669 (epic FACTORY-659, slice T1; agentsafety-accepted design,
  * director 2026-10-05 12:30 PDT) — the ONE place a brand-new butchr install
  * gets its first rule. The web UI (FACTORY-663) cannot CREATE a rule, only
- * edit/enable one the web write path (FACTORY-662) is already allowed to
- * touch (any `ui-`-prefixed id, `../rules/rules-write-registry.ts`'s own
- * `UI_EDITABLE_ID_PREFIX`), so a fresh install needs one such rule to
- * already exist, disabled, before the dashboard has anything to show.
+ * edit/enable an existing one (FACTORY-730: the web write path now accepts
+ * any existing rule id, not only a `ui-`-prefixed one — but a fresh install
+ * with no rules file at all still has nothing for the dashboard to show),
+ * so a fresh install needs one rule to already exist, disabled, before the
+ * dashboard has anything to show.
  * `seedFirstRunRules` is that seed. Called ONCE, inline, from
  * `src/daemon/index.ts`'s own startup, BEFORE `loadRules` runs for real —
  * never from an HTTP route, an MCP tool, a reload, or a file watcher. No
