@@ -97,14 +97,23 @@ export interface RuleDto {
   resumeContextCutoff: number | null;
   /**
    * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY
-   * for the idle poke. Unlike `permissionMode`/`lizardMode` above, never
-   * `null` — `Rule.idlePokeMinutes`/`idlePokeMessage`/`idlePokeEnabled` are
-   * always resolved to a concrete default server-side (see those fields'
-   * own doc comments, `../../../src/rules/rules.js`), so this DTO always
-   * carries a real value too. Nothing in the daemon reads these yet.
+   * for the idle poke. `idlePokeMinutes`/`idlePokeMessage`, like
+   * `permissionMode`/`lizardMode` above, are `null` when absent on the raw
+   * `Rule` — and `null` here means something specific: this rule's real
+   * EFFECTIVE threshold/text is today's global `stalledMinutes`/existing
+   * wake text, NOT the epic's own 30-minute/default-text seed
+   * (`DEFAULT_IDLE_POKE_MINUTES`/`DEFAULT_IDLE_POKE_MESSAGE`,
+   * `../../../src/rules/rules.js`) — review round 1 caught an earlier
+   * version of this DTO defaulting to that seed here, which misreported a
+   * rule's real threshold as 30 when it was actually inheriting the
+   * global 10. `idlePokeEnabled` has no such inherit-ambiguity —
+   * `Rule.idlePokeEnabled` is always resolved server-side (see that
+   * field's own doc comment) — so it is never `null`, same as it is
+   * always a real boolean for a rule that matched. Nothing in the daemon
+   * reads any of these three yet.
    */
-  idlePokeMinutes: number;
-  idlePokeMessage: string;
+  idlePokeMinutes: number | null;
+  idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`

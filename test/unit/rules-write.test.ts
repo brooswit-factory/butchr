@@ -469,7 +469,7 @@ describe("writeRuleFields (PUT)", () => {
     const patch: RuleFieldPatch = { idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false };
     const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
     const etag = rulesEtag(env());
-    const outcome = writeRuleFields("ui-first-rule", patch, etag, false, planHash, deps);
+    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
     const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
     expect(nextDoc.rules[0].idlePokeMinutes).toBe(45);
