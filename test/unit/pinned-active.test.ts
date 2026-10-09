@@ -351,7 +351,7 @@ describe("createPinnedActiveDetector: FACTORY-845 — a per-id minutesFor overri
     now = 6 * MIN; // past the per-id 5m override, nowhere near the global 30m
     await det.check(["ACME"]);
     expect(chan.posted.length).toBe(1);
-    expect(chan.posted[0]!.text).toContain("5 minute(s)"); // the resolved per-id window, not 30
+    expect(chan.posted[0]!.text).toContain("5-minute window"); // the resolved per-id window, not 30
   });
 
   test("an id with NO minutesFor entry still uses the global `minutes`, unchanged", async () => {

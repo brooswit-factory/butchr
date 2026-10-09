@@ -13,7 +13,12 @@ function makeDeps(overrides: Partial<Parameters<typeof createIdlePokeEngine>[0]>
     dryRun: true,
     globalMinutes: 10,
     defaultMessage: "default message",
-    suppressMinutes: 5,
+    // 0 by default: with a FROZEN mock clock, the engine's own construction
+    // and a test's first `check()` call see the identical instant, which
+    // would otherwise make guard 4 (restart/reconnect suppression, below)
+    // spuriously fire on every test that isn't exercising it. The "guard 4
+    // and the 90-second trap" tests override this explicitly.
+    suppressMinutes: 0,
     maxPokesPerPoll: 10,
     comments: async () => [] as readonly { id: string; body: string; created: string }[],
     addComment: async (issue: string, text: string) => { addComments.push({ issue, text }); },

@@ -1668,7 +1668,7 @@ function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): v
 
 // FACTORY-845: the channel half, copying the SAME call shape every other
 // delivery seam in this file already uses (`deliverNotice`/
-// `renderNotifyDelivery`, `notifyAgent(mcp, ...)`, `herd.nudge`) — an
+// `renderNotifyDelivery`, the MCP notify call, `herd.nudge`) — an
 // EIGHTH seam in this file, which is why
 // test/unit/notify-deliver-seams.test.ts's exact-count assertions are
 // updated in this same commit (7 -> 8) — see that test file's own doc
