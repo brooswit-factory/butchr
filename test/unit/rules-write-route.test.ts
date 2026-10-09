@@ -6,7 +6,7 @@ import type { McpHandle } from "@brooswit/thatch";
 import { liveView, type ViewDeps } from "../../src/web/view.js";
 import { createCsrfTokenIssuer } from "../../src/web/csrf.js";
 import { CSRF_HEADER, BODY_CAP_BYTES } from "../../src/web/write-guard.js";
-import { writeRuleEnabled, writeRuleFields, planRuleWrite, type RulesWriteOutcome, type RulesPlanOutcome } from "../../src/rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeRuleDelete, planRuleWrite, type RulesWriteOutcome, type RulesPlanOutcome } from "../../src/rules/rules-write.js";
 import { rulesEtag } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 import { createWriteRateLimiter } from "../../src/web/write-rate-limit.js";
@@ -1365,6 +1365,119 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
       });
       expect(applyRes.status).toBe(200);
     } finally { await app.stop(true); }
+  });
+
+  // FACTORY-932: `checkWriteRateLimit` is one shared call site
+  // (`src/web/view.ts`) every write route runs through identically — the
+  // tests above already pin it end-to-end for `POST /api/rules/:id/enabled`;
+  // this pins the SAME wiring for `DELETE /api/rules/:id` specifically,
+  // since nothing currently exercises that route through the limiter at
+  // all. Fails if the delete route's own `checkWriteRateLimit` call (view.ts,
+  // right after its own `checkWriteGuard`) is ever removed, reordered after
+  // `deps.rulesWrite.delete`, or if a route-specific rate-limit key diverges
+  // from the shared per-client one.
+  test("the shared write rate limit trips on DELETE /api/rules/:id too: budget exhausted, delete never called for the refused requests", async () => {
+    const csrf = createCsrfTokenIssuer();
+    let calls = 0;
+    const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 2 });
+    const { app, origin, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, writeRateLimit,
+      rulesWrite: {
+        enabled: (() => { throw new Error("unused"); }) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (() => { throw new Error("unused"); }) as any,
+        delete: (() => { calls++; return ACCEPTED; }) as any,
+      },
+    });
+    try {
+      const statuses: number[] = [];
+      const retryAfters: (string | null)[] = [];
+      for (let i = 0; i < 5; i++) {
+        const res = await fetch(`${origin}/api/rules/managers`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: "x", confirm: true }),
+        });
+        statuses.push(res.status);
+        retryAfters.push(res.headers.get("retry-after"));
+      }
+      expect(statuses).toEqual([200, 200, 429, 429, 429]);
+      expect(calls).toBe(2); // the delete dep was never reached for the 3 refused requests
+      for (const ra of retryAfters.slice(2)) {
+        expect(ra).not.toBeNull();
+        expect(ra).toMatch(/^[0-9]+$/);
+      }
+    } finally { await app.stop(true); }
+  });
+
+  // The ticket's own review bar for this test: "assert the refusal writes
+  // NOTHING — rules file byte-for-byte unchanged, not just the status
+  // code." Drives a REAL `writeRuleDelete` (not a mocked outcome, same
+  // precedent as the DELETE describe block's own full-stack write test
+  // above) so a regression that let a 429'd request slip past the limiter
+  // and reach the real write path would actually mutate the file — a
+  // mocked `delete` dep could never catch that class of bug.
+  // Review round 1 (PR #749 @ 41d747d5) flagged the first draft of this
+  // test: both the accepted and the refused request targeted the SAME rule
+  // id, so even a limiter bypass would have hit a real "already deleted"
+  // refusal from `writeRuleDelete` itself and left the file byte-identical
+  // regardless — the assertion could not actually detect the regression it
+  // claimed to. Fixed by seeding TWO rules and pointing the refused request
+  // at the one the first request never touched: a limiter bypass would now
+  // actually delete "b" and change the file, giving this test a real tooth.
+  test("a 429'd DELETE wrote NOTHING — the rules file is byte-for-byte unchanged, not merely a 429 status", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "butchr-rules-write-route-"));
+    try {
+      const envDeps: RulesEnv = { XDG_CONFIG_HOME: dir };
+      mkdirSync(join(dir, "butchr"), { recursive: true });
+      const rulesFilePath = join(dir, "butchr", "rules.json");
+      const originalText = JSON.stringify({
+        rules: [
+          { id: "a", resourceProvider: "jira-work", query: "project = BUTCHR AND role = a", brief: "rule a", enabled: false },
+          { id: "b", resourceProvider: "jira-work", query: "project = BUTCHR AND role = b", brief: "rule b", enabled: false },
+        ],
+      }, null, 2) + "\n";
+      writeFileSync(rulesFilePath, originalText);
+      const writeDeps = { env: envDeps };
+      const etag = rulesEtag(envDeps);
+
+      const csrf = createCsrfTokenIssuer();
+      const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
+      const { app, origin, host } = startApp({
+        csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true, writeRateLimit,
+        rulesWrite: {
+          enabled: (() => { throw new Error("unused"); }) as any,
+          fields: (() => { throw new Error("unused"); }) as any,
+          undo: (() => { throw new Error("unused"); }) as any,
+          plan: (() => { throw new Error("unused"); }) as any,
+          delete: ((id: string, ifMatch: string, confirm: boolean) => writeRuleDelete(id, ifMatch, confirm, () => false, writeDeps)) as any,
+        },
+      });
+      try {
+        const first = await fetch(`${origin}/api/rules/a`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etag, confirm: true }),
+        });
+        expect(first.status).toBe(200); // consumes the budget (max: 1); "a" IS deleted
+        const beforeSecond = readFileSync(rulesFilePath, "utf8");
+        const etagAfterFirst = rulesEtag(envDeps); // a valid, current ifMatch for "b" — the 429 must come from the limiter, not a stale-etag 409
+        const second = await fetch(`${origin}/api/rules/b`, {
+          method: "DELETE", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
+          body: JSON.stringify({ ifMatch: etagAfterFirst, confirm: true }),
+        });
+        expect(second.status).toBe(429);
+        // The limiter must refuse BEFORE `writeRuleDelete` runs again. "b"
+        // is still present and the file is byte-for-byte unchanged since
+        // the first write — if the limiter were bypassed, this real
+        // writeRuleDelete call WOULD have removed "b" and changed the
+        // file, so this assertion actually has teeth (unlike targeting the
+        // already-deleted "a" again, which would pass even on a bypass).
+        const afterSecond = readFileSync(rulesFilePath, "utf8");
+        expect(afterSecond).toBe(beforeSecond);
+        const stillB = JSON.parse(afterSecond);
+        expect(stillB.rules.map((r: { id: string }) => r.id)).toEqual(["b"]);
+      } finally { await app.stop(true); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
 
