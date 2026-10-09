@@ -84,6 +84,9 @@
     "../test/unit/dashboard-app-create-rule-dialog.test.tsx",
     // FACTORY-666: the agent-control panel's own DOM-rendering component
     // tests, same reason as the blocks above.
-    "../test/unit/dashboard-app-agent-control-panel.test.tsx"
+    "../test/unit/dashboard-app-agent-control-panel.test.tsx",
+    // FACTORY-668: the daemon health/logs page's own DOM-rendering
+    // component tests, same reason as the blocks above.
+    "../test/unit/dashboard-app-daemon-route.test.tsx"
   ]
 }
