@@ -24,13 +24,15 @@
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
 import { AtlassianHttpError } from "../atlassian/client.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, blockedTransition, prTransition, excludeBookkeepingComments, WAKE_MARKERS } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, blockedTransition, stalledTransition, prTransition, excludeBookkeepingComments, WAKE_MARKERS } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
 import { skippedCommentCheckLine, type SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
 import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
-import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
+import { MARKER as STALL_MARKER } from "../agents/stall-remediation.js";
+import { RateCap, HOUR_MS } from "../agents/escalation-helper.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_MAX_PER_HOUR } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
@@ -242,6 +244,31 @@ export interface IssueResourceDeps {
    * at all keeps the same effective behaviour.
    */
   blockedWakeDebounceMinutes?: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * blockedWakeDebounceMinutes above): the SAME debounce shape, threaded
+   * through for the `agent:stalled` boss wake instead. Optional; omitted,
+   * `DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES` (src/config/config.ts) is used.
+   */
+  stalledWakeDebounceMinutes?: number;
+  /**
+   * FACTORY-972: the hard per-boss hourly cap on DELIVERED `agent:stalled`
+   * wakes — see `Config.stalledWakeMaxPerHour`'s own doc comment. Optional;
+   * omitted, `DEFAULT_STALLED_WAKE_MAX_PER_HOUR` is used.
+   */
+  stalledWakeMaxPerHour?: number;
+  /**
+   * FACTORY-972: the `/health` counter's writer for a DELIVERED stalled
+   * wake — same "optional callback, caller owns the counter" shape
+   * `onCommentCheckSkipped` above already is. Called once per delivered
+   * wake, after the rate cap has already admitted it.
+   */
+  onStalledWake?: (recipient: string) => void;
+  /**
+   * FACTORY-972: the `/health` counter's writer for a stalled wake that the
+   * hourly rate cap rejected — counted and logged, never delivered (item 4).
+   */
+  onStalledWakeCapped?: (recipient: string) => void;
 }
 
 /**
@@ -351,7 +378,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped" | "blockedWakeDebounceMinutes">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped" | "blockedWakeDebounceMinutes" | "stalledWakeDebounceMinutes" | "stalledWakeMaxPerHour" | "onStalledWake" | "onStalledWakeCapped">): EventRules<JiraIssue> {
   // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
   // only this — never a direct `process.stdout`/`process.stderr` write. The
   // default is a fresh closure that looks up `console.error` at CALL time
@@ -404,6 +431,24 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
   // episode, not once per boss.
   const blockedWakeFired = new Map<string, number>();
   const blockedWakeDebounceMs = (deps.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
+
+  // FACTORY-972 (story FACTORY-971, extending FACTORY-949 above): the SAME
+  // per-episode debounce state, for the `agent:stalled` boss wake instead —
+  // see `stalledWake` below.
+  const stalledWakeFired = new Map<string, number>();
+  const stalledWakeDebounceMs = (deps.stalledWakeDebounceMinutes ?? DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES) * 60_000;
+  // item 4: a SEPARATE axis from the debounce above — caps DELIVERED
+  // stalled wakes per RECIPIENT (the boss's own watcher key) per rolling
+  // hour, regardless of how many distinct tickets of that boss's go
+  // stalled. `RateCap`/`HOUR_MS` (src/agents/escalation-helper.ts) are the
+  // existing dependency-free per-key rate-limiter primitives this codebase
+  // already has for exactly this shape (max posts per key per window) —
+  // reused here rather than hand-rolled, even though this ticket's own text
+  // names admission.ts's cap as "the nearest analog, different domain":
+  // escalation-helper.ts's RateCap is domain-agnostic on its key (a pane id
+  // there, a boss watcher key here) and was already built dependency-free
+  // for this exact "N posts per key per window" shape.
+  const stalledWakeRateCap = new RateCap(deps.stalledWakeMaxPerHour ?? DEFAULT_STALLED_WAKE_MAX_PER_HOUR, HOUR_MS);
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedResource<JiraIssue>[], key: string) => list.find((r) => r.issue.key === key)?.issue;
@@ -532,6 +577,37 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         // default "deliver", so an unreadable dedup check must not be the
         // thing that silently loses it.
         blockedWakeFired.set(key, now);
+        return true;
+      };
+
+      // FACTORY-972 (story FACTORY-971): `blockedWake`'s own twin — the
+      // SAME debounce (item 2) and marker-dedup (item 3, against
+      // `[butchr:stall]` — STALL_MARKER, already in WAKE_MARKERS so the
+      // same shared `fetchComments(key)` call already carries it when
+      // present) shape, for the `agent:stalled` episode instead. Does NOT
+      // itself apply the hourly rate cap (item 4) — that is a DIFFERENT
+      // axis, checked by the caller (`decide()` below) only once this
+      // function has already decided the EPISODE itself is due a wake;
+      // see `stalledWakeRateCap`'s own doc comment above for why the two
+      // axes are kept separate.
+      const stalledWake = async (key: string): Promise<boolean> => {
+        const now = Date.now();
+        const last = stalledWakeFired.get(key);
+        if (last !== undefined && now - last < stalledWakeDebounceMs) return false; // item 2: debounced
+        const result = await fetchComments(key);
+        if (result.ok) {
+          const windowStart = now - stalledWakeDebounceMs;
+          const markerAlreadyPosted = result.rows.some(
+            (c) => c.body.startsWith(STALL_MARKER) && Date.parse(c.created) >= windowStart,
+          );
+          if (markerAlreadyPosted) {
+            stalledWakeFired.set(key, now);
+            return false;
+          }
+        }
+        // Fail OPEN toward firing, not toward silence — same reasoning as
+        // `blockedWake`'s own doc comment just above.
+        stalledWakeFired.set(key, now);
         return true;
       };
 
@@ -982,6 +1058,12 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         if ("status" in reason) return reason.status.to === "In Review" || reason.status.to === "Done";
         if ("comment" in reason) return isBossRelevantComment(key, rows, reason.comment);
         if ("blocked" in reason) return true;
+        // FACTORY-972: the stalled-wake twin of the blocked carve-out just
+        // above — see this ticket's own architecture note (the ticket
+        // text, and src/resources/types.ts's NotifyReason doc comment) for
+        // why a reason not named here would otherwise be silently dropped
+        // for a related watcher by this gate's own default-deny.
+        if ("stalled" in reason) return true;
         return false;
       };
       const deliverToRelated = (
@@ -1097,6 +1179,30 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // that the allowlist itself names it.
           if (space === "related" && before && after && blockedTransition(before, after) && (await blockedWake(key))) {
             return deliverToRelated(key, watcher, space, { deliver: true, reason: { blocked: { key } } });
+          }
+          // FACTORY-972 (story FACTORY-971): the stalled-wake twin of the
+          // blocked branch just above — same template, same reasons
+          // (space === "related" only; checked before `suppressed()` since
+          // a pure agent:* flip is `isDaemonLabelOnlyDiff`, which
+          // `crossDaemonSuppressed` would otherwise swallow). Unlike
+          // `blockedWake`, `stalledWake` returning `true` is not yet
+          // sufficient to deliver: item 4's hourly rate cap is a SEPARATE,
+          // per-recipient (here, the boss's own watcher key) axis, checked
+          // ONLY once the episode itself is confirmed due — an episode the
+          // cap rejects is still recorded as "fired" by `stalledWake`
+          // above (so a later re-flip inside the same debounce window
+          // doesn't ask the cap again for the SAME episode), but is
+          // counted/logged, never delivered (item 4's own words).
+          if (space === "related" && before && after && stalledTransition(before, after) && (await stalledWake(key))) {
+            if (!stalledWakeRateCap.allow(watcher, Date.now())) {
+              deps.onStalledWakeCapped?.(watcher);
+              log(`[wake] stalled key=${key} recipients=boss CAPPED watcher=${watcher}`);
+              return { deliver: false };
+            }
+            stalledWakeRateCap.record(watcher, Date.now());
+            deps.onStalledWake?.(watcher);
+            log(`[wake] stalled key=${key} recipients=boss`);
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { stalled: { key } } });
           }
           // Appear/disappear (no `before` or no `after` to diff at all) is
           // still a real change and is still always delivered, unchecked —

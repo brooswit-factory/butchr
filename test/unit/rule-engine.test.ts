@@ -704,6 +704,39 @@ describe("rule relationships", () => {
     expect([...ev.changedPrimary].sort()).toEqual(["jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2"]);
   });
 
+  // FACTORY-972 (story FACTORY-971): the end-to-end counterpart to
+  // test/unit/stalled-wake.test.ts — THIS level is where "the stalled
+  // ticket's own watcher and siblings never woken" is actually enforced
+  // (`entry.watchers.includes(watcher)`, this file's own `decide()` just
+  // above), not inside `createIssueEventRules` itself. Mirrors "the boss
+  // learns a child's status change" just above, for an agent:*->
+  // agent:stalled label transition instead of a status change.
+  test("the boss learns a child's agent:stalled transition, once, through the real relatedAllows gate, and no sibling or the worker's own watcher is woken", async () => {
+    const events = createRuleEventRules({ rules: ruleSet });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(ruleSet, ms, keys(ms))) });
+    const before = world(worker({ labels: ["agent:working"] }));
+    const after = world(worker({ labels: ["agent:stalled"], updated: "later" }));
+    const heard = relatedIdFor(after, "BUTCHR-2");
+    const ev = await events.poll(snap(before), snap(after));
+    expect(ev.changedRelated).toEqual([heard]);
+    expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { stalled: { key: "BUTCHR-2" } } });
+    // `stalledWake`'s own debounce (like `blockedWake`'s — see
+    // `blockedWakeFired`'s own doc comment in issue.ts) is keyed by the
+    // STALLED TICKET, not by (ticket, watcher): "a ticket with two bosses
+    // ... must still fire at most once per episode, not once per boss."
+    // "review" also matches the boss ticket here (this file's own "every
+    // rule on the boss ticket hears it" guarantee for an ORDINARY change),
+    // but asking it about the SAME already-fired episode in the SAME poll
+    // correctly gets nothing more — the episode already fired, to whichever
+    // watcher asked first.
+    expect((await ev.decide(heard, "jira-work:review:BUTCHR-1", "related")).deliver).toBe(false);
+    // No agent on the WORKER ticket itself, and a sibling rule's agent key
+    // that is NOT actually one of this entry's watchers, gets anything.
+    for (const other of ["jira-work:story:BUTCHR-2", "jira-work:review:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
+      expect(await ev.decide(heard, other, "related")).toEqual({ deliver: false });
+    }
+  });
+
   test("a worker agent's own write is swallowed for itself but still reaches its boss", async () => {
     const ledger = createOwnWriteLedger();
     ledger.record("BUTCHR-2", "later", "jira-work:story:BUTCHR-2", Date.now());

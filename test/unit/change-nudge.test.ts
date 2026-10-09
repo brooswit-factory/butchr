@@ -115,6 +115,15 @@ describe("changeNudge", () => {
       "[butchr] TASK (related to your BOSS) has its ticket TASK newly agent:blocked — it needs you — re-read it, then act on what changed.",
     );
   });
+
+  // FACTORY-972: the stalled-wake twin of the blocked test just above —
+  // same wording, same producers (issue.ts's boss wake, project.ts's
+  // manager wake).
+  test("stalled — the related path a boss actually receives", () => {
+    expect(changeNudge("BOSS", "TASK", { stalled: { key: "TASK" } })).toBe(
+      "[butchr] TASK (related to your BOSS) has its ticket TASK newly agent:stalled — it needs you — re-read it, then act on what changed.",
+    );
+  });
 });
 
 describe("notifyReasonTag", () => {
@@ -192,6 +201,11 @@ describe("notifyReasonTag", () => {
   // FACTORY-949: names the blocked ticket's own key, operator-facing.
   test("blocked names the blocked ticket's own key", () => {
     expect(notifyReasonTag({ blocked: { key: "TASK-1" } })).toBe(" (blocked:TASK-1)");
+  });
+
+  // FACTORY-972: the stalled twin of the blocked test just above.
+  test("stalled names the stalled ticket's own key", () => {
+    expect(notifyReasonTag({ stalled: { key: "TASK-1" } })).toBe(" (stalled:TASK-1)");
   });
 });
 
