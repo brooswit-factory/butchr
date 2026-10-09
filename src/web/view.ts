@@ -17,9 +17,13 @@ import type { RulesPreviewResult } from "./rules-preview.js";
 import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps, type WriteGuardRequest } from "./write-guard.js";
 import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
-import { validateRuleFieldPatch, type RuleFieldPatch } from "../rules/rules-write-registry.js";
+import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, type RuleCreateInput } from "../rules/rules-write-registry.js";
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
+import type { SessionDefinitionsWriteOutcome } from "../resources/session-definitions-write.js";
+import type { LinksWriteOutcome } from "../resources/links-write.js";
+import type { FileLinksEntry } from "../resources/link-store.js";
+import { formatResourceRef } from "../resources/resource-ref.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -29,7 +33,9 @@ import type { SettingsApiResponse } from "./settings-api.js";
 import type { JiraTestResult } from "./jira-connection-test.js";
 import { SettingProvidedByEnvironmentError } from "../settings/write-settings.js";
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
+import type { DaemonLogsResult } from "./daemon-logs.js";
 import type { SetupStatusResponse, JiraWriteRequestOutcome, RateGate } from "./setup-api.js";
+import { validateStopRequestBody, validateShelveRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody, type AgentWriteOutcome, type AdoptInput } from "../agents/agents-write.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -272,6 +278,65 @@ export interface ViewDeps {
     plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
     /** FACTORY-731 — `DELETE /api/rules/:id`. See `../rules/rules-write.ts`'s `writeRuleDelete` for the full gate list (unknown id, stale etag, enabled, live agents, missing confirm). */
     delete: (id: string, ifMatch: string, confirm: boolean) => RulesWriteOutcome;
+    /**
+     * FACTORY-927 — `POST /api/rules`'s own write (`createRule`,
+     * `../rules/rules-write.ts`). Always creates the new rule DISABLED;
+     * confirm is mandatory, independent of blast radius — see that
+     * function's own doc comment. Optional (unlike `enabled`/`fields`/
+     * `undo`/`plan`/`delete` above, which predate this ticket and every
+     * existing caller of this object already supplies): an omitted
+     * `create` (or `planCreate` below) makes `POST /api/rules` answer 503,
+     * same "endpoint disabled: not configured" discipline every other
+     * optional `ViewDeps` dependency already follows — never a reason to
+     * widen every pre-existing literal of this object.
+     */
+    create?: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
+    /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. Optional — see `create`'s own doc comment immediately above. */
+    planCreate?: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
+  };
+  /**
+   * FACTORY-667 (epic FACTORY-659, slice D1) — the session-definitions
+   * write orchestration (`../resources/session-definitions-write.ts`). Same
+   * "one function per route, already does its own etag/allowlist/confirm
+   * checks, returns a tagged outcome this file maps straight to a status +
+   * body" discipline as `rulesWrite` above. Optional: an omitted value
+   * makes every `/api/session-definitions/*` write route answer 503, same
+   * "endpoint disabled: not configured" discipline every other optional
+   * `ViewDeps` write dependency already follows.
+   */
+  sessionDefinitionsWrite?: {
+    fields: (name: string, patch: Record<string, unknown>, ifMatch: string, confirm: boolean) => Promise<SessionDefinitionsWriteOutcome>;
+    frozen: (name: string, frozen: boolean, ifMatch: string) => Promise<SessionDefinitionsWriteOutcome>;
+    undo: (backupId: string) => SessionDefinitionsWriteOutcome;
+  };
+  /**
+   * FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`'s
+   * own read: every owner->targets entry in the butchr-managed FILE link
+   * store (`../resources/link-store.ts`'s `listAllFileLinks`), parsed to
+   * `ResourceRef`s. No secrets here (links are never secret-shaped), so
+   * unlike `settings` below this is never redacted — but a link entry can
+   * name a local filesystem path, so the ROUTE itself still sits behind the
+   * dashboard-origin + same-UID peer guard (review round 1: a config-read
+   * this sensitive never gets a looser check just because `configInventory`
+   * happens to have none). Read FRESH every request, same discipline as
+   * `configInventory`/`rulesFileState`. Optional: an omitted value makes
+   * `GET /api/links` answer 503, never open with an empty list (which
+   * would look identical to "no links exist" and silently hide a
+   * misconfiguration).
+   */
+  linksRead?: () => FileLinksEntry[];
+  /**
+   * FACTORY-962 — the links write orchestration
+   * (`../resources/links-write.ts`). Same "one function per route, already
+   * does its own validation/idempotency/lock checks, returns a tagged
+   * outcome this file maps straight to a status + body" discipline as
+   * `sessionDefinitionsWrite` above. Optional: an omitted value makes every
+   * `/api/links/*` write route answer 503.
+   */
+  linksWrite?: {
+    add: (resource: string, target: string) => Promise<LinksWriteOutcome>;
+    remove: (resource: string, target: string) => Promise<LinksWriteOutcome>;
+    undo: (backupId: string) => LinksWriteOutcome;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -357,6 +422,23 @@ export interface ViewDeps {
    */
   daemonRestartRateLimit?: () => WriteRateLimitOutcome;
   /**
+   * FACTORY-668 (C1, read) — `GET /api/daemon/logs`'s own data
+   * (`./daemon-logs.ts`'s `readDaemonLogs`, already bound to this process's
+   * own `currentSystemdInfo()` and bounds). Optional: an omitted value
+   * makes the route unreachable (503), never open.
+   */
+  daemonLogs?: () => Promise<DaemonLogsResult>;
+  /**
+   * FACTORY-668 (C2, write) — `POST /api/daemon/reload`'s own logic:
+   * literally `deps.reloadRulesNow` (above) re-exposed over HTTP for the
+   * first time — the SAME `reloadRules(rulesHolder)` SIGHUP already calls,
+   * never a second reload code path. Non-destructive (a reload never kills
+   * a running agent mid-ticket, see `reloadRules`'s own doc comment), so
+   * unlike `daemonRestart` this is NOT confirm-gated. Optional: an omitted
+   * value makes the route unreachable (503).
+   */
+  daemonReload?: () => ReloadResult;
+  /**
    * FACTORY-665 (PR-2) — `GET /api/setup/status`'s own data: whether the
    * daemon is fully configured (Atlassian identity present) or running in
    * setup mode. Synchronous, no I/O (reads a boolean this daemon's own
@@ -406,6 +488,25 @@ export interface ViewDeps {
    * simple choice here. Optional: absent means no flood protection.
    */
   jiraTokenWriteRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /**
+   * FACTORY-666 — the agent-control orchestration (`../agents/agents-write.ts`).
+   * One function per action; each already does its own ownership/reason/
+   * confirm checks and returns a tagged outcome this file maps straight to
+   * a status + body, never re-deciding anything here. Optional: an omitted
+   * value makes every `/api/agents/:issue/*` route answer 503, same
+   * "endpoint disabled: not configured" discipline every other optional
+   * `ViewDeps` dependency already follows.
+   */
+  agentsWrite?: {
+    snapshot: (issue: string) => Promise<AgentWriteOutcome>;
+    start: (issue: string) => Promise<AgentWriteOutcome>;
+    planStop: (issue: string) => Promise<AgentWriteOutcome>;
+    stop: (issue: string) => Promise<AgentWriteOutcome>;
+    planShelve: (issue: string, reason: string) => Promise<AgentWriteOutcome>;
+    shelve: (issue: string, reason: string) => Promise<AgentWriteOutcome>;
+    adopt: (issue: string, input: AdoptInput) => Promise<AgentWriteOutcome>;
+    prioritize: (issue: string, priority: string) => Promise<AgentWriteOutcome>;
+  };
 }
 
 /** `onParse`'s own sentinels for a body that failed to become JSON cleanly (too large, or not valid JSON) — see `view.ts`'s `onParse` hook. A route handler checks for either BEFORE reading any of its own expected fields off `body`. */
@@ -470,9 +571,18 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   return parts.length ? parts.join("; ") : "edit";
 }
 
-function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null }, outcome: { ok: boolean; error?: string }): void {
+/**
+ * FACTORY-694 item 2: `ctx.kind` defaults to `"write"` (every pre-existing
+ * caller is a real config write, unchanged) — `POST /api/settings/jira/test`
+ * is the one caller that passes `kind: "test"`, since a connection test
+ * changes nothing and must never be labeled or alerted on as a write (see
+ * `./audit-log.ts`'s own `composeAlertText`/`createAuditLogger` for what
+ * `kind` changes: a "test" success alerts nobody, and a "test" failure gets
+ * its own label and never joins the write-rejection aggregator).
+ */
+function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null; kind?: "write" | "test" }, outcome: { ok: boolean; error?: string }): void {
   if (!deps.auditWrite) return;
-  const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.() };
+  const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.(), kind: ctx.kind ?? "write" as const };
   deps.auditWrite(outcome.ok ? { ...base, outcome: "accepted" } : { ...base, outcome: "rejected", reason: outcome.error ?? "rejected" });
 }
 
@@ -823,31 +933,52 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // chain (Origin, Host, peer-uid, Content-Type, CSRF) because this makes
     // an outbound credentialed call, plus its own tighter rate limit (1 per
     // 5s — separate from the generic write-flood budget). Every attempt
-    // (accepted or rejected by the guard/limiter) is audited; the result
-    // handed back is the fixed, non-leaking shape `jiraTest()` already
-    // returns — this route never sees or forwards the upstream body/token.
-    .post("/api/settings/jira/test", async ({ set, request, server }) => {
+    // (accepted or rejected by the guard/limiter) is audited, with its OWN
+    // "jira-test" audit kind (FACTORY-694 item 2 — see `auditOutcome`'s own
+    // doc comment: a test is never a config write, so it must never alert
+    // on success and must never share the write-rejection aggregator); the
+    // result handed back is the fixed, non-leaking shape `jiraTest()`
+    // already returns — this route never sees or forwards the upstream
+    // body/token.
+    //
+    // FACTORY-694 item 1: this route has NO body of its own to read (the
+    // test always uses the daemon's own already-loaded credentials) — but
+    // the global `onParse` hook still runs before this handler and sets
+    // `set.status` to 413/400 on an oversize or malformed body, which would
+    // otherwise leak through verbatim underneath this route's own 200 (the
+    // outbound call still made, the limiter slot still burned, with a
+    // misleading 413/400 glued onto a real result). Checked here, right
+    // after the guard and BEFORE the limiter or `jiraTest()` — a bad
+    // sentinel refuses outright, same as every other write route's own
+    // `bodyProblem` check.
+    .post("/api/settings/jira/test", async ({ set, request, server, body }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
-        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: guard.reason });
         set.status = guard.status;
         return guard.body;
       }
       if (!deps.jiraTest) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
       if (deps.jiraTestRateLimit) {
         const clientKey = server?.requestIP(request)?.address ?? "unresolved";
         const result = deps.jiraTestRateLimit(clientKey);
         if (!result.ok) {
           const error = `rate limited: too many jira connection tests — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error });
           set.status = 429;
           set.headers["retry-after"] = String(result.retryAfterSeconds);
           return { error };
         }
       }
       const result = await deps.jiraTest();
-      auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
+      auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
       return result;
     })
     // FACTORY-665 (PR-2) — `GET /api/setup/status`. Same guard discipline as
@@ -938,6 +1069,106 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.csrf) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
       return { csrfToken: deps.csrf.token };
+    })
+    // FACTORY-927 — `POST /api/rules`: create a new rule from the Rules
+    // page. Own `checkWriteGuard` call (see the enable route's own comment
+    // below for why that's load-bearing, not merely redundant with
+    // `onRequest`'s own prefix check), the SAME shared write-rate limit
+    // every other write-shaped route uses, and the SAME `auditOutcome`
+    // pipeline. `deps.rulesWrite.planCreate` is called FIRST, on every
+    // request — it never writes, and is the ONE call every attempt makes
+    // regardless of `confirm`.
+    //
+    // THREE OUTCOMES (review round 1, 2026-10-09, items 2/3 — fixing an
+    // audit-noise bug: the previous version called `create` even when the
+    // plan merely reported "not yet confirmed," so every ORDINARY two-step
+    // create wrote a spurious REJECTED audit line on its first call):
+    //   1. `plan.ok === false`, OR `plan.ok === true` but the scope could
+    //      not be measured (`plan.scopeUnmeasurable`) — a genuine refusal
+    //      (collision, stale file, or a previewer that's down), audited as
+    //      rejected, same as any other write refusal. `confirmReason`
+    //      (`"unmeasurable-scope"` for the second case; absent for the
+    //      first — a collision/staleness refusal is never a "just confirm
+    //      it" situation) rides the response body verbatim, same shape
+    //      `DELETE /api/rules/:id` already returns it in.
+    //   2. `plan.ok === true`, scope WAS measured, but `confirm` was not
+    //      `true` on this call — the ORDINARY first step of the two-step
+    //      flow: returns the plan itself, 200, `requiresConfirm: true`,
+    //      `confirmReason: "rule-create"` — a real, typed response shape
+    //      (the SAME `RulesPlanResult` shape `POST /api/rules/plan`
+    //      already returns for an edit/enable dry run) carrying `scope`/
+    //      `planHash` structurally, never a string for the client to parse
+    //      a number back out of. UNAUDITED — same precedent `POST
+    //      /api/rules/plan` already sets for its own report-only dry run
+    //      (that route has no `auditOutcome` call at all): this is
+    //      exploration, not an attempted write, so it must never count
+    //      against N2's write-flood budget's own alert aggregation the way
+    //      a real rejected write does.
+    //   3. `plan.ok === true`, scope measured, AND `confirm === true` —
+    //      the real write: `create` is called (with the plan's own
+    //      just-computed `planHash` — see `createRule`'s own doc comment
+    //      for why a client-supplied one is never needed here), and its
+    //      outcome (accepted or refused) is ALWAYS audited — this is the
+    //      one call this route makes that can actually write.
+    .post("/api/rules", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      const createRule = deps.rulesWrite?.create;
+      const planCreateRule = deps.rulesWrite?.planCreate;
+      if (!createRule || !planCreateRule) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        // Review round 1, item 4 (AC7 gap): a malformed body is still a
+        // refused create ATTEMPT — audited exactly like every other
+        // validation failure below, never silently skipped just because
+        // the failure is early. No id is known yet at this point (the body
+        // never parsed far enough to have one).
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids: [], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      // Best-effort id for the audit line below even when validation
+      // itself is what's about to fail — the same "name what we can" spirit
+      // every other route's own audit context already follows.
+      const rawId = body && typeof body === "object" ? (body as Record<string, unknown>).id : undefined;
+      const idsForAudit = typeof rawId === "string" ? [rawId] : [];
+      const parsed = validateRuleCreateInput(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids: idsForAudit, origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      const b = body as Record<string, unknown>;
+      const confirm = b.confirm === true;
+      const ids = [parsed.input.id];
+      const plan = await planCreateRule(parsed.input, confirm);
+      if (!plan.ok) {
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, { ok: false, error: plan.error });
+        set.status = plan.status;
+        return { error: plan.error };
+      }
+      if (plan.scopeUnmeasurable) {
+        // Same unconditional fail-closed discipline `createRule` itself
+        // documents for this case — refused here, before ever reaching the
+        // write lock, so a previewer outage never produces a confusing
+        // "needs confirm" response for a number that was never real.
+        auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, { ok: false, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; try again` });
+        set.status = 503;
+        return { error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again`, confirmReason: plan.confirmReason };
+      }
+      if (plan.requiresConfirm) {
+        // Outcome 2 above — the ordinary "not yet confirmed" dry run.
+        // Deliberately `return plan;` verbatim, never audited: see this
+        // route's own header comment.
+        return plan;
+      }
+      const outcome = await createRule(parsed.input, confirm, plan.planHash);
+      auditOutcome(deps, { route: "POST /api/rules", action: "create", ids, origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error, ...(outcome.confirmReason ? { confirmReason: outcome.confirmReason } : {}) }; }
+      return outcome;
     })
     // FACTORY-662 item 7: `POST /api/rules/:id/enabled` — the ONLY route
     // that may flip `enabled`, for exactly the "ui-" marked rules, gated by
@@ -1087,6 +1318,169 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
+    // FACTORY-667 (epic FACTORY-659, slice D1) — `POST
+    // /api/session-definitions/:name/fields`: the low-risk/risky-confirm-
+    // gated field patch (`modelPower`/`effort`/`permissionMode`/
+    // `lizardMode`). B1: own `checkWriteGuard` call, same discipline as
+    // every other write route in this file. A `requiresConfirm: true`
+    // outcome is returned VERBATIM, never audited — see `../resources/
+    // session-definitions-write.ts`'s own header for why (mirrors `POST
+    // /api/rules/plan`'s own "report-only, no audit" shape).
+    .post("/api/session-definitions/:name/fields", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const name = decodeURIComponent(params.name);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.ifMatch !== "string" || typeof b.patch !== "object" || b.patch === null || Array.isArray(b.patch)) {
+        const error = "body must be { patch: object, ifMatch: string, confirm?: boolean }";
+        auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const confirm = b.confirm === true;
+      const outcome = await deps.sessionDefinitionsWrite.fields(name, b.patch as Record<string, unknown>, b.ifMatch, confirm);
+      if (outcome.ok && outcome.requiresConfirm) return outcome;
+      auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: `patch ${Object.keys(b.patch as Record<string, unknown>).join(",")}`, ids: [name], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-667 — `POST /api/session-definitions/:name/frozen`: the two
+    // freeze gates (`../resources/session-freeze.ts`), through this ticket's
+    // own backed-up/locked/undoable write contract. B1: own
+    // `checkWriteGuard` call, same discipline as every other write route.
+    .post("/api/session-definitions/:name/frozen", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const name = decodeURIComponent(params.name);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.frozen !== "boolean" || typeof b.ifMatch !== "string") {
+        const error = "body must be { frozen: boolean, ifMatch: string }";
+        auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.sessionDefinitionsWrite.frozen(name, b.frozen, b.ifMatch);
+      auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: `frozen=${b.frozen}`, ids: [name], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-667 — `POST /api/session-definitions/undo/:backupId`: B2
+    // scoping (own process's last UI write only, own resulting etag only)
+    // — see `../resources/session-definitions-write.ts`'s own header.
+    .post("/api/session-definitions/undo/:backupId", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const backupId = decodeURIComponent(params.backupId);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const outcome = deps.sessionDefinitionsWrite.undo(backupId);
+      auditOutcome(deps, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`:
+    // every owner->targets entry in the butchr-managed link store. Same
+    // guard discipline as `GET /api/daemon/logs`/`GET /api/agents/:issue`
+    // above (dashboard-origin guard + same-UID peer check, checked BEFORE
+    // any work, `Cache-Control: no-store`) — a link entry can name a local
+    // filesystem path, so this read is at least as sensitive as those.
+    .get("/api/links", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.linksRead) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      return {
+        links: deps.linksRead().map((entry) => ({
+          owner: formatResourceRef(entry.owner),
+          targets: entry.targets.map((t) => formatResourceRef(t)),
+        })),
+      };
+    })
+    // FACTORY-962 — `POST /api/links/add`: adds `target` to `resource`'s
+    // managed link list. Full write guard chain + shared write rate limit,
+    // same discipline as every other write route in this file.
+    // `../resources/links-write.ts`'s `writeLinkAdd` owns reference
+    // validation, self-link refusal, the jira-project-owner refusal, and
+    // idempotency (already-present is reported, not audited as a
+    // rejected write — it never reaches the backup/lock/write path at all).
+    .post("/api/links/add", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.resource !== "string" || typeof b.target !== "string") {
+        const error = "body must be { resource: string, target: string }";
+        auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.linksWrite.add(b.resource, b.target);
+      auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 — `POST /api/links/remove`: symmetric with `/add` above.
+    .post("/api/links/remove", async ({ body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.resource !== "string" || typeof b.target !== "string") {
+        const error = "body must be { resource: string, target: string }";
+        auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+        set.status = 400;
+        return { error };
+      }
+      const outcome = await deps.linksWrite.remove(b.resource, b.target);
+      auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-962 — `POST /api/links/undo/:backupId`: B2 scoping, same as
+    // `/api/session-definitions/undo/:backupId` above (own process's last
+    // UI write only, own resulting etag only) — see
+    // `../resources/links-write.ts`'s own header.
+    .post("/api/links/undo/:backupId", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const backupId = decodeURIComponent(params.backupId);
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const outcome = deps.linksWrite.undo(backupId);
+      auditOutcome(deps, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
     // FACTORY-665 — `PUT /api/settings/:key`: the ONE route that may change
     // an allowlisted settings.json value. Full write guard chain (own
     // `checkWriteGuard` call, same discipline as every other write route in
@@ -1164,11 +1558,250 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
+    // FACTORY-668 (C1, read) — `GET /api/daemon/logs`: a bounded, redacted
+    // tail of this daemon's own journal (`./daemon-logs.ts`). Same guard
+    // discipline as `GET /api/agents/:issue`/`GET /api/rules` above
+    // (dashboard-origin guard + same-UID peer check, checked BEFORE any
+    // work, `Cache-Control: no-store`) — a log viewer is at least as
+    // sensitive as those reads, so it never gets a looser check just
+    // because today's `/health`/`/state` happen to have none.
+    .get("/api/daemon/logs", async ({ request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.daemonLogs) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      set.headers["cache-control"] = "no-store";
+      const result = await deps.daemonLogs();
+      if (!result.ok) { set.status = 503; return { error: result.error }; }
+      return result;
+    })
+    // FACTORY-668 (C2, write) — `POST /api/daemon/reload`: re-reads
+    // rules.json in-process (`deps.daemonReload`, literally
+    // `reloadRules(rulesHolder)` — the SAME function SIGHUP and the rules
+    // write path already call). Full write-guard chain + the shared write
+    // rate limit, same as every other write route in this file. NOT
+    // confirm-gated, unlike `POST /api/daemon/restart`: a reload never
+    // takes the daemon down or kills a running agent mid-ticket (see
+    // `reloadRules`'s own doc comment) — every attempt, accepted or
+    // refused (a parse/validation problem in rules.json), is still
+    // audited.
+    .post("/api/daemon/reload", async ({ set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.daemonReload) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const result = deps.daemonReload();
+      auditOutcome(deps, { route: "POST /api/daemon/reload", action: "reload", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.problems.join("; ") || "reload failed" });
+      if (!result.ok) { set.status = 409; return { error: result.problems.join("; ") || "reload failed", path: result.path }; }
+      return result;
+    })
     .get("/agents", () => mcp.connections.list().map((c) => ({ id: c.id, issue: c.headers["x-issue"] ?? null, connectedAt: c.connectedAt })))
     .post("/agents/:issue/open", async ({ params, set }) => {
       const r = await deps.open(decodeURIComponent(params.issue));
       if (!r.ok) { set.status = 409; return { ok: false, error: r.error ?? "could not open" }; }
       return { ok: true };
+    })
+    // FACTORY-666 — `GET /api/agents/:issue`: the agent-control panel's own
+    // read, same guard discipline as `GET /api/rules` (dashboard-origin
+    // guard + same-UID peer check, `Cache-Control: no-store`) since this
+    // reflects live Jira state. `decodeURIComponent` can throw on a
+    // malformed `%` escape — same 400, never an uncaught 500, as
+    // `GET /api/rules/:id/preview` already handles this.
+    .get("/api/agents/:issue", async ({ params, request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      set.headers["cache-control"] = "no-store";
+      const result = await deps.agentsWrite.snapshot(issue);
+      if (!result.ok) { set.status = result.status; return { error: result.error }; }
+      const { ok, ...rest } = result;
+      return rest;
+    })
+    // FACTORY-666 — `POST /api/agents/:issue/start`: `start_worker`'s own
+    // effect (`../agents/agents-write.ts`'s `doAgentStart`), under the
+    // worker's own current boss. Never destructive — no confirm step. B1:
+    // own `checkWriteGuard` call, same discipline as every other write
+    // route in this file (see the rules-enable route's own comment for why
+    // this is load-bearing, not merely redundant with `onRequest`'s own
+    // prefix gate).
+    .post("/api/agents/:issue/start", async ({ params, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/start", action: "start (as boss)", ids: [issue], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const outcome = await deps.agentsWrite.start(issue);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/start", action: "start (as boss)", ids: [issue], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-666 — `POST /api/agents/:issue/stop`. DESTRUCTIVE (AC2): the
+    // SAME combined plan-then-confirm pattern `POST /api/rules` (FACTORY-927)
+    // uses — `planAgentStop` is called FIRST on every request, and is the
+    // one call every attempt makes regardless of `confirm`. THREE OUTCOMES,
+    // same discipline as that route's own header comment:
+    //   1. The plan itself is a refusal (nothing running for this issue) —
+    //      audited as rejected, same as any other write refusal.
+    //   2. The plan succeeded but `confirm` was not `true` — the ORDINARY
+    //      first step of the two-step flow: returns the plan verbatim (200,
+    //      `requiresConfirm: true`, `confirmReason: "agent-stop"`, a
+    //      structured `preview` naming the pane about to be closed) —
+    //      UNAUDITED, exploration, not an attempted write.
+    //   3. The plan succeeded AND `confirm === true` — the real stop
+    //      (`Herd.stop`, idempotent): its outcome is ALWAYS audited.
+    .post("/api/agents/:issue/stop", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/stop", action: "stop", ids: [issue], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/stop", action: "stop", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      const parsed = validateStopRequestBody(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/stop", action: "stop", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      if (!parsed.confirm) {
+        const plan = await deps.agentsWrite.planStop(issue);
+        if (!plan.ok) {
+          auditOutcome(deps, { route: "POST /api/agents/:issue/stop", action: "stop", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: plan.error });
+          set.status = plan.status;
+          return { error: plan.error };
+        }
+        return plan; // outcome 2 — deliberately verbatim, never audited.
+      }
+      const outcome = await deps.agentsWrite.stop(issue);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/stop", action: "stop", ids: [issue], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-666 — `POST /api/agents/:issue/shelve`. DESTRUCTIVE (AC2),
+    // same three-outcome plan-then-confirm shape as `stop` immediately
+    // above, PLUS a mandatory, non-empty `reason` (checked by
+    // `planAgentShelve`/`doAgentShelve` themselves — see `shelve_worker`'s
+    // own refusal) before a `confirmReason` is ever handed out.
+    .post("/api/agents/:issue/shelve", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      const parsed = validateShelveRequestBody(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      if (!parsed.confirm) {
+        const plan = await deps.agentsWrite.planShelve(issue, parsed.reason);
+        if (!plan.ok) {
+          auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: plan.error });
+          set.status = plan.status;
+          return { error: plan.error };
+        }
+        return plan; // outcome 2 — deliberately verbatim, never audited.
+      }
+      const outcome = await deps.agentsWrite.shelve(issue, parsed.reason);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-666 — `POST /api/agents/:issue/adopt`: `adopt_worker`'s own
+    // effect, with the operator-supplied `bossKey` (the one action with no
+    // current boss to derive). Not flagged destructive in this ticket's
+    // scope — no confirm step — but a "shelve" disposition still requires
+    // a non-empty `reason`, checked by `doAgentAdopt` itself.
+    .post("/api/agents/:issue/adopt", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/adopt", action: "adopt", ids: [issue], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/adopt", action: "adopt", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      const parsed = validateAdoptRequestBody(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/adopt", action: "adopt", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      const input: AdoptInput = parsed.input;
+      const outcome = await deps.agentsWrite.adopt(issue, input);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/adopt", action: `adopt bossKey=${input.bossKey} disposition=${input.disposition}`, ids: [issue], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
+    })
+    // FACTORY-666 — `POST /api/agents/:issue/prioritize`: `prioritize_worker`'s
+    // own effect, under the worker's own current boss. Not flagged
+    // destructive — no confirm step.
+    .post("/api/agents/:issue/prioritize", async ({ params, body, set, request, server }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let issue: string;
+      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
+      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") });
+      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      const parsed = validatePrioritizeRequestBody(body);
+      if (!parsed.ok) {
+        auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: "prioritize (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
+        set.status = 400;
+        return { error: parsed.error };
+      }
+      const outcome = await deps.agentsWrite.prioritize(issue, parsed.priority);
+      auditOutcome(deps, { route: "POST /api/agents/:issue/prioritize", action: `prioritize (as boss)=${parsed.priority}`, ids: [issue], origin: request.headers.get("origin") }, outcome);
+      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
+      return outcome;
     })
     // BUTCHR-267: the dashboard row's terminal-attach link target, keyed by
     // pane rather than issue (the row data BUTCHR-264 serves carries the

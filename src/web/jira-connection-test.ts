@@ -7,6 +7,15 @@
  * reach the return value, only the raw `fetch` call does. Timeout 10s. No
  * redirects followed to another host (`redirect: "manual"` — a 3xx is
  * reported as `httpStatusClass: "other"`, never silently followed).
+ *
+ * FACTORY-694 item 3: `ok` is NOT merely "status was 2xx" — a reverse proxy
+ * or captive portal can answer any URL with a 200 and an HTML body, which
+ * would otherwise read as "connected". A 2xx response is only accepted as a
+ * genuine Jira `/myself` reply when its body parses as JSON and carries a
+ * string `accountId` field (the one field every real `/myself` response
+ * has) — never echoed back, only used as a yes/no check. Anything else
+ * (non-2xx, unparseable body, missing/non-string `accountId`) returns one of
+ * the same fixed, non-leaking error strings as every other failure path.
  */
 
 export type HttpStatusClass = "2xx" | "401/403" | "other" | "network";
@@ -49,9 +58,19 @@ export async function testJiraConnection(creds: JiraTestCredentials, fetchFn: Fe
       signal: controller.signal,
     });
     const httpStatusClass = classify(res.status);
-    return httpStatusClass === "2xx"
+    if (httpStatusClass !== "2xx") {
+      return { ok: false, site: creds.site, httpStatusClass, error: fixedErrorFor(httpStatusClass) };
+    }
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      return { ok: false, site: creds.site, httpStatusClass, error: NOT_JIRA_ERROR };
+    }
+    const hasAccountId = !!body && typeof body === "object" && typeof (body as Record<string, unknown>).accountId === "string";
+    return hasAccountId
       ? { ok: true, site: creds.site, httpStatusClass }
-      : { ok: false, site: creds.site, httpStatusClass, error: fixedErrorFor(httpStatusClass) };
+      : { ok: false, site: creds.site, httpStatusClass, error: NOT_JIRA_ERROR };
   } catch {
     return { ok: false, site: creds.site, httpStatusClass: "network", error: fixedErrorFor("network") };
   } finally {
@@ -68,3 +87,6 @@ function fixedErrorFor(httpStatusClass: HttpStatusClass): string {
     default: return "unknown error";
   }
 }
+
+/** FACTORY-694 item 3: fixed, non-leaking error for a 2xx response that doesn't look like a real Jira `/myself` reply (no parseable JSON body with a string `accountId`) — never echoes the body that triggered it. */
+const NOT_JIRA_ERROR = "Jira returned a 2xx response that doesn't look like Jira (no accountId in the body).";

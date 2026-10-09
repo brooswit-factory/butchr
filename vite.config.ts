@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
@@ -38,7 +38,19 @@ const thirdPartyNoticesPlugin = (): Plugin => {
       }
     },
     closeBundle() {
-      writeFileSync(join(import.meta.dirname, "dist", "web", "THIRD_PARTY_NOTICES.txt"), collectThirdPartyNoticesForBundle(import.meta.dirname, moduleIds));
+      // FACTORY-927 (review round 1, item 1 — a CI failure traced here,
+      // not caused by that ticket's own diff): `closeBundle` is documented
+      // to run after `writeBundle` (i.e. after `dist/web` already has
+      // every chunk written to it), but was observed, on an otherwise
+      // unmodified build, to sometimes fire before `outDir` exists —
+      // `writeFileSync` below then fails on a MISSING DIRECTORY, not a
+      // missing file, which is this plugin's own output path's problem to
+      // guard against regardless of why the ordering slipped. `mkdirSync`
+      // is idempotent (`recursive: true`) and a no-op on the normal path
+      // where the directory already exists.
+      const dir = join(import.meta.dirname, "dist", "web");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "THIRD_PARTY_NOTICES.txt"), collectThirdPartyNoticesForBundle(import.meta.dirname, moduleIds));
     },
   };
 };

@@ -95,6 +95,34 @@ export function readRuleById(currentText: string | undefined, id: string): Recor
   return rules[idx] as Record<string, unknown>;
 }
 
+/** FACTORY-927 — whether `id` already names a rule in `currentText`, for `createRule`'s own collision check (`./rules-write.ts`). `true` for a malformed/absent document too (reading it as "no, go ahead" would be wrong — but a malformed document can never actually reach this call in practice, since `createRule` runs this under the same lock `loadRules` has already validated the CURRENT file through at daemon startup; kept as a cheap, honest `false` rather than throwing, since "does this id exist" has a clear answer — no — even for an empty/absent file). */
+export function ruleIdExists(currentText: string | undefined, id: string): boolean {
+  try {
+    const { rules } = parseRulesDoc(currentText);
+    return findRuleIndex(rules, id) !== -1;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * FACTORY-927 — appends a brand-new rule object to `currentText`'s `rules`
+ * array and returns the whole next document's text, same full
+ * `JSON.parse`/rebuild/`JSON.stringify` round-trip `applyRuleFieldPatch`
+ * uses immediately below (see this file's own header for why that's the
+ * right discipline here too). Every OTHER rule survives a plain value copy,
+ * untouched. Does NOT validate `newRule`'s own shape — that's `loadRules`'s
+ * job, run by `commitWrite` (`./write-rules.ts`) BEFORE anything is written,
+ * exactly like every other write in this codebase relies on for the same
+ * reason (see `rules-write-registry.ts`'s own `validateRuleCreateInput` doc
+ * comment).
+ */
+export function appendRule(currentText: string | undefined, newRule: Record<string, unknown>): string {
+  const { doc, rules } = parseRulesDoc(currentText);
+  rules.push(newRule);
+  return JSON.stringify(doc, null, 2) + "\n";
+}
+
 /**
  * FACTORY-731 — `DELETE /api/rules/:id`'s own next-document builder:
  * removes rule `id` from the `rules` array entirely and returns the whole

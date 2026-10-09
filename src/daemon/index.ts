@@ -67,6 +67,7 @@ import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMe
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
@@ -114,6 +115,9 @@ import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-de
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessionDefinitionUndo, type LastUiWriteRef as SessionDefinitionLastUiWriteRef } from "../resources/session-definitions-write.js";
+import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
+import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
@@ -139,13 +143,15 @@ import { rulesEtag } from "../rules/write-rules.js";
 import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
-import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache } from "../rules/rules-write.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache, createRule, planRuleCreate } from "../rules/rules-write.js";
 import { buildSettingsApiResponse } from "../web/settings-api.js";
-import { readUnitHint } from "../web/settings-unit-hint.js";
+import { createCachedUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
 import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
 import { writeSetting } from "../settings/write-settings.js";
 import { restartDaemon } from "../web/daemon-restart.js";
+import { readDaemonLogs, DEFAULT_DAEMON_LOGS_MAX_LINES, DEFAULT_DAEMON_LOGS_MAX_BYTES } from "../web/daemon-logs.js";
+import { currentSystemdInfo } from "../agents/ground-truth.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -199,6 +205,12 @@ installLogSink();
 const settingsFileResult = loadSettingsFile(process.env);
 for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
 const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
+// FACTORY-694 item 6: ONE shared cache instance for this process's lifetime
+// — every `GET /api/settings` call (both the read path below and the
+// re-read after a settings write) shares the same ~30s TTL memo, so a burst
+// of dashboard polls spawns at most one `systemctl` child per window
+// instead of one per request. See `createCachedUnitHint`'s own doc comment.
+const cachedUnitHint = createCachedUnitHint();
 // FACTORY-665 (PR-2) — a fresh install with no Atlassian identity yet must
 // not crash at startup: it starts in SETUP MODE instead (serving only
 // `/health`, the dashboard shell, and the setup API — see
@@ -1064,14 +1076,52 @@ const rulesWriteDeps = {
   getSourceEtag: () => rulesHolder.getSourceEtag(),
 };
 
+// FACTORY-666 — shared by every `agentsWrite.*` binding above: this
+// daemon's own already-constructed `ops` (Jira) and `herd` (process
+// control/stop), plus `config.assignees` (the SAME `Roles` shape
+// `atlassianTools`'s own `adopt_worker` already staffs by — `../tools/
+// relationship.ts`'s `Roles` is a structural duplicate of `AssigneeRoles`,
+// never a second type).
+const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
+
+// FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+// path's own deps — `dir`/`store` are the SAME `sessionDefinitionsPath()`/
+// `defaultSessionFreezeIo().store` `configInventory` above already reads,
+// never a second resolution. `lastUiWrite` is its OWN ref (undo scoped to
+// THIS write path only, never shared with `rulesWriteDeps.lastUiWrite`).
+const sessionDefinitionsWriteDeps = {
+  dir: () => sessionDefinitionsPath(),
+  store: defaultSessionFreezeIo().store,
+  lastUiWrite: { value: null } as SessionDefinitionLastUiWriteRef,
+};
+
+// FACTORY-962 (epic FACTORY-659, slice D1 follow-up): the links write
+// path's own deps — `path` is the SAME `defaultLinksStorePath()` the
+// `butchr link` CLI and `resourceLinkTools` already read/write, never a
+// second resolution. `lastUiWrite` is its OWN ref (undo scoped to THIS
+// write path only, never shared with `sessionDefinitionsWriteDeps.lastUiWrite`).
+const linksWriteDeps = {
+  path: () => defaultLinksStorePath(),
+  lastUiWrite: { value: null } as LastLinksUiWrite,
+};
+
+// FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
+// caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
+// HTTP exposure of the SAME trigger) are literally the same function —
+// defined once here so the two call sites can never drift from each other
+// or from `SIGHUP`'s own handler below, which also calls `reloadRules`
+// directly against this one `rulesHolder`.
+const reloadRulesInProcess = () => {
+  const result = reloadRules(rulesHolder);
+  scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
+  return result;
+};
+
 const { app, mcp } = buildApp({
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
-  reloadRulesNow: () => {
-    const result = reloadRules(rulesHolder);
-    scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
-    return result;
-  },
+  reloadRulesNow: reloadRulesInProcess,
+  daemonReload: reloadRulesInProcess,
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -1100,6 +1150,20 @@ const { app, mcp } = buildApp({
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
+  },
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
+  // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
+  // (process control) — no second Jira client, no second herdr client.
+  agentsWrite: {
+    snapshot: (issue) => agentSnapshot(agentWriteDeps, issue),
+    start: (issue) => doAgentStart(agentWriteDeps, issue),
+    planStop: (issue) => planAgentStop(agentWriteDeps, issue),
+    stop: (issue) => doAgentStop(agentWriteDeps, issue),
+    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
+    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
+    adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
+    prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
   },
   // FACTORY-772: `issueLoopWatchdog` is assigned further below (after the
   // issue loop itself is started — see that call site's own comment for
@@ -1239,6 +1303,33 @@ const { app, mcp } = buildApp({
     // comment, `../agents/query-agent-inventory.ts`, names the exact race
     // this accepts) — never a fresh census of its own.
     delete: (id, ifMatch, confirm) => writeRuleDelete(id, ifMatch, confirm, (ruleId) => ruleHasLiveAgent(ruleId, dashboardFeed.snapshot().rows), rulesWriteDeps),
+    // FACTORY-927: the SAME shared `scopeOf`/`rulesWriteDeps` every other
+    // rules write above reuses — `createRule`'s own reload-on-success and
+    // stale-file refusal ride the identical wiring, never a second copy.
+    create: (input, confirm, planHash) => createRule(input, confirm, planHash, scopeOf, rulesWriteDeps),
+    planCreate: (input, confirm) => planRuleCreate(input, confirm, scopeOf, rulesWriteDeps),
+  },
+  // FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+  // orchestration (`../resources/session-definitions-write.ts`) — reuses
+  // this daemon's own already-constructed `sessionDefinitionsWriteDeps`
+  // above, never a second freeze store or directory resolution.
+  sessionDefinitionsWrite: {
+    fields: (name, patch, ifMatch, confirm) => writeSessionDefinitionFields(sessionDefinitionsWriteDeps, name, patch, ifMatch, confirm),
+    frozen: (name, frozen, ifMatch) => writeSessionDefinitionFrozen(sessionDefinitionsWriteDeps, name, frozen, ifMatch),
+    undo: (backupId) => writeSessionDefinitionUndo(sessionDefinitionsWriteDeps, backupId),
+  },
+  // FACTORY-962 (epic FACTORY-659, slice D1 follow-up): `GET /api/links`'s
+  // own read — the file-backed link store only (see `listAllFileLinks`'s
+  // own header for why a jira-project-owned link can't be enumerated this
+  // way), read fresh every request, same discipline as `configInventory`.
+  linksRead: () => listAllFileLinks(defaultLinksStorePath()),
+  // FACTORY-962: the links write orchestration (`../resources/links-write.ts`)
+  // — reuses this daemon's own already-constructed `linksWriteDeps` above,
+  // never a second path resolution.
+  linksWrite: {
+    add: (resource, target) => writeLinkAdd(linksWriteDeps, resource, target),
+    remove: (resource, target) => writeLinkRemove(linksWriteDeps, resource, target),
+    undo: (backupId) => writeLinkUndo(linksWriteDeps, backupId),
   },
   auditWrite,
   writeRateLimit,
@@ -1252,7 +1343,7 @@ const { app, mcp } = buildApp({
   // was built from are passed through too, so `buildSettingEntries` can
   // report `source: "environment" | "file" | "default"` correctly for
   // every allowlisted key — see that function's own doc comment.
-  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
+  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
   // daemon's own already-loaded credentials, never anything from the
   // request itself.
@@ -1269,13 +1360,18 @@ const { app, mcp } = buildApp({
   settingsWrite: async (key, value, confirm) => {
     writeSetting(key, value, confirm);
     const fresh = loadSettingsFile(process.env);
-    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => readUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
+    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
   },
   // FACTORY-665: `POST /api/daemon/restart` — fixed-argv `systemctl --user
   // restart butchr.service`, ONLY when this daemon is actually running
   // under that unit (see `../web/daemon-restart.ts`'s own header).
   daemonRestart: () => restartDaemon(),
   daemonRestartRateLimit,
+  // FACTORY-668 (C1, read): `currentSystemdInfo()` is this process's OWN
+  // measured identity — the SAME derivation `ENVIRONMENT.md`'s "ground
+  // truth" and `/health`'s `build.unit`/`build.journalctl` already use —
+  // never a guessed unit name.
+  daemonLogs: () => readDaemonLogs(currentSystemdInfo(), { maxLines: DEFAULT_DAEMON_LOGS_MAX_LINES, maxBytes: DEFAULT_DAEMON_LOGS_MAX_BYTES }),
   // FACTORY-665 (PR-2): this daemon is already configured, so `GET
   // /api/setup/status` always reports `configured: true` here — the
   // dashboard's Setup page never shows once this is wired (setup mode,

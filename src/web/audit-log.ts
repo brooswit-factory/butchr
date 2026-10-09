@@ -60,6 +60,19 @@ export interface AuditWriteEvent {
   outcome: "accepted" | "rejected";
   /** Present (and required) when `outcome === "rejected"`; the refusal reason. */
   reason?: string;
+  /**
+   * FACTORY-694 item 2: `"write"` (default, every pre-existing caller) is a
+   * real config write — accepted alerts individually, rejected aggregates.
+   * `"test"` is a read-only connection test (`POST /api/settings/jira/test`)
+   * that changes nothing: an accepted test alerts NOBODY (there is nothing
+   * for an admin to review), and a rejected/failed test alerts immediately,
+   * under its own label, and never joins the `"write"` rejection aggregator
+   * — a burst of failed connection tests must never swallow or relabel a
+   * real rejected write's own "last event" detail, and vice versa. See
+   * `composeAlertText`/`createAuditLogger` below for exactly where this
+   * changes behavior.
+   */
+  kind?: "write" | "test";
 }
 
 export interface AuditLogDeps {
@@ -117,13 +130,15 @@ const CAP = { route: 200, action: 200, ids: 400, diff: 400, reason: 400, host: 2
 
 /** B4 fix (1): every field composed into the alert goes through `quoteField` (control/bidi stripping, mention-neutralizing, link-defanging, length-capping) — see this module's own header. */
 function composeAlertText(event: AuditWriteEvent, host: string, count: number): string {
-  const verb = event.outcome === "accepted" ? "ACCEPTED" : count > 1 ? `REJECTED x${count}` : "REJECTED";
+  const isTest = event.kind === "test";
+  const noun = isTest ? "connection test" : "write";
+  const verb = event.outcome === "accepted" ? "ACCEPTED" : isTest ? "FAILED" : count > 1 ? `REJECTED x${count}` : "REJECTED";
   const route = quoteField(event.route, { cap: CAP.route });
   const action = quoteField(event.action, { cap: CAP.action });
   const ids = quoteField(event.ids.join(", "), { cap: CAP.ids });
   const diff = quoteField(event.diffSummary, { cap: CAP.diff });
   const hostQ = quoteField(host, { cap: CAP.host });
-  const header = `**write ${verb}** on **${hostQ}** — ${route} ${action} [${ids}]`;
+  const header = `**${noun} ${verb}** on **${hostQ}** — ${route} ${action} [${ids}]`;
   const lines = [`route: ${route}`, `action: ${action}`, `ids: ${ids}`, `diff: ${diff}`];
   if (event.reason) lines.push(`reason: ${quoteField(event.reason, { cap: CAP.reason })}`);
   if (count > 1) lines.push(`count: ${count} rejected write(s) aggregated in this window (showing the last)`);
@@ -163,6 +178,17 @@ export function createAuditLogger(deps: AuditLogDeps): (event: Omit<AuditWriteEv
     deps.log(`[butchr:audit] ${line}`);
 
     if (event.outcome === "accepted") {
+      // FACTORY-694 item 2: a successful connection test changes nothing —
+      // never alert on it (only a failure is actionable for an admin).
+      if (event.kind !== "test") dispatchAlert(event, 1);
+      return;
+    }
+
+    if (event.kind === "test") {
+      // A failed/rejected connection test alerts immediately, under its own
+      // label — it must never join the "write" rejection aggregator below,
+      // whose aggregated "last event" exists to summarize a burst of real
+      // rejected writes, not get its detail overwritten by an unrelated test.
       dispatchAlert(event, 1);
       return;
     }

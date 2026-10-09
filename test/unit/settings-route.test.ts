@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { McpHandle } from "@brooswit/thatch";
 import { liveView, type ViewDeps } from "../../src/web/view.js";
 import { createCsrfTokenIssuer } from "../../src/web/csrf.js";
+import { BODY_CAP_BYTES } from "../../src/web/write-guard.js";
 import type { SettingsApiResponse } from "../../src/web/settings-api.js";
 import type { JiraTestResult } from "../../src/web/jira-connection-test.js";
 
@@ -243,8 +244,8 @@ describe("POST /api/settings/jira/test", () => {
     } finally { await app.stop(true); }
   });
 
-  test("valid CSRF, jiraTest configured: 200 with the exact fixed shape, audited", async () => {
-    const audited: Array<{ outcome: string }> = [];
+  test("valid CSRF, jiraTest configured: 200 with the exact fixed shape, audited with kind \"test\"", async () => {
+    const audited: Array<{ outcome: string; kind?: string }> = [];
     const deps = writeDeps({ jiraTest: async () => ok, auditWrite: (e) => { audited.push(e); } });
     const app = liveView(fakeMcp, baseDeps(deps));
     app.listen(0);
@@ -258,6 +259,64 @@ describe("POST /api/settings/jira/test", () => {
       expect(await res.json()).toEqual(ok);
       expect(audited).toHaveLength(1);
       expect(audited[0]!.outcome).toBe("accepted");
+      expect(audited[0]!.kind).toBe("test");
+    } finally { await app.stop(true); }
+  });
+
+  // FACTORY-694 item 1: the body parser's own sentinels (__bodyTooLarge,
+  // __invalidJson) were never checked on this route — an oversize or
+  // malformed body still reached `jiraTest()` and burned the rate-limiter
+  // slot, with `onParse`'s own 413/400 glued onto the real result. Fixed:
+  // refuse before the limiter and before any outbound call, same as every
+  // other write route's own `bodyProblem` check.
+  test("FACTORY-694 item 1: oversized body (above the cap): 413, jiraTest() never called, limiter slot never burned", async () => {
+    let called = false;
+    let limiterCalls = 0;
+    const deps = writeDeps({
+      jiraTest: async () => { called = true; return ok; },
+      jiraTestRateLimit: () => { limiterCalls++; return { ok: true as const }; },
+    });
+    const app = liveView(fakeMcp, baseDeps(deps));
+    app.listen(0);
+    const port = app.server!.port!;
+    deps.dashboardOriginGuard.port = port;
+    try {
+      const session = await fetch(`http://127.0.0.1:${port}/api/session`, { headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "sec-fetch-site": "same-origin" } });
+      const { csrfToken } = (await session.json()) as { csrfToken: string };
+      const big = "x".repeat(BODY_CAP_BYTES + 1024);
+      const res = await fetch(`http://127.0.0.1:${port}/api/settings/jira/test`, {
+        method: "POST",
+        headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": csrfToken },
+        body: JSON.stringify({ padding: big }),
+      });
+      expect(res.status).toBe(413);
+      expect(called).toBe(false);
+      expect(limiterCalls).toBe(0);
+    } finally { await app.stop(true); }
+  });
+
+  test("FACTORY-694 item 1: malformed JSON body: 400, jiraTest() never called, limiter slot never burned", async () => {
+    let called = false;
+    let limiterCalls = 0;
+    const deps = writeDeps({
+      jiraTest: async () => { called = true; return ok; },
+      jiraTestRateLimit: () => { limiterCalls++; return { ok: true as const }; },
+    });
+    const app = liveView(fakeMcp, baseDeps(deps));
+    app.listen(0);
+    const port = app.server!.port!;
+    deps.dashboardOriginGuard.port = port;
+    try {
+      const session = await fetch(`http://127.0.0.1:${port}/api/session`, { headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "sec-fetch-site": "same-origin" } });
+      const { csrfToken } = (await session.json()) as { csrfToken: string };
+      const res = await fetch(`http://127.0.0.1:${port}/api/settings/jira/test`, {
+        method: "POST",
+        headers: { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": csrfToken },
+        body: "{not json",
+      });
+      expect(res.status).toBe(400);
+      expect(called).toBe(false);
+      expect(limiterCalls).toBe(0);
     } finally { await app.stop(true); }
   });
 
