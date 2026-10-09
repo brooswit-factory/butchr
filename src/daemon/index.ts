@@ -112,6 +112,7 @@ import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-de
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessionDefinitionUndo, type LastUiWriteRef as SessionDefinitionLastUiWriteRef } from "../resources/session-definitions-write.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
@@ -1049,6 +1050,17 @@ const rulesWriteDeps = {
 // never a second type).
 const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
 
+// FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+// path's own deps — `dir`/`store` are the SAME `sessionDefinitionsPath()`/
+// `defaultSessionFreezeIo().store` `configInventory` above already reads,
+// never a second resolution. `lastUiWrite` is its OWN ref (undo scoped to
+// THIS write path only, never shared with `rulesWriteDeps.lastUiWrite`).
+const sessionDefinitionsWriteDeps = {
+  dir: () => sessionDefinitionsPath(),
+  store: defaultSessionFreezeIo().store,
+  lastUiWrite: { value: null } as SessionDefinitionLastUiWriteRef,
+};
+
 // FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
 // caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
 // HTTP exposure of the SAME trigger) are literally the same function —
@@ -1252,6 +1264,15 @@ const { app, mcp } = buildApp({
     // stale-file refusal ride the identical wiring, never a second copy.
     create: (input, confirm, planHash) => createRule(input, confirm, planHash, scopeOf, rulesWriteDeps),
     planCreate: (input, confirm) => planRuleCreate(input, confirm, scopeOf, rulesWriteDeps),
+  },
+  // FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+  // orchestration (`../resources/session-definitions-write.ts`) — reuses
+  // this daemon's own already-constructed `sessionDefinitionsWriteDeps`
+  // above, never a second freeze store or directory resolution.
+  sessionDefinitionsWrite: {
+    fields: (name, patch, ifMatch, confirm) => writeSessionDefinitionFields(sessionDefinitionsWriteDeps, name, patch, ifMatch, confirm),
+    frozen: (name, frozen, ifMatch) => writeSessionDefinitionFrozen(sessionDefinitionsWriteDeps, name, frozen, ifMatch),
+    undo: (backupId) => writeSessionDefinitionUndo(sessionDefinitionsWriteDeps, backupId),
   },
   auditWrite,
   writeRateLimit,
