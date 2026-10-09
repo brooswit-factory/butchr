@@ -1865,12 +1865,12 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
 // currently-running agent — never the bare `spec.key` (this ticket's own
 // change), and the full agent key is preserved in herdr metadata.
 describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () => {
-  test("an ordinary rule-engine spawn labels its workspace \"<shortId> · <ruleId>\", not the bare key", async () => {
+  test("an ordinary rule-engine spawn labels its workspace \"<ruleId> · <shortId>\", not the bare key", async () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
     await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
-    expect(f.creates[0].label).toBe("FACTORY-51 · jira-work");
+    expect(f.creates[0].label).toBe("jira-work · FACTORY-51");
   });
 
   test("a legacy/bare key (no rule-engine encoding) still labels as itself — unchanged, pre-FACTORY-95 behaviour", async () => {
@@ -1907,11 +1907,11 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
       const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
       const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
       await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-      expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(f.creates[0].label).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
       // `labelFor` unconditionally reasserts every OTHER member of the group's own
       // correct label whenever the group has more than one member — cheap, idempotent,
       // and never relies on knowing whether herdr's own stored value already agrees.
-      expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
+      expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "repos · brooswit-factory:rinth" }]);
       expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
@@ -1931,11 +1931,11 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
       const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
       const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
       await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-      expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
+      expect(f.creates[0].label).toBe("repos · brooswit-factory:rinth");
       // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
       expect(f.renamed).toHaveLength(1);
       expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
-      expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(f.renamed[0]?.label).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
       expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
       // The one invariant that matters: no two live workspaces ever share a label.
       expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
@@ -1980,7 +1980,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
-    expect(renameFor("wA")).toBe("FACTORY-51 · jira-work");
+    expect(renameFor("wA")).toBe("jira-work · FACTORY-51");
     expect(renameFor("wB")).toBe("triage");
     const metadataFor = (workspaceId: string) => f.metadata.find((m) => m.workspace_id === workspaceId);
     expect(metadataFor("wA")).toEqual({ workspace_id: "wA", source: "butchr", tokens: { agentKey: keyA } });
@@ -2015,8 +2015,8 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
       const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
       const labels = [renameFor("wA"), renameFor("wB")];
       expect(new Set(labels).size).toBe(2); // never shared
-      expect(labels).toContain("brooswit-factory:rinth · repos"); // one keeps the bare label
-      expect(labels.find((l) => l !== "brooswit-factory:rinth · repos")).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(labels).toContain("repos · brooswit-factory:rinth"); // one keeps the bare label
+      expect(labels.find((l) => l !== "repos · brooswit-factory:rinth")).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
@@ -2029,7 +2029,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     await herd.relabelOwnedWorkspaces();
-    expect(f.renamed.map((r) => r.label)).toEqual(["FACTORY-51 · jira-work", "FACTORY-51 · jira-work"]);
+    expect(f.renamed.map((r) => r.label)).toEqual(["jira-work · FACTORY-51", "jira-work · FACTORY-51"]);
   });
 
   test("never throws when herdr itself is unreachable — logged and swallowed, like reap.ts's own detector", async () => {
@@ -2058,7 +2058,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const lines: string[] = [];
     const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
     await herd.relabelOwnedWorkspaces();
-    expect(renamed).toEqual([{ workspace_id: "w-good", label: "FACTORY-1 · jira-work" }]);
+    expect(renamed).toEqual([{ workspace_id: "w-good", label: "jira-work · FACTORY-1" }]);
     expect(lines.some((l) => l.includes(`WARNING: [relabel] ${bad}`))).toBe(true);
   });
 });

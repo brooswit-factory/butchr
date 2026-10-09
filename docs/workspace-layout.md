@@ -29,7 +29,7 @@ reusing FACTORY-90's naming was not enough; four additional hazards
 
 **A1 — the leaf is the provider's short id alone.** `baseDisplayLabel`
 combines a short id with the rule id for a herdr LABEL
-(`"<shortId> · <ruleId>"`), but a workspace path already carries the rule id
+(`"<ruleId> · <shortId>"`), but a workspace path already carries the rule id
 as its own directory segment (`<provider>/<ruleId>/<leaf>`) — appending it
 into the leaf too would duplicate it. Only the leaf changes; the three-level
 shape is unchanged, which is what lets a caller tell an old-layout directory
