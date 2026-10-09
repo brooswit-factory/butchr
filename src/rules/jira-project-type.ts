@@ -117,12 +117,12 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
  // exactly the way `createIssueEventRules`'s own equivalent state already
  // does, rather than resetting (and re-firing) every poll.
  const projectEventRules = createProjectEventRules({
-   comments: deps.comments,
-   blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes,
-   stalledWakeDebounceMinutes: deps.stalledWakeDebounceMinutes,
-   stalledWakeMaxPerHour: deps.stalledWakeMaxPerHour,
-   onStalledWake: deps.onStalledWake,
-   onStalledWakeCapped: deps.onStalledWakeCapped,
+   ...(deps.comments ? { comments: deps.comments } : {}),
+   ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
+   ...(deps.stalledWakeDebounceMinutes !== undefined ? { stalledWakeDebounceMinutes: deps.stalledWakeDebounceMinutes } : {}),
+   ...(deps.stalledWakeMaxPerHour !== undefined ? { stalledWakeMaxPerHour: deps.stalledWakeMaxPerHour } : {}),
+   ...(deps.onStalledWake ? { onStalledWake: deps.onStalledWake } : {}),
+   ...(deps.onStalledWakeCapped ? { onStalledWakeCapped: deps.onStalledWakeCapped } : {}),
  });
  // FACTORY-981: adapts a `ProjectMatch` into the `ProjectResource` shape
  // `createProjectEventRules` actually diffs/decides over — `key` is set to
