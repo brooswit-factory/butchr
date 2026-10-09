@@ -48,15 +48,15 @@ jobs:
           curl -fsSL -o /usr/local/bin/herdr https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-linux-x86_64
           chmod +x /usr/local/bin/herdr
           herdr --version
+      - name: install the stub 'claude' (CI has no Claude account; see scripts/ci-fixtures/claude's own doc comment). Installed to /usr/local/bin, same as herdr above — a pane's own shell may not inherit a PATH only exported to this step. (No --version check: the stub ignores all args and just sleeps, so that would hang this step.)
+        run: install -m 0755 scripts/ci-fixtures/claude /usr/local/bin/claude
       - name: start herdr server
         run: |
           herdr server > herdr-server.log 2>&1 &
           for i in $(seq 1 30); do herdr api snapshot >/dev/null 2>&1 && exit 0; sleep 1; done
           echo "herdr server never became ready:"; cat herdr-server.log; exit 1
-      - name: run the real spawn smoke test (stub 'claude' on PATH — CI has no Claude account; see scripts/ci-fixtures/claude's own doc comment for why that's fine here)
-        run: |
-          chmod +x scripts/ci-fixtures/claude
-          PATH="$PWD/scripts/ci-fixtures:$PATH" bun run scripts/verify-ci-spawn-smoke.ts
+      - name: run the real spawn smoke test
+        run: bun run scripts/verify-ci-spawn-smoke.ts
       - name: stop herdr server
         if: always()
         run: herdr server stop || true
