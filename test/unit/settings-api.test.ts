@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
 
+/** FACTORY-694 item 4: every definition that is actually secret, reviewed and hardcoded by hand — NOT derived from `SECRET_KEY_RE` or any other rule. Adding a new `SETTINGS_DEFINITIONS` entry without updating this set (when it should be secret) is caught by the "every definition's secret flag is deliberate" test below. */
+const EXPECTED_SECRET_KEYS = new Set([
+  "ATLASSIAN_TOKEN",
+  "GITHUB_TOKEN_FILE",
+  "ROCKETCHAT_ADMIN_TOKEN_FILE",
+  "ROCKETCHAT_TOKEN_DIR",
+  "BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE",
+]);
+
 describe("buildSettingEntries", () => {
   test("every definition is reported exactly once, in order", () => {
     const entries = buildSettingEntries({});
@@ -75,6 +84,47 @@ describe("buildSettingEntries", () => {
       if (name === "BUTCHR_ASSIGNEE_STORY") { expect(SECRET_KEY_RE.test(name)).toBe(false); continue; }
       expect(SECRET_KEY_RE.test(name)).toBe(true);
     }
+  });
+
+  // FACTORY-694 item 4: `secret` is now an explicit, per-definition field —
+  // these tests prove it is deliberate (every definition has one, it
+  // matches a hand-reviewed expected set) and INDEPENDENT of the key's own
+  // name (a non-matching name can still be flagged secret, and a
+  // matching-looking name is never silently un-flagged by renaming alone).
+  describe("every definition's `secret` flag", () => {
+    test("is set on exactly the hand-reviewed expected set — not derived at runtime", () => {
+      for (const def of SETTINGS_DEFINITIONS) {
+        expect(def.secret).toBe(EXPECTED_SECRET_KEYS.has(def.key));
+      }
+    });
+
+    test("every key whose NAME matches SECRET_KEY_RE is explicitly secret: true (regression guard, not the source of truth)", () => {
+      for (const def of SETTINGS_DEFINITIONS) {
+        if (SECRET_KEY_RE.test(def.key)) expect(def.secret).toBe(true);
+      }
+    });
+
+    test("a future key with a secret VALUE and a NON-matching name is hidden because of its explicit flag alone, never because of its name", () => {
+      // "WEIRD_CUSTOM_SETTING" matches no part of SECRET_KEY_RE (token|secret|password|key) — yet is explicitly secret: true here.
+      expect(SECRET_KEY_RE.test("WEIRD_CUSTOM_SETTING")).toBe(false);
+      const definitions = [{ key: "WEIRD_CUSTOM_SETTING", description: "d", secret: true as const }];
+      const entries = buildSettingEntries({ WEIRD_CUSTOM_SETTING: "super-secret-value" }, undefined, {}, definitions);
+      const entry = entries[0]!;
+      expect(entry.secret).toBe(true);
+      expect(JSON.stringify(entry)).not.toContain("super-secret-value");
+      expect("value" in entry).toBe(false);
+      if (entry.secret) expect(entry.set).toBe(true);
+    });
+
+    test("a key with a matching-looking name but secret: false is shown verbatim — the flag, not the name, decides", () => {
+      // "SOME_KEY_PATH" matches SECRET_KEY_RE by name (contains "KEY") but is explicitly secret: false.
+      expect(SECRET_KEY_RE.test("SOME_KEY_PATH")).toBe(true);
+      const definitions = [{ key: "SOME_KEY_PATH", description: "d", secret: false as const }];
+      const entries = buildSettingEntries({ SOME_KEY_PATH: "/not/a/secret" }, undefined, {}, definitions);
+      const entry = entries[0]!;
+      expect(entry.secret).toBe(false);
+      if (!entry.secret) expect(entry.value).toBe("/not/a/secret");
+    });
   });
 
   // FACTORY-665 additions: `source: "file"` and `editable`.

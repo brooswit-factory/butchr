@@ -464,9 +464,18 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   return parts.length ? parts.join("; ") : "edit";
 }
 
-function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null }, outcome: { ok: boolean; error?: string }): void {
+/**
+ * FACTORY-694 item 2: `ctx.kind` defaults to `"write"` (every pre-existing
+ * caller is a real config write, unchanged) — `POST /api/settings/jira/test`
+ * is the one caller that passes `kind: "test"`, since a connection test
+ * changes nothing and must never be labeled or alerted on as a write (see
+ * `./audit-log.ts`'s own `composeAlertText`/`createAuditLogger` for what
+ * `kind` changes: a "test" success alerts nobody, and a "test" failure gets
+ * its own label and never joins the write-rejection aggregator).
+ */
+function auditOutcome(deps: ViewDeps, ctx: { route: string; action: string; ids: string[]; origin: string | null; kind?: "write" | "test" }, outcome: { ok: boolean; error?: string }): void {
   if (!deps.auditWrite) return;
-  const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.() };
+  const base = { route: ctx.route, action: ctx.action, ids: ctx.ids, diffSummary: ctx.action, origin: ctx.origin, uid: process.getuid?.(), kind: ctx.kind ?? "write" as const };
   deps.auditWrite(outcome.ok ? { ...base, outcome: "accepted" } : { ...base, outcome: "rejected", reason: outcome.error ?? "rejected" });
 }
 
@@ -817,31 +826,52 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // chain (Origin, Host, peer-uid, Content-Type, CSRF) because this makes
     // an outbound credentialed call, plus its own tighter rate limit (1 per
     // 5s — separate from the generic write-flood budget). Every attempt
-    // (accepted or rejected by the guard/limiter) is audited; the result
-    // handed back is the fixed, non-leaking shape `jiraTest()` already
-    // returns — this route never sees or forwards the upstream body/token.
-    .post("/api/settings/jira/test", async ({ set, request, server }) => {
+    // (accepted or rejected by the guard/limiter) is audited, with its OWN
+    // "jira-test" audit kind (FACTORY-694 item 2 — see `auditOutcome`'s own
+    // doc comment: a test is never a config write, so it must never alert
+    // on success and must never share the write-rejection aggregator); the
+    // result handed back is the fixed, non-leaking shape `jiraTest()`
+    // already returns — this route never sees or forwards the upstream
+    // body/token.
+    //
+    // FACTORY-694 item 1: this route has NO body of its own to read (the
+    // test always uses the daemon's own already-loaded credentials) — but
+    // the global `onParse` hook still runs before this handler and sets
+    // `set.status` to 413/400 on an oversize or malformed body, which would
+    // otherwise leak through verbatim underneath this route's own 200 (the
+    // outbound call still made, the limiter slot still burned, with a
+    // misleading 413/400 glued onto a real result). Checked here, right
+    // after the guard and BEFORE the limiter or `jiraTest()` — a bad
+    // sentinel refuses outright, same as every other write route's own
+    // `bodyProblem` check.
+    .post("/api/settings/jira/test", async ({ set, request, server, body }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) {
-        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: guard.reason });
         set.status = guard.status;
         return guard.body;
       }
       if (!deps.jiraTest) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
       if (deps.jiraTestRateLimit) {
         const clientKey = server?.requestIP(request)?.address ?? "unresolved";
         const result = deps.jiraTestRateLimit(clientKey);
         if (!result.ok) {
           const error = `rate limited: too many jira connection tests — retry after ${result.retryAfterSeconds}s`;
-          auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
+          auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error });
           set.status = 429;
           set.headers["retry-after"] = String(result.retryAfterSeconds);
           return { error };
         }
       }
       const result = await deps.jiraTest();
-      auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
+      auditOutcome(deps, { route: "POST /api/settings/jira/test", action: "jira-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "rejected" });
       return result;
     })
     // FACTORY-665 (PR-2) — `GET /api/setup/status`. Same guard discipline as
