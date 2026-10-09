@@ -69,60 +69,70 @@ const ROUTE_CASES: RouteCase[] = [
 
 for (const rc of ROUTE_CASES) {
   describe(`${rc.label} — write guard go-red cases (full battery)`, () => {
-    test("no Origin: 403, write never called", async () => {
+    test("no Origin: 403, write never called, nothing audited (a guard refusal writes no audit line)", async () => {
       const csrf = createCsrfTokenIssuer();
       let called = false;
-      const { app, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }));
+      const audited: unknown[] = [];
+      const { app, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }, audited));
       try {
         const res = await fetch(rc.path(port), { method: "POST", headers: { host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: rc.body });
         expect(res.status).toBe(403);
         expect(called).toBe(false);
+        expect(audited.length).toBe(0);
       } finally { await app.stop(true); }
     });
 
-    test("wrong Origin (forged): 403, write never called", async () => {
+    test("wrong Origin (forged): 403, write never called, nothing audited", async () => {
       const csrf = createCsrfTokenIssuer();
       let called = false;
-      const { app, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }));
+      const audited: unknown[] = [];
+      const { app, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }, audited));
       try {
         const res = await fetch(rc.path(port), { method: "POST", headers: { origin: "http://evil.example", host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: rc.body });
         expect(res.status).toBe(403);
         expect(called).toBe(false);
+        expect(audited.length).toBe(0);
       } finally { await app.stop(true); }
     });
 
-    test("missing CSRF header: 403, write never called", async () => {
+    test("missing CSRF header: 403, write never called, nothing audited", async () => {
       const csrf = createCsrfTokenIssuer();
       let called = false;
-      const { app, origin, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }));
+      const audited: unknown[] = [];
+      const { app, origin, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }, audited));
       try {
         const res = await fetch(rc.path(port), { method: "POST", headers: { origin, host, "content-type": "application/json" }, body: rc.body });
         expect(res.status).toBe(403);
         expect(called).toBe(false);
+        expect(audited.length).toBe(0);
       } finally { await app.stop(true); }
     });
 
-    test("wrong Content-Type: 415, write never called", async () => {
+    test("wrong Content-Type: 415, write never called, nothing audited", async () => {
       const csrf = createCsrfTokenIssuer();
       let called = false;
-      const { app, origin, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }));
+      const audited: unknown[] = [];
+      const { app, origin, host, port } = startApp(stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }, audited));
       try {
         const res = await fetch(rc.path(port), { method: "POST", headers: { origin, host, "content-type": "text/plain", [CSRF_HEADER]: csrf.token }, body: rc.body });
         expect(res.status).toBe(415);
         expect(called).toBe(false);
+        expect(audited.length).toBe(0);
       } finally { await app.stop(true); }
     });
 
-    test("failing peer-UID check: 403, write never called", async () => {
+    test("failing peer-UID check: 403, write never called, nothing audited", async () => {
       const csrf = createCsrfTokenIssuer();
       let called = false;
-      const deps = stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } });
+      const audited: unknown[] = [];
+      const deps = stubDeps(csrf, { [rc.writeKey]: (..._a: unknown[]) => { called = true; return ACCEPTED; } }, audited);
       deps.writeGuard = writeGuardDeps(csrf, false);
       const { app, origin, host, port } = startApp(deps);
       try {
         const res = await fetch(rc.path(port), { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: rc.body });
         expect(res.status).toBe(403);
         expect(called).toBe(false);
+        expect(audited.length).toBe(0);
       } finally { await app.stop(true); }
     });
   });
