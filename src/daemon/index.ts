@@ -65,6 +65,7 @@ import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMe
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
@@ -1038,6 +1039,14 @@ const rulesWriteDeps = {
   getSourceEtag: () => rulesHolder.getSourceEtag(),
 };
 
+// FACTORY-666 — shared by every `agentsWrite.*` binding above: this
+// daemon's own already-constructed `ops` (Jira) and `herd` (process
+// control/stop), plus `config.assignees` (the SAME `Roles` shape
+// `atlassianTools`'s own `adopt_worker` already staffs by — `../tools/
+// relationship.ts`'s `Roles` is a structural duplicate of `AssigneeRoles`,
+// never a second type).
+const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
+
 const { app, mcp } = buildApp({
   getRules,
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
@@ -1074,6 +1083,20 @@ const { app, mcp } = buildApp({
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
+  },
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
+  // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
+  // (process control) — no second Jira client, no second herdr client.
+  agentsWrite: {
+    snapshot: (issue) => agentSnapshot(agentWriteDeps, issue),
+    start: (issue) => doAgentStart(agentWriteDeps, issue),
+    planStop: (issue) => planAgentStop(agentWriteDeps, issue),
+    stop: (issue) => doAgentStop(agentWriteDeps, issue),
+    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
+    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
+    adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
+    prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
   },
   // FACTORY-772: `issueLoopWatchdog` is assigned further below (after the
   // issue loop itself is started — see that call site's own comment for
