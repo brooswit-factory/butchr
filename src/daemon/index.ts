@@ -1,6 +1,6 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
-import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
+import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
@@ -77,6 +77,7 @@ import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -1457,12 +1458,11 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
-// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
-// `pinnedActiveDetector` further down (project loop only) share the SAME
-// herdr.agent.list() read rather than each defining its own — "wire from the
-// existing seam, do not add a second reader". Behaviour-preserving: this is
-// the exact closure `syncLabels` was already given, moved to a name instead
-// of an inline argument.
+// BUTCHR-305/BUTCHR-238: extracted so this closure is importable by name
+// rather than reproduced inline — `createLabelSync` below has since moved to
+// its own `agentStatusesFeedingDashboard` tee (FACTORY-407, see that
+// closure's own doc comment), so the one live consumer of THIS closure today
+// is `pinnedActiveDetector` further down (project loop only, FACTORY-941).
 /**
  * The ticket a pane's workspace works, for rule-engine workspaces only — a
  * legacy workspace is never attributed to its ticket.
@@ -1510,9 +1510,18 @@ const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<str
   }
   return m;
 };
+// FACTORY-941: keyed by the FULL agentKey (`dashboardAgentOfCwd`, both
+// `jira-work` and `jira-project` providers — see `cwdAgentResolvers`'s own
+// doc comment, src/agents/dashboard.ts), never the bare key `resourceOfCwd`
+// produces: `pinnedActiveDetector`'s ids are `ProjectMatch.agentKey`
+// (`desiredFrom`'s `discovery.idOf` for the project resource type —
+// src/rules/jira-project-type.ts), which `resourceOfCwd` would always
+// resolve to `null` for (it is DELIBERATELY gated to `ownsRuleAgent` —
+// see `ownedAgentOfCwd`'s own doc comment above), making this map
+// structurally incapable of matching a project id if built that way.
 const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
   const { agents } = await herdr.agent.list();
-  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })));
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: dashboardAgentOfCwd(a.cwd) })));
 };
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
@@ -1665,6 +1674,14 @@ function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): v
     });
   }
 }
+
+// FACTORY-941: this poll's resolved pinned-active minutes override per
+// jira-project agentKey — `pinnedActiveMinutesFor` (src/rules/
+// jira-project-type.ts, exported there so its resolution logic is directly
+// unit-testable without importing this module) rebuilds this fresh from
+// each poll's own matches; see the `projectType.discovery.search` wrap
+// further down for exactly where/why.
+let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
 
 // FACTORY-845: the channel half, copying the SAME call shape every other
 // delivery seam in this file already uses (`deliverNotice`/
@@ -3060,6 +3077,33 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
+// BUTCHR-305/BUTCHR-238/FACTORY-941: audible-only pinned-active detection
+// for the project/manager tier — see src/agents/pinned-active.ts's own top
+// comment for the full derivation of why this shape (a resource both
+// `desired` "active" and `running`, with its agent stopped acting) is
+// invisible to every other detector, and why it is wired into the PROJECT
+// loop only (the issue tier already covers the same phenomenon via
+// `syncLabels`/`stallRemediation` above). `minutesFor` resolves per-id from
+// `pinnedActiveMinutesByProject`, refreshed each poll by the
+// `projectType.discovery.search` wrap further down (see that wrap's own
+// comment for why NOT `syncLabels`, unlike the issue tier's
+// `updateIdlePokeRuleConfig`). `addComment`/
+// `comments` decode `id` (a full `ProjectMatch.agentKey`) to its bare
+// project key via `resourceKeyOf` before reaching Jira/Confluence — neither
+// `speakOnOwnChannel` nor `ownChannelComments` understands an encoded
+// agentKey (see `issueCrashLoopDetector`'s own identical `resourceKeyOf`
+// wrapping above for the established precedent).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  minutesFor: (id) => pinnedActiveMinutesByProject.get(id),
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  quotaBlocked: (id) => herd.resourceQuotaBlocked(resourceKeyOf(id)) || quotaGate.blockedIds().some((qid) => resourceKeyOf(qid) === resourceKeyOf(id)),
+  log: (line) => console.error(`  [pinned-active] ${line}`),
+});
+
 // Free-form jira-project resource agents (BUTCHR-425): no ticket, Confluence,
 // or boss/worker workflow — just discovery (matching Jira projects), spawn,
 // and residency/admission, sharing the same host cap and herd namespace as
@@ -3082,6 +3126,24 @@ const projectType = createJiraProjectResourceType({
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
 });
+// FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
+// matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
+// `reconcileNow`/`checkPinnedActive` above — `discovery.search()` is the
+// first thing each poll calls (ahead of `reconcileNow`, which in turn runs
+// ahead of `syncLabels` — see that file's own call order), so wrapping it
+// here, rather than updating from `syncLabels` the way
+// `updateIdlePokeRuleConfig` does for the issue tier, is what keeps this
+// map current for the SAME poll's `checkPinnedActive` call rather than one
+// poll stale. `pinnedActiveMinutesFor` itself lives in jira-project-type.ts
+// (exported there, unit-tested directly) — this wrap is only the glue that
+// refreshes the module-level binding `pinnedActiveDetector.minutesFor`
+// reads above.
+const projectDiscoverySearch = projectType.discovery.search;
+projectType.discovery.search = async () => {
+  const matches = await projectDiscoverySearch();
+  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  return matches;
+};
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,
@@ -3090,8 +3152,13 @@ runResourceLoop(projectType, {
   notify: async () => {},
   onRespawn: async (id, reason) => { console.error(`  [jira-project] ${id} respawned: ${reason}`); },
   // No labels to sync; the only per-poll bookkeeping is retiring MCP
-  // connections for agents that dropped out of this poll's matches.
+  // connections for agents that dropped out of this poll's matches. The
+  // pinned-active minutes refresh (FACTORY-941) is NOT done here: `syncLabels`
+  // runs AFTER `reconcileNow` (src/daemon/loop.ts's own call order), which is
+  // too late for `checkPinnedActive` below to see this poll's rule matches —
+  // see the `projectType.discovery.search` wrap above instead.
   syncLabels: async (matches) => { await resourceConnections.retain(new Set(matches.map((m) => m.agentKey))); return new Set<string>(); },
+  checkPinnedActive: pinnedActiveDetector.check,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_PROJECT),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_PROJECT),
