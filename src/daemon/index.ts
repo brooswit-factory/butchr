@@ -111,6 +111,7 @@ import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
+import { confluencePageRules, CONFLUENCE_PAGE_POLL_MS, startConfluencePageLoop } from "./confluence-page-loop.js";
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
@@ -608,6 +609,12 @@ const zendeskTickets = zendeskStaffing.run
 // runs, reading the local disk directly (src/resources/filesystem.ts).
 const fsRules = filesystemRules(getRules());
 
+// FACTORY-998: confluence-page rules need no SEPARATE credential either —
+// this daemon never reaches here without a fully-configured Atlassian site
+// (the setup-mode gate above), so the real `ops` client built below already
+// covers it; every enabled confluence-page rule always runs.
+const confluencePageEnabledRules = confluencePageRules(getRules());
+
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
@@ -725,6 +732,7 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
 const jiraProjectEnabled = getRules().some((r) => r.enabled && r.resourceProvider === "jira-project");
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
+const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
 // BUTCHR-408: unlike every rule above, the managed-sessions query is built
 // into the daemon, never a user rules.json rule — it always runs (no
 // staffing gate, same "every enabled filesystem rule always runs" reasoning
@@ -748,7 +756,7 @@ const admissionController = createAdmissionController({
   rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -908,6 +916,13 @@ const filesystemHealth = createResourceLoopHealth({
   enabled: fsRules.length > 0,
   ...(fsRules.length ? {} : { disabledReason: "no enabled filesystem rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
+  log: (line) => console.error(line),
+});
+const confluencePageHealth = createResourceLoopHealth({
+  name: "confluence-page",
+  enabled: confluencePageEnabledRules.length > 0,
+  ...(confluencePageEnabledRules.length ? {} : { disabledReason: "no enabled confluence-page rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * CONFLUENCE_PAGE_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
@@ -1174,7 +1189,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -2554,6 +2569,34 @@ startFilesystemLoop({
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => filesystemHealth.recordSuccess(),
   onError: (e) => filesystemHealth.recordError(e),
+});
+
+// FACTORY-998: the confluence-page rule loop — its own agents and admission
+// bucket, reusing the SAME `ops` (AtlassianOps) instance every other
+// Confluence/Jira read path in this daemon already uses: no new credential,
+// no new staffing gate (see `confluencePageEnabledRules`'s own comment,
+// above `fsRules`).
+if (confluencePageEnabledRules.length) console.error(`  confluence-page rules: ${confluencePageEnabledRules.map((r) => r.id).join(", ")}`);
+startConfluencePageLoop({
+  rules: getRules(),
+  getChildPages: (parentId, cursor) => ops.getChildPages(parentId, cursor),
+  getPageVersions: (pageIds) => ops.getPageVersions(pageIds),
+  getPageComments: (pageId) => ops.getPageComments(pageId),
+  herd,
+  deliver: async (agent, resource, msg) => {
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => confluencePageHealth.recordSuccess(),
+  onError: (e) => confluencePageHealth.recordError(e),
 });
 
 // BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
