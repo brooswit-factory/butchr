@@ -62,16 +62,17 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // `changeNudge` (only Jira-issue-shaped resources call this function).
   // Folded into the same defensive fallback rather than given its own
   // clause here, for the same reason `pr`/`linked` are.
-  // FACTORY-997: `confluencePageEdit`/`confluencePageComment` are the same
-  // shape of "unreachable here in practice" as `linked`/`definitionField`
-  // above — a standalone Confluence page has no Jira-issue-shaped agent to
-  // call `changeNudge` for it (src/resources/confluence-page.ts's own
-  // event rules have no wiring into src/daemon/index.ts's issue-tier nudge
-  // path at all). Folded into the same defensive fallback for the same
-  // reason.
-  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason || "confluencePageEdit" in reason || "confluencePageComment" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
+  // FACTORY-998: `confluencePageEdit`/`confluencePageComment` ARE reachable
+  // here now — `confluencePageNudge` below (a real `confluence-page` agent's
+  // own nudge, src/rules/confluence-page-type.ts) calls THIS function, unlike
+  // the FACTORY-997 standalone-page event path, which never wired itself
+  // into any nudge renderer at all. Given their own clauses just below,
+  // mirroring `notifyReasonTag`'s own rendering of the same two members.
+  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
+  if ("confluencePageEdit" in reason) return `was edited (version ${reason.confluencePageEdit.from} → ${reason.confluencePageEdit.to})`;
+  if ("confluencePageComment" in reason) return `got ${reason.confluencePageComment.ids.length} new footer comment${reason.confluencePageComment.ids.length === 1 ? "" : "s"}`;
   if ("status" in reason) return `changed status from "${reason.status.from}" to "${reason.status.to}"`;
   if ("label" in reason) {
     const { prefix, from, to } = reason.label;
@@ -277,6 +278,21 @@ export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEv
  */
 export function filesystemNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Filesystem resource ${resource} ${reasonClause(reason)} — re-read it from disk.`;
+}
+
+/**
+ * FACTORY-998: the agent-facing push for a `confluence-page` agent's own
+ * child page. Carries no page-authored text (an edit or a new footer
+ * comment is read fresh, never pushed into the prompt — see this ticket's
+ * own "Agent safety" writeup and src/rules/confluence-page-type.ts); names
+ * the tool to re-read with (`get_my_confluence_page`, FACTORY-993/996,
+ * src/tools/defs.ts), since a confluence-page agent has no Jira/GitHub/
+ * Zendesk read tools. `reasonClause` already renders `confluencePageEdit`/
+ * `confluencePageComment` (and `appeared`/`disappeared`, for a
+ * singleton/persistent rule's query agent) without any change here.
+ */
+export function confluencePageNudge(resource: string, reason: NotifyReason | undefined): string {
+  return `[butchr] Confluence page ${resource} ${reasonClause(reason)} — re-read it with get_my_confluence_page.`;
 }
 
 /**

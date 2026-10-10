@@ -281,6 +281,7 @@ const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
   "zendesk-ticket": "zendesk-ticket",
   "jira-project": "jira-project",
   filesystem: "filesystem",
+  "confluence-page": "confluence-page",
 };
 
 /**

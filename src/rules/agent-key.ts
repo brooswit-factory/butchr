@@ -6,7 +6,7 @@
 import { isFilesystemResourceId } from "../resources/filesystem-ref.js";
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isGithubPrRef } from "../resources/github-pr-ref.js";
-import { isIssueKey, isProjectId } from "../resources/id.js";
+import { isIssueKey, isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
@@ -20,7 +20,7 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * issue), and (BUTCHR-407) local filesystem resources (files/directories, no
  * external credential). Only providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -61,7 +61,10 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  * `filesystem`: a canonical absolute path (`/home/butchr/repo/src/index.ts`),
  * resolved via `realpath` by discovery before it ever reaches this check
- * (src/resources/filesystem.ts).
+ * (src/resources/filesystem.ts). `confluence-page`: a bare numeric
+ * Confluence page id (`ConfluencePageRef`'s own canonical form,
+ * `../resources/confluence-page-ref.ts`) — the matched CHILD page's own id,
+ * never the rule's own ancestor id.
  */
 /**
  * FACTORY-570: `platform` is forwarded only to the `filesystem` case's
@@ -82,6 +85,7 @@ export function isResourceId(provider: ResourceProvider, id: string, platform: N
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);
     case "filesystem": return isFilesystemResourceId(id, platform);
+    case "confluence-page": return isConfluencePageResourceId(id);
   }
 }
 

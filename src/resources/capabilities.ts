@@ -94,7 +94,16 @@ const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
+  // FACTORY-998: `query` flipped true — a real provider/rule now exists
+  // (src/rules/confluence-page-type.ts, `{"ancestor": "<page id>"}`), usable
+  // by a caller with zero provider-specific knowledge the same way every
+  // other `true` cell here is. `read` stays `false` on purpose: a bare
+  // version-number read is not what this cell means (see the handoff doc's
+  // own "partial implementation" carve-out this module's header cites) —
+  // page CONTENT is read via `get_my_confluence_page`
+  // (FACTORY-993/996, src/tools/defs.ts), a self-only verb with no
+  // provider-agnostic entry point, not through a shared `read` capability.
+  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },

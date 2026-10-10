@@ -18,13 +18,17 @@ import { describe, expect, test } from "bun:test";
  * the base source read `void notifyAgent(mcp, agent, ..., msg).catch(...)`
  * followed unconditionally by `await herd.nudge(...)` at all 7 sites.
  *
- * FACTORY-845: the count below is now 8, not 7 — `deliverIdlePoke` (the
+ * FACTORY-845: the count below was 8, not 7 — `deliverIdlePoke` (the
  * idle-poke engine's channel half, src/daemon/index.ts) is an EIGHTH seam,
  * added in the same commit that updates these counts, exactly as
  * FACTORY-868's own contract on FACTORY-845 instructs ("when you add a
  * site, update the counts in the same commit and say so in your PR"). This
  * is the intended, anticipated outcome of adding a seam — not evidence the
  * new seam is wrong.
+ *
+ * FACTORY-998: the count below is now 9, not 8 — `startConfluencePageLoop`
+ * (the new `confluence-page` rule loop) is a NINTH seam, same contract,
+ * same reasoning: an anticipated, intended new seam, not a regression.
  */
 
 const src = await Bun.file(new URL("../../src/daemon/index.ts", import.meta.url)).text();
@@ -34,9 +38,9 @@ describe("every delivery seam routes through the ONE shared gate (acceptance D)"
     expect(src.includes("void notifyAgent(")).toBe(false);
   });
 
-  test("notifyAgent is still called exactly 8 times — once per seam, none dropped", () => {
+  test("notifyAgent is still called exactly 9 times — once per seam, none dropped", () => {
     const count = src.split("notifyAgent(mcp,").length - 1;
-    expect(count).toBe(8);
+    expect(count).toBe(9);
   });
 
   test("every notifyAgent(mcp, ...) call is wrapped as deliverNotice's pushChannel — never called bare", () => {
@@ -45,9 +49,9 @@ describe("every delivery seam routes through the ONE shared gate (acceptance D)"
     expect(wrapped).toBe(calls);
   });
 
-  test("deliverNotice and renderNotifyDelivery are each invoked exactly 8 times — one per seam, no seam keeps its own copy", () => {
-    expect(src.split("deliverNotice({").length - 1).toBe(8);
-    expect(src.split("renderNotifyDelivery(").length - 1).toBe(8);
+  test("deliverNotice and renderNotifyDelivery are each invoked exactly 9 times — one per seam, no seam keeps its own copy", () => {
+    expect(src.split("deliverNotice({").length - 1).toBe(9);
+    expect(src.split("renderNotifyDelivery(").length - 1).toBe(9);
   });
 
   test("the shared gate is imported from src/notify/deliver.ts, not reimplemented locally", () => {
@@ -120,6 +124,13 @@ describe("named per-seam checks", () => {
 
   test("FACTORY-845: idle-poke engine (deliverIdlePoke)", () => {
     const block = sliceAfter("const deliverIdlePoke = async (issue: string, text: string)", 500);
+    expect(block).toContain("deliverNotice({");
+    expect(block).toContain("renderNotifyDelivery(");
+    expect(block).not.toContain("void notifyAgent(");
+  });
+
+  test("FACTORY-998: confluence-page loop (startConfluencePageLoop)", () => {
+    const block = sliceAfter("startConfluencePageLoop({");
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
