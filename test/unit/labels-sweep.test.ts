@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { sweepStaleAgentLabels } from "../../src/labels/sweep.js";
+import { sweepAbsentLiveAgentLabels, sweepStaleAgentLabels } from "../../src/labels/sweep.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import type { LabelWriter } from "../../src/labels/sync.js";
 import { ALL_ADMISSION_LABEL_KEYS, ALL_AGENT_LABEL_KEYS } from "../../src/labels/plan.js";
@@ -72,6 +72,42 @@ describe("sweepStaleAgentLabels", () => {
     const jira = fakeJira();
     await sweepStaleAgentLabels({ search: async () => [iss("KAN-1", "Done", ["admission:withheld"])], jira });
     expect(jira.calls).toEqual([{ key: "KAN-1", add: [], remove: ["admission:withheld"] }]);
+  });
+});
+
+describe("sweepAbsentLiveAgentLabels (FACTORY-1001)", () => {
+  test("purges a labelled active ticket outside the rule query when its owned pane is gone, without a notification seam", async () => {
+    const jira = fakeJira();
+    const writes: string[][] = [];
+    await sweepAbsentLiveAgentLabels({
+      search: async () => [iss("MINECRAFT-168", "In Progress", ["agent:working", "needs-design"])],
+      jira,
+      liveKeys: new Set(),
+      ownedKeys: new Set(["MINECRAFT-168"]),
+      onWrite: (keys) => writes.push([...keys]),
+    });
+    expect(jira.calls).toEqual([{ key: "MINECRAFT-168", add: [], remove: ["agent:working"] }]);
+    expect(writes).toEqual([["MINECRAFT-168"]]);
+  });
+
+  test("does not purge another daemon's live pane or a genuinely live owned pane", async () => {
+    const jira = fakeJira();
+    await sweepAbsentLiveAgentLabels({
+      search: async () => [iss("FACTORY-7", "In Progress", ["agent:idle"]), iss("FACTORY-8", "In Progress", ["agent:blocked"])],
+      jira,
+      liveKeys: new Set(["FACTORY-7", "FACTORY-8"]),
+      ownedKeys: new Set(["FACTORY-7"]),
+    });
+    expect(jira.calls).toEqual([]);
+  });
+
+  test("selects every non-none agent state from the canonical anchor", async () => {
+    const jira = fakeJira();
+    let jql = "";
+    await sweepAbsentLiveAgentLabels({ search: async (value) => { jql = value; return []; }, jira, liveKeys: new Set(), ownedKeys: new Set(["FACTORY-9"]) });
+    const quoted = [...jql.matchAll(/"(agent:[a-z-]+)"/g)].map((m) => m[1]);
+    expect(quoted.sort()).toEqual(ALL_AGENT_LABEL_KEYS.filter((label) => label !== "agent:none").sort());
+    expect(jql).toContain("key IN (FACTORY-9)");
   });
 });
 

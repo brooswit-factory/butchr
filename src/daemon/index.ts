@@ -71,7 +71,7 @@ import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelv
 import { createLabelSync } from "../labels/sync.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
-import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { sweepAbsentLiveAgentLabels, sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
@@ -2149,6 +2149,14 @@ const syncLabels = createLabelSync({
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
+  reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => sweepAbsentLiveAgentLabels({
+    search: (jql) => atlassian.search(jql),
+    jira: labelWriter,
+    liveKeys,
+    ownedKeys,
+    onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
+    log: (line) => console.error(`  ${line}`),
+  }),
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
