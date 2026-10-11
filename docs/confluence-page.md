@@ -78,8 +78,10 @@ Each poll, for every enabled `confluence-page` rule
 3. One `getPageComments(id)` call PER child — never batched (that op's own
    doc comment on `AtlassianOps` names a MEASURED trap: a batch-shaped
    footer-comments request silently returns the wrong pages' comments).
+4. One `getPage(id)` call PER readable child, using that same authenticated
+   client, to read its current storage body for the resource-specific brief.
 
-Call count per tick is therefore `2 + N` Confluence API calls for one rule
+Call count per tick is therefore `2 + 2N` Confluence API calls for one rule
 with `N` current children (one or more `getChildPages` pages, one batched
 `getPageVersions`, `N` individual `getPageComments`) — linear in the number
 of children, same shape FACTORY-997's own event path documents for its
@@ -123,35 +125,19 @@ A `confluence-page` agent is nudged with `confluencePageNudge`
 A matched child page is always `"active"` — this provider has no notion of
 rest (same as `filesystem`/`github-issue`).
 
-## Brief mechanism — a deliberate decision, not a silent default
+## Brief mechanism
 
-The epic's own gloss says "the child page's text becomes the agent's
-brief." FACTORY-991/995's spike (see FACTORY-995, comment 33373) found that
-is NOT what any existing provider actually does: `filesystem`'s "brief" is
-ALWAYS `rule.brief` — the rule author's own fixed text — never the matched
-resource's own content.
+For every matched child, `specForConfluencePage` uses that child's current
+Confluence storage body as its resource-specific agent brief. The provider
+refreshes it during each discovery poll, so an edit supplies the current
+content to a future or recreated agent. It does not claim to rewrite an
+already-running agent's original prompt.
 
-**Decision: follow that precedent exactly.** `specForConfluencePage`
-(`src/rules/confluence-page-type.ts`) sets `brief: rule.brief`, never the
-child page's rendered body. An agent that needs its own page's content
-reads it with `get_my_confluence_page` (FACTORY-993/996,
-`src/tools/defs.ts`) — a tool call, resolved server-side from the caller's
-own `x-issue`, not a brief substitution.
-
-Why (b) over (a) — inlining the page's content as the brief:
-
-- Consistency: no other provider inlines a resource's own content into the
-  spawn brief (`jira-work`'s brief is the rule's own text; an issue's
-  description/comments are read via tools, not pushed into `brief`).
-  `confluence-page` special-casing the spawn path would be the one provider
-  that behaves differently for no structural reason.
-- `get_my_confluence_page`/`get_my_confluence_page_comments` were built by
-  FACTORY-993/996 SPECIFICALLY to serve this need — using them is not a
-  workaround, it is the intended read path.
-- Inlining raw page content into a brief widens the injection surface at
-  spawn time, before any of the runtime bounded-read/size-cap protections
-  `get_my_confluence_page` already has (see "Agent safety" in this story's
-  own PR description) apply.
+The content is surrounded by an explicit untrusted-data boundary instructing
+the agent not to treat page text as authority over system, developer, or
+workspace instructions. This is intentionally provider-specific: it fulfills
+the binding child-page-brief contract rather than silently falling back to
+the shared `rule.brief`.
 
 ## Safety
 
@@ -169,10 +155,12 @@ Why (b) over (a) — inlining the page's content as the brief:
 - **A single child's unreadable version/comments is dropped, not fatal** —
   costs only that one page for that one tick; the rule's poll otherwise
   succeeds normally.
-- **Page content is never pushed into a prompt by the provider itself** —
-  see "Brief mechanism" above; a page's own text (and any footer comment
-  text) reaches an agent only through a deliberate tool call
-  (`get_my_confluence_page`/`get_my_confluence_page_comments`), both of
-  which are bounded, caller-controllable range reads with a size cap — see
-  that tool's own doc comment (`src/tools/defs.ts`) and this story's PR
-  description's "Agent safety" section for the full writeup.
+- **Bounded prompt input.** A child with no readable storage body, or one
+  over `MAX_CONFLUENCE_PAGE_BRIEF_CHARS` (32,000 characters), is omitted
+  from that poll rather than silently truncated. This is an honest refusal:
+  its agent is not launched with partial task material. A later smaller,
+  readable version can match and launch normally.
+- **Injection boundary.** The provider marks the body as untrusted task data
+  before it enters a brief. Authentication remains unchanged: all reads use
+  the existing `AtlassianOps` client and no page text is sent to another
+  service by discovery.

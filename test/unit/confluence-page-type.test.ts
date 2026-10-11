@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   confluencePageShortDisplayId,
   createConfluencePageResourceType,
+  MAX_CONFLUENCE_PAGE_BRIEF_CHARS,
   createConfluencePageTypeEventRules,
   MAX_CHILD_PAGES,
   ownsConfluencePageAgent,
@@ -17,6 +18,8 @@ import type { Rule } from "../../src/rules/rules.js";
 import { runResourceLoop } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { NotifyReason } from "../../src/resources/types.js";
+
+const pageBody = (body: string) => async () => ({ body: { storage: { value: body } } });
 
 function rule(over: Partial<Rule> & { id: string; query: string }): Rule {
   return { enabled: true, resourceProvider: "confluence-page", brief: "Work this child page.", execution: "swarm", account: "none", role: "worker", ...over };
@@ -160,16 +163,61 @@ describe("ownsConfluencePageAgent / confluencePageShortDisplayId", () => {
   });
 });
 
-describe("brief mechanism (design decision (b)): spec.brief is always the rule's own fixed text, never the page's content", () => {
-  test("specForConfluencePage never substitutes the page's own title/content into brief", () => {
+describe("brief mechanism: the child page's bounded, untrusted text is the resource-specific agent brief", () => {
+  test("specForConfluencePage uses the matched child's content, never the shared rule brief", () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-    const match: ConfluencePageMatch = { agentKey: "confluence-page:docs:200", rule: r, page: page({ id: "200", title: "Some real page title" }) };
+    const match: ConfluencePageMatch = { agentKey: "confluence-page:docs:200", rule: r, page: page({ id: "200", title: "Some real page title" }), brief: "<confluence-page-content>Child instructions</confluence-page-content>" };
     const spec = specForConfluencePage(match);
-    expect(spec.brief).toBe(r.brief);
-    expect(spec.brief).not.toContain("Some real page title");
+    expect(spec.brief).toBe(match.brief);
+    expect(spec.brief).toContain("Child instructions");
+    expect(spec.brief).not.toBe(r.brief);
     expect(spec.resource).toBe("200");
     expect(spec.issuetype).toBe("confluence-page");
     expect(spec.summary).toBe("Some real page title");
+  });
+
+  test("discovery reads each child body through the existing client and makes that body's text the brief", async () => {
+    const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
+    const matches = await searchConfluencePageRules({
+      rules: [r],
+      getChildPages: async () => ({ results: [{ id: "200" }] }),
+      getPageVersions: async () => ({ "200": 1 }),
+      getPageComments: async () => ({ results: [] }),
+      getPage: pageBody("<p>Current child text</p>"),
+    });
+    expect(specForConfluencePage(matches[0]).brief).toContain("Current child text");
+  });
+
+  test("an oversized or body-less child is honestly omitted rather than truncating untrusted content into a brief", async () => {
+    const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
+    const matches = await searchConfluencePageRules({
+      rules: [r],
+      getChildPages: async () => ({ results: [{ id: "200" }, { id: "201" }] }),
+      getPageVersions: async () => ({ "200": 1, "201": 1 }),
+      getPageComments: async () => ({ results: [] }),
+      getPage: async (id) => id === "200"
+        ? { body: { storage: { value: "x".repeat(MAX_CONFLUENCE_PAGE_BRIEF_CHARS + 1) } } }
+        : { body: {} },
+    });
+    expect(matches).toEqual([]);
+  });
+
+  test("a later discovery after an edit carries the new body for a future or recreated spec", async () => {
+    const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
+    let version = 1;
+    let body = "<p>First revision</p>";
+    const deps = {
+      rules: [r],
+      getChildPages: async () => ({ results: [{ id: "200" }] }),
+      getPageVersions: async () => ({ "200": version }),
+      getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(body),
+    };
+    expect(specForConfluencePage((await searchConfluencePageRules(deps))[0]).brief).toContain("First revision");
+    version = 2;
+    body = "<p>Second revision</p>";
+    deps.getPage = pageBody(body);
+    expect(specForConfluencePage((await searchConfluencePageRules(deps))[0]).brief).toContain("Second revision");
   });
 
   test("specForConfluencePageQuery (singleton/persistent) also uses the rule's own brief, with no single resource", () => {

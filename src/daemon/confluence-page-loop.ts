@@ -69,6 +69,7 @@ export function startConfluencePageLoop(deps: ConfluencePageLoopDeps): Stop {
     getChildPages: deps.getChildPages,
     getPageVersions: deps.getPageVersions,
     getPageComments: deps.getPageComments,
+    getPage: deps.getPage,
     log: deps.log,
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsConfluencePageAgent),
   });
