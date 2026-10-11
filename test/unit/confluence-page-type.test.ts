@@ -192,7 +192,9 @@ describe("brief mechanism: the child page's bounded, untrusted text is the resou
       getPageComments: async () => ({ results: [] }),
       getPage: pageBody("<p>Current child text</p>"),
     });
-    expect(specForConfluencePage(matches[0]).brief).toContain("Current child text");
+    const match = matches[0];
+    if (!match) throw new Error("expected the readable child page to match");
+    expect(specForConfluencePage(match).brief).toContain("Current child text");
   });
 
   test("an oversized or body-less child is honestly omitted rather than truncating untrusted content into a brief", async () => {
@@ -221,11 +223,15 @@ describe("brief mechanism: the child page's bounded, untrusted text is the resou
       getPageComments: async () => ({ results: [] }),
       getPage: pageBody(body),
     };
-    expect(specForConfluencePage((await searchConfluencePageRules(deps))[0]).brief).toContain("First revision");
+    const first = (await searchConfluencePageRules(deps))[0];
+    if (!first) throw new Error("expected the first revision to match");
+    expect(specForConfluencePage(first).brief).toContain("First revision");
     version = 2;
     body = "<p>Second revision</p>";
     deps.getPage = pageBody(body);
-    expect(specForConfluencePage((await searchConfluencePageRules(deps))[0]).brief).toContain("Second revision");
+    const second = (await searchConfluencePageRules(deps))[0];
+    if (!second) throw new Error("expected the second revision to match");
+    expect(specForConfluencePage(second).brief).toContain("Second revision");
   });
 
   test("specForConfluencePageQuery (singleton/persistent) also uses the rule's own brief, with no single resource", () => {
@@ -239,7 +245,7 @@ describe("brief mechanism: the child page's bounded, untrusted text is the resou
 
 describe("createConfluencePageTypeEventRules — swarm add/remove/edit diff, reusing diffConfluencePage", () => {
   const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-  const unit = (p: ConfluencePageSnapshot) => ({ kind: "resource" as const, match: { agentKey: `confluence-page:docs:${p.id}`, rule: r, page: p } });
+  const unit = (p: ConfluencePageSnapshot) => ({ kind: "resource" as const, match: { agentKey: `confluence-page:docs:${p.id}`, rule: r, page: p, brief: "<confluence-page-content/>" } });
 
   test("a page entering the primary set is NOT itself a notification (spawn already says it)", async () => {
     const rules = createConfluencePageTypeEventRules();
