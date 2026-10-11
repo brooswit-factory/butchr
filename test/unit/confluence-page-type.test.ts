@@ -32,7 +32,7 @@ function page(over: Partial<ConfluencePageSnapshot> & { id: string }): Confluenc
 describe("searchConfluencePageRules — discovery: real child-page enumeration", () => {
   test("one rule, one page of children: each child becomes a match keyed by the real encoded agent key", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r],
       getChildPages: async (parentId) => {
         expect(parentId).toBe("100");
@@ -40,6 +40,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
       },
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(matches.length).toBe(2);
@@ -53,7 +54,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
   test("pagination: getChildPages is paged to exhaustion via nextCursor, never just the first page", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
     const calls: Array<string | undefined> = [];
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r],
       getChildPages: async (_parentId, cursor) => {
         calls.push(cursor);
@@ -63,6 +64,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
       },
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(calls).toEqual([undefined, "c2", "c3"]);
@@ -71,7 +73,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
 
   test("crossing MAX_CHILD_PAGES rejects the whole rule's poll, never a truncated list", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r],
       getChildPages: async (_parentId, cursor) => {
         const n = cursor ? Number(cursor) : 0;
@@ -79,17 +81,19 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
       },
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     await expect(searchConfluencePageRules(deps)).rejects.toThrow(new RegExp(`over ${MAX_CHILD_PAGES} child pages`));
   });
 
   test("a child page missing from getPageVersions' response is dropped, not fatal", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r],
       getChildPages: async () => ({ results: [{ id: "200" }, { id: "201" }] }),
       getPageVersions: async () => ({ "200": 1 }), // 201 missing: unreadable this tick
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(matches.map((m) => m.page.id)).toEqual(["200"]);
@@ -97,7 +101,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
 
   test("a child page whose getPageComments call throws is dropped, not fatal, and does not affect sibling pages", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r],
       getChildPages: async () => ({ results: [{ id: "200" }, { id: "201" }] }),
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
@@ -105,6 +109,7 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
         if (id === "201") throw new Error("boom");
         return { results: [] };
       },
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(matches.map((m) => m.page.id)).toEqual(["200"]);
@@ -114,11 +119,12 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
     const enabledOther = rule({ id: "other", resourceProvider: "jira-work" as Rule["resourceProvider"], query: "q" });
     const disabled = rule({ id: "disabled", query: JSON.stringify({ ancestor: "999" }), enabled: false });
     let called = false;
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [enabledOther, disabled],
       getChildPages: async () => { called = true; return { results: [] }; },
       getPageVersions: async () => ({}),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(matches).toEqual([]);
@@ -128,11 +134,12 @@ describe("searchConfluencePageRules — discovery: real child-page enumeration",
   test("two rules naming the same child page produce two distinct agent keys, never colliding", async () => {
     const r1 = rule({ id: "rule1", query: JSON.stringify({ ancestor: "100" }) });
     const r2 = rule({ id: "rule2", query: JSON.stringify({ ancestor: "200" }) });
-    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments"> = {
+    const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {
       rules: [r1, r2],
       getChildPages: async () => ({ results: [{ id: "500" }] }), // same child under both ancestors
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     };
     const matches = await searchConfluencePageRules(deps);
     expect(matches.length).toBe(2);
@@ -195,6 +202,7 @@ describe("brief mechanism: the child page's bounded, untrusted text is the resou
       getChildPages: async () => ({ results: [{ id: "200" }, { id: "201" }] }),
       getPageVersions: async () => ({ "200": 1, "201": 1 }),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
       getPage: async (id) => id === "200"
         ? { body: { storage: { value: "x".repeat(MAX_CONFLUENCE_PAGE_BRIEF_CHARS + 1) } } }
         : { body: {} },
@@ -331,6 +339,7 @@ describe("createConfluencePageResourceType — end-to-end: add/remove a child pa
       getChildPages: async () => ({ results: childIds.map((id) => ({ id })) }),
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, 1])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     });
     const herd = fakeHerd();
     const notified: Array<{ issue: string; about: string; reason: NotifyReason | undefined }> = [];
@@ -358,6 +367,7 @@ describe("createConfluencePageResourceType — end-to-end: add/remove a child pa
       getChildPages: async () => ({ results: [{ id: "300" }] }),
       getPageVersions: async (ids) => Object.fromEntries(ids.map((id) => [id, version])),
       getPageComments: async () => ({ results: [] }),
+      getPage: pageBody(""),
     });
     const notified: Array<{ issue: string; about: string; reason: NotifyReason | undefined }> = [];
     const stop = runResourceLoop(resourceType, {

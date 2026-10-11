@@ -76,7 +76,7 @@ export interface ConfluencePageResourceDeps {
   getPageVersions(pageIds: readonly string[]): Promise<Record<string, number>>;
   getPageComments(pageId: string): Promise<{ results: Array<{ id: string }> }>;
   /** Existing authenticated Confluence read; no provider-specific auth path. */
-  getPage?(pageId: string): Promise<unknown>;
+  getPage(pageId: string): Promise<unknown>;
   log?: (line: string) => void;
   /** BUTCHR-398: this provider's own running herd ids, for `logExecutionModeSwitches` — see `RuleResourceDeps.runningIds`'s own doc comment (src/rules/resource-type.ts). Optional; omitted, no mode-switch logging runs. */
   runningIds?: () => Promise<readonly string[]>;
@@ -167,15 +167,11 @@ export async function searchConfluencePageRules(
         } catch {
           continue; // this one page's comments read failed this tick — drop just this page, not the whole rule.
         }
-        // Production always supplies `getPage`; keeping this optional makes
-        // existing narrow discovery fakes test enumeration independently.
-        let body: string | null = "";
-        if (deps.getPage) {
-          try {
-            body = bodyOf(await deps.getPage(child.id));
-          } catch {
-            continue; // unreadable content cannot safely become this agent's brief.
-          }
+        let body: string | null;
+        try {
+          body = bodyOf(await deps.getPage(child.id));
+        } catch {
+          continue; // unreadable content cannot safely become this agent's brief.
         }
         if (body === null || body.length > MAX_CONFLUENCE_PAGE_BRIEF_CHARS) continue;
         out.push({
