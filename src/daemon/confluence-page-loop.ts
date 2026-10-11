@@ -31,6 +31,7 @@ export interface ConfluencePageLoopDeps {
   getChildPages: ConfluencePageResourceDeps["getChildPages"];
   getPageVersions: ConfluencePageResourceDeps["getPageVersions"];
   getPageComments: ConfluencePageResourceDeps["getPageComments"];
+  getPage: ConfluencePageResourceDeps["getPage"];
   herd: Herd;
   /** Deliver one message to one agent (channel push and pane prompt). */
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
@@ -69,6 +70,7 @@ export function startConfluencePageLoop(deps: ConfluencePageLoopDeps): Stop {
     getChildPages: deps.getChildPages,
     getPageVersions: deps.getPageVersions,
     getPageComments: deps.getPageComments,
+    getPage: deps.getPage,
     log: deps.log,
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsConfluencePageAgent),
   });

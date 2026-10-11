@@ -2582,6 +2582,7 @@ startConfluencePageLoop({
   getChildPages: (parentId, cursor) => ops.getChildPages(parentId, cursor),
   getPageVersions: (pageIds) => ops.getPageVersions(pageIds),
   getPageComments: (pageId) => ops.getPageComments(pageId),
+  getPage: (pageId) => ops.getPage(pageId),
   herd,
   deliver: async (agent, resource, msg) => {
     const result = await deliverNotice({
