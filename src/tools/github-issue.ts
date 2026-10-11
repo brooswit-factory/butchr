@@ -109,7 +109,23 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
   "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
   "filesystem": "your own file tools (Read/Write/Edit/Bash) directly — there is no butchr MCP tool for a filesystem resource",
+  // FACTORY-998: the ONE non-Jira provider with a narrow carve-out in
+  // `forJiraCallers` below (`CONFLUENCE_PAGE_OWN_TOOL_NAMES`) — every OTHER
+  // Jira/Confluence tool still refuses it, citing this same message.
+  "confluence-page": "get_my_confluence_page and get_my_confluence_page_comments",
 };
+
+/**
+ * FACTORY-998: the exact two tools a `confluence-page` rule agent is let
+ * through `forJiraCallers` for — everything else in the wrapped Jira/
+ * Confluence tool set still refuses it, same as every other non-Jira
+ * provider. These two were built (FACTORY-993/996) specifically to read a
+ * confluence-page agent's own resource via `x-issue` — see
+ * `requireOwnConfluencePageId` (src/tools/defs.ts) — and both act ONLY on
+ * the caller's own page, never on an argument, so widening this allowlist
+ * to exactly these two names cannot be used to reach any OTHER resource.
+ */
+const CONFLUENCE_PAGE_OWN_TOOL_NAMES = new Set(["get_my_confluence_page", "get_my_confluence_page_comments"]);
 
 /**
  * Wrap Jira/Confluence tools so a `github-issue`, `jira-idea` or
@@ -127,6 +143,13 @@ export function forJiraCallers(tools: Record<string, ToolDef<any>>, log: (line: 
       ...def,
       handler: (args: unknown, c: { headers: Readonly<Record<string, string>> }) => {
         const provider = callerIdentity(c.headers)?.provider;
+        // FACTORY-998: a `confluence-page` caller passes through for EXACTLY
+        // its own two read tools (`CONFLUENCE_PAGE_OWN_TOOL_NAMES`) — every
+        // other Jira/Confluence tool still refuses it below, same as every
+        // other non-Jira provider.
+        if (provider === "confluence-page" && CONFLUENCE_PAGE_OWN_TOOL_NAMES.has(name)) {
+          return def.handler(args as never, c as never);
+        }
         if (provider && provider !== "jira-work" && provider !== "jira-project") {
           log(`  [tools] ${c.headers["x-butchr-agent"]} → refused ${name}: ${provider} agents have no Jira work or Confluence tools`);
           throw new Refusal(`${name}: refusing a ${provider} agent — Jira and Confluence tools are for jira-work agents; use ${OWN_TOOLS[provider]}`);
