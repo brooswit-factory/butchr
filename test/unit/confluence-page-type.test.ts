@@ -204,7 +204,6 @@ describe("brief mechanism: the child page's bounded, untrusted text is the resou
       getChildPages: async () => ({ results: [{ id: "200" }, { id: "201" }] }),
       getPageVersions: async () => ({ "200": 1, "201": 1 }),
       getPageComments: async () => ({ results: [] }),
-      getPage: pageBody(""),
       getPage: async (id) => id === "200"
         ? { body: { storage: { value: "x".repeat(MAX_CONFLUENCE_PAGE_BRIEF_CHARS + 1) } } }
         : { body: {} },
