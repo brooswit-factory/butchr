@@ -237,7 +237,13 @@ describe("reconcileNow", () => {
   });
 
   test("FACTORY-1001: onStopped covers normal stops, respawn stops, and only successful stops", async () => {
-    const cases = [
+    const cases: Array<{
+      name: string;
+      herd: () => Herd & { stopped: string[] };
+      desired: Map<string, any>;
+      expectedStopped: string[];
+      expectedHook: string[];
+    }> = [
       {
         name: "normal stop",
         herd: () => fakeHerd(["OLD"]),
@@ -262,7 +268,7 @@ describe("reconcileNow", () => {
         expectedStopped: [],
         expectedHook: [],
       },
-    ] as const;
+    ];
 
     for (const scenario of cases) {
       const herd = scenario.herd();
