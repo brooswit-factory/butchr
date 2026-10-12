@@ -76,6 +76,30 @@ describe("sweepStaleAgentLabels", () => {
 });
 
 describe("sweepAbsentLiveAgentLabels (FACTORY-1001)", () => {
+  test("table-driven lifecycle matrix purges only absent panes owned by this daemon", async () => {
+    const cases = [
+      { name: "stop/drain", live: [], owned: ["FACTORY-10"], labels: ["agent:working"], expected: ["agent:working"] },
+      { name: "restart", live: [], owned: ["FACTORY-11"], labels: ["agent:stalled", "pr:open"], expected: ["agent:stalled"] },
+      { name: "pane gone", live: [], owned: ["FACTORY-12"], labels: ["agent:blocked"], expected: ["agent:blocked"] },
+      { name: "live pane", live: ["FACTORY-13"], owned: ["FACTORY-13"], labels: ["agent:idle"], expected: [] },
+      { name: "other daemon ownership", live: [], owned: [], labels: ["agent:working"], expected: [], found: false },
+      { name: "no-wake/no label", live: [], owned: ["FACTORY-15"], labels: ["pr:open"], expected: [] },
+    ];
+    for (const scenario of cases) {
+      const jira = fakeJira();
+      const writes: string[][] = [];
+      await sweepAbsentLiveAgentLabels({
+        search: async () => scenario.found === false ? [] : [iss(`FACTORY-${10 + cases.indexOf(scenario)}`, "In Progress", scenario.labels)],
+        jira,
+        liveKeys: new Set(scenario.live),
+        ownedKeys: new Set(scenario.owned),
+        onWrite: (keys) => writes.push([...keys]),
+      });
+      expect(jira.calls.map((call) => call.remove), scenario.name).toEqual(scenario.expected.length ? [scenario.expected] : []);
+      expect(writes, scenario.name).toEqual(scenario.expected.length ? [[`FACTORY-${10 + cases.indexOf(scenario)}`]] : []);
+    }
+  });
+
   test("purges a labelled active ticket outside the rule query when its owned pane is gone, without a notification seam", async () => {
     const jira = fakeJira();
     const writes: string[][] = [];

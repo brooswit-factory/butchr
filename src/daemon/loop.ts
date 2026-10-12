@@ -913,6 +913,10 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       }
       if (opts.account) await opts.account.release(issue, "respawn");
       await herd.stop(issue);
+      // FACTORY-1001: a respawn is also a real lifecycle stop. Purge the
+      // stopped pane's agent labels before the replacement is launched so a
+      // failed/restarted pane cannot leave stale ownership behind.
+      await opts.onStopped?.(issue);
       await herd.spawn(toSpawn, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
