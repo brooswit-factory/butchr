@@ -30,7 +30,7 @@
 const SEP = ":";
 const QUERY_AGENT_MARKER = "@query";
 
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 export type AnyAgentKeyParts =

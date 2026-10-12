@@ -10,6 +10,21 @@ Jira ticket anywhere — had no path to a wake at all before this change: it
 is not reachable from any issue's linked-item list, so `linked-eventing.ts`
 never sees it.
 
+## Update (FACTORY-998): the real provider has landed
+
+FACTORY-992/998 shipped the real `confluence-page` provider this doc's own
+"What this module is, and is not" section below describes as pending —
+`src/rules/confluence-page-type.ts`, registered in `RESOURCE_PROVIDERS`
+(`src/rules/agent-key.ts`) and `capabilities.ts`'s `query` cell for
+`confluence-page`, wired into `src/daemon/index.ts`'s production loop
+lineup. See **docs/confluence-page.md** for that provider's own full
+writeup (query syntax, discovery/pagination, change events, the brief-
+mechanism decision, safety). The rest of THIS document is kept as-is,
+unedited, as the historical record of FACTORY-997's own narrower scope —
+`src/resources/confluence-page.ts` itself is unchanged by FACTORY-998 and
+still serves exactly the standalone-page (no owning Jira ticket, no
+ancestor rule) case this document describes.
+
 ## What this module is, and is not
 
 `src/resources/confluence-page.ts` provides a `ResourceType<ConfluencePageSnapshot>`
