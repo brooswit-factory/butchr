@@ -471,6 +471,8 @@ export interface ReconcileOptions {
    * this ticket, and any caller with nothing to clear).
    */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  /** Successful stop hook; never gates reconciliation. */
+  onStopped?: (id: string) => Promise<void>;
   /**
    * Holds ids against the shared admission cap while their spawn is in
    * flight — `AdmissionController.reserve`. Called for each respawn before
@@ -776,6 +778,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   for (const issue of plan.stop) {
     try {
       await herd.stop(issue);
+      await opts.onStopped?.(issue);
       // BUTCHR-412: released only AFTER a successful stop — if herd.stop
       // itself threw, the agent may still be running, and releasing its
       // account out from under a still-live agent would be wrong; a
@@ -910,6 +913,10 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       }
       if (opts.account) await opts.account.release(issue, "respawn");
       await herd.stop(issue);
+      // FACTORY-1001: a respawn is also a real lifecycle stop. Purge the
+      // stopped pane's agent labels before the replacement is launched so a
+      // failed/restarted pane cannot leave stale ownership behind.
+      await opts.onStopped?.(issue);
       await herd.spawn(toSpawn, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
@@ -1166,6 +1173,7 @@ export interface GenericLoopDeps<T> {
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  onStopped?: (id: string) => Promise<void>;
   /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
   reserveAdmission?: (ids: readonly string[]) => void;
   /** See `ReconcileOptions.releaseAdmission` — threaded straight through to `reconcileNow` below. */
@@ -1269,6 +1277,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+        ...(deps.onStopped ? { onStopped: deps.onStopped } : {}),
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
         ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),

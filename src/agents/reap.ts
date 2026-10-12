@@ -183,6 +183,8 @@ export interface ReaperDeps {
    * isolation `check()` already gives every other candidate's close.
    */
   release?: (agentKey: string) => Promise<void>;
+  /** Called only after a workspace was conclusively closed. */
+  onReaped?: (agentKey: string) => Promise<void>;
   log?: (line: string) => void;
 }
 
@@ -226,6 +228,7 @@ export function createReaper(deps: ReaperDeps): Reaper {
             if (deps.release) {
               await deps.release(c.agentKey).catch((e) => log(`WARNING: [reap] account release failed for ${c.agentKey}: ${(e as Error)?.message ?? e}`));
             }
+            await deps.onReaped?.(c.agentKey).catch((e) => log(`WARNING: [reap] label purge failed for ${c.agentKey}: ${(e as Error)?.message ?? e}`));
           }
         } catch (e) {
           log(`WARNING: [reap] close failed for ${c.workspaceId} (${c.label}): ${(e as Error)?.message ?? e}`);

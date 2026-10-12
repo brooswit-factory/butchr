@@ -94,6 +94,12 @@ export interface SyncDeps {
    * old isOwnLabelBump swallow into the same mechanism agent writes use.
    */
   onWrite?: (keys: readonly string[]) => void;
+  /**
+   * FACTORY-1001: scan active, labelled tickets outside the rule-query
+   * result too. Receives this poll's already-read live-herd snapshot, so it
+   * does not add a second herdr observation or invent a notification path.
+   */
+  reconcileAbsentLiveAgentLabels?: (liveKeys: ReadonlySet<string>, ownedKeys: ReadonlySet<string>) => Promise<void>;
   log?: (line: string) => void;
   /**
    * Called once at the end of every syncLabels run, after all issues (and
@@ -198,6 +204,7 @@ export function createLabelSync(deps: SyncDeps) {
     const written = new Set<string>();
     const seen = new Set(issues.map((i) => i.key));
     const agents = await deps.agentStatuses();
+    await deps.reconcileAbsentLiveAgentLabels?.(new Set(agents.keys()), new Set(issues.map((issue) => issue.key)));
     // BUTCHR-352: read once per poll, synchronously — see this dep's own doc
     // comment for why this is never a second I/O call.
     const withheldKeys = deps.withheld?.();
