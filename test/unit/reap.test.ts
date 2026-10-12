@@ -440,4 +440,41 @@ describe("createReaper", () => {
     await reaper.check();
     expect(closes).toEqual(["w1"]);
   });
+
+  test("FACTORY-1001: a successfully reaped owned pane invokes the lifecycle purge hook exactly once", async () => {
+    const reaped: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "jira-work:task:BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      onReaped: async (agentKey) => { reaped.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(reaped).toEqual(["jira-work:task:BUTCHR-9"]);
+  });
+
+  test("FACTORY-1001: table-driven reap outcomes notify only after a conclusive close", async () => {
+    const cases = [
+      { name: "reaped", close: async () => true, expected: ["jira-work:task:REAP-1"] },
+      { name: "pane still live", close: async () => false, expected: [] },
+      { name: "close error", close: async () => { throw new Error("herdr unavailable"); }, expected: [] },
+    ];
+    for (const scenario of cases) {
+      const reaped: string[] = [];
+      const clock = tickingNow(0);
+      const reaper = createReaper({
+        now: clock.now,
+        candidates: async () => [{ workspaceId: `w-${scenario.name}`, label: "FACTORY-1001", agentKey: "jira-work:task:REAP-1", paneIds: ["p1"] }],
+        close: scenario.close,
+        onReaped: async (agentKey) => { reaped.push(agentKey); },
+      });
+      await reaper.check();
+      clock.advance(MIN);
+      await reaper.check();
+      expect(reaped, scenario.name).toEqual(scenario.expected);
+    }
+  });
 });

@@ -236,6 +236,51 @@ describe("reconcileNow", () => {
     expect(calls).toEqual([{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
   });
 
+  test("FACTORY-1001: onStopped covers normal stops, respawn stops, and only successful stops", async () => {
+    const cases: Array<{
+      name: string;
+      herd: () => Herd & { stopped: string[] };
+      desired: Map<string, any>;
+      expectedStopped: string[];
+      expectedHook: string[];
+    }> = [
+      {
+        name: "normal stop",
+        herd: () => fakeHerd(["OLD"]),
+        desired: new Map<string, any>(),
+        expectedStopped: ["OLD"],
+        expectedHook: ["OLD"],
+      },
+      {
+        name: "respawn stop",
+        herd: () => fakeHerd(["STALE"], [{ issue: "STALE", reason: "argv mismatch", observedArgv: [] }]),
+        desired: new Map([["STALE", { key: "STALE", issuetype: "Task", summary: "s", parent: null }]]),
+        expectedStopped: ["STALE"],
+        expectedHook: ["STALE"],
+      },
+      {
+        name: "failed stop",
+        herd: () => ({
+          ...fakeHerd(["BROKEN"]),
+          async stop() { throw new Error("herdr unavailable"); },
+        } as Herd & { stopped: string[] }),
+        desired: new Map<string, any>(),
+        expectedStopped: [],
+        expectedHook: [],
+      },
+    ];
+
+    for (const scenario of cases) {
+      const herd = scenario.herd();
+      const hooks: string[] = [];
+      await reconcileNow(herd, scenario.desired, {
+        onStopped: async (issue) => { hooks.push(issue); },
+      });
+      expect(herd.stopped, scenario.name).toEqual(scenario.expectedStopped);
+      expect(hooks, scenario.name).toEqual(scenario.expectedHook);
+    }
+  });
+
   test("no onRespawn callback provided → stale issue still gets stopped and spawned", async () => {
     const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
     const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
