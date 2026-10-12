@@ -440,4 +440,19 @@ describe("createReaper", () => {
     await reaper.check();
     expect(closes).toEqual(["w1"]);
   });
+
+  test("FACTORY-1001: a successfully reaped owned pane invokes the lifecycle purge hook exactly once", async () => {
+    const reaped: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "jira-work:task:BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      onReaped: async (agentKey) => { reaped.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(reaped).toEqual(["jira-work:task:BUTCHR-9"]);
+  });
 });

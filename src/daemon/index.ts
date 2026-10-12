@@ -69,6 +69,7 @@ import { realAtlassian } from "../tools/atlassian-real.js";
 import { atlassianTools } from "../tools/defs.js";
 import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
+import { isAgentLabel } from "../labels/plan.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
 import { sweepAbsentLiveAgentLabels, sweepStaleAgentLabels } from "../labels/sweep.js";
@@ -2086,6 +2087,23 @@ const issueReconcileFailureDetector = createReconcileFailureDetector({
 // second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
 // wrapper) is used directly — `strandedCandidates`/`closeStranded` are
 // HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+// A successful stop/reap is authoritative evidence that this daemon owned the
+// pane. Purge every agent:* value, including agent:none, through the existing
+// quiet writer and own-write ledger; no comment or notification path exists.
+const purgeStoppedAgentLabels = async (agentKeys: readonly string[]): Promise<void> => {
+  const keys = [...new Set(agentKeys.map(resourceKeyOf))];
+  if (!keys.length) return;
+  const issues = await atlassian.search(`key IN (${keys.join(",")})`);
+  const written: string[] = [];
+  for (const issue of issues) {
+    const remove = issue.labels.filter(isAgentLabel);
+    if (!remove.length) continue;
+    await labelWriter.updateLabels(issue.key, { remove });
+    written.push(issue.key);
+  }
+  if (written.length) recordOwnWrite(written, DAEMON_WRITER);
+};
+
 const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
@@ -2096,6 +2114,7 @@ const issueReaper = createReaper({
   // nothing else in this daemon would otherwise release a temporary account
   // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
   ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
+  onReaped: async (agentKey) => purgeStoppedAgentLabels([agentKey]),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-287: a live per-issue residency census, independent of
@@ -2320,6 +2339,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  onStopped: (agent) => purgeStoppedAgentLabels([agent]),
   // FACTORY-916: `herd.lastFreshSpawnResumed` told `reconcileNow` this
   // respawn resumed its prior Claude session via an ordinary fresh spawn
   // (never `resumeInPlace()` — that is `onResumePreserved` below), so it
