@@ -99,7 +99,7 @@ function reasonClause(reason: NotifyReason | undefined): string {
   if ("blocked" in reason) return `has its ticket ${reason.blocked.key} newly agent:blocked — it needs you`;
   // FACTORY-972: same "named explicitly, same wording for both producers"
   // reasoning as `blocked` just above — see NotifyReason's own doc comment.
-  if ("stalled" in reason) return reason.stalled.count === undefined ? `has its ticket ${reason.stalled.key} newly agent:stalled - it needs you` : `remains stalled (notification count: ${reason.stalled.count}). This count is informational; it does not indicate failure or escalation`;
+  if ("stalled" in reason) return reason.stalled.at === undefined ? `has its ticket ${reason.stalled.key} newly agent:stalled — it needs you` : `remains stalled after the configured inactivity interval`;
   // BUTCHR-351: `reason.comment === null` means the mover was a comment
   // DELETION, not an addition (see NotifyReason's own doc comment) —
   // "got a new comment" would be actively wrong there.

@@ -1688,7 +1688,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
 };
 let localStalledKeys = new Set<string>();
 const knownLocalStalledKeys = new Set<string>();
-const stalledEvents = new StalledEvents(Date.now, join(dirname(rulesPath()), "stalled-notifications.json"));
+const stalledEvents = new StalledEvents(Date.now);
 let stalledMinutesByIssue: ReadonlyMap<string, number> = new Map();
 const stalled = createStalledCheck({
   now: () => Date.now(),
@@ -2634,9 +2634,6 @@ startConfluencePageLoop({
 // admission/health wiring shape as every rule loop above, its own bucket.
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
-  stalledEvents, stalledObservation,
-  resourceStallObservation: createResourceStallObserver({ statuses: agentStatuses, comments: async () => [] }),
-  defaultStalledMinutes: config.stalledMinutes,
   roles: managedSessionRoles,
   accountPolicies: managedSessionAccountPolicies,
   resolvedAgents: managedSessionResolvedAgents,
@@ -2678,6 +2675,9 @@ startManagedSessionsLoop({
   // (src/daemon/session-definitions-loop.ts).
   checkRestoredPaneDeferred: managedSessionRestoredPaneEscalationDetector.check,
   log: (line) => console.error(`  ${line}`),
+  stalledEvents, stalledObservation,
+  resourceStallObservation: createResourceStallObserver({ statuses: agentStatuses, comments: async () => [] }),
+  defaultStalledMinutes: config.stalledMinutes,
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
   // FACTORY-53/FACTORY-71: linked-change eventing for a managed session that

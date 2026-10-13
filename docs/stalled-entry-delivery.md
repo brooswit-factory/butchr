@@ -53,30 +53,21 @@ produce one event when polling resumes, without a catch-up burst. Ordinary linke
 caps still apply to other updates. Project-member discovery includes active
 stalled tickets even after they leave its normal updated-time window.
 
-## Count identity, reset, and persistence
+## Recurrence boundary
 
-One cumulative informational count belongs to each resource epoch; every recipient
-gets that count. Fanout and duplicate polls never increment it. Working, comments,
-recovery, removal, and later inactivity episodes reset timing without resetting
-the count. Long-lived projects and Director can legitimately accumulate high
-counts. Counts measure notification epochs, not confirmed reads or delivery.
+The scheduler has only in-memory interval and recipient-deduplication state.
+There is no notice count, persistence file, ticket property, or hidden Jira
+metadata. Restarting resets scheduling observations.
 
-Within one daemon, ticket identity is the bare Jira key; project/session identity
-is the full existing agent key including rule and resource. Renaming an identity
-starts a different count. Counts and last emission times persist atomically in
-`stalled-notifications.json` beside the rules file, before the epoch becomes visible.
-A write failure blocks the epoch; corrupt state is reported rather than silently
-reset. Removed identities are retained. Explicitly removing the state file resets
-its counts. Inactivity floors and recipient acknowledgements are process-local;
-a restart preserves counts but rebuilds the local inactivity observation floor.
+On another daemon, an unchanged external label supplies neither the source
+rule's manual timeout nor a new event for a repeat. This implementation uses the
+watcher's local global timeout for such external observations; it does not provide
+fleet-synchronized recurrence. This boundary remains unresolved before merge.
 
-Cross-daemon boundary: epochs are shared only within one daemon. An external
-label carries no timeout or count, so another daemon uses its own global timeout,
-count file, and observation clock. The label is its remote evidence until cleanup;
-local status checks cannot prove a remote agent is running. Fleet-wide identical
-epochs, manual timeouts, and counts require shared metadata beyond the unchanged
-label. Resolve that architecture decision before claiming fleet-wide parity.
+The minimal fleet-wide alternative is a human-visible ordinary stall comment
+from the owning daemon once per source-configured interval. Existing comment
+change detection would route it to self and linked watchers without new metadata
+or transport. That alternative has not been implemented or deployed.
 
-Tests use fake resources/statuses, explicit clocks, and temporary state files.
-Runtime delivery requires separately authorized rollout verification; these tests
-do not start agents, edit Jira, or restart daemons.
+Tests use fake resources/statuses and explicit clocks. No tests start agents,
+edit Jira, or restart daemons. Counts are explicitly deferred.

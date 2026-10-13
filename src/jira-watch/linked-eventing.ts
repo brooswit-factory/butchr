@@ -1110,7 +1110,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             if (deps.stalledEvents && deps.stalledObservation) {
               const notice = deps.stalledEvents.observe(await deps.stalledObservation(issue));
               if (notice && deps.stalledEvents.pending(notice, entry.notifyAgentKey)) {
-                triggering.push({ target: item.target, kind: item.kind, detail: `agent stalled; notification count: ${notice.count} (informational)`, stalledCount: notice.count });
+                triggering.push({ target: item.target, kind: item.kind, detail: "agent remains stalled", stalled: true });
                 toAdvance.push(() => deps.stalledEvents!.acknowledge(notice, entry.notifyAgentKey));
                 toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
                 continue;
@@ -1238,7 +1238,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         // so this block now always runs (no owner kind can run uncapped).
         const max = effectiveMaxLinkedTurnsPerHour(entry.rule);
         const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
-        if (history.length >= max && !events.some((event) => event.stalledCount !== undefined)) {
+        if (history.length >= max && !events.some((event) => event.stalled === true)) {
           turns.set(entry.agentKey, history);
           // BUTCHR-471: `entry.notifyAgentKey`, NOT `entry.agentKey` — for a
           // managed-session owner, `agentKey` is the synthetic per-(session,
