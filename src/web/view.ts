@@ -557,6 +557,7 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   if (patch.role !== undefined) parts.push(`role: ${show(current?.role)} -> ${show(patch.role)}`);
   // FACTORY-846: same one-line-per-changed-field treatment as permissionMode/lizardMode above.
   if (patch.idlePokeMinutes !== undefined) parts.push(`idlePokeMinutes: ${show(current?.idlePokeMinutes)} -> ${show(patch.idlePokeMinutes)}`);
+  if (patch.stalledMinutes !== undefined) parts.push(`stalledMinutes: ${show(current?.stalledMinutes)} -> ${show(patch.stalledMinutes)}`);
   if (patch.idlePokeMessage !== undefined) parts.push(`idlePokeMessage: ${show(current?.idlePokeMessage)} -> ${show(patch.idlePokeMessage)}`);
   if (patch.idlePokeEnabled !== undefined) parts.push(`idlePokeEnabled: ${show(current?.idlePokeEnabled)} -> ${show(patch.idlePokeEnabled)}`);
   if (patch.agentPreferences !== undefined) {

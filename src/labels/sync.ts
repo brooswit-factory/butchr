@@ -277,7 +277,8 @@ export function createLabelSync(deps: SyncDeps) {
         // steady state) rather than as a new periodic log source of its own.
         if (stalledNow) {
           const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
-          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}, no non-daemon-chatter comment during that streak`);
+          const threshold = deps.stalled?.thresholdMinutes?.(issue.key);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}${threshold != null ? `, configured threshold ${threshold}m` : ""}, no non-daemon-chatter comment during that streak`);
         }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a

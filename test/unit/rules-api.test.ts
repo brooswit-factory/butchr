@@ -49,6 +49,15 @@ describe("briefExcerpt", () => {
 });
 
 describe("buildRulesApiResponse", () => {
+  test("stalled timeout exposes the configured override or inheritance", () => {
+    for (const configured of [undefined, 40]) {
+      const response = buildRulesApiResponse({
+        rulesFile: { path: "/rules.json", rules: [rule(configured === undefined ? {} : { stalledMinutes: configured })], error: null },
+        mtime: null, sourceEtag: "same", fileEtag: "same", ruleInventory: [entry()],
+      });
+      expect(response.rules[0]!.stalledMinutes).toBe(configured ?? null);
+    }
+  });
   test("valid file: path/mtime/valid/problems, one entry per rule, never the full brief", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [rule()], error: null },

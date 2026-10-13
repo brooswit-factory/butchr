@@ -78,7 +78,7 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * `account` still are); now explicit, validated against `AGENT_ROLES`
  * below, same discipline every other leaf here already has.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes"];
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -188,6 +188,7 @@ export interface RuleFieldPatch {
   agentPreferences?: AgentPreferencePatch[];
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. CONFIG SURFACE ONLY: never risky, never requires `confirm`. */
   idlePokeMinutes?: number;
+  stalledMinutes?: number | null;
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
   idlePokeMessage?: string;
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
@@ -234,6 +235,10 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.idlePokeMinutes !== "number" || !Number.isFinite(b.idlePokeMinutes) || b.idlePokeMinutes <= 0) return { ok: false, error: "idlePokeMinutes must be a positive number" };
     patch.idlePokeMinutes = b.idlePokeMinutes;
   }
+  if ("stalledMinutes" in b) {
+    if (b.stalledMinutes !== null && (typeof b.stalledMinutes !== "number" || !Number.isFinite(b.stalledMinutes) || b.stalledMinutes <= 0)) return { ok: false, error: "stalledMinutes must be a positive number or null (inherit)" };
+    patch.stalledMinutes = b.stalledMinutes as number | null;
+  }
   if ("idlePokeMessage" in b) {
     if (typeof b.idlePokeMessage !== "string" || b.idlePokeMessage.trim() === "") return { ok: false, error: "idlePokeMessage must be a non-empty string" };
     patch.idlePokeMessage = b.idlePokeMessage.trim();
@@ -242,7 +247,7 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.idlePokeEnabled !== "boolean") return { ok: false, error: "idlePokeEnabled must be a boolean" };
     patch.idlePokeEnabled = b.idlePokeEnabled;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "ifMatch", "confirm", "planHash"]);
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }

@@ -13,7 +13,8 @@ export const jiraProjectShortDisplayId = (resourceId: string): string => resourc
 
 /**
  * FACTORY-941: per-agentKey pinned-active minutes override, resolved fresh
- * from one poll's own `ProjectMatch[]` — reuses the SAME `idlePokeMinutes`
+ * from one poll's own `ProjectMatch[]`. Explicit `stalledMinutes` wins;
+ * otherwise preserve the legacy `idlePokeMinutes` override. The older path reuses `idlePokeMinutes`
  * `Rule` field the issue tier's idle-poke engine reads (src/agents/
  * idle-poke.ts), applied here to `jira-project` rules instead (never a
  * second, pinned-active-only config field — see
@@ -32,7 +33,10 @@ export function pinnedActiveMinutesFor(matches: readonly ProjectMatch[]): Readon
   const result = new Map<string, number>();
   for (const m of matches) {
     if (!m.rule.enabled) continue;
-    if (m.rule.idlePokeMinutes !== undefined) result.set(m.agentKey, m.rule.idlePokeMinutes);
+    // New explicit threshold wins; retain old project-only idlePokeMinutes
+    // behavior for existing configurations that have not migrated yet.
+    const minutes = m.rule.stalledMinutes ?? m.rule.idlePokeMinutes;
+    if (minutes !== undefined) result.set(m.agentKey, minutes);
   }
   return result;
 }
