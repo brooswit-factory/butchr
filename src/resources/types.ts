@@ -196,7 +196,7 @@ export type NotifyReason =
   | { linked: { events: readonly LinkedChangeEvent[] } }
   | { definitionField: { brief?: string; workingDirectory?: string } }
   | { blocked: { key: string } }
-  | { stalled: { key: string } }
+  | { stalled: { key: string; count?: number; at?: number } }
   | { confluencePageEdit: { from: number; to: number } }
   | { confluencePageComment: { ids: readonly string[] } };
 
@@ -262,6 +262,8 @@ export type NotifyReason =
  * never needs to import the Jira-work-specific linked-discovery module.
  */
 export interface LinkedChangeEvent {
+  /** Shared resource epoch count; exempts scheduled stalls from ordinary turn caps. */
+  stalledCount?: number;
   /** The linked item's own identity: a Jira issue key for every kind this story handles. */
   target: string;
   kind: string;

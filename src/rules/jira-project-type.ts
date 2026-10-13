@@ -1,3 +1,5 @@
+import type { createResourceStallObserver } from "../agents/resource-stall-observer.js";
+import { withStalledEvents, type StalledEvents, type StallObservation } from "../agents/stalled-events.js";
 import type { SpawnSpec } from '../agents/workspace.js';
 import type { JiraIssue } from '../atlassian/types.js';
 import type { JiraProject } from '../resources/jira-project.js';
@@ -50,6 +52,10 @@ export function specForProject(m: ProjectMatch): SpawnSpec {
 }
 
 export interface CreateJiraProjectResourceTypeDeps {
+  stalledEvents?: StalledEvents | undefined;
+  stalledObservation?: ((issue: JiraIssue) => Promise<StallObservation>) | undefined;
+  resourceStallObservation?: ReturnType<typeof createResourceStallObserver> | undefined;
+  defaultStalledMinutes?: number | undefined;
   rules: readonly Rule[];
   search: (query: string) => Promise<JiraProject[]>;
   prepare?: (spec: SpawnSpec) => Promise<SpawnSpec>;
@@ -123,6 +129,7 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
      try {
        await linkedEventingState.runTick([], {
          search: searchIssues,
+          stalledEvents: deps.stalledEvents, stalledObservation: deps.stalledObservation,
          notify,
          ...(deps.log ? { log: deps.log } : {}),
          ...(deps.now ? { now: deps.now } : {}),
@@ -138,7 +145,10 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
  },
  activation:{verdictFor:()=> 'active'},
  // Membership controls residency. No ticket/Confluence workflow, auto-assignment, or work prompts.
- eventRules:{poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})},
+ eventRules: deps.stalledEvents && deps.resourceStallObservation
+   ? withStalledEvents<ProjectMatch>({poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})}, deps.stalledEvents, m=>m.agentKey,
+       async m=>deps.resourceStallObservation!(m.agentKey,m.rule.stalledMinutes ?? m.rule.idlePokeMinutes ?? deps.defaultStalledMinutes ?? 10, !(await deps.isFrozen?.(m.agentKey))), deps.resourceStallObservation.forget)
+   : {poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})},
  spawnConfig:{specFor:specForProject},
  };
 }

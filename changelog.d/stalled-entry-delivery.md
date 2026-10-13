@@ -1,7 +1,7 @@
 bump: minor
 
 ### Added
-- Manual per-rule `stalledMinutes` overrides for Jira issue stalled detection and project-manager pinned-active detection, independently configurable from idle pokes. Omission preserves existing defaults; configuration patches can clear an override back to inheritance.
+- Manual stalledMinutes for Jira issue and project rules, plus opt-in managed-session detection. Repeat stalled notifications at that fixed interval through existing updated-event routing, with a persisted cumulative informational count shared across each daemon's recipients.
 
 ### Fixed
-- Deliver entry into `agent:stalled` to the ticket's own agent and every routed related watcher without swallowing it as a daemon label echo or letting the first recipient consume the others' event. Linked eventing also recognizes stalled entry. Preserve delivery limits, repeated-poll deduplication, and silent label cleanup/removal.
+- Deliver stalled entry to self and linked watchers without label-echo suppression. Repeats need no label toggles or wake comments and have no backoff or hourly cap. Activity resets inactivity, duplicate polls stay silent, and label cleanup does not wake agents.

@@ -1,3 +1,4 @@
+import type { StalledEvents, StallObservation } from "../agents/stalled-events.js";
 /**
  * linked-eventing.ts — BUTCHR-436 (epic BUTCHR-421, story 2/4 of 4): makes a
  * change to a Jira-kind link discovered by story 1
@@ -481,6 +482,8 @@ export function effectiveMaxLinkedItems(rule: Rule): number {
 }
 
 export interface LinkedEventingDeps {
+  stalledEvents?: StalledEvents | undefined;
+  stalledObservation?: ((issue: JiraIssue) => Promise<StallObservation>) | undefined;
   /** The SAME batched-search seam every other Jira-kind fetch in this codebase already uses (`RuleResourceDeps.search`) — ONE `key in (...)` call per tick covers every opted-in owner's Jira-kind linked targets combined, never one call per linked item. */
   search: (jql: string) => Promise<JiraIssue[]>;
   /** `AtlassianClient#remoteLinks` — called ONLY for a match whose rule has `linkedRemoteLinks: true`, never otherwise (BUTCHR-436's own knob contract: zero remote-link calls for a non-opted-in resource). Optional; omitted, no rule can ever opt into remote links (treated the same as a rule that doesn't). */
@@ -778,7 +781,9 @@ export function createLinkedEventingState(): LinkedEventingState {
             // since an already-delivered member that keeps re-matching this
             // deliberately over-inclusive window sorts right back to the
             // front next tick).
-            const members = await deps.search(`project = ${m.projectKey} AND updated >= "-${minutes}m" ORDER BY updated ASC`);
+            const members = await deps.search(deps.stalledEvents
+              ? `project = ${m.projectKey} AND (updated >= "-${minutes}m" OR (labels = "agent:stalled" AND status IN ("In Progress", "In Review"))) ORDER BY updated ASC`
+              : `project = ${m.projectKey} AND updated >= "-${minutes}m" ORDER BY updated ASC`);
             // BUTCHR-469 (review round 2 fix): partition into "genuinely
             // needs a slot" vs. "already known, nothing new" — a stale
             // member only reappears here because the window is deliberately
@@ -1102,6 +1107,15 @@ export function createLinkedEventingState(): LinkedEventingState {
             const bkey = baselineKey(entry.agentKey, item.target);
             const beforeRaw = baselines.get(bkey);
             const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
+            if (deps.stalledEvents && deps.stalledObservation) {
+              const notice = deps.stalledEvents.observe(await deps.stalledObservation(issue));
+              if (notice && deps.stalledEvents.pending(notice, entry.notifyAgentKey)) {
+                triggering.push({ target: item.target, kind: item.kind, detail: `agent stalled; notification count: ${notice.count} (informational)`, stalledCount: notice.count });
+                toAdvance.push(() => deps.stalledEvents!.acknowledge(notice, entry.notifyAgentKey));
+                toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
+                continue;
+              }
+            }
             if (!before) {
               // BUTCHR-469 (review round 1 fix): a MEMBER-sourced target with
               // no baseline is NOT a neutral "first sighting" to seed
@@ -1132,7 +1146,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             // doesn't move with it; in practice a comment write always bumps
             // `updated` too, so this is belt-and-suspenders, not the primary trigger.
             const commentChanged = commentChangedBetween(before, snap);
-            const enteredStalled = stalledTransition(asIssue(item.target, before), asIssue(item.target, snap));
+            const enteredStalled = !deps.stalledEvents && stalledTransition(asIssue(item.target, before), asIssue(item.target, snap));
             const changed = before.status !== snap.status || before.summary !== snap.summary || before.updated !== snap.updated || commentChanged;
             if (!changed) continue;
             // FACTORY-9: `isDaemonLabelOnlyDiff` only ever inspects
@@ -1224,7 +1238,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         // so this block now always runs (no owner kind can run uncapped).
         const max = effectiveMaxLinkedTurnsPerHour(entry.rule);
         const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
-        if (history.length >= max) {
+        if (history.length >= max && !events.some((event) => event.stalledCount !== undefined)) {
           turns.set(entry.agentKey, history);
           // BUTCHR-471: `entry.notifyAgentKey`, NOT `entry.agentKey` — for a
           // managed-session owner, `agentKey` is the synthetic per-(session,

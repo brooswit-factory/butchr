@@ -68,6 +68,11 @@ export class StalledTracker {
   }
 
   /** Drop tracking for a ticket leaving the active set — a later respawn starts a fresh floor. */
+  resetAt(issue: string, at: number): void {
+    const entry = this.entries.get(issue);
+    if (entry && entry.idleSince !== null) entry.idleSince = Math.max(entry.idleSince, at);
+  }
+
   forget(issue: string): void {
     this.entries.delete(issue);
   }
@@ -218,6 +223,7 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
   // a later, genuinely new disqualification logs fresh rather than staying
   // silent because SOME comment was already logged once, long ago.
   const declineLogged = new Map<string, string>();
+  const activitySeen = new Map<string, number>();
   return {
     async check(issue, label) {
       const minutes = deps.minutesFor?.(issue) ?? deps.minutes;
@@ -244,12 +250,14 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
         // false wake costs one debounced comment (see
         // stall-remediation.ts) while a false silence costs nothing
         // visible at all.
-        const disqualifying = rows.find((c) => {
+        const disqualifying = [...rows].sort((a, b) => Date.parse(b.created) - Date.parse(a.created)).find((c) => {
           if (c.body.startsWith(DAEMON_CHATTER_PREFIX)) return false;
           const createdAt = Date.parse(c.created);
-          return Number.isNaN(createdAt) || createdAt >= streakStart;
+          return Number.isNaN(createdAt) || createdAt > streakStart || (createdAt === streakStart && activitySeen.get(issue) !== createdAt);
         });
         if (disqualifying) {
+          const activityAt = Date.parse(disqualifying.created);
+          if (Number.isFinite(activityAt)) { tracker.resetAt(issue, activityAt); activitySeen.set(issue, activityAt); }
           if (declineLogged.get(issue) !== disqualifying.id) {
             declineLogged.set(issue, disqualifying.id);
             const unparseable = Number.isNaN(Date.parse(disqualifying.created));

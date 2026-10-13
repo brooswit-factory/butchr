@@ -1,81 +1,82 @@
-# Stalled label events
+# Stalled notifications
 
-`agent:stalled` is a timer signal, not a diagnosis that an agent is broken.
-`StalledTracker` in `src/agents/stalled.ts` requires an uninterrupted idle
-streak (`done` maps to idle) lasting `BUTCHR_STALLED_MINUTES`, default 10.
-Working, blocked, or no agent resets the streak. A non-`[butchr:` comment
-at or after the streak started disqualifies it; an unreadable comment time
-also disqualifies it. A failed comment fetch is unknown, and label sync
-holds the applied label. The label stabilizer requires two consecutive
-observations for a change to an existing label.
+Stalled is an inactivity observation, not a failure diagnosis. Working, blocked,
+missing, frozen, and removed local agents receive no recurring stalled event.
+Done counts as idle. Non-daemon comments reset the Jira inactivity floor to their
+timestamp; the detector does not judge their meaning. Failed reads and invalid
+comment timestamps cannot prove inactivity. Label stabilization is unchanged.
 
-Entry into stalled is actionable for the ticket's own agent and every
-watcher already admitted by the existing related-resource routing rules.
-`createIssueEventRules` checks this entry before own-write and cross-daemon
-label-echo suppression. Debounce is per ticket and recipient, so notifying
-self or the first boss cannot consume a second recipient's event. The
-existing 30-minute default debounce, recent `[butchr:stall]` marker dedup,
-and six-per-hour recipient cap remain. A concurrent real comment still
-uses ordinary event classification when the stalled wake is debounced.
+## Manual configuration
 
-Generic linked eventing also recognizes stalled entry before its label-only
-and own-write filters. It retains per-owner baselines, duplicate-link
-deduplication, and the existing linked-turn rate cap. An unchanged poll
-does not generate another event. This does not add links, enable disabled
-watchers, or broaden discovery.
+Set a positive finite `stalledMinutes` on the rule whose query selects the agents.
+There is no inference from issue type, rank, or link depth. The same value controls
+initial detection and each subsequent interval.
 
-The exception is entry only. Removing stalled or purging agent labels is
-still silent when there is no independent meaningful change. Other label
-noise remains suppressed; existing explicit PR and blocked wake rules are
-unchanged. This preserves FACTORY-999's silent cleanup contract while
-addressing the self/related delivery gap associated with FACTORY-242.
+| Manually selected group | Minutes |
+| --- | ---: |
+| Tasks | 10 |
+| Stories | 40 |
+| Epics | 160 |
+| Projects/managers | 640 |
+| Director | 2560 |
 
-Unit tests use fake Jira data and delivery sinks. Production delivery must
-be verified after a separately approved merge and rollout; no test needs
-live agents, synthetic Jira edits, or daemon restarts.
+Issue swarm rules inherit `BUTCHR_STALLED_MINUTES` (default 10) when omitted.
+The longest explicit timeout wins when several enabled rules match one ticket.
+The rule read API returns null for inheritance; plan/apply accepts null to clear
+an override. Singleton/persistent issue rules are rejected because they have no
+single-ticket inactivity detector.
 
-## Manual timeout configuration
+Projects prefer `stalledMinutes`, then legacy `idlePokeMinutes`, then the global
+value. Managed sessions opt in with `stalledMinutes` in their definition, e.g.
+2560 for Director. Omission leaves managed-session stalled detection disabled.
+Their status observations and definition edits reset inactivity; these sessions
+have no Jira comment channel. No live configuration or enabled state is changed.
 
-Set a positive finite `stalledMinutes` on the relevant rule in `rules.json`.
-The rule's existing query selects its agents; no issue type, rank, link
-depth, or hierarchy is inferred. Configure these accepted starting values
-manually when rollout is authorized:
+## Existing updated-event path
 
-| Configured group | `stalledMinutes` | Duration |
-| --- | ---: | --- |
-| Tasks | 10 | 10 minutes |
-| Stories | 40 | 40 minutes |
-| Epics | 160 | 2 hours 40 minutes |
-| Projects/managers | 640 | 10 hours 40 minutes |
-| Director (follow-on required; see below) | 2560 | 42 hours 40 minutes |
+Entry into `agent:stalled` passes label-only suppression. Other daemon label noise
+and cleanup remain silent. Existing PR/blocked exceptions remain unchanged.
+Self and linked recipients retain the existing routing and delivery functions.
 
-For example, merge `"stalledMinutes": 40` into the existing story rule,
-`"stalledMinutes": 160` into the epic rule, and `"stalledMinutes": 640`
-into the project-manager rule. Preserve each rule's actual query, id,
-enabled state, and all unrelated settings. These are manual values, not
-a multiplier or an automatically generated policy. No live config is
-changed by this PR.
+An unchanged Jira label does not create another Jira update. At each due interval,
+`withStalledEvents` includes the resource in the existing `changedPrimary` or
+`changedRelated` poll result and supplies a `stalled` reason to `decide`. Generic
+linked eventing includes the same epoch in its existing coalesced updated-event
+payload. There is no artificial Jira timestamp, label toggle, new wake channel,
+or periodic Jira comment. Production no longer wires the one-time remediation
+and pinned-active comment writers.
 
-For Jira issue resource rules, absence inherits `BUTCHR_STALLED_MINUTES`
-(default 10). If multiple enabled rules match one ticket, its shared label
-uses the longest explicit timeout; rules with no override do not erase an
-explicit one. Overrides are rebuilt from the current matches each poll.
-The stalled diagnostic logs the effective threshold when it qualifies.
-The rules read API returns the configured value, or `null` for inheritance;
-the existing rule plan/apply API accepts a positive value or `null` to
-remove the override. In the file, remove the property to inherit.
+While inactivity continues, one epoch occurs at each configured interval forever.
+Duplicate polls in that interval stay silent for each recipient. There is no
+backoff, hourly stalled-event cap, count-based limit, or escalation. Missed polls
+produce one event when polling resumes, without a catch-up burst. Ordinary linked
+caps still apply to other updates. Project-member discovery includes active
+stalled tickets even after they leave its normal updated-time window.
 
-For `jira-project` rules the value sets the existing pinned-active detector
-threshold. Explicit `stalledMinutes` takes precedence over the legacy
-project-only `idlePokeMinutes` override; that legacy fallback remains for
-backward compatibility. These project agents have no Jira issue label.
-The new value does not configure recurring poke intervals, debounce,
-notification caps, or issue idle-poke timing.
+## Count identity, reset, and persistence
 
-Managed Director/session-definition agents currently have no stalled
-detector (`src/resources/session-definition.ts` documents that gap).
-The agreed Director target of 2560 minutes is recorded for that focused
-follow-on; do not put an unsupported `stalledMinutes` field into a session
-manifest or substitute `idlePokeMinutes`. Likewise, query-level
-singleton/persistent Jira issue agents do not enter per-ticket label sync.
-This PR does not introduce a new detector or activate a stopped Director.
+One cumulative informational count belongs to each resource epoch; every recipient
+gets that count. Fanout and duplicate polls never increment it. Working, comments,
+recovery, removal, and later inactivity episodes reset timing without resetting
+the count. Long-lived projects and Director can legitimately accumulate high
+counts. Counts measure notification epochs, not confirmed reads or delivery.
+
+Within one daemon, ticket identity is the bare Jira key; project/session identity
+is the full existing agent key including rule and resource. Renaming an identity
+starts a different count. Counts and last emission times persist atomically in
+`stalled-notifications.json` beside the rules file, before the epoch becomes visible.
+A write failure blocks the epoch; corrupt state is reported rather than silently
+reset. Removed identities are retained. Explicitly removing the state file resets
+its counts. Inactivity floors and recipient acknowledgements are process-local;
+a restart preserves counts but rebuilds the local inactivity observation floor.
+
+Cross-daemon boundary: epochs are shared only within one daemon. An external
+label carries no timeout or count, so another daemon uses its own global timeout,
+count file, and observation clock. The label is its remote evidence until cleanup;
+local status checks cannot prove a remote agent is running. Fleet-wide identical
+epochs, manual timeouts, and counts require shared metadata beyond the unchanged
+label. Resolve that architecture decision before claiming fleet-wide parity.
+
+Tests use fake resources/statuses, explicit clocks, and temporary state files.
+Runtime delivery requires separately authorized rollout verification; these tests
+do not start agents, edit Jira, or restart daemons.

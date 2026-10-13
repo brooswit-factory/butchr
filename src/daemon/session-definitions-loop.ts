@@ -1,3 +1,4 @@
+import type { ManagedSessionResourceDeps } from "../rules/session-definition-type.js";
 /**
  * BUTCHR-408 — the daemon loop for butchr's own built-in managed-session
  * query. Structurally a sibling of `filesystem-loop.ts`, simplified because
@@ -27,6 +28,10 @@ import { runResourceLoop } from "./loop.js";
 export const MANAGED_SESSIONS_POLL_MS = 15_000;
 
 export interface ManagedSessionsLoopDeps {
+  stalledEvents?: ManagedSessionResourceDeps["stalledEvents"];
+  stalledObservation?: ManagedSessionResourceDeps["stalledObservation"];
+  resourceStallObservation?: ManagedSessionResourceDeps["resourceStallObservation"];
+  defaultStalledMinutes?: number;
   /** The well-known definitions directory. Defaults to `sessionDefinitionsPath()`; a test passes a temp dir. */
   root?: string;
   env?: SessionDefinitionsEnv;
@@ -146,6 +151,7 @@ export interface ManagedSessionsLoopDeps {
 export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
   const rule = builtinManagedSessionsRule(deps.root ?? sessionDefinitionsPath(deps.env));
   const type = createManagedSessionResourceType({
+    stalledEvents: deps.stalledEvents, stalledObservation: deps.stalledObservation, resourceStallObservation: deps.resourceStallObservation, defaultStalledMinutes: deps.defaultStalledMinutes,
     rule,
     list: deps.list ?? listFilesystemResources,
     read: deps.read ?? ((path) => readFile(path, "utf8")),
