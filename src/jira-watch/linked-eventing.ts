@@ -1108,12 +1108,14 @@ export function createLinkedEventingState(): LinkedEventingState {
             const beforeRaw = baselines.get(bkey);
             const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
             if (deps.stalledEvents && deps.stalledObservation) {
-              const notice = deps.stalledEvents.observe(await deps.stalledObservation(issue));
+              let notice;
+              try { notice = deps.stalledEvents.observe(await deps.stalledObservation(issue)); }
+              catch (error) { deps.log?.(`[stalled] ${item.target}: observation failed: ${String(error)}`); }
               if (notice && deps.stalledEvents.pending(notice, entry.notifyAgentKey)) {
                 triggering.push({ target: item.target, kind: item.kind, detail: "agent remains stalled", stalled: true });
                 toAdvance.push(() => deps.stalledEvents!.acknowledge(notice, entry.notifyAgentKey));
                 toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
-                continue;
+                if (!before) continue;
               }
             }
             if (!before) {

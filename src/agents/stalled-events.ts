@@ -52,6 +52,7 @@ export function withStalledEvents<T>(base: EventRules<T>, events: StalledEvents,
   idOf: (resource: T) => string,
   observe: (resource: T) => Promise<StallObservation | undefined>,
   forgetObservation?: (id: string) => void,
+  onObservationError: (id: string, error: unknown) => void = (id, error) => console.error(`[stalled] ${id}: observation failed: ${String(error)}`),
 ): EventRules<T> {
   let previous = new Map<string, string>();
   return {
@@ -61,7 +62,16 @@ export function withStalledEvents<T>(base: EventRules<T>, events: StalledEvents,
       for (const resource of [...next.primary, ...next.related.map((r) => r.issue)]) {
         const id = idOf(resource);
         if (current.has(id)) continue;
-        const observation = await observe(resource);
+        let observation: StallObservation | undefined;
+        try { observation = await observe(resource); }
+        catch (error) {
+          // An optional reminder must not prevent ordinary ticket updates.
+          // Retain its previous observation identity; unknown is not removal.
+          const previousKey = previous.get(id);
+          if (previousKey !== undefined) current.set(id, previousKey);
+          onObservationError(id, error);
+          continue;
+        }
         if (!observation) continue;
         current.set(id, observation.key);
         const notice = events.observe(observation);
@@ -74,18 +84,18 @@ export function withStalledEvents<T>(base: EventRules<T>, events: StalledEvents,
         changedPrimary: [...new Set([...ordinary.changedPrimary, ...next.primary.map(idOf).filter((id) => notices.has(id))])],
         changedRelated: [...new Set([...ordinary.changedRelated, ...next.related.map((r) => idOf(r.issue)).filter((id) => notices.has(id))])],
         async decide(key, recipient, space) {
+          const changed = (space === "primary" ? ordinary.changedPrimary : ordinary.changedRelated).includes(key);
+          const verdict = changed ? await ordinary.decide(key, recipient, space) : { deliver: false as const };
+          // Preserve ordinary PR/status/comment precedence. The pending
+          // reminder remains available on the next otherwise-quiet poll.
+          if (verdict.deliver && (!verdict.reason || !("stalled" in verdict.reason))) return verdict;
           const notice = notices.get(key);
           const routed = space === "primary" ? recipient === key : next.related.some((r) => idOf(r.issue) === key && r.watchers.includes(recipient));
           if (notice && routed && events.pending(notice, recipient)) {
             events.acknowledge(notice, recipient);
             return { deliver: true, reason: { stalled: notice } satisfies NotifyReason };
           }
-          if (!(space === "primary" ? ordinary.changedPrimary : ordinary.changedRelated).includes(key)) return { deliver: false };
-          const verdict = await ordinary.decide(key, recipient, space);
-          // The shared epoch replaces the former entry-only wake; cleanup
-          // still follows the ordinary label filter.
-          if (verdict.deliver && verdict.reason && "stalled" in verdict.reason) return { deliver: false };
-          return verdict;
+          return { deliver: false };
         },
       };
     },

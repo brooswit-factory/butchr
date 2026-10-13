@@ -163,3 +163,43 @@ test("edited manual intervals take effect for the next update", () => {
   now = 40 * minute;
   expect(events.observe({ key: "TASK-1", stalled: true, minutes: 40 })!.at).toBe(now);
 });
+
+test("ordinary PR updates retain priority and the reminder remains due on the next poll", async () => {
+  const events = new StalledEvents(() => 0);
+  const rules = withStalledEvents(createIssueEventRules({ comments: async () => [] }), events,
+    i => i.key, async i => ({ key: i.key, minutes: 10, stalled: true }));
+  const before = { primary: [issue(["agent:stalled", "pr:open"])], related: [] };
+  const after = { primary: [{ ...issue(["agent:stalled", "pr:approved"]), updated: "approved" }], related: [] };
+  const poll = await rules.poll(before, after);
+  expect(await poll.decide("TASK-1", "TASK-1", "primary")).toMatchObject({ deliver: true, reason: { pr: { from: "open", to: "approved" } } });
+  const next = await rules.poll(after, after);
+  expect(await next.decide("TASK-1", "TASK-1", "primary")).toMatchObject({ deliver: true, reason: { stalled: { key: "TASK-1" } } });
+});
+
+test("failed reminder observation does not block ordinary status updates", async () => {
+  const errors: string[] = [];
+  const rules = withStalledEvents(createIssueEventRules({ comments: async () => [] }), new StalledEvents(() => 0),
+    i => i.key, async () => { throw new Error("unavailable"); }, undefined, id => { errors.push(id); });
+  const before = { primary: [issue()], related: [] };
+  const after = { primary: [{ ...issue(), status: "In Review", updated: "review" }], related: [] };
+  const poll = await rules.poll(before, after);
+  expect(await poll.decide("TASK-1", "TASK-1", "primary")).toMatchObject({ deliver: true, reason: { status: { from: "In Progress", to: "In Review" } } });
+  expect(errors).toEqual(["TASK-1"]);
+});
+
+test("failed linked reminder observation still delivers an ordinary linked status update", async () => {
+  const rule = parseRules({ rules: [{ id: "tasks", resourceProvider: "jira-work", query: "q", brief: "work", linkedEventing: true }] })[0]!;
+  const matches = [{ agentKey: "jira-work:tasks:BOSS-1", rule,
+    issue: { ...issue([]), key: "BOSS-1", issuelinks: [{ type: "Blocks", otherEnd: "outward" as const, key: "TASK-1" }] } }];
+  let target = issue();
+  const sent: unknown[] = [];
+  const state = createLinkedEventingState();
+  const deps = { search: async () => [target], comments: async () => [], stalledEvents: new StalledEvents(() => 0),
+    stalledObservation: async (): Promise<never> => { throw new Error("unavailable"); },
+    notify: async (_agent: string, _about: string, reason: unknown) => { sent.push(reason); } };
+  await state.runTick(matches, deps);
+  target = { ...target, status: "In Review", updated: "review" };
+  await state.runTick(matches, deps);
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({ linked: { events: [{ detail: 'status changed from "In Progress" to "In Review"' }] } });
+});
