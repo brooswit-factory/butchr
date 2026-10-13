@@ -1,5 +1,3 @@
-import type { createResourceStallObserver } from "../agents/resource-stall-observer.js";
-import { withStalledEvents, type StalledEvents, type StallObservation } from "../agents/stalled-events.js";
 /**
  * BUTCHR-408 — the built-in managed-session query: a `Rule` butchr ships
  * itself (never read from `rules.json`, never user-editable), expressed as
@@ -423,10 +421,6 @@ export function createSessionDefinitionEventRules(): EventRules<ExecutionUnit<Se
 }
 
 export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps {
-  stalledEvents?: StalledEvents | undefined;
-  stalledObservation?: ((issue: JiraIssue) => Promise<StallObservation>) | undefined;
-  resourceStallObservation?: ReturnType<typeof createResourceStallObserver> | undefined;
-  defaultStalledMinutes?: number | undefined;
   log?: (line: string) => void;
   /**
    * PR #394 review fix: an agent's own manifest `role` was validated and
@@ -629,7 +623,6 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
           try {
             await linkedEventingState.runTick([], {
               search: searchIssues,
-          stalledEvents: deps.stalledEvents, stalledObservation: deps.stalledObservation,
               notify,
               ...(deps.log ? { log: deps.log } : {}),
               ...(deps.now ? { now: deps.now } : {}),
@@ -644,14 +637,7 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
       },
     },
     activation: { verdictFor: () => "active" },
-    eventRules: deps.stalledEvents && deps.resourceStallObservation
-      ? withStalledEvents(createSessionDefinitionEventRules(), deps.stalledEvents, unitAgentKey, async u => {
-          if (u.kind !== "resource") return undefined;
-          const m = u.match;
-          return deps.resourceStallObservation!(m.agentKey, m.definition.stalledMinutes ?? deps.defaultStalledMinutes ?? 10,
-            m.definition.stalledMinutes !== undefined && !m.definition.frozen && !(await deps.isFrozen?.(m.agentKey)), m.resource.mtimeMs);
-        }, deps.resourceStallObservation.forget)
-      : createSessionDefinitionEventRules(),
+    eventRules: createSessionDefinitionEventRules(),
     spawnConfig: { specFor: specForSessionDefinitionUnit },
   };
 }

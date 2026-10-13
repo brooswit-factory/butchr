@@ -365,7 +365,6 @@ export interface SessionDefinition {
    * the shipped per-role values and what applying them to a live fleet
    * requires.
    */
-  stalledMinutes?: number;
   idlePokeMinutes?: number;
   /**
    * REUSED VERBATIM from `Rule.idlePokeMessage` — same optional non-empty
@@ -399,7 +398,7 @@ export interface SessionDefinition {
 
 const DEFINITION_FIELDS = new Set([
   "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "lizardMode", "execution", "account", "role", "frozen",
-  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects", "stalledMinutes", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
+  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 
 const MAX_CONTROLLERS_PER_FIELD = 100;
@@ -547,7 +546,6 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   // FACTORY-926: same field names, same validation idiom as `Rule`'s own
   // `idlePokeMinutes`/`idlePokeMessage`/`idlePokeEnabled` (src/rules/rules.ts)
   // — see this interface's own doc comments on these three fields for why.
-  if (doc.stalledMinutes !== undefined && (typeof doc.stalledMinutes !== "number" || !Number.isFinite(doc.stalledMinutes) || doc.stalledMinutes <= 0)) problems.push(`${at}.stalledMinutes must be a positive number`);
   if (doc.idlePokeMinutes !== undefined && (!Number.isFinite(doc.idlePokeMinutes) || (doc.idlePokeMinutes as number) <= 0)) problems.push(`${at}.idlePokeMinutes must be a positive number`);
   if (doc.idlePokeMessage !== undefined && !nonEmpty(doc.idlePokeMessage)) problems.push(`${at}.idlePokeMessage must be a non-empty string`);
   if (doc.idlePokeEnabled !== undefined && typeof doc.idlePokeEnabled !== "boolean") problems.push(`${at}.idlePokeEnabled must be a boolean`);
@@ -579,7 +577,6 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     ...(d.linkedEventingProjects !== undefined
       ? { linkedEventingProjects: (d.linkedEventingProjects as string[]).map((s) => formatResourceRef(parseResourceRef(s.trim()))) }
       : {}),
-    ...(d.stalledMinutes !== undefined ? { stalledMinutes: d.stalledMinutes as number } : {}),
     ...(d.idlePokeMinutes !== undefined ? { idlePokeMinutes: d.idlePokeMinutes as number } : {}),
     ...(typeof d.idlePokeMessage === "string" ? { idlePokeMessage: d.idlePokeMessage.trim() } : {}),
     idlePokeEnabled: (d.idlePokeEnabled as boolean | undefined) ?? true,

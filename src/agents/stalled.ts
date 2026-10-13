@@ -267,7 +267,7 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
                 : `[stalled] ${issue} declined: comment ${disqualifying.id} (${disqualifying.created}) is not daemon chatter and landed at/after the current idle streak began (${new Date(streakStart).toISOString()}) — someone is attending`,
             );
           }
-          return false;
+          return Number.isFinite(activityAt) ? false : null;
         }
         declineLogged.delete(issue);
         return true;
@@ -283,7 +283,7 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
         return null;
       }
     },
-    forget: (issue) => { tracker.forget(issue); declineLogged.delete(issue); },
+    forget: (issue) => { tracker.forget(issue); declineLogged.delete(issue); activitySeen.delete(issue); },
     elapsedMinutes: (issue) => tracker.elapsedMinutes(issue),
     thresholdMinutes: (issue) => deps.minutesFor?.(issue) ?? deps.minutes,
     streakStart: (issue) => tracker.streakStart(issue),

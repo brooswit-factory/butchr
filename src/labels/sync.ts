@@ -315,7 +315,7 @@ export function createLabelSync(deps: SyncDeps) {
         // wake it was meant to deliver). `stalledResult` is threaded through
         // uncollapsed so the module can distinguish "could not verify" from
         // "stabilizing" from "nothing going on" for its own log lines,
-        // without any of those ever gating whether it acts.
+        // and suppress a notice when current inactivity cannot be verified.
         //
         // BUTCHR-353: this ticket's own outward `Implements` links ARE its
         // workers — already hydrated on `issue.issuelinks` by `search()`'s
@@ -328,7 +328,7 @@ export function createLabelSync(deps: SyncDeps) {
         // — `undefined` only when Jira genuinely didn't hydrate it, treated
         // as "not Done" by gatherWorkerSignals, never fabricated.
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
-        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers, deps.stalled?.streakStart?.(issue.key));
 
         // FACTORY-845: always evaluated, every poll, for every active
         // issue — never only when `stalledNow`/`stalled` — so the

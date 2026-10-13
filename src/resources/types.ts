@@ -196,7 +196,7 @@ export type NotifyReason =
   | { linked: { events: readonly LinkedChangeEvent[] } }
   | { definitionField: { brief?: string; workingDirectory?: string } }
   | { blocked: { key: string } }
-  | { stalled: { key: string; at?: number } }
+  | { stalled: { key: string } }
   | { confluencePageEdit: { from: number; to: number } }
   | { confluencePageComment: { ids: readonly string[] } };
 
@@ -262,8 +262,6 @@ export type NotifyReason =
  * never needs to import the Jira-work-specific linked-discovery module.
  */
 export interface LinkedChangeEvent {
-  /** Recurring stalled update; exempt from ordinary linked turn caps. */
-  stalled?: boolean;
   /** The linked item's own identity: a Jira issue key for every kind this story handles. */
   target: string;
   kind: string;

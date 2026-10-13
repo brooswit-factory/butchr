@@ -1,4 +1,3 @@
-import { withStalledEvents, type StalledEvents, type StallObservation } from "../agents/stalled-events.js";
 /**
  * The rule engine's `ResourceType` (src/resources/types.ts): what the generic
  * loop (src/daemon/loop.ts `runResourceLoop`) staffs once rules replace the
@@ -37,8 +36,6 @@ export interface RuleMatch {
 }
 
 export interface RuleResourceDeps {
-  stalledEvents?: StalledEvents | undefined;
-  stalledObservation?: ((issue: JiraIssue) => Promise<StallObservation>) | undefined;
   /** Validated rules, loaded once at startup. Disabled rules are never searched. */
   rules: readonly Rule[];
   /** Raw Jira search for one rule's JQL. */
@@ -632,7 +629,6 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
         if (deps.notify) {
           try {
             await linkedEventingState.runTick(latest, {
-              stalledEvents: deps.stalledEvents, stalledObservation: deps.stalledObservation,
               search: deps.search,
               ...(deps.remoteLinks ? { remoteLinks: deps.remoteLinks } : {}),
               ...(deps.suppress ? { suppress: deps.suppress } : {}),
@@ -658,9 +654,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
       },
     },
     activation: { verdictFor: () => "active" },
-    eventRules: deps.stalledEvents && deps.stalledObservation
-      ? withStalledEvents(createRuleEventRules(deps), deps.stalledEvents, unitAgentKey, async (u) => u.kind === "resource" ? deps.stalledObservation!(u.match.issue) : undefined)
-      : createRuleEventRules(deps),
+    eventRules: createRuleEventRules(deps),
     spawnConfig: { specFor: specForUnit },
   };
 }

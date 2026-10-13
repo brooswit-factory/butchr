@@ -1,10 +1,6 @@
-import type { JiraIssue } from "../atlassian/types.js";
-import { mapAgentStatus } from "../labels/plan.js";
-import { StalledEvents, type StallObservation } from "../agents/stalled-events.js";
-import { createResourceStallObserver } from "../agents/resource-stall-observer.js";
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
-import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
+import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
@@ -82,6 +78,8 @@ import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
 import { createSilentStopCheck } from "../agents/silent-stop.js";
+import { createStallRemediator } from "../agents/stall-remediation.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
@@ -1686,9 +1684,6 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   coverage.recordChecked(DASHBOARD_DETECTOR);
   return statusMapFromAgents(agents);
 };
-let localStalledKeys = new Set<string>();
-const knownLocalStalledKeys = new Set<string>();
-const stalledEvents = new StalledEvents(Date.now);
 let stalledMinutesByIssue: ReadonlyMap<string, number> = new Map();
 const stalled = createStalledCheck({
   now: () => Date.now(),
@@ -1728,6 +1723,34 @@ const quotaGate = createQuotaGate(
   readPane,
   () => Date.now(),
 );
+// BUTCHR-221/BUTCHR-210: the stall deadlock-breaker's remediation half —
+// posts one debounced wake comment on a ticket once agent:stalled is
+// actually applied (never on the raw per-poll signal — see
+// src/agents/stall-remediation.ts's own top comment for the gating
+// rationale and the own-write ledger hazard it avoids by construction).
+// Always an issue key (syncLabels below is never wired into the project
+// loop further down this file), so `ops.addComment` is the right seam —
+// same one parked.ts uses, no second Atlassian writer.
+const stallRemediation = createStallRemediator({
+  now: () => Date.now(),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  comments: (issue) => atlassian.comments(issue),
+  quotaBlocked: (issue) => herd.resourceQuotaBlocked(issue) || quotaGate.blockedIds().some((id) => resourceKeyOf(id) === issue),
+  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
+  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
+  // never a herd/live probe: a boss's worker is staffed under a different
+  // Atlassian account than the boss (this fleet's own tier->account split),
+  // so a probe wired here would be structurally blind to every worker it
+  // could ever be asked about (three independent live confirmations, all
+  // probeOutOfScope:true — see this ticket's own PR body) — the label path
+  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
+  // doc comment argues (src/tools/relationship.ts). Paid at most once per
+  // non-Done worker, only on the one poll that is actually about to post a
+  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
+  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
+  log: (line) => console.error(`  ${line}`),
+});
+
 // FACTORY-845: this poll's resolved idle-poke config per issue, built from
 // the rule engine's own (rule, issue) matches just before `syncLabels` runs
 // (see the `syncLabels: (matches) => ...` wiring further down this file) —
@@ -1765,6 +1788,14 @@ function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): v
     });
   }
 }
+
+// FACTORY-941: this poll's resolved pinned-active minutes override per
+// jira-project agentKey — `pinnedActiveMinutesFor` (src/rules/
+// jira-project-type.ts, exported there so its resolution logic is directly
+// unit-testable without importing this module) rebuilds this fresh from
+// each poll's own matches; see the `projectType.discovery.search` wrap
+// further down for exactly where/why.
+let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
 
 // FACTORY-845: the channel half, copying the SAME call shape every other
 // delivery seam in this file already uses (`deliverNotice`/
@@ -2149,7 +2180,7 @@ const syncLabels = createLabelSync({
   agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
-  // Stalled notices are emitted by existing event rules, without wake comments.
+  stallRemediation,
   ...(silentStop ? { silentStop } : {}),
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
@@ -2242,25 +2273,7 @@ let commentChecksSkipped = 0;
 let stalledWakes = 0;
 let stalledWakesCapped = 0;
 
-const stalledObservation = async (issue: JiraIssue): Promise<StallObservation> => {
-  const minutes = stalledMinutesByIssue.get(issue.key) ?? config.stalledMinutes;
-  if (knownLocalStalledKeys.has(issue.key) && !localStalledKeys.has(issue.key)) return { key: issue.key, minutes, stalled: false };
-  if (localStalledKeys.has(issue.key)) {
-    const statuses = await agentStatuses();
-    const values = [...statuses].filter(([id]) => resourceKeyOf(id) === issue.key).map(([, value]) => value);
-    const labels = values.map(mapAgentStatus);
-    const status = labels.length && labels.every(label => label === "idle") ? "idle" : labels.find(label => label !== "idle") ?? "none";
-    return { key: issue.key, minutes, stalled: issue.labels.includes("agent:stalled") && ["In Progress", "In Review"].includes(issue.status) && await stalled.check(issue.key, status) === true };
-  }
-  const eligible = ["In Progress", "In Review"].includes(issue.status) && issue.labels.includes("agent:stalled");
-  if (!eligible) return { key: issue.key, minutes, stalled: false };
-  const comments = await atlassian.comments(issue.key);
-  const activity = comments.filter(c => !c.body.startsWith("[butchr:")).map(c => Date.parse(c.created));
-  if (activity.some(t => !Number.isFinite(t))) return { key: issue.key, minutes, stalled: false };
-  return { key: issue.key, minutes, stalled: true, ...(activity.length ? { activity: Math.max(...activity) } : {}) };
-};
 const ruleResourceType = createRuleResourceType({
-  stalledEvents, stalledObservation,
   rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
   // leaving the query and stop their agents.
@@ -2329,14 +2342,6 @@ const ruleResourceType = createRuleResourceType({
 // ResumeDeferGuard, the notify-tick hash counter — all local to
 // `runResourceLoop`/`startLoop`) — never re-registers an agent, re-reads
 // config, or duplicates any of this daemon's other long-lived state.
-const stalledDiscoverySearch = ruleResourceType.discovery.search;
-ruleResourceType.discovery.search = async () => {
-  const matches = await stalledDiscoverySearch();
-  stalledMinutesByIssue = stalledMinutesForIssues(matches);
-  localStalledKeys = new Set(uniqueIssues(matches).map(i => i.key));
-  for (const key of localStalledKeys) knownLocalStalledKeys.add(key);
-  return matches;
-};
 const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   herd,
   ownsId: ownsRuleAgent,
@@ -2407,9 +2412,6 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     // is still available.
     if (idlePoke) updateIdlePokeRuleConfig(matches);
     stalledMinutesByIssue = stalledMinutesForIssues(matches);
-    localStalledKeys = new Set(uniqueIssues(matches).map(i => i.key));
-  for (const key of localStalledKeys) knownLocalStalledKeys.add(key);
-
     return syncLabels(uniqueIssues(matches));
   },
   checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
@@ -2675,9 +2677,6 @@ startManagedSessionsLoop({
   // (src/daemon/session-definitions-loop.ts).
   checkRestoredPaneDeferred: managedSessionRestoredPaneEscalationDetector.check,
   log: (line) => console.error(`  ${line}`),
-  stalledEvents, stalledObservation,
-  resourceStallObservation: createResourceStallObserver({ statuses: agentStatuses, comments: async () => [] }),
-  defaultStalledMinutes: config.stalledMinutes,
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
   // FACTORY-53/FACTORY-71: linked-change eventing for a managed session that
@@ -3263,15 +3262,39 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
+// BUTCHR-305/BUTCHR-238/FACTORY-941: audible-only pinned-active detection
+// for the project/manager tier — see src/agents/pinned-active.ts's own top
+// comment for the full derivation of why this shape (a resource both
+// `desired` "active" and `running`, with its agent stopped acting) is
+// invisible to every other detector, and why it is wired into the PROJECT
+// loop only (the issue tier already covers the same phenomenon via
+// `syncLabels`/`stallRemediation` above). `minutesFor` resolves per-id from
+// `pinnedActiveMinutesByProject`, refreshed each poll by the
+// `projectType.discovery.search` wrap further down (see that wrap's own
+// comment for why NOT `syncLabels`, unlike the issue tier's
+// `updateIdlePokeRuleConfig`). `addComment`/
+// `comments` decode `id` (a full `ProjectMatch.agentKey`) to its bare
+// project key via `resourceKeyOf` before reaching Jira/Confluence — neither
+// `speakOnOwnChannel` nor `ownChannelComments` understands an encoded
+// agentKey (see `issueCrashLoopDetector`'s own identical `resourceKeyOf`
+// wrapping above for the established precedent).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  minutesFor: (id) => pinnedActiveMinutesByProject.get(id),
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  quotaBlocked: (id) => herd.resourceQuotaBlocked(resourceKeyOf(id)) || quotaGate.blockedIds().some((qid) => resourceKeyOf(qid) === resourceKeyOf(id)),
+  log: (line) => console.error(`  [pinned-active] ${line}`),
+});
+
 // Free-form jira-project resource agents (BUTCHR-425): no ticket, Confluence,
 // or boss/worker workflow — just discovery (matching Jira projects), spawn,
 // and residency/admission, sharing the same host cap and herd namespace as
 // every other rule provider. Always sentinels (src/agents/capacity-role.ts),
 // so admission never withholds one regardless of `config.maxAgents`.
 const projectType = createJiraProjectResourceType({
-  stalledEvents, stalledObservation,
-  resourceStallObservation: createResourceStallObserver({ statuses: agentStatuses, comments: id => ownChannelComments(resourceKeyOf(id)) }),
-  defaultStalledMinutes: config.stalledMinutes,
   rules: getRules(),
   search: (q) => atlassian.searchProjects(q),
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
@@ -3288,15 +3311,39 @@ const projectType = createJiraProjectResourceType({
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
 });
+// FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
+// matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
+// `reconcileNow`/`checkPinnedActive` above — `discovery.search()` is the
+// first thing each poll calls (ahead of `reconcileNow`, which in turn runs
+// ahead of `syncLabels` — see that file's own call order), so wrapping it
+// here, rather than updating from `syncLabels` the way
+// `updateIdlePokeRuleConfig` does for the issue tier, is what keeps this
+// map current for the SAME poll's `checkPinnedActive` call rather than one
+// poll stale. `pinnedActiveMinutesFor` itself lives in jira-project-type.ts
+// (exported there, unit-tested directly) — this wrap is only the glue that
+// refreshes the module-level binding `pinnedActiveDetector.minutesFor`
+// reads above.
+const projectDiscoverySearch = projectType.discovery.search;
+projectType.discovery.search = async () => {
+  const matches = await projectDiscoverySearch();
+  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  return matches;
+};
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,
-  // Stalled epochs use the existing resource-updated notification path.
-  notify: notifyRuleAgent,
+  // Free-form: no notification concept (eventRules.poll always reports no
+  // changes — see jira-project-type.ts), and no respawn ticket to comment on.
+  notify: async () => {},
   onRespawn: async (id, reason) => { console.error(`  [jira-project] ${id} respawned: ${reason}`); },
-  // Retire connections for project agents no longer matched.
+  // No labels to sync; the only per-poll bookkeeping is retiring MCP
+  // connections for agents that dropped out of this poll's matches. The
+  // pinned-active minutes refresh (FACTORY-941) is NOT done here: `syncLabels`
+  // runs AFTER `reconcileNow` (src/daemon/loop.ts's own call order), which is
+  // too late for `checkPinnedActive` below to see this poll's rule matches —
+  // see the `projectType.discovery.search` wrap above instead.
   syncLabels: async (matches) => { await resourceConnections.retain(new Set(matches.map((m) => m.agentKey))); return new Set<string>(); },
-  // Stalled epochs now enter projectType.eventRules; no separate wake comment.
+  checkPinnedActive: pinnedActiveDetector.check,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_PROJECT),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_PROJECT),

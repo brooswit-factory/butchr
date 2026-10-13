@@ -1,73 +1,19 @@
-# Stalled notifications
+# Stalled episode notices
 
-Stalled is an inactivity observation, not a failure diagnosis. Working, blocked,
-missing, frozen, and removed local agents receive no recurring stalled event.
-Done counts as idle. Non-daemon comments reset the Jira inactivity floor to their
-timestamp; the detector does not judge their meaning. Failed reads and invalid
-comment timestamps cannot prove inactivity. Label stabilization is unchanged.
+A Jira ticket receives one visible `[butchr:stall]` comment after continuous inactivity reaches its configured threshold and its stabilized `agent:stalled` label has been read back. Ordinary comment-change delivery informs the ticket's own agent and linked watchers. A label change alone sends no stalled notification, including through the legacy project event path.
 
-## Manual configuration
+The same uninterrupted stall never produces another notice, regardless of elapsed time. Real agent activity or a non-daemon comment resets inactivity; a later qualifying stall can receive one new notice. Daemon notices do not reset the detector. Unknown activity or failed comment reads suppress a write without closing the episode. Failed writes may retry, first checking visible history for a successful prior post.
 
-Set a positive finite `stalledMinutes` on the rule whose query selects the agents.
-There is no inference from issue type, rank, or link depth. The same value controls
-initial detection and each subsequent interval.
+Existing visible comment history supports adoption after restart or sequential ownership handoff. Overlapping checks within one process are serialized per ticket. There is no repeat scheduler, backoff, stall count, new Jira metadata, or new persistence. As before, a history window that no longer contains the notice cannot prove prior delivery, and the existing single-owner deployment model is required: Jira comment creation has no cross-process compare-and-set guarantee. Working activity occurring entirely while the daemon is offline cannot be reconstructed without visible history.
 
-| Manually selected group | Minutes |
-| --- | ---: |
-| Tasks | 10 |
-| Stories | 40 |
-| Epics | 160 |
-| Projects/managers | 640 |
-| Director | 2560 |
+## Manual thresholds
 
-Issue swarm rules inherit `BUTCHR_STALLED_MINUTES` (default 10) when omitted.
-The longest explicit timeout wins when several enabled rules match one ticket.
-The rule read API returns null for inheritance; plan/apply accepts null to clear
-an override. Singleton/persistent issue rules are rejected because they have no
-single-ticket inactivity detector.
+Set `stalledMinutes` on each supported rule. The manual values 10, 40, 160, 640, and 2560 are accepted as ordinary durations; no role, depth, issue type, or hierarchy chooses them automatically. A missing value inherits the daemon's default. API patches use `null` to remove an override. Overlapping issue rules use the longest explicit value. Disabled or removed rules leave no stale override.
 
-Projects prefer `stalledMinutes`, then legacy `idlePokeMinutes`, then the global
-value. Managed sessions opt in with `stalledMinutes` in their definition, e.g.
-2560 for Director. Omission leaves managed-session stalled detection disabled.
-Their status observations and definition edits reset inactivity; these sessions
-have no Jira comment channel. No live configuration or enabled state is changed.
+Jira issue thresholds apply to `jira-work` swarm rules. Jira project rules use the existing pinned-active detector, with `stalledMinutes` preferred over its legacy `idlePokeMinutes` override. Project notices retain their existing own-channel behavior. Managed filesystem sessions and query-level singleton/persistent issue agents have no per-ticket comment detector; this change does not invent a channel or enable one. Director/advisor sessions and live configuration are untouched.
 
-## Existing updated-event path
+The legacy stalled-wake configuration keys and reason type remain accepted for compatibility, but issue/project label transitions no longer produce that event. Ordinary comment routing retains its existing delivery controls.
 
-Entry into `agent:stalled` passes label-only suppression. Other daemon label noise
-and cleanup remain silent. Existing PR/blocked exceptions remain unchanged.
-Self and linked recipients retain the existing routing and delivery functions.
+## Verification
 
-An unchanged Jira label does not create another Jira update. At each due interval,
-`withStalledEvents` includes the resource in the existing `changedPrimary` or
-`changedRelated` poll result and supplies a `stalled` reason to `decide`. Generic
-linked eventing includes the same epoch in its existing coalesced updated-event
-payload. There is no artificial Jira timestamp, label toggle, new wake channel,
-or periodic Jira comment. Production no longer wires the one-time remediation
-and pinned-active comment writers.
-
-While inactivity continues, one epoch occurs at each configured interval forever.
-Duplicate polls in that interval stay silent for each recipient. There is no
-backoff, hourly stalled-event cap, count-based limit, or escalation. Missed polls
-produce one event when polling resumes, without a catch-up burst. Ordinary linked
-caps still apply to other updates. Project-member discovery includes active
-stalled tickets even after they leave its normal updated-time window.
-
-## Recurrence boundary
-
-The scheduler has only in-memory interval and recipient-deduplication state.
-There is no notice count, persistence file, ticket property, or hidden Jira
-metadata. Restarting resets scheduling observations.
-
-On another daemon, an unchanged external label supplies neither the source
-rule's manual timeout nor a new event for a repeat. This implementation uses the
-watcher's local global timeout for such external observations; it does not provide
-fleet-synchronized recurrence. This boundary remains unresolved before merge.
-
-The minimal fleet-wide alternative is a human-visible ordinary stall comment
-from the owning daemon once per source-configured interval. Existing comment
-change detection would route it to self and linked watchers without new metadata
-or transport. That alternative has not been implemented or deployed.
-
-Tests use fake resources/statuses and explicit clocks. No tests start agents,
-edit Jira, or restart daemons. Counts are explicitly deferred.
+Regression tests exercise a week-long continuous stall, genuine activity followed by a new stall, the notice not rearming its own detector, restart adoption, concurrent polls, unknown reads, failed-write retries, label-only suppression, and ordinary delivery to self plus multiple watchers. Deployment health confirms installed identity only; a natural stall and observed comment/delivery are needed to prove runtime behavior.

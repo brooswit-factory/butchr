@@ -1099,7 +1099,7 @@ describe("createLabelSync", () => {
     // the re-stall — that would mean the adoption dedupe was not actually
     // reached through the real wiring, only provable in stall-remediation.ts's
     // own module-level tests (which hand-set labelApplied directly).
-    test("re-stall after a successful wake posts at most one wake comment total (evidence-based adoption survives the episode boundary)", async () => {
+    test("real activity followed by a later qualifying stall produces a new visible notice", async () => {
       let now = 0;
       let agentState: string | null = "working";
       const jira = fakeJira();
@@ -1157,9 +1157,9 @@ describe("createLabelSync", () => {
       now = 60 * 60_000;
       await sync([st.issue()]); st.absorb(jira); // t=60: agent:stalled confirmed & written this poll
       now = 65 * 60_000;
-      await sync([st.issue()]); st.absorb(jira); // t=65: labelApplied true — remediator ADOPTS the existing wake comment
+      await sync([st.issue()]); st.absorb(jira); // t=65: labelApplied true — remediator posts for the new episode
       expect(st.current()).toEqual(["agent:stalled"]);
-      expect(posted.length).toBe(1); // exactly one wake comment across the WHOLE sequence, including the re-stall
+      expect(posted.length).toBe(2); // one comment in each verified episode
     });
   });
 
