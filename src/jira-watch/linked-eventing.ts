@@ -172,7 +172,7 @@ import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
 import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
 import type { LinkStore } from "../resources/link-store.js";
-import { isDaemonLabelOnlyDiff, excludeBookkeepingComments } from "./diff.js";
+import { isDaemonLabelOnlyDiff, stalledTransition, excludeBookkeepingComments } from "./diff.js";
 import { watchedKeys } from "./routes.js";
 import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
@@ -1132,6 +1132,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             // doesn't move with it; in practice a comment write always bumps
             // `updated` too, so this is belt-and-suspenders, not the primary trigger.
             const commentChanged = commentChangedBetween(before, snap);
+            const enteredStalled = stalledTransition(asIssue(item.target, before), asIssue(item.target, snap));
             const changed = before.status !== snap.status || before.summary !== snap.summary || before.updated !== snap.updated || commentChanged;
             if (!changed) continue;
             // FACTORY-9: `isDaemonLabelOnlyDiff` only ever inspects
@@ -1141,15 +1142,17 @@ export function createLinkedEventingState(): LinkedEventingState {
             // unrelated daemon-label move (e.g. agent:working->agent:blocked)
             // is never silently swallowed as "just label noise" — a real
             // comment is never daemon-label-only.
-            if (!commentChanged && isDaemonLabelOnlyDiff(asIssue(item.target, before), asIssue(item.target, snap))) {
+            if (!enteredStalled && !commentChanged && isDaemonLabelOnlyDiff(asIssue(item.target, before), asIssue(item.target, snap))) {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // real move, but daemon-label-only — not a real change here either
               continue;
             }
-            if (deps.suppress?.(item.target, snap.updated, entry.agentKey)) {
+            // Only stalled entry bypasses daemon/self-write echo suppression.
+            // Baselines and the existing per-owner delivery cap still apply.
+            if (!enteredStalled && deps.suppress?.(item.target, snap.updated, entry.agentKey)) {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // own-write echo
               continue;
             }
-            triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap) });
+            triggering.push({ target: item.target, kind: item.kind, detail: enteredStalled ? "agent entered stalled" : changeDetail(before, snap) });
             toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
             continue;
           }

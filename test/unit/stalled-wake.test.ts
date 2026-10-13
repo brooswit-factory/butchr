@@ -100,7 +100,7 @@ describe("FACTORY-972: the stalledWake carve-out survives the real relatedAllows
     expect((await poll.decide("TASK-1", "STORY-1", "related")).deliver).toBe(false);
   });
 
-  test("the SAME agent:*->agent:stalled transition on the primary edge never fires the stalled reason — stalledWake is gated to space===\"related\" only", async () => {
+  test("the SAME agent:*->agent:stalled transition on the primary edge wakes self", async () => {
     const store = commentStore();
     const rules = createIssueEventRules({ comments: store.comments });
     const before = issue({ key: "TASK-1", labels: ["agent:working"], updated: "t0" });
@@ -109,11 +109,10 @@ describe("FACTORY-972: the stalledWake carve-out survives the real relatedAllows
     const after = issue({ key: "TASK-1", labels: ["agent:stalled"], updated: "t1" });
     const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
     const verdict = await poll.decide("TASK-1", "TASK-1", "primary");
-    expect(verdict.deliver).toBe(false);
-    if (verdict.deliver) expect(verdict.reason).not.toEqual({ stalled: { key: "TASK-1" } });
+    expect(verdict).toEqual({ deliver: true, reason: { stalled: { key: "TASK-1" } } });
   });
 
-  // NOTE: "the stalled ticket's own watcher and siblings never woken" is
+  // NOTE: "unrelated watchers never woken through a related edge" is
   // enforced one level UP from this module — `createRuleEventRules`'s own
   // `entry.watchers.includes(watcher)` check (src/rules/resource-type.ts),
   // never inside `createIssueEventRules.decide()` itself, which trusts its

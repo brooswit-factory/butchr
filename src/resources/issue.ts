@@ -432,9 +432,8 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
   const blockedWakeFired = new Map<string, number>();
   const blockedWakeDebounceMs = (deps.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
 
-  // FACTORY-972 (story FACTORY-971, extending FACTORY-949 above): the SAME
-  // per-episode debounce state, for the `agent:stalled` boss wake instead —
-  // see `stalledWake` below.
+  // Debounce stalled entry per (ticket, recipient). A self notification or
+  // the first related watcher must not consume another watcher's event.
   const stalledWakeFired = new Map<string, number>();
   const stalledWakeDebounceMs = (deps.stalledWakeDebounceMinutes ?? DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES) * 60_000;
   // item 4: a SEPARATE axis from the debounce above — caps DELIVERED
@@ -590,9 +589,10 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // function has already decided the EPISODE itself is due a wake;
       // see `stalledWakeRateCap`'s own doc comment above for why the two
       // axes are kept separate.
-      const stalledWake = async (key: string): Promise<boolean> => {
+      const stalledWake = async (key: string, watcher: string): Promise<boolean> => {
+        const recipientKey = JSON.stringify([key, watcher]);
         const now = Date.now();
-        const last = stalledWakeFired.get(key);
+        const last = stalledWakeFired.get(recipientKey);
         if (last !== undefined && now - last < stalledWakeDebounceMs) return false; // item 2: debounced
         const result = await fetchComments(key);
         if (result.ok) {
@@ -601,13 +601,13 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             (c) => c.body.startsWith(STALL_MARKER) && Date.parse(c.created) >= windowStart,
           );
           if (markerAlreadyPosted) {
-            stalledWakeFired.set(key, now);
+            stalledWakeFired.set(recipientKey, now);
             return false;
           }
         }
         // Fail OPEN toward firing, not toward silence — same reasoning as
         // `blockedWake`'s own doc comment just above.
-        stalledWakeFired.set(key, now);
+        stalledWakeFired.set(recipientKey, now);
         return true;
       };
 
@@ -1180,28 +1180,19 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           if (space === "related" && before && after && blockedTransition(before, after) && (await blockedWake(key))) {
             return deliverToRelated(key, watcher, space, { deliver: true, reason: { blocked: { key } } });
           }
-          // FACTORY-972 (story FACTORY-971): the stalled-wake twin of the
-          // blocked branch just above — same template, same reasons
-          // (space === "related" only; checked before `suppressed()` since
-          // a pure agent:* flip is `isDaemonLabelOnlyDiff`, which
-          // `crossDaemonSuppressed` would otherwise swallow). Unlike
-          // `blockedWake`, `stalledWake` returning `true` is not yet
-          // sufficient to deliver: item 4's hourly rate cap is a SEPARATE,
-          // per-recipient (here, the boss's own watcher key) axis, checked
-          // ONLY once the episode itself is confirmed due — an episode the
-          // cap rejects is still recorded as "fired" by `stalledWake`
-          // above (so a later re-flip inside the same debounce window
-          // doesn't ask the cap again for the SAME episode), but is
-          // counted/logged, never delivered (item 4's own words).
-          if (space === "related" && before && after && stalledTransition(before, after) && (await stalledWake(key))) {
+          // Stalled entry is actionable for self and routed related watchers,
+          // even when the daemon wrote it. Keep this exception before both
+          // suppression arms; recovery/removal remains ordinary label noise.
+          // Retain marker dedup, per-recipient debounce and the hourly cap.
+          if (before && after && stalledTransition(before, after) && (await stalledWake(key, watcher))) {
             if (!stalledWakeRateCap.allow(watcher, Date.now())) {
               deps.onStalledWakeCapped?.(watcher);
-              log(`[wake] stalled key=${key} recipients=boss CAPPED watcher=${watcher}`);
+              log(`[wake] stalled key=${key} recipients=${space === "primary" ? "self" : "boss"} CAPPED watcher=${watcher}`);
               return { deliver: false };
             }
             stalledWakeRateCap.record(watcher, Date.now());
             deps.onStalledWake?.(watcher);
-            log(`[wake] stalled key=${key} recipients=boss`);
+            log(`[wake] stalled key=${key} recipients=${space === "primary" ? "self" : "boss"}`);
             return deliverToRelated(key, watcher, space, { deliver: true, reason: { stalled: { key } } });
           }
           // Appear/disappear (no `before` or no `after` to diff at all) is
