@@ -164,6 +164,8 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
   if (patch.role !== undefined) next.role = patch.role;
   if (patch.idlePokeMinutes !== undefined) next.idlePokeMinutes = patch.idlePokeMinutes;
+  if (patch.stalledMinutes === null) delete next.stalledMinutes;
+  else if (patch.stalledMinutes !== undefined) next.stalledMinutes = patch.stalledMinutes;
   if (patch.idlePokeMessage !== undefined) next.idlePokeMessage = patch.idlePokeMessage;
   if (patch.idlePokeEnabled !== undefined) next.idlePokeEnabled = patch.idlePokeEnabled;
   if (patch.agentPreferences !== undefined) {

@@ -201,8 +201,7 @@
 import type { AtlassianOps } from "../tools/atlassian.js";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
-import { RateCap, HOUR_MS } from "../agents/escalation-helper.js";
-import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES, DEFAULT_STALLED_WAKE_MAX_PER_HOUR } from "../config/config.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
@@ -226,7 +225,7 @@ const PROPERTY_KEY = "butchr";
  * instead — the SAME precedent src/jira-watch/diff.ts's own `WAKE_MARKERS`
  * already sets for this exact string, rather than importing it.
  */
-const STALL_MARKER = "[butchr:stall]";
+
 
 /**
  * BUTCHR-227 DoD #9 / §6: the space ceiling on a Jira project entity
@@ -1437,7 +1436,7 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
   if (!sameIdSet(prev.observedBlockedKeys, next.observedBlockedKeys)) return true;
   // FACTORY-972: same SET-equality reasoning as `observedBlockedKeys` just
   // above, for its stalled twin.
-  if (!sameIdSet(prev.observedStalledKeys, next.observedStalledKeys)) return true;
+  // Stalled labels are display-only; the visible comment follows ordinary delivery.
   const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.commentIds]));
   return next.observedEpics.some((e) => {
     const before = prevEpics.get(e.key);
@@ -1489,17 +1488,6 @@ export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "commen
   const blockedWakeFired = new Map<string, number>();
   const blockedWakeDebounceMs = (deps?.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
 
-  // FACTORY-972 (story FACTORY-971): the stalled-wake twin of
-  // `blockedWakeFired`/`blockedWakeDebounceMs` above, plus its own
-  // per-recipient (here, the PROJECT's own key — the manager) hourly rate
-  // cap — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment
-  // (src/resources/issue.ts) for why this is a separate axis from the
-  // debounce, and `RateCap`/`HOUR_MS` (src/agents/escalation-helper.ts) for
-  // the shared primitive both this module and issue.ts reuse.
-  const stalledWakeFired = new Map<string, number>();
-  const stalledWakeDebounceMs = (deps?.stalledWakeDebounceMinutes ?? DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES) * 60_000;
-  const stalledWakeRateCap = new RateCap(deps?.stalledWakeMaxPerHour ?? DEFAULT_STALLED_WAKE_MAX_PER_HOUR, HOUR_MS);
-
   // Same shape/reasoning as `createIssueEventRules`'s own `blockedWake` —
   // see that function's own doc comment (src/resources/issue.ts) for the
   // debounce (item 4) and marker-dedup (item 5) rules this mirrors exactly,
@@ -1529,32 +1517,6 @@ export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "commen
       }
     }
     blockedWakeFired.set(key, now);
-    return true;
-  };
-
-  // FACTORY-972 (story FACTORY-971): `blockedWake`'s own twin, for the
-  // `agent:stalled` episode instead — same debounce/marker-dedup shape
-  // (against STALL_MARKER, `[butchr:stall]`, already in WAKE_MARKERS).
-  const stalledWake = async (key: string): Promise<boolean> => {
-    const now = Date.now();
-    const last = stalledWakeFired.get(key);
-    if (last !== undefined && now - last < stalledWakeDebounceMs) return false;
-    if (deps?.comments) {
-      try {
-        const comments = await deps.comments(key);
-        const windowStart = now - stalledWakeDebounceMs;
-        const markerAlreadyPosted = comments.some((c) => c.body.startsWith(STALL_MARKER) && Date.parse(c.created) >= windowStart);
-        if (markerAlreadyPosted) {
-          stalledWakeFired.set(key, now);
-          return false;
-        }
-      } catch {
-        // Fail OPEN toward firing — see issue.ts's `blockedWake`'s own doc
-        // comment for why an unreadable dedup check must not be the thing
-        // that silently loses this event.
-      }
-    }
-    stalledWakeFired.set(key, now);
     return true;
   };
 
@@ -1588,30 +1550,6 @@ export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "commen
           const candidates = [...p.observedBlockedKeys].filter((k) => !prevBlockedSet.has(k)).sort();
           for (const k of candidates) {
             if (await blockedWake(k)) return { deliver: true, reason: { blocked: { key: k } } };
-          }
-          // FACTORY-972 (story FACTORY-971): the stalled-wake twin of the
-          // blocked candidate loop just above — same "newly present since
-          // last poll, sorted, one per poll" shape (this function's own
-          // top comment, "STATED LIMIT"). Unlike `blockedWake`, a `true`
-          // from `stalledWake` here still passes through the hourly rate
-          // cap (item 4) — keyed by `key` (the PROJECT's own id: the
-          // recipient is the manager, the project's own agent) — before
-          // this poll actually delivers; a capped candidate is counted/
-          // logged and NOT delivered, but its own `stalledWakeFired` entry
-          // is already set by `stalledWake` above either way, so a later
-          // re-flip inside the same debounce window does not ask the cap
-          // again for the SAME episode.
-          const prevStalledSet = new Set(before?.observedStalledKeys ?? []);
-          const stalledCandidates = [...p.observedStalledKeys].filter((k) => !prevStalledSet.has(k)).sort();
-          for (const k of stalledCandidates) {
-            if (!(await stalledWake(k))) continue;
-            if (!stalledWakeRateCap.allow(key, Date.now())) {
-              deps?.onStalledWakeCapped?.(key);
-              continue;
-            }
-            stalledWakeRateCap.record(key, Date.now());
-            deps?.onStalledWake?.(key);
-            return { deliver: true, reason: { stalled: { key: k } } };
           }
           // Reuses `projectVerdict` rather than a second decision mechanism
           // (per this file's top comment): a change that is already fully

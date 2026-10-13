@@ -555,6 +555,8 @@ export interface Rule {
    * validation idiom as `stalledMinutes`.
    */
   idlePokeMinutes?: number;
+  /** Manual stalled-detection threshold in minutes. Absent inherits the daemon default; independent of idle pokes. */
+  stalledMinutes?: number;
   /**
    * FACTORY-846: per-rule override of the wake comment's own closing
    * sentence (`DEFAULT_TAIL` in src/agents/stall-remediation.ts's
@@ -638,7 +640,7 @@ export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your tic
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
+  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -849,6 +851,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // comments). idlePokeEnabled DOES get an always-resolved default
     // (true), because "on" is already today's unconditional behaviour.
     const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
+    const { stalledMinutes } = raw;
+    if (stalledMinutes !== undefined && (typeof stalledMinutes !== "number" || !Number.isFinite(stalledMinutes) || stalledMinutes <= 0)) errors.push(`${at}.stalledMinutes must be a positive number`);
+    if (stalledMinutes !== undefined && resourceProvider !== "jira-project" && !(resourceProvider === "jira-work" && (execution === undefined || execution === "swarm"))) errors.push(`${at}.stalledMinutes requires a jira-work swarm rule or jira-project rule with an existing stalled detector`);
     if (idlePokeMinutes !== undefined && (!Number.isFinite(idlePokeMinutes) || (idlePokeMinutes as number) <= 0)) errors.push(`${at}.idlePokeMinutes must be a positive number`);
     if (idlePokeMessage !== undefined && !nonEmpty(idlePokeMessage)) errors.push(`${at}.idlePokeMessage must be a non-empty string`);
     if (idlePokeEnabled !== undefined && typeof idlePokeEnabled !== "boolean") errors.push(`${at}.idlePokeEnabled must be a boolean`);
@@ -883,6 +888,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
       ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),
+      ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
       ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
       idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
     });

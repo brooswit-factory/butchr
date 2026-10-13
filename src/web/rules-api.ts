@@ -101,6 +101,7 @@ export interface RulesApiRuleEntry {
    * `true`/`false` for a rule that matched.
    */
   idlePokeMinutes: number | null;
+  stalledMinutes: number | null;
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
@@ -176,6 +177,7 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       resumeOnRespawn: raw?.resumeOnRespawn ?? null,
       resumeContextCutoff: raw?.resumeContextCutoff ?? null,
       idlePokeMinutes: raw?.idlePokeMinutes ?? null,
+      stalledMinutes: raw?.stalledMinutes ?? null,
       idlePokeMessage: raw?.idlePokeMessage ?? null,
       idlePokeEnabled: raw?.idlePokeEnabled ?? true,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),

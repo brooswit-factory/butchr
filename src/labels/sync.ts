@@ -277,7 +277,8 @@ export function createLabelSync(deps: SyncDeps) {
         // steady state) rather than as a new periodic log source of its own.
         if (stalledNow) {
           const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
-          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}, no non-daemon-chatter comment during that streak`);
+          const threshold = deps.stalled?.thresholdMinutes?.(issue.key);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}${threshold != null ? `, configured threshold ${threshold}m` : ""}, no non-daemon-chatter comment during that streak`);
         }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a
@@ -314,7 +315,7 @@ export function createLabelSync(deps: SyncDeps) {
         // wake it was meant to deliver). `stalledResult` is threaded through
         // uncollapsed so the module can distinguish "could not verify" from
         // "stabilizing" from "nothing going on" for its own log lines,
-        // without any of those ever gating whether it acts.
+        // and suppress a notice when current inactivity cannot be verified.
         //
         // BUTCHR-353: this ticket's own outward `Implements` links ARE its
         // workers — already hydrated on `issue.issuelinks` by `search()`'s
@@ -327,7 +328,7 @@ export function createLabelSync(deps: SyncDeps) {
         // — `undefined` only when Jira genuinely didn't hydrate it, treated
         // as "not Done" by gatherWorkerSignals, never fabricated.
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
-        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers, deps.stalled?.streakStart?.(issue.key));
 
         // FACTORY-845: always evaluated, every poll, for every active
         // issue — never only when `stalledNow`/`stalled` — so the

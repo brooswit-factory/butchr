@@ -1290,100 +1290,25 @@ describe("FACTORY-949: the project's manager wakes on a ticket's agent:blocked t
  * is already "a ticket with no boss wakes only the manager", since the
  * manager wake never consults anything boss-shaped to begin with.
  */
-describe("FACTORY-972: the project's manager wakes on a ticket's agent:stalled transition", () => {
-  test("a ticket newly present in observedStalledKeys wakes the manager with the stalled reason", async () => {
+describe("project stalled labels remain display-only", () => {
+  test("entry, persistence, removal and re-entry never create a special wake", async () => {
+    const rules = createProjectEventRules({comments: async () => { throw Error("unused"); }});
+    let before = project({observedStalledKeys: []});
+    for (const keys of [["ACME-1"], ["ACME-1"], [], ["ACME-1"]]) {
+      const after = project({observedStalledKeys: keys});
+      const poll = await rules.poll({primary: [before], related: []}, {primary: [after], related: []});
+      expect(poll.changedPrimary).toEqual([]);
+      expect((await poll.decide("ACME", "ACME", "primary")).deliver).toBe(false);
+      before = after;
+    }
+  });
+  test("ordinary project comment changes still wake the manager", async () => {
     const rules = createProjectEventRules();
-    const before = project({ observedStalledKeys: [] });
-    const after = project({ observedStalledKeys: ["ACME-1"] });
-    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
+    const before = project({observedStalledKeys: []});
+    const after = project({observedStalledKeys: ["ACME-1"], observedCommentIds: ["101", "100"]});
+    const poll = await rules.poll({primary: [before], related: []}, {primary: [after], related: []});
     expect(poll.changedPrimary).toEqual(["ACME"]);
-    const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
-  });
-
-  test("a ticket STILL present in observedStalledKeys from the previous poll (no new transition) does not re-fire", async () => {
-    const rules = createProjectEventRules();
-    const p = project({ observedStalledKeys: ["ACME-1"] });
-    const poll = await rules.poll({ primary: [p], related: [] }, { primary: [p], related: [] });
-    const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict.deliver).toBe(false);
-  });
-
-  test("debounce: a re-flip into stalled within the debounce window does not re-fire a second wake (idle<->stalled flap = one event)", async () => {
-    const rules = createProjectEventRules({ stalledWakeDebounceMinutes: 10 });
-    const noneStalled = project({ observedStalledKeys: [] });
-    const stalled = project({ observedStalledKeys: ["ACME-1"] });
-    const firstPoll = await rules.poll({ primary: [noneStalled], related: [] }, { primary: [stalled], related: [] });
-    const firstVerdict = await firstPoll.decide("ACME", "ACME", "primary");
-    expect(firstVerdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
-
-    // Flap: stalled -> none -> stalled again, inside the debounce window.
-    const secondPoll = await rules.poll({ primary: [stalled], related: [] }, { primary: [noneStalled], related: [] });
-    expect((await secondPoll.decide("ACME", "ACME", "primary")).deliver).toBe(false);
-    const thirdPoll = await rules.poll({ primary: [noneStalled], related: [] }, { primary: [stalled], related: [] });
-    const thirdVerdict = await thirdPoll.decide("ACME", "ACME", "primary");
-    expect(thirdVerdict.deliver).toBe(false); // same episode, inside the window — exactly one event total
-  });
-
-  test("dedup: a [butchr:stall] marker already posted for this episode suppresses the manager wake too", async () => {
-    const postedAt = new Date().toISOString();
-    const rules = createProjectEventRules({
-      stalledWakeDebounceMinutes: 10,
-      comments: async (key) => (key === "ACME-1" ? [{ id: "c1", body: "[butchr:stall] ACME-1 has read agent:stalled, continuously, for 30 minute(s): ...", created: postedAt, authorEmail: null }] : []),
-    });
-    const before = project({ observedStalledKeys: [] });
-    const after = project({ observedStalledKeys: ["ACME-1"] });
-    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
-    const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict.deliver).toBe(false);
-  });
-
-  test("an unreadable comments() fetch fails OPEN toward firing, not toward silence", async () => {
-    const rules = createProjectEventRules({
-      stalledWakeDebounceMinutes: 10,
-      comments: async () => { throw new Error("transient"); },
-    });
-    const before = project({ observedStalledKeys: [] });
-    const after = project({ observedStalledKeys: ["ACME-1"] });
-    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
-    const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
-  });
-
-  test("falls back to projectVerdict's own watermark comparison once no stalled-key candidate qualifies", async () => {
-    const rules = createProjectEventRules();
-    const before = project({ observedVersion: 5, observedStalledKeys: ["ACME-1"] });
-    const after = project({ observedVersion: 6, observedStalledKeys: ["ACME-1"] }); // same stalled key, but version moved
-    const poll = await rules.poll({ primary: [before], related: [] }, { primary: [after], related: [] });
-    const verdict = await poll.decide("ACME", "ACME", "primary");
-    expect(verdict).toEqual({ deliver: true }); // via projectVerdict's versionBehind axis, not the stalled axis — no reason attached
-  });
-
-  // item 4: the hourly rate cap, a NEW axis blockedWake has no equivalent of.
-  test("the hourly cap is enforced once exceeded, and the excess is counted via onStalledWakeCapped — never delivered", async () => {
-    const capped: string[] = [];
-    const delivered: string[] = [];
-    const rules = createProjectEventRules({
-      stalledWakeMaxPerHour: 1,
-      onStalledWake: (r) => delivered.push(r),
-      onStalledWakeCapped: (r) => capped.push(r),
-    });
-    const none = project({ observedStalledKeys: [] });
-    const one = project({ observedStalledKeys: ["ACME-1"] });
-    const poll1 = await rules.poll({ primary: [none], related: [] }, { primary: [one], related: [] });
-    expect(await poll1.decide("ACME", "ACME", "primary")).toEqual({ deliver: true, reason: { stalled: { key: "ACME-1" } } });
-
-    // A second, DIFFERENT ticket in the SAME project going stalled in the
-    // same poll window — same recipient (the manager, keyed by the
-    // project's own key "ACME") — exceeds the cap of 1/hour and must be
-    // counted, not delivered, even though it is a genuinely NEW episode
-    // (never debounced on its own ticket-key axis).
-    const two = project({ observedStalledKeys: ["ACME-1", "ACME-2"] });
-    const poll2 = await rules.poll({ primary: [one], related: [] }, { primary: [two], related: [] });
-    const verdict2 = await poll2.decide("ACME", "ACME", "primary");
-    expect(verdict2.deliver).toBe(false);
-    expect(capped).toEqual(["ACME"]);
-    expect(delivered).toEqual(["ACME"]);
+    expect((await poll.decide("ACME", "ACME", "primary")).deliver).toBe(true);
   });
 });
 

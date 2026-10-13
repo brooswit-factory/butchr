@@ -46,7 +46,7 @@ import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
 import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
 import { reloadRules } from "../rules/reload.js";
-import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
+import { createRuleResourceType, ownsRuleAgent, uniqueIssues, stalledMinutesForIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
@@ -1684,9 +1684,11 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   coverage.recordChecked(DASHBOARD_DETECTOR);
   return statusMapFromAgents(agents);
 };
+let stalledMinutesByIssue: ReadonlyMap<string, number> = new Map();
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
+  minutesFor: (issue) => stalledMinutesByIssue.get(issue),
   comments: (issue) => atlassian.comments(issue),
   log: (line) => console.error(`  ${line}`),
 });
@@ -2409,6 +2411,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     // doc comment above for why this is the only place that association
     // is still available.
     if (idlePoke) updateIdlePokeRuleConfig(matches);
+    stalledMinutesByIssue = stalledMinutesForIssues(matches);
     return syncLabels(uniqueIssues(matches));
   },
   checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
