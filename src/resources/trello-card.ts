@@ -246,7 +246,11 @@ export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardCl
       return out;
     },
     async comments(ref) {
-      if (ref.boardId !== deps.boardId) throw new Error(`${formatTrelloCardRef(ref)} is outside TRELLO_BOARD_ID`);
+      // Re-read the card first, the same way `get`/`addComment` do: `ref.boardId`
+      // is caller-supplied identity, not proof of the card's CURRENT board. A
+      // card that has since moved to another board must be refused here too,
+      // not just trusted because the caller still names the old board.
+      await getCard(ref);
       const out: TrelloComment[] = [];
       let before: string | undefined;
       for (let page = 1; ; page++) {
@@ -254,7 +258,11 @@ export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardCl
         const body = await request(`/cards/${ref.cardId}/actions`, "card comments", { filter: "commentCard", limit: String(PAGE_LIMIT), ...(before ? { before } : {}) }) as unknown;
         if (!Array.isArray(body)) throw new Error("Trello card comments returned an unexpected body");
         const items = body as Array<Record<string, unknown>>;
-        for (const a of items) out.push(mapComment(a));
+        for (const a of items) {
+          const comment = mapComment(a);
+          if (!comment) throw new Error(`Trello comments for ${formatTrelloCardRef(ref)} included a malformed comment action (missing or non-string id/text)`);
+          out.push(comment);
+        }
         if (items.length < PAGE_LIMIT) break;
         // Trello's actions endpoint returns newest-first; page backward by the oldest id seen so far.
         const last = items[items.length - 1];
@@ -267,12 +275,15 @@ export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardCl
   };
 }
 
-function mapComment(a: Record<string, unknown>): TrelloComment {
+/** `null` for a malformed comment action — never a fabricated `"undefined"` id or a silently-substituted empty body. */
+function mapComment(a: Record<string, unknown>): TrelloComment | null {
+  if (typeof a.id !== "string" || !a.id) return null;
   const data = a.data && typeof a.data === "object" ? a.data as Record<string, unknown> : {};
+  if (typeof data.text !== "string") return null;
   return {
-    id: String(a.id),
+    id: a.id,
     authorId: typeof a.idMemberCreator === "string" ? a.idMemberCreator : null,
-    body: str(data.text) ?? "",
+    body: data.text,
     created: str(a.date) ?? "",
   };
 }

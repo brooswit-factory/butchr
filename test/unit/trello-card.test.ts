@@ -124,10 +124,11 @@ describe("trello card client", () => {
     await expect(client.get({ boardId: BOARD, cardId: CARD3 })).rejects.toThrow("HTTP 404");
   });
 
-  test("comments reverse Trello's newest-first order to oldest-first, and the client refuses an off-board card", async () => {
+  test("comments re-reads the card first, reverse Trello's newest-first order to oldest-first, and the client refuses an off-board card", async () => {
     const urls: string[] = [];
     const client = createTrelloCardClient({ boardId: BOARD, apiKey: FAKE_KEY, token: FAKE_TOKEN, fetchImpl: async (url) => {
       urls.push(url);
+      if (new URL(url).pathname.endsWith(`/cards/${CARD1}`)) return json(apiCard(CARD1));
       // Trello's actions endpoint is newest-first by default: id "2" before id "1".
       return json([{ id: "2", idMemberCreator: "m1", data: { text: "second" }, date: "b" }, { id: "1", idMemberCreator: "m1", data: { text: "first" }, date: "a" }]);
     } });
@@ -136,10 +137,34 @@ describe("trello card client", () => {
       { id: "1", authorId: "m1", body: "first", created: "a" },
       { id: "2", authorId: "m1", body: "second", created: "b" },
     ]);
-    const u = new URL(urls[0]!);
+    expect(urls).toHaveLength(2); // card re-read, then one page of actions
+    const u = new URL(urls[1]!);
     expect(u.origin + u.pathname).toBe(`https://api.trello.com/1/cards/${CARD1}/actions`);
     expect(u.searchParams.get("filter")).toBe("commentCard");
     await expect(client.comments({ boardId: "f".padEnd(24, "9"), cardId: CARD1 })).rejects.toThrow("outside TRELLO_BOARD_ID");
+  });
+
+  test("comments refuses a card that moved off the configured board, even though the supplied ref still names the allowed board", async () => {
+    // The ref itself claims the configured board, but Trello's own re-read says the card now lives elsewhere.
+    const client = createTrelloCardClient({ boardId: BOARD, apiKey: FAKE_KEY, token: FAKE_TOKEN, fetchImpl: async (url) => {
+      if (new URL(url).pathname.endsWith(`/cards/${CARD1}`)) return json(apiCard(CARD1, { idBoard: "f".padEnd(24, "9") }));
+      throw new Error("comments should never be fetched for a card that failed its board re-read");
+    } });
+    await expect(client.comments({ boardId: BOARD, cardId: CARD1 })).rejects.toThrow("refusing");
+  });
+
+  test("comments reject a malformed action instead of fabricating an id or substituting an empty body", async () => {
+    const malformed = [
+      { idMemberCreator: "m1", data: { text: "no id" }, date: "a" }, // missing id
+      { id: "1", idMemberCreator: "m1", data: {}, date: "a" }, // missing text
+    ];
+    for (const bad of malformed) {
+      const client = createTrelloCardClient({ boardId: BOARD, apiKey: FAKE_KEY, token: FAKE_TOKEN, fetchImpl: async (url) => {
+        if (new URL(url).pathname.endsWith(`/cards/${CARD1}`)) return json(apiCard(CARD1));
+        return json([bad]);
+      } });
+      await expect(client.comments({ boardId: BOARD, cardId: CARD1 })).rejects.toThrow("malformed comment action");
+    }
   });
 
   test("comments pages backward with `before` when a page is full, and caps rather than looping forever", async () => {
@@ -147,6 +172,7 @@ describe("trello card client", () => {
     const full = () => Array.from({ length: 1000 }, (_, i) => ({ id: String(1000 - i), idMemberCreator: "m1", data: { text: "x" }, date: String(1000 - i) }));
     let page = 0;
     const client = createTrelloCardClient({ boardId: BOARD, apiKey: FAKE_KEY, token: FAKE_TOKEN, fetchImpl: async (url) => {
+      if (new URL(url).pathname.endsWith(`/cards/${CARD1}`)) return json(apiCard(CARD1));
       before.push(new URL(url).searchParams.get("before"));
       page++;
       return json(full());
