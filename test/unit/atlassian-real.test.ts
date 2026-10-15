@@ -366,9 +366,9 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
           getComments: (parameters: unknown) => {
             calls.push(parameters);
             if (calls.length === 1) {
-              return Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 1) })), total: 125, startAt: 0, maxResults: 100 });
+              return Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 1), body: "b" })), total: 125, startAt: 0, maxResults: 100 });
             }
-            return Promise.resolve({ comments: Array.from({ length: 25 }, (_, i) => ({ id: String(i + 101) })), total: 125, startAt: 100, maxResults: 100 });
+            return Promise.resolve({ comments: Array.from({ length: 25 }, (_, i) => ({ id: String(i + 101), body: "b" })), total: 125, startAt: 100, maxResults: 100 });
           },
         },
       }),
@@ -391,7 +391,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
         // ALWAYS a full (100-item) page, so the short-page stop never fires
         // — and a `total` far beyond what any page ever delivers, so the
         // startAt < total loop condition never naturally terminates either.
-        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })), total: 100_000 }) },
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i), body: "b" })), total: 100_000 }) },
       }),
       isNotFoundError: () => false,
     }));
@@ -420,7 +420,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             // NO `total` field anywhere in any of these responses — but
             // `maxResults` IS reported and genuinely honoured, so rule 2
             // (short against the server's own reported page size) applies.
-            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })), maxResults: 100 });
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}`, body: "b" })), maxResults: 100 });
           },
         },
       }),
@@ -456,7 +456,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining);
             return Promise.resolve({
-              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })),
               total: 125,
               startAt,
               maxResults: 50,
@@ -503,7 +503,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining);
             return Promise.resolve({
-              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })),
               startAt,
               maxResults: 50,
             });
@@ -539,7 +539,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining); // capped to 50 despite maxResults: 100 requested
             // NEITHER `total` NOR `maxResults` anywhere in this response.
-            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })) });
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })) });
           },
         },
       }),
@@ -638,7 +638,7 @@ describe("realAtlassian epic-axis pagination wired into the real project-tier de
         // 21 comments — one MORE than the pre-BUTCHR-309 20-item cap — all
         // returned on a SINGLE Jira page (maxResults: 100 now), `total: 21`
         // stops the loop after page 1.
-        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1) })), total: 21 }) },
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1), body: "b" })), total: 21 }) },
       }),
       isNotFoundError: () => false,
     }));
@@ -752,5 +752,21 @@ describe("jira_get_comments delivers readable bodies end-to-end (FACTORY-1008)",
     let n = 0;
     const { tool } = await toolFor(() => Promise.resolve(n++ === 0 ? { comments: [{ id: "1", body: adf([t("a")]) }], total: 3, maxResults: 100 } : { comments: [], total: 3, maxResults: 100 }));
     await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/empty page.*before reported total/);
+  });
+
+  test("missing, null, {} and [] bodies are rejected; a valid empty ADF doc and an empty string are accepted", async () => {
+    for (const bad of [undefined, null, {}, []]) {
+      const { tool } = await toolFor(() => Promise.resolve({ comments: [bad === undefined ? { id: "1" } : { id: "1", body: bad }], total: 1 }));
+      await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+    }
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body: { type: "doc", version: 1, content: [] } }, { id: "2", body: "" }], total: 2 }));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results.map((r: any) => r.body)).toEqual(["", ""]);
+  });
+
+  test("a total reported on page 1 still binds when page 2 omits total and is empty", async () => {
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(n++ === 0 ? { comments: [{ id: "1", body: adf([t("a")]) }], total: 3 } : { comments: [] }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/before reported total 3/);
   });
 });

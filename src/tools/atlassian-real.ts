@@ -522,8 +522,9 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         }
         const batch: any[] = r.comments;
         for (const c of batch) {
-          if (!c || typeof c.id !== "string" || (c.body !== undefined && c.body !== null && typeof c.body !== "string" && typeof c.body !== "object")) {
-            throw new Error(`getIssueComments(${key}): malformed comment at startAt=${startAt} (id/body shape) — refusing to return it as readable`);
+          const validBody = typeof c?.body === "string" || (c?.body && typeof c.body === "object" && !Array.isArray(c.body) && c.body.type === "doc" && Array.isArray(c.body.content));
+          if (!c || typeof c.id !== "string" || !validBody) {
+            throw new Error(`getIssueComments(${key}): malformed comment at startAt=${startAt} (id, or body that is neither a string nor an ADF doc) — refusing to return it as readable`);
           }
           results.push({
             id: c.id,
@@ -537,9 +538,10 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
         if (responseTotal !== undefined) total = responseTotal;
         startAt += batch.length;
-        if (responseTotal !== undefined) {
+        if (total !== undefined) {
+          // A total seen on ANY page binds the walk: stopping short of it is an error, never a partial list.
           if (batch.length === 0) {
-            if (startAt < responseTotal) throw new Error(`getIssueComments(${key}): empty page at startAt=${startAt} before reported total ${responseTotal} — refusing to return a silently partial list`);
+            if (startAt < total) throw new Error(`getIssueComments(${key}): empty page at startAt=${startAt} before reported total ${total} — refusing to return a silently partial list`);
             break;
           }
         } else if (responseMaxResults !== undefined) {
