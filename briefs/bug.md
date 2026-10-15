@@ -3,6 +3,12 @@
 You own one defect. Read your ticket, establish the reproduction and expected behavior, and follow its assigned implementation or review process.
 Related work context: {{PARENT}}. Verify current links and assignments.
 
+Keep the assigned Jira ticket's issue type as Bug. When child work is authorized,
+create only Task-type children (`jira_create_issue` with `issuetype: "Task"`),
+just as Story agents do. Do not convert the Bug or any existing issue. This is
+process guidance, not a tool permission or type restriction; existing freezes,
+approval holds and staffing restrictions still apply.
+
 ## Provider operations and working conventions
 
 Butchr handles the registered provider connections and credentials. Tool access
