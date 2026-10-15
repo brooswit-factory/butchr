@@ -3,6 +3,7 @@ import type { AtlassianOps } from "./atlassian.js";
 import { atlassianTools } from "./defs.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
 import { withOutcomeRecording } from "./outcome.js";
+import { getConfluencePageDocById } from "./docs.js";
 
 /** Provider operations, without staffing, ownership or completion policy. */
 export function providerAtlassianTools(
@@ -12,7 +13,7 @@ export function providerAtlassianTools(
   const key = z.string().refine(isIssueKey, "Expected a Jira issue key");
   const project = z.string().refine(isProjectId, "Expected a Jira project key");
   const text = z.string().min(1);
-  const existing = atlassianTools(ops, log, {}, onWrite);
+  const existing = atlassianTools(ops, log, {}, onWrite, undefined, undefined, undefined, false);
   const tools: Record<string, ToolDef<any>> = {};
   // These provider handlers already preserve paging, optimistic locking and receipts.
   for (const name of ["confluence_create_page", "confluence_update_page", "confluence_search_pages", "confluence_get_page", "confluence_list_spaces"]) {
@@ -36,6 +37,18 @@ export function providerAtlassianTools(
     } };
   }
   tools.jira_get_issue = { description: "Read the specified Jira issue using the connected account.", input: { key }, handler: (a) => ops.getIssue((a as { key: string }).key) };
+  tools.jira_get_comments = { description: "Read all comments on an explicit Jira issue. The adapter exhausts pagination; embedded issue comments may be incomplete.", input: { key }, handler: (a: any) => ops.getIssueComments(a.key) };
+  tools.jira_get_project_property = { description: "Read an explicit Jira project property, including document configuration.", input: { projectKey: project, propertyKey: text }, handler: (a: any) => ops.getProjectProperty(a.projectKey, a.propertyKey) };
+  tools.jira_get_remote_link = { description: "Read an issue's remote link by explicit global ID. Missing links return null.", input: { key, globalId: text }, handler: (a: any) => ops.getRemoteLink(a.key, a.globalId) };
+  tools.confluence_get_comments = { description: "Read footer comments on an explicit Confluence page.", input: { id: text }, handler: (a: any) => ops.getPageComments(a.id) };
+  tools.confluence_read_document = { description: "Read a bounded storage-body range. Partial reads contain chunk, never body. Continue next.offset with the first version as expectVersion; discard chunks and restart on version drift. Never replace a page with a partial chunk.", input: { id: text, offset: z.number().int().min(0).optional(), limit: z.number().int().min(1).optional(), expectVersion: z.number().int().min(1).optional() }, handler: (a: any) => getConfluencePageDocById(ops, a.id, a.offset, a.limit, a.expectVersion) };
+  tools.confluence_add_comment = { description: "Add a plain-text footer comment to an explicit Confluence page, attributed to the caller.", input: { id: text, text }, handler: (a: any, c) => {
+    const actor = c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "butchr";
+    const escape = (value: string) => value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return ops.commentOnPage(a.id, `<p>${escape(`[${actor}] ${a.text}`).replace(/\r?\n/g, "<br/>")}</p>`);
+  } };
+  write("jira_add_labels", "Add explicit labels to an issue using the provider adapter. This does not activate work or remove holds.", { key, labels: z.array(text).min(1) }, a => [a.key], a => ops.addLabels(a.key, a.labels));
+  write("jira_remove_labels", "Remove only the specified labels. On approved reactivation, explicitly clear butchr:shelved before transitioning; preserve approval and dependency holds.", { key, labels: z.array(text).min(1) }, a => [a.key], a => ops.removeLabels(a.key, a.labels));
   tools.jira_search = { description: "Search Jira using JQL and the connected account's permissions.", input: { jql: text, maxResults: z.number().int().min(1).max(100).default(25) }, handler: (a) => { const p = a as { jql: string; maxResults: number }; return ops.search(p.jql, p.maxResults); } };
   write("jira_add_comment", "Comment on the specified Jira issue, attributed to the caller.", { key, text }, a => [a.key], (a, c) => {
     const actor = c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "butchr";

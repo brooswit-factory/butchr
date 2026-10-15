@@ -9,3 +9,5 @@ bump: major
 
 ### Fixed
 - Verify GitHub targets before fetching comments, and report unconfirmed Zendesk note privacy truthfully.
+
+Bundled briefs use the provider contract; custom brief bodies are preserved. Explicit full comment reads, bounded page reads, document discovery and label operations retain review and reactivation capabilities. Outcome receipts are recorded once per call with explicit target attribution.

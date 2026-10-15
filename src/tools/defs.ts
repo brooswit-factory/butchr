@@ -260,6 +260,8 @@ export function atlassianTools(
    * its pane.
    */
   standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
+  /** Registry composers wrap validation and execution once at their outer boundary. */
+  recordOutcomes = true,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -1077,5 +1079,5 @@ export function atlassianTools(
   // BUTCHR-341: the ONE place `tools` is assembled — see `withOutcomeRecording`'s
   // own doc comment (src/tools/outcome.ts) for why wrapping happens exactly
   // here rather than at each of the 34 definitions above.
-  return withOutcomeRecording(tools, log);
+  return recordOutcomes ? withOutcomeRecording(tools, log) : tools;
 }

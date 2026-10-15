@@ -120,3 +120,45 @@ describe("role-independent provider contract", () => {
     expect(() => providerTarget({}, undefined, "jira-idea", v => v, "read")).toThrow("explicit target");
   });
 });
+
+test("explicit comment, document discovery and shelf operations preserve targets and provider denials", async () => {
+  const { ops, calls } = fakeOps();
+  const tools = providerAtlassianTools(ops, silent);
+  for (const caller of [task, manager, query]) {
+    await call(tools, "confluence_get_comments", { id: "123" }, caller);
+    await call(tools, "confluence_add_comment", { id: "123", text: "<review>&" }, caller);
+    await call(tools, "jira_get_project_property", { projectKey: "OTHER", propertyKey: "butchr" }, caller);
+    await call(tools, "jira_get_remote_link", { key: "OTHER-2", globalId: "doc" }, caller);
+    await call(tools, "jira_remove_labels", { key: "OTHER-2", labels: ["butchr:shelved"] }, caller);
+    await call(tools, "jira_add_labels", { key: "OTHER-2", labels: ["butchr:shelved"] }, caller);
+  }
+  expect(calls[1]!.args).toEqual(["123", "<p>[jira-work:tasks:WORK-1] &lt;review&gt;&amp;</p>"]);
+  expect(calls[4]!.args).toEqual(["OTHER-2", ["butchr:shelved"]]);
+  expect(calls.filter(c => c.method === "transition")).toHaveLength(0);
+  const denied = providerAtlassianTools({ getPageComments: async () => { throw new Error("403 Forbidden"); } } as unknown as AtlassianOps, silent);
+  await expect(call(denied, "confluence_get_comments", { id: "123" }, query)).rejects.toThrow("403");
+  await expect(call(tools, "confluence_get_comments", {}, manager)).rejects.toThrow();
+});
+
+test("Confluence bounded reads require stable versions and never expose partial content as body", async () => {
+  const tools = providerAtlassianTools({ getPage: async () => ({ title: "Doc", version: { number: 3 }, body: { storage: { value: "abcdef" } } }) } as unknown as AtlassianOps, silent);
+  const first = await call(tools, "confluence_read_document", { id: "123", limit: 3 });
+  expect(first.chunk).toBe("abc");
+  expect(first.body).toBeUndefined();
+  expect(first.next.offset).toBe(3);
+  await expect(call(tools, "confluence_read_document", { id: "123", offset: 3, limit: 3 })).rejects.toThrow();
+  await expect(call(tools, "confluence_read_document", { id: "123", offset: 3, limit: 3, expectVersion: 2 })).rejects.toThrow();
+  expect((await call(tools, "confluence_read_document", { id: "123", offset: 3, limit: 3, expectVersion: 3 })).chunk).toBe("def");
+});
+
+test("composed Confluence handlers emit exactly one outcome including validation and provider failures", async () => {
+  const lines: string[] = [];
+  const tools = providerAtlassianTools({ getPage: async (id: string) => { if (id === "denied") throw new Error("403"); return { id }; } } as unknown as AtlassianOps, line => lines.push(line));
+  await call(tools, "confluence_get_page", { id: "123" });
+  await expect(call(tools, "confluence_get_page", { id: "denied" })).rejects.toThrow("403");
+  await expect(call(tools, "confluence_get_page", {})).rejects.toThrow();
+  const outcomes = lines.filter(line => line.includes("[tools2]"));
+  expect(outcomes).toHaveLength(3);
+  expect(outcomes[0]).toContain("target=123");
+  expect(outcomes[1]).toContain("outcome=error");
+});
