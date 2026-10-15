@@ -192,6 +192,7 @@ function buildLine(f: OutcomeFields): string {
 function extractTarget(args: unknown): string | undefined {
   if (args && typeof args === "object") {
     const a = args as Record<string, unknown>;
+    if (typeof a.target === "string" && a.target) return a.target;
     if (typeof a.key === "string" && a.key) return a.key;
     if (typeof a.from === "string" && a.from && typeof a.to === "string" && a.to) return `${a.from}→${a.to}`;
     if (typeof a.id === "string" && a.id) return a.id;

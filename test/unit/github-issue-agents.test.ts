@@ -165,7 +165,7 @@ describe("github issue tools", () => {
   test("github_get_issue reads the caller's own issue: title, body, type and comments", async () => {
     const { client, calls } = fakeGithub(issues);
     const tools = githubIssueTools({ client, log: () => {} });
-    expect(Object.keys(tools[`github_get_issue`]!.input)).toEqual([]);
+    expect(Object.keys(tools[`github_get_issue`]!.input)).toEqual(["target"]);
     expect(await call(tools, "github_get_issue", {}, ghCaller)).toMatchObject({
       issue: "acme/w#12", title: "Crash on save", body: "steps…", type: "Bug", state: "open",
       comments: [{ id: "5", author: "alice", body: "any update?", created: "c", updated: "c" }],

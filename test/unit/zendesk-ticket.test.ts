@@ -307,8 +307,8 @@ describe("zendesk ticket tools", () => {
   test("no tool can reply publicly: exactly a read and an internal note, and the note takes only text", () => {
     const tools = zendeskTicketTools({ client: fakeZendesk(tickets).client, log: () => {} });
     expect(Object.keys(tools).sort()).toEqual(["zendesk_add_internal_note", "zendesk_get_ticket"]);
-    expect(Object.keys(tools.zendesk_add_internal_note!.input)).toEqual(["text"]);
-    expect(Object.keys(tools.zendesk_get_ticket!.input)).toEqual([]);
+    expect(Object.keys(tools.zendesk_add_internal_note!.input)).toEqual(["target", "text"]);
+    expect(Object.keys(tools.zendesk_get_ticket!.input)).toEqual(["target"]);
   });
 
   test("zendesk_get_ticket reads the caller's own ticket and its comments, marked public or internal", async () => {
@@ -325,7 +325,7 @@ describe("zendesk ticket tools", () => {
     const { client, calls } = fakeZendesk(tickets);
     const writes: string[][] = [];
     const tools = zendeskTicketTools({ client, onWrite: (r, u, w) => writes.push([r, u, w]), log: () => {} });
-    expect(await call(tools, "zendesk_add_internal_note", { text: "Reproduced.", public: true }, zdCaller)).toEqual({ ok: true, ticket: "acme#42", note: "901", internal: true });
+    expect(await call(tools, "zendesk_add_internal_note", { text: "Reproduced.", public: true }, zdCaller)).toEqual({ ok: true, ticket: "acme#42", note: "901", internal: true, confirmedPrivate: true });
     expect(calls.filter((c) => c.method === "PUT").map((c) => JSON.parse(c.body!))).toEqual([{ ticket: { comment: { body: `${zendeskNoteTag("support")} Reproduced.`, public: false } } }]);
     expect(writes).toEqual([["acme#42", "2026-09-16T11:00:00Z", ZD]]);
   });

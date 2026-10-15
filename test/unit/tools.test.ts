@@ -2685,27 +2685,12 @@ describe("BUTCHR-336: every boss-facing priority surface states the admission me
   });
 });
 
-// BUTCHR-299 (review of BUTCHR-336): the SAME backstop, extended to the
-// briefs — the copy every boss agent actually reads. The tool-description
-// guard above left a hole this fills: deleting the mechanism sentence from
-// a brief used to fail nothing, and a claim in prose that nothing executes
-// is exactly the defect this work exists to remove.
-//
-// The set of briefs is DERIVED, never hand-listed: any brief that tells a
-// boss to revise a worker's priority ("priority as reality shifts") must
-// also state that doing so does not change what gets staffed. That way a
-// brief which GAINS the guidance later is covered automatically, and
-// briefs/task.md — whose only mention is about WHO sets priority, not its
-// effect — is correctly excluded without naming it.
-//
-// Briefs HARD-WRAP, so both sides are matched on whitespace-collapsed text.
-// A line-naive match here reports a confident false negative: the sentence
-// is present but spans a line break. That mistake was actually made while
-// verifying this change, which is why the unwrapping is load-bearing
-// rather than incidental.
-describe("BUTCHR-299: every brief that tells a boss to revise priority also states the admission mechanism", () => {
+// Every brief teaching the current priority operation must explain its actual
+// admission effect. Derive from the advertised verb, independent of caller role.
+// Collapse whitespace because shipped briefs may hard-wrap the mechanism.
+describe("BUTCHR-299: every brief teaching explicit priority changes states the admission mechanism", () => {
   const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
-  const GUIDANCE = "priority as reality shifts";
+  const GUIDANCE = "`jira_set_priority`";
   const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
   const unwrapped = (file: string) => readFileSync(join(BRIEFS_DIR, file), "utf8").replace(/\s+/g, " ");
 
@@ -2723,7 +2708,7 @@ describe("BUTCHR-299: every brief that tells a boss to revise priority also stat
     expect(unwrapped(file)).toContain(MECHANISM_CLAUSE);
   });
 
-  test("briefs/task.md is deliberately excluded — its mention is about WHO sets priority, not its effect", () => {
-    expect(withGuidance).not.toContain("task.md");
+  test("task agents receive the same priority mechanism guidance as other callers", () => {
+    expect(withGuidance).toContain("task.md");
   });
 });

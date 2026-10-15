@@ -48,8 +48,8 @@ describe("github-pr tools", () => {
   test("exactly a read and a comment tool, comment takes only text", () => {
     const tools = githubPrTools({ client: fakeGithub(prs).client, log: () => {} });
     expect(Object.keys(tools).sort()).toEqual(["github_get_pr", "github_pr_add_comment"]);
-    expect(Object.keys(tools.github_pr_add_comment!.input)).toEqual(["text"]);
-    expect(Object.keys(tools.github_get_pr!.input)).toEqual([]);
+    expect(Object.keys(tools.github_pr_add_comment!.input)).toEqual(["target", "text"]);
+    expect(Object.keys(tools.github_get_pr!.input)).toEqual(["target"]);
   });
 
   test("github_get_pr reads the caller's own PR and its comments — merged/draft included", async () => {
