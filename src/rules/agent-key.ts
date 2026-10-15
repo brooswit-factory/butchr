@@ -7,6 +7,7 @@ import { isFilesystemResourceId } from "../resources/filesystem-ref.js";
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isGithubPrRef } from "../resources/github-pr-ref.js";
 import { isIssueKey, isProjectId } from "../resources/id.js";
+import { isJiraComponentRef } from "../resources/jira-component-ref.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
@@ -17,10 +18,13 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * collide), Jira Product Discovery ideas (the same Jira API as work items,
  * still a separate provider), Zendesk tickets, free-form Jira project
  * resources (`jira-project`, one agent per project key rather than per
- * issue), and (BUTCHR-407) local filesystem resources (files/directories, no
- * external credential). Only providers with an adapter are listed.
+ * issue), (BUTCHR-407) local filesystem resources (files/directories, no
+ * external credential), and (FACTORY-990, scaffolding only — see
+ * `../rules/jira-component-type.ts`'s own header) Jira components, one agent
+ * per `<PROJECT>:<componentId>` rather than per issue or project. Only
+ * providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "jira-component"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -61,7 +65,10 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  * `filesystem`: a canonical absolute path (`/home/butchr/repo/src/index.ts`),
  * resolved via `realpath` by discovery before it ever reaches this check
- * (src/resources/filesystem.ts).
+ * (src/resources/filesystem.ts). `jira-component` (FACTORY-990): a canonical
+ * `<PROJECT>:<componentId>` (`PROJ:10000`) — see
+ * `../resources/jira-component-ref.ts`'s header for why the component id,
+ * never the component's name, is the stable half of this identity.
  */
 /**
  * FACTORY-570: `platform` is forwarded only to the `filesystem` case's
@@ -82,6 +89,7 @@ export function isResourceId(provider: ResourceProvider, id: string, platform: N
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);
     case "filesystem": return isFilesystemResourceId(id, platform);
+    case "jira-component": return isJiraComponentRef(id);
   }
 }
 

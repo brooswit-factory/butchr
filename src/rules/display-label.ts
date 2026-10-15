@@ -58,6 +58,7 @@ import { managedSessionShortDisplayId, MANAGED_SESSIONS_RULE_ID } from "./sessio
 import { githubIssueShortDisplayId } from "./github-issue-type.js";
 import { githubPrShortDisplayId } from "./github-pr-type.js";
 import { zendeskTicketShortDisplayId } from "./zendesk-ticket-type.js";
+import { jiraComponentShortDisplayId } from "./jira-component-type.js";
 
 /**
  * The one dispatch spot — see this module's own top comment for why this is
@@ -79,6 +80,7 @@ export function shortDisplayId(provider: ResourceProvider, ruleId: string, resou
     case "github-issue": return githubIssueShortDisplayId(resourceId);
     case "github-pr": return githubPrShortDisplayId(resourceId);
     case "zendesk-ticket": return zendeskTicketShortDisplayId(resourceId);
+    case "jira-component": return jiraComponentShortDisplayId(resourceId);
   }
 }
 
