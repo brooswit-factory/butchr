@@ -1,0 +1,4 @@
+bump: minor
+
+### Added
+- **A minimal `trello-card` resource provider (FACTORY-1009), additive alongside the existing Jira/Confluence providers.** `src/resources/trello-card-ref.ts` (identity: `<boardId>#<cardId>`, both 24-hex Trello ObjectIds, scoped to one configured `TRELLO_BOARD_ID`) and `src/resources/trello-card.ts` (API key/token file loading with the same ownership/permission checks as the existing Zendesk token file, plus a REST client: board-scoped query, read, comments, and a single `addComment` write that re-reads the card first). Wired into `capabilities.ts`/`comments.ts` with the same `query`/`read`/`comments` row shape `zendesk-ticket` already declares. No rule type, agent staffing, MCP tools, or daemon loop are added yet — there is no live Trello account to verify any of that against, and the user has not decided whether to adopt Trello. See `docs/trello-card.md` for the full scope note and setup instructions for a future live pass.
