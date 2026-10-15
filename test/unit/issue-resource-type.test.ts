@@ -53,16 +53,16 @@ describe("ISSUE_SPAWN_CONFIG.specFor", () => {
 });
 
 // BUTCHR-240: the `todoWorkers` fetch seam `createAbandonedDetector`
-// (src/agents/abandoned.ts) optionally takes — a single `deps.search(...)`
+// (src/agents/abandoned.ts) optionally takes - a single `deps.searchAll(...)`
 // call over TODO_WORKER_JQL, the house pattern `createRelated` (same file,
 // untested at this level for the same reason: a thin I/O adapter) uses for
 // its own batched extra query.
 describe("createTodoWorkersFetch", () => {
-  test("calls search with exactly TODO_WORKER_JQL and returns its result", async () => {
+  test("calls searchAll with exactly TODO_WORKER_JQL and returns its result", async () => {
     const calls: string[] = [];
     const worker = issue({ key: "WORK-1", status: "To Do" });
     const fetch = createTodoWorkersFetch({
-      search: async (jql) => { calls.push(jql); return [worker]; },
+      searchAll: async (jql) => { calls.push(jql); return [worker]; },
     });
     expect(await fetch()).toEqual([worker]);
     expect(calls).toEqual([TODO_WORKER_JQL]);
