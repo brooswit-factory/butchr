@@ -673,3 +673,52 @@ describe("realAtlassian epic-axis pagination wired into the real project-tier de
     expect(projectVerdict(acme!)).toBe("asleep");
   });
 });
+
+describe("jira_get_comments delivers readable bodies end-to-end (FACTORY-1008)", () => {
+  const adf = (...paras: any[]) => ({ type: "doc", version: 1, content: paras.map((content) => ({ type: "paragraph", content })) });
+  const t = (text: string) => ({ type: "text", text });
+  const author = (n: string) => ({ accountId: `acct-${n}`, displayName: `User ${n}`, emailAddress: `${n}@x.com` });
+  async function toolFor(getComments: (p: any) => Promise<unknown>) {
+    mock.module("jira.js", () => ({ createCloudClient: () => ({ issueComments: { getComments } }), isNotFoundError: () => false }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const { providerAtlassianTools } = await import("../../src/tools/provider-atlassian.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    return { ops, tool: providerAtlassianTools(ops, () => {}).jira_get_comments! };
+  }
+
+  test("two pages: the agent surface carries id, full body text, created and author — not ids only", async () => {
+    const pages = [
+      { comments: [{ id: "2", created: "2026-10-15T14:02:34.266-0700", author: author("a"), body: adf([t("Release hold "), { type: "mention", attrs: { text: "@Wroos" } }, t(" stays.")], [t("Second paragraph.")]) }], total: 3, maxResults: 2 },
+      { comments: [{ id: "1", created: "2026-10-15T13:58:07.083-0700", author: author("b"), body: adf([t("Hold: do not merge. See "), { type: "inlineCard", attrs: { url: "https://github.com/o/r/pull/9" } }]) }, { id: "0", created: "2026-10-14T00:00:00.000-0700", author: author("c"), body: adf() }], total: 3, maxResults: 2 },
+    ];
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(pages[n++]));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results.map((r: any) => r.id)).toEqual(["2", "1", "0"]);
+    expect(got.results[0].body).toBe("Release hold @Wroos stays.\nSecond paragraph.");
+    expect(got.results[1].body).toBe("Hold: do not merge. See https://github.com/o/r/pull/9");
+    expect(got.results[0].created).toBe("2026-10-15T14:02:34.266-0700");
+    expect(got.results[0].author).toEqual({ accountId: "acct-a", displayName: "User a", email: "a@x.com" });
+    expect(got.results[2].body).toBe(""); // genuinely empty comment stays empty
+  });
+
+  test("ID bookkeeping consumers still get every id in order from the same reader", async () => {
+    const { ops } = await toolFor(() => Promise.resolve({ comments: [{ id: "7", body: adf([t("x")]) }, { id: "8", body: adf([t("y")]) }], total: 2, maxResults: 100 }));
+    expect((await ops.getIssueComments("KAN-9")).results.map((c) => c.id)).toEqual(["7", "8"]);
+  });
+
+  test("no comments: empty list, not an error", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [], total: 0, maxResults: 100 }));
+    expect(await tool.handler({ key: "KAN-9" }, { headers: {} } as any)).toEqual({ results: [] });
+  });
+
+  test("provider denial propagates rather than becoming an empty list", async () => {
+    const { tool } = await toolFor(() => Promise.reject(new Error("403 Forbidden")));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/403/);
+  });
+
+  test("nonterminating pagination still throws instead of returning a partial list", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i), body: adf([t("b")]) })), total: 100_000 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/exceeded 100 pages/);
+  });
+});

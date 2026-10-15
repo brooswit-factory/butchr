@@ -1,7 +1,8 @@
 import { createCloudClient, isNotFoundError } from "jira.js";
 import { createV2Client, createV1Client } from "confluence.js";
 import { createClient as createConfluenceClient } from "confluence.js/core";
-import type { AtlassianOps } from "./atlassian.js";
+import type { AtlassianOps, IssueCommentRecord } from "./atlassian.js";
+import { adfToText } from "../atlassian/client.js";
 
 /** One paragraph of plain text as ADF (what Jira v3 wants for descriptions/comments). */
 export const adf = (text: string) => ({
@@ -505,7 +506,7 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Runaway protection: `MAX_COMMENT_PAGES` throws rather than returning a
     // silently partial list if none of the three signals above is ever hit.
     getIssueComments: async (key) => {
-      const results: Array<{ id: string }> = [];
+      const results: IssueCommentRecord[] = [];
       let startAt = 0;
       let total: number | undefined;
       const PAGE_SIZE = 100;
@@ -517,7 +518,14 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         }
         const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
         const batch: any[] = r?.comments ?? [];
-        for (const c of batch) results.push({ id: c.id });
+        for (const c of batch) {
+          results.push({
+            id: c.id,
+            body: typeof c.body === "string" ? c.body : adfToText(c.body),
+            created: c.created ?? "",
+            author: { accountId: c.author?.accountId ?? null, displayName: c.author?.displayName ?? null, email: c.author?.emailAddress ?? null },
+          });
+        }
         const responseTotal = typeof r?.total === "number" ? r.total : undefined;
         const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
         if (responseTotal !== undefined) total = responseTotal;

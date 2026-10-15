@@ -541,7 +541,7 @@ function fakeWorld(opts: {
     },
     getIssueComments: async (key: string) => {
       calls.getIssueComments.push(key);
-      return { results: opts.epicComments?.[key] ?? [] };
+      return { results: (opts.epicComments?.[key] ?? []) as any[] };
     },
   };
 

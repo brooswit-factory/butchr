@@ -5,10 +5,10 @@ import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink, JiraRemoteLinkI
 export interface JiraIssueDetail extends JiraIssue { description: string }
 
 /** ADF node shape is large and mostly irrelevant here; walk it structurally. */
-interface AdfNode { type?: string; text?: string; content?: AdfNode[] }
+interface AdfNode { type?: string; text?: string; content?: AdfNode[]; attrs?: Record<string, any> }
 
 /** Block-level node types whose children are distinct lines, not one run of text. */
-const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList"]);
+const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList", "blockquote", "panel", "expand", "table", "tableRow", "tableCell", "tableHeader"]);
 
 /**
  * Flatten an ADF document (or any node within one) to plain text: every
@@ -21,6 +21,12 @@ export function adfToText(node: AdfNode | null | undefined): string {
   if (!node || typeof node !== "object") return "";
   if (node.type === "text") return node.text ?? "";
   if (node.type === "hardBreak") return "\n";
+  // Leaf inline nodes carry their readable form in `attrs`, not `content`;
+  // without these a comment that is only a mention or a link flattens to "".
+  if (node.type === "mention") return node.attrs?.text ?? "";
+  if (node.type === "inlineCard" || node.type === "blockCard") return node.attrs?.url ?? "";
+  if (node.type === "emoji") return node.attrs?.text ?? node.attrs?.shortName ?? "";
+  if (node.type === "status") return node.attrs?.text ?? "";
   const parts = (node.content ?? []).map(adfToText);
   return node.type && ADF_BLOCK_TYPES.has(node.type) ? parts.join("\n") : parts.join("");
 }
