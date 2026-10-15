@@ -37,7 +37,7 @@ export function providerAtlassianTools(
     } };
   }
   tools.jira_get_issue = { description: "Read the specified Jira issue using the connected account.", input: { key }, handler: (a) => ops.getIssue((a as { key: string }).key) };
-  tools.jira_get_comments = { description: "Read all comments on an explicit Jira issue. The adapter exhausts pagination; embedded issue comments may be incomplete.", input: { key }, handler: (a: any) => ops.getIssueComments(a.key) };
+  tools.jira_get_comments = { description: "Read all comments on an explicit Jira issue, newest first. Each result has id, body (PLAIN TEXT flattened from Jira ADF; mentions as display text, links as URL), bodyRaw (provider ADF, for content plain text cannot express; unsupported nodes appear as [unsupported type] in body), created (ISO timestamp) and author {accountId, displayName, email}. The adapter exhausts pagination or throws; it never returns a partial list. Embedded issue comments may be incomplete.", input: { key }, handler: (a: any) => ops.getIssueComments(a.key) };
   tools.jira_get_project_property = { description: "Read an explicit Jira project property, including document configuration.", input: { projectKey: project, propertyKey: text }, handler: (a: any) => ops.getProjectProperty(a.projectKey, a.propertyKey) };
   tools.jira_get_remote_link = { description: "Read an issue's remote link by explicit global ID. Missing links return null.", input: { key, globalId: text }, handler: (a: any) => ops.getRemoteLink(a.key, a.globalId) };
   tools.confluence_get_comments = { description: "Read footer comments on an explicit Confluence page.", input: { id: text }, handler: (a: any) => ops.getPageComments(a.id) };

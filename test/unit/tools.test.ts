@@ -1562,7 +1562,7 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       getIssue: async () => ({ ok: true }),
       getIssueComments: async (key: string) => {
         getIssueCommentsCalls.push(key);
-        return { results: opts.epicComments?.[key] ?? [] };
+        return { results: (opts.epicComments?.[key] ?? []) as any[] };
       },
       search: async (jql: string) => {
         searchCalls.push(jql);
@@ -1743,7 +1743,7 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
       getIssue: async () => opts.issue ?? { key: "KAN-7" },
       getIssueComments: async (key: string) => {
         getIssueCommentsCalls.push(key);
-        return { results: opts.commentsByKey?.[key] ?? [] };
+        return { results: (opts.commentsByKey?.[key] ?? []) as any[] };
       },
       search: async () => ({ ok: true }),
       addComment: async () => ({ ok: true }),

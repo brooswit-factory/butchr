@@ -169,7 +169,7 @@ function world(opts: {
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
     correctText: unimplemented("correctText"),
-    getIssueComments: async (key: string) => ({ results: (epicIssues.get(key)?.comments ?? []).map((c) => ({ id: c.id })) }),
+    getIssueComments: async (key: string) => ({ results: (epicIssues.get(key)?.comments ?? []).map((c) => ({ id: c.id })) as any[] }),
 
     getMyself: async () => ({ accountId: "acct-project-agent" }),
     searchProjects: async () => ({

@@ -390,5 +390,22 @@ export interface AtlassianOps {
    * `getPageComments`) — "one reader, not two". This op is that one
    * reader, reused by both discovery and `check_in`.
    */
-  getIssueComments(key: string): Promise<{ results: Array<{ id: string }> }>;
+  getIssueComments(key: string): Promise<{ results: IssueCommentRecord[] }>;
+}
+
+/**
+ * One Jira comment as `getIssueComments` returns it (FACTORY-1008). `id` is
+ * all the notification bookkeeping reads; `body` is what the agent-facing
+ * `jira_get_comments` tool exists to deliver. `body` is PLAIN TEXT: Jira's
+ * ADF flattened by `adfToText` (paragraphs/lists/tables newline-separated,
+ * mentions as their display text, links as their URL). It is never
+ * fabricated — a comment whose body Jira returned empty has `body: ""`.
+ */
+export interface IssueCommentRecord {
+  id: string;
+  body: string;
+  /** The provider's raw body (ADF object or string) so nothing the plain-text rendering cannot express is lost. */
+  bodyRaw: unknown;
+  created: string;
+  author: { accountId: string | null; displayName: string | null; email: string | null };
 }
