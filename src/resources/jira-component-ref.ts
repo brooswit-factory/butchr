@@ -34,9 +34,17 @@ export interface JiraComponentRef {
 
 export const isJiraComponentId = (id: string): boolean => COMPONENT_ID_RE.test(id);
 
-/** True only for the canonical form `formatJiraComponentRef` produces. */
+/**
+ * True only for the canonical form `formatJiraComponentRef` produces —
+ * same split as `jira-project-ref.ts`'s own `isJiraProjectRef`/
+ * `parseJiraProjectRef` pair: this does NOT case-fold (a lowercase project
+ * segment is rejected), while `parseJiraComponentRef` below does.
+ */
 export function isJiraComponentRef(id: string): boolean {
-  return parseJiraComponentRef(id) !== null;
+  const m = /^([^:]+):([^:]+)$/.exec(id);
+  if (!m) return false;
+  const [, project, componentId] = m as unknown as [string, string, string];
+  return isProjectId(project) && isJiraComponentId(componentId);
 }
 
 export function formatJiraComponentRef(ref: JiraComponentRef): string {

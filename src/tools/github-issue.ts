@@ -109,6 +109,11 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
   "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
   "filesystem": "your own file tools (Read/Write/Edit/Bash) directly — there is no butchr MCP tool for a filesystem resource",
+  // FACTORY-990: `jira-component` is inert scaffolding (no ResourceType, no
+  // spawn wiring — see ../rules/jira-component-type.ts's own header), so no
+  // agent can ever be this caller in practice; this entry exists only to
+  // keep `OWN_TOOLS` total over `CallerIdentity["provider"]`.
+  "jira-component": "no tools — the jira-component provider is inert scaffolding with no agent that can call this",
 };
 
 /**
