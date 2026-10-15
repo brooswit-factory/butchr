@@ -56,7 +56,7 @@ export function providerAtlassianTools(
     return ops.addComment(a.key, a.text.startsWith(tag) ? a.text : `${tag} ${a.text}`);
   });
   write("jira_transition", "Transition the specified issue to a status supported by Jira. Review and dependency conventions belong to the workflow.", { key, status: text }, a => [a.key], a => ops.transition(a.key, a.status));
-  write("jira_set_priority", "Set the specified Jira issue's priority by name.", { key, priority: text }, a => [a.key], a => ops.setPriority(a.key, a.priority));
+  write("jira_set_priority", "Set the specified Jira issue's priority by name. Priority is not read by admission or reconcile, so it does not change which ticket is staffed first.", { key, priority: text }, a => [a.key], a => ops.setPriority(a.key, a.priority));
   write("jira_assign", "Assign the specified Jira issue to an explicit Atlassian account ID. No role expansion.", { key, assignee: text }, a => [a.key], a => ops.assign(a.key, a.assignee));
   write("jira_update_issue", "Replace only the supplied summary and/or description on the specified Jira issue.", { key, summary: text.optional(), description: z.string().optional() }, a => [a.key], async a => {
     if (a.summary === undefined && a.description === undefined) throw new Error("Supply summary or description");
