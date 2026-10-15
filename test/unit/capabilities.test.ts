@@ -18,6 +18,7 @@ const REF_OF: Record<(typeof CAPABILITY_PROVIDERS)[number], CapabilityRef> = {
   "github-issue": { provider: "github-issue", owner: "brooswit-factory", repo: "butchr", number: 1 },
   "github-pr": { provider: "github-pr", owner: "brooswit-factory", repo: "butchr", number: 1 },
   "zendesk-ticket": { provider: "zendesk-ticket", subdomain: "acme", id: 1 },
+  "trello-card": { provider: "trello-card", boardId: "a".repeat(24), cardId: "b".repeat(24) },
   filesystem: { provider: "filesystem", path: "/srv/factory/butchr" },
   webpage: { provider: "webpage", url: "https://example.com/resource" },
 };
@@ -43,6 +44,9 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   });
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
     expect(capabilitiesOf(REF_OF["zendesk-ticket"])).toEqual(["query", "read", "comments"]);
+  });
+  test("trello-card: query, read and comments (FACTORY-1009: wired through comments.ts, reusing TrelloCardClient.comments/.addComment) — no rule type/link-store integration yet, so links stays false and it's excluded from ResourceRef, same shape as zendesk-ticket's own row", () => {
+    expect(capabilitiesOf(REF_OF["trello-card"])).toEqual(["query", "read", "comments"]);
   });
   test("filesystem: query and links (BUTCHR-407: listFilesystemResources is a real, generic query entry point) — no read/stat-content or snapshot capability wired for a zero-provider-knowledge caller", () => {
     expect(capabilitiesOf(REF_OF.filesystem)).toEqual(["query", "links"]);
@@ -73,6 +77,7 @@ const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typ
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
 };
