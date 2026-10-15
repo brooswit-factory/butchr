@@ -113,7 +113,6 @@ function setup(over: { ideaMatches?: RuleMatch[]; githubMatches?: GithubIssueMat
 
 const LINKED = {
   ok: true, idea: "IDEA-1", ideaUrl: `${SITE}/browse/IDEA-1`, issue: "acme/widgets#42", issueUrl: "https://github.com/Acme/Widgets/issues/42",
-  ideaRule: "ideas", githubRule: "features",
 };
 
 describe("the remote link Butchr writes", () => {
@@ -218,19 +217,12 @@ describe("linking tools", () => {
     expect(s.jira.links["IDEA-1"]![0]!.object.url).toBe("https://github.com/acme/widgets/issues/42");
   });
 
-  test("denied by configuration: no GitHub or Jira request is made", async () => {
-    const s = setup({ githubMatches: [ghMatch("features", "acme/widgets#42"), ghMatch("tasks", "acme/widgets#7")] });
-    await expect(call(s.tools, "jira_idea_link_github_issue", { url: "https://github.com/acme/widgets/issues/7" }, IDEA_AGENT)).rejects.toThrow("that rule ideas lists in inwardConnectionRules");
-    await expect(call(s.tools, "github_link_jira_idea", { idea: "IDEA-1" }, { headers: { "x-butchr-agent": encodeAgentKey({ resourceProvider: "github-issue", ruleId: "tasks", resourceId: "acme/widgets#7" }) } }))
-      .rejects.toThrow("whose inwardConnectionRules lists rule tasks");
-    await expect(call(s.tools, "jira_idea_link_github_issue", { url: "https://github.com/acme/widgets/issues/42" }, { headers: { "x-butchr-agent": "jira-idea:quiet-ideas:IDEA-1" } })).rejects.toThrow("not currently matched");
-    // Same org, but outside the `features` rule's repo: scope — never matched, so never linkable.
-    await expect(call(s.tools, "jira_idea_link_github_issue", { url: "https://github.com/acme/other/issues/42" }, IDEA_AGENT)).rejects.toThrow("acme/other#42 is not currently matched");
+  test("explicit links do not depend on workflow rule matches", async () => {
+    const s = setup();
     s.setIdeaMatches([]);
-    await expect(call(s.tools, "github_link_jira_idea", { idea: "IDEA-1" }, GH_AGENT)).rejects.toThrow("not currently matched");
-    expect(s.github.calls).toEqual([]);
-    expect(s.jira.calls).toEqual([]);
-    expect(s.logs.filter((l) => l.includes("refused"))).not.toHaveLength(0);
+    s.setGithubMatches([]);
+    expect(await call(s.tools, "github_link_jira_idea", { target: "acme/widgets#42", idea: "IDEA-1" }, { headers: { "x-issue": "WORK-1" } })).toMatchObject({ created: true, idea: "IDEA-1" });
+    expect(s.writes()).toHaveLength(1);
   });
 
   test("malformed arguments and cross-provider confusion are refused before anything is read", async () => {

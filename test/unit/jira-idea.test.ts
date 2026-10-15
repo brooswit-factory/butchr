@@ -193,7 +193,7 @@ describe("jira idea tools", () => {
   test("jira_idea_get reads the caller's own idea with its description and every comment", async () => {
     const { client, calls } = fakeJira(issues);
     const tools = jiraIdeaTools({ client, site: "https://site", log: () => {} });
-    expect(Object.keys(tools.jira_idea_get!.input)).toEqual([]);
+    expect(Object.keys(tools.jira_idea_get!.input)).toEqual(["target"]);
     expect(await call(tools, "jira_idea_get", {}, ideaCaller)).toEqual({
       idea: "IDEA-1", url: "https://site/browse/IDEA-1", summary: "summary of IDEA-1", description: "why this matters",
       issuetype: "Idea", status: "Parking lot", labels: ["p1"], updated: "u1",

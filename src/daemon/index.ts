@@ -66,7 +66,7 @@ import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMessage, terminalCommand } from "../terminal/open.js";
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
-import { atlassianTools } from "../tools/defs.js";
+import { providerAtlassianTools } from "../tools/provider-atlassian.js";
 import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
 import { isAgentLabel } from "../labels/plan.js";
@@ -95,8 +95,7 @@ import { createAdmissionController } from "../agents/admission.js";
 import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
-import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
-import { restrictJiraProjectManagers } from "../tools/jira-project-scope.js";
+import { githubIssueTools } from "../tools/github-issue.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -107,8 +106,8 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
-import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
-import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { loadZendeskAuth, createZendeskTicketClient } from "../resources/zendesk-ticket.js";
+import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
@@ -621,6 +620,18 @@ const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.em
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
 const ideaRules = jiraIdeaRules(getRules());
 const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
+// Tool connections are independent of agent staffing. Reuse clients where possible;
+// keep the same credentials, organization/account boundaries and Zendesk opt-in.
+const githubToolIssues = githubIssues ?? (config.github
+  ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const githubToolPrs = githubPrs ?? (config.github
+  ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const jiraToolIdeas = jiraIdeas ?? createJiraIdeaClient(atlassian);
+const zendeskToolAuth = !zendeskTickets && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
+  ? loadZendeskAuth(process.env) : undefined;
+const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
+  ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskToolAuth.subdomain, token: zendeskToolAuth.token }) : undefined);
+
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
 // This gate preflights that per project (first sight, cached for the run)
@@ -1412,48 +1423,17 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  // FACTORY-732: a jira-project (manager) caller passes `forJiraCallers`
-  // now, but `restrictJiraProjectManagers` immediately confines it to its
-  // own project's jira_get_issue/jira_search/jira_add_comment/jira_transition
-  // — see src/tools/jira-project-scope.ts.
-  ...restrictJiraProjectManagers(forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)), ops),
-  // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
-  // provider-specific tool set below it — the local file store needs no
-  // credentials and works for every ResourceRef kind, and a `jira-project`
-  // owner routes to the project-property-backed store instead (this daemon
-  // already has Jira credentials loaded, unlike the CLI, so the factory
-  // below is cheap and side-effect-free rather than genuinely lazy) — see
-  // `src/resources/link-store-router.ts` for the routing decision itself.
-  // FACTORY-732: a jira-project (manager) CALLER (not the `resource` a link
-  // names — the resource-link test fixtures above a jira-project OWNER as
-  // an argument, which this gate never touches) has no allowlisted name
-  // here (add_link/remove_link/list_links are all outside
-  // JIRA_PROJECT_MANAGER_TOOLS), so it is refused on every one of these.
-  ...restrictJiraProjectManagers(
-    resourceLinkTools(
-      routingLinkStore,
-      (line) => console.error(line),
-    ),
-    ops,
-  ),
-  ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  // Linking needs both providers running: authorization reads both loops' latest matches.
-  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
-  // BUTCHR-456: registered unconditionally, like resourceLinkTools above — a
-  // managed-session agent needs no external credential to be authorized
-  // (the grant lives in another definition's own manifest), and the SAME
-  // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
-  // the managed-sessions loop and `butchr session` CLI already use, never a
-  // second resolution of "where definitions live" or "which freeze store".
-  // FACTORY-732: freeze_session is not in JIRA_PROJECT_MANAGER_TOOLS, so a jira-project (manager) caller is refused here too.
-  ...restrictJiraProjectManagers(
-    sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
-    ops,
-  ),
+  // Provider operations use the daemon's connections, independent of caller role.
+  ...providerAtlassianTools(ops, undefined, recordOwnWrite),
+  ...resourceLinkTools(routingLinkStore, (line) => console.error(line)),
+  ...(githubToolIssues ? githubIssueTools({ client: githubToolIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(githubToolPrs ? githubPrTools({ client: githubToolPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(zendeskToolTickets ? zendeskTicketTools({ client: zendeskToolTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // Linking requires both configured provider clients; their account checks remain authoritative.
+  ...(githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  // Session control retains its explicit controller authorization and containment.
+  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
