@@ -517,11 +517,18 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           );
         }
         const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
-        const batch: any[] = r?.comments ?? [];
+        if (!r || typeof r !== "object" || !Array.isArray(r.comments)) {
+          throw new Error(`getIssueComments(${key}): malformed response at startAt=${startAt} (no \`comments\` array) — refusing to report an empty or partial list`);
+        }
+        const batch: any[] = r.comments;
         for (const c of batch) {
+          if (!c || typeof c.id !== "string" || (c.body !== undefined && c.body !== null && typeof c.body !== "string" && typeof c.body !== "object")) {
+            throw new Error(`getIssueComments(${key}): malformed comment at startAt=${startAt} (id/body shape) — refusing to return it as readable`);
+          }
           results.push({
             id: c.id,
             body: typeof c.body === "string" ? c.body : adfToText(c.body),
+            bodyRaw: c.body ?? null,
             created: c.created ?? "",
             author: { accountId: c.author?.accountId ?? null, displayName: c.author?.displayName ?? null, email: c.author?.emailAddress ?? null },
           });
@@ -531,7 +538,10 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         if (responseTotal !== undefined) total = responseTotal;
         startAt += batch.length;
         if (responseTotal !== undefined) {
-          if (batch.length === 0) break; // safety net even when `total` is known — see this op's own doc comment
+          if (batch.length === 0) {
+            if (startAt < responseTotal) throw new Error(`getIssueComments(${key}): empty page at startAt=${startAt} before reported total ${responseTotal} — refusing to return a silently partial list`);
+            break;
+          }
         } else if (responseMaxResults !== undefined) {
           if (batch.length < responseMaxResults) break; // short against what the server actually honoured
         } else if (batch.length === 0) {

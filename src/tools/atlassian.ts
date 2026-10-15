@@ -404,6 +404,8 @@ export interface AtlassianOps {
 export interface IssueCommentRecord {
   id: string;
   body: string;
+  /** The provider's raw body (ADF object or string) so nothing the plain-text rendering cannot express is lost. */
+  bodyRaw: unknown;
   created: string;
   author: { accountId: string | null; displayName: string | null; email: string | null };
 }

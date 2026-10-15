@@ -721,4 +721,36 @@ describe("jira_get_comments delivers readable bodies end-to-end (FACTORY-1008)",
     const { tool } = await toolFor(() => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i), body: adf([t("b")]) })), total: 100_000 }));
     await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/exceeded 100 pages/);
   });
+
+  test("linked marked text keeps its href; media/unsupported nodes are named; raw ADF is preserved", async () => {
+    const body = { type: "doc", version: 1, content: [
+      { type: "paragraph", content: [t("see "), { type: "text", text: "the PR", marks: [{ type: "link", attrs: { href: "https://github.com/o/r/pull/9" } }] }] },
+      { type: "mediaSingle", content: [{ type: "media", attrs: { type: "file", id: "m1", alt: "screenshot.png" } }] },
+      { type: "futureWidget", attrs: { x: 1 } },
+    ] };
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body }], total: 1, maxResults: 100 }));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results[0].body).toBe("see the PR (https://github.com/o/r/pull/9)\n[unsupported media: screenshot.png]\n[unsupported futureWidget]");
+    expect(got.results[0].body).toContain("[unsupported media: screenshot.png]");
+    expect(got.results[0].body).toContain("[unsupported futureWidget]");
+    expect(got.results[0].bodyRaw).toEqual(body);
+  });
+
+  test("missing `comments` array throws instead of reporting an empty list", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ total: 2, maxResults: 100 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed response/);
+  });
+
+  test("malformed comment (no id / non-object body) throws", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ body: adf([t("x")]) }], total: 1 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+    const { tool: tool2 } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body: 42 }], total: 1 }));
+    await expect(Promise.resolve().then(() => tool2.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+  });
+
+  test("empty page before the reported total throws instead of returning a partial list", async () => {
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(n++ === 0 ? { comments: [{ id: "1", body: adf([t("a")]) }], total: 3, maxResults: 100 } : { comments: [], total: 3, maxResults: 100 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/empty page.*before reported total/);
+  });
 });
