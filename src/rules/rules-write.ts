@@ -73,7 +73,7 @@ const executionOf = (raw: unknown): string => (raw === undefined ? "swarm" : Str
  * is never a real instance of any of the other reasons either — see
  * `createRule`'s own doc comment.
  */
-export type ConfirmReason = "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "capacity-sentinel" | "rule-delete" | "rule-create";
+export type ConfirmReason = "unmeasurable-scope" | "scope-ceiling" | "swarm-enable" | "query-change" | "stop-restart" | "risky-permission" | "rule-delete" | "rule-create";
 
 export class WriteRefusedError extends Error {
   constructor(message: string, readonly status: number, readonly confirmReason?: ConfirmReason) { super(message); }
@@ -348,25 +348,16 @@ function requireConfirmForBlastRadius(counts: { spawned: number; stopped: number
  * the plan and the apply can never disagree about whether this gate
  * applies to a given patch.
  *
- * FACTORY-817: `role: "sentinel"` joins this gate — deliberately, not an
- * oversight. Unlike `permissionMode`/`lizardMode` (which change what an
- * agent is allowed to do unattended), `"sentinel"` changes whether a rule's
- * agent(s) are even subject to `BUTCHR_MAX_AGENTS` at all — an operator
- * silently opting a rule out of the fleet cap is exactly the kind of
- * "slipped in alongside an unrelated edit" change this gate exists to
- * catch. `"worker"` (the default, ON) requires no confirm, same as every
- * other safe default on this gate.
  */
-function isRiskyFieldPatch(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode" | "role">): boolean {
-  return (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true || patch.role === "sentinel";
+function isRiskyFieldPatch(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">): boolean {
+  return (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true;
 }
 
-function requireConfirmForRiskyFields(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode" | "role">, confirm: boolean): void {
+function requireConfirmForRiskyFields(patch: Pick<RuleFieldPatch, "permissionMode" | "lizardMode">, confirm: boolean): void {
   if (isRiskyFieldPatch(patch) && !confirm) {
     const named = [
       patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode) ? `permissionMode: ${JSON.stringify(patch.permissionMode)}` : undefined,
       patch.lizardMode === true ? "lizardMode: true" : undefined,
-      patch.role === "sentinel" ? `role: "sentinel"` : undefined,
     ].filter((s): s is string => s !== undefined);
     throw new WriteRefusedError(`setting ${named.join(" and ")} is never a default and requires an explicit confirm — retry with confirm: true to proceed`, 409);
   }
@@ -743,10 +734,6 @@ export interface RulesPlanResult {
    * ENABLED rule's query also trips `"stop-restart"`, but this is the more
    * actionable thing to show), `"stop-restart"`, `"risky-permission"`
    * (FACTORY-729 — `permissionMode: "bypassPermissions" | "auto"` or
-   * `lizardMode: true`), `"capacity-sentinel"` (FACTORY-817 —
-   * `role: "sentinel"`; least specific of all, so a patch that ALSO trips
-   * `stop-restart` or `risky-permission` reports that instead, which
-   * already implies this one's own "confirm before this lands" posture).
    *
    * DELIBERATE DEVIATION from the ticket's literal `confirmRequired` +
    * `reason` field names (stated here and in the PR body per this ticket's
@@ -847,12 +834,8 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   // FACTORY-729: see `requireConfirmForRiskyFields`'s own doc comment — the
   // same raw/unconditional computation style as the three gates above, so
   // `confirmReason` can classify it even on a call that already supplied
-  // `confirm: true`. FACTORY-817: split into its two named sub-reasons —
-  // `rawRiskyField` (the UNION, for `requiresConfirm`) still fires on
-  // either, but `confirmReason` below needs to know WHICH one to report.
-  const rawRiskyPermission = (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true;
-  const rawCapacitySentinel = patch.role === "sentinel";
-  const rawRiskyField = rawRiskyPermission || rawCapacitySentinel;
+  // `confirm: true`.
+  const rawRiskyField = (patch.permissionMode !== undefined && RISKY_PERMISSION_MODES.has(patch.permissionMode)) || patch.lizardMode === true;
   const requiresConfirm = scopeUnmeasurable || (rawOverCeiling && !confirm) || (rawSwarmEnable && !confirm) || (rawQueryChange && !confirm) || (rawStopRestart && !confirm) || (rawRiskyField && !confirm);
   // `confirmReason` names which gate is why `requiresConfirm` is `true` —
   // absent exactly when `requiresConfirm` is `false` (whether because no
@@ -874,9 +857,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
             ? "query-change"
             : rawStopRestart
               ? "stop-restart"
-              : rawRiskyPermission
-                ? "risky-permission"
-                : "capacity-sentinel";
+              : "risky-permission";
 
   const planHash = buildPlanHash(nextText, counts, scopeUnmeasurable ? Number.POSITIVE_INFINITY : scope);
   return {
@@ -919,7 +900,6 @@ function buildNewRuleRecord(input: RuleCreateInput): Record<string, unknown> {
     execution: "swarm",
     account: "none",
   };
-  if (input.role !== undefined) record.role = input.role;
   if (input.permissionMode !== undefined) record.permissionMode = input.permissionMode;
   if (input.lizardMode !== undefined) record.lizardMode = input.lizardMode;
   if (input.agentPreferences !== undefined && input.agentPreferences.length > 0) {

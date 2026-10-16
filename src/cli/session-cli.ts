@@ -36,7 +36,7 @@ const USAGE = `usage: butchr session list [--archived]
                              --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
-                             [--role worker|sentinel] [--frozen]
+                             [--frozen]
                              [--mcp-servers <json array>]
                              [--freeze-controllers <comma-separated names>]
                              [--unfreeze-controllers <comma-separated names>]
@@ -126,7 +126,7 @@ function formatListEntry(e: SessionDefinitionListEntry): string[] {
     return lines;
   }
   return [
-    `${e.name}  valid  vendor=${e.vendor} tier=${e.tier} role=${e.role} execution=${e.execution}  (${freezeSummary(e.manifestFrozen, e.storeFrozen)})`,
+    `${e.name}  valid  vendor=${e.vendor} tier=${e.tier} execution=${e.execution}  (${freezeSummary(e.manifestFrozen, e.storeFrozen)})`,
     `  freezeControllers=${controllersSummary(e.freezeControllers)} unfreezeControllers=${controllersSummary(e.unfreezeControllers)}`,
   ];
 }
@@ -134,7 +134,7 @@ function formatListEntry(e: SessionDefinitionListEntry): string[] {
 function formatShowEntry(e: SessionDefinitionListEntry): string[] {
   const lines = [`name: ${e.name}`, `path: ${e.path}`, `agentKey: ${e.agentKey}`, `valid: ${e.valid}`];
   if (e.valid) {
-    lines.push(`vendor: ${e.vendor}`, `tier: ${e.tier}`, `role: ${e.role}`, `execution: ${e.execution}`);
+    lines.push(`vendor: ${e.vendor}`, `tier: ${e.tier}`, `execution: ${e.execution}`);
     lines.push(`freezeControllers: ${controllersSummary(e.freezeControllers)}`, `unfreezeControllers: ${controllersSummary(e.unfreezeControllers)}`);
   } else {
     lines.push("problems:");
@@ -251,7 +251,6 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
     }
     const execution = str("execution");
     const account = str("account");
-    const role = str("role");
     // Comma-separated, trimmed, empty entries dropped — a bare `--freeze-controllers` with no value
     // (parseFlags would then read it as `true`, not a list) is treated as "flag given, no names",
     // same as an empty string; sessionDefinitionProblems is still what decides if the result is valid.
@@ -266,7 +265,6 @@ export async function runSessionCli(argv: string[], io: SessionCliIo = defaultIo
       workingDirectory: workingDirectory!, brief: brief!, vendor: vendor!, tier: tier!, permissionMode: permissionMode!,
       ...(execution !== undefined ? { execution } : {}),
       ...(account !== undefined ? { account } : {}),
-      ...(role !== undefined ? { role } : {}),
       ...(flags.has("frozen") ? { frozen: true } : {}),
       ...(mcpServers !== undefined ? { mcpServers } : {}),
       ...(freezeControllers !== undefined ? { freezeControllers } : {}),

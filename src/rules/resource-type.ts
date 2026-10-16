@@ -275,7 +275,7 @@ export function relatedForRules(
     const provider = listener.rule.resourceProvider;
     return [{
       agentKey: `related:${provider}:${issue.key}`,
-      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none", role: "worker" },
+      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none" },
       issue,
     }];
   };

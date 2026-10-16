@@ -162,7 +162,6 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   if (patch.query !== undefined) next.query = patch.query;
   if (patch.permissionMode !== undefined) next.permissionMode = patch.permissionMode;
   if (patch.lizardMode !== undefined) next.lizardMode = patch.lizardMode;
-  if (patch.role !== undefined) next.role = patch.role;
   if (patch.idlePokeMinutes !== undefined) next.idlePokeMinutes = patch.idlePokeMinutes;
   if (patch.stalledMinutes === null) delete next.stalledMinutes;
   else if (patch.stalledMinutes !== undefined) next.stalledMinutes = patch.stalledMinutes;

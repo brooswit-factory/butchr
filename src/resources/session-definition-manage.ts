@@ -20,7 +20,7 @@
 import { access, readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import type { AccountPolicy, AgentRole, ExecutionMode } from "../rules/rules.js";
+import type { AccountPolicy, ExecutionMode } from "../rules/rules.js";
 import { builtinManagedSessionsRule } from "../rules/session-definition-type.js";
 import {
   isDefinitionJsonFile, isHiddenDefinitionFile, parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems,
@@ -56,9 +56,8 @@ export interface SessionDefinitionListEntry {
   /** FACTORY-75 — the new two-axis mechanism's own fields (src/resources/power-scale.ts), set together, never alongside `tier` (see `SessionDefinition.tier`'s own doc comment). */
   modelPower?: number;
   effort?: number;
-  role?: AgentRole;
   execution?: ExecutionMode;
-  /** FACTORY-72: reused verbatim from `Rule`/`SessionDefinition` — see those types' own doc comments. `undefined` for an invalid definition, same reasoning as `vendor`/`tier`/`role`/`execution` above. */
+  /** FACTORY-72: reused verbatim from `Rule`/`SessionDefinition` — see those types' own doc comments. `undefined` for an invalid definition, same reasoning as `vendor`/`tier`/`execution` above. */
   account?: AccountPolicy;
   /** FACTORY-72: `SessionDefinition.permissionMode` — `undefined` for an invalid definition, same reasoning as the other content fields above. */
   permissionMode?: SessionPermissionMode;
@@ -160,7 +159,7 @@ export async function listSessionDefinitions(deps: SessionDefinitionListDeps): P
         ...(definition.tier !== undefined ? { tier: definition.tier } : {}),
         ...(definition.modelPower !== undefined ? { modelPower: definition.modelPower } : {}),
         ...(definition.effort !== undefined ? { effort: definition.effort } : {}),
-        role: definition.role, execution: definition.execution,
+        execution: definition.execution,
         account: definition.account, permissionMode: definition.permissionMode, workingDirectory: definition.workingDirectory,
         ...(definition.lizardMode !== undefined ? { lizardMode: definition.lizardMode } : {}),
         mcpServerNames: (definition.mcpServers ?? []).map((s) => s.name),
@@ -195,7 +194,6 @@ export interface CreateSessionDefinitionInput {
   permissionMode: string;
   execution?: string;
   account?: string;
-  role?: string;
   frozen?: boolean;
   mcpServers?: unknown;
   freezeControllers?: string[];
@@ -270,7 +268,6 @@ export async function createSessionDefinition(deps: CreateSessionDefinitionDeps,
     permissionMode: input.permissionMode,
     ...(input.execution !== undefined ? { execution: input.execution } : {}),
     ...(input.account !== undefined ? { account: input.account } : {}),
-    ...(input.role !== undefined ? { role: input.role } : {}),
     ...(input.frozen !== undefined ? { frozen: input.frozen } : {}),
     ...(input.mcpServers !== undefined ? { mcpServers: input.mcpServers } : {}),
     ...(input.freezeControllers !== undefined ? { freezeControllers: input.freezeControllers } : {}),

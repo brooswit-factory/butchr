@@ -4,21 +4,21 @@
  * living in the well-known directory `sessionDefinitionsPath()` resolves.
  * Kept apart from `src/rules/rules.ts` on purpose: a `Rule` configures ONE
  * uniform policy for every resource it matches, but every definition file
- * needs its OWN vendor/tier/frozen/role — heterogeneous per file, not
+ * needs its OWN vendor/tier/frozen — heterogeneous per file, not
  * uniform per rule — so this is validated as its own per-RESOURCE document,
  * not a `Rule` field. `src/rules/session-definition-type.ts` is what reads a
  * matched filesystem resource's content through this parser and turns it
  * into a `SpawnSpec`.
  *
  * Fields that already have a validated home elsewhere are REUSED verbatim,
- * never redefined: `execution`/`account`/`role` are `Rule`'s own types
+ * never redefined: `execution`/`account` are `Rule`'s own types
  * (src/rules/rules.ts) — same enums, same defaults, same "independent of
  * every other field" house style.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { expandHome, pathModuleFor } from "./filesystem-query.js";
-import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
+import { ACCOUNT_POLICIES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
 import { formatResourceRef, parseResourceRef } from "./resource-ref.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, type AgentEffort } from "./power-scale.js";
 
@@ -314,8 +314,6 @@ export interface SessionDefinition {
   execution: ExecutionMode;
   /** Reused verbatim from `Rule`. BUTCHR-460: wired, same as every other provider's rule-level `account` — see docs/rocketchat-accounts.md's "Wiring" section (`managedSessionAccountPolicies`, src/daemon/index.ts). */
   account: AccountPolicy;
-  /** Reused verbatim from `Rule`. Default `"worker"` — same default as `Rule.role`. */
-  role: AgentRole;
   /** Frozen persistent definitions run no agent at all — excluded from the built-in query's eligible set entirely (see session-definition-type.ts). Default `false`. */
   frozen: boolean;
   /**
@@ -437,7 +435,7 @@ export interface SessionDefinition {
 }
 
 const DEFINITION_FIELDS = new Set([
-  "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "lizardMode", "execution", "account", "role", "frozen",
+  "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "lizardMode", "execution", "account", "frozen",
   "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 
@@ -577,7 +575,6 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.lizardMode !== undefined && typeof doc.lizardMode !== "boolean") problems.push(`${at}.lizardMode must be a boolean`);
   if (doc.execution !== undefined && !oneOf(EXECUTION_MODES, doc.execution)) problems.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
   if (doc.account !== undefined && !oneOf(ACCOUNT_POLICIES, doc.account)) problems.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
-  if (doc.role !== undefined && !oneOf(AGENT_ROLES, doc.role)) problems.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
   if (doc.frozen !== undefined && typeof doc.frozen !== "boolean") problems.push(`${at}.frozen must be a boolean`);
   if (doc.mcpServers !== undefined) parseMcpServers(doc.mcpServers, `${at}.mcpServers`, problems);
   if (doc.freezeControllers !== undefined) problems.push(...controllerListProblems(doc.freezeControllers, `${at}.freezeControllers`));
@@ -609,7 +606,6 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     ...(d.lizardMode !== undefined ? { lizardMode: d.lizardMode as boolean } : {}),
     execution: (d.execution as ExecutionMode | undefined) ?? "swarm",
     account: (d.account as AccountPolicy | undefined) ?? "none",
-    role: (d.role as AgentRole | undefined) ?? "worker",
     frozen: (d.frozen as boolean | undefined) ?? false,
     ...(d.mcpServers !== undefined ? { mcpServers: parseMcpServers(d.mcpServers, `${at}.mcpServers`, []) as McpServerBinding[] } : {}),
     ...(d.freezeControllers !== undefined ? { freezeControllers: (d.freezeControllers as string[]).map((s) => s.trim()) } : {}),

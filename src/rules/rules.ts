@@ -42,7 +42,7 @@ import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
-import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
+import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode } from "./agent-harness.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /**
@@ -133,27 +133,6 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
  */
 export const ACCOUNT_POLICIES = ["none", "temporary", "permanent"] as const;
 export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
-
-/**
- * Fleet capacity role (BUTCHR-391 epic decision, 2026-09-25T00:25Z, folded
- * into BUTCHR-398): independent of `execution`/`account`. `worker` (the
- * default) counts toward `BUTCHR_MAX_AGENTS` and is subject to admission
- * withholding exactly as every agent is today. `sentinel` opts a rule's
- * agent(s) OUT of the cap entirely — never withheld, never counted toward
- * residency — for long-lived agents (e.g. persistent directors) that must
- * never be starved by, or compete for, ordinary worker capacity. Applies
- * per-agent: a swarm rule's every per-resource agent is a sentinel, or a
- * singleton/persistent rule's one query-level agent is. See
- * src/agents/admission.ts for how residency/admission honour this.
- *
- * FACTORY-817: THIS copy's own value+type now live in `./agent-harness.ts`
- * (a dependency-free leaf — see that module's own top comment) and are
- * re-exported here unchanged, same reason/pattern as `AGENT_HARNESSES`/
- * `RULE_PERMISSION_MODES` above — the rule form's "Included in capacity"
- * toggle (`dashboard-app/src/components/FirstRuleSetup.tsx`) needs this as
- * a real VALUE, via `./rule-form-catalog.ts`.
- */
-export { AGENT_ROLES, type AgentRole };
 
 /**
  * FACTORY-75: `modelPower`/`effortPower` are the SAME 0-100 two-axis
@@ -305,8 +284,6 @@ export interface Rule {
   execution: ExecutionMode;
   /** Rocket.Chat account lifecycle, independent of `execution`. Defaults to `"none"` (today's behaviour, exactly) when absent from the file. */
   account: AccountPolicy;
-  /** Fleet capacity role, independent of `execution`/`account`. Defaults to `"worker"` (today's behaviour, exactly) when absent from the file. */
-  role: AgentRole;
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
   relationships?: RuleRelationships;
@@ -327,7 +304,7 @@ export interface Rule {
    * yet (that is stories 2/3), so no knob here changes any agent's behaviour
    * in this story. Kept as four independently optional fields, mirroring
    * `agentPreferences`/`relationships` above rather than `execution`/
-   * `account`/`role`'s always-defaulted style, because "absent" and "false"
+   * `account`'s always-defaulted style, because "absent" and "false"
    * are the same no-op here — there is no live default value to normalise
    * onto every rule for a mechanism that does not run yet.
    */
@@ -470,43 +447,12 @@ export interface Rule {
    * `permissionMode`; `ruleLizardModeOf` covers every rule-engine agent id).
    * Both fields validate for `jira-idea`/`zendesk-ticket` rules too — same
    * "every provider accepts every value" house style `execution`/`account`/
-   * `role` already use above — but neither is wired into
+   * `account` already use above — but neither is wired into
    * `specForJiraIdea`/`specForZendeskTicket` yet, so setting them on one of
    * those two rule kinds is accepted at load and silently has no effect: a
    * deliberate, documented scope boundary, not an oversight.
    */
   lizardMode?: boolean;
-  /**
-   * FACTORY-907 (epic FACTORY-906) — gentles a rule's own lane of
-   * admissions: at most this many NEW agents (desired but not yet running —
-   * see `src/agents/admission.ts`'s own "WITHHOLDING, NOT DROPPING" header)
-   * are admitted for THIS rule per `admit()` call. Independent of
-   * `resourceProvider`/`execution`/`account`/`role`, same house style as
-   * every other independently-optional knob above. Absent: today's
-   * behaviour exactly — unchanged, byte-for-byte, down to the log line (see
-   * `minSecondsBetweenAdmissions` immediately below for the shared
-   * rationale). Never affects an ALREADY-RUNNING agent, and never raises
-   * `BUTCHR_MAX_AGENTS`'s own fleet-wide cap — this only ever narrows how
-   * much of that cap one rule's lane may claim on a single poll; a
-   * candidate this defers is retried on the next poll, in the same
-   * wait-ordered position it would have had anyway, never dropped or marked
-   * stalled/blocked/withheld-by-cap.
-   */
-  maxNewPerTick?: number;
-  /**
-   * FACTORY-907 — companion to `maxNewPerTick` immediately above: at most
-   * one new admission for THIS rule every this-many seconds, wall-clock
-   * (`AdmissionControllerDeps.now`, src/agents/admission.ts — injectable for
-   * tests, `Date.now` in production). When BOTH fields are set on the same
-   * rule, BOTH must allow an admission for it to proceed — neither alone
-   * overrides the other. Rationale (the ticket's own problem statement):
-   * lowering a rule's priority filter can land a whole batch of workers on
-   * one poll, and four cores can't absorb that burst (measured: load5 49 in
-   * 4 minutes at 21:50 PDT) — these two fields are the rule-level throttle
-   * that makes each step gentle, independent of `BUTCHR_MAX_AGENTS` itself.
-   * Absent: today's behaviour exactly, unchanged.
-   */
-  minSecondsBetweenAdmissions?: number;
   /**
    * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — opts this rule's
    * agent(s) into resuming their prior Claude session on a respawn that
@@ -553,7 +499,7 @@ export interface Rule {
    * remediation.ts) is FACTORY-845's job, which this ticket's text names
    * as the engine story reading these field names; this field only
    * describes what a rule WOULD want once that wiring exists. When
-   * ABSENT — unlike `execution`/`account`/`role` above — there is
+   * ABSENT — unlike `execution`/`account` above — there is
    * deliberately NO default resolved here: the rule simply inherits the
    * global `stalledMinutes` as it already does today, so an install that
    * configures nothing keeps its existing 10-minute threshold unchanged.
@@ -599,7 +545,7 @@ export interface Rule {
    * resolves it to an explicit boolean rather than leaving it absent.
    *
    * Still typed OPTIONAL on `Rule` itself, same as `execution`/`account`/
-   * `role` (which `parseRules` ALSO always resolves): this interface
+   * `account` (which `parseRules` ALSO always resolves): this interface
    * doubles as a literal-object shape at many call sites across the
    * codebase (tests, fixtures) that build a `Rule` directly without going
    * through `parseRules`, and a required field here would force every one
@@ -686,11 +632,26 @@ export const DEFAULT_IDLE_POKE_MINUTES = 30;
  */
 export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down";
 
+/**
+ * FACTORY-1013 — keys this schema ONCE had and no longer does, kept in the
+ * accepted-key set so an ALREADY-DEPLOYED `rules.json` written against the
+ * old schema still loads instead of failing the whole file with "unknown
+ * field" and leaving the daemon with zero rules on upgrade. They are parsed
+ * into nothing, read by nothing, and surfaced nowhere — the capacity
+ * admission system they configured (`role`'s worker/sentinel fleet-capacity
+ * exemption, and the per-rule `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * admission pacing) is gone, not disabled. This set is a MIGRATION
+ * AFFORDANCE ONLY: never add a new key here, never read one of these back
+ * out, and never reintroduce a field that rations, queues or paces spawns.
+ */
+const REMOVED_RULE_FIELDS: readonly string[] = ["role", "maxNewPerTick", "minSecondsBetweenAdmissions"];
+
 const RULE_FIELDS = new Set([
-  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
+  "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
   "notifyDeliveryMode",
+  ...REMOVED_RULE_FIELDS,
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -843,7 +804,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!isObject(raw)) { errors.push(`${at} must be an object`); return; }
     const before = errors.length;
     unknownFields(raw, RULE_FIELDS, at, errors);
-    const { id, enabled, resourceProvider, query, brief, execution, account, role } = raw;
+    const { id, enabled, resourceProvider, query, brief, execution, account } = raw;
     if (typeof id !== "string" || !isRuleId(id)) errors.push(`${at}.id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})`);
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
     else { seen.add(id); providerOf.set(id, resourceProvider); }
@@ -865,9 +826,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // (see docs/execution-modes.md — BUTCHR-397 found no concrete provider-specific blocker).
     if (execution !== undefined && !oneOf(EXECUTION_MODES, execution)) errors.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
-    // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
-    if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
-    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution` and `account` alike, and of each other.
     const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
     if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
     if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
@@ -878,23 +837,19 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
     const { linkedDescriptionLinks } = raw;
     if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
-    // FACTORY-87: independent of resourceProvider/execution/account/role/linked-eventing, same
+    // FACTORY-87: independent of resourceProvider/execution/account/linked-eventing, same
     // house style — see RULE_PERMISSION_MODES's own doc comment for why there is no Codex-vendor
     // rejection here, unlike SessionDefinition's own permissionMode/lizardMode fields.
     const { permissionMode, lizardMode } = raw;
     if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
     if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
-    // FACTORY-907: same independently-optional house style as every field above — independent of resourceProvider/execution/account/role/linked-eventing/permissionMode/lizardMode.
-    const { maxNewPerTick, minSecondsBetweenAdmissions } = raw;
-    if (maxNewPerTick !== undefined && !isPositiveInt(maxNewPerTick)) errors.push(`${at}.maxNewPerTick must be a positive integer`);
-    if (minSecondsBetweenAdmissions !== undefined && !isPositiveInt(minSecondsBetweenAdmissions)) errors.push(`${at}.minSecondsBetweenAdmissions must be a positive integer`);
     // FACTORY-851: independent of every field above, same house style — no tri-state for `resumeOnRespawn` (absent or `true` both mean on; only explicit `false` means off).
     const { resumeOnRespawn, resumeContextCutoff } = raw;
     if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
     if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
     // FACTORY-846: idlePokeMinutes/idlePokeMessage stay OPTIONAL — same
     // absent-means-absent style as permissionMode/lizardMode immediately
-    // above, deliberately NOT the always-defaulted execution/account/role
+    // above, deliberately NOT the always-defaulted execution/account
     // style, because resolving either to a brand-new default here would be
     // exactly the "silently change every install" conflict FACTORY-844
     // calls out (see Rule.idlePokeMinutes/idlePokeMessage's own doc
@@ -911,7 +866,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // house style as `permissionMode`/`lizardMode` — ABSENT must stay
     // today's channel-first/prompt-fallback behaviour, so there is
     // deliberately no always-resolved default here (unlike `execution`/
-    // `account`/`role`, which DO resolve). See `Rule.notifyDeliveryMode`'s
+    // `account`, which DO resolve). See `Rule.notifyDeliveryMode`'s
     // own doc comment.
     const { notifyDeliveryMode } = raw;
     if (notifyDeliveryMode !== undefined && !oneOf(NOTIFY_DELIVERY_MODES, notifyDeliveryMode)) errors.push(`${at}.notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}`);
@@ -928,7 +883,6 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       query: (query as string).trim(), brief: brief as string,
       execution: (execution as ExecutionMode | undefined) ?? "swarm",
       account: (account as AccountPolicy | undefined) ?? "none",
-      role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
       ...(mcpServers ? { mcpServers } : {}),
@@ -941,8 +895,6 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
       ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
       ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
-      ...(maxNewPerTick !== undefined ? { maxNewPerTick: maxNewPerTick as number } : {}),
-      ...(minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: minSecondsBetweenAdmissions as number } : {}),
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
       ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),

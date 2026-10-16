@@ -28,7 +28,7 @@ import { readFile } from "node:fs/promises";
 import type { JiraIssue } from "../atlassian/types.js";
 import { decodeAnyAgentKey, encodeAgentKey } from "./agent-key.js";
 import { diffMatches, groupExecutionUnits, resourceMatches, unitAgentKey, type ExecutionUnit } from "./execution.js";
-import type { AccountPolicy, AgentEffort, AgentRole, Rule } from "./rules.js";
+import type { AccountPolicy, AgentEffort, Rule } from "./rules.js";
 import type { SpawnSpec } from "../agents/workspace.js";
 import { createLinkedEventingState, type LinkedEventingDeps, type ProjectLinkedEventingMatch } from "../jira-watch/linked-eventing.js";
 import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/filesystem-ref.js";
@@ -47,10 +47,7 @@ export const MANAGED_SESSIONS_RULE_ID = "managed-sessions";
  * The built-in rule itself: `enabled`/`resourceProvider`/`query` make it an
  * ordinary `filesystem` rule (one file per direct child of `root`, no
  * recursion — a managed-session definition is never nested); `execution`/
- * `account`/`role` are fixed to their ordinary defaults (this RULE's own
- * capacity role — every managed-session AGENT's own `role`, from its own
- * manifest, is validated and stored but not yet wired into the fleet-cap
- * classifier, which is rule-level only; see docs/managed-sessions.md). Never
+ * `account` are fixed to their ordinary defaults. Never
  * built from JSON / `parseRules` — constructed directly, so it needs no
  * `brief` a human ever reads (`specForSessionDefinition` always overrides it
  * per match from that match's own manifest).
@@ -64,7 +61,6 @@ export function builtinManagedSessionsRule(root: string): Rule {
     brief: "Built-in managed-session query (BUTCHR-408) — every matched definition supplies its own real brief.",
     execution: "swarm",
     account: "none",
-    role: "worker",
   };
 }
 
@@ -147,7 +143,6 @@ const MANAGED_SESSION_LINKED_EVENTING_RULE: Rule = {
   brief: "Managed-session linked-eventing opt-in gate (FACTORY-53) — never a real rule; matches no resource of its own.",
   execution: "swarm",
   account: "none",
-  role: "worker",
   linkedEventing: true,
 };
 
@@ -423,30 +418,8 @@ export function createSessionDefinitionEventRules(): EventRules<ExecutionUnit<Se
 export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps {
   log?: (line: string) => void;
   /**
-   * PR #394 review fix: an agent's own manifest `role` was validated and
-   * stored but never reached the fleet-capacity admission classifier
-   * (`roleOfAgent`, src/daemon/index.ts) — every managed-session agent was
-   * classified "worker" regardless of what its definition said, so a
-   * `role: "sentinel"` definition (every Bakr/Candlestix definition in the
-   * S5 mapping) was still capped and counted against the fleet limit.
-   * When given, cleared and rebuilt every poll from THIS poll's eligible
-   * matches, keyed identically to `discovery.idOf` — the daemon passes the
-   * SAME map instance into `roleOfAgent`, which consults it for a
-   * `managed-sessions` id before falling back to the (fixed, always
-   * `"worker"`) built-in rule's own role. Deliberately rebuilt, never
-   * merged, so a definition that goes ineligible (removed, edited invalid,
-   * frozen) stops being sentinel-exempt on the SAME poll it drops out,
-   * never lingering stale. Before this loop's first poll completes (e.g.
-   * right after a daemon restart, before an already-running managed-session
-   * agent's OWN definition has been read again), the map has no entry for
-   * it yet, and `roleOfAgent` falls back to `"worker"` — the same
-   * fail-safe default it already documents for "cannot be resolved".
-   */
-  roles?: Map<string, AgentRole>;
-  /**
-   * BUTCHR-460 — same seam as `roles` immediately above, one field over:
-   * `accountPolicyOf` (src/daemon/index.ts) is RULE-level only, same reason
-   * `roleOfAgent` was before BUTCHR-408's `roles` map — the built-in
+   * BUTCHR-460 — a rebuilt-every-poll seam:
+   * `accountPolicyOf` (src/daemon/index.ts) is RULE-level only — the built-in
    * managed-sessions rule is ONE shared `Rule` (fixed `account: "none"`) for
    * every heterogeneous definition file, so a per-file `account` policy
    * needs this same rebuilt-every-poll map, keyed identically. Before this
@@ -567,10 +540,6 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
       idOf: unitAgentKey,
       search: async () => {
         const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot, onDeprecatedTier, onSkippedNonDefinition);
-        if (deps.roles) {
-          deps.roles.clear();
-          for (const m of matches) deps.roles.set(m.agentKey, m.definition.role);
-        }
         if (deps.accountPolicies) {
           deps.accountPolicies.clear();
           for (const m of matches) deps.accountPolicies.set(m.agentKey, m.definition.account);

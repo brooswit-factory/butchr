@@ -162,7 +162,7 @@ function hasOtherState(dir: string, io: WriteRulesIo, allowlist: ReadonlySet<str
  * `rules-write-registry.ts`'s own header for why that's enforced by
  * allowlist omission, not a literal check — but a USER who edits the query
  * and enables the rule now gets agents that can actually follow their
- * brief), `account: "none"`, `role: "worker"`.
+ * brief), `account: "none"`.
  *
  * `brief: "@builtin:task"` (manager-factory review on PR #652, 2026-10-05
  * 22:09 PDT): `brief` is FILE-ONLY — FACTORY-662's web write path
@@ -185,7 +185,6 @@ function templateRuleDoc(): string {
         brief: "@builtin:task",
         execution: "swarm",
         account: "none",
-        role: "worker",
         agentPreferences: [{ harness: "claude", model: "sonnet", effort: "low" }],
         permissionMode: "default",
         lizardMode: true,

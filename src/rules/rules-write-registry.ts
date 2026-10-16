@@ -12,10 +12,6 @@
  * `mcpServers`, `mcpConfigFile`, `brief` remain fixed — still refused for
  * free, same mechanism, just a shorter list of what's fixed.
  *
- * FACTORY-817 (story FACTORY-756, epic FACTORY-748) widens the row again:
- * `role` ("Included in capacity" on the rule form) joins the editable
- * top-level fields — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
- *
  * FACTORY-730 retires the `UI_EDITABLE_ID_PREFIX`/`isUiEditableRuleId` route-
  * level gate this header used to describe as "gate 2": a write to ANY
  * existing rule id (an operator's real `epics`/`tasks`/`bugs` rule, not only
@@ -24,7 +20,7 @@
  * per-write, PER-INDEX `assertOnlyChanged` allowlist below:
  *   A DEFAULT-DENY diff check: any changed path NOT matched here throws,
  *   which is what makes the fixed template fields (`execution`, `account`,
- *   `role`, `mcpServers`, `mcpConfigFile`, `brief`) refused FOR FREE — they
+ *   `mcpServers`, `mcpConfigFile`, `brief`) refused FOR FREE — they
  *   are refused because they are simply never in this list, not because of
  *   a second, separate "is this a fixed field" check that could drift from
  *   the first. Built by `../rules/rules-write-apply.ts`'s
@@ -37,7 +33,7 @@
  *   `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
  *   builders use — never consulted directly by `assertOnlyChanged`.
  */
-import { AGENT_HARNESSES, AGENT_ROLES, NOTIFY_DELIVERY_MODES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type NotifyDeliveryMode, type RulePermissionMode } from "./rules.js";
+import { AGENT_HARNESSES, NOTIFY_DELIVERY_MODES, RULE_PERMISSION_MODES, type AgentHarness, type NotifyDeliveryMode, type RulePermissionMode } from "./rules.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
 import { RESOURCE_PROVIDERS, isRuleId, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
@@ -73,12 +69,11 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * route, `POST /api/rules/:id/enabled`, owns it — see `validateRuleFieldPatch`'s
  * own explicit rejection of it on this route).
  *
- * FACTORY-817: `role` joins this list — the "Included in capacity" toggle
- * on the rule form. Previously fixed (refused for free, like `execution`/
- * `account` still are); now explicit, validated against `AGENT_ROLES`
- * below, same discipline every other leaf here already has.
+ * FACTORY-1013: `role` ("Included in capacity") is GONE from this list —
+ * and from the schema — with the capacity admission system it configured.
+ * Nothing on this write surface may ration, queue or pace spawns.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode"];
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -87,10 +82,7 @@ export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissio
  * dangerous-permission launches must be an opt-in a human visibly confirmed,
  * not a value that slipped in alongside an unrelated edit. `lizardMode: true`
  * carries the same requirement unconditionally (there is no "safe" value of
- * it to exempt). FACTORY-817: `role: "sentinel"` carries the same
- * requirement too — see `requireConfirmForRiskyFields`'s own doc comment
- * (`../rules/rules-write.ts`) for why opting a rule OUT of the fleet
- * capacity cap gets the same explicit-confirm treatment as these.
+ * it to exempt).
  */
 export const RISKY_PERMISSION_MODES: ReadonlySet<RulePermissionMode> = new Set(["bypassPermissions", "auto"]);
 
@@ -174,16 +166,6 @@ export interface RuleFieldPatch {
   permissionMode?: RulePermissionMode;
   /** FACTORY-729 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. `true` additionally requires `confirm: true` on the write itself (`../rules/rules-write.ts`) — never a default. */
   lizardMode?: boolean;
-  /**
-   * FACTORY-817 — the "Included in capacity" toggle: `"worker"` (ON, the
-   * default — see `./rules.ts`'s own `Rule.role` doc comment) counts this
-   * rule's agent(s) toward `BUTCHR_MAX_AGENTS`; `"sentinel"` (OFF) opts them
-   * OUT entirely. Validated against `AGENT_ROLES` below. Setting `"sentinel"`
-   * additionally requires `confirm: true` on the write itself (`../rules/
-   * rules-write.ts`) — never a default, same discipline as `lizardMode:
-   * true`/a risky `permissionMode`.
-   */
-  role?: AgentRole;
   /** Must be the SAME LENGTH as the rule's current `agentPreferences` (see `RULES_V1_ALLOWED_PATHS`'s own doc comment on why an array-length change is never permitted) — one entry per existing preference, in order. */
   agentPreferences?: AgentPreferencePatch[];
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. CONFIG SURFACE ONLY: never risky, never requires `confirm`. */
@@ -232,10 +214,6 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.lizardMode !== "boolean") return { ok: false, error: "lizardMode must be a boolean" };
     patch.lizardMode = b.lizardMode;
   }
-  if ("role" in b) {
-    if (typeof b.role !== "string" || !(AGENT_ROLES as readonly string[]).includes(b.role)) return { ok: false, error: `role must be one of ${AGENT_ROLES.join(", ")}` };
-    patch.role = b.role as AgentRole;
-  }
   if ("agentPreferences" in b) {
     if (!Array.isArray(b.agentPreferences)) return { ok: false, error: "agentPreferences must be an array" };
     const entries: AgentPreferencePatch[] = [];
@@ -270,7 +248,7 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (b.notifyDeliveryMode !== null && (typeof b.notifyDeliveryMode !== "string" || !(NOTIFY_DELIVERY_MODES as readonly string[]).includes(b.notifyDeliveryMode))) return { ok: false, error: `notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}, or null to clear it` };
     patch.notifyDeliveryMode = b.notifyDeliveryMode as NotifyDeliveryMode | null;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode", "ifMatch", "confirm", "planHash"]);
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }
@@ -297,7 +275,6 @@ export interface RuleCreateInput {
   query: string;
   permissionMode?: RulePermissionMode;
   lizardMode?: boolean;
-  role?: AgentRole;
   /** At most one entry in this v1 slice — a brand-new rule has no existing preference slot to grow, so (unlike `RuleFieldPatch.agentPreferences`, which must match an existing length) this accepts 0 or 1, never more. */
   agentPreferences?: AgentPreferencePatch[];
 }
@@ -308,7 +285,7 @@ export interface RuleCreateInput {
  * validator also tolerates as allowed-but-not-part-of-the-patch keys (see
  * `validateRuleFieldPatch`'s own `allowedKeys` immediately above). Per-field
  * validation reuses the SAME validators (`validateAgentPreferencePatch`,
- * the `RULE_PERMISSION_MODES`/`AGENT_ROLES` checks) every other write route
+ * the `RULE_PERMISSION_MODES` check) every other write route
  * already goes through — a value this function accepts is always one the
  * rest of this module's own write path would also accept for an existing
  * rule's PUT. `id`/`resourceProvider`/`query` get only SHAPE validation here
@@ -337,10 +314,6 @@ export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleC
     if (typeof b.lizardMode !== "boolean") return { ok: false, error: "lizardMode must be a boolean" };
     input.lizardMode = b.lizardMode;
   }
-  if ("role" in b) {
-    if (typeof b.role !== "string" || !(AGENT_ROLES as readonly string[]).includes(b.role)) return { ok: false, error: `role must be one of ${AGENT_ROLES.join(", ")}` };
-    input.role = b.role as AgentRole;
-  }
   if ("agentPreferences" in b) {
     if (!Array.isArray(b.agentPreferences) || b.agentPreferences.length > 1) return { ok: false, error: "agentPreferences must be an array of at most one entry" };
     const entries: AgentPreferencePatch[] = [];
@@ -360,7 +333,7 @@ export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleC
     }
     input.agentPreferences = entries;
   }
-  const allowedKeys = new Set(["id", "resourceProvider", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "confirm", "planHash"]);
+  const allowedKeys = new Set(["id", "resourceProvider", "query", "permissionMode", "lizardMode", "agentPreferences", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not accepted when creating a rule` };
   }
