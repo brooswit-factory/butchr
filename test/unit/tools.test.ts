@@ -918,7 +918,11 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     const calls: Array<[string, unknown[]]> = [];
     const rec = (name: string, result: unknown = { ok: name }) => (...a: unknown[]) => { calls.push([name, a]); return Promise.resolve(result); };
     const ops: AtlassianOps = {
-      getIssue: async () => ({ fields: { issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "To Do" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-7" } }] } }),
+      // FACTORY-829: already assigned — this test is exercising audit-line
+      // wiring, not start_worker's own assignment behavior (covered in
+      // relationship.test.ts/agents-write.test.ts), so an unassigned Task
+      // here must not trip the new "no role configured" refusal.
+      getIssue: async () => ({ fields: { issuetype: { name: "Task" }, project: { key: "KAN" }, status: { name: "To Do" }, assignee: { accountId: "acct-task" }, issuelinks: [{ type: { name: "Implements" }, inwardIssue: { key: "KAN-7" } }] } }),
       search: rec("search"), addComment: rec("addComment"), linkIssues: rec("linkIssues"), transition: rec("transition"),
       createIssue: rec("createIssue"), setPriority: rec("setPriority"), assign: rec("assign"),
       createPage: rec("createPage"), getPage: rec("getPage"), updatePage: rec("updatePage", { version: 1 }) as unknown as AtlassianOps["updatePage"], searchPages: rec("searchPages"), listSpaces: rec("listSpaces"),

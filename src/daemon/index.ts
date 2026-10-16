@@ -129,6 +129,9 @@ import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessio
 import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
 import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
+import { loadCatamorbiusFullConfig } from "../catamorbius/push-config.js";
+import { createCatamorbiusPushController, attachProcessShutdown, type CatamorbiusPushController } from "../catamorbius/push-controller.js";
+import type { LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
@@ -312,6 +315,47 @@ if (config.githubTokenReadError) console.error(`butchr: ${config.githubTokenRead
 // (never routed through `Config`, matching that module's own convention —
 // see this ticket's own doc for why Zendesk config isn't centralized there).
 const resourceLookupDeps = { jiraHost: config.atlassian ? new URL(config.atlassian.site).hostname.toLowerCase() : undefined, zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
+
+// FACTORY-137 (D9): Catamorbius push mode — off unless CATAMORBIUS_URL is
+// configured AND at least one provider is enabled via CATAMORBIUS_PROVIDERS
+// (see src/catamorbius/push-config.ts). A malformed value (bad URL, a
+// non-positive numeric knob, an unknown provider name) fails daemon startup
+// loudly, same as every other opted-in config block in this file already
+// does; an unreadable token file degrades to "push disabled, poll instead"
+// with one WARNING (see that module's own header for why that one case,
+// and only that one, does not throw). The client's own `start()` never
+// blocks or throws into daemon startup (task 1's own contract) — only this
+// SYNCHRONOUS config parse can fail startup, never the connection itself.
+let catamorbiusPush: CatamorbiusPushController | undefined;
+try {
+  const catamorbiusFullConfig = loadCatamorbiusFullConfig(
+    process.env as Record<string, string | undefined>,
+    (p) => readFileSync(p, "utf8"),
+    (line) => console.error(line),
+  );
+  if (catamorbiusFullConfig) {
+    catamorbiusPush = createCatamorbiusPushController(catamorbiusFullConfig, {
+      clientDeps: { fetch, now: Date.now, setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h as never), random: Math.random },
+      log: (line) => console.error(line),
+    });
+    catamorbiusPush.start();
+    console.error(`  [catamorbius] push mode enabled: providers=${catamorbiusFullConfig.push.providers.join(",")}, ttl=${catamorbiusFullConfig.push.ttlMs}ms, grace=${catamorbiusFullConfig.push.graceMs}ms, debounce=${catamorbiusFullConfig.push.debounceMs}ms`);
+  }
+} catch (e) {
+  console.error(`butchr: ${(e as Error).message}`);
+  console.error("See .env.example for the required CATAMORBIUS_* configuration.");
+  process.exit(1);
+}
+// D9: "the daemon stop path stops it" — this daemon had no existing
+// SIGTERM/SIGINT handler before this ticket, so the platform default
+// (terminate immediately) was the whole daemon's effective shutdown
+// contract. `attachProcessShutdown` stops the push client THEN exits,
+// preserving that default instead of silently replacing it — see its own
+// doc comment (src/catamorbius/push-controller.ts) for the regression this
+// fixes (readiness review on PR #805's current head: the original version
+// here only called `stop()` and never exited, leaving the whole daemon
+// running forever on SIGTERM/SIGINT once push mode was enabled).
+if (catamorbiusPush) attachProcessShutdown(catamorbiusPush);
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -1871,7 +1915,14 @@ const quotaGate = createQuotaGate(
 // loop further down this file), so `ops.addComment` is the right seam —
 // same one every other daemon-side comment write uses, no second Atlassian
 // writer.
-const stallRemediation = createStallRemediator({
+// FACTORY-1016: `undefined` when BUTCHR_STALL_REMEDIATION_MODE=off (the
+// new default) — the same disables-entirely-when-omitted shape
+// `silentStop`/`idlePoke` already use, and src/labels/sync.ts's
+// `deps.stallRemediation?.check`/`?.forget` are already written to treat
+// an absent remediator as "do nothing" (no further change needed there).
+// This was previously unconditional, which is exactly the unwanted
+// automatic `[butchr:stall]` wake this ticket exists to stop.
+const stallRemediation = config.stallRemediationMode === "off" ? undefined : createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
@@ -2285,7 +2336,7 @@ const syncLabels = createLabelSync({
   agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
-  stallRemediation,
+  ...(stallRemediation ? { stallRemediation } : {}),
   ...(silentStop ? { silentStop } : {}),
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   coverage,
@@ -2468,6 +2519,8 @@ const ruleResourceType = createRuleResourceType({
   // `createLinkStore`'s own doc comment, src/resources/link-store.ts).
   linkStore: createLinkStore(defaultLinksStorePath()),
   notify: notifyRuleAgent,
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 
 // FACTORY-772: wrapped in a function, rather than called inline once, so
@@ -2882,6 +2935,8 @@ startManagedSessionsLoop({
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
@@ -3507,6 +3562,8 @@ const projectType = createJiraProjectResourceType({
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 // FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
 // matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches

@@ -548,6 +548,12 @@ export interface ManagedSessionResourceDeps extends SessionDefinitionSearchDeps 
   isFrozen?: (id: string) => Promise<boolean>;
   /** Injectable clock, for deterministic tests — threaded straight through to `LinkedEventingDeps.now`. */
   now?: () => number;
+  /** FACTORY-137: the daemon's Catamorbius push controller's read-only coverage query — passed straight through to `runTick`. Optional; omitted, push mode never activates for managed-session project watches. */
+  push?: LinkedEventingDeps["push"];
+  setTimeout?: LinkedEventingDeps["setTimeout"];
+  clearTimeout?: LinkedEventingDeps["clearTimeout"];
+  /** FACTORY-137: called once with this call's own `LinkedEventingState`, so the daemon can register it with the push controller. Optional; omitted, this instance never receives push signals. */
+  onLinkedEventingState?: (state: ReturnType<typeof createLinkedEventingState>) => void;
 }
 
 export function createManagedSessionResourceType(deps: ManagedSessionResourceDeps): ResourceType<ExecutionUnit<SessionDefinitionMatch>> {
@@ -562,6 +568,7 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
   // (src/rules/jira-project-type.ts).
   let latest: SessionDefinitionMatch[] = [];
   const linkedEventingState = createLinkedEventingState();
+  deps.onLinkedEventingState?.(linkedEventingState);
   return {
     discovery: {
       idOf: unitAgentKey,
@@ -628,6 +635,9 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
               ...(deps.now ? { now: deps.now } : {}),
               ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
               ...(deps.comments ? { comments: deps.comments } : {}),
+              ...(deps.push ? { push: deps.push } : {}),
+              ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
+              ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
             }, projectMatches);
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] managed-session project tick threw: ${(e as Error)?.message ?? e}`);

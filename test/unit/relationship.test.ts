@@ -414,15 +414,16 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
     const { ops, addIssue } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
     addIssue("BUTCHR-9", { issuetype: "Task", project: "BUTCHR", bossKey: "SOMEONE-ELSE" });
-    await expect(startWorker(ops, "BUTCHR-1", "BUTCHR-9")).rejects.toThrow(/not one of BUTCHR-1's own workers/);
+    await expect(startWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-9")).rejects.toThrow(/not one of BUTCHR-1's own workers/);
   });
 
-  test("start_worker transitions an owned worker to In Progress", async () => {
+  test("start_worker transitions an owned worker to In Progress, and (FACTORY-829) assigns it when it arrived unassigned", async () => {
     const { ops, addIssue, issues } = makeWorld();
     addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
-    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
-    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" }); // no assignee
+    await startWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-2");
     expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+    expect(issues.get("BUTCHR-2")!.assignee).toBe(ROLES.story);
   });
 
   test("finish_worker refuses a stranger's key and transitions an owned one to Done", async () => {
@@ -438,6 +439,59 @@ describe("start_worker / finish_worker / prioritize_worker / tell_worker: owners
 });
 
 // ---------------------------------------------------------------------------
+// FACTORY-829: start_worker moved a worker to In Progress without ever
+// assigning it — invisible forever to the fleet's own assignee-scoped
+// admission search (`ISSUE_JQL`, src/resources/issue.ts). Live, reachable
+// via the dashboard's "Start" button (`doAgentStart`, src/agents/agents-write.ts),
+// not just the dead `atlassianTools`/defs.ts legacy path. Fixed in
+// `startWorker` itself so every current and future caller gets it.
+// ---------------------------------------------------------------------------
+describe("start_worker (FACTORY-829): resolves a missing assignee by role before transitioning", () => {
+  test("a Task that arrives unassigned is assigned by roles.task, then transitioned", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await startWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.assignee).toBe(ROLES.task);
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+  });
+
+  test("a PROJECT caller's Epic that arrives unassigned is assigned by roles.epic, then transitioned", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" }); // no assignee — project caller's own worker
+    await startWorker(ops, ROLES, "BUTCHR", "BUTCHR-1");
+    expect(issues.get("BUTCHR-1")!.assignee).toBe(ROLES.epic);
+    expect(issues.get("BUTCHR-1")!.status).toBe("In Progress");
+  });
+
+  test("an ALREADY-assigned worker keeps its existing assignee — never reassigned to the configured role or to currentUser", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", assignee: "some-other-legitimate-owner" });
+    await startWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-2");
+    expect(issues.get("BUTCHR-2")!.assignee).toBe("some-other-legitimate-owner");
+    expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
+  });
+
+  test("no role configured for the worker's type: refuses clearly, names the missing env var, and never transitions a still-unassigned ticket", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    const noStoryRole = { task: ROLES.task, epic: ROLES.epic }; // roles.story deliberately unset
+    await expect(startWorker(ops, noStoryRole, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/no assignee for a Story.*BUTCHR_ASSIGNEE_STORY/);
+    expect(issues.get("BUTCHR-2")!.assignee).toBeUndefined();
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do"); // unchanged — never transitioned while still unassigned
+  });
+
+  test("the refusal for an unresolvable role names WHY, not just that it failed — invisible-to-admission, so a reader understands the stakes", async () => {
+    const { ops, addIssue } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Task", project: "BUTCHR", bossKey: "BUTCHR-1" });
+    await expect(startWorker(ops, {}, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/invisible to the fleet's own assignee-scoped admission search/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FACTORY-909: Jira native parent / Epic-link as an equivalent boss
 // relationship, with the [butchr:missing-implements] fallback warning.
 // ---------------------------------------------------------------------------
@@ -446,7 +500,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const { ops, addIssue, issues } = makeWorld();
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766" });
-    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    await startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804");
     expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
   });
 
@@ -454,7 +508,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const { ops, addIssue, issues } = makeWorld();
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766" });
-    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    await startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804");
     expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
   });
 
@@ -462,7 +516,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const { ops, addIssue, issues } = makeWorld();
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766", parentKey: "FACTORY-766" });
-    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    await startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804");
     expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
   });
 
@@ -476,8 +530,8 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const spy = console.error;
     console.error = (...a: unknown[]) => { calls.push(String(a[0])); };
     try {
-      await startWorker(ops, "FACTORY-766", "FACTORY-804");
-      await expect(startWorker(ops, "FACTORY-900", "FACTORY-804")).rejects.toThrow(/not one of FACTORY-900's own workers/);
+      await startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804");
+      await expect(startWorker(ops, ROLES, "FACTORY-900", "FACTORY-804")).rejects.toThrow(/not one of FACTORY-900's own workers/);
     } finally {
       console.error = spy;
     }
@@ -489,7 +543,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const { ops, addIssue } = makeWorld();
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY" });
-    await expect(startWorker(ops, "FACTORY-766", "FACTORY-804")).rejects.toThrow(/no boss at all/);
+    await expect(startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804")).rejects.toThrow(/no boss at all/);
   });
 
   test("6. Task under Story via native parent only", async () => {
@@ -497,7 +551,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", bossKey: "FACTORY-766" });
     addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-804" });
-    await startWorker(ops, "FACTORY-804", "FACTORY-805");
+    await startWorker(ops, ROLES, "FACTORY-804", "FACTORY-805");
     expect(issues.get("FACTORY-805")!.status).toBe("In Progress");
   });
 
@@ -505,7 +559,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     const { ops, addIssue, issues } = makeWorld();
     addIssue("FACTORY-766", { issuetype: "Epic", project: "FACTORY" });
     addIssue("FACTORY-804", { issuetype: "Story", project: "FACTORY", parentKey: "FACTORY-766" });
-    await startWorker(ops, "FACTORY-766", "FACTORY-804");
+    await startWorker(ops, ROLES, "FACTORY-766", "FACTORY-804");
     expect(issues.get("FACTORY-804")!.status).toBe("In Progress");
   });
 
@@ -515,7 +569,7 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     // tier for a Task child (isEligibleParentTier requires Story).
     addIssue("FACTORY-700", { issuetype: "Task", project: "FACTORY" });
     addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-700" });
-    await expect(startWorker(ops, "FACTORY-700", "FACTORY-805")).rejects.toThrow(/not one of FACTORY-700's own workers/);
+    await expect(startWorker(ops, ROLES, "FACTORY-700", "FACTORY-805")).rejects.toThrow(/not one of FACTORY-700's own workers/);
     expect(issues.get("FACTORY-805")!.labels).toContain(MISSING_IMPLEMENTS_LABEL);
     expect(issues.get("FACTORY-805")!.comments.some((c) => c.includes(`[${MISSING_IMPLEMENTS_LABEL}]`) && c.includes("FACTORY-700"))).toBe(true);
   });
@@ -525,11 +579,11 @@ describe("FACTORY-909: resolveBoss via Jira native parent, table-driven", () => 
     addIssue("FACTORY-700", { issuetype: "Task", project: "FACTORY" });
     addIssue("FACTORY-701", { issuetype: "Task", project: "FACTORY" });
     addIssue("FACTORY-805", { issuetype: "Task", project: "FACTORY", parentKey: "FACTORY-700" });
-    await expect(startWorker(ops, "FACTORY-700", "FACTORY-805")).rejects.toThrow();
+    await expect(startWorker(ops, ROLES, "FACTORY-700", "FACTORY-805")).rejects.toThrow();
     // A second, unrelated caller hitting the SAME ineligible-parent child
     // must not produce a second comment — the label gate is per-ticket,
     // not per-caller.
-    await expect(startWorker(ops, "FACTORY-701", "FACTORY-805")).rejects.toThrow();
+    await expect(startWorker(ops, ROLES, "FACTORY-701", "FACTORY-805")).rejects.toThrow();
     const missingImplementsComments = issues.get("FACTORY-805")!.comments.filter((c) => c.includes(`[${MISSING_IMPLEMENTS_LABEL}]`));
     expect(missingImplementsComments.length).toBe(1);
   });
@@ -1874,9 +1928,34 @@ describe("FACTORY-849/FACTORY-852: stop-cause write sites, driven through the re
     mkdirSync(dir, { recursive: true });
     persistIntentionalStop(dir, "submit_to_boss");
     expect(workspaceStopCause(dir)).not.toBeUndefined();
-    await startWorker(ops, "BUTCHR-1", "BUTCHR-2");
+    await startWorker(ops, ROLES, "BUTCHR-1", "BUTCHR-2");
     expect(issues.get("BUTCHR-2")!.status).toBe("In Progress");
     expect(workspaceStopCause(dir)).toBeUndefined(); // superseded by reactivation
+  });
+
+  // FACTORY-829 review (47205): the actual assign REJECTION, distinct from
+  // "no role configured" (relationship.test.ts's own FACTORY-829 describe
+  // block covers that half, where `ops.assign` is never even called). Here
+  // a role IS configured — `ops.assign` is called, but the write itself
+  // fails (a real Jira error, e.g. a permission or network problem). Proves
+  // the failure propagates before either of start_worker's OTHER writes:
+  // no transition (the ticket must not end up "active" while still
+  // unassigned — the exact undiscoverable state this fix exists to close),
+  // and no stop-cause clear (a stale marker from a prior stop survives a
+  // failed reactivation attempt, since this one never actually reactivated
+  // anything).
+  test("FACTORY-829: when the role-based assign ITSELF rejects, the failure propagates before the transition or the stop-cause clear", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" }); // no assignee
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "submit_to_boss");
+    const broken: AtlassianOps = { ...ops, assign: async () => { throw new Error("403 Jira refused the assignment"); } };
+    await expect(startWorker(broken, ROLES, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/403 Jira refused the assignment/);
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do"); // never transitioned
+    expect(issues.get("BUTCHR-2")!.assignee).toBeUndefined(); // never considered assigned
+    expect(workspaceStopCause(dir)).not.toBeUndefined(); // the prior stop marker survives — nothing here actually reactivated it
   });
 
   test("adoptWorker(kind: \"start\") clears a prior stop-cause marker on the ticket it adopts-and-starts", async () => {
@@ -2958,7 +3037,7 @@ describe("FACTORY-498: shelving removed", () => {
         addIssue("BUTCHR-9", { issuetype: caller === "BUTCHR" ? "Epic" : "Story", project: "BUTCHR", ...(caller === "BUTCHR" ? {} : { bossKey: caller }), status: "In Progress", assignee: caller === "BUTCHR" ? ROLES.epic : ROLES.story, labels });
         const touchedLabels: string[] = [];
         const spied: AtlassianOps = { ...ops, addLabels: async (...args) => { touchedLabels.push("add"); return ops.addLabels(...args); }, removeLabels: async (...args) => { touchedLabels.push("remove"); return ops.removeLabels(...args); } };
-        if (verb === "start") await startWorker(spied, caller, "BUTCHR-9");
+        if (verb === "start") await startWorker(spied, ROLES, caller, "BUTCHR-9");
         if (verb === "finish") await finishWorker(spied, caller, "BUTCHR-9");
         if (verb === "adopt") await adoptWorker(spied, ROLES, caller, "BUTCHR-9", { kind: "start" });
         expect(touchedLabels).toEqual([]);
