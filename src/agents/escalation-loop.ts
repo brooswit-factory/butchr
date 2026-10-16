@@ -1294,17 +1294,28 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
       log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
     }
 
-    // FACTORY-381: no issue AND (by construction — onBlocked is the only
-    // caller of managedSessionOf) no managed-session identity resolvable
-    // from unparseable text alone either — capture on a genuinely NEW text,
-    // fire-and-forget (onNoPrompt stays void/sync, unchanged), mirroring the
-    // sustained-unresponsive alarm's own unawaited IIFE just below. Dedupe
-    // (`isNewText`) is checked BEFORE this fires, never inside it, so a
-    // permanently failing capture logs once per distinct text, not once per
-    // poll.
+    // FACTORY-383 PR #526 review: `managedSessionOf` is keyed on the pane's
+    // cwd/identity, not on whether its text happens to parse as a dialog —
+    // a genuine managed session can land here with garbled text just as
+    // easily as a legacy/unowned pane can, so this path must consult it
+    // exactly like `onBlocked` does rather than assume the text alone rules
+    // it out. Capture on a genuinely NEW text, fire-and-forget (onNoPrompt
+    // stays void/sync, unchanged), mirroring the sustained-unresponsive
+    // alarm's own unawaited IIFE just below. Dedupe (`isNewText`) is checked
+    // BEFORE this fires, never inside it, so a permanently failing capture
+    // logs once per distinct text, not once per poll.
     if (issue === null && isNewText) {
       const resolvedContext = context ?? { cwd: null, sessionName: null };
       void (async () => {
+        const session = deps.managedSessionOf ? await deps.managedSessionOf(paneId) : null;
+        if (session) {
+          // A managed session has its own escalation path (keyed on a
+          // parseable prompt's fingerprint); unparseable text from one is
+          // not this ticket's gap to fill and must not be misfiled under
+          // the ticketless shape meant for the non-managed-session path.
+          log(`${paneId} blocked with no parseable dialog but IS a managed session — not captured as ticketless`);
+          return;
+        }
         const capturePath = await captureTicketlessText(deps, paneId, "unparseable", resolvedContext);
         log(`${paneId} blocked with no parseable dialog and no issue key — cannot escalate${capturePath ? ` (captured to ${capturePath})` : ""}`);
       })();

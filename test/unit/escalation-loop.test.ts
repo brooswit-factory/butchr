@@ -2255,6 +2255,35 @@ describe("createEscalator — ticketless (non-managed) escalation captures the f
       expect(h.logs.filter((l) => /ticketless capture failed/.test(l)).length).toBe(2);
     });
 
+    test("a managed session with unparseable text is NOT captured as ticketless (PR #526 review)", async () => {
+      // `managedSessionOf` is keyed on the pane's own cwd/identity, not on
+      // whether its text happens to parse as a dialog — a genuine managed
+      // session can land here with garbled text too, and that text belongs
+      // to the managed-session escalation path, not this ticketless one.
+      const target: ManagedSessionTarget = {
+        agentKey: "filesystem:managed-sessions:%2Fhome%2Fbutchr%2F.config%2Fbutchr%2Fsession-definitions%2Fadmin-brooswit-nexus.json",
+        definitionPath: "/home/butchr/.config/butchr/session-definitions/admin-brooswit-nexus.json",
+      };
+      const cap = fakeCaptureSink();
+      const h = harness({ captures: cap.sink, managedSessionOf: async () => target });
+      h.escalator.onNoPrompt("p1", null, "some garbled text", 1);
+      await Bun.sleep(0);
+
+      expect(cap.files.size).toBe(0);
+      expect(h.logs.some((l) => /IS a managed session — not captured as ticketless/.test(l))).toBe(true);
+      expect(h.posted).toEqual([]);
+      expect(h.sent).toEqual([]);
+    });
+
+    test("a non-managed keyless pane with unparseable text keeps capturing even when managedSessionOf is wired", async () => {
+      const cap = fakeCaptureSink();
+      const h = harness({ captures: cap.sink, managedSessionOf: async () => null });
+      h.escalator.onNoPrompt("p1", null, "some garbled text", 1);
+      await Bun.sleep(0);
+
+      expect(cap.files.size).toBe(1);
+    });
+
     test("eviction recognizes the unparseable-trigger name and does not touch a session-limit capture", async () => {
       const cap = fakeCaptureSink();
       const foreignSessionLimit = "KAN-1-unrecognised-20260101T000000Z.txt";
