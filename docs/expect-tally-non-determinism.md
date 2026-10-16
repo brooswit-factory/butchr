@@ -204,12 +204,12 @@ points in history.** To check whether a diff removed an assertion, read
 the diff itself:
 
 ```bash
-git diff <base>...<head> -- test/ tests/ '*.test.*' '**/__tests__/**' | grep -E '^-[^-]' || true
+git diff <base>...<head> | grep -E '^-[^-]' || true
 ```
 
-**Three defects, each handled or stated — FACTORY-901 added the last two
-after the first two alone were found to make this check always-pass on a
-repo this exact wording does not describe:**
+**Four defects, each handled or stated — FACTORY-901 added the last three
+after the first alone was found to make this check always-pass on a repo
+this exact wording does not describe:**
 
 - **The trailing `|| true` is required, not optional prose.** Plain `grep`
   exits 1 when nothing matches — and "nothing matches" (no removed line in
@@ -228,20 +228,24 @@ repo this exact wording does not describe:**
   pattern does not apply here", and silently reports the reassuring one —
   worse than no check, because it produces positive-sounding evidence. The
   fix is to not filter by assertion-library syntax at all: list every
-  removed line under the matched paths (`grep -E '^-[^-]'`, excluding only
-  the `---`/diff-header lines `^-{2,}` would also start with) and read it —
+  removed line in the diff (`grep -E '^-[^-]'`, excluding only the
+  `---`/diff-header lines `^-{2,}` would also start with) and read it —
   diffs under review are small enough that this is cheap, and it cannot
   silently fail to apply.
-- **Do not hardcode `-- test/` as the only place tests live.** Colocated
-  test files (`src/foo.test.ts` beside `src/foo.ts`, or files under
-  `__tests__/`) are common and a bare `-- test/` pathspec silently excludes
-  them from the diff entirely, which is a second, independent way for this
-  command to report "clean" no matter what was deleted (also FACTORY-901).
-  The widened pathspec above covers `test/`, `tests/`, any `*.test.*`
-  filename, and anything under `__tests__/`; **verify it actually matched
-  something in the diff under review before trusting an empty result as
-  "nothing was removed" rather than "my pathspec missed this repo's test
-  files."**
+- **Do not restrict to a pathspec at all — no test-file naming convention
+  is safe to assume.** The first attempt at fixing this scoped the diff to
+  `-- test/ tests/ '*.test.*' '**/__tests__/**'`, which is itself still a
+  guess: a repo that mixes `.test.ts` and `.spec.ts` files in the same
+  suite reproduces the identical false-clean failure, one level down —
+  reviewed on PR #792 (FACTORY-901), reproduced with a two-file fixture
+  (`src/covered.test.ts`, touched only by an added comment, alongside
+  `src/omitted.spec.ts`, whose diff removes a real `assert.equal(...)`
+  line): the pathspec matches `covered.test.ts`, the scoped grep finds
+  nothing to flag, and the real removal in the unmatched `.spec.ts` file
+  is invisible — a test-file naming enumeration can always be a guess shy
+  of whatever a given repo actually uses. The fix is to drop the pathspec
+  and run the command over the whole diff: a pathspec can miss a file:
+  nothing can.
 - **Every line this prints is a candidate to read, not a verdict.**
   Verified directly in this repo against a real historical diff
   (`88883e2...`): the command printed one line —
