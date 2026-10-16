@@ -386,6 +386,22 @@ export interface Config {
    */
   idlePokeMaxPerPoll: number;
   /**
+   * FACTORY-1016: the global per-ticket stall wake's (src/agents/
+   * stall-remediation.ts, the `[butchr:stall]` comment) mode. `"off"` — the
+   * default, changed by this ticket — never constructs the remediator
+   * (src/daemon/index.ts), so no `[butchr:stall]` wake comment is ever
+   * posted and no episode is tracked; `agent:stalled` labeling itself
+   * (src/agents/stalled.ts, src/labels/sync.ts) and ordinary review/user
+   * comment delivery are untouched — this flag only gates the wake-comment
+   * write path. `"live"` restores today's always-on behaviour (posts one
+   * debounced wake per verified stalled episode), for a deployment that
+   * still wants it. There is deliberately no `"dry-run"`: unlike
+   * silentStopMode/idlePokeMode, this module's only externally-visible
+   * effect is the Jira write itself (no separate detection signal worth
+   * logging on its own), so a third mode would add a state nothing reads.
+   */
+  stallRemediationMode: "off" | "live";
+  /**
    * BUTCHR-200: minutes a worker must sit continuously ABANDONED (its own
    * Implements boss observed Done while it is still open) before the
    * abandoned-worker detector's stage 1 escalation comment fires (see
@@ -802,6 +818,7 @@ export interface ConfigEnv {
   BUTCHR_IDLE_POKE_MODE?: string | undefined;
   BUTCHR_IDLE_POKE_SUPPRESS_MINUTES?: string | undefined;
   BUTCHR_IDLE_POKE_MAX_PER_POLL?: string | undefined;
+  BUTCHR_STALL_REMEDIATION_MODE?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_CRASHLOOP_COUNT?: string | undefined;
@@ -1034,6 +1051,12 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const idlePokeMaxPerPoll = env.BUTCHR_IDLE_POKE_MAX_PER_POLL ? Number(env.BUTCHR_IDLE_POKE_MAX_PER_POLL) : 3;
   if (!Number.isInteger(idlePokeMaxPerPoll) || idlePokeMaxPerPoll <= 0) throw new Error(`BUTCHR_IDLE_POKE_MAX_PER_POLL is not a positive integer: ${env.BUTCHR_IDLE_POKE_MAX_PER_POLL}`);
 
+  const stallRemediationModeRaw = env.BUTCHR_STALL_REMEDIATION_MODE?.trim();
+  if (stallRemediationModeRaw !== undefined && stallRemediationModeRaw !== "" && stallRemediationModeRaw !== "off" && stallRemediationModeRaw !== "live") {
+    throw new Error(`BUTCHR_STALL_REMEDIATION_MODE must be "off" or "live": ${env.BUTCHR_STALL_REMEDIATION_MODE}`);
+  }
+  const stallRemediationMode: "off" | "live" = stallRemediationModeRaw === "live" ? "live" : "off";
+
   const abandonedMinutes = env.BUTCHR_ABANDONED_MINUTES ? Number(env.BUTCHR_ABANDONED_MINUTES) : 30;
   if (!Number.isFinite(abandonedMinutes) || abandonedMinutes <= 0) throw new Error(`BUTCHR_ABANDONED_MINUTES is not a positive number: ${env.BUTCHR_ABANDONED_MINUTES}`);
 
@@ -1116,6 +1139,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     idlePokeMode,
     idlePokeSuppressMinutes,
     idlePokeMaxPerPoll,
+    stallRemediationMode,
     abandonedMinutes,
     atRestMinutes,
     crashLoopCount,
@@ -1391,7 +1415,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
+  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} stallRemediationMode=${c.stallRemediationMode} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
