@@ -82,6 +82,27 @@ export interface AtlassianOps {
   getProjectPropertyOrNull(projectKey: string, propertyKey: string): Promise<unknown | null>;
 
   /**
+   * FACTORY-19: does the project itself exist (and is it visible to this
+   * credential)? Exists so a caller of `getProjectPropertyOrNull` can tell
+   * "this project has never written the property" (a real empty collection)
+   * apart from "this project key doesn't exist, or isn't visible to me" (a
+   * caller error that must not read as quiet emptiness) — `getProjectPropertyOrNull`
+   * itself cannot distinguish the two: Jira 404s a missing project and a
+   * missing property on an existing project identically on that endpoint.
+   * `true`/`false` only; any non-404 rejection (rate limit, auth, network)
+   * still rejects, same "narrow what counts as not-found" discipline as
+   * `getProjectPropertyOrNull`.
+   *
+   * Declared OPTIONAL rather than added to every existing fake in this
+   * codebase: the one caller that needs it (`src/resources/jira-project-link-store.ts`)
+   * falls back to today's existing "null property == empty collection"
+   * behaviour when a given `AtlassianOps` doesn't implement it, so no
+   * unrelated test's fake needs updating for this to land. The real
+   * implementation (`atlassian-real.ts`) always provides it.
+   */
+  projectExists?(projectKey: string): Promise<boolean>;
+
+  /**
    * Read one remote issue link by its `globalId`. Resolves `null` when no
    * such link exists — the real impl converts Jira's 404 into `null` so
    * every caller has one "not found" shape instead of a try/catch each.

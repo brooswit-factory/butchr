@@ -1,0 +1,5 @@
+bump: minor
+
+### Added
+
+- **Catamorbius SSE client foundation (`src/catamorbius/`) — not wired into the daemon yet.** A standalone client for the Catamorbius push gateway: connection lifecycle with an observable state machine (`idle`/`connecting`/`live`/`reconnecting`/`unauthorized`/`unavailable`), resume via `Last-Event-ID`, a liveness watchdog, exponential-jittered reconnect backoff floored at the server's own `retry:` hint, and a `probe()` reachability check against `GET /healthz`. Config (`CATAMORBIUS_URL`, `CATAMORBIUS_TOKEN_FILE`, and tunables) is off unless `CATAMORBIUS_URL` is set. A new `catamorbiusPush` capability on the existing provider-capability model (`src/resources/capabilities.ts`) declares which providers the gateway has a CloudEvent mapping for (`jira-work-item`, `github-issue`, `github-pr`); `src/catamorbius/mapping.ts` maps between a watched resource and the gateway's CloudEvents accordingly. See `docs/catamorbius-push.md` for the full wire contract, client semantics, and mapping rules. Nothing in the daemon constructs or starts this client — a follow-up task wires it in.

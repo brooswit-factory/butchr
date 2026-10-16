@@ -58,12 +58,38 @@ export interface LinkCliIo {
 }
 
 /**
+ * FACTORY-19: a malformed `ATLASSIAN_EMAIL` (any string jira.js's own Zod
+ * auth schema rejects as not-an-email) does NOT come from `loadConfig`
+ * (`src/config/config.ts`) — that function only checks non-emptiness, never
+ * format. It surfaces inside `realAtlassian()` instead: `createCloudClient`
+ * validates its `auth` object with Zod at construction time and throws a
+ * `ZodError` whose `.message` is a JSON-stringified, multi-line issue dump
+ * (MEASURED live) — left uncaught, that dump would reach `tryStoreOp`'s
+ * single `io.stderr` call below and print as many lines, the one CLI error
+ * path this story's ticket found that wasn't already a clean single line
+ * (a missing credential, or any Jira 4xx/5xx the resulting client call
+ * hits, already produces one — see `jiraProjectStoreFromEnv`'s own catch).
+ * Ducktyped (`name`/`issues`) rather than `instanceof ZodError`: `zod` is
+ * only a transitive dependency of jira.js here, not a direct one in this
+ * package's own `package.json`, so importing it just to narrow a catch
+ * would take on a dependency this package does not declare.
+ */
+function flattenZodIssues(issues: ReadonlyArray<{ path?: ReadonlyArray<unknown>; message?: string }>): string {
+  return issues.map((i) => `${Array.isArray(i.path) && i.path.length ? `${i.path.join(".")}: ` : ""}${i.message ?? "invalid"}`).join("; ");
+}
+
+function isZodError(e: unknown): e is { name: "ZodError"; issues: ReadonlyArray<{ path?: ReadonlyArray<unknown>; message?: string }> } {
+  return typeof e === "object" && e !== null && (e as { name?: unknown }).name === "ZodError" && Array.isArray((e as { issues?: unknown }).issues);
+}
+
+/**
  * Loads Jira credentials from the SAME environment the daemon reads
  * (`loadConfig`, `src/config/config.ts`) and builds a project-property-
  * backed store over them. Called lazily — see this file's own header — so a
  * missing/invalid credential only ever surfaces when a `jira-project` owner
  * is actually named, never for any other resource kind. Throws (never
- * catches): the rejection propagates through `createRoutingLinkStore`'s
+ * catches, other than to flatten a `ZodError` per this file's `flattenZodIssues`
+ * comment above): the rejection propagates through `createRoutingLinkStore`'s
  * factory call into whichever `listLinks`/`addLink`/`removeLink` call
  * triggered it, where `tryStoreOp` below converts it into a clean stderr
  * line.
@@ -76,7 +102,12 @@ export function jiraProjectStoreFromEnv(): LinkStore {
   // credential (see this file's own header: never caught here, surfaced by
   // `tryStoreOp` as a clean stderr line).
   if (!config.atlassian) throw new Error(`cannot resolve a jira-project link owner: ${config.atlassianDisabledReason ?? "Atlassian is not configured"}`);
-  return createJiraProjectLinkStore(realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }));
+  try {
+    return createJiraProjectLinkStore(realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }));
+  } catch (e) {
+    if (isZodError(e)) throw new Error(`invalid Atlassian credentials: ${flattenZodIssues(e.issues)}`);
+    throw e;
+  }
 }
 
 function defaultIo(): LinkCliIo {
