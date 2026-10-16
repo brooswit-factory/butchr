@@ -3,6 +3,19 @@ export type Section = (typeof SECTIONS)[number];
 
 export interface Entry { version: string; date: string; sections: Partial<Record<Section, string[]>>; raw: string }
 
+/** Every `### <text>` heading line in `raw`, verbatim — not limited to the recognised `SECTIONS`.
+ *  Used to catch a misspelled or custom heading that `parseSections` would otherwise silently
+ *  drop (or, for a multi-word/punctuated heading that doesn't even match `parseSections`'s
+ *  single-word heading pattern, misattribute to whichever section came before it). */
+export function headingsIn(raw: string): string[] {
+  const out: string[] = [];
+  for (const line of raw.split("\n")) {
+    const m = /^###\s+(.+?)\s*$/.exec(line);
+    if (m) out.push(m[1]!);
+  }
+  return out;
+}
+
 /** `### <Section>` blocks with `- bullet` lines beneath them, from a fragment or an entry body. */
 export function parseSections(raw: string): Partial<Record<Section, string[]>> {
   const sections: Partial<Record<Section, string[]>> = {};

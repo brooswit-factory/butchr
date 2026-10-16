@@ -56,6 +56,15 @@ describe("computeRelease (FACTORY-627: base is a tag's version, not package.json
     expect(() => computeRelease(v("0.1.0"), majorButNoBreaking)).toThrow(/BREAKING.*disagree|x\.md/);
   });
 
+  test("a fragment with an unrecognised heading throws at merge time too, not just at the gate (FACTORY-192)", () => {
+    expect(() => computeRelease(v("0.1.0"), [frag("x.md", "bump: patch\n### Notes\n- lost otherwise\n")])).toThrow(/unrecognised heading.*x\.md.*Notes/s);
+  });
+
+  test("a mixed fragment (one recognised, one unrecognised heading) still throws, rather than releasing with only the recognised bullet", () => {
+    const fragments = [frag("changelog.d/A.md", "bump: patch\n### Fixed\n- kept\n### Notes\n- lost otherwise\n")];
+    expect(() => computeRelease(v("0.1.0"), fragments)).toThrow(/unrecognised heading.*A\.md.*Notes/s);
+  });
+
   test("a valid, correctly-declared BREAKING fragment alongside other valid fragments still computes normally", () => {
     const fragments = [
       frag("changelog.d/A.md", "bump: patch\n### Fixed\n- a fix\n"),

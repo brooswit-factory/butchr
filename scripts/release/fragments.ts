@@ -1,14 +1,17 @@
-import { parseSections, type Section } from "./changelog.js";
+import { headingsIn, parseSections, SECTIONS, type Section } from "./changelog.js";
 import type { Bump } from "./semver.js";
 
-/** A `changelog.d/<TICKET>.md` fragment: `bump: <level>` on its own line, then `### <Section>` blocks. */
-export interface Fragment { path: string; bump: Bump | null; sections: Partial<Record<Section, string[]>> }
+/** A `changelog.d/<TICKET>.md` fragment: `bump: <level>` on its own line, then `### <Section>` blocks.
+ *  `unknownHeadings` lists every `### <text>` heading in the fragment that isn't one of `SECTIONS` —
+ *  the bullets under each are the ones `parseSections` silently drops (or misattributes). */
+export interface Fragment { path: string; bump: Bump | null; sections: Partial<Record<Section, string[]>>; unknownHeadings: string[] }
 
 const BUMP_RE = /^bump:\s*(major|minor|patch)\s*$/m;
 
 export function parseFragment(path: string, content: string): Fragment {
   const bump = (BUMP_RE.exec(content)?.[1] as Bump | undefined) ?? null;
-  return { path, bump, sections: parseSections(content) };
+  const unknownHeadings = [...new Set(headingsIn(content).filter((h) => !(SECTIONS as readonly string[]).includes(h)))];
+  return { path, bump, sections: parseSections(content), unknownHeadings };
 }
 
 export const hasBreaking = (f: Fragment) => !!f.sections.BREAKING?.length;
