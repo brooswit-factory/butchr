@@ -48,7 +48,7 @@ export function providerAtlassianTools(
     return ops.commentOnPage(a.id, `<p>${escape(`[${actor}] ${a.text}`).replace(/\r?\n/g, "<br/>")}</p>`);
   } };
   write("jira_add_labels", "Add explicit labels to an issue using the provider adapter. This does not activate work or remove holds.", { key, labels: z.array(text).min(1) }, a => [a.key], a => ops.addLabels(a.key, a.labels));
-  write("jira_remove_labels", "Remove only the specified labels. On approved reactivation, explicitly clear butchr:shelved before transitioning; preserve approval and dependency holds.", { key, labels: z.array(text).min(1) }, a => [a.key], a => ops.removeLabels(a.key, a.labels));
+  write("jira_remove_labels", "Remove only the specified labels; preserve unrelated labels, approval and dependency holds.", { key, labels: z.array(text).min(1) }, a => [a.key], a => ops.removeLabels(a.key, a.labels));
   tools.jira_search = { description: "Search Jira using JQL and the connected account's permissions.", input: { jql: text, maxResults: z.number().int().min(1).max(100).default(25) }, handler: (a) => { const p = a as { jql: string; maxResults: number }; return ops.search(p.jql, p.maxResults); } };
   write("jira_add_comment", "Comment on the specified Jira issue, attributed to the caller.", { key, text }, a => [a.key], (a, c) => {
     const actor = c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "butchr";

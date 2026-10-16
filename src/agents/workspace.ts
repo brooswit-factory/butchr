@@ -202,8 +202,8 @@ export interface SpawnSpec {
    * the same already-polled snapshot `specForMatch` (src/rules/resource-type.ts)
    * builds the rest of this spec from. Absent (every non-Jira-rule-engine
    * caller) means `classifyStop` sees `ticketStatus: ""`/`ticketLabels: []`,
-   * which cannot match `"Done"` or `EXEMPT_LABEL` — i.e. "status/labels
-   * unknown" never reads as "intentional", the same safe-direction default
+   * which cannot match `"Done"` — i.e. an unknown ticket status never
+   * reads as "intentional", the same safe-direction default
    * `classifyStop`'s own doc comment argues for an undeterminable cause.
    */
   ticketStatus?: string;

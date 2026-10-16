@@ -126,7 +126,6 @@ const DISPOSITIONS: Record<string, Disposition> = {
   // documented in each verb's own description (checked below).
   new_worker: "permitted",
   start_worker: "permitted",
-  shelve_worker: "permitted",
   adopt_worker: "permitted",
   finish_worker: "permitted",
   prioritize_worker: "permitted",

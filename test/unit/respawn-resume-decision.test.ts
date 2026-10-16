@@ -64,11 +64,11 @@ describe("FACTORY-916: decideRespawnResume", () => {
     expect(decision).toEqual({ reason: RESUME_DECISION_REASON.intentional });
   });
 
-  test("intentional stop via the shelved label (no marker at all) -> fresh", () => {
+  test("historical shelving label does not force a fresh session", () => {
     persistSessionId(dir, "sess-1");
     writeTranscript("sess-1", 100);
     const decision = decideRespawnResume({ dir, ticketStatus: "In Progress", ticketLabels: ["butchr:shelved"], home });
-    expect(decision).toEqual({ reason: RESUME_DECISION_REASON.intentional });
+    expect(decision).toEqual({ resumeSessionId: "sess-1" });
   });
 
   test("unintended stop, no persisted session id at all -> fresh, reason logged", () => {

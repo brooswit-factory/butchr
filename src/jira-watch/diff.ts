@@ -193,7 +193,7 @@ export function prTransition(before: JiraIssue, after: JiraIssue): { from: strin
  * `[butchr:restored-degraded]`) is bookkeeping: an observational log line
  * for a human reader (even abandoned.ts's boss-escalation
  * stages are phrased as information, resolved by a human or a later
- * `shelve_worker`/`finish_worker` call, never by an agent replying to THIS
+ * `finish_worker` call, never by an agent replying to THIS
  * comment with an ANSWER) — none of these is swallowed by this change
  * either, since a bookkeeping comment landing alone (no coinciding daemon
  * label flip) still bumps `updated` and still delivers via the existing

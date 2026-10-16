@@ -244,8 +244,8 @@ export interface WithdrawalGradeEntry {
 /**
  * A medium's withdrawal story is a LIST, not a single grade, because a real
  * medium's own records are not all made safe the same way — `labels` alone
- * mixes `eventual` (`agent:*`/`pr:*`) and `same-call` (`butchr:shelved`/
- * `butchr:orphan`). Forcing one grade to describe an entire medium would
+ * mixes `eventual` (`agent:*`/`pr:*`) and `same-call` (`butchr:orphan`).
+ * Forcing one grade to describe an entire medium would
  * either overclaim (picking the strongest grade present and letting it
  * imply coverage it does not have) or underclaim (picking the weakest and
  * hiding a real, stronger guarantee) — both are the exact overclaim/
@@ -335,7 +335,7 @@ export const MEDIA_REGISTRY: Readonly<Record<Medium, MediaRegistryEntry>> = {
       {
         grade: "same-call",
         mechanism:
-          "butchr:shelved and butchr:orphan — cleared inside the SAME call as the verb that ends the shelved/orphan state, never by a separate later mechanism: start_worker/finish_worker/adopt_worker's 'start' disposition all clear butchr:shelved before transitioning; adopt_worker (both the issue- and project-caller paths, both dispositions) clears butchr:orphan. See src/labels/registry.ts's own EXEMPT_LABEL/ORPHAN_LABEL entries for the exact call sites and ordering rationale.",
+          "butchr:orphan — cleared inside the SAME adopt_worker call that ends the orphan state, on both the issue- and project-caller paths, never by a separate later mechanism. See src/labels/registry.ts's ORPHAN_LABEL entry for the exact call sites and ordering rationale.",
       },
     ],
     detector:

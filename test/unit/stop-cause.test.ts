@@ -6,7 +6,7 @@ import {
   workspaceStopCause, persistIntentionalStop, clearStopCause,
   recordIntentionalStop, clearIntentionalStop, classifyStop,
 } from "../../src/agents/stop-cause.js";
-import { EXEMPT_LABEL } from "../../src/labels/plan.js";
+const HISTORICAL_LABEL = "butchr:shelved";
 
 describe("FACTORY-849/FACTORY-852: workspaceStopCause / persistIntentionalStop / clearStopCause — modelled on workspaceSessionId's own ENOENT discipline", () => {
   test("persistIntentionalStop writes what workspaceStopCause reads back", () => {
@@ -32,8 +32,8 @@ describe("FACTORY-849/FACTORY-852: workspaceStopCause / persistIntentionalStop /
     const root = mkdtempSync(join(tmpdir(), "bw-stop-cause-replace-"));
     try {
       persistIntentionalStop(root, "stand_down", 1);
-      persistIntentionalStop(root, "shelve_worker", 2);
-      expect(workspaceStopCause(root)).toEqual({ reason: "shelve_worker", at: 2 });
+      persistIntentionalStop(root, "submit_to_boss", 2);
+      expect(workspaceStopCause(root)).toEqual({ reason: "submit_to_boss", at: 2 });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -132,7 +132,7 @@ describe("FACTORY-849/FACTORY-852: recordIntentionalStop / clearIntentionalStop 
     try {
       const dirs = ["task", "review"].map((rule) => join(root, "jira-work", rule, "KAN-12"));
       for (const dir of dirs) mkdirSync(dir, { recursive: true });
-      recordIntentionalStop("KAN-12", "shelve_worker", root);
+      recordIntentionalStop("KAN-12", "submit_to_boss", root);
       expect(workspaceStopCause(dirs[0]!)).not.toBeUndefined();
 
       clearIntentionalStop("KAN-12", root);
@@ -149,7 +149,7 @@ describe("FACTORY-849/FACTORY-852: classifyStop — pure, total over (stopCause,
   const base = { stopCause: undefined, ticketStatus: "In Progress", ticketLabels: [] as readonly string[] };
 
   test("any recorded stop-cause record is intentional, regardless of its specific reason", () => {
-    for (const reason of ["stand_down", "submit_to_boss", "finish_without_a_boss", "finish_worker", "shelve_worker"] as const) {
+    for (const reason of ["stand_down", "submit_to_boss", "finish_without_a_boss", "finish_worker"] as const) {
       expect(classifyStop({ ...base, stopCause: { reason, at: 1 } })).toBe("intentional");
     }
   });
@@ -158,8 +158,8 @@ describe("FACTORY-849/FACTORY-852: classifyStop — pure, total over (stopCause,
     expect(classifyStop({ ...base, ticketStatus: "Done" })).toBe("intentional");
   });
 
-  test("a ticket carrying the shelved-exemption label is intentional even with no recorded marker and a non-Done status", () => {
-    expect(classifyStop({ ...base, ticketLabels: [EXEMPT_LABEL] })).toBe("intentional");
+  test("a historical shelving label does not classify a non-Done ticket as intentional", () => {
+    expect(classifyStop({ ...base, ticketLabels: [HISTORICAL_LABEL] })).toBe("unintended");
   });
 
   test("no marker, not Done, no shelved label: unintended — the pane-vanished case", () => {
@@ -170,7 +170,7 @@ describe("FACTORY-849/FACTORY-852: classifyStop — pure, total over (stopCause,
     expect(classifyStop({ stopCause: undefined, ticketStatus: "To Do", ticketLabels: ["some-other-label"] })).toBe("unintended");
   });
 
-  test("a non-Done status with the shelved label still OR's to intentional (any one condition suffices)", () => {
-    expect(classifyStop({ stopCause: undefined, ticketStatus: "In Progress", ticketLabels: [EXEMPT_LABEL, "other"] })).toBe("intentional");
+  test("historical labels are inert even alongside other labels", () => {
+    expect(classifyStop({ stopCause: undefined, ticketStatus: "In Progress", ticketLabels: [HISTORICAL_LABEL, "other"] })).toBe("unintended");
   });
 });
