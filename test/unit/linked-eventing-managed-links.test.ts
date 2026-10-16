@@ -263,6 +263,48 @@ describe("FACTORY-9: managed links reconciled into watchers via the existing lin
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR-1"))).toBe(true);
     expect(notified).toHaveLength(0); // nothing to report either way (seed poll)
   });
+
+  test("FACTORY-833: a genuine managed-link removal that happens DURING a failed link-store tick is still caught, exactly once, on the next successful tick", async () => {
+    const owner = issue("BUTCHR-1");
+    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
+    const ownerRef = ref("jira-work-item:BUTCHR-1");
+    const targetRef = ref("jira-work-item:BUTCHR-9");
+    const real = fakeLinkStore();
+    await addLink(real, ownerRef, targetRef);
+    let broken = false;
+    const store: LinkStore = {
+      list: async (k) => { if (broken) throw new Error("disk error"); return real.list(k); },
+      add: real.add,
+      remove: real.remove,
+    };
+    const state = createLinkedEventingState();
+    const { deps, notified, logs } = fakeDeps(world, { linkStore: store });
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed: BUTCHR-9 watched via managed link
+    expect(notified).toHaveLength(0);
+
+    // The link-store read fails this tick. BUTCHR-9 is genuinely unlinked
+    // in the real store during this same window, but that must not
+    // surface yet — this tick has no trustworthy data either way.
+    broken = true;
+    await removeLink(real, ownerRef, targetRef);
+    await state.runTick([m], deps);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR-1"))).toBe(true);
+    expect(notified).toHaveLength(0);
+
+    // The store recovers and now genuinely reports BUTCHR-9 gone — the
+    // watch set was left untouched during the failed tick, so this
+    // comparison is against the last genuinely observed membership and
+    // correctly reports the removal, exactly once.
+    broken = false;
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-9", kind: "jira-key", detail: "no longer linked" }] } });
+
+    await state.runTick([m], deps); // still absent — must not re-report
+    expect(notified).toHaveLength(1);
+  });
 });
 
 describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot", () => {
