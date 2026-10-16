@@ -293,8 +293,6 @@ function unreachableOps(): AtlassianOps {
     getRemoteLink: unreachable("getRemoteLink"),
     upsertRemoteLink: unreachable("upsertRemoteLink"),
     getChildPages: unreachable("getChildPages") as unknown as AtlassianOps["getChildPages"],
-    getPageLabels: unreachable("getPageLabels") as unknown as AtlassianOps["getPageLabels"],
-    createPageWithLabel: unreachable("createPageWithLabel") as unknown as AtlassianOps["createPageWithLabel"],
     addLabels: unreachable("addLabels"),
     removeLabels: unreachable("removeLabels"),
     deleteIssue: unreachable("deleteIssue"),

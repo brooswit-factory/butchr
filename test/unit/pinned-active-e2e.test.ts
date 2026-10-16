@@ -69,8 +69,6 @@ function world(opts: {
     getRemoteLink: unimplemented("getRemoteLink"),
     upsertRemoteLink: unimplemented("upsertRemoteLink"),
     getChildPages: unimplemented("getChildPages"),
-    getPageLabels: unimplemented("getPageLabels"),
-    createPageWithLabel: unimplemented("createPageWithLabel"),
     addLabels: unimplemented("addLabels"),
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
