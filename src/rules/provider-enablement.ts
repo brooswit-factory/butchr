@@ -43,6 +43,11 @@ export const PROVIDER_ENABLED_ENV_VAR: Record<ResourceProvider, string> = {
   "github-pr": "BUTCHR_PROVIDER_GITHUB_PR_ENABLED",
   "zendesk-ticket": "BUTCHR_PROVIDER_ZENDESK_TICKET_ENABLED",
   filesystem: "BUTCHR_PROVIDER_FILESYSTEM_ENABLED",
+  // FACTORY-990: jira-component is inert scaffolding (no discovery/spawn
+  // wiring — see ../rules/jira-component-type.ts's own header), so this
+  // switch has no caller yet; it exists only to keep this map total over
+  // ResourceProvider.
+  "jira-component": "BUTCHR_PROVIDER_JIRA_COMPONENT_ENABLED",
 };
 
 /**

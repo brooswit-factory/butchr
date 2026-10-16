@@ -94,6 +94,7 @@ describe("loadConfig", () => {
     expect(c.providerEnabled).toEqual({
       "jira-work": true, "jira-idea": true, "jira-project": true, "confluence-page": true,
       "github-issue": true, "github-pr": true, "zendesk-ticket": true, filesystem: true,
+      "jira-component": true,
     });
   });
   test("FACTORY-66 review round 2: a provider can be individually disabled while its credentials, siblings and BUTCHR_ATLASSIAN_ENABLED all stay untouched — the gap a single combined flag left", () => {
