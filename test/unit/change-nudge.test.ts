@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { changeNudge, notifyReasonTag, sessionDefinitionFieldNudge } from "../../src/agents/change-nudge.js";
-import type { NotifyReason } from "../../src/resources/types.js";
+import { changeNudge, linkedChangeNudge, notifyReasonTag, sessionDefinitionFieldNudge } from "../../src/agents/change-nudge.js";
+import type { LinkedChangeEvent, NotifyReason } from "../../src/resources/types.js";
 
 /**
  * BUTCHR-87: `changeNudge` (the agent-facing nudge) and `notifyReasonTag`
@@ -206,6 +206,30 @@ describe("notifyReasonTag", () => {
   // FACTORY-972: the stalled twin of the blocked test just above.
   test("stalled names the stalled ticket's own key", () => {
     expect(notifyReasonTag({ stalled: { key: "TASK-1" } })).toBe(" (stalled:TASK-1)");
+  });
+});
+
+describe("linkedChangeNudge", () => {
+  test("FACTORY-833 (ask #2): a linkId, when present, is appended to the kind — 'issuelink 12027', never a bare 'issuelink'", () => {
+    const events: LinkedChangeEvent[] = [{ target: "BUTCHR-18", kind: "issuelink", detail: "no longer linked", linkId: "12027" }];
+    const msg = linkedChangeNudge("BUTCHR-436", events);
+    expect(msg).toContain("BUTCHR-18 (issuelink 12027): no longer linked");
+  });
+
+  test("no linkId: renders exactly as before this field existed — bare kind, no trailing space", () => {
+    const events: LinkedChangeEvent[] = [{ target: "BUTCHR-33", kind: "jira-key", detail: 'status changed from "Backlog" to "Done" (as of 2026-10-08T12:00:00.000+0000)' }];
+    const msg = linkedChangeNudge("BUTCHR-436", events);
+    expect(msg).toContain('BUTCHR-33 (jira-key): status changed from "Backlog" to "Done" (as of 2026-10-08T12:00:00.000+0000)');
+  });
+
+  test("two distinct links to two distinct targets each render their own distinct id on their own line", () => {
+    const events: LinkedChangeEvent[] = [
+      { target: "BUTCHR-3", kind: "issuelink", detail: "no longer linked", linkId: "11502" },
+      { target: "BUTCHR-19", kind: "issuelink", detail: "no longer linked", linkId: "11503" },
+    ];
+    const msg = linkedChangeNudge("BUTCHR-18", events);
+    expect(msg).toContain("BUTCHR-3 (issuelink 11502): no longer linked");
+    expect(msg).toContain("BUTCHR-19 (issuelink 11503): no longer linked");
   });
 });
 

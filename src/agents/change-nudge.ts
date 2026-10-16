@@ -267,7 +267,14 @@ export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined
 export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEvent[]): string {
   const n = events.length;
   const summary = `[butchr] ${issue}: ${n} linked Jira item${n === 1 ? "" : "s"} changed — re-read them.`;
-  const lines = events.map((e) => `${e.target} (${e.kind}): ${e.detail}`);
+  // FACTORY-833: `e.linkId`, when present, is appended to the kind
+  // (`issuelink 12027`, never a bare `issuelink`) so two distinct links
+  // sharing the same `target`+`kind` — the ambiguity this ticket's filer
+  // hit ("FACTORY-18 sits in two epics' chains") — render as
+  // distinguishable lines instead of identical ones. Absent for a kind
+  // with no provider-issued id (see `LinkedChangeEvent.linkId`'s own doc
+  // comment) — that line renders exactly as it always has.
+  const lines = events.map((e) => `${e.target} (${e.kind}${e.linkId ? ` ${e.linkId}` : ""}): ${e.detail}`);
   return [summary, ...lines].join("\n");
 }
 

@@ -1,6 +1,57 @@
-import { describe, expect, test, mock } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
 import type { ProjectResourceDeps } from "../../src/resources/project.js";
+
+/**
+ * FACTORY-77 (shared CI investigation, see also FACTORY-66): every test
+ * below calls `mock.module("jira.js", ...)` / `mock.module("confluence.js",
+ * ...)` to fake out `realAtlassian`'s two SDK clients, but none of them ever
+ * restored the real module afterward — `mock.module` patches the GLOBAL
+ * module registry, not a per-test sandbox, so a leaked fake stays resolvable
+ * to whichever OTHER test file imports "jira.js"/"confluence.js" next in the
+ * same process. Observed failure mode this produces when it leaks past this
+ * file: test/unit/link-cli-jira-project.test.ts's "malformed-config path
+ * (FACTORY-19)" tests construct a REAL `realAtlassian()` client and expect
+ * Zod to reject a malformed email at construction time — against the LAST
+ * fake `createCloudClient` stub this file installs (confirmed live on
+ * hosted CI: the leaked client's own keys matched this file's very last
+ * `mock.module("jira.js", ...)` call, `{ projects: { getProject } }`),
+ * construction never throws and a later real call crashes instead with
+ * "undefined is not an object (evaluating
+ * 'jira.projectProperties.getProjectProperty')" — exactly the shape seen on
+ * hosted CI (bun 1.4.3; not reproducible locally under bun 1.3.14, which
+ * happens to re-resolve the real module between files on its own — CI's bun
+ * does not).
+ *
+ * `mock.restore()` does NOT undo `mock.module`'s registry patch — Bun only
+ * documents it as resetting spy/mock FUNCTIONS (calls, implementations),
+ * never a module replacement, and hosted CI is the proof: the leaked fake
+ * from this file's own LAST mock.module("jira.js", ...) call survived an
+ * `afterEach(() => mock.restore())` here and was still resolvable from
+ * link-cli-jira-project.test.ts, a completely different file, later in the
+ * same process. The only way to actually undo a `mock.module` call is to
+ * `mock.module` the same specifier again with a factory that returns the
+ * REAL module.
+ *
+ * That capture must be a SPREAD COPY, not the bare namespace object:
+ * `await import("jira.js")` returns a live module-namespace binding, and
+ * `mock.module` was confirmed (live, by instrumenting both sides of this
+ * exact restore) to mutate that SAME live binding in place rather than
+ * swap in an unrelated object — so holding onto the raw namespace still
+ * observes every later mock.module call too, and re-registering it as the
+ * "real" module just re-installs whatever the most recent fake was. A
+ * `{ ...(await import(...)) }` spread reads every export's CURRENT value
+ * once, upfront, into a brand new plain object immune to any later mutation
+ * of the original binding — confirmed fixed under the same harness that
+ * reproduced the leak.
+ */
+const realJiraJs = { ...(await import("jira.js")) };
+const realConfluenceJs = { ...(await import("confluence.js")) };
+afterEach(() => {
+  mock.restore();
+  mock.module("jira.js", () => realJiraJs);
+  mock.module("confluence.js", () => realConfluenceJs);
+});
 
 describe("realAtlassian confluence page ops", () => {
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {

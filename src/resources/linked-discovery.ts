@@ -72,21 +72,35 @@ export type LinkedItemKind =
 export interface LinkedItem {
   kind: LinkedItemKind;
   target: string;
+  /**
+   * FACTORY-833: the provider's OWN identity for this specific link —
+   * `IssueLink.id`/`JiraRemoteLink.id` (both real Jira link ids, never
+   * fabricated here) for `issuelink`/`remote-link`, absent for every other
+   * kind (a `parent`/`jira-key`/managed/external link has no comparable
+   * provider-issued id to carry). Lets a consumer tell apart two DISTINCT
+   * links that happen to share the same `target` and `kind` (e.g. a ticket
+   * linked to the same other ticket by two different relationship types)
+   * — a case `target`+`kind` alone cannot disambiguate. Optional, and
+   * deliberately never synthesized when the provider doesn't supply one:
+   * an invented id would be worse than none, since a reader might treat it
+   * as something they could look up.
+   */
+  linkId?: string;
 }
 
 /** Jira `issuelinks`: every type, both directions — unlike `src/jira-watch/routes.ts`'s `watchedKeys`, nothing here is filtered to `Implements`. */
 export function issuelinkItems(links: readonly IssueLink[]): LinkedItem[] {
-  return links.map((l) => ({ kind: "issuelink" as const, target: l.key }));
+  return links.map((l) => ({ kind: "issuelink" as const, target: l.key, ...(l.id !== undefined ? { linkId: l.id } : {}) }));
 }
 
-/** Jira's native `parent` (e.g. an Epic) — see `JiraIssue.parent`'s own doc comment for why this fleet's own hierarchy uses `Implements` instead and this field is usually null here; other Jira sites and issue types do carry it. */
+/** Jira's native `parent` (e.g. an Epic) — see `JiraIssue.parent`'s own doc comment for why this fleet's own hierarchy uses `Implements` instead and this field is usually null here; other Jira sites and issue types do carry it. No `linkId`: the native `parent` field is a single scalar, not an identified link object — there is no separate id to carry. */
 export function parentItems(parent: string | null | undefined): LinkedItem[] {
   return parent ? [{ kind: "parent" as const, target: parent }] : [];
 }
 
-/** Every Jira remote issue link, as a target URL — see this module's own top comment for where the input array comes from at runtime. */
+/** Every Jira remote issue link, as a target URL — see this module's own top comment for where the input array comes from at runtime. `JiraRemoteLink.id` is always present (required on that type), so every item here always carries a `linkId`. */
 export function remoteLinkItems(links: readonly JiraRemoteLink[]): LinkedItem[] {
-  return links.map((l) => ({ kind: "remote-link" as const, target: l.url }));
+  return links.map((l) => ({ kind: "remote-link" as const, target: l.url, linkId: l.id }));
 }
 
 /** A bare Jira issue key, anywhere in text (not only inside a URL) — reuses `isIssueKey` (src/resources/id.ts), the same charset `src/tools/docs.ts`'s doc-binding path already treats as "shaped like an issue key", rather than a third regex disagreeing with the two that module's own doc comment already warns about. */

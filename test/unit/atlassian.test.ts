@@ -105,7 +105,7 @@ describe("AtlassianClient", () => {
       "/search/jql": { issues: [{ key: "KAN-757", fields: { summary: "s", issuelinks: [{ id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } }] } }] },
     }));
     const issues = await c.search("x");
-    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759" }]);
+    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759", id: "10595" }]);
   });
   test("search leaves issuelinks UNDEFINED (never a fabricated []) when the response omits the field entirely — 'unknown', not 'confirmed none'", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/search/jql": { issues: [{ key: "K", fields: { summary: "s" } }] } }));
@@ -125,7 +125,7 @@ describe("AtlassianClient", () => {
       ] } }] },
     }));
     const issues = await c.search("x");
-    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759", status: "Done" }]);
+    expect(issues[0]!.issuelinks).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759", id: "10595", status: "Done" }]);
   });
   test("search leaves the stub's status UNDEFINED (never a fabricated 'not Done') when the payload's stub carries no nested fields at all", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({
@@ -140,7 +140,7 @@ describe("AtlassianClient", () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-759": { fields: { issuelinks: [
       { id: "10595", type: { name: "Implements" }, outwardIssue: { key: "KAN-757", fields: { status: { name: "In Progress" } } } },
     ] } } }));
-    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757", status: "In Progress" }]);
+    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757", id: "10595", status: "In Progress" }]);
   });
   test("links reads both directions", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-1": { fields: { issuelinks: [
@@ -163,13 +163,13 @@ describe("AtlassianClient", () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-759": { fields: { issuelinks: [
       { id: "10595", type: { name: "Implements" }, outwardIssue: { key: "KAN-757" } },
     ] } } }));
-    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757" }]);
+    expect(await c.links("KAN-759")).toEqual([{ type: "Implements", otherEnd: "outward", key: "KAN-757", id: "10595" }]);
   });
   test("links maps the implementer's view of an Implements link: the boss is otherEnd 'inward'", async () => {
     const c = new AtlassianClient("https://x", "a", "t", fakeFetch({ "/issue/KAN-757": { fields: { issuelinks: [
       { id: "10595", type: { name: "Implements" }, inwardIssue: { key: "KAN-759" } },
     ] } } }));
-    expect(await c.links("KAN-757")).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759" }]);
+    expect(await c.links("KAN-757")).toEqual([{ type: "Implements", otherEnd: "inward", key: "KAN-759", id: "10595" }]);
   });
   test("a non-2xx response throws with the status", async () => {
     const c = new AtlassianClient("https://x", "a", "t", async () => new Response("nope", { status: 401 }));
