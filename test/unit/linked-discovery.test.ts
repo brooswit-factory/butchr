@@ -40,11 +40,35 @@ describe("parentItems: the native Jira parent (Epic)", () => {
 });
 
 describe("remoteLinkItems: every Jira remote issue link", () => {
-  test("a remote link", () => {
-    expect(remoteLinkItems([remote("https://example.com/doc")])).toEqual([{ kind: "remote-link", target: "https://example.com/doc" }]);
+  test("a remote link — JiraRemoteLink.id is required, so linkId is always carried through", () => {
+    expect(remoteLinkItems([remote("https://example.com/doc")])).toEqual([{ kind: "remote-link", target: "https://example.com/doc", linkId: "1" }]);
   });
   test("no links -> nothing", () => {
     expect(remoteLinkItems([])).toEqual([]);
+  });
+});
+
+describe("FACTORY-833: linkId — the provider's own link identity, never fabricated", () => {
+  test("issuelinkItems carries IssueLink.id through as linkId, when present", () => {
+    expect(issuelinkItems([{ type: "Implements", otherEnd: "inward", key: "BUTCHR-436", id: "12027" }])).toEqual([
+      { kind: "issuelink", target: "BUTCHR-436", linkId: "12027" },
+    ]);
+  });
+  test("issuelinkItems: no id on the input -> no linkId on the output (never invented)", () => {
+    expect(issuelinkItems([link("Blocks", "outward", "BUTCHR-1")])).toEqual([{ kind: "issuelink", target: "BUTCHR-1" }]);
+    expect(Object.keys(issuelinkItems([link("Blocks", "outward", "BUTCHR-1")])[0]!)).not.toContain("linkId");
+  });
+  test("parentItems never carries a linkId — the native `parent` field has no comparable id to carry", () => {
+    expect(Object.keys(parentItems("BUTCHR-421")[0]!)).not.toContain("linkId");
+  });
+  test("two issuelinks to distinct targets each keep their own distinct linkId", () => {
+    expect(issuelinkItems([
+      { type: "Implements", otherEnd: "inward", key: "BUTCHR-3", id: "11502" },
+      { type: "Implements", otherEnd: "outward", key: "BUTCHR-19", id: "11503" },
+    ])).toEqual([
+      { kind: "issuelink", target: "BUTCHR-3", linkId: "11502" },
+      { kind: "issuelink", target: "BUTCHR-19", linkId: "11503" },
+    ]);
   });
 });
 
@@ -110,7 +134,7 @@ describe("discoverLinkedItems: combined, de-duplicated set", () => {
     })).toEqual([
       { kind: "issuelink", target: "BUTCHR-1" },
       { kind: "parent", target: "BUTCHR-421" },
-      { kind: "remote-link", target: "https://example.com/doc" },
+      { kind: "remote-link", target: "https://example.com/doc", linkId: "1" },
       { kind: "github-issue", target: "brooswit-factory/butchr#42" },
     ]);
   });

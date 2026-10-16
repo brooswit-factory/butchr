@@ -104,6 +104,19 @@ export interface IssueLink {
    * addition.
    */
   status?: string;
+  /**
+   * FACTORY-833: Jira's own `issueLink.id` — the REST payload's top-level
+   * `id` (distinct from `inwardIssue`/`outwardIssue`'s own issue id), always
+   * present on a real Jira response. Optional here (not required), same
+   * "payload-measured field, never fabricated" discipline as `status`
+   * above — so every existing test fixture across this codebase that
+   * builds an `IssueLink` literal without an `id` keeps compiling and
+   * behaving exactly as before this field was added. Lets a consumer
+   * (`issuelinkItems`, src/resources/linked-discovery.ts) name WHICH of an
+   * issue's possibly-several links it means, rather than only the other
+   * end's key — see that function's own doc comment.
+   */
+  id?: string;
 }
 
 /**
