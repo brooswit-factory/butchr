@@ -154,7 +154,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
       membersByProject.BUTCHR = ["BUTCHR-1"]; // changed again — back in the window
       await state.runTick([], deps, [m]);
       expect(notified).toHaveLength(2);
-      expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // a real diff, not the generic first-appearance phrasing
+      expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]); // a real diff, not the generic first-appearance phrasing
     });
 
     test("survives a daemon restart: a fresh state (no baselines, no watermark) still reports the member's next real change instead of re-swallowing it", async () => {
@@ -267,7 +267,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     membersByProject.BUTCHR = ["BUTCHR-9"];
     await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
   });
 
   test("coalescing: many members changing in one tick produce ONE nudge for the project owner", async () => {
@@ -311,7 +311,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     now.value += 61 * 60_000;
     await state.runTick([], deps, [m]); // the same outstanding change is re-detected (BUTCHR-1 still in the held window) and delivered
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done"' }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("review round 1 regression: a member dropped by maxLinkedItems holds this owner's ENTIRE watermark — the capped member is retried, not lost, once room exists", async () => {
@@ -437,6 +437,46 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: expect.stringMatching(/^updated since /) }]);
   });
 
+  test("FACTORY-833: a genuine managed-link removal for a project owner that happens DURING a failed link-store tick is still caught, exactly once, on the next successful tick", async () => {
+    const ownerRef = ref("jira-project:BUTCHR");
+    const targetRef = ref("jira-work-item:BUTCHR-9");
+    const real = fakeLinkStore();
+    await addLink(real, ownerRef, targetRef);
+    let broken = false;
+    const store: LinkStore = {
+      list: async (k) => { if (broken) throw new Error("disk error"); return real.list(k); },
+      add: real.add,
+      remove: real.remove,
+    };
+    const state = createLinkedEventingState();
+    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: store });
+    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
+
+    await state.runTick([], deps, [m]); // seed watermark + BUTCHR-9 watched via managed link
+    await state.runTick([], deps, [m]); // unchanged
+    expect(notified).toHaveLength(0);
+
+    // The link-store read fails this tick. BUTCHR-9 is genuinely unlinked
+    // during this same window, but that must not surface yet.
+    broken = true;
+    await removeLink(real, ownerRef, targetRef);
+    await state.runTick([], deps, [m]);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR"))).toBe(true);
+    expect(notified).toHaveLength(0);
+
+    // The store recovers and now genuinely reports BUTCHR-9 gone — caught
+    // exactly once, against the last genuinely observed membership.
+    broken = false;
+    await state.runTick([], deps, [m]);
+    expect(notified).toHaveLength(1);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: "no longer linked" }]);
+
+    await state.runTick([], deps, [m]); // still absent — must not re-report
+    expect(notified).toHaveLength(1);
+  });
+
   test("comment events: a new comment on a project member (already baselined) is reported as 'got a new comment', the same mechanism an issue owner's linked target already uses", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { updated: "t1" }) };
@@ -457,7 +497,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     membersByProject.BUTCHR = ["BUTCHR-1"]; // the new comment bumped `updated`, so it's back in the window
     await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment" }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment (as of t2)" }]);
   });
 
   test("the member-discovery search's own already-fetched issue data is reused directly, without a second 'key in (...)' call for the same key", async () => {

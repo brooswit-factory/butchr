@@ -5,7 +5,7 @@
  * (src/resources/filesystem.ts) directly, so every enabled `filesystem` rule
  * always runs.
  *
- * Gets none of the Jira work loop's label sync or parked/abandoned/stall
+ * Gets none of the Jira work loop's label sync or abandoned/stall
  * detectors — those write Jira-work conventions no filesystem resource has.
  * `ownsId` scopes reconciliation to `filesystem` agents, so no loop can stop
  * another's.

@@ -296,7 +296,7 @@ describe("createStalledCheck", () => {
     });
     await check.check("KAN-1", "idle"); // floor starts at now=0
     now = 10 * 60_000;
-    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified, not silently ignored
+      expect(await check.check("KAN-1", "idle")).toBeNull(); // unverifiable activity cannot close an episode
     expect(logs.some((l) => l.includes("WARNING") && l.includes("[stalled]") && l.includes("KAN-1") && l.includes("c1") && l.includes("unparseable"))).toBe(true);
   });
 

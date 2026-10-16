@@ -37,7 +37,7 @@
  *   `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
  *   builders use — never consulted directly by `assertOnlyChanged`.
  */
-import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./rules.js";
+import { AGENT_HARNESSES, AGENT_ROLES, NOTIFY_DELIVERY_MODES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type NotifyDeliveryMode, type RulePermissionMode } from "./rules.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
 import { RESOURCE_PROVIDERS, isRuleId, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
@@ -78,7 +78,7 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * `account` still are); now explicit, validated against `AGENT_ROLES`
  * below, same discipline every other leaf here already has.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode"];
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -188,10 +188,27 @@ export interface RuleFieldPatch {
   agentPreferences?: AgentPreferencePatch[];
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. CONFIG SURFACE ONLY: never risky, never requires `confirm`. */
   idlePokeMinutes?: number;
+  stalledMinutes?: number | null;
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
   idlePokeMessage?: string;
   /** FACTORY-846 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment. */
   idlePokeEnabled?: boolean;
+  /**
+   * FACTORY-1010 — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
+   * CONFIG SURFACE ONLY: never risky, never requires `confirm` — unlike
+   * `permissionMode`'s risky values, neither transport choice here is
+   * dangerous. Validated against `NOTIFY_DELIVERY_MODES` below.
+   * `null` means REMOVE the field, returning the rule to the omitted/
+   * default channel-first/prompt-fallback behaviour — same `null`-means-
+   * unset precedent `stalledMinutes` above already uses, and for the same
+   * reason: `undefined` (the field simply absent from the PATCH body)
+   * already means "leave whatever is there alone" for every field on this
+   * type, so clearing an EXPLICIT value back to "inherit/default" needs a
+   * value `undefined` cannot carry. `applyRuleFieldPatch` (./rules-write-
+   * apply.ts) deletes the key from the stored rule on `null`, never writes
+   * a literal `"notifyDeliveryMode": null` to the file.
+   */
+  notifyDeliveryMode?: NotifyDeliveryMode | null;
 }
 
 /** `patch`'s own shape, independent of what the CURRENT rule looks like (that comparison — e.g. the length match above — happens where the current rule is in hand, in `./write-rules.ts`'s caller). `__proto__`/prototype-pollution bodies are rejected here: a `JSON.parse`'d `__proto__` key never becomes an OWN enumerable property, so `Object.keys`/`in` checks below never see it either way, but every value is read by EXPLICIT key name below, never spread or `Object.assign`-merged onto a trusted object, which is what actually matters for this module's own output never carrying one. */
@@ -234,6 +251,10 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.idlePokeMinutes !== "number" || !Number.isFinite(b.idlePokeMinutes) || b.idlePokeMinutes <= 0) return { ok: false, error: "idlePokeMinutes must be a positive number" };
     patch.idlePokeMinutes = b.idlePokeMinutes;
   }
+  if ("stalledMinutes" in b) {
+    if (b.stalledMinutes !== null && (typeof b.stalledMinutes !== "number" || !Number.isFinite(b.stalledMinutes) || b.stalledMinutes <= 0)) return { ok: false, error: "stalledMinutes must be a positive number or null (inherit)" };
+    patch.stalledMinutes = b.stalledMinutes as number | null;
+  }
   if ("idlePokeMessage" in b) {
     if (typeof b.idlePokeMessage !== "string" || b.idlePokeMessage.trim() === "") return { ok: false, error: "idlePokeMessage must be a non-empty string" };
     patch.idlePokeMessage = b.idlePokeMessage.trim();
@@ -242,7 +263,14 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.idlePokeEnabled !== "boolean") return { ok: false, error: "idlePokeEnabled must be a boolean" };
     patch.idlePokeEnabled = b.idlePokeEnabled;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "ifMatch", "confirm", "planHash"]);
+  // FACTORY-1010: CONFIG SURFACE ONLY, same validation idiom as `./rules.ts`'s
+  // own `parseRules` for this field — `null` (REMOVE, back to default) is
+  // additionally accepted, same `stalledMinutes` precedent immediately above.
+  if ("notifyDeliveryMode" in b) {
+    if (b.notifyDeliveryMode !== null && (typeof b.notifyDeliveryMode !== "string" || !(NOTIFY_DELIVERY_MODES as readonly string[]).includes(b.notifyDeliveryMode))) return { ok: false, error: `notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}, or null to clear it` };
+    patch.notifyDeliveryMode = b.notifyDeliveryMode as NotifyDeliveryMode | null;
+  }
+  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode", "ifMatch", "confirm", "planHash"]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }

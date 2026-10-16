@@ -101,8 +101,8 @@ export type TierField = { kind: "project" } | { kind: "issue"; issuetype: Issuet
 
 /**
  * Row-kind discriminator. Today there is exactly one kind: "agent", one row
- * per agent this daemon runs. BUTCHR-288 (shelved until this endpoint
- * merges) is expected to add a "withheld" kind — one row per ticket the
+ * per agent this daemon runs. BUTCHR-288
+ * is expected to add a "withheld" kind — one row per ticket the
  * admission cap is withholding, which has a `resourceKey` and `tier` but NO
  * agent, and therefore no `pane` and no `agentStatus`. Because those two
  * fields live only on the "agent" variant below rather than on a shared base

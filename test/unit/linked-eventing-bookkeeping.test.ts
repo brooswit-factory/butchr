@@ -82,6 +82,6 @@ describe("FACTORY-865 site 2 criterion D (representative): an allowlisted WAKE m
     ];
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment" }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment (as of t2)" }]);
   });
 });

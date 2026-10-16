@@ -32,8 +32,10 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import type { NotifyDeliveryMode } from "../notify/deliver.js";
 import { builtinBriefProblem } from "../agents/workspace.js";
 import { filesystemQueryProblems } from "../resources/filesystem-query.js";
+import { confluencePageQueryProblems } from "../resources/confluence-page-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { githubPrQueryProblems } from "../resources/github-pr.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
@@ -96,6 +98,15 @@ export { AGENT_EFFORTS, type AgentEffort };
  * and a rule that falls back to Agy still gets the same silent no-op an
  * absent `permissionMode` always gave that branch. `Rule.lizardMode` below
  * is a DIFFERENT case as of FACTORY-108 — see its own doc comment.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (src/resources/session-definition.ts) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here. The
+ * constant itself is edited in `./agent-harness.ts`, not here.
  */
 export { RULE_PERMISSION_MODES, type RulePermissionMode };
 
@@ -554,6 +565,8 @@ export interface Rule {
    * validation idiom as `stalledMinutes`.
    */
   idlePokeMinutes?: number;
+  /** Manual stalled-detection threshold in minutes. Absent inherits the daemon default; independent of idle pokes. */
+  stalledMinutes?: number;
   /**
    * FACTORY-846: per-rule override of the wake comment's own closing
    * sentence (`DEFAULT_TAIL` in src/agents/stall-remediation.ts's
@@ -595,7 +608,46 @@ export interface Rule {
    * same as `../web/rules-api.ts`.
    */
   idlePokeEnabled?: boolean;
+  /**
+   * FACTORY-1010 — per-rule, explicit choice of notification transport for
+   * this rule's own agent(s): `"channel"` sends ONLY over the agent's MCP
+   * dev channel, `"prompt"` sends ONLY as a direct typed-prompt nudge.
+   * Reuses the existing two transports `deliverNotice` already has
+   * (src/notify/deliver.ts) — this field names which ONE of them is used,
+   * never both, and never a new transport. ABSENT (the default, same
+   * tri-state-free discipline as `resumeOnRespawn`/`lizardMode` above) is
+   * today's behaviour exactly, unchanged: `deliverNotice`'s own
+   * channel-first-with-prompt-fallback gate, byte-for-byte — this field is
+   * never silently resolved to either value here. An explicit value skips
+   * that fallback entirely: `"channel"` with a channel miss (unavailable,
+   * refused, or the push itself throwing) reports a clear non-delivery
+   * result rather than trying the prompt; `"prompt"` never attempts the
+   * channel push at all. See `deliverNotice`'s own doc comment
+   * (src/notify/deliver.ts) for the exact non-fallback contract, and
+   * `NOTIFY_DELIVERY_MODES` immediately below for the validated values.
+   * Threaded through every rule-owned delivery seam that routes through
+   * `deliverNotice` (src/daemon/index.ts) — NOT through the managed-session
+   * (`SessionDefinition`) delivery seam, which has no `Rule` to read this
+   * from, and NOT through the idle-poke engine's own per-ISSUE multi-rule
+   * merge (`idlePokeRuleConfigByIssue`/`IdlePokeRuleConfig`,
+   * src/agents/idle-poke.ts) — that is a distinct stall-remediation wake
+   * nudge, not an update notification, and merging a categorical transport
+   * choice across several matching rules the way `idlePokeEnabled`/
+   * `idlePokeMinutes`/`idlePokeMessage` already do is deliberately left to
+   * a follow-up rather than guessed at here.
+   */
+  notifyDeliveryMode?: NotifyDeliveryMode;
 }
+
+/**
+ * FACTORY-1010 — the two transports `Rule.notifyDeliveryMode` may pin a
+ * rule's own agent(s) to; see that field's own doc comment for the
+ * byte-identical-when-absent contract. Re-exports `deliver.ts`'s own type
+ * rather than declaring an independent copy, so the validated rules-file
+ * value and the gate's own parameter can never drift apart.
+ */
+export const NOTIFY_DELIVERY_MODES = ["channel", "prompt"] as const;
+export type { NotifyDeliveryMode };
 
 /**
  * FACTORY-851 — default `Rule.resumeContextCutoff` when a rule leaves it
@@ -637,7 +689,8 @@ export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your tic
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
+  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
+  "notifyDeliveryMode",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -802,6 +855,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
     else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "confluence-page") for (const p of confluencePageQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
     if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
@@ -847,14 +901,25 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // comments). idlePokeEnabled DOES get an always-resolved default
     // (true), because "on" is already today's unconditional behaviour.
     const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
+    const { stalledMinutes } = raw;
+    if (stalledMinutes !== undefined && (typeof stalledMinutes !== "number" || !Number.isFinite(stalledMinutes) || stalledMinutes <= 0)) errors.push(`${at}.stalledMinutes must be a positive number`);
+    if (stalledMinutes !== undefined && resourceProvider !== "jira-project" && !(resourceProvider === "jira-work" && (execution === undefined || execution === "swarm"))) errors.push(`${at}.stalledMinutes requires a jira-work swarm rule or jira-project rule with an existing stalled detector`);
     if (idlePokeMinutes !== undefined && (!Number.isFinite(idlePokeMinutes) || (idlePokeMinutes as number) <= 0)) errors.push(`${at}.idlePokeMinutes must be a positive number`);
     if (idlePokeMessage !== undefined && !nonEmpty(idlePokeMessage)) errors.push(`${at}.idlePokeMessage must be a non-empty string`);
     if (idlePokeEnabled !== undefined && typeof idlePokeEnabled !== "boolean") errors.push(`${at}.idlePokeEnabled must be a boolean`);
+    // FACTORY-1010: independent of every field above, same absent-means-absent
+    // house style as `permissionMode`/`lizardMode` — ABSENT must stay
+    // today's channel-first/prompt-fallback behaviour, so there is
+    // deliberately no always-resolved default here (unlike `execution`/
+    // `account`/`role`, which DO resolve). See `Rule.notifyDeliveryMode`'s
+    // own doc comment.
+    const { notifyDeliveryMode } = raw;
+    if (notifyDeliveryMode !== undefined && !oneOf(NOTIFY_DELIVERY_MODES, notifyDeliveryMode)) errors.push(`${at}.notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem" || resourceProvider === "confluence-page") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -881,7 +946,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
       ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),
+      ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
       ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
+      ...(notifyDeliveryMode !== undefined ? { notifyDeliveryMode: notifyDeliveryMode as NotifyDeliveryMode } : {}),
       idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
     });
   });

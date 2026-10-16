@@ -1,7 +1,6 @@
 import { mkdirSync, writeFileSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { workspaceDirsForResource } from "./workspace.js";
-import { EXEMPT_LABEL } from "./parked.js";
 
 /**
  * FACTORY-849/FACTORY-852 — the durable half of "why did this workspace's
@@ -19,8 +18,8 @@ import { EXEMPT_LABEL } from "./parked.js";
  * separately-persisted record rather than reading that registry's memory.
  */
 
-/** The verbs/events this story found that butchr itself uses to end an agent's work on a ticket — see each call site (src/tools/defs.ts's `stand_down` handler; `finishWorker`/`shelveWorker`/`submitToBoss`/`finishWithoutABoss` in src/tools/relationship.ts) for why each one qualifies. */
-export type StopReason = "stand_down" | "submit_to_boss" | "finish_without_a_boss" | "finish_worker" | "shelve_worker";
+
+export type StopReason = "stand_down" | "submit_to_boss" | "finish_without_a_boss" | "finish_worker";
 
 /** One workspace's recorded stop cause — `undefined` (never this type) means "nothing recorded", the same fail-safe shape `workspaceSessionId` already uses. */
 export interface StopCauseRecord {
@@ -48,52 +47,7 @@ export function persistIntentionalStop(dir: string, reason: StopReason, at: numb
   renameSync(tmp, target);
 }
 
-/**
- * Removes this workspace's persisted stop-cause record — the explicit half
- * of superseding a stale marker, mirrored on `invalidatePersistedSessionId`
- * (src/agents/workspace.ts): tolerates ENOENT (nothing to remove is not an
- * error), never throws otherwise being out of scope for this best-effort
- * bookkeeping.
- *
- * WHERE THIS IS CALLED, AND WHY THAT IS THE RIGHT MOMENT (decided for DoD
- * item 4): `startWorker`/`adoptWorker(..., "start")` (src/tools/relationship.ts)
- * call this on the worker they are reactivating, in the SAME place and for
- * the SAME reason they already clear `EXEMPT_LABEL` (`butchr:shelved`,
- * BUTCHR-50) — that label means "currently shelved", a STATE, not a
- * history, and the verb that reverses the state is the verb that withdraws
- * the declaration; a stop-cause record is the same shape of claim ("this
- * workspace's last stop was intentional"), about to become false the
- * moment its boss sends it back to work (reactivating a shelved worker, or
- * sending an In Review worker back for another round — `startWorker`'s own
- * doc comment names both). Without this, a worker that called
- * `shelve_worker` or `submit_to_boss` on itself, got reactivated, and later
- * crashed for real would still read back its OLD "intentional" marker and
- * misclassify the NEW, genuinely unintended stop.
- *
- * NOT called from `stand_down`'s own wake path: that wake is the in-memory
- * registry this module deliberately does not depend on (see this file's
- * top comment).
- *
- * FACTORY-850/FACTORY-916 wired this into the spawn path
- * (`decideRespawnResume`, src/agents/respawn.ts, via `HerdrHerd.tryClaudeResume`
- * and the non-claude branch of `HerdrHerd.spawnExclusive`, both
- * src/agents/herd.ts) — the one place that can tell "a resume is actually
- * happening" apart from every other reason this workspace's files might
- * be touched. Both call sites clear the marker as soon as a spawn
- * DECISION is made, before the launch it is deciding for has run — a
- * narrower, separate defect FACTORY-930 found and closed: a launch that
- * then FAILS (blocked / providers exhausted / the pane dying immediately)
- * must not leave the marker cleared, or the NEXT spawn attempt misreads a
- * deliberate `stand_down` as unintended and resumes it. The fix lives in
- * `spawnExclusive` (src/agents/herd.ts), not here: it snapshots
- * `workspaceStopCause(dir)` before either call site above can clear it,
- * and re-persists that snapshot verbatim (`persistIntentionalStop`) if
- * every launch attempted for that spawn() call ultimately fails. This
- * function's own unconditional-clear-on-call contract is unchanged, and
- * deliberately so — `test/unit/respawn-resume-decision.test.ts`'s
- * marker-clearing tests exercise `decideRespawnResume` directly, with no
- * notion of launch success, and must keep passing unmodified.
- */
+
 export function clearStopCause(dir: string): void {
   try { rmSync(join(dir, ".butchr-stop-cause.json")); }
   catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
@@ -132,37 +86,7 @@ export function clearIntentionalStop(resourceId: string, root?: string): void {
 
 export type StopClassification = "intentional" | "unintended";
 
-/**
- * The read-time rule (DoD item 3): PURE and total over one already-fetched
- * snapshot — a recorded stop-cause record, the ticket's current status, and
- * its current labels — exactly the three inputs FACTORY-849/FACTORY-843
- * specify, costing no Jira or filesystem call of its own (both reads are
- * the caller's job: `workspaceStopCause` for the first input, the ticket's
- * own `jira_get_issue`-shaped fields for the other two).
- *
- * `intentional` when ANY of:
- *  - a stop-cause record is present at all (its specific `reason` is never
- *    consulted here — every reason this story records is, by construction,
- *    a butchr-caused end of work; see `StopReason`'s own doc comment for
- *    the full list).
- *  - `ticketStatus` is `"Done"` — this codebase's own sole terminal-status
- *    literal (see e.g. `openWorkers`/`assertOwnWorker` in
- *    src/tools/relationship.ts, which already compare against `"Done"`
- *    alone to mean closed; there is no second "Closed" synonym anywhere in
- *    this codebase to also check).
- *  - `ticketLabels` carries `EXEMPT_LABEL` (`butchr:shelved`,
- *    src/agents/parked.ts) — the shelved-exemption literal, imported, never
- *    retyped.
- *
- * Everything else — including a workspace this classifier cannot find a
- * stop-cause record for at all (a pane that simply vanished, a missing
- * record file, a workspace from before this ticket) — is `unintended`.
- * FACTORY-843 states that preference explicitly: an UNDETERMINABLE cause
- * must resolve to `unintended`, because a wrongly-fresh start only loses
- * work a resume would have kept, while a wrongly-resumed session (the cost
- * a wrong `intentional` verdict risks) is bounded by the sibling story's
- * own token/size cutoff — the cheaper direction to be wrong in.
- */
+
 export function classifyStop(input: {
   stopCause: StopCauseRecord | undefined;
   ticketStatus: string;
@@ -170,6 +94,5 @@ export function classifyStop(input: {
 }): StopClassification {
   if (input.stopCause !== undefined) return "intentional";
   if (input.ticketStatus === "Done") return "intentional";
-  if (input.ticketLabels.includes(EXEMPT_LABEL)) return "intentional";
   return "unintended";
 }

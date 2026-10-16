@@ -202,8 +202,8 @@ export interface SpawnSpec {
    * the same already-polled snapshot `specForMatch` (src/rules/resource-type.ts)
    * builds the rest of this spec from. Absent (every non-Jira-rule-engine
    * caller) means `classifyStop` sees `ticketStatus: ""`/`ticketLabels: []`,
-   * which cannot match `"Done"` or `EXEMPT_LABEL` — i.e. "status/labels
-   * unknown" never reads as "intentional", the same safe-direction default
+   * which cannot match `"Done"` — i.e. an unknown ticket status never
+   * reads as "intentional", the same safe-direction default
    * `classifyStop`'s own doc comment argues for an undeterminable cause.
    */
   ticketStatus?: string;
@@ -1037,37 +1037,27 @@ const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "github-pr", "j
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
-  "Your resource is a GitHub issue, not a Jira ticket. Read it (title, body, type, comments) with the butchr `github_get_issue` tool and comment on it with `github_add_comment`; both act only on your own issue. When your rule is allowed to, `github_link_jira_idea` links your issue to an existing Jira Product Discovery idea. Jira and Confluence tools refuse you. You are told when the issue changes — re-read it then.";
+  "Your resource is a GitHub issue. Use `github_get_issue` and `github_add_comment` with an explicit target (owner/repo#number), or omit it for your own issue. `github_link_jira_idea` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** FACTORY-57: what a `github-pr` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_PR_TOOLS_NOTE =
-  "Your resource is a GitHub pull request, not a Jira ticket. Read it (title, body, state, merged/draft, labels, comments) with the butchr `github_get_pr` tool and comment on it with `github_pr_add_comment`; both act only on your own pull request. Jira and Confluence tools refuse you. Your agent is stopped when this PR is merged or closed and your rule's own query no longer matches it. You are told when the PR changes — re-read it then.";
+  "Your resource is a GitHub pull request. Use `github_get_pr` and `github_pr_add_comment` with an explicit target (owner/repo#number), or omit it for your own PR. Your rule query determines when this agent is stopped; re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
 export const JIRA_IDEA_TOOLS_NOTE =
-  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool, list the GitHub issues its Jira remote links point at with `jira_idea_github_issues`, and comment on it with `jira_idea_add_comment`; all three act only on your own idea. When your rule is allowed to, `jira_idea_link_github_issue` links your idea to an existing GitHub issue. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
+  "Your resource is a Jira Product Discovery idea. Use `jira_idea_get`, `jira_idea_github_issues`, and `jira_idea_add_comment` with an explicit target (issue key), or omit it for your own idea. `jira_idea_link_github_issue` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** What a `zendesk-ticket` agent is told about its tools; a Jira work brief carries no such section. */
 export const ZENDESK_TICKET_TOOLS_NOTE =
-  "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
+  "Your resource is a Zendesk ticket. Use `zendesk_get_ticket` and `zendesk_add_internal_note` with an explicit target (subdomain#number), or omit it for your own ticket. You cannot reply to the customer with the internal-note operation: every note is internal. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
-/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. NOT shown to a managed-session (`managed-sessions` rule) agent — see `MANAGED_SESSION_TOOLS_NOTE` below, which is the accurate note for that narrower case (BUTCHR-456 gives it exactly two conditional tools, not none). */
+/** File editing remains a native filesystem operation; provider tools use explicit targets. */
 export const FILESYSTEM_TOOLS_NOTE =
-  "Your resource is a file or directory on disk, not a Jira ticket. Read and edit it directly with your own file tools — there is no butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. You are told when it changes (created, modified, or removed) — re-read it from disk then.";
+  "Your resource is a file or directory. Read and edit it directly with your own file tools within authorized filesystem boundaries; there is no butchr MCP tool for general file editing. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
-/**
- * BUTCHR-456: what a MANAGED-SESSION agent specifically is told — narrower
- * than `FILESYSTEM_TOOLS_NOTE` above, which would otherwise tell a
- * `director-brooswit-mud`-shaped agent "there is no butchr MCP tool for it"
- * even once its own definition IS granted freeze/unfreeze control over
- * another one, undermining the very capability this delegation exists to
- * give it. Shown to every managed-session agent regardless of whether it
- * currently holds any grant (a definition's OWN manifest is what actually
- * decides that at call time — this brief text is static per rule, like
- * every other `TOOLS_NOTE` entry, not re-derived per grant).
- */
+/** Session control retains its explicit authorization independently of provider access. */
 export const MANAGED_SESSION_TOOLS_NOTE =
-  "Your resource is a managed-session definition file, not a Jira ticket. Read and edit YOUR OWN definition directly with your own file tools — there is no general-purpose butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. The ONE exception: if ANOTHER definition's own `freezeControllers`/`unfreezeControllers` grant names your definition's file, you may call the butchr `freeze_session`/`unfreeze_session` tool (argument: that OTHER definition's name) to flip its freeze state. You have no other butchr MCP tool, and you can never edit any grant, or create, archive, or delete a definition — see docs/managed-sessions.md's \"Delegated freeze/unfreeze\" section. You are told when your own file changes (created, modified, or removed) — re-read it from disk then.";
+  "Your resource is a managed-session definition. Preserve session-control authorization and freezes. `freeze_session` and `unfreeze_session` require the target definition's explicit freezeControllers/unfreezeControllers authorization; do not edit grants or create, archive or delete definitions without authorization. Read docs/managed-sessions.md for this operational contract. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "github-pr": GITHUB_PR_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 

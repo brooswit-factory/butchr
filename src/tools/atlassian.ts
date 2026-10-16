@@ -82,6 +82,27 @@ export interface AtlassianOps {
   getProjectPropertyOrNull(projectKey: string, propertyKey: string): Promise<unknown | null>;
 
   /**
+   * FACTORY-19: does the project itself exist (and is it visible to this
+   * credential)? Exists so a caller of `getProjectPropertyOrNull` can tell
+   * "this project has never written the property" (a real empty collection)
+   * apart from "this project key doesn't exist, or isn't visible to me" (a
+   * caller error that must not read as quiet emptiness) — `getProjectPropertyOrNull`
+   * itself cannot distinguish the two: Jira 404s a missing project and a
+   * missing property on an existing project identically on that endpoint.
+   * `true`/`false` only; any non-404 rejection (rate limit, auth, network)
+   * still rejects, same "narrow what counts as not-found" discipline as
+   * `getProjectPropertyOrNull`.
+   *
+   * Declared OPTIONAL rather than added to every existing fake in this
+   * codebase: the one caller that needs it (`src/resources/jira-project-link-store.ts`)
+   * falls back to today's existing "null property == empty collection"
+   * behaviour when a given `AtlassianOps` doesn't implement it, so no
+   * unrelated test's fake needs updating for this to land. The real
+   * implementation (`atlassian-real.ts`) always provides it.
+   */
+  projectExists?(projectKey: string): Promise<boolean>;
+
+  /**
    * Read one remote issue link by its `globalId`. Resolves `null` when no
    * such link exists — the real impl converts Jira's 404 into `null` so
    * every caller has one "not found" shape instead of a try/catch each.
@@ -103,25 +124,12 @@ export interface AtlassianOps {
    */
   getChildPages(parentId: string, cursor?: string): Promise<{ results: Array<{ id: string; title?: string }>; nextCursor?: string }>;
 
-  /** A page's label names, direct read (not CQL — same reasoning as getChildPages). */
-  getPageLabels(pageId: string): Promise<string[]>;
-
-  /**
-   * Create a Confluence page WITH a label, atomically in one call. A
-   * deliberately SEPARATE op from `createPage` (see atlassian-real.ts for
-   * why) so that no existing caller of `createPage`/`confluence_create_page`
-   * changes behavior. `spaceKey` (not `spaceId`) because the underlying v1
-   * content API takes the space's key, not its numeric id.
-   */
-  createPageWithLabel(p: { spaceKey: string; parentId: string; title: string; body: string; label: string }): Promise<{ id: string; title: string; url: string }>;
-
   /**
    * Read-modify-write: unions `labels` into the issue's CURRENT label set and
    * writes the result back. NEVER removes an existing label — there is no
    * other way to set a label on an issue that already exists (labels can
    * otherwise only be set at creation), and a naive replace would silently
-   * destroy whatever labels the ticket already carried (src/tools/relationship.ts,
-   * shelve_worker).
+   * destroy whatever labels the ticket already carried.
    */
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 
@@ -390,5 +398,22 @@ export interface AtlassianOps {
    * `getPageComments`) — "one reader, not two". This op is that one
    * reader, reused by both discovery and `check_in`.
    */
-  getIssueComments(key: string): Promise<{ results: Array<{ id: string }> }>;
+  getIssueComments(key: string): Promise<{ results: IssueCommentRecord[] }>;
+}
+
+/**
+ * One Jira comment as `getIssueComments` returns it (FACTORY-1008). `id` is
+ * all the notification bookkeeping reads; `body` is what the agent-facing
+ * `jira_get_comments` tool exists to deliver. `body` is PLAIN TEXT: Jira's
+ * ADF flattened by `adfToText` (paragraphs/lists/tables newline-separated,
+ * mentions as their display text, links as their URL). It is never
+ * fabricated — a comment whose body Jira returned empty has `body: ""`.
+ */
+export interface IssueCommentRecord {
+  id: string;
+  body: string;
+  /** The provider's raw body (ADF object or string) so nothing the plain-text rendering cannot express is lost. */
+  bodyRaw: unknown;
+  created: string;
+  author: { accountId: string | null; displayName: string | null; email: string | null };
 }

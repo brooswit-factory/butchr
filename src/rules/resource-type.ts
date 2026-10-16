@@ -620,7 +620,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
         // `reconcileNow` in `runResourceLoop`, src/daemon/loop.ts), so a
         // just-spawned owning agent already exists before this ever tries to
         // nudge it. Belt-and-suspenders try/catch, same discipline as
-        // `checkParked`/`checkAbandoned` (src/daemon/loop.ts): a failure here
+        // `checkAbandoned` (src/daemon/loop.ts): a failure here
         // must never take down `related()`'s own return value, which the
         // Implements/Relates/scope-ownership related-resource mechanism
         // below still depends on regardless of this feature. Only runs when
@@ -659,7 +659,18 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   };
 }
 
-/** Each distinct Jira issue across `units`' `"resource"`-kind (swarm) matches once — for the label/detector layer, which works per ticket. A `singleton`/`persistent` rule's own query-level unit carries no single issue and is not represented here (BUTCHR-398): label sync, parked- and abandoned-worker detection stay per-resource concepts. */
+/** Labels are shared per ticket: the longest explicit matching timeout wins.
+ * Rebuild per poll so disabled/removed rules cannot leave stale overrides. */
+export function stalledMinutesForIssues(units: readonly ExecutionUnit<RuleMatch>[]): ReadonlyMap<string, number> {
+  const result = new Map<string, number>();
+  for (const { rule, issue } of resourceMatches(units)) {
+    if (!rule.enabled || rule.stalledMinutes === undefined) continue;
+    result.set(issue.key, Math.max(result.get(issue.key) ?? 0, rule.stalledMinutes));
+  }
+  return result;
+}
+
+/** Each distinct Jira issue from resource-kind (swarm) units, for per-ticket detectors. */
 export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIssue[] {
   const byKey = new Map<string, JiraIssue>();
   for (const m of resourceMatches(units)) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);

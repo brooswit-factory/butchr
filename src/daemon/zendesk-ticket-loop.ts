@@ -4,7 +4,7 @@
  * testable.
  *
  * What it deliberately does NOT get from the Jira loop: label sync, the
- * parked/abandoned/stall detectors, respawn and crash-loop comments. Every
+ * abandoned/stall detectors, respawn and crash-loop comments. Every
  * one of those writes to the resource, and nothing but an agent's own
  * internal note may be written to a Zendesk ticket. `ownsId` scopes
  * reconciliation to `zendesk-ticket` agents, so no loop can stop another's.

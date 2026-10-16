@@ -777,9 +777,10 @@ describe("filesystem in the shared agent-key / rules / identity surfaces", () =>
     expect(callerIdentity({ "x-butchr-agent": qkey })).toEqual({ provider: "filesystem", agent: qkey, ruleId: "docs", query: true });
   });
 
-  test("FILESYSTEM_TOOLS_NOTE mentions there is no MCP tool and that other providers' tools refuse it", () => {
+  test("FILESYSTEM_TOOLS_NOTE distinguishes direct file editing from registered provider access", () => {
     expect(FILESYSTEM_TOOLS_NOTE).toContain("no butchr MCP tool");
-    expect(FILESYSTEM_TOOLS_NOTE).toContain("Jira, Confluence, GitHub and Zendesk tools all refuse you");
+    expect(FILESYSTEM_TOOLS_NOTE).toContain("Other registered provider operations accept explicit targets");
+    expect(FILESYSTEM_TOOLS_NOTE).not.toContain("tools all refuse you");
   });
 });
 

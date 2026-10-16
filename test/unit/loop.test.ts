@@ -236,6 +236,51 @@ describe("reconcileNow", () => {
     expect(calls).toEqual([{ issue: "STALE", reason: "argv lacks --permission-mode bypassPermissions", observedArgv: ["claude", "--resume", "abc"] }]);
   });
 
+  test("FACTORY-1001: onStopped covers normal stops, respawn stops, and only successful stops", async () => {
+    const cases: Array<{
+      name: string;
+      herd: () => Herd & { stopped: string[] };
+      desired: Map<string, any>;
+      expectedStopped: string[];
+      expectedHook: string[];
+    }> = [
+      {
+        name: "normal stop",
+        herd: () => fakeHerd(["OLD"]),
+        desired: new Map<string, any>(),
+        expectedStopped: ["OLD"],
+        expectedHook: ["OLD"],
+      },
+      {
+        name: "respawn stop",
+        herd: () => fakeHerd(["STALE"], [{ issue: "STALE", reason: "argv mismatch", observedArgv: [] }]),
+        desired: new Map([["STALE", { key: "STALE", issuetype: "Task", summary: "s", parent: null }]]),
+        expectedStopped: ["STALE"],
+        expectedHook: ["STALE"],
+      },
+      {
+        name: "failed stop",
+        herd: () => ({
+          ...fakeHerd(["BROKEN"]),
+          async stop() { throw new Error("herdr unavailable"); },
+        } as Herd & { stopped: string[] }),
+        desired: new Map<string, any>(),
+        expectedStopped: [],
+        expectedHook: [],
+      },
+    ];
+
+    for (const scenario of cases) {
+      const herd = scenario.herd();
+      const hooks: string[] = [];
+      await reconcileNow(herd, scenario.desired, {
+        onStopped: async (issue) => { hooks.push(issue); },
+      });
+      expect(herd.stopped, scenario.name).toEqual(scenario.expectedStopped);
+      expect(hooks, scenario.name).toEqual(scenario.expectedHook);
+    }
+  });
+
   test("no onRespawn callback provided → stale issue still gets stopped and spawned", async () => {
     const herd = fakeHerd(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
     const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
@@ -2542,25 +2587,24 @@ describe("startLoop respawn wiring", () => {
   });
 });
 
-describe("startLoop checkParked wiring (BUTCHR-24)", () => {
+describe("startLoop checkAbandoned wiring (BUTCHR-200)", () => {
   // @brooswit/sundry's watch() only calls its onChange callback when the
   // polled snapshot's hash differs from the previous one — a detector wired
   // into onChange would silently stop firing on any poll whose snapshot
-  // doesn't change. checkParked must be invoked from the observe function
-  // instead, so it runs on EVERY poll, changed or not — this is the trap the
-  // ticket calls out, and it needs its own test, independent of anything the
-  // parked predicate itself does.
-  test("checkParked runs on every poll, including a poll whose (issues, related) snapshot is identical to the previous one", async () => {
+  // doesn't change. checkAbandoned must be invoked from the observe function
+  // instead, so it runs on EVERY poll, changed or not — this needs its own
+  // test, independent of anything the abandoned predicate itself does.
+  test("checkAbandoned runs on every poll, including a poll whose issues snapshot is identical to the previous one", async () => {
     const herd = fakeHerd();
-    const calls: Array<{ issues: JiraIssue[]; related: unknown[] }> = [];
-    // The SAME issue/related snapshot every poll — watch()'s hash never
-    // changes, so onChange would never fire if checkParked were wired there.
+    const calls: Array<{ issues: JiraIssue[] }> = [];
+    // The SAME issue snapshot every poll — watch()'s hash never changes, so
+    // onChange would never fire if checkAbandoned were wired there.
     const stop = startLoop({
       search: async () => [iss("A", "In Progress")],
       related: async () => [],
       herd,
       notify: () => {},
-      checkParked: async (issues, related) => { calls.push({ issues: [...issues], related: [...related] }); },
+      checkAbandoned: async (issues) => { calls.push({ issues: [...issues] }); },
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 55));
@@ -2571,7 +2615,7 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
     expect(calls[0]!.issues[0]!.key).toBe("A");
   });
 
-  test("a checkParked rejection is caught: does not stop the loop, and does not appear as a notify or onError event", async () => {
+  test("a checkAbandoned rejection is caught: does not stop the loop, and does not appear as a notify or onError event", async () => {
     const herd = fakeHerd();
     let calls = 0;
     const errors: unknown[] = [];
@@ -2580,14 +2624,14 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
       related: async () => [],
       herd,
       notify: () => {},
-      checkParked: async () => { calls++; throw new Error("boom"); },
+      checkAbandoned: async () => { calls++; throw new Error("boom"); },
       onError: (e) => errors.push(e),
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 35));
     stop();
     expect(calls).toBeGreaterThan(1); // kept polling despite the rejection
-    expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkParked's internal errors
+    expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkAbandoned's internal errors
   });
 });
 

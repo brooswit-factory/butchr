@@ -68,8 +68,8 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
 | `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
-| `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim; FACTORY-577: also mapped onto a Codex launch's `bypassApprovalsAndSandbox` (see "Per-vendor launch differences"). |
-| `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
+| `permissionMode` | yes | `"default"` \| `"manual"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim; FACTORY-577: also mapped onto a Codex launch's `bypassApprovalsAndSandbox` (see "Per-vendor launch differences"). `"default"`/`"manual"` are the SAME launcher value — `manual` is Claude's own `--help`-advertised alias for its real canonical `default` (FACTORY-275; see `SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts). `"bypassPermissions"`'s operator-facing friendly name is **"unattended mode"** — prose only, the wire value is unchanged. |
+| `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `lizardMode` | no | DROVR-42/FACTORY-67/FACTORY-138/FACTORY-108. Boolean, accepted at manifest load for BOTH vendors (no vendor rejection here, unlike `strictMcpConfig`, which is still rejected for `vendor: "codex"`). Absent → ELIGIBLE for a `vendor: "claude"` definition (the FACTORY-138 default, `lizardMode ?? (vendor === "claude")`); a `vendor: "codex"` definition stays NOT eligible when absent — the default applies to Claude only. Explicit `false` always means never scanned or touched, for either vendor. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **For `vendor: "claude"`:** never reaches `SpawnSpec` or the launched process's argv, whether from an explicit `true` or the FACTORY-138 default — read live, every poll, by the daemon's separate permission-answer timer. **For `vendor: "codex"` (FACTORY-108):** the opposite — only an EXPLICIT `true` reaches `SpawnSpec.lizardMode` and the launch argv (dropping `--dangerously-bypass-approvals-and-sandbox` so drovr's Codex approval-answering has a dialog to see); since Codex is never eligible by default, there is no default-driven argv change to worry about. See "Codex support" below for the full asymmetry. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
@@ -365,7 +365,7 @@ usage: butchr session list [--archived]
        butchr session show <name>
        butchr session create <name> --working-directory <dir> --brief <text>
                              --vendor claude|codex --tier tier1..tier5
-                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
                              [--role worker|sentinel] [--frozen]
@@ -1093,9 +1093,24 @@ field is independent, and a definition may set it alongside any
 plus an afterthought. `acceptEdits` auto-accepts file EDITS only — Bash and
 MCP tool prompts still appear there, and those are what lizard mode answers.
 `"bypassPermissions"` skips permission prompts by design, so `lizardMode`
-there has nothing to answer. What `"auto"` does is version-dependent and
-UNVERIFIED here — don't assume it behaves like `bypassPermissions`, and
-don't assume `lizardMode` is therefore a no-op under it.
+there has nothing to answer.
+
+**`"auto"` is NOT an equivalent no-op pair with `"bypassPermissions"`
+(FACTORY-275).** An earlier version of this doc claimed the tool-permission
+dialog "essentially never appears" under either mode, treating them as
+interchangeable — that claim was wrong and has been removed. The installed
+`claude` binary's own `--permission-mode` option help (verified at 2.1.251)
+describes them as genuinely different: `"auto"` — *"Use a model classifier
+to approve/deny permission prompts"*, a real per-prompt judgment that can
+still deny; `"bypassPermissions"` — *"Bypass all permission checks (requires
+allowDangerouslySkipPermissions)"*, which never checks and never denies.
+Neither shows an interactive dialog to a human, which is likely why the two
+were conflated, but "no human-facing dialog" is not "the same behaviour".
+Whether `lizardMode`'s auto-answer ever actually has something to press
+under `"auto"` (i.e. whether the classifier itself ever produces the same
+kind of prompt drovr recognizes) is a separate, still-open question this
+ticket did not attempt to observe live — don't assume either answer without
+watching an `"auto"` pane yourself.
 
 **No stale-argv risk for CLAUDE, unlike `permissionMode`/`strictMcpConfig`
 (FACTORY-43).** Those two fields DO reach the launched process's argv, which
@@ -1381,6 +1396,19 @@ managed-session agent does its own Jira/Confluence work (if any) directly
 through an operator-configured Atlassian MCP connection, never through
 butchr's `jira_*`/`confluence_*` tools or the boss verbs — butchr's
 hierarchy verbs are for jira-work ticket agents (Epic/Story/Task) only.
+
+**One narrow, named exception (FACTORY-996, story FACTORY-993):**
+`get_my_confluence_page`/`get_my_confluence_page_comments` (`src/tools/
+defs.ts`) let a managed-session agent read — never write — its OWN
+resource page's body and comments through butchr's own MCP, but ONLY when
+that agent's own resource genuinely IS a Confluence page (a `confluence-page`
+ResourceType instance, FACTORY-992, not yet shipped as of this story) — the
+page id comes exclusively from the caller's own `x-issue`, never an
+argument, so this cannot be used to reach any OTHER page nor does it open a
+general Jira/Confluence integration for an arbitrary filesystem-backed
+managed-session agent. Every other managed-session agent (one whose
+resource is an ordinary file) still gets a refusal from both verbs, same as
+before this story — the paragraph above is otherwise unchanged.
 
 ## Escalating an unanswerable startup dialog (FACTORY-45)
 

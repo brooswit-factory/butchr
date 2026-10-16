@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ApiError } from "confluence.js/core";
-import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET, nativeParentOf, isEligibleParentTier, resolveBoss } from "../../src/tools/docs.js";
+import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET, nativeParentOf, isEligibleParentTier, resolveBoss, getConfluencePageDocById } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 /**
@@ -9,18 +8,18 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
  * across calls in a way the simple call-recording `rig()` in tools.test.ts
  * isn't built for — this fake exists for that reason, not as a second
  * version of that one. Everything docs.ts doesn't touch (search, addComment,
- * …) is stubbed since it's never called. `createPageWithLabel`/
- * `getChildPages`/`getPageLabels` remain on this fake even though nothing in
- * docs.ts calls them anymore post-FACTORY-86 (they backed `ensureDoc`'s
- * retired creation path) — kept only because they're still part of the
- * `AtlassianOps` interface every fake must implement in full.
+ * …) is stubbed since it's never called. `getChildPages` remains on this
+ * fake even though nothing in docs.ts calls it anymore post-FACTORY-86 (it
+ * backed `ensureDoc`'s retired creation path) — kept only because it's
+ * still part of the `AtlassianOps` interface every fake must implement in
+ * full (and is now also exercised directly by the `confluence-page` rule
+ * loop's own tests, not this file's).
  */
 function makeWorld(opts: { childPageSize?: number } = {}) {
   const childPageSize = opts.childPageSize ?? 50;
   const issues = new Map<string, { summary: string; bossKey?: string; remoteLink?: { title: string; url: string } }>();
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
   const projectProperties = new Map<string, unknown>();
-  let nextId = 100;
   let upsertRemoteLinkCalls = 0;
 
   function addIssue(key: string, summary: string, bossKey?: string) {
@@ -98,14 +97,6 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
         results: slice.map((id) => ({ id, title: pages.get(id)!.title })),
         ...(nextIndex < all.length ? { nextCursor: String(nextIndex) } : {}),
       };
-    },
-    getPageLabels: async (pageId: string) => pages.get(pageId)?.labels ?? [],
-    createPageWithLabel: async (p) => {
-      const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
-      if (titleTaken) throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
-      const id = String(nextId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-      return { id, title: p.title, url: pageUrl(id) };
     },
   commentOnPage: async () => ({ ok: true }),
   getPageComments: async () => ({ results: [] }),
@@ -424,6 +415,78 @@ describe("docs.ts: get_doc — never creates, self or other", () => {
 
 });
 
+describe("docs.ts: getConfluencePageDocById (FACTORY-996) — reads a page BY ITS OWN ID directly, no key, no remote-link resolution", () => {
+  test("a page's body/id/url/version — fits entirely (complete: true)", async () => {
+    const { ops, pages } = makeWorld();
+    pages.set("500", { parentId: "", title: "my resource page", body: "<p>hello</p>", labels: [], version: 1 });
+    const result = await getConfluencePageDocById(ops, "500");
+    expect(result).toEqual({
+      found: true,
+      complete: true,
+      id: "500",
+      url: expect.any(String),
+      title: "my resource page",
+      version: 1,
+      size: { chars: "<p>hello</p>".length, bytes: Buffer.byteLength("<p>hello</p>", "utf8") },
+      body: "<p>hello</p>",
+    });
+  });
+
+  test("never resolves { found: false } — a nonexistent page rejects instead, same as every other direct getPage call site in this file", async () => {
+    const { ops } = makeWorld();
+    await expect(getConfluencePageDocById(ops, "no-such-page")).rejects.toThrow(/no such page/);
+  });
+
+  test("empty body -> complete: true, body: \"\", size.chars === 0", async () => {
+    const { ops, pages } = makeWorld();
+    pages.set("501", { parentId: "", title: "empty", body: "", labels: [], version: 1 });
+    const result = await getConfluencePageDocById(ops, "501");
+    expect(result).toEqual({
+      found: true,
+      complete: true,
+      id: "501",
+      url: expect.any(String),
+      title: "empty",
+      version: 1,
+      size: { chars: 0, bytes: 0 },
+      body: "",
+    });
+  });
+
+  test("does-not-fit: complete: false, body ABSENT, chunk/slice/next correct — same three-arm shape as get_doc", async () => {
+    const { ops, pages } = makeWorld();
+    const body = "0123456789"; // 10 chars
+    pages.set("502", { parentId: "", title: "oversized", body, labels: [], version: 7 });
+    const result = await getConfluencePageDocById(ops, "502", 0, 4);
+    expect(result).toMatchObject({
+      found: true,
+      complete: false,
+      id: "502",
+      version: 7,
+      size: { chars: 10, bytes: 10 },
+      slice: { offset: 0, chars: 4, bytes: 4 },
+      next: { offset: 4 },
+      chunk: "0123",
+      warning: expect.any(String),
+    });
+    expect("body" in result).toBe(false);
+  });
+
+  test("expectVersion mismatch mid-read refuses rather than risking a spliced body", async () => {
+    const { ops, pages } = makeWorld();
+    pages.set("503", { parentId: "", title: "versioned", body: "0123456789", labels: [], version: 1 });
+    await getConfluencePageDocById(ops, "503", 0, 4); // first slice, version 1
+    pages.get("503")!.version = 2; // page edited mid-read
+    await expect(getConfluencePageDocById(ops, "503", 4, 4, 1)).rejects.toThrow(/changed mid-read/);
+  });
+
+  test("offset past the end refuses", async () => {
+    const { ops, pages } = makeWorld();
+    pages.set("504", { parentId: "", title: "short", body: "abc", labels: [], version: 1 });
+    await expect(getConfluencePageDocById(ops, "504", 100, undefined, 1)).rejects.toThrow(/offset.*past the end/);
+  });
+});
+
 describe("docs.ts: findDoc — never creates, links, or infers a space/parent (FACTORY-84/FACTORY-86)", () => {
   test("a ticket with no doc -> null, and touches no write op at all", async () => {
     const { ops, addIssue, pages, issues, upsertCalls } = makeWorld();
@@ -468,24 +531,18 @@ describe("docs.ts: findDoc — never creates, links, or infers a space/parent (F
     await expect(findDoc(ops, "not-a-key")).rejects.toThrow(/not a valid Jira key/);
   });
 
-  test("never calls createPageWithLabel/getChildPages/getPageLabels/upsertRemoteLink — the retired creation machinery is never reached", async () => {
+  test("never calls getChildPages/upsertRemoteLink — the retired creation machinery is never reached", async () => {
     const { ops, addIssue } = makeWorld();
     addIssue("BUTCHR-51", "instrumented");
-    let createCalled = false;
     let childPagesCalled = false;
-    let pageLabelsCalled = false;
     let upsertCalled = false;
     const instrumentedOps: AtlassianOps = {
       ...ops,
-      createPageWithLabel: async (p) => { createCalled = true; return ops.createPageWithLabel(p); },
       getChildPages: async (id, cursor) => { childPagesCalled = true; return ops.getChildPages(id, cursor); },
-      getPageLabels: async (id) => { pageLabelsCalled = true; return ops.getPageLabels(id); },
       upsertRemoteLink: async (key, globalId, relationship, object) => { upsertCalled = true; return ops.upsertRemoteLink(key, globalId, relationship, object); },
     };
     await findDoc(instrumentedOps, "BUTCHR-51");
-    expect(createCalled).toBe(false);
     expect(childPagesCalled).toBe(false);
-    expect(pageLabelsCalled).toBe(false);
     expect(upsertCalled).toBe(false);
   });
 });

@@ -163,13 +163,11 @@ function world(opts: {
     getRemoteLink: unimplemented("getRemoteLink"),
     upsertRemoteLink: unimplemented("upsertRemoteLink"),
     getChildPages: unimplemented("getChildPages"),
-    getPageLabels: unimplemented("getPageLabels"),
-    createPageWithLabel: unimplemented("createPageWithLabel"),
     addLabels: unimplemented("addLabels"),
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
     correctText: unimplemented("correctText"),
-    getIssueComments: async (key: string) => ({ results: (epicIssues.get(key)?.comments ?? []).map((c) => ({ id: c.id })) }),
+    getIssueComments: async (key: string) => ({ results: (epicIssues.get(key)?.comments ?? []).map((c) => ({ id: c.id })) as any[] }),
 
     getMyself: async () => ({ accountId: "acct-project-agent" }),
     searchProjects: async () => ({

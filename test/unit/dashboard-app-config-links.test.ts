@@ -12,6 +12,7 @@ const SAMPLE_RESOURCE_IDS: Record<(typeof RESOURCE_PROVIDERS)[number], string> =
   "zendesk-ticket": "subdomain#9",
   "jira-project": "FACTORY",
   filesystem: "/abs/path",
+  "confluence-page": "123456",
   "jira-component": "FACTORY:10000",
 };
 

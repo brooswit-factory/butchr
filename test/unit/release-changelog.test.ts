@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { collateEntry, hasContent, parseChangelog, prependEntry } from "../../scripts/release/changelog.js";
+import { collateEntry, hasContent, headingsIn, parseChangelog, prependEntry } from "../../scripts/release/changelog.js";
 
 const md = `# Changelog
 ## [0.2.0] - 2026-08-25
@@ -23,6 +23,19 @@ describe("changelog parser", () => {
   });
   test("bullets under an unknown section do not count as content", () => { expect(hasContent(parseChangelog(md)[2]!)).toBe(false); });
   test("a malformed heading is not an entry", () => { expect(parseChangelog("## 0.3.0\n- x\n## [0.3.0]\n- y")).toEqual([]); });
+});
+
+describe("headingsIn (FACTORY-192: must see every heading, not just single-word ones parseSections recognises)", () => {
+  test("every ### heading line, verbatim, in order", () => {
+    expect(headingsIn("### Added\n- a\n### Notes\n- b\n")).toEqual(["Added", "Notes"]);
+  });
+  test("a multi-word heading is captured whole, not truncated at the first space", () => {
+    expect(headingsIn("### Known Issues\n- a\n")).toEqual(["Known Issues"]);
+  });
+  test("a punctuated heading is captured verbatim", () => {
+    expect(headingsIn("### Fixed!\n- a\n")).toEqual(["Fixed!"]);
+  });
+  test("no headings in a fragment with none", () => { expect(headingsIn("bump: patch\n- not a heading\n")).toEqual([]); });
 });
 
 describe("collateEntry", () => {

@@ -3,8 +3,8 @@
  * actually consults, for any detector that DECLINES to assert rather than
  * fetching successfully and finding nothing.
  *
- * THE GAP THIS CLOSES: `src/agents/stalled.ts` (and five other modules —
- * `parked.ts`, `frozen-asleep.ts`, `crash-loop.ts`, `reconcile-failure.ts`,
+ * THE GAP THIS CLOSES: `src/agents/stalled.ts` (and four other modules —
+ * `frozen-asleep.ts`, `crash-loop.ts`, `reconcile-failure.ts`,
  * `escalation-loop.ts`) already treat a failed comments/links fetch as a
  * THIRD outcome, never collapsed into "confirmed clean" — that fix
  * (BUTCHR-121 and predecessors) was correct and stays. But every one of

@@ -59,15 +59,20 @@ export class StalledTracker {
    * (src/labels/plan.ts), since a ticket with no agent has no pane at its
    * prompt to read a wake comment.
    */
-  observe(issue: string, label: ObservedLabel): boolean {
+  observe(issue: string, label: ObservedLabel, minutes = this.minutes): boolean {
     let e = this.entries.get(issue);
     if (!e) { e = { idleSince: null }; this.entries.set(issue, e); }
     if (label !== "idle") { e.idleSince = null; return false; }
     if (e.idleSince == null) e.idleSince = this.now();
-    return this.now() - e.idleSince >= this.minutes * 60_000;
+    return this.now() - e.idleSince >= minutes * 60_000;
   }
 
   /** Drop tracking for a ticket leaving the active set — a later respawn starts a fresh floor. */
+  resetAt(issue: string, at: number): void {
+    const entry = this.entries.get(issue);
+    if (entry && entry.idleSince !== null) entry.idleSince = Math.max(entry.idleSince, at);
+  }
+
   forget(issue: string): void {
     this.entries.delete(issue);
   }
@@ -126,6 +131,8 @@ export interface StalledCheck {
    * stall remediator) must use optional chaining and its own fallback.
    */
   elapsedMinutes?: (issue: string) => number | null;
+  /** Effective configured threshold for diagnostics, independent of elapsed time. */
+  thresholdMinutes?: (issue: string) => number;
 
   /**
    * FACTORY-845: exposes `StalledTracker.streakStart` (the precise instant
@@ -166,6 +173,8 @@ export interface StalledCheckDeps {
   now: () => number;
   /** N minutes: see StalledTracker. */
   minutes: number;
+  /** Manual per-ticket rule override; absent inherits minutes. Does not change poke cadence. */
+  minutesFor?: (issue: string) => number | undefined;
   /**
    * Recent comments on a ticket; only called for a cheap-precondition
    * candidate. BUTCHR-289: widened from `{ authorEmail }` to `{ id, body,
@@ -214,9 +223,11 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
   // a later, genuinely new disqualification logs fresh rather than staying
   // silent because SOME comment was already logged once, long ago.
   const declineLogged = new Map<string, string>();
+  const activitySeen = new Map<string, number>();
   return {
     async check(issue, label) {
-      if (!tracker.observe(issue, label)) {
+      const minutes = deps.minutesFor?.(issue) ?? deps.minutes;
+      if (!tracker.observe(issue, label, minutes)) {
         declineLogged.delete(issue);
         return false;
       }
@@ -239,12 +250,14 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
         // false wake costs one debounced comment (see
         // stall-remediation.ts) while a false silence costs nothing
         // visible at all.
-        const disqualifying = rows.find((c) => {
+        const disqualifying = [...rows].sort((a, b) => Date.parse(b.created) - Date.parse(a.created)).find((c) => {
           if (c.body.startsWith(DAEMON_CHATTER_PREFIX)) return false;
           const createdAt = Date.parse(c.created);
-          return Number.isNaN(createdAt) || createdAt >= streakStart;
+          return Number.isNaN(createdAt) || createdAt > streakStart || (createdAt === streakStart && activitySeen.get(issue) !== createdAt);
         });
         if (disqualifying) {
+          const activityAt = Date.parse(disqualifying.created);
+          if (Number.isFinite(activityAt)) { tracker.resetAt(issue, activityAt); activitySeen.set(issue, activityAt); }
           if (declineLogged.get(issue) !== disqualifying.id) {
             declineLogged.set(issue, disqualifying.id);
             const unparseable = Number.isNaN(Date.parse(disqualifying.created));
@@ -254,7 +267,7 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
                 : `[stalled] ${issue} declined: comment ${disqualifying.id} (${disqualifying.created}) is not daemon chatter and landed at/after the current idle streak began (${new Date(streakStart).toISOString()}) — someone is attending`,
             );
           }
-          return false;
+          return Number.isFinite(activityAt) ? false : null;
         }
         declineLogged.delete(issue);
         return true;
@@ -270,8 +283,9 @@ export function createStalledCheck(deps: StalledCheckDeps): StalledCheck {
         return null;
       }
     },
-    forget: (issue) => { tracker.forget(issue); declineLogged.delete(issue); },
+    forget: (issue) => { tracker.forget(issue); declineLogged.delete(issue); activitySeen.delete(issue); },
     elapsedMinutes: (issue) => tracker.elapsedMinutes(issue),
+    thresholdMinutes: (issue) => deps.minutesFor?.(issue) ?? deps.minutes,
     streakStart: (issue) => tracker.streakStart(issue),
   };
 }

@@ -10,7 +10,7 @@
  *
  * Everything NOT named here (spawn, argv, panes, escalation, labels, docs)
  * stays SHARED across every resource type — see src/agents/workspace.ts,
- * src/agents/argv.ts, src/agents/herd.ts, src/agents/parked.ts, src/labels/*.
+ * src/agents/argv.ts, src/agents/herd.ts, src/labels/*.
  * A resource type's spawnConfig member only ever produces the
  * (already-shared) SpawnSpec those consume; it never re-implements them.
  *
@@ -30,7 +30,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
  * predates genericity, back when `T` was always `JiraIssue`) and is kept
  * as-is rather than renamed — see src/daemon/loop.ts's `RelatedIssue` alias,
  * which is this same type under the name and default type param existing
- * callers (e.g. src/agents/parked.ts) already depend on.
+ * callers already depend on.
  */
 export interface RelatedResource<T> {
   issue: T;
@@ -196,7 +196,9 @@ export type NotifyReason =
   | { linked: { events: readonly LinkedChangeEvent[] } }
   | { definitionField: { brief?: string; workingDirectory?: string } }
   | { blocked: { key: string } }
-  | { stalled: { key: string } };
+  | { stalled: { key: string } }
+  | { confluencePageEdit: { from: number; to: number } }
+  | { confluencePageComment: { ids: readonly string[] } };
 
 /**
  * FACTORY-949 (implementing story FACTORY-948): `blocked` names the
@@ -228,6 +230,25 @@ export type NotifyReason =
  */
 
 /**
+ * FACTORY-997 (story FACTORY-994, epic FACTORY-348): the ONLY two members
+ * `src/resources/confluence-page.ts`'s `createConfluencePageEventRules`
+ * ever produces — a standalone Confluence page (no owning Jira ticket) has
+ * nothing status/label/assignee-shaped to report, so it defines its own
+ * pair rather than reusing any issue-tier member above (per this union's
+ * own top doc comment: "a future type's event rules are free to ... define
+ * their own union"). `confluencePageEdit` fires when
+ * `confluencePageVersion`'s fingerprint (the page's own `version.number`)
+ * moved between two polls; `confluencePageComment` fires when the page's
+ * footer-comment id SET gained one or more members (never fewer — a
+ * shrinking set is a deletion, which this module does not classify as an
+ * event; see that module's own `diffConfluencePage` doc comment). The two
+ * are mutually exclusive within one `decide()` call — `diffConfluencePage`
+ * checks the version first and only falls through to comments when the
+ * version did not move, documented there as a deliberate simplification
+ * when both happen in the same poll.
+ */
+
+/**
  * BUTCHR-436 (epic BUTCHR-421, story 2/4): one line of a coalesced
  * linked-change nudge — see `linkedChangeNudge` (src/agents/change-nudge.ts)
  * for the rendering (`<target> (<kind>): <detail>`) and
@@ -246,6 +267,16 @@ export interface LinkedChangeEvent {
   kind: string;
   /** What happened, already rendered ("status changed from X to Y", "unreadable", "no longer linked", …) — see `src/jira-watch/linked-eventing.ts`'s own doc comment for the exact phrases used. */
   detail: string;
+  /**
+   * FACTORY-833: the provider's own id for this specific link (`LinkedItem.linkId`,
+   * src/resources/linked-discovery.ts — a Jira `issueLink.id`/remote-link id,
+   * never a fabricated one), when the kind that produced this event carries
+   * one. Absent for a kind with no comparable provider id (`parent`,
+   * `jira-key`, a managed link, any external kind). Disambiguates two
+   * DISTINCT links that otherwise render identically (same `target`, same
+   * `kind`) — see `linkedChangeNudge`'s own doc comment for the rendering.
+   */
+  linkId?: string;
 }
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };

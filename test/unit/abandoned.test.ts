@@ -1,8 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { abandonedCandidates, createAbandonedDetector, MARKER } from "../../src/agents/abandoned.js";
-import { parkedCandidates } from "../../src/agents/parked.js";
 import type { JiraIssue, IssueLink } from "../../src/atlassian/types.js";
-import type { RelatedIssue } from "../../src/daemon/loop.js";
 
 const MIN = 60_000;
 
@@ -122,35 +120,7 @@ describe("abandonedCandidates (pure predicate)", () => {
   });
 });
 
-/**
- * BUTCHR-240: proves — rather than merely asserting — that `parkedCandidates`
- * and `abandonedCandidates` stay mutually exclusive on boss status after this
- * ticket's change, on ONE SHARED fixture pattern rather than two independent
- * ones that could each pass while the real invariant silently broke. The
- * fixture is a To Do child/worker exactly as `abandonedCandidates` now
- * receives one (via `todoWorkers`) and exactly as `parkedCandidates` already
- * receives one (via `related`) — the two detectors' own candidate shapes,
- * not a third one invented for this test.
- */
-describe("BUTCHR-240: parkedCandidates and abandonedCandidates are mutually exclusive on boss status", () => {
-  const rel = (child: JiraIssue, watchers: string[]): RelatedIssue => ({ issue: child, watchers });
-
-  test("boss LIVE (In Progress): parked fires, abandoned does not", () => {
-    const child = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "In Progress")] });
-    const activeIssues = [iss("BOSS-1", "In Progress")]; // parked's own active-set resolution
-    expect(parkedCandidates(activeIssues, [rel(child, ["BOSS-1"])])).toEqual([{ child, boss: "BOSS-1" }]);
-    expect(abandonedCandidates([child])).toEqual([]);
-  });
-
-  test("boss DONE: abandoned fires, parked does not (a Done boss is never in ISSUE_JQL's active set, so bossStatus.get(boss) is undefined, not \"In Progress\")", () => {
-    const child = iss("WORK-1", "To Do", { issuelinks: [bossLink("BOSS-1", "Done")] });
-    const activeIssues: JiraIssue[] = []; // a Done boss is never in the active `issues` set
-    expect(parkedCandidates(activeIssues, [rel(child, ["BOSS-1"])])).toEqual([]);
-    expect(abandonedCandidates([child])).toEqual([{ worker: child, boss: "BOSS-1" }]);
-  });
-});
-
-/** A fake Jira comment store: addComment writes land here, newest-first, exactly like AtlassianClient.comments(). Mirrors parked.test.ts's own fakeJira(). */
+/** A fake Jira comment store: addComment writes land here, newest-first, exactly like AtlassianClient.comments(). */
 function fakeJira() {
   const byTicket = new Map<string, { id: string; body: string; created: string }[]>();
   const linksByKey = new Map<string, IssueLink[]>();

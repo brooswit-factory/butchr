@@ -6,7 +6,7 @@
 import { isFilesystemResourceId } from "../resources/filesystem-ref.js";
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isGithubPrRef } from "../resources/github-pr-ref.js";
-import { isIssueKey, isProjectId } from "../resources/id.js";
+import { isIssueKey, isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { isJiraComponentRef } from "../resources/jira-component-ref.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
@@ -24,7 +24,7 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * per `<PROJECT>:<componentId>` rather than per issue or project. Only
  * providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "jira-component"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page", "jira-component"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -65,8 +65,11 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  * `filesystem`: a canonical absolute path (`/home/butchr/repo/src/index.ts`),
  * resolved via `realpath` by discovery before it ever reaches this check
- * (src/resources/filesystem.ts). `jira-component` (FACTORY-990): a canonical
- * `<PROJECT>:<componentId>` (`PROJ:10000`) — see
+ * (src/resources/filesystem.ts). `confluence-page`: a bare numeric
+ * Confluence page id (`ConfluencePageRef`'s own canonical form,
+ * `../resources/confluence-page-ref.ts`) — the matched CHILD page's own id,
+ * never the rule's own ancestor id. `jira-component` (FACTORY-990): a
+ * canonical `<PROJECT>:<componentId>` (`PROJ:10000`) — see
  * `../resources/jira-component-ref.ts`'s header for why the component id,
  * never the component's name, is the stable half of this identity.
  */
@@ -89,6 +92,7 @@ export function isResourceId(provider: ResourceProvider, id: string, platform: N
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);
     case "filesystem": return isFilesystemResourceId(id, platform);
+    case "confluence-page": return isConfluencePageResourceId(id);
     case "jira-component": return isJiraComponentRef(id);
   }
 }

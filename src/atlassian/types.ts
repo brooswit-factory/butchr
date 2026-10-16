@@ -59,7 +59,7 @@ export interface JiraIssue {
    * (this file's sibling in src/resources/project.ts) already uses for its
    * own watermark, chosen here over widening `T` to a wrapper struct because
    * every other consumer of `JiraIssue` in this codebase (labels, workspace
-   * building, parked/abandoned detection, every existing test fixture) can
+   * building, abandoned detection, every existing test fixture) can
    * and does ignore an extra optional field with zero changes required,
    * where a wrapper struct would have forced type changes at every one of
    * those call sites for a flag none of them need. `ISSUE_ACTIVATION.verdictFor`
@@ -98,12 +98,25 @@ export interface IssueLink {
    * that needs a label off the other end of a link cannot get it from this
    * stub and must fetch that issue directly. A caller reading a Done boss's
    * status off its own worker's inward stub (src/agents/abandoned.ts) is the
-   * reason this field exists; every other existing consumer (`parked.ts`,
-   * `jira-watch/routes.ts`'s `watchedKeys`, `resources/issue.ts`'s boss-key
+   * reason this field exists; every other existing consumer
+   * (`jira-watch/routes.ts`'s `watchedKeys`, `resources/issue.ts`'s boss-key
    * lookup) reads only `type`/`otherEnd`/`key` and is unaffected by its
    * addition.
    */
   status?: string;
+  /**
+   * FACTORY-833: Jira's own `issueLink.id` — the REST payload's top-level
+   * `id` (distinct from `inwardIssue`/`outwardIssue`'s own issue id), always
+   * present on a real Jira response. Optional here (not required), same
+   * "payload-measured field, never fabricated" discipline as `status`
+   * above — so every existing test fixture across this codebase that
+   * builds an `IssueLink` literal without an `id` keeps compiling and
+   * behaving exactly as before this field was added. Lets a consumer
+   * (`issuelinkItems`, src/resources/linked-discovery.ts) name WHICH of an
+   * issue's possibly-several links it means, rather than only the other
+   * end's key — see that function's own doc comment.
+   */
+  id?: string;
 }
 
 /**

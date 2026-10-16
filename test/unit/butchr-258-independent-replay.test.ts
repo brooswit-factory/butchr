@@ -145,7 +145,7 @@ function fakeWorld(opts: {
   pageVersions?: Record<string, number>;
   pageComments?: Record<string, Array<{ id: string; body: string }>>;
   epicsInReview?: JiraIssue[];
-  epicComments?: Record<string, Array<{ id: string }>>;
+  epicComments?: Record<string, Array<{ id: string }>>; // ids only: cast at the reader below
 }): FakeWorld {
   const properties = new Map(Object.entries(opts.properties).filter(([, v]) => v !== undefined) as [string, Record<string, unknown>][]);
   const unimplemented = (name: string) => async (..._a: unknown[]) => {
@@ -168,8 +168,6 @@ function fakeWorld(opts: {
     getRemoteLink: unimplemented("getRemoteLink"),
     upsertRemoteLink: unimplemented("upsertRemoteLink"),
     getChildPages: unimplemented("getChildPages"),
-    getPageLabels: unimplemented("getPageLabels"),
-    createPageWithLabel: unimplemented("createPageWithLabel"),
     addLabels: unimplemented("addLabels"),
     removeLabels: unimplemented("removeLabels"),
     deleteIssue: unimplemented("deleteIssue"),
@@ -193,7 +191,7 @@ function fakeWorld(opts: {
       return out;
     },
     getPageComments: async (pageId: string) => ({ results: opts.pageComments?.[pageId] ?? [] }),
-    getIssueComments: async (key: string) => ({ results: opts.epicComments?.[key] ?? [] }),
+    getIssueComments: async (key: string) => ({ results: (opts.epicComments?.[key] ?? []) as any[] }),
   };
   const deps: ProjectResourceDeps = {
     ops,
@@ -718,8 +716,6 @@ describe("SECTION 6b — THE check_in SEAM: the REAL handler (src/tools/defs.ts)
       getRemoteLink: unimplemented("getRemoteLink"),
       upsertRemoteLink: unimplemented("upsertRemoteLink"),
       getChildPages: unimplemented("getChildPages"),
-      getPageLabels: unimplemented("getPageLabels"),
-      createPageWithLabel: unimplemented("createPageWithLabel"),
       addLabels: unimplemented("addLabels"),
       removeLabels: unimplemented("removeLabels"),
       deleteIssue: unimplemented("deleteIssue"),

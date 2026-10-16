@@ -304,10 +304,16 @@ into a `ResourceRef` at this layer — achieved structurally, the same way the
 file store achieves it: an entry this build's `resource-ref.ts` can't parse
 survives an `add`/`remove` of a DIFFERENT target in the same property, byte
 for byte (pinned by `jira-project-link-store.test.ts`'s "unknown-provider
-(unparseable) entries" suite). Missing property (`getProjectPropertyOrNull`
-resolving `null`, i.e. a genuine Jira 404) is treated as `{ v: 1, links: [] }`
-— an empty collection, not an error; any OTHER read/write failure (a
-permission error, a network error, a malformed value) propagates uncaught.
+(unparseable) entries" suite). Missing property on an EXISTING project
+(`getProjectPropertyOrNull` resolving `null`, i.e. a genuine Jira 404 on the
+property) is treated as `{ v: 1, links: [] }` — an empty collection, not an
+error; any OTHER read/write failure (a permission error, a network error, a
+malformed value) propagates uncaught. **Corrected by Decision 10
+(FACTORY-19):** as originally shipped, a `null` read was trusted
+unconditionally, so a nonexistent/invisible PROJECT key — which 404s the
+SAME property endpoint identically to a real project with no property —
+also silently resolved to an empty collection on `list`, rather than the
+error this paragraph always meant to promise. See Decision 10 for the fix.
 
 **Atomicity / race window, NAMED:** `add`/`remove` are a read-modify-write of
 the FULL property value (`getProjectPropertyOrNull` then
@@ -365,11 +371,15 @@ SAME `loadConfig` (`src/config/config.ts`) the daemon itself uses, reading
 CLI invoker's own environment — an operator must run `butchr link ... jira-project:X ...`
 with the same Jira credentials the daemon would use, the same discipline
 Decision 7 already documents for `BUTCHR_WORKSPACES`/`BUTCHR_LINKS_STORE_FILE`.
-A missing/invalid credential, or a Jira 4xx/5xx the resulting call hits,
-surfaces through the EXACT SAME path a file-store read failure already did
-before this story: `tryStoreOp` (link-cli.ts) turns any rejected store call
-into one clean `stderr` line and exit 1 — no separate error-handling branch
-was added for this case.
+A missing credential, or a Jira 4xx/5xx the resulting call hits, surfaces
+through the EXACT SAME path a file-store read failure already did before
+this story: `tryStoreOp` (link-cli.ts) turns any rejected store call into
+one clean `stderr` line and exit 1 — no separate error-handling branch was
+added for those cases. **One credential shape was NOT already clean as
+shipped, corrected by Decision 10 (FACTORY-19):** a malformed (not merely
+missing) `ATLASSIAN_EMAIL` threw jira.js's own multi-line `ZodError` dump
+from inside `realAtlassian()`, which `tryStoreOp` printed as-is — see
+Decision 10.
 
 **Targets of any kind, self-links, idempotency:** unchanged and inherited
 for free. A `jira-project` owner's targets may be any of the six
@@ -383,6 +393,92 @@ reimplementing it.
 **`ProviderAdapter.nativeLinks` for `jira-project`:** untouched by this
 story — nothing in this codebase constructs a `ProviderAdapter` at all yet
 (Decision 6), so there was nothing to omit or stub.
+
+## Decision 10 — FACTORY-19: CLI config-error flattening, and project-existence validation
+
+Two follow-ups Decision 9's own PR review surfaced (FACTORY-18's handoff),
+both scoped narrowly to the `jira-project` path Decision 9 added — neither
+touches the file store (Decision 7) or any non-`jira-project` owner. A
+third follow-up from the same review, a caller-vs-project authorization
+gate on `add_link`/`remove_link`, was explicitly REJECTED by the user
+(2026-10-16: "a task in one project may legitimately work with another
+project" — cross-project work is legitimate, project identity alone must
+not become a new restriction) and is out of this Task's scope entirely; it
+is not addressed here or elsewhere by this story.
+
+**1. One clean line for a malformed `ATLASSIAN_EMAIL`.** The ticket's own
+premise — that `loadConfig` (`src/config/config.ts`) prints a multi-line
+dump for a malformed email — does not match the code: `loadConfig` never
+validates email FORMAT, only non-emptiness (it does validate `ATLASSIAN_SITE`'s
+format, a different field, with its own clear single-line error). MEASURED
+instead: the actual multi-line dump comes from jira.js's own Zod auth
+schema, thrown as a `ZodError` from inside `createCloudClient()`
+(`realAtlassian()`, `src/tools/atlassian-real.ts`) the first time a
+`jira-project` call actually constructs the real client — `ZodError.message`
+is a JSON-stringified array of issue objects, which prints as many lines
+when handed to a single `stderr` call. Fixed in `jiraProjectStoreFromEnv()`
+(`src/cli/link-cli.ts`): the `realAtlassian(...)` call is wrapped in a
+try/catch that duck-types the rejection (`e.name === "ZodError" &&
+Array.isArray(e.issues)` — NOT `instanceof ZodError`, since `zod` is only a
+transitive dependency of jira.js here, not one this package declares
+directly) and, on a match, flattens every issue's `path`/`message` into one
+semicolon-joined line and throws a plain single-line `Error` instead. A
+missing credential, and any Jira 4xx/5xx the resulting client call hits,
+were already single-line (Decision 9's "CLI credential loading") and are
+untouched — this adds no new branch to either of those paths, only to the
+one shape that wasn't already clean. Pinned by
+`test/unit/link-cli-jira-project.test.ts`'s "malformed-config path"
+describe block, both at the `jiraProjectStoreFromEnv()` level and through
+the full `runLinkCli` dispatch.
+
+**2. A nonexistent/invisible project key must not read as an empty link
+collection.** `getProjectPropertyOrNull` 404s identically whether the
+PROPERTY is missing on a real project or the PROJECT itself doesn't exist
+(or isn't visible to the credential in use) — Jira's project-property GET
+endpoint does not distinguish the two in its response. Decision 9's
+`createJiraProjectLinkStore` trusted a `null` read unconditionally, so
+`list` on a nonexistent project key silently returned `[]` — indistinguishable
+from a real, empty collection — while `add` on the same key already failed
+one step later, when the resulting `setProjectProperty` write itself 404s.
+Fixed with a dedicated existence check, NOT by narrowing
+`getProjectPropertyOrNull`'s own contract: a new `AtlassianOps.projectExists(projectKey):
+Promise<boolean>` op (`src/tools/atlassian.ts`), real implementation in
+`atlassian-real.ts` calling `GET /rest/api/3/project/{projectIdOrKey}`
+directly (`jira.projects.getProject`) and converting ITS OWN 404 to `false`
+(the same `isNotFoundError` check every other not-found conversion in that
+file already uses) — any non-404 rejection still propagates uncaught, same
+discipline as `getProjectPropertyOrNull` itself.
+`jira-project-link-store.ts`'s `readProperty` now calls
+`assertProjectExists` whenever the property read resolves `null`, throwing
+a clear error if the project does not exist, before ever treating that
+`null` as `{ v: 1, links: [] }`. An EXISTING project with no property yet
+is unaffected and still lists as empty — this is not a behavior change for
+that case, named explicitly because it is the one not getting fixed here.
+
+`projectExists` is declared OPTIONAL on `AtlassianOps`
+(`projectExists?(...)`), deliberately NOT added as a required member: this
+codebase has ~20 test files that each hand-write a complete `AtlassianOps`
+fake enumerating every member literally, and making this one required would
+have forced an unrelated edit to every one of them for a fix scoped to a
+single call site. `jira-project-link-store.ts` falls back to the
+pre-FACTORY-19 behavior (treat `null` as empty, unconditionally) when a
+given `AtlassianOps` doesn't implement it — harmless for every existing
+fake that doesn't exercise this path, since the real implementation
+(`atlassian-real.ts`) always provides it in production. `getProjectPropertyOrNull`'s
+own contract, and its OTHER caller (`src/resources/project.ts`'s `butchr`
+property discovery, which BUTCHR-81 measured depends on today's exact
+"any failure throws, only a genuine not-found resolves null" shape), is
+UNTOUCHED by this fix — changing that shared op's behavior to resolve this
+story's narrower problem would have been an unaudited change to an
+already-tested, unrelated consumer.
+
+Pinned by `jira-project-link-store.test.ts`'s "nonexistent project
+(FACTORY-19)" describe block (covering: a nonexistent project refuses on
+`list` and on `add`, before any write; an existing project with no property
+still lists as empty; an `AtlassianOps` without `projectExists` falls back
+unchanged) and `atlassian-real.test.ts`'s "realAtlassian projectExists"
+describe block (the real not-found conversion, and that any other
+rejection still propagates).
 
 ## The operations: core, MCP, CLI
 
@@ -984,3 +1080,85 @@ but it visibly trades against "a director is woken when anything in its
 project changes." The knob to loosen this for a managed session does not
 exist yet (see follow-ups above). Once deployed, rate-capped lines appear
 in the journal for managed sessions for the first time.
+
+## Decision 10 — Link identity and transition timestamps in the delivered notice (FACTORY-833)
+
+FACTORY-833's filer flagged two usability gaps in the coalesced
+`linkedChangeNudge` message (`src/agents/change-nudge.ts`): a line like
+`FACTORY-18 (jira-key): no longer linked` names the linked TARGET but not
+WHICH of that target's own links is meant (a ticket can sit in more than
+one chain), and a status-change line like `status changed from "Backlog"
+to "Done"` carries no indication of WHEN that transition actually
+happened, so a transition detected late (a rate-capped tick, a slow poll
+cycle) reads exactly like one that just happened. Two review rounds (PR
+#800) progressively tightened both halves of this past their first-pass
+implementation; this section describes the shipped shape.
+
+**Link identity.** `LinkedItem` (`src/resources/linked-discovery.ts`) and
+`LinkedChangeEvent` (`src/resources/types.ts`) both gained an optional
+`linkId` — the PROVIDER's own id for that specific link
+(`IssueLink.id`/`JiraRemoteLink.id`, both already present on Jira's raw
+payload, previously discarded by `parseIssueLinks` and, for a remote
+link, by `jiraKindLinkedItems`'s own `remoteKeyItems` construction — round
+1 wired the parser, round 2 caught that the actual runtime path never
+called it for remote links and fixed that separately). A kind with no
+comparable provider id (`parent`, `jira-key` member discovery, a managed
+link, any BUTCHR-437 external kind) simply never carries one —
+`linkedChangeNudge` renders `(${kind} ${linkId})` only when present,
+`(${kind})` otherwise, so every existing caller/test that never sees a
+`linkId` is unaffected.
+
+**Per-link removal, not just per-target (round 2).** `discoverLinkedItems`
+still collapses two distinct native issuelinks sharing the same `target`
+to ONE `LinkedItem` for status-diffing/fetching purposes (first
+occurrence's kind/id wins, unchanged) — a target's status is one fact
+regardless of how many links point at it. But round 1's `watchSets`
+(target → `{kind, linkId?}`) could only ever see whichever single link
+survived that collapse, so removing ONE of two distinct links to the same
+target while the other remained produced NO event (the target was still
+in `kept`), and removing both at once reported only one id. `runTick` now
+also builds `issuelinkIdsThisTick` (per issue owner, straight from
+`m.issue.issuelinks`, never from the already-collapsed `kept`) and
+persists it as `issuelinkMembership`, diffed independently by linkId —
+see that map's own doc comment in `linked-eventing.ts`. A removed-but-id-
+tracked issuelink is reported by THIS mechanism, one line per vanished
+id; the generic target-level `watchSets` removal line is suppressed only
+for an issuelink that HAD a linkId (an issuelink with none — a provider
+payload gap, or a legacy test fixture — still falls back to the generic
+line, so removal is never silently lost either way). Scoped to native
+issuelinks only: a managed link's identity is its (owner, target) pair in
+the link store, which already IS unique per target by construction, so
+this gap never existed there.
+
+**Transition timestamps (tightened in round 2).** `changeDetail`
+(`src/jira-watch/linked-eventing.ts`) names WHEN the reported field
+actually moved — not simply `after.updated`, Jira's own single field
+bumped by ANY change: round 1's first pass used it directly, which round
+2 found lets a LATER, unrelated edit (a comment or label landing while an
+earlier status transition is still held by the rate cap) overwrite the
+displayed timestamp with its own unrelated time, falsely implying the
+transition is as recent as that later edit. `runTick` now tracks
+`observedAt` per (owner, target) — THREE independent timestamps
+(`statusAt`/`summaryAt`/`commentAt`), each frozen at the tick its OWN
+field was last seen to differ from the previously observed value for
+that same field, updated immediately every tick regardless of
+rate-capping (the same "delayed, not lost" exception `lastExternalPollAt`
+already documents for a different field). `changeDetail` picks whichever
+one matches the branch that actually fires; the generic "updated" fallback
+(none of status/summary/comment differ from the baseline) has no specific
+field to shadow and uses `after.updated` directly, since that generic
+bump IS the only fact being reported. Chosen over suppressing a stale
+transition outright: suppression risks silently dropping a real,
+still-unread change a rate-capped or slow-polling owner genuinely needs
+to hear about, which this module already treats as unacceptable elsewhere
+(see the "DELAYED, NOT LOST" discipline in `linked-eventing.ts`'s own top
+comment).
+
+**Not done here:** per-link identity for a MANAGED link or a `jira-key`
+project member was not pursued — neither has a provider-issued id
+comparable to a Jira issuelink's, and both are already unique per
+(owner, target) by construction (see above), so the ambiguity this
+ticket describes does not apply to them. Whether the 2026-10-08
+observation that prompted this ticket came from a daemon running code
+older than FACTORY-9's fix (merged 2026-09-26) remains unverified — no
+fleet/daemon access from this work.

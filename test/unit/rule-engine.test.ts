@@ -711,7 +711,7 @@ describe("rule relationships", () => {
   // above), not inside `createIssueEventRules` itself. Mirrors "the boss
   // learns a child's status change" just above, for an agent:*->
   // agent:stalled label transition instead of a status change.
-  test("the boss learns a child's agent:stalled transition, once, through the real relatedAllows gate, and no sibling or the worker's own watcher is woken", async () => {
+  test("stalled label-only transitions do not wake the boss, sibling, or worker", async () => {
     const events = createRuleEventRules({ rules: ruleSet });
     const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(ruleSet, ms, keys(ms))) });
     const before = world(worker({ labels: ["agent:working"] }));
@@ -719,7 +719,7 @@ describe("rule relationships", () => {
     const heard = relatedIdFor(after, "BUTCHR-2");
     const ev = await events.poll(snap(before), snap(after));
     expect(ev.changedRelated).toEqual([heard]);
-    expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: true, reason: { stalled: { key: "BUTCHR-2" } } });
+    expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: false });
     // `stalledWake`'s own debounce (like `blockedWake`'s — see
     // `blockedWakeFired`'s own doc comment in issue.ts) is keyed by the
     // STALLED TICKET, not by (ticket, watcher): "a ticket with two bosses

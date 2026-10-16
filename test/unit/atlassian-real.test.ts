@@ -366,9 +366,9 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
           getComments: (parameters: unknown) => {
             calls.push(parameters);
             if (calls.length === 1) {
-              return Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 1) })), total: 125, startAt: 0, maxResults: 100 });
+              return Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i + 1), body: "b" })), total: 125, startAt: 0, maxResults: 100 });
             }
-            return Promise.resolve({ comments: Array.from({ length: 25 }, (_, i) => ({ id: String(i + 101) })), total: 125, startAt: 100, maxResults: 100 });
+            return Promise.resolve({ comments: Array.from({ length: 25 }, (_, i) => ({ id: String(i + 101), body: "b" })), total: 125, startAt: 100, maxResults: 100 });
           },
         },
       }),
@@ -391,7 +391,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
         // ALWAYS a full (100-item) page, so the short-page stop never fires
         // — and a `total` far beyond what any page ever delivers, so the
         // startAt < total loop condition never naturally terminates either.
-        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i) })), total: 100_000 }) },
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i), body: "b" })), total: 100_000 }) },
       }),
       isNotFoundError: () => false,
     }));
@@ -420,7 +420,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             // NO `total` field anywhere in any of these responses — but
             // `maxResults` IS reported and genuinely honoured, so rule 2
             // (short against the server's own reported page size) applies.
-            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}` })), maxResults: 100 });
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${calls.length}-${i}`, body: "b" })), maxResults: 100 });
           },
         },
       }),
@@ -456,7 +456,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining);
             return Promise.resolve({
-              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })),
               total: 125,
               startAt,
               maxResults: 50,
@@ -503,7 +503,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining);
             return Promise.resolve({
-              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })),
+              comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })),
               startAt,
               maxResults: 50,
             });
@@ -539,7 +539,7 @@ describe("realAtlassian getIssueComments pagination (BUTCHR-309)", () => {
             const remaining = Math.max(0, 125 - startAt);
             const size = Math.min(50, remaining); // capped to 50 despite maxResults: 100 requested
             // NEITHER `total` NOR `maxResults` anywhere in this response.
-            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}` })) });
+            return Promise.resolve({ comments: Array.from({ length: size }, (_, i) => ({ id: `${startAt + i}`, body: "b" })) });
           },
         },
       }),
@@ -638,7 +638,7 @@ describe("realAtlassian epic-axis pagination wired into the real project-tier de
         // 21 comments — one MORE than the pre-BUTCHR-309 20-item cap — all
         // returned on a SINGLE Jira page (maxResults: 100 now), `total: 21`
         // stops the loop after page 1.
-        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1) })), total: 21 }) },
+        issueComments: { getComments: () => Promise.resolve({ comments: Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1), body: "b" })), total: 21 }) },
       }),
       isNotFoundError: () => false,
     }));
@@ -671,5 +671,136 @@ describe("realAtlassian epic-axis pagination wired into the real project-tier de
     const [acme] = await createProjectResourceType(deps).discovery.search();
     expect(acme!.unseenEpicCommentIds["ACME-1"]).toEqual([]);
     expect(projectVerdict(acme!)).toBe("asleep");
+  });
+});
+
+describe("jira_get_comments delivers readable bodies end-to-end (FACTORY-1008)", () => {
+  const adf = (...paras: any[]) => ({ type: "doc", version: 1, content: paras.map((content) => ({ type: "paragraph", content })) });
+  const t = (text: string) => ({ type: "text", text });
+  const author = (n: string) => ({ accountId: `acct-${n}`, displayName: `User ${n}`, emailAddress: `${n}@x.com` });
+  async function toolFor(getComments: (p: any) => Promise<unknown>) {
+    mock.module("jira.js", () => ({ createCloudClient: () => ({ issueComments: { getComments } }), isNotFoundError: () => false }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const { providerAtlassianTools } = await import("../../src/tools/provider-atlassian.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    return { ops, tool: providerAtlassianTools(ops, () => {}).jira_get_comments! };
+  }
+
+  test("two pages: the agent surface carries id, full body text, created and author — not ids only", async () => {
+    const pages = [
+      { comments: [{ id: "2", created: "2026-10-15T14:02:34.266-0700", author: author("a"), body: adf([t("Release hold "), { type: "mention", attrs: { text: "@Wroos" } }, t(" stays.")], [t("Second paragraph.")]) }], total: 3, maxResults: 2 },
+      { comments: [{ id: "1", created: "2026-10-15T13:58:07.083-0700", author: author("b"), body: adf([t("Hold: do not merge. See "), { type: "inlineCard", attrs: { url: "https://github.com/o/r/pull/9" } }]) }, { id: "0", created: "2026-10-14T00:00:00.000-0700", author: author("c"), body: adf() }], total: 3, maxResults: 2 },
+    ];
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(pages[n++]));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results.map((r: any) => r.id)).toEqual(["2", "1", "0"]);
+    expect(got.results[0].body).toBe("Release hold @Wroos stays.\nSecond paragraph.");
+    expect(got.results[1].body).toBe("Hold: do not merge. See https://github.com/o/r/pull/9");
+    expect(got.results[0].created).toBe("2026-10-15T14:02:34.266-0700");
+    expect(got.results[0].author).toEqual({ accountId: "acct-a", displayName: "User a", email: "a@x.com" });
+    expect(got.results[2].body).toBe(""); // genuinely empty comment stays empty
+  });
+
+  test("ID bookkeeping consumers still get every id in order from the same reader", async () => {
+    const { ops } = await toolFor(() => Promise.resolve({ comments: [{ id: "7", body: adf([t("x")]) }, { id: "8", body: adf([t("y")]) }], total: 2, maxResults: 100 }));
+    expect((await ops.getIssueComments("KAN-9")).results.map((c) => c.id)).toEqual(["7", "8"]);
+  });
+
+  test("no comments: empty list, not an error", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [], total: 0, maxResults: 100 }));
+    expect(await tool.handler({ key: "KAN-9" }, { headers: {} } as any)).toEqual({ results: [] });
+  });
+
+  test("provider denial propagates rather than becoming an empty list", async () => {
+    const { tool } = await toolFor(() => Promise.reject(new Error("403 Forbidden")));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/403/);
+  });
+
+  test("nonterminating pagination still throws instead of returning a partial list", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: Array.from({ length: 100 }, (_, i) => ({ id: String(i), body: adf([t("b")]) })), total: 100_000 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/exceeded 100 pages/);
+  });
+
+  test("linked marked text keeps its href; media/unsupported nodes are named; raw ADF is preserved", async () => {
+    const body = { type: "doc", version: 1, content: [
+      { type: "paragraph", content: [t("see "), { type: "text", text: "the PR", marks: [{ type: "link", attrs: { href: "https://github.com/o/r/pull/9" } }] }] },
+      { type: "mediaSingle", content: [{ type: "media", attrs: { type: "file", id: "m1", alt: "screenshot.png" } }] },
+      { type: "futureWidget", attrs: { x: 1 } },
+    ] };
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body }], total: 1, maxResults: 100 }));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results[0].body).toBe("see the PR (https://github.com/o/r/pull/9)\n[unsupported media: screenshot.png]\n[unsupported futureWidget]");
+    expect(got.results[0].body).toContain("[unsupported media: screenshot.png]");
+    expect(got.results[0].body).toContain("[unsupported futureWidget]");
+    expect(got.results[0].bodyRaw).toEqual(body);
+  });
+
+  test("missing `comments` array throws instead of reporting an empty list", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ total: 2, maxResults: 100 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed response/);
+  });
+
+  test("malformed comment (no id / non-object body) throws", async () => {
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ body: adf([t("x")]) }], total: 1 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+    const { tool: tool2 } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body: 42 }], total: 1 }));
+    await expect(Promise.resolve().then(() => tool2.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+  });
+
+  test("empty page before the reported total throws instead of returning a partial list", async () => {
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(n++ === 0 ? { comments: [{ id: "1", body: adf([t("a")]) }], total: 3, maxResults: 100 } : { comments: [], total: 3, maxResults: 100 }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/empty page.*before reported total/);
+  });
+
+  test("missing, null, {} and [] bodies are rejected; a valid empty ADF doc and an empty string are accepted", async () => {
+    for (const bad of [undefined, null, {}, []]) {
+      const { tool } = await toolFor(() => Promise.resolve({ comments: [bad === undefined ? { id: "1" } : { id: "1", body: bad }], total: 1 }));
+      await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/malformed comment/);
+    }
+    const { tool } = await toolFor(() => Promise.resolve({ comments: [{ id: "1", body: { type: "doc", version: 1, content: [] } }, { id: "2", body: "" }], total: 2 }));
+    const got: any = await tool.handler({ key: "KAN-9" }, { headers: {} } as any);
+    expect(got.results.map((r: any) => r.body)).toEqual(["", ""]);
+  });
+
+  test("a total reported on page 1 still binds when page 2 omits total and is empty", async () => {
+    let n = 0;
+    const { tool } = await toolFor(() => Promise.resolve(n++ === 0 ? { comments: [{ id: "1", body: adf([t("a")]) }], total: 3 } : { comments: [] }));
+    await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/before reported total 3/);
+  });
+});
+
+describe("realAtlassian projectExists (FACTORY-19)", () => {
+  function rig(getProject: (p: unknown) => Promise<unknown>, notFound: (e: unknown) => boolean) {
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({ projects: { getProject } }),
+      isNotFoundError: notFound,
+    }));
+  }
+
+  test("resolves true when the project read succeeds", async () => {
+    const calls: unknown[] = [];
+    rig((p) => { calls.push(p); return Promise.resolve({ key: "PROJ" }); }, () => false);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    expect(await ops.projectExists!("PROJ")).toBe(true);
+    expect(calls).toEqual([{ projectIdOrKey: "PROJ" }]);
+  });
+
+  test("resolves false on a genuine not-found, same isNotFoundError check the neighbouring not-found ops use", async () => {
+    const notFoundErr = new Error("404");
+    rig(() => Promise.reject(notFoundErr), (e) => e === notFoundErr);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    expect(await ops.projectExists!("NOPE")).toBe(false);
+  });
+
+  test("any OTHER rejection (not a not-found) still propagates uncaught", async () => {
+    const serverErr = new Error("Atlassian 500");
+    rig(() => Promise.reject(serverErr), () => false);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.projectExists!("PROJ")).rejects.toThrow(/Atlassian 500/);
   });
 });

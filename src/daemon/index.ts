@@ -15,6 +15,13 @@ import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js";
+// FACTORY-1010: a SEPARATE import statement from the one above on purpose —
+// test/unit/notify-deliver-seams.test.ts's own regex pins that exact
+// `import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js"`
+// line verbatim (acceptance D: "the shared gate is imported ... not
+// reimplemented locally"), so widening it inline would break that guard for
+// a reason unrelated to what it actually checks.
+import type { NotifyDeliveryMode } from "../notify/deliver.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
 import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "./health.js";
@@ -46,7 +53,7 @@ import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../
 import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
 import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
 import { reloadRules } from "../rules/reload.js";
-import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
+import { createRuleResourceType, ownsRuleAgent, uniqueIssues, stalledMinutesForIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
 import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
@@ -66,12 +73,13 @@ import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMessage, terminalCommand } from "../terminal/open.js";
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
-import { atlassianTools } from "../tools/defs.js";
-import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
+import { providerAtlassianTools } from "../tools/provider-atlassian.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
+import { isAgentLabel } from "../labels/plan.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
-import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { sweepAbsentLiveAgentLabels, sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
@@ -81,7 +89,6 @@ import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
-import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
@@ -94,8 +101,7 @@ import { createAdmissionController } from "../agents/admission.js";
 import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
-import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
-import { restrictJiraProjectManagers } from "../tools/jira-project-scope.js";
+import { githubIssueTools } from "../tools/github-issue.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -106,11 +112,12 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
-import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
-import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { loadZendeskAuth, createZendeskTicketClient } from "../resources/zendesk-ticket.js";
+import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
+import { confluencePageRules, CONFLUENCE_PAGE_POLL_MS, startConfluencePageLoop } from "./confluence-page-loop.js";
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
@@ -608,11 +615,29 @@ const zendeskTickets = zendeskStaffing.run
 // runs, reading the local disk directly (src/resources/filesystem.ts).
 const fsRules = filesystemRules(getRules());
 
+// FACTORY-998: confluence-page rules need no SEPARATE credential either —
+// this daemon never reaches here without a fully-configured Atlassian site
+// (the setup-mode gate above), so the real `ops` client built below already
+// covers it; every enabled confluence-page rule always runs.
+const confluencePageEnabledRules = confluencePageRules(getRules());
+
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
 const ideaRules = jiraIdeaRules(getRules());
 const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
+// Tool connections are independent of agent staffing. Reuse clients where possible;
+// keep the same credentials, organization/account boundaries and Zendesk opt-in.
+const githubToolIssues = githubIssues ?? (config.github
+  ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const githubToolPrs = githubPrs ?? (config.github
+  ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const jiraToolIdeas = jiraIdeas ?? createJiraIdeaClient(atlassian);
+const zendeskToolAuth = !zendeskTickets && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
+  ? loadZendeskAuth(process.env) : undefined;
+const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
+  ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskToolAuth.subdomain, token: zendeskToolAuth.token }) : undefined);
+
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
 // This gate preflights that per project (first sight, cached for the run)
@@ -725,6 +750,7 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
 const jiraProjectEnabled = getRules().some((r) => r.enabled && r.resourceProvider === "jira-project");
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
+const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
 // BUTCHR-408: unlike every rule above, the managed-sessions query is built
 // into the daemon, never a user rules.json rule — it always runs (no
 // staffing gate, same "every enabled filesystem rule always runs" reasoning
@@ -748,7 +774,7 @@ const admissionController = createAdmissionController({
   rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -908,6 +934,13 @@ const filesystemHealth = createResourceLoopHealth({
   enabled: fsRules.length > 0,
   ...(fsRules.length ? {} : { disabledReason: "no enabled filesystem rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
+  log: (line) => console.error(line),
+});
+const confluencePageHealth = createResourceLoopHealth({
+  name: "confluence-page",
+  enabled: confluencePageEnabledRules.length > 0,
+  ...(confluencePageEnabledRules.length ? {} : { disabledReason: "no enabled confluence-page rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * CONFLUENCE_PAGE_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
@@ -1151,7 +1184,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop,
   // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
   // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
   // (process control) — no second Jira client, no second herdr client.
@@ -1160,8 +1193,6 @@ const { app, mcp } = buildApp({
     start: (issue) => doAgentStart(agentWriteDeps, issue),
     planStop: (issue) => planAgentStop(agentWriteDeps, issue),
     stop: (issue) => doAgentStop(agentWriteDeps, issue),
-    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
-    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
     adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
     prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
   },
@@ -1174,7 +1205,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1396,48 +1427,17 @@ const { app, mcp } = buildApp({
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  // FACTORY-732: a jira-project (manager) caller passes `forJiraCallers`
-  // now, but `restrictJiraProjectManagers` immediately confines it to its
-  // own project's jira_get_issue/jira_search/jira_add_comment/jira_transition
-  // — see src/tools/jira-project-scope.ts.
-  ...restrictJiraProjectManagers(forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)), ops),
-  // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
-  // provider-specific tool set below it — the local file store needs no
-  // credentials and works for every ResourceRef kind, and a `jira-project`
-  // owner routes to the project-property-backed store instead (this daemon
-  // already has Jira credentials loaded, unlike the CLI, so the factory
-  // below is cheap and side-effect-free rather than genuinely lazy) — see
-  // `src/resources/link-store-router.ts` for the routing decision itself.
-  // FACTORY-732: a jira-project (manager) CALLER (not the `resource` a link
-  // names — the resource-link test fixtures above a jira-project OWNER as
-  // an argument, which this gate never touches) has no allowlisted name
-  // here (add_link/remove_link/list_links are all outside
-  // JIRA_PROJECT_MANAGER_TOOLS), so it is refused on every one of these.
-  ...restrictJiraProjectManagers(
-    resourceLinkTools(
-      routingLinkStore,
-      (line) => console.error(line),
-    ),
-    ops,
-  ),
-  ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  // Linking needs both providers running: authorization reads both loops' latest matches.
-  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
-  // BUTCHR-456: registered unconditionally, like resourceLinkTools above — a
-  // managed-session agent needs no external credential to be authorized
-  // (the grant lives in another definition's own manifest), and the SAME
-  // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
-  // the managed-sessions loop and `butchr session` CLI already use, never a
-  // second resolution of "where definitions live" or "which freeze store".
-  // FACTORY-732: freeze_session is not in JIRA_PROJECT_MANAGER_TOOLS, so a jira-project (manager) caller is refused here too.
-  ...restrictJiraProjectManagers(
-    sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
-    ops,
-  ),
+  // Provider operations use the daemon's connections, independent of caller role.
+  ...providerAtlassianTools(ops, undefined, recordOwnWrite),
+  ...resourceLinkTools(routingLinkStore, (line) => console.error(line)),
+  ...(githubToolIssues ? githubIssueTools({ client: githubToolIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(githubToolPrs ? githubPrTools({ client: githubToolPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(zendeskToolTickets ? zendeskTicketTools({ client: zendeskToolTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // Linking requires both configured provider clients; their account checks remain authoritative.
+  ...(githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  // Session control retains its explicit controller authorization and containment.
+  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
@@ -1668,9 +1668,11 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   coverage.recordChecked(DASHBOARD_DETECTOR);
   return statusMapFromAgents(agents);
 };
+let stalledMinutesByIssue: ReadonlyMap<string, number> = new Map();
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
+  minutesFor: (issue) => stalledMinutesByIssue.get(issue),
   comments: (issue) => atlassian.comments(issue),
   log: (line) => console.error(`  ${line}`),
 });
@@ -1712,24 +1714,13 @@ const quotaGate = createQuotaGate(
 // rationale and the own-write ledger hazard it avoids by construction).
 // Always an issue key (syncLabels below is never wired into the project
 // loop further down this file), so `ops.addComment` is the right seam —
-// same one parked.ts uses, no second Atlassian writer.
+// same one every other daemon-side comment write uses, no second Atlassian
+// writer.
 const stallRemediation = createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   quotaBlocked: (issue) => herd.resourceQuotaBlocked(issue) || quotaGate.blockedIds().some((id) => resourceKeyOf(id) === issue),
-  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
-  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
-  // never a herd/live probe: a boss's worker is staffed under a different
-  // Atlassian account than the boss (this fleet's own tier->account split),
-  // so a probe wired here would be structurally blind to every worker it
-  // could ever be asked about (three independent live confirmations, all
-  // probeOutOfScope:true — see this ticket's own PR body) — the label path
-  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
-  // doc comment argues (src/tools/relationship.ts). Paid at most once per
-  // non-Done worker, only on the one poll that is actually about to post a
-  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
-  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
 
@@ -1787,12 +1778,25 @@ let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
 // updated in this same commit (7 -> 8) — see that test file's own doc
 // comment and this story's PR body for why that is the INTENDED outcome of
 // adding a seam, not a sign anything is wrong.
+// FACTORY-1010: deliberately does NOT read `Rule.notifyDeliveryMode` here.
+// This seam already resolves config across however many rules match one
+// ISSUE (`idlePokeRuleConfigByIssue`/`updateIdlePokeRuleConfig` above), a
+// different shape than every OTHER seam's one-rule-per-agent-key lookup
+// (`ruleNotifyDeliveryMode`) — merging a categorical transport choice the
+// same way `idlePokeEnabled`/`idlePokeMinutes`/`idlePokeMessage` already
+// merge is left to a follow-up rather than guessed at here. This is also a
+// stall-remediation wake nudge, not an update notification about a ticket
+// change, which is the event family this ticket's acceptance criteria name.
 const deliverIdlePoke = async (issue: string, text: string): Promise<{ via: "channel" | "prompt" }> => {
   const result = await deliverNotice({
     pushChannel: () => notifyAgent(mcp, issue, issue, text),
     nudgePrompt: () => herd.nudge(issue, text),
   });
   console.error(`  [notify] ${issue} ← idle-poke: ${renderNotifyDelivery(result)}`);
+  // FACTORY-1010: `result.via` is never `"none"` here — this call passes no
+  // explicit `mode`, and `"none"` is only ever returned for one (src/notify/
+  // deliver.ts's own doc comment on `NotifyDelivery`).
+  if (result.via === "none") throw new Error(`unreachable: deliverIdlePoke got via "none" without an explicit mode (${issue})`);
   return { via: result.via };
 };
 
@@ -1813,17 +1817,6 @@ const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngin
   deliver: deliverIdlePoke,
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
-// see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
-// every other daemon-side comment write; no second Atlassian writer.
-const parkedDetector = createParkedDetector({
-  now: () => Date.now(),
-  minutes: config.parkedMinutes,
-  addComment: async (issue, text) => { await ops.addComment(issue, text); },
-  comments: (issue) => atlassian.comments(issue),
-  links: (issue) => atlassian.links(issue),
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-95/123/124/141: reads a resource's own channel — shared by the
 // frozen-asleep detector below, BOTH crash-loop detector instances further
 // down, and the blocked-dialog escalator (`escalator`'s `ownChannelComments`
@@ -1833,14 +1826,12 @@ const parkedDetector = createParkedDetector({
 // hand there — see that function's own doc comment for the full mechanism
 // (routing, the single-id call shape, and the BUTCHR-129 unwrap history).
 // `issueComments` is injected as `atlassian.comments`, the same client
-// `stalled`/`parkedDetector` above already use.
+// `stalled` above already uses.
 const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comments(key));
 // BUTCHR-200: escalates a worker whose Implements boss reached Done while it
-// is still open — see src/agents/abandoned.ts. Unlike parkedDetector above
-// (which predates the BUTCHR-95/123/141 comment-read-path fix and still
-// uses the raw `atlassian.comments` call, deliberately not corrected here —
-// out of scope), this reads through `ownChannelComments`, the tier-aware
-// reader, per this ticket's own requirement. Posts through the same
+// is still open — see src/agents/abandoned.ts. This reads through
+// `ownChannelComments`, the tier-aware reader, per this ticket's own
+// requirement. Posts through the same
 // `ops.addComment` seam as every other daemon-side comment write; no second
 // Atlassian writer. ON by default (see the wiring below): this detector's
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
@@ -1859,7 +1850,7 @@ const abandonedDetector = createAbandonedDetector({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
-  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
+  todoWorkers: createTodoWorkersFetch({ searchAll: (jql) => atlassian.searchAll(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
@@ -2086,6 +2077,23 @@ const issueReconcileFailureDetector = createReconcileFailureDetector({
 // second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
 // wrapper) is used directly — `strandedCandidates`/`closeStranded` are
 // HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+// A successful stop/reap is authoritative evidence that this daemon owned the
+// pane. Purge every agent:* value, including agent:none, through the existing
+// quiet writer and own-write ledger; no comment or notification path exists.
+const purgeStoppedAgentLabels = async (agentKeys: readonly string[]): Promise<void> => {
+  const keys = [...new Set(agentKeys.map(resourceKeyOf))];
+  if (!keys.length) return;
+  const issues = await atlassian.search(`key IN (${keys.join(",")})`);
+  const written: string[] = [];
+  for (const issue of issues) {
+    const remove = issue.labels.filter(isAgentLabel);
+    if (!remove.length) continue;
+    await labelWriter.updateLabels(issue.key, { remove });
+    written.push(issue.key);
+  }
+  if (written.length) recordOwnWrite(written, DAEMON_WRITER);
+};
+
 const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
@@ -2096,6 +2104,7 @@ const issueReaper = createReaper({
   // nothing else in this daemon would otherwise release a temporary account
   // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
   ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
+  onReaped: async (agentKey) => purgeStoppedAgentLabels([agentKey]),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-287: a live per-issue residency census, independent of
@@ -2116,29 +2125,6 @@ const issueResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-352: the issue tier's own admission census bucket — the SAME
-// `admissionController` instance the issue/project `runResourceLoop` calls
-// below already share (see that construction's own comment for why one
-// instance, not one per tier). Only the ISSUE tier's bucket is relevant here:
-// syncLabels only ever processes Jira issues (only the issue `runResourceLoop`
-// call wires `syncLabels` in at all — see that call site's own comment), so
-// a project-tier candidate is never a `syncLabels` input in the first place.
-// Returns the TRUSTED withheld set from a `checked: true` bucket, or the
-// literal `"unknown"` from a `checked: false` one (residency threw, an
-// untrusted implausible zero, or this source has never reported) — never a
-// guess either way. `desiredLabels` (src/labels/plan.ts) re-emits whatever
-// admission:withheld marker a ticket already carries on `"unknown"` rather
-// than flipping it off from an observation never made (KAN-832/837's own
-// pattern) — so a bad poll holds the last TRUSTED state rather than
-// asserting a confident wrong one in either direction. Synchronous:
-// `census()` reads state `admit()` already computed EARLIER in this SAME
-// poll (`reconcileNow` runs before `syncLabels` — see src/daemon/loop.ts's
-// own call order), never a second/stale read.
-const issueAdmissionWithheld = (): ReadonlySet<string> | "unknown" => {
-  const bucket = admissionController.census().buckets.find((b) => b.source === ADMISSION_SOURCE_ISSUE);
-  return bucket?.checked ? new Set(bucket.withheld.map(resourceKeyOf)) : "unknown";
-};
-
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: agentStatusesFeedingDashboard,
@@ -2147,8 +2133,15 @@ const syncLabels = createLabelSync({
   stallRemediation,
   ...(silentStop ? { silentStop } : {}),
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
-  withheld: issueAdmissionWithheld,
   coverage,
+  reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => sweepAbsentLiveAgentLabels({
+    search: (jql) => atlassian.search(jql),
+    jira: labelWriter,
+    liveKeys,
+    ownedKeys,
+    onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
+    log: (line) => console.error(`  ${line}`),
+  }),
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
@@ -2198,6 +2191,24 @@ if (getRules().some(r => r.enabled && r.resourceProvider === "jira-work")) void 
 // src/jira-watch/linked-eventing.ts's own top comment for why this is
 // "UNCHANGED IN SHAPE": the actual channel-push mechanism below is
 // untouched, only its `reason` branching gains one more case).
+// FACTORY-1010 — the per-rule explicit delivery choice (`Rule.notifyDeliveryMode`),
+// resolved once here and reused by every rule-owned `deliverNotice` seam
+// below. A direct lookup, never the idle-poke engine's own multi-rule-per-
+// ISSUE merge (`updateIdlePokeRuleConfig` below): an agent key carries
+// exactly the one rule that owns it (`decodeAnyAgentKey`'s own doc comment,
+// src/rules/agent-key.ts), so there is no "several rules matched one
+// agent" case to resolve here the way several rules CAN match one issue.
+// `undefined` — the absent case `deliverNotice` itself already treats as
+// today's channel-first/prompt-fallback behaviour — for a key that fails
+// to decode, or whose owning rule cannot be found (defensive; every real
+// agent key handed to a `deliver` closure was produced for a rule
+// `getRules()` still lists).
+const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined => {
+  const decoded = decodeAnyAgentKey(agent);
+  if (!decoded) return undefined;
+  return getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider)?.notifyDeliveryMode;
+};
+
 const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
   // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
   // for a query-level agent that's its own query key, shown as-is in
@@ -2215,6 +2226,7 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const result = await deliverNotice({
     pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
     nudgePrompt: () => herd.nudge(agent, msg),
+    mode: ruleNotifyDeliveryMode(agent),
   });
   const reasonTag = notifyReasonTag(reason);
   console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
@@ -2312,6 +2324,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  onStopped: (agent) => purgeStoppedAgentLabels([agent]),
   // FACTORY-916: `herd.lastFreshSpawnResumed` told `reconcileNow` this
   // respawn resumed its prior Claude session via an ordinary fresh spawn
   // (never `resumeInPlace()` — that is `onResumePreserved` below), so it
@@ -2357,7 +2370,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   // for a model/effort-only deferral (src/daemon/loop.ts's own split at the
   // `RESTORED_PANE_STALE_REASON_PREFIX` check).
   checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
-  // Label sync and the parked/abandoned detectors work per TICKET, so they
+  // Label sync and the abandoned detector work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => {
     // FACTORY-845: refresh this poll's per-issue idle-poke rule config
@@ -2366,9 +2379,9 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     // doc comment above for why this is the only place that association
     // is still available.
     if (idlePoke) updateIdlePokeRuleConfig(matches);
+    stalledMinutesByIssue = stalledMinutesForIssues(matches);
     return syncLabels(uniqueIssues(matches));
   },
-  checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
   checkReconcileFailure: issueReconcileFailureDetector.check,
@@ -2431,6 +2444,7 @@ startGithubIssueLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2457,6 +2471,7 @@ startGithubPrLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2494,6 +2509,7 @@ startJiraIdeaLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2519,6 +2535,7 @@ startZendeskTicketLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2544,6 +2561,7 @@ startFilesystemLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2556,9 +2574,45 @@ startFilesystemLoop({
   onError: (e) => filesystemHealth.recordError(e),
 });
 
+// FACTORY-998: the confluence-page rule loop — its own agents and admission
+// bucket, reusing the SAME `ops` (AtlassianOps) instance every other
+// Confluence/Jira read path in this daemon already uses: no new credential,
+// no new staffing gate (see `confluencePageEnabledRules`'s own comment,
+// above `fsRules`).
+if (confluencePageEnabledRules.length) console.error(`  confluence-page rules: ${confluencePageEnabledRules.map((r) => r.id).join(", ")}`);
+startConfluencePageLoop({
+  rules: getRules(),
+  getChildPages: (parentId, cursor) => ops.getChildPages(parentId, cursor),
+  getPageVersions: (pageIds) => ops.getPageVersions(pageIds),
+  getPageComments: (pageId) => ops.getPageComments(pageId),
+  getPage: (pageId) => ops.getPage(pageId),
+  herd,
+  deliver: async (agent, resource, msg) => {
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => confluencePageHealth.recordSuccess(),
+  onError: (e) => confluencePageHealth.recordError(e),
+});
+
 // BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
 // read from rules.json, over the well-known definitions directory. Same
 // admission/health wiring shape as every rule loop above, its own bucket.
+//
+// FACTORY-1010: deliberately OUT of this ticket's scope — its agents come
+// from `SessionDefinition` manifests (src/resources/session-definition.ts),
+// never a `Rule`, so there is no `notifyDeliveryMode` to read here, and
+// `ruleNotifyDeliveryMode` is not called below (it would resolve to
+// `undefined` for any key it was handed anyway, byte-identical to today).
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,

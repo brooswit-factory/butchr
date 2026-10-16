@@ -5,10 +5,12 @@ import type { JiraIssue, IssueLink, JiraComment, JiraRemoteLink, JiraRemoteLinkI
 export interface JiraIssueDetail extends JiraIssue { description: string }
 
 /** ADF node shape is large and mostly irrelevant here; walk it structurally. */
-interface AdfNode { type?: string; text?: string; content?: AdfNode[] }
+interface AdfNode { type?: string; text?: string; content?: AdfNode[]; attrs?: Record<string, any>; marks?: Array<{ type?: string; attrs?: Record<string, any> }> }
+
+const KNOWN_EMPTY_LEAVES = new Set(["paragraph", "heading", "listItem", "bulletList", "orderedList", "doc", "codeBlock", "blockquote", "panel", "expand", "table", "tableRow", "tableCell", "tableHeader", "mediaSingle", "mediaGroup"]);
 
 /** Block-level node types whose children are distinct lines, not one run of text. */
-const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList"]);
+const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList", "blockquote", "panel", "expand", "table", "tableRow", "tableCell", "tableHeader"]);
 
 /**
  * Flatten an ADF document (or any node within one) to plain text: every
@@ -19,8 +21,24 @@ const ADF_BLOCK_TYPES = new Set(["doc", "bulletList", "orderedList"]);
  */
 export function adfToText(node: AdfNode | null | undefined): string {
   if (!node || typeof node !== "object") return "";
-  if (node.type === "text") return node.text ?? "";
+  if (node.type === "text") {
+    // A link mark carries the href outside the visible text; keep both so a
+    // hyperlinked word never loses its target.
+    const href = node.marks?.find((m) => m?.type === "link")?.attrs?.href;
+    const text = node.text ?? "";
+    return typeof href === "string" && href && href !== text ? `${text} (${href})` : text;
+  }
   if (node.type === "hardBreak") return "\n";
+  // Leaf inline nodes carry their readable form in `attrs`, not `content`;
+  // without these a comment that is only a mention or a link flattens to "".
+  if (node.type === "mention") return node.attrs?.text ?? "";
+  if (node.type === "inlineCard" || node.type === "blockCard") return node.attrs?.url ?? "";
+  if (node.type === "emoji") return node.attrs?.text ?? node.attrs?.shortName ?? "";
+  if (node.type === "status") return node.attrs?.text ?? "";
+  if (node.type === "rule") return "---";
+  // Loss-aware: a leaf we cannot render (media, extensions, future node
+  // types) is named, never silently erased. Containers recurse as before.
+  if (node.type && node.content === undefined && !KNOWN_EMPTY_LEAVES.has(node.type)) return `[unsupported ${node.type}${typeof node.attrs?.alt === "string" ? `: ${node.attrs.alt}` : ""}]`;
   const parts = (node.content ?? []).map(adfToText);
   return node.type && ADF_BLOCK_TYPES.has(node.type) ? parts.join("\n") : parts.join("");
 }
@@ -312,8 +330,16 @@ function parseIssueLinks(raw: any[] | undefined): IssueLink[] {
     // `outwardIssue`; every other field on the stub's own `fields` object
     // (e.g. `labels` — confirmed NEVER present, in either direction) is
     // deliberately still discarded, exactly as before this change.
-    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key, ...(l.outwardIssue.fields?.status?.name !== undefined ? { status: l.outwardIssue.fields.status.name } : {}) });
-    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key, ...(l.inwardIssue.fields?.status?.name !== undefined ? { status: l.inwardIssue.fields.status.name } : {}) });
+    // FACTORY-833: `l.id` is the issueLink's OWN id (top-level on the raw
+    // link object, distinct from `inwardIssue`/`outwardIssue`'s own issue
+    // id) — carried through as a plain string so a consumer can name WHICH
+    // link it means. Coerced with `String(...)`, never trusted to already
+    // be a string: Jira's own REST docs type this field as a string, but
+    // nothing here re-verifies that against a live payload, so this stays
+    // defensive rather than assuming the schema.
+    const id = l.id !== undefined ? { id: String(l.id) } : {};
+    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key, ...id, ...(l.outwardIssue.fields?.status?.name !== undefined ? { status: l.outwardIssue.fields.status.name } : {}) });
+    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key, ...id, ...(l.inwardIssue.fields?.status?.name !== undefined ? { status: l.inwardIssue.fields.status.name } : {}) });
   }
   return out;
 }

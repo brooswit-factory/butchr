@@ -28,15 +28,23 @@ export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];
 
 /**
- * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
+ * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same
  * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, `../resources/session-definition.ts`). See
  * `Rule.permissionMode`'s own doc comment (`./rules.ts`) for the full
  * contract (default, per-vendor mapping, etc.) — this file only owns the
  * constant's VALUE and TYPE, kept independent for the leaf-module reason
  * described above.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (`../resources/session-definition.ts`) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here.
  */
-export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export const RULE_PERMISSION_MODES = ["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
 
 /**

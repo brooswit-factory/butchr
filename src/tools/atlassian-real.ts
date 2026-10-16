@@ -1,7 +1,7 @@
 import { createCloudClient, isNotFoundError } from "jira.js";
 import { createV2Client, createV1Client } from "confluence.js";
-import { createClient as createConfluenceClient } from "confluence.js/core";
-import type { AtlassianOps } from "./atlassian.js";
+import type { AtlassianOps, IssueCommentRecord } from "./atlassian.js";
+import { adfToText } from "../atlassian/client.js";
 
 /** One paragraph of plain text as ADF (what Jira v3 wants for descriptions/comments). */
 export const adf = (text: string) => ({
@@ -52,17 +52,6 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
   // The v1 (legacy "content") API's /wiki/rest/api/search still serves CQL and is not
   // deprecated, so a second client, same host/auth, is the documented way to reach it.
   const wiki1: any = createV1Client({ host: cfg.site, auth });
-  // confluence.js's v1 client wraps only a handful of legacy endpoints
-  // (content/{archive,publish,search}) — it has NO wrapped method at all for
-  // `POST /wiki/rest/api/content` (confirmed against
-  // node_modules/confluence.js/dist/v1/createV1Client.d.ts: `.content` only
-  // exposes archivePages/publishLegacyDraft/publishSharedDraft/searchContentByCQL).
-  // That endpoint is the only one that can set `metadata.labels` atomically at
-  // create time (the v2 create has no label support at all), so
-  // createPageWithLabel below drives it with the bare low-level client
-  // (`confluence.js/core`'s `createClient`, the same one createV1Client uses
-  // internally) rather than through a wrapped call that doesn't exist.
-  const wikiRaw = createConfluenceClient({ host: cfg.site, auth });
   return {
     getIssue: (key) => jira.issues.getIssue({ issueIdOrKey: key }),
     search: (jql, maxResults) =>
@@ -208,6 +197,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         throw e;
       }),
 
+    // FACTORY-19: a dedicated existence check against the project ITSELF
+    // (GET /rest/api/3/project/{projectIdOrKey}), never the property
+    // endpoint — that's the whole point, see this op's own doc comment on
+    // AtlassianOps for why getProjectPropertyOrNull's 404 alone can't tell
+    // "no such project" from "project exists, property never written".
+    projectExists: (projectKey) =>
+      jira.projects.getProject({ projectIdOrKey: projectKey }).then(() => true).catch((e: unknown) => {
+        if (isNotFoundError(e)) return false;
+        throw e;
+      }),
+
     // getRemoteIssueLinks with a `globalId` 404s (jira.js throws NotFoundError)
     // when no such link exists, rather than resolving an empty result (MEASURED
     // live against BUTCHR-33) — every caller wants one "not found" shape, so
@@ -225,56 +225,21 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     upsertRemoteLink: (key, globalId, relationship, object) =>
       jira.issueRemoteLinks.createOrUpdateRemoteIssueLink({ issueIdOrKey: key, globalId, relationship, object }),
 
-    // GetChildPages (v2) is a DIRECT, cursor-paginated read — never CQL. As of
-    // FACTORY-84/FACTORY-86, nothing in production code calls this anymore
-    // (its only caller, docs.ts's `ensureDoc`, had its per-ticket
-    // auto-creation removed) — kept on this interface pending a follow-up
-    // decision on whether to remove it. `_links.next`, when present, is a
-    // relative URL carrying an opaque `cursor` query param; a `new URL` needs
-    // a base to parse a relative one, so an arbitrary absolute base is used
-    // purely as a parsing scratchpad and discarded — MEASURED live: a
-    // `limit: 1` call against a parent with 2+ children came back with
-    // `_links.next` set, and following its `cursor` reached the rest.
+    // GetChildPages (v2) is a DIRECT, cursor-paginated read — never CQL. Its
+    // original caller, docs.ts's `ensureDoc`, was retired by FACTORY-86, but
+    // FACTORY-998/FACTORY-992's `confluence-page` rule loop now calls this
+    // directly (src/rules/confluence-page-type.ts) — current, not dead.
+    // `_links.next`, when present, is a relative URL carrying an opaque
+    // `cursor` query param; a `new URL` needs a base to parse a relative
+    // one, so an arbitrary absolute base is used purely as a parsing
+    // scratchpad and discarded — MEASURED live: a `limit: 1` call against a
+    // parent with 2+ children came back with `_links.next` set, and
+    // following its `cursor` reached the rest.
     getChildPages: async (parentId, cursor) => {
       const r: any = await wiki.children.getChildPages({ id: parentId, limit: 50, ...(cursor ? { cursor } : {}) });
       const nextUrl: string | undefined = r?._links?.next;
       const nextCursor = nextUrl ? new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor") : null;
       return { results: (r?.results ?? []).map((c: any) => ({ id: c.id, title: c.title })), ...(nextCursor ? { nextCursor } : {}) };
-    },
-    getPageLabels: (pageId) =>
-      wiki.label.getPageLabels({ id: pageId }).then((r: any) => (r?.results ?? []).map((l: any) => l.name).filter(Boolean)),
-
-    // MEASURED live against the BUTCHR space: a v1 create with `space: { key }`
-    // (NOT spaceId — v1 wants the space's KEY) plus `ancestors: [{ id: parentId }]`
-    // plus `metadata: { labels: [{ prefix: "global", name }] }` produced a page
-    // whose label was present on an IMMEDIATE direct read (no async-index lag,
-    // unlike CQL). Response shape is the legacy v1 "content" shape (`_links.base`
-    // + `_links.webui` for the URL, string `id`, `title`) — NOT the v2 shape
-    // `createPage`/`getPage` above return; that's the whole reason this is a
-    // separate op rather than a `labels?` branch inside `createPage` — a caller
-    // of the existing op must never see a shape change.
-    // MEASURED live: creating a second page with the SAME title in the SAME
-    // space 400s ("A page with this title already exists") and creates
-    // nothing — a real, atomic, server-enforced rejection, not a
-    // client-side check. As of FACTORY-84/FACTORY-86, nothing in production
-    // code calls this anymore (its only caller, docs.ts's `ensureDoc`, had
-    // its per-ticket auto-creation removed) — kept on this interface pending
-    // a follow-up decision on whether to remove it.
-    createPageWithLabel: async (p) => {
-      const created: any = await wikiRaw.sendRequest({
-        url: "/wiki/rest/api/content",
-        method: "POST",
-        body: {
-          type: "page",
-          title: p.title,
-          space: { key: p.spaceKey },
-          ancestors: [{ id: p.parentId }],
-          body: { storage: { value: p.body, representation: "storage" } },
-          metadata: { labels: [{ prefix: "global", name: p.label }] },
-        },
-      });
-      const base = created?._links?.base ?? `${cfg.site}/wiki`;
-      return { id: created.id, title: created.title, url: `${base}${created?._links?.webui ?? ""}` };
     },
 
     // Read-modify-write: `fields.labels` on editIssue takes the FULL desired
@@ -505,7 +470,7 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Runaway protection: `MAX_COMMENT_PAGES` throws rather than returning a
     // silently partial list if none of the three signals above is ever hit.
     getIssueComments: async (key) => {
-      const results: Array<{ id: string }> = [];
+      const results: IssueCommentRecord[] = [];
       let startAt = 0;
       let total: number | undefined;
       const PAGE_SIZE = 100;
@@ -516,14 +481,33 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           );
         }
         const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
-        const batch: any[] = r?.comments ?? [];
-        for (const c of batch) results.push({ id: c.id });
+        if (!r || typeof r !== "object" || !Array.isArray(r.comments)) {
+          throw new Error(`getIssueComments(${key}): malformed response at startAt=${startAt} (no \`comments\` array) — refusing to report an empty or partial list`);
+        }
+        const batch: any[] = r.comments;
+        for (const c of batch) {
+          const validBody = typeof c?.body === "string" || (c?.body && typeof c.body === "object" && !Array.isArray(c.body) && c.body.type === "doc" && Array.isArray(c.body.content));
+          if (!c || typeof c.id !== "string" || !validBody) {
+            throw new Error(`getIssueComments(${key}): malformed comment at startAt=${startAt} (id, or body that is neither a string nor an ADF doc) — refusing to return it as readable`);
+          }
+          results.push({
+            id: c.id,
+            body: typeof c.body === "string" ? c.body : adfToText(c.body),
+            bodyRaw: c.body ?? null,
+            created: c.created ?? "",
+            author: { accountId: c.author?.accountId ?? null, displayName: c.author?.displayName ?? null, email: c.author?.emailAddress ?? null },
+          });
+        }
         const responseTotal = typeof r?.total === "number" ? r.total : undefined;
         const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
         if (responseTotal !== undefined) total = responseTotal;
         startAt += batch.length;
-        if (responseTotal !== undefined) {
-          if (batch.length === 0) break; // safety net even when `total` is known — see this op's own doc comment
+        if (total !== undefined) {
+          // A total seen on ANY page binds the walk: stopping short of it is an error, never a partial list.
+          if (batch.length === 0) {
+            if (startAt < total) throw new Error(`getIssueComments(${key}): empty page at startAt=${startAt} before reported total ${total} — refusing to return a silently partial list`);
+            break;
+          }
         } else if (responseMaxResults !== undefined) {
           if (batch.length < responseMaxResults) break; // short against what the server actually honoured
         } else if (batch.length === 0) {

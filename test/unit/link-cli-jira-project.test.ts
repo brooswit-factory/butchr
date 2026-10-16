@@ -63,6 +63,48 @@ describe("credential-missing path", () => {
   });
 });
 
+describe("malformed-config path (FACTORY-19): a bad ATLASSIAN_EMAIL", () => {
+  const ATLASSIAN_KEYS = ["ATLASSIAN_SITE", "ATLASSIAN_EMAIL", "ATLASSIAN_TOKEN", "ATLASSIAN_TOKEN_FILE"] as const;
+  let saved: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    saved = Object.fromEntries(ATLASSIAN_KEYS.map((k) => [k, process.env[k]]));
+    process.env.ATLASSIAN_SITE = "https://x.atlassian.net";
+    process.env.ATLASSIAN_EMAIL = "not-an-email";
+    process.env.ATLASSIAN_TOKEN = "t";
+    delete process.env.ATLASSIAN_TOKEN_FILE;
+  });
+  afterEach(() => {
+    for (const k of ATLASSIAN_KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  });
+
+  test("jiraProjectStoreFromEnv itself throws ONE single-line error, not jira.js's multi-line Zod dump", () => {
+    let caught: Error | undefined;
+    try {
+      jiraProjectStoreFromEnv();
+    } catch (e) {
+      caught = e as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).not.toContain("\n");
+    expect(caught!.message).toMatch(/invalid Atlassian credentials/);
+    expect(caught!.message).toMatch(/email/i);
+    expect(caught!.name).not.toBe("ZodError");
+  });
+
+  test("a jira-project CLI call surfaces the malformed email as ONE clean stderr line + exit 1, never a multi-line dump", async () => {
+    io = { store: createRoutingLinkStore({ fileStore: createLinkStore(join(dir, "links.json")), jiraProjectStore: jiraProjectStoreFromEnv }), stdout: (l) => out.push(l), stderr: (l) => err.push(l) };
+    expect(await runLinkCli(["list", "jira-project:BUTCHR"], io)).toBe(1);
+    expect(out).toEqual([]);
+    expect(err).toHaveLength(1);
+    expect(err[0]).not.toContain("\n");
+    expect(err[0]).toMatch(/butchr link: invalid Atlassian credentials/);
+  });
+});
+
 describe("Jira 4xx/5xx path (credentials present, the underlying Jira call itself fails)", () => {
   function unimplementedOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
     const unimplemented = (name: string) => async (..._a: unknown[]) => { throw new Error(`fake ops: ${name} not used by this test`); };
@@ -76,8 +118,6 @@ describe("Jira 4xx/5xx path (credentials present, the underlying Jira call itsel
       getProjectPropertyOrNull: unimplemented("getProjectPropertyOrNull"),
       getRemoteLink: unimplemented("getRemoteLink"), upsertRemoteLink: unimplemented("upsertRemoteLink"),
       getChildPages: unimplemented("getChildPages") as unknown as AtlassianOps["getChildPages"],
-      getPageLabels: unimplemented("getPageLabels") as unknown as AtlassianOps["getPageLabels"],
-      createPageWithLabel: unimplemented("createPageWithLabel") as unknown as AtlassianOps["createPageWithLabel"],
       addLabels: unimplemented("addLabels"), removeLabels: unimplemented("removeLabels"), deleteIssue: unimplemented("deleteIssue"),
       commentOnPage: unimplemented("commentOnPage"), getPageComments: unimplemented("getPageComments") as unknown as AtlassianOps["getPageComments"],
       searchProjects: unimplemented("searchProjects") as unknown as AtlassianOps["searchProjects"],

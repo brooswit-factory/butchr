@@ -53,61 +53,15 @@ import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-help
  * reasoning).
  */
 
-/** Marker every escalation comment this module writes starts with. Distinct from `[butchr:parked]` on purpose — see the module-level note on markers in this ticket's PR body: a shared marker would make a future "show me every X" grep silently wrong (the same reasoning `ORPHAN_LABEL`'s doc comment, src/tools/relationship.ts, already gives for keeping that label distinct from `EXEMPT_LABEL`). Named for the STATE ("this worker has been abandoned"), not the detector, so it reads correctly to someone who has never heard of this module. */
+/** Marker every escalation comment this module writes starts with. Distinct from `[butchr:parked]` on purpose — see the module-level note on markers in this ticket's PR body: a shared marker would make a future "show me every X" grep silently wrong. Named for the STATE ("this worker has been abandoned"), not the detector, so it reads correctly to someone who has never heard of this module. */
 export const MARKER = "[butchr:abandoned]";
 
 /**
- * `butchr:shelved` (`EXEMPT_LABEL` in `parked.ts`) is DELIBERATELY NOT
- * CHECKED HERE — the opposite of `parked.ts`'s decision, which exempts it.
- *
- * `parked.ts` exempts it because a boss can legitimately decide "not yet"
- * about a To Do child it still owns — the label is reversible, and only its
- * own (live) boss can reverse it. Here, the boss is Done. A shelved worker
- * can only be reactivated by its own boss calling `start_worker`
- * (src/tools/relationship.ts's `assertOwnWorker`, which refuses any caller
- * that is not the worker's own Implements-linked boss — verified in this
- * tree) — so a worker left shelved under a Done boss can NEVER be
- * reactivated, by anyone. It is not less abandoned than an unshelved one; it
- * is MORE so, because it carries a label asserting a decision is in force
- * that nothing can ever reverse again. Exempting it would silence this
- * detector on precisely its worst case.
- *
- * This is NOT in tension with the sibling guard (BUTCHR-193/BUTCHR-191),
- * which deliberately lets a boss `shelve_worker` an open worker and then
- * close over it — rejecting the alternative (refusing to close over a
- * shelved worker too) because that reproduces the BUTCHR-92 circle: a boss
- * with a worker it can neither finish (the work isn't done) nor shelve (now
- * refused) has no exit at all. The design both tickets converge on: PERMIT
- * it at the door (the guard), MAKE THE CONSEQUENCE AUDIBLE AFTERWARDS (this
- * module) — enforce where there is an exit, make audible where there is
- * not. This module is the audible half.
- *
- * `IssueLink`'s hydrated field set (`issuetype, priority, status, summary` —
- * MEASURED, BUTCHR-192) never includes `labels`, so this predicate could
- * never see `butchr:shelved` on the boss even if it wanted to. It reads the
- * WORKER's own labels (which `issues` already carries in full), not the
- * boss's.
- *
- * BEFORE BUTCHR-240, that worker-label read was where this decision mostly
- * stopped mattering in practice: a shelved worker is, by `shelve_worker`'s
- * own contract, moved to To Do, which was outside `ISSUE_JQL` and therefore
- * outside this detector's candidate set entirely — so the no-exemption
- * decision only ever bit on an anomalous case (a stale `butchr:shelved`
- * label surviving on an In Progress/In Review worker, e.g. a labelling bug
- * or a hand-added label that was never withdrawn).
- *
- * BUTCHR-240 changed that at the INPUT layer, not this predicate: a second
- * JQL search (`TODO_WORKER_JQL`, src/resources/issue.ts) now feeds this
- * daemon's own To Do workers into `check()`'s candidate list, concatenated
- * with `issues` BEFORE `abandonedCandidates` ever runs (see the `FORMER
- * KNOWN LIMITATION` on `abandonedCandidates` below). The worker's own
- * labels are therefore now reachable in To Do too, not only In Progress/In
- * Review, and a shelved worker moved to To Do is no longer outside this
- * detector's candidate set — it is an ORDINARY candidate. The anomalous
- * case this decision was originally written for is no longer the only one
- * it bites on. The no-exemption decision itself does not change (see
- * above) — the new facts are stronger support for it, not weaker, since a
- * worker shelved under a Done boss can never be reactivated by anyone.
+ * Candidate detection includes this daemon's To Do workers as well as its
+ * active workers. `TODO_WORKER_JQL` (src/resources/issue.ts) supplies those
+ * To Do workers to `check()` alongside the active `issues` snapshot before
+ * `abandonedCandidates` runs. A worker with a Done boss is still abandoned
+ * regardless of its labels; labels do not exempt it from detection.
  */
 
 export interface AbandonedCandidate {
@@ -381,20 +335,16 @@ export interface AbandonedDetector {
 
 /**
  * Builds the abandoned-worker detector wired into src/daemon/loop.ts (via
- * src/daemon/index.ts) alongside (never instead of) `parked.ts`'s. See
- * `LoopDeps.checkAbandoned`'s doc comment (src/daemon/loop.ts) for WHY this
- * must be called from the poll's observe function and never from
- * `watch()`'s onChange callback — the same reasoning `checkParked` already
- * documents there.
+ * src/daemon/index.ts). See `LoopDeps.checkAbandoned`'s doc comment
+ * (src/daemon/loop.ts) for WHY this must be called from the poll's observe
+ * function and never from `watch()`'s onChange callback.
  *
  * §3g (this ticket): DO NOT size this module's rate cap for the day-one
  * zero. `MAX_PER_HOUR` matches `parked.ts`'s own cap (3/hour) — not because
  * this module's steady-state volume is expected to match `parked.ts`'s, but
  * because no measurement available today predicts what it actually will be
- * (the sibling guard, BUTCHR-193/BUTCHR-191, recommends `shelve_worker` as
- * its own discharge path, and every agent that follows that advice and then
- * closes is a candidate inflow this module did not create and cannot
- * control), and inventing a different number without evidence would be
+ * (direct Jira status changes can create candidate inflow outside this
+ * module's control), and inventing a different number without evidence would be
  * exactly the "tuning for the zero" this ticket warns against. Revisit once
  * real volume is observed.
  */
@@ -477,15 +427,19 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
       // comment): one is "can't reach the query, so don't lose what already
       // works"; the other is "can't confirm Done, so don't claim it".
       let allIssues = issues;
+      let complete = true;
       if (deps.todoWorkers) {
         const todo = await deps.todoWorkers().catch((e) => {
           log(`WARNING: [abandoned] todoWorkers fetch failed: ${(e as Error)?.message ?? e}`);
           return null;
         });
         if (todo !== null) allIssues = [...issues, ...todo];
+        else complete = false;
       }
       const candidates = abandonedCandidates(allIssues);
-      tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.worker.key, c.boss))));
+      // Absence is meaningful only after a complete read. Keep observation
+      // clocks through query failures, while processing known active issues.
+      if (complete) tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.worker.key, c.boss))));
 
       for (const { worker, boss } of candidates) {
         const e = tracker.observe(worker.key, boss);

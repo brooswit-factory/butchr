@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, DEFAULT_IDLE_POKE_MESSAGE, DEFAULT_IDLE_POKE_MINUTES,
-  encodeAgentKey, encodeQueryAgentKey, EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules,
+  encodeAgentKey, encodeQueryAgentKey, EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, NOTIFY_DELIVERY_MODES, parseRules,
   RESOURCE_PROVIDERS, RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
@@ -14,6 +14,7 @@ import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
 import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
 import { ownsFilesystemAgent } from "../../src/rules/filesystem-type.js";
+import { ownsConfluencePageAgent } from "../../src/rules/confluence-page-type.js";
 import { ownsJiraComponentAgent } from "../../src/rules/jira-component-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
@@ -251,7 +252,7 @@ describe("execution and account (BUTCHR-397)", () => {
   test("every valid value is accepted for every provider — the two fields are provider-generic", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       for (const execution of EXECUTION_MODES) for (const account of ACCOUNT_POLICIES) {
-        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, execution, account }] });
         expect(r).toMatchObject({ resourceProvider, execution, account });
       }
@@ -305,7 +306,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
   test("both values are accepted for every provider, independent of execution and account", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
         expect(r).toMatchObject({ resourceProvider, role, execution });
@@ -333,7 +334,7 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
 
   test("every permissionMode value and both lizardMode values are accepted for every provider, independent of execution/account/role/each other", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const permissionMode of RULE_PERMISSION_MODES) for (const lizardMode of [true, false]) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, permissionMode, lizardMode }] });
         expect(r).toMatchObject({ resourceProvider, permissionMode, lizardMode });
@@ -352,7 +353,7 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
 
   test("rejects a bad permissionMode value, naming the rule and field", () => {
     expect(() => parseRules({ rules: [{ ...minimal, permissionMode: "yolo" }] }, "f.json"))
-      .toThrow("f.json: rules[0].permissionMode must be one of default, acceptEdits, bypassPermissions, plan, auto");
+      .toThrow("f.json: rules[0].permissionMode must be one of default, manual, acceptEdits, bypassPermissions, plan, auto");
   });
 
   test("rejects a non-boolean lizardMode, naming the rule and field", () => {
@@ -378,7 +379,7 @@ describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-9
 
   test("both fields accepted for every provider, independent of execution/account/role/each other", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 }] });
       expect(r).toMatchObject({ resourceProvider, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 });
     }
@@ -425,7 +426,7 @@ describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, st
 
   test("both values and every provider accept the field, independent of execution/account/role/each other — same house style as permissionMode/lizardMode", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const resumeOnRespawn of [true, false]) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, resumeOnRespawn, resumeContextCutoff: 50_000 }] });
         expect(r).toMatchObject({ resourceProvider, resumeOnRespawn, resumeContextCutoff: 50_000 });
@@ -603,7 +604,7 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
 
   test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true }] });
       expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true });
     }
@@ -704,9 +705,45 @@ describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour cha
 
   test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false }] });
       expect(r).toMatchObject({ resourceProvider, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false });
+    }
+  });
+});
+
+// FACTORY-1010: `Rule.notifyDeliveryMode` — the per-rule explicit choice
+// between the agent's MCP channel and a direct typed prompt for every
+// update/notification `deliverNotice` seam this rule owns. Same
+// absent-means-absent house style as `permissionMode`/`lizardMode` above:
+// omitted must stay today's channel-first/prompt-fallback behaviour
+// byte-for-byte, so there is deliberately no default resolved here.
+describe("notifyDeliveryMode (FACTORY-1010 — per-rule explicit delivery choice)", () => {
+  test("omitted stays absent — today's channel-first/prompt-fallback behaviour, unchanged", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.notifyDeliveryMode).toBeUndefined();
+  });
+
+  test("accepts and keeps each valid value", () => {
+    for (const mode of NOTIFY_DELIVERY_MODES) {
+      const [r] = parseRules({ rules: [{ ...minimal, notifyDeliveryMode: mode }] });
+      expect(r!.notifyDeliveryMode).toBe(mode);
+    }
+  });
+
+  test("rejects any value outside the two supported transports", () => {
+    for (const bad of ["both", "none", "Channel", "", 1, true, null]) {
+      expect(() => parseRules({ rules: [{ ...minimal, notifyDeliveryMode: bad }] }, "f.json")).toThrow("f.json: rules[0].notifyDeliveryMode must be one of channel, prompt");
+    }
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role and the idle-poke knobs above", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      for (const mode of NOTIFY_DELIVERY_MODES) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, notifyDeliveryMode: mode }] });
+        expect(r).toMatchObject({ resourceProvider, notifyDeliveryMode: mode });
+      }
     }
   });
 });
@@ -863,7 +900,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent, "jira-component": ownsJiraComponentAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent, "confluence-page": ownsConfluencePageAgent, "jira-component": ownsJiraComponentAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -890,6 +927,7 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "zendesk-ticket": return "acme#12";
     case "jira-project": return "BUTCHR";
     case "filesystem": return "/tmp/example.txt";
+    case "confluence-page": return "123456";
     case "jira-component": return "BUTCHR:10000";
   }
 }

@@ -1,6 +1,6 @@
 import type { JiraIssue } from "../atlassian/types.js";
 import { isActive } from "../reconcile/plan.js";
-import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isActiveStatusLabel, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
+import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 import type { StallRemediator } from "../agents/stall-remediation.js";
 import type { SilentStopCheck } from "../agents/silent-stop.js";
@@ -68,32 +68,18 @@ export interface SyncDeps {
    */
   idlePokeRuleConfig?: (issue: string) => IdlePokeRuleConfig | undefined;
   /**
-   * BUTCHR-352: THIS poll's admission census for the withheld set
-   * (src/agents/admission.ts's `AdmissionController.census()`) — either the
-   * set of issue keys a TRUSTED (`checked: true`) bucket reports withheld
-   * this poll, or the literal `"unknown"` when the census could not check at
-   * all this poll (`checked: false` — residency threw, an untrusted
-   * implausible zero, or this source has never reported). `"unknown"` is
-   * passed straight through to `desiredLabels`' own `withheld: "unknown"`
-   * handling (src/labels/plan.ts) for EVERY issue this poll — which re-emits
-   * whatever `admission:withheld` marker a ticket already carries instead of
-   * reading a blind poll as "confirmed not withheld" (the KAN-832/837
-   * pattern, reused). Called once per poll, synchronously (the census this
-   * reads was already computed earlier in the SAME poll, before syncLabels
-   * ever runs — see src/daemon/index.ts's own wiring comment and
-   * src/daemon/loop.ts's `reconcileNow`-before-`syncLabels` ordering), never
-   * a second I/O call of its own. Optional so every existing caller/fixture
-   * that doesn't supply it is unaffected — admission:withheld is then simply
-   * never emitted (desiredLabels defaults `withheld` to `false`).
-   */
-  withheld?: () => ReadonlySet<string> | "unknown";
-  /**
    * Called once per poll with the keys this poll wrote daemon-owned labels
    * for (only when non-empty), so the caller can feed the own-write ledger
    * (src/jira-watch/own-writes.ts) with writer "daemon" — generalizes the
    * old isOwnLabelBump swallow into the same mechanism agent writes use.
    */
   onWrite?: (keys: readonly string[]) => void;
+  /**
+   * FACTORY-1001: scan active, labelled tickets outside the rule-query
+   * result too. Receives this poll's already-read live-herd snapshot, so it
+   * does not add a second herdr observation or invent a notification path.
+   */
+  reconcileAbsentLiveAgentLabels?: (liveKeys: ReadonlySet<string>, ownedKeys: ReadonlySet<string>) => Promise<void>;
   log?: (line: string) => void;
   /**
    * Called once at the end of every syncLabels run, after all issues (and
@@ -198,9 +184,7 @@ export function createLabelSync(deps: SyncDeps) {
     const written = new Set<string>();
     const seen = new Set(issues.map((i) => i.key));
     const agents = await deps.agentStatuses();
-    // BUTCHR-352: read once per poll, synchronously — see this dep's own doc
-    // comment for why this is never a second I/O call.
-    const withheldKeys = deps.withheld?.();
+    await deps.reconcileAbsentLiveAgentLabels?.(new Set(agents.keys()), new Set(issues.map((issue) => issue.key)));
 
     for (const issue of issues) {
       let agentStatus: string | null;
@@ -270,7 +254,8 @@ export function createLabelSync(deps: SyncDeps) {
         // steady state) rather than as a new periodic log source of its own.
         if (stalledNow) {
           const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
-          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}, no non-daemon-chatter comment during that streak`);
+          const threshold = deps.stalled?.thresholdMinutes?.(issue.key);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}${threshold != null ? `, configured threshold ${threshold}m` : ""}, no non-daemon-chatter comment during that streak`);
         }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a
@@ -307,7 +292,7 @@ export function createLabelSync(deps: SyncDeps) {
         // wake it was meant to deliver). `stalledResult` is threaded through
         // uncollapsed so the module can distinguish "could not verify" from
         // "stabilizing" from "nothing going on" for its own log lines,
-        // without any of those ever gating whether it acts.
+        // and suppress a notice when current inactivity cannot be verified.
         //
         // BUTCHR-353: this ticket's own outward `Implements` links ARE its
         // workers — already hydrated on `issue.issuelinks` by `search()`'s
@@ -320,7 +305,7 @@ export function createLabelSync(deps: SyncDeps) {
         // — `undefined` only when Jira genuinely didn't hydrate it, treated
         // as "not Done" by gatherWorkerSignals, never fabricated.
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
-        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers, deps.stalled?.streakStart?.(issue.key));
 
         // FACTORY-845: always evaluated, every poll, for every active
         // issue — never only when `stalledNow`/`stalled` — so the
@@ -337,8 +322,7 @@ export function createLabelSync(deps: SyncDeps) {
           });
         }
       }
-      const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
-      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
+      const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, currentLabels: issue.labels });
       const ok = await write(written, issue.key, issue.labels, desired);
       if (ok) lastLabels.set(issue.key, [...issue.labels.filter((l) => !isDaemonLabel(l)), ...desired]);
     }
@@ -351,11 +335,8 @@ export function createLabelSync(deps: SyncDeps) {
       deps.silentStop?.forget(key);
       deps.idlePoke?.forget(key);
       const current = lastLabels.get(key)!;
-      // BUTCHR-352: admission:* is lifecycle-bound to active status the same
-      // way agent:* is — see isActiveStatusLabel's own doc comment — so both
-      // are stripped here; pr:* is deliberately left untouched (independent
-      // of status).
-      const desired = current.filter((l) => !isActiveStatusLabel(l));
+      // Only agent:* is tied to active status; pr:* and other labels survive.
+      const desired = current.filter((l) => !isAgentLabel(l));
       const ok = await write(written, key, current, desired);
       if (ok) lastLabels.delete(key);
     }

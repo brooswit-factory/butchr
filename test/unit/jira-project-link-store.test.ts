@@ -16,8 +16,6 @@ function unimplementedOps(overrides: Partial<AtlassianOps> = {}): AtlassianOps {
     getProjectProperty: unimplemented("getProjectProperty"), getProjectPropertyOrNull: unimplemented("getProjectPropertyOrNull"),
     getRemoteLink: unimplemented("getRemoteLink"), upsertRemoteLink: unimplemented("upsertRemoteLink"),
     getChildPages: unimplemented("getChildPages") as unknown as AtlassianOps["getChildPages"],
-    getPageLabels: unimplemented("getPageLabels") as unknown as AtlassianOps["getPageLabels"],
-    createPageWithLabel: unimplemented("createPageWithLabel") as unknown as AtlassianOps["createPageWithLabel"],
     addLabels: unimplemented("addLabels"), removeLabels: unimplemented("removeLabels"), deleteIssue: unimplemented("deleteIssue"),
     commentOnPage: unimplemented("commentOnPage"), getPageComments: unimplemented("getPageComments") as unknown as AtlassianOps["getPageComments"],
     searchProjects: unimplemented("searchProjects") as unknown as AtlassianOps["searchProjects"],
@@ -57,6 +55,43 @@ describe("missing property", () => {
     const { ops } = fakeWorld();
     const store = createJiraProjectLinkStore(ops);
     expect(await store.list(owner)).toEqual([]);
+  });
+});
+
+describe("nonexistent project (FACTORY-19)", () => {
+  test("list errors clearly when the project itself does not exist, rather than reading as empty", async () => {
+    const ops = unimplementedOps({
+      getProjectPropertyOrNull: async () => null,
+      projectExists: async (projectKey) => { expect(projectKey).toBe("PROJ"); return false; },
+    });
+    const store = createJiraProjectLinkStore(ops);
+    await expect(store.list(owner)).rejects.toThrow(/PROJ.*does not exist/);
+  });
+
+  test("an EXISTING project with no property yet still lists as empty", async () => {
+    const ops = unimplementedOps({
+      getProjectPropertyOrNull: async () => null,
+      projectExists: async () => true,
+    });
+    const store = createJiraProjectLinkStore(ops);
+    expect(await store.list(owner)).toEqual([]);
+  });
+
+  test("ops that don't implement projectExists fall back to the pre-FACTORY-19 behaviour: null reads as empty", async () => {
+    const { ops } = fakeWorld();
+    expect(ops.projectExists).toBeUndefined();
+    const store = createJiraProjectLinkStore(ops);
+    expect(await store.list(owner)).toEqual([]);
+  });
+
+  test("add on a nonexistent project also errors clearly (and before any write attempt)", async () => {
+    const ops = unimplementedOps({
+      getProjectPropertyOrNull: async () => null,
+      projectExists: async () => false,
+      setProjectProperty: async () => { throw new Error("test bug: should never reach the write"); },
+    });
+    const store = createJiraProjectLinkStore(ops);
+    await expect(store.add(owner, "confluence-page:1")).rejects.toThrow(/does not exist/);
   });
 });
 

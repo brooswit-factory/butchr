@@ -60,7 +60,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-1");
     const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of t2)' }]);
   });
 
   test("a burst of N simultaneous linked changes in one tick produces exactly ONE coalesced message", async () => {
@@ -113,7 +113,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     await state.runTick([m], deps); // the same outstanding change (Done, never delivered) is re-detected and delivered
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("an agent's own edit to a linked ticket does not notify itself (own-write echo)", async () => {
@@ -134,7 +134,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
     const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' }]);
   });
 
   test("a daemon-label-only change on a linked ticket does not notify", async () => {
@@ -204,6 +204,241 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(1);
   });
 
+  test("FACTORY-833 (ask #2): a removed issuelink names its own provider link id, not just the target key — distinct links to distinct targets carry distinct ids", async () => {
+    let withLinks = true;
+    const owner = () => issue("BUTCHR-1", {
+      issuelinks: (withLinks ? [
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-2", id: "11502" },
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-3", id: "12027" },
+      ] : []) as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2"), "BUTCHR-3": issue("BUTCHR-3") };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const r = rule();
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner())], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    withLinks = false;
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner())], deps); // both removed in the same tick
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect([...reason.linked.events].sort((a, b) => a.target.localeCompare(b.target))).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "11502" },
+      { target: "BUTCHR-3", kind: "issuelink", detail: "no longer linked", linkId: "12027" },
+    ]);
+  });
+
+  test("FACTORY-833 (ask #2): an issuelink with no id (a test-fixture/legacy shape) never fabricates one — linkId absent, never invented", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never }); // no `id`
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect(reason.linked.events[0]!.linkId).toBeUndefined();
+    expect(Object.keys(reason.linked.events[0]!)).not.toContain("linkId");
+  });
+
+  test("FACTORY-833 (ask #3): a status change's detail names WHEN the issue's own `updated` field actually moved to, so a transition detected late never reads as freshly-happened", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "Backlog", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed
+    // The real transition happened at "t2" (its own `updated`), but this
+    // owner's tick doesn't run until much later — the detail must still
+    // name "t2", not imply the transition is as fresh as this tick's own
+    // wall-clock time.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "Backlog" to "Done" (as of t2)' }]);
+  });
+
+  test("FACTORY-833: a rate-capped target that keeps changing status while held reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, { now });
+    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const m = match("jira-work:task:BUTCHR-1", r, owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps); // uses the one allowed turn
+    expect(notified).toHaveLength(1);
+
+    // Two further real transitions land WHILE capped — delayed, not lost;
+    // the diff this module coalesces is against the LAST delivered
+    // baseline, so the eventual delivery reports the NET transition
+    // (before -> final), with the FINAL transition's own timestamp, never
+    // the intermediate "t3" or a fabricated "right now".
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Review", updated: "t3" });
+    await state.runTick([m], deps); // capped
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t4" });
+    await state.runTick([m], deps); // still capped
+    expect(notified).toHaveLength(1);
+    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
+
+    now.value += 61 * 60_000;
+    await state.runTick([m], deps); // delivered now
+    expect(notified).toHaveLength(2);
+    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t4)' }]);
+  });
+
+  test("FACTORY-833 (review round 2, PR #800): a status transition held by the rate cap keeps ITS OWN timestamp even after a later unrelated summary-only edit lands before delivery", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", summary: "s0", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, { now });
+    // maxLinkedTurnsPerHour: 1, exhausted by a throwaway change first, so
+    // the real status transition below lands already-capped.
+    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const m = match("jira-work:task:BUTCHR-1", r, owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", summary: "s0", updated: "t2" }); // consumes the one allowed turn
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+
+    // The real status transition this test cares about, landing already capped.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s0", updated: "t3" });
+    await state.runTick([m], deps); // capped — "Done" transition held, dated t3 internally
+    expect(notified).toHaveLength(1);
+
+    // A LATER unrelated edit: summary changes, status stays "Done". Must not
+    // overwrite the already-frozen status-transition timestamp (t3) with t4.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s1", updated: "t4" });
+    await state.runTick([m], deps); // still capped
+    expect(notified).toHaveLength(1);
+    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
+
+    now.value += 61 * 60_000;
+    await state.runTick([m], deps); // delivered — status wins over summary in changeDetail's own priority, dated to its OWN t3, not the later t4
+    expect(notified).toHaveLength(2);
+    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' }]);
+  });
+
+  test("FACTORY-833: two DISTINCT issuelinks (different relationship types) to the SAME target collapse to one watched item (existing dedup-by-target contract) and carry the FIRST link's own id, never a fabricated or merged one", async () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed — one watcher, not two
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1); // ONE event line, not two, for the one target
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect(reason.linked.events).toHaveLength(1);
+    expect(reason.linked.events[0]!.linkId).toBe("100"); // first occurrence (Blocks) wins, same convention `discoverLinkedItems` already uses for kind
+  });
+
+  test("FACTORY-833 (review round 2, PR #800): removing ONE of two distinct links to the same target reports THAT specific link's removal, even though the target remains linked via the sibling", async () => {
+    let bothLinks = true;
+    const owner = () => issue("BUTCHR-1", {
+      issuelinks: (bothLinks ? [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ] : [
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ]) as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps); // seed: both 100 and 200 tracked
+    expect(notified).toHaveLength(0);
+
+    bothLinks = false; // remove link 100; BUTCHR-2 stays linked via 200
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps);
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "100" }] } });
+
+    // Stays absent — must not re-report, and the target itself (still
+    // linked via 200, unchanged) must not separately fire "no longer linked".
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps);
+    expect(notified).toHaveLength(1);
+  });
+
+  test("FACTORY-833 (review round 2, PR #800): removing BOTH distinct links to the same target at once reports BOTH removals, not just one", async () => {
+    let links: "both" | "none" = "both";
+    const owner = () => issue("BUTCHR-1", {
+      issuelinks: (links === "both" ? [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ] : []) as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    links = "none"; // both links gone; the target itself is now fully unlinked too
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect([...reason.linked.events].sort((a, b) => a.linkId!.localeCompare(b.linkId!))).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "100" },
+      { target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "200" },
+    ]); // not just one — and not a third, generic target-level line alongside them
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps); // stays absent — must not re-report
+    expect(notified).toHaveLength(1);
+  });
+
+  test("FACTORY-833 (review round 2, PR #800): adding a SECOND distinct link to an already-tracked target is silently seeded, never a spurious removal or duplicate event", async () => {
+    let links: "one" | "two" = "one";
+    const owner = () => issue("BUTCHR-1", {
+      issuelinks: (links === "two" ? [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ] : [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+      ]) as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps); // seed: just link 100
+    expect(notified).toHaveLength(0);
+
+    links = "two"; // a second, distinct link (200) is added to the same target
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps);
+    expect(notified).toHaveLength(0); // silently seeded — no event for the new link, and no false removal of 100
+
+    // Now removing ONLY 200 (the just-added one) must report ITS removal,
+    // confirming it was genuinely tracked once added, not silently ignored.
+    links = "one";
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), owner())], deps);
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "200" }] } });
+  });
+
   test("maxLinkedItems is respected: a resource never polls more linked items than its cap, remote links included", async () => {
     const owner = issue("BUTCHR-1", {
       issuelinks: [
@@ -234,6 +469,70 @@ describe("BUTCHR-436: linked-change eventing", () => {
     await state.runTick(matches, deps); // must not throw
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] remote-links fetch failed"))).toBe(true);
     expect(notified).toHaveLength(0); // nothing to report yet for either owner (seed poll)
+  });
+
+  test("FACTORY-833: a failed remote-links fetch, on a LATER tick, must not report an already-tracked remote-linked target as 'no longer linked'", async () => {
+    const owner = issue("BUTCHR-1");
+    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
+    const state = createLinkedEventingState();
+    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
+    const { deps, notified, logs } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": [remoteLink] } });
+    const r = rule({ linkedRemoteLinks: true });
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // seed: BUTCHR-9 discovered via remote link, no prior baseline
+    expect(notified).toHaveLength(0);
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // unchanged
+    expect(notified).toHaveLength(0);
+
+    // The remote-links fetch now fails transiently. Without BUTCHR-9's own
+    // real link having been touched, this must NOT synthesize a "no longer
+    // linked" for it — the target simply failed to re-fetch this tick, that
+    // is not positive evidence of removal.
+    deps.remoteLinks = async () => { throw new Error("timeout"); };
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] remote-links fetch failed"))).toBe(true);
+    expect(notified).toHaveLength(0); // the false positive this ticket reports
+
+    // Once the fetch recovers, BUTCHR-9 is still linked and unchanged — no
+    // spurious "re-added" or "changed" event from the baseline having been
+    // preserved through the failed tick.
+    deps.remoteLinks = async (key) => [remoteLink].filter(() => key === "BUTCHR-1");
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(notified).toHaveLength(0);
+  });
+
+  test("FACTORY-833 (review round 1): a genuine removal that happens DURING a failed-fetch tick is still caught, exactly once, on the next successful tick — never lost, never repeated", async () => {
+    const owner = issue("BUTCHR-1");
+    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
+    const state = createLinkedEventingState();
+    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
+    let currentRemoteLinks: JiraRemoteLink[] = [remoteLink];
+    const { deps, notified, logs } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": currentRemoteLinks } });
+    const r = rule({ linkedRemoteLinks: true });
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    // The fetch fails THIS tick. BUTCHR-9 is genuinely removed in the real
+    // world during this same window, but that must not surface yet — the
+    // tick has no trustworthy data to confirm it either way.
+    deps.remoteLinks = async () => { throw new Error("timeout"); };
+    currentRemoteLinks = [];
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] remote-links fetch failed"))).toBe(true);
+    expect(notified).toHaveLength(0);
+
+    // The fetch recovers and now genuinely reports BUTCHR-9 gone — the
+    // watch set was left untouched during the failed tick, so this
+    // comparison is against the last GENUINELY observed membership and
+    // correctly reports the removal, exactly once.
+    deps.remoteLinks = async () => currentRemoteLinks;
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(notified).toHaveLength(1);
+    expect(notified[0]!.reason).toEqual({ linked: { events: [{ target: "BUTCHR-9", kind: "remote-link", detail: "no longer linked", linkId: "1" }] } });
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // still absent — must not re-report
+    expect(notified).toHaveLength(1);
   });
 
   test("a failed batched linked-item search fails open (logs a WARNING and skips the tick — no notify, no false 'unreadable' report for a healthy link)", async () => {
@@ -302,7 +601,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
     expect(reason.linked.events).toEqual([
-      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' },
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' },
       { target: "BUTCHR-404", kind: "issuelink", detail: "unreadable" },
     ]);
   });
@@ -419,6 +718,6 @@ describe("jiraKindLinkedItems", () => {
       { id: "2", globalId: null, relationship: null, url: "https://github.com/brooswit-factory/butchr/pull/1", title: "t2", applicationType: null },
     ];
     const items = jiraKindLinkedItems({ agentKey: "a", rule: rule(), issue: owner }, remoteLinks);
-    expect(items).toEqual([{ kind: "remote-link", target: "BUTCHR-9" }]);
+    expect(items).toEqual([{ kind: "remote-link", target: "BUTCHR-9", linkId: "1" }]);
   });
 });
