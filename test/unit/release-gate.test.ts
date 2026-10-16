@@ -95,6 +95,29 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
     const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Notes\n- unrelated\n")] });
     expect(reasons.some((r) => /x\.md has no bullets under a known section/.test(r))).toBe(true);
   });
+
+  describe("unrecognised headings fail loud instead of silently dropping the bullets under them (FACTORY-192)", () => {
+    test("an unknown-only heading fails, naming the file, the heading, and the valid sections", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Notes\n- unrelated\n")] });
+      expect(reasons.some((r) => /x\.md has unrecognised heading\(s\) "### Notes"/.test(r) && /BREAKING\/Added\/Changed\/Fixed\/Removed/.test(r))).toBe(true);
+    });
+    test("a mixed fragment (one recognised, one unrecognised heading) still fails, even though it has at least one bullet under a known section", () => {
+      const r = evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- kept\n### Notes\n- lost otherwise\n")] });
+      expect(r.ok).toBe(false);
+      expect(r.verdicts.some((v) => !v.ok && /unrecognised heading\(s\) "### Notes"/.test(v.reason))).toBe(true);
+    });
+    test("a multi-word heading fails", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Known Issues\n- a\n")] });
+      expect(reasons.some((r) => /"### Known Issues"/.test(r))).toBe(true);
+    });
+    test("a punctuated heading fails", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Fixed!\n- a\n")] });
+      expect(reasons.some((r) => /"### Fixed!"/.test(r))).toBe(true);
+    });
+    test("a fragment with only recognised headings passes this check", () => {
+      expect(evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a\n")] }).ok).toBe(true);
+    });
+  });
   test("a fragment with a valid bump and at least one bullet passes the content check", () => {
     expect(evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a fix\n")] }).ok).toBe(true);
   });

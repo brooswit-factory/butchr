@@ -73,11 +73,14 @@ export function evaluate(f: Facts): GateResult {
     ? `${f.newFragments.length} new changelog.d/ fragment(s): ${f.newFragments.map((x) => x.path).join(", ")}`
     : `gated files changed but no changelog.d/ fragment was added — create changelog.d/<TICKET>.md starting with "bump: major|minor|patch" on its own line, followed by "### Added"/"### Fixed"/etc. bullets (see changelog.d/README.md)`);
 
-  // 5. per-fragment: a valid declared level, at least one bullet, and BREAKING <=> major.
+  // 5. per-fragment: a valid declared level, no unrecognised heading, at least one bullet, and BREAKING <=> major.
   for (const frag of f.newFragments) {
     v(frag.bump !== null, frag.bump !== null
       ? `${frag.path} declares bump: ${frag.bump}`
       : `${frag.path} has no valid "bump: major|minor|patch" line`);
+    v(frag.unknownHeadings.length === 0, frag.unknownHeadings.length === 0
+      ? `${frag.path} has no unrecognised headings`
+      : `${frag.path} has unrecognised heading(s) ${frag.unknownHeadings.map((h) => `"### ${h}"`).join(", ")} — bullets under these are silently dropped; use one of ${SECTIONS.join("/")}`);
     v(hasContent(frag), hasContent(frag)
       ? `${frag.path} has at least one bullet`
       : `${frag.path} has no bullets under a known section (${SECTIONS.join("/")}) — add at least one describing the change`);
