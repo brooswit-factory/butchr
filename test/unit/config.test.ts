@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, validateAtlassianSiteShape, loadAtlassianConfig } from "../../src/config/config.js";
+import { PROVIDER_ENABLED_ENV_VAR } from "../../src/rules/provider-enablement.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
@@ -87,6 +88,39 @@ describe("loadConfig", () => {
     expect(loadAtlassianConfig({}, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("not configured") });
     expect(loadAtlassianConfig({ ...base, BUTCHR_ATLASSIAN_ENABLED: "false" }, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("disabled") });
     expect(loadAtlassianConfig({ ...base, ATLASSIAN_EMAIL: undefined }, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("misconfigured") });
+  });
+  test("FACTORY-66 review round 2: providerEnabled defaults every registered provider to true, independently of BUTCHR_ATLASSIAN_ENABLED and of each other", () => {
+    const c = loadConfig(base, noRead);
+    expect(c.providerEnabled).toEqual({
+      "jira-work": true, "jira-idea": true, "jira-project": true, "confluence-page": true,
+      "github-issue": true, "github-pr": true, "zendesk-ticket": true, filesystem: true,
+    });
+  });
+  test("FACTORY-66 review round 2: a provider can be individually disabled while its credentials, siblings and BUTCHR_ATLASSIAN_ENABLED all stay untouched — the gap a single combined flag left", () => {
+    // Disable exactly ONE of the four Atlassian-backed providers (confluence-page); the other three, the credential itself, and every non-Atlassian provider are unaffected.
+    const c = loadConfig({ ...base, [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" }, noRead);
+    expect(c.atlassian).toBeDefined(); // the credential itself is untouched
+    expect(c.providerEnabled["confluence-page"]).toBe(false);
+    expect(c.providerEnabled["jira-work"]).toBe(true);
+    expect(c.providerEnabled["jira-idea"]).toBe(true);
+    expect(c.providerEnabled["jira-project"]).toBe(true);
+    expect(c.providerEnabled["github-issue"]).toBe(true);
+    expect(c.providerEnabled["github-pr"]).toBe(true);
+    expect(c.providerEnabled["zendesk-ticket"]).toBe(true);
+    expect(c.providerEnabled.filesystem).toBe(true);
+  });
+  test("FACTORY-66 review round 2: each of the eight providers' switches is settable independently of every other", () => {
+    for (const [provider, envVar] of Object.entries(PROVIDER_ENABLED_ENV_VAR)) {
+      const c = loadConfig({ ...base, [envVar]: "false" }, noRead);
+      for (const [otherProvider, enabled] of Object.entries(c.providerEnabled)) {
+        expect(enabled).toBe(otherProvider === provider ? false : true);
+      }
+    }
+  });
+  test("FACTORY-66 review round 2: describeConfig names exactly the switched-off providers, and nothing when every switch is at its default", () => {
+    expect(describeConfig(loadConfig(base, noRead))).not.toContain("providerSwitchOff");
+    const d = describeConfig(loadConfig({ ...base, [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false", [PROVIDER_ENABLED_ENV_VAR.filesystem]: "false" }, noRead));
+    expect(d).toContain("providerSwitchOff=github-pr,filesystem");
   });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));

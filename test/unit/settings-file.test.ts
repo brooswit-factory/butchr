@@ -14,6 +14,7 @@ import {
   type SettingsFileEnv,
 } from "../../src/settings/settings-file.js";
 import { SETTINGS_DEFINITIONS } from "../../src/web/settings-api.js";
+import { PROVIDER_ENABLED_ENV_VAR } from "../../src/rules/provider-enablement.js";
 
 let dir: string;
 
@@ -101,6 +102,27 @@ describe("validateSettingValue", () => {
     expect(validateSettingValue("BUTCHR_POLL_STALE_MS", under).ok).toBe(false);
     expect(validateSettingValue("BUTCHR_POLL_STALE_MS", under, true).ok).toBe(false);
     expect(validateSettingValue("BUTCHR_POLL_STALE_MS", String(POLL_STALE_MS_FLOOR))).toEqual({ ok: true, normalized: String(POLL_STALE_MS_FLOOR) });
+  });
+
+  // FACTORY-66 review round 2: the eight per-provider switches, persisted
+  // and validated through this SAME settings surface — strict "true"/
+  // "false" only (unlike the lenient env-var read path
+  // `parseProviderEnabledMap` accepts, which this intentionally does not
+  // reuse: see that function's own doc comment, ../rules/provider-enablement.ts).
+  test("BUTCHR_PROVIDER_<PROVIDER>_ENABLED: exactly true/false, every other spelling refused (including the lenient env-var forms this surface deliberately does NOT accept)", () => {
+    const key = PROVIDER_ENABLED_ENV_VAR["jira-work"];
+    expect(validateSettingValue(key, "true")).toEqual({ ok: true, normalized: "true" });
+    expect(validateSettingValue(key, "false")).toEqual({ ok: true, normalized: "false" });
+    for (const bad of ["0", "no", "off", "1", "yes", "TRUE", "False", ""]) {
+      expect(validateSettingValue(key, bad).ok).toBe(false);
+    }
+  });
+
+  test("every one of the eight per-provider switches is independently allowlisted under its own exact name", () => {
+    for (const envVar of Object.values(PROVIDER_ENABLED_ENV_VAR)) {
+      expect(isAllowlistedSettingsKey(envVar)).toBe(true);
+      expect(validateSettingValue(envVar, "false")).toEqual({ ok: true, normalized: "false" });
+    }
   });
 });
 
@@ -192,6 +214,34 @@ describe("loadSettingsFile", () => {
     expect(result.values).toEqual({});
     expect(result.problems[0]).toMatch(/must be a string/);
   });
+
+  // FACTORY-66 review round 2: persistence through the real surface — a
+  // provider switch written to settings.json survives a fresh
+  // `loadSettingsFile` read (the "reload" a restart performs), same as
+  // every other allowlisted key, and an invalid persisted value is
+  // dropped individually (never crashes the whole file, never silently
+  // becomes a DIFFERENT valid value).
+  test("a provider switch persisted in settings.json survives a fresh read (restart-equivalent reload)", () => {
+    const key = PROVIDER_ENABLED_ENV_VAR["confluence-page"];
+    writeFile(JSON.stringify({ [key]: "false", BUTCHR_MAX_AGENTS: "5" }));
+    const result = loadSettingsFile(env());
+    expect(result.values[key]).toBe("false");
+    expect(result.values.BUTCHR_MAX_AGENTS).toBe("5"); // an unrelated key in the same file is unaffected
+    expect(result.problems).toEqual([]);
+    // A second, independent read (simulating a second restart) sees the same persisted value.
+    expect(loadSettingsFile(env()).values[key]).toBe("false");
+  });
+
+  test("an invalid persisted provider-switch value is dropped individually — every other key in the same file still applies", () => {
+    const key = PROVIDER_ENABLED_ENV_VAR["github-pr"];
+    writeFile(JSON.stringify({ [key]: "nope", BUTCHR_MAX_AGENTS: "5" }));
+    const result = loadSettingsFile(env());
+    expect(result.values[key]).toBeUndefined();
+    expect(result.values.BUTCHR_MAX_AGENTS).toBe("5");
+    expect(result.problems.length).toBe(1);
+    expect(result.problems[0]).toContain(key);
+    expect(result.problems[0]).toMatch(/must be "true" or "false"/);
+  });
 });
 
 describe("effectiveSettingsEnv", () => {
@@ -215,5 +265,16 @@ describe("effectiveSettingsEnv", () => {
     const merged = effectiveSettingsEnv(input, { BUTCHR_MAX_AGENTS: "12" });
     expect(input.BUTCHR_MAX_AGENTS).toBeUndefined();
     expect(merged.BUTCHR_MAX_AGENTS).toBe("12");
+  });
+
+  // FACTORY-66 review round 2: a provider switch written through
+  // settings.json (never an env var) still reaches `Config.providerEnabled`
+  // with an UNSET env var, same layering every other allowlisted key has —
+  // this is the full "typed schema/API/UI" round trip the ticket asks for,
+  // short of the actual HTTP write route (covered by settings-api.test.ts).
+  test("a settings.json-only provider switch (no env var set) reaches effectiveSettingsEnv exactly as any other allowlisted key would", () => {
+    const key = PROVIDER_ENABLED_ENV_VAR["zendesk-ticket"];
+    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({}, { [key]: "false" });
+    expect(merged[key]).toBe("false");
   });
 });

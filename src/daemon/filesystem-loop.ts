@@ -27,6 +27,22 @@ export const FILESYSTEM_POLL_MS = 15_000;
 export interface FilesystemLoopDeps {
   /** All validated rules; only enabled `filesystem` rules run. */
   rules: readonly Rule[];
+  /**
+   * FACTORY-66 review round 2 — this provider's own independent on/off
+   * switch (`BUTCHR_PROVIDER_FILESYSTEM_ENABLED`, `../rules/provider-enablement.ts`),
+   * distinct from `rule.enabled` (per-rule). Default `true`. Checked ONCE
+   * here, not re-checked per poll — same startup-only discipline the
+   * daemon's other provider switches already have (this knob needs a
+   * restart to change, same as every other env-derived one); when `false`,
+   * `deps.rules` is substituted with a fixed empty array for every poll
+   * this loop ever runs, so no `filesystem` rule (existing or added later
+   * via a rules reload) is ever matched — this does NOT reintroduce the
+   * "frozen snapshot" problem `createFilesystemResourceType`'s call below
+   * exists to avoid: that concern is about FILTERING RULE CONTENT once at
+   * startup instead of every poll; this is a FIXED, never-reloading
+   * provider-level switch, not a rules snapshot.
+   */
+  enabled?: boolean;
   /** Every resource one query currently matches (src/resources/filesystem.ts#listFilesystemResources). Injectable so tests use a temp dir and an explicit tick — never a sleep-and-hope. */
   list?: (query: FilesystemQuery) => Promise<FilesystemResource[]>;
   herd: Herd;
@@ -61,8 +77,13 @@ export function startFilesystemLoop(deps: FilesystemLoopDeps): Stop {
   // `filesystem` subset on every poll from whatever it reads here, so
   // filtering it ourselves, once, at loop-start would freeze a snapshot a
   // rules reload (`RulesHolder.setRules`) could never update.
+  //
+  // FACTORY-66 review round 2: `deps.enabled === false` is the ONE
+  // exception — see that field's own doc comment for why substituting a
+  // permanently-empty array here is NOT the same mistake: this switch
+  // never reloads, so there is no live snapshot to go stale.
   const type = createFilesystemResourceType({
-    rules: deps.rules,
+    rules: deps.enabled === false ? [] : deps.rules,
     list: deps.list ?? listFilesystemResources,
     log: deps.log,
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsFilesystemAgent),

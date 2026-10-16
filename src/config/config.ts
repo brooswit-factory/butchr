@@ -2,6 +2,8 @@ import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import type { RestoredResumePolicy } from "../agents/argv.js";
 import { MANAGED_ESCALATION_DEFAULTS, OPS_ALERT_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
+import type { ResourceProvider } from "../rules/agent-key.js";
+import { PROVIDER_ENABLED_ENV_VAR, parseProviderEnabledMap } from "../rules/provider-enablement.js";
 
 /**
  * FACTORY-491 — the epic's own reading of an ambiguous director steer
@@ -100,6 +102,23 @@ export interface Config {
   atlassian?: { site: string; email: string; token: string };
   /** Set only when `atlassian` above is `undefined` — names exactly why (disabled, unconfigured, or misconfigured) and which rule providers are not staffed as a result. Never thrown as an exception: see `loadAtlassianConfig`. */
   atlassianDisabledReason?: string;
+  /**
+   * FACTORY-66 review round 2 — ONE independent on/off switch PER
+   * registered `RESOURCE_PROVIDERS` entry (`src/rules/agent-key.ts`), keyed
+   * by provider name, always fully populated (every key present; `true`
+   * unless its own `BUTCHR_PROVIDER_<PROVIDER>_ENABLED` env var/setting is
+   * explicitly falsy — see `parseProviderEnabledMap`,
+   * `src/rules/provider-enablement.ts`). Distinct from BOTH `rule.enabled`
+   * (per-rule) and credential presence (`atlassian`/`github`/Zendesk's own
+   * env vars): an operator can flip exactly one provider off while its
+   * credentials, sibling providers and enabled rules all stay untouched —
+   * the gap the single, coarser `BUTCHR_ATLASSIAN_ENABLED` flag above left
+   * (it still works, and still disables all four Atlassian-backed
+   * providers at once as a convenience — this map is the finer-grained
+   * complement, not a replacement). `src/daemon/index.ts` applies this via
+   * `applyProviderSwitch` on top of each provider's own staffing result.
+   */
+  providerEnabled: Record<ResourceProvider, boolean>;
   /** Port the daemon serves the MCP endpoint and the live-view webapp on. */
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
@@ -745,6 +764,15 @@ export interface ConfigEnv {
   ATLASSIAN_TOKEN_FILE?: string | undefined;
   /** FACTORY-66: explicit opt-out — "false"/"0"/"no"/"off" (case-insensitive) disables Atlassian regardless of what ATLASSIAN_* is set, bypassing setup mode too. Unset/anything else leaves today's presence-based behavior unchanged. */
   BUTCHR_ATLASSIAN_ENABLED?: string | undefined;
+  /** FACTORY-66 review round 2: one independent on/off switch per registered RESOURCE_PROVIDERS entry — see `Config.providerEnabled`'s own doc comment and `src/rules/provider-enablement.ts`'s `PROVIDER_ENABLED_ENV_VAR` for the full name list and the "false"/"0"/"no"/"off" convention each one shares with BUTCHR_ATLASSIAN_ENABLED above. */
+  BUTCHR_PROVIDER_JIRA_WORK_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_JIRA_IDEA_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_JIRA_PROJECT_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_CONFLUENCE_PAGE_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_GITHUB_ISSUE_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_GITHUB_PR_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_ZENDESK_TICKET_ENABLED?: string | undefined;
+  BUTCHR_PROVIDER_FILESYSTEM_ENABLED?: string | undefined;
   BUTCHR_PORT?: string | undefined;
   HERDR_SOCKET?: string | undefined;
   BUTCHR_TERMINAL?: string | undefined;
@@ -843,6 +871,10 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const atlassianResult = loadAtlassianConfig(env, readFile);
   const atlassian = atlassianResult.config;
   const atlassianDisabledReason = atlassianResult.disabledReason;
+
+  // FACTORY-66 review round 2: one independent switch per registered
+  // provider — see `Config.providerEnabled`'s own doc comment.
+  const providerEnabled = parseProviderEnabledMap(env as Record<string, string | undefined>);
 
   const port = parsePort(env);
 
@@ -1064,6 +1096,7 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(atlassian ? { atlassian } : {}),
     ...(atlassianDisabledReason ? { atlassianDisabledReason } : {}),
     ...(githubTokenReadError ? { githubTokenReadError } : {}),
+    providerEnabled,
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
@@ -1341,6 +1374,11 @@ export const describeConfig = (c: Config): string =>
   `provider=${c.agent?.provider ?? "claude"} model=${c.agent?.model ?? "provider-default"} ` +
   `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
   `${c.atlassian ? `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars)` : `atlassian=disabled (${c.atlassianDisabledReason ?? "not configured"})`} port=${c.port} ` +
+  // FACTORY-66 review round 2: the per-provider switches, named only when
+  // at least one is OFF (a fleet where every provider is at its default
+  // "on" need not clutter every startup banner with eight redundant
+  // "=enabled"s) — see `Config.providerEnabled`'s own doc comment.
+  `${(() => { const off = (Object.entries(c.providerEnabled) as Array<[string, boolean]>).filter(([, v]) => !v).map(([k]) => k); return off.length ? `providerSwitchOff=${off.join(",")} ` : ""; })()}` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : `disabled${c.githubTokenReadError ? ` (${c.githubTokenReadError})` : ""}`} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +

@@ -1,5 +1,6 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { atlassianProviderStaffing } from '../rules/atlassian-staffing.js';
+import { applyProviderSwitch } from '../rules/provider-enablement.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
@@ -617,7 +618,10 @@ const accountNameOf = (id: string): string | undefined =>
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
 // runs and nothing is spawned for one (announced by startGithubIssueLoop).
-const githubStaffing = githubIssueStaffing(getRules(), config.github);
+// FACTORY-66 review round 2: `applyProviderSwitch` applies this provider's
+// OWN independent switch on top of the credential-driven decision above —
+// see that function's own doc comment (src/rules/provider-enablement.ts).
+const githubStaffing = applyProviderSwitch("github-issue", githubIssueStaffing(getRules(), config.github), config.providerEnabled["github-issue"]);
 const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -626,7 +630,7 @@ const githubIssues = githubStaffing.run && config.github
 // Config["github"]'s own doc comment) but are their own provider, staffing
 // gate, client and loop — a rules file with github-issue rules and no
 // github-pr rules stays unaffected, and vice versa.
-const githubPrStaffingResult = githubPrStaffing(getRules(), config.github);
+const githubPrStaffingResult = applyProviderSwitch("github-pr", githubPrStaffing(getRules(), config.github), config.providerEnabled["github-pr"]);
 const githubPrs = githubPrStaffingResult.run && config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -635,14 +639,19 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
 // when an enabled zendesk-ticket rule exists.
-const zendeskStaffing = zendeskTicketStaffing(getRules(), process.env as Record<string, string | undefined>);
+const zendeskStaffing = applyProviderSwitch("zendesk-ticket", zendeskTicketStaffing(getRules(), process.env as Record<string, string | undefined>), config.providerEnabled["zendesk-ticket"]);
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
-// filesystem rules need no external credential — every enabled one always
-// runs, reading the local disk directly (src/resources/filesystem.ts).
+// filesystem rules need no external credential — every enabled one runs,
+// reading the local disk directly (src/resources/filesystem.ts) — UNLESS
+// this provider's own independent switch is off (FACTORY-66 review round
+// 2: see `FilesystemLoopDeps.enabled`'s own doc comment,
+// src/daemon/filesystem-loop.ts).
 const fsRules = filesystemRules(getRules());
+const filesystemEnabled = config.providerEnabled.filesystem;
+const filesystemStaffing = applyProviderSwitch("filesystem", { run: fsRules.length > 0, rules: fsRules, reason: null }, filesystemEnabled);
 
 // FACTORY-998 (FACTORY-66 update): confluence-page rules need no SEPARATE
 // credential — they share Atlassian's `ops` client — but FACTORY-66 means
@@ -655,11 +664,16 @@ const confluencePageEnabledRules = confluencePageRules(getRules());
 // (src/rules/atlassian-staffing.ts) for the shape and the "why one function
 // for four providers" rationale — pulled out into its own module so it has
 // a direct unit test, same discipline as `githubIssueStaffing`/
-// `zendeskTicketStaffing`.
-const jiraWorkStaffing = atlassianProviderStaffing("jira-work", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
-const jiraIdeaStaffing = atlassianProviderStaffing("jira-idea", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
-const jiraProjectStaffing = atlassianProviderStaffing("jira-project", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
-const confluencePageStaffing = atlassianProviderStaffing("confluence-page", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
+// `zendeskTicketStaffing`. FACTORY-66 review round 2: `applyProviderSwitch`
+// then applies EACH of these four providers' OWN independent switch on
+// top — `BUTCHR_ATLASSIAN_ENABLED` above is a single, coarser lever for
+// the whole credential; these four are the finer-grained complement a
+// reviewer asked for (one of the four can be off while the other three
+// and the credential itself stay fully active).
+const jiraWorkStaffing = applyProviderSwitch("jira-work", atlassianProviderStaffing("jira-work", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-work"]);
+const jiraIdeaStaffing = applyProviderSwitch("jira-idea", atlassianProviderStaffing("jira-idea", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-idea"]);
+const jiraProjectStaffing = applyProviderSwitch("jira-project", atlassianProviderStaffing("jira-project", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-project"]);
+const confluencePageStaffing = applyProviderSwitch("confluence-page", atlassianProviderStaffing("confluence-page", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["confluence-page"]);
 
 /**
  * FACTORY-66 — disabled stand-ins for the real Atlassian client/ops, used
@@ -856,7 +870,7 @@ const admissionController = createAdmissionController({
   rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(filesystemStaffing.run ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -1023,8 +1037,8 @@ const zendeskTicketHealth = createResourceLoopHealth({
 });
 const filesystemHealth = createResourceLoopHealth({
   name: "filesystem",
-  enabled: fsRules.length > 0,
-  ...(fsRules.length ? {} : { disabledReason: "no enabled filesystem rules" }),
+  enabled: filesystemStaffing.run,
+  ...(filesystemStaffing.run ? {} : { disabledReason: filesystemStaffing.reason ?? "no enabled filesystem rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
   log: (line) => console.error(line),
 });
@@ -2573,8 +2587,25 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
-  onError: (e) => console.error(`  loop error: ${(e as Error)?.message ?? e}`),
-  onPollSuccess: () => loopHealth.recordSuccess(),
+  // FACTORY-66 review round 2 (P2, brooswit @ 46b4c7f): `jiraWorkHealth`
+  // (added by this ticket, since jira-work can now be disabled like every
+  // other provider) was constructed and included in `/health`'s
+  // `resourceLoops` but nothing ever called its `recordSuccess`/
+  // `recordError` — only the SHARED, generic `loopHealth`/`notifyHealth`
+  // heartbeats below were fed, same as before this ticket. Left alone,
+  // `jiraWorkHealth` would report STALE/`lastSuccessAt: null` forever past
+  // `config.pollStaleMs`, even on a fully healthy, fully-staffed host —
+  // wired alongside the existing calls, never replacing them (the shared
+  // heartbeat below is still this whole daemon's own liveness signal, not
+  // jira-work-specific, and must keep recording exactly as before).
+  onError: (e) => {
+    console.error(`  loop error: ${(e as Error)?.message ?? e}`);
+    jiraWorkHealth.recordError(e);
+  },
+  onPollSuccess: () => {
+    loopHealth.recordSuccess();
+    jiraWorkHealth.recordSuccess();
+  },
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
 
@@ -2742,9 +2773,11 @@ startZendeskTicketLoop({
 // The filesystem rule loop: its own agents and admission bucket, no external
 // credential, none of the Jira-writing detectors above, and its own resource
 // (a file or directory) is never written to by butchr itself.
-if (fsRules.length) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
+if (filesystemStaffing.run) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
+else if (!filesystemEnabled) console.error(`  WARNING: ${filesystemStaffing.reason}`);
 startFilesystemLoop({
   rules: getRules(),
+  enabled: filesystemEnabled,
   herd,
   deliver: async (agent, resource, msg) => {
     const result = await deliverNotice({

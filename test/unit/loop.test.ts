@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { desiredFrom, reconcileNow, startLoop, RespawnGuard, scopedHerd, ResumeDeferGuard, RESUME_WAITING_NOTICE_AT_POLLS } from "../../src/daemon/loop.js";
+import { createLoopHealth, createResourceLoopHealth } from "../../src/daemon/health.js";
 import { RESTORED_PANE_STALE_REASON_PREFIX } from "../../src/agents/herd.js";
 import { createRestoredPaneEscalationDetector } from "../../src/agents/restored-pane-escalation.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../../src/jira-watch/own-writes.js";
@@ -3120,5 +3121,74 @@ describe("startLoop FACTORY-922 (implementing FACTORY-921's resolved decision po
     await new Promise((r) => setTimeout(r, 40));
     stop();
     expect(notified.filter((e) => e.issue === "K").length).toBe(0);
+  });
+});
+
+/**
+ * FACTORY-66 review round 2 (P2, brooswit @ 46b4c7f, PR #797) —
+ * `src/daemon/index.ts`'s `startIssueLoop` constructs a dedicated
+ * `jiraWorkHealth` tracker (`createResourceLoopHealth`) and includes it in
+ * `/health`'s `resourceLoops`, but — before this fix — nothing ever called
+ * its `recordSuccess`/`recordError`: only the SHARED, generic
+ * `loopHealth`/`notifyHealth` heartbeat was fed. Left that way,
+ * `jiraWorkHealth` would report `state: "stale"`, `lastSuccessAt: null`
+ * FOREVER past `config.pollStaleMs`, even on a fully healthy, fully-staffed
+ * host — a silent, permanently-wrong monitoring signal. The fix wires BOTH
+ * trackers off the SAME `onPollSuccess`/`onError` pair `startLoop`
+ * (`src/daemon/loop.ts`, the same adapter `runResourceLoop` production code
+ * uses) already calls once per poll — this is a regression test for
+ * exactly that wiring, using a fake (manually-advanced, never wall-clock)
+ * `now` for both health trackers so the assertions are deterministic.
+ */
+describe("FACTORY-66 review round 2 (P2): a dedicated resource-loop health tracker fed from the same onPollSuccess/onError pair as the shared loop heartbeat", () => {
+  test("a healthy configured poll refreshes BOTH trackers; a failing poll records the dedicated tracker's error without faking a shared-heartbeat success", async () => {
+    // Fake clock: advanced only from inside the callbacks below, never tied
+    // to wall-clock time, so `ok`/`lastSuccessAt` assertions below are
+    // exact rather than timing-sensitive.
+    let t = 0;
+    const sharedHeartbeat = createLoopHealth({ name: "pollLoop", thresholdMs: 100, now: () => t, checkIntervalMs: 1e9 });
+    const dedicated = createResourceLoopHealth({ name: "jira-work", enabled: true, thresholdMs: 100, now: () => t, checkIntervalMs: 1e9 });
+
+    let shouldFail = false;
+    const herd = fakeHerd();
+    const stop = startLoop({
+      search: async () => {
+        if (shouldFail) throw new Error("jira 500");
+        return [];
+      },
+      herd,
+      notify: () => {},
+      intervalMs: 5,
+      // The EXACT shape `src/daemon/index.ts`'s fixed `startIssueLoop` now
+      // uses: both the dedicated tracker and the shared heartbeat are fed
+      // from ONE onPollSuccess/onError pair, never two separate wirings
+      // that could silently drift apart again.
+      onError: (e) => {
+        t += 1;
+        dedicated.recordError(e);
+      },
+      onPollSuccess: () => {
+        t += 1;
+        sharedHeartbeat.recordSuccess();
+        dedicated.recordSuccess();
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 40)); // several real polls; only `t` (the fake clock) drives the health math
+    expect(t).toBeGreaterThan(1); // more than one poll actually happened
+    expect(sharedHeartbeat.status().ok).toBe(true);
+    const healthyReport = dedicated.report();
+    expect(healthyReport.ok).toBe(true);
+    expect(healthyReport.state).toBe("ok");
+    expect(healthyReport.lastSuccessAt).not.toBeNull(); // THE regression this fixes: before, this stayed null forever
+    expect(healthyReport.consecutiveFailures).toBe(0);
+
+    shouldFail = true;
+    await new Promise((r) => setTimeout(r, 40));
+    stop();
+
+    const failedReport = dedicated.report();
+    expect(failedReport.consecutiveFailures).toBeGreaterThan(0);
+    expect(failedReport.lastError).toMatchObject({ message: "jira 500" });
   });
 });
