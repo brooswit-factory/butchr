@@ -1002,25 +1002,37 @@ describe("createEscalator — #team-admin routing for managed-session escalation
 
     // AC 4 extension per FACTORY-367 comment 26758 (the correction that
     // superseded 26602/26603 on this point): chatter injected INSIDE the
-    // extraction window — i.e. among the up-to-6 lines `parsePrompt`
-    // actually takes as `question` — not merely prepended above it.
-    // Measured directly against REAL and TRUST (real captured-pane fixtures
-    // already used throughout this file) at N = 1, 2, 5 injected lines
-    // (the ticket's named drift points), placed immediately before the
-    // option block so they fall inside QUESTION_TAIL(6): the identity DOES
-    // drift for both fixtures at every N — this is FACTORY-378's diagnosed
-    // defect (`parsePrompt` takes the literal last 6 preceding lines with
-    // no anchor to the dialog's own frame), reachable here exactly as
-    // predicted, not a new defect and not something this ticket fixes.
-    // This is the ticket's own explicitly anticipated outcome ("If AC 4 ...
-    // turn out to be unachievable because extraction itself is corrupting
-    // things, that is a legitimate finding — report it with what you
-    // measured... do not reach into prompt.ts") — reported as a comment on
-    // FACTORY-369. What THIS test asserts instead: the per-pane rate cap
-    // already built for exactly this contingency (`MANAGED_TEAM_ADMIN_MAX_PER_HOUR`)
-    // bounds the resulting #team-admin exposure rather than leaving it
-    // unbounded, so a pane whose identity drifts every poll still does not
-    // spam the channel — the outcome AC 4's binding routing spec forbids.
+    // extraction window — i.e. between the real question and the options,
+    // still below the dialog's own frame — not merely prepended above it.
+    //
+    // FACTORY-486 closed this for real dialogs whose question is separated
+    // from its options by a blank line — confirmed, by measuring every real
+    // dialog capture in this repo's `.captures/` corpus, to be true of every
+    // one that draws a frame rule at all (see `extractQuestion`'s own
+    // comment in prompt.ts for the full evidence and its one stated
+    // caveat). Proven directly against real captures — not these two
+    // hand-authored fixtures — in prompt.test.ts's
+    // "FACTORY-486: question/fingerprint invariant to chatter INSIDE the
+    // frame" describe block (pane-cap-weekly-limit-real.txt and a second,
+    // structurally distinct real shape from a BUTCHR-438 capture).
+    //
+    // REAL and TRUST specifically are NOT fixed by this, and this test still
+    // asserts that they drift — not because the fix is incomplete, but
+    // because neither fixture has the structural signal the fix anchors on:
+    // REAL draws no frame rule at all, and TRUST draws a rule but has no
+    // blank line anywhere between its own content and its options (its
+    // comment above claims it is real, verbatim captured text, so this
+    // suite must not invent a blank line into it to make it pass — see
+    // prompt.test.ts's own "stated limitation" test for the same shape,
+    // reconstructed there explicitly as a synthetic example rather than
+    // silently editing a fixture claimed to be verbatim). This is the
+    // ticket's own explicitly anticipated outcome ("If ... some shapes
+    // cannot be made invariant ... that is a legitimate finding — report it
+    // with what you measured") rather than a defect left unfixed by choice.
+    //
+    // The per-pane rate cap below still matters here: whatever residual
+    // drift these two specific unanchored shapes still produce remains
+    // bounded, not unbounded.
     function injectInWindow(fixture: string, n: number): string {
       const lines = fixture.split("\n");
       const optionLineIdx = lines.findIndex((l) => /^\s*(❯|>)?\s*(\d+\.\s+|No, exit|Yes, I trust)/.test(l));
@@ -1028,12 +1040,12 @@ describe("createEscalator — #team-admin routing for managed-session escalation
       return [...lines.slice(0, optionLineIdx), ...chatter, ...lines.slice(optionLineIdx)].join("\n");
     }
 
-    test("AC 4 extension: in-window chatter injection (1/2/5 lines) DOES drift the identity for REAL and TRUST — a measured FACTORY-378 finding, not fixed here", () => {
+    test("AC 4 extension: in-window chatter injection (1/2/5 lines) still drifts the identity for REAL and TRUST specifically — both lack the blank-line separator FACTORY-486's fix anchors on (fixed for real dialogs that have it, see prompt.test.ts)", () => {
       for (const fixture of [REAL, TRUST]) {
         const base = fingerprint(parsePrompt(fixture)!);
         for (const n of [1, 2, 5]) {
           const drifted = fingerprint(parsePrompt(injectInWindow(fixture, n))!);
-          expect(drifted).not.toBe(base); // measured drift, matches FACTORY-378's diagnosis — see comment above
+          expect(drifted).not.toBe(base); // measured, unanchored shapes — see comment above
         }
       }
     });
