@@ -14,7 +14,7 @@ import type { Herd } from "../agents/herd.js";
 import { filesystemNudge, sessionDefinitionFieldNudge } from "../agents/change-nudge.js";
 import { realPathExists, wireManagedSessionArchiveRelease } from "../agents/managed-session-account-release.js";
 import { resourceKeyOf } from "../agents/workspace.js";
-import type { LinkedEventingDeps } from "../jira-watch/linked-eventing.js";
+import type { LinkedEventingDeps, LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import type { FilesystemQuery } from "../resources/filesystem-query.js";
 import { listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { sessionDefinitionsPath, type SessionDefinitionsEnv } from "../resources/session-definition.js";
@@ -136,6 +136,12 @@ export interface ManagedSessionsLoopDeps {
   comments?: LinkedEventingDeps["comments"];
   linkStore?: LinkedEventingDeps["linkStore"];
   isFrozen?: (id: string) => Promise<boolean>;
+  /** FACTORY-137: the daemon's Catamorbius push controller's read-only coverage query, threaded straight through. Optional; omitted, push mode never activates for managed-session project watches. */
+  push?: LinkedEventingDeps["push"];
+  setTimeout?: LinkedEventingDeps["setTimeout"];
+  clearTimeout?: LinkedEventingDeps["clearTimeout"];
+  /** FACTORY-137: called once with this loop's own `LinkedEventingState`, so the daemon can register it with the push controller. */
+  onLinkedEventingState?: (state: LinkedEventingState) => void;
 }
 
 /**
@@ -159,6 +165,10 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
     ...(deps.isFrozen ? { isFrozen: deps.isFrozen } : {}),
     ...(deps.lizardModes ? { lizardModes: deps.lizardModes } : {}),
+    ...(deps.push ? { push: deps.push } : {}),
+    ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
+    ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
+    ...(deps.onLinkedEventingState ? { onLinkedEventingState: deps.onLinkedEventingState } : {}),
   });
   const account = deps.account
     ? wireManagedSessionArchiveRelease(deps.account, { exists: deps.exists ?? realPathExists, ...(deps.env ? { env: deps.env } : {}), ruleId: rule.id })
