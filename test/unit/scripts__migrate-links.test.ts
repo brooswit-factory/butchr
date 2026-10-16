@@ -8,8 +8,8 @@ import {
   type MigrateIssue,
   type MigrateLink,
   type Plan,
+  type ConfigWithAtlassian,
 } from "../../scripts/migrate-links.js";
-import type { Config } from "../../src/config/config.js";
 
 const link = (type: string, direction: "inward" | "outward", key: string, id = "1"): MigrateLink => ({ id, type, direction, key });
 
@@ -274,9 +274,11 @@ describe("summarize / formatTable", () => {
   });
 });
 
-function fakeConfig(): Config {
+function fakeConfig(): ConfigWithAtlassian {
   return {
-    atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" }, port: 7717, stalledMinutes: 10, blockedWakeDebounceMinutes: 10, stalledWakeDebounceMinutes: 30, stalledWakeMaxPerHour: 6, silentStopMode: "dry-run", silentStopSuppressMinutes: 5, idlePokeMode: "dry-run", idlePokeSuppressMinutes: 5, idlePokeMaxPerPoll: 3, abandonedMinutes: 30, atRestMinutes: 10, crashLoopCount: 5, crashLoopWindowMinutes: 60, standDownMaxSleepMinutes: 60, yieldLoopCount: 5, yieldLoopWindowMinutes: 5, unresponsiveMinutes: 5, idleDialogMinutes: 2, pollStaleMs: 60_000, herdrCallTimeoutMs: 10_000, loopWatchdogThresholdMs: 120_000, assignees: {}, captureDir: "/tmp/captures", permissionAuditPath: "/tmp/permission-audit.jsonl", projectAllowlist: [], maxAgents: 8, extensionAuth: { allowedOrigins: [] },
+    atlassian: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" },
+    providerEnabled: { "jira-work": true, "jira-idea": true, "jira-project": true, "confluence-page": true, "github-issue": true, "github-pr": true, "zendesk-ticket": true, filesystem: true },
+    port: 7717, stalledMinutes: 10, blockedWakeDebounceMinutes: 10, stalledWakeDebounceMinutes: 30, stalledWakeMaxPerHour: 6, silentStopMode: "dry-run", silentStopSuppressMinutes: 5, idlePokeMode: "dry-run", idlePokeSuppressMinutes: 5, idlePokeMaxPerPoll: 3, abandonedMinutes: 30, atRestMinutes: 10, crashLoopCount: 5, crashLoopWindowMinutes: 60, standDownMaxSleepMinutes: 60, yieldLoopCount: 5, yieldLoopWindowMinutes: 5, unresponsiveMinutes: 5, idleDialogMinutes: 2, pollStaleMs: 60_000, herdrCallTimeoutMs: 10_000, loopWatchdogThresholdMs: 120_000, assignees: {}, captureDir: "/tmp/captures", permissionAuditPath: "/tmp/permission-audit.jsonl", projectAllowlist: [], maxAgents: 8, extensionAuth: { allowedOrigins: [] },
     managedEscalationRouting: { normalMention: "@admin-assembly", normalRoom: "team-admin", assemblyMention: "@manager-factory", assemblyRoom: "team-engineering", directorMention: "@director", directorRoom: "team-engineering", tier2Minutes: 10, tier3Minutes: 20 },
     opsAlert: { room: "team-admin", mention: "@director", dedupMinutes: 60 },
   };
