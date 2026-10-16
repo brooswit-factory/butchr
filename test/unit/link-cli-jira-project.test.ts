@@ -83,11 +83,18 @@ describe("malformed-config path (FACTORY-19): a bad ATLASSIAN_EMAIL", () => {
 
   test("jiraProjectStoreFromEnv itself throws ONE single-line error, not jira.js's multi-line Zod dump", () => {
     let caught: Error | undefined;
+    console.error("FACTORY-77-DIAG", JSON.stringify({
+      ATLASSIAN_SITE: process.env.ATLASSIAN_SITE,
+      ATLASSIAN_EMAIL: process.env.ATLASSIAN_EMAIL,
+      ATLASSIAN_TOKEN: process.env.ATLASSIAN_TOKEN,
+      ATLASSIAN_TOKEN_FILE: process.env.ATLASSIAN_TOKEN_FILE,
+    }));
     try {
       jiraProjectStoreFromEnv();
     } catch (e) {
       caught = e as Error;
     }
+    console.error("FACTORY-77-DIAG result", JSON.stringify({ caught: !!caught, name: caught?.name, message: caught?.message }));
     expect(caught).toBeDefined();
     expect(caught!.message).not.toContain("\n");
     expect(caught!.message).toMatch(/invalid Atlassian credentials/);
