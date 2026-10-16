@@ -381,11 +381,9 @@ export interface AbandonedDetector {
 
 /**
  * Builds the abandoned-worker detector wired into src/daemon/loop.ts (via
- * src/daemon/index.ts) alongside (never instead of) `parked.ts`'s. See
- * `LoopDeps.checkAbandoned`'s doc comment (src/daemon/loop.ts) for WHY this
- * must be called from the poll's observe function and never from
- * `watch()`'s onChange callback — the same reasoning `checkParked` already
- * documents there.
+ * src/daemon/index.ts). See `LoopDeps.checkAbandoned`'s doc comment
+ * (src/daemon/loop.ts) for WHY this must be called from the poll's observe
+ * function and never from `watch()`'s onChange callback.
  *
  * §3g (this ticket): DO NOT size this module's rate cap for the day-one
  * zero. `MAX_PER_HOUR` matches `parked.ts`'s own cap (3/hour) — not because

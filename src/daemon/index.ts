@@ -89,7 +89,6 @@ import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
-import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
@@ -1717,7 +1716,8 @@ const quotaGate = createQuotaGate(
 // rationale and the own-write ledger hazard it avoids by construction).
 // Always an issue key (syncLabels below is never wired into the project
 // loop further down this file), so `ops.addComment` is the right seam —
-// same one parked.ts uses, no second Atlassian writer.
+// same one every other daemon-side comment write uses, no second Atlassian
+// writer.
 const stallRemediation = createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
@@ -1831,17 +1831,6 @@ const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngin
   deliver: deliverIdlePoke,
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
-// see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
-// every other daemon-side comment write; no second Atlassian writer.
-const parkedDetector = createParkedDetector({
-  now: () => Date.now(),
-  minutes: config.parkedMinutes,
-  addComment: async (issue, text) => { await ops.addComment(issue, text); },
-  comments: (issue) => atlassian.comments(issue),
-  links: (issue) => atlassian.links(issue),
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-95/123/124/141: reads a resource's own channel — shared by the
 // frozen-asleep detector below, BOTH crash-loop detector instances further
 // down, and the blocked-dialog escalator (`escalator`'s `ownChannelComments`
@@ -1851,14 +1840,12 @@ const parkedDetector = createParkedDetector({
 // hand there — see that function's own doc comment for the full mechanism
 // (routing, the single-id call shape, and the BUTCHR-129 unwrap history).
 // `issueComments` is injected as `atlassian.comments`, the same client
-// `stalled`/`parkedDetector` above already use.
+// `stalled` above already uses.
 const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comments(key));
 // BUTCHR-200: escalates a worker whose Implements boss reached Done while it
-// is still open — see src/agents/abandoned.ts. Unlike parkedDetector above
-// (which predates the BUTCHR-95/123/141 comment-read-path fix and still
-// uses the raw `atlassian.comments` call, deliberately not corrected here —
-// out of scope), this reads through `ownChannelComments`, the tier-aware
-// reader, per this ticket's own requirement. Posts through the same
+// is still open — see src/agents/abandoned.ts. This reads through
+// `ownChannelComments`, the tier-aware reader, per this ticket's own
+// requirement. Posts through the same
 // `ops.addComment` seam as every other daemon-side comment write; no second
 // Atlassian writer. ON by default (see the wiring below): this detector's
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
@@ -2421,7 +2408,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   // for a model/effort-only deferral (src/daemon/loop.ts's own split at the
   // `RESTORED_PANE_STALE_REASON_PREFIX` check).
   checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
-  // Label sync and the parked/abandoned detectors work per TICKET, so they
+  // Label sync and the abandoned detector work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => {
     // FACTORY-845: refresh this poll's per-issue idle-poke rule config
@@ -2433,7 +2420,6 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     stalledMinutesByIssue = stalledMinutesForIssues(matches);
     return syncLabels(uniqueIssues(matches));
   },
-  checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
   checkReconcileFailure: issueReconcileFailureDetector.check,

@@ -620,7 +620,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
         // `reconcileNow` in `runResourceLoop`, src/daemon/loop.ts), so a
         // just-spawned owning agent already exists before this ever tries to
         // nudge it. Belt-and-suspenders try/catch, same discipline as
-        // `checkParked`/`checkAbandoned` (src/daemon/loop.ts): a failure here
+        // `checkAbandoned` (src/daemon/loop.ts): a failure here
         // must never take down `related()`'s own return value, which the
         // Implements/Relates/scope-ownership related-resource mechanism
         // below still depends on regardless of this feature. Only runs when

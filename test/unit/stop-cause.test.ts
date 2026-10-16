@@ -6,7 +6,7 @@ import {
   workspaceStopCause, persistIntentionalStop, clearStopCause,
   recordIntentionalStop, clearIntentionalStop, classifyStop,
 } from "../../src/agents/stop-cause.js";
-import { EXEMPT_LABEL } from "../../src/agents/parked.js";
+import { EXEMPT_LABEL } from "../../src/labels/plan.js";
 
 describe("FACTORY-849/FACTORY-852: workspaceStopCause / persistIntentionalStop / clearStopCause — modelled on workspaceSessionId's own ENOENT discipline", () => {
   test("persistIntentionalStop writes what workspaceStopCause reads back", () => {

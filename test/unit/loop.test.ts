@@ -2587,25 +2587,24 @@ describe("startLoop respawn wiring", () => {
   });
 });
 
-describe("startLoop checkParked wiring (BUTCHR-24)", () => {
+describe("startLoop checkAbandoned wiring (BUTCHR-200)", () => {
   // @brooswit/sundry's watch() only calls its onChange callback when the
   // polled snapshot's hash differs from the previous one — a detector wired
   // into onChange would silently stop firing on any poll whose snapshot
-  // doesn't change. checkParked must be invoked from the observe function
-  // instead, so it runs on EVERY poll, changed or not — this is the trap the
-  // ticket calls out, and it needs its own test, independent of anything the
-  // parked predicate itself does.
-  test("checkParked runs on every poll, including a poll whose (issues, related) snapshot is identical to the previous one", async () => {
+  // doesn't change. checkAbandoned must be invoked from the observe function
+  // instead, so it runs on EVERY poll, changed or not — this needs its own
+  // test, independent of anything the abandoned predicate itself does.
+  test("checkAbandoned runs on every poll, including a poll whose issues snapshot is identical to the previous one", async () => {
     const herd = fakeHerd();
-    const calls: Array<{ issues: JiraIssue[]; related: unknown[] }> = [];
-    // The SAME issue/related snapshot every poll — watch()'s hash never
-    // changes, so onChange would never fire if checkParked were wired there.
+    const calls: Array<{ issues: JiraIssue[] }> = [];
+    // The SAME issue snapshot every poll — watch()'s hash never changes, so
+    // onChange would never fire if checkAbandoned were wired there.
     const stop = startLoop({
       search: async () => [iss("A", "In Progress")],
       related: async () => [],
       herd,
       notify: () => {},
-      checkParked: async (issues, related) => { calls.push({ issues: [...issues], related: [...related] }); },
+      checkAbandoned: async (issues) => { calls.push({ issues: [...issues] }); },
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 55));
@@ -2616,7 +2615,7 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
     expect(calls[0]!.issues[0]!.key).toBe("A");
   });
 
-  test("a checkParked rejection is caught: does not stop the loop, and does not appear as a notify or onError event", async () => {
+  test("a checkAbandoned rejection is caught: does not stop the loop, and does not appear as a notify or onError event", async () => {
     const herd = fakeHerd();
     let calls = 0;
     const errors: unknown[] = [];
@@ -2625,14 +2624,14 @@ describe("startLoop checkParked wiring (BUTCHR-24)", () => {
       related: async () => [],
       herd,
       notify: () => {},
-      checkParked: async () => { calls++; throw new Error("boom"); },
+      checkAbandoned: async () => { calls++; throw new Error("boom"); },
       onError: (e) => errors.push(e),
       intervalMs: 10,
     });
     await new Promise((r) => setTimeout(r, 35));
     stop();
     expect(calls).toBeGreaterThan(1); // kept polling despite the rejection
-    expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkParked's internal errors
+    expect(errors).toEqual([]); // startLoop's own onError is for the fetch/reconcile stage, not checkAbandoned's internal errors
   });
 });
 

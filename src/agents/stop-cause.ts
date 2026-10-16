@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { workspaceDirsForResource } from "./workspace.js";
-import { EXEMPT_LABEL } from "./parked.js";
+import { EXEMPT_LABEL } from "../labels/plan.js";
 
 /**
  * FACTORY-849/FACTORY-852 — the durable half of "why did this workspace's

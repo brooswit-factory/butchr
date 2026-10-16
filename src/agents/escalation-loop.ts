@@ -160,7 +160,7 @@ export interface EscalatorDeps {
   /**
    * BUTCHR-124: minutes a pane must be reported blocked, with text that does
    * not parse as a recognized dialog, CONTINUOUSLY (see onNoPrompt), before
-   * the sustained-unresponsive alarm fires. Mirrors parkedMinutes/
+   * the sustained-unresponsive alarm fires. Mirrors
    * idleDialogMinutes/stalledMinutes — an in-memory floor, so a daemon
    * restart mid-episode costs at most one threshold's delay (see onNoPrompt's
    * doc comment on `unresponsive`).

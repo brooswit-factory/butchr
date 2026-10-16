@@ -8,7 +8,7 @@
  * other Confluence/Jira read path already uses is always available here
  * too — no new credential, no new staffing predicate.
  *
- * Gets none of the Jira work loop's label sync or parked/abandoned/stall
+ * Gets none of the Jira work loop's label sync or abandoned/stall
  * detectors — those write Jira-work conventions no Confluence page has.
  * `ownsId` scopes reconciliation to `confluence-page` agents, so no loop
  * can stop another's.

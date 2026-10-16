@@ -320,7 +320,7 @@ export interface WorkerRef {
  * carries `butchr:orphan`/`pr:merged`, and neither appears on BUTCHR-156's
  * outward link to it). So this can answer "is this worker Done" for free,
  * but it can NEVER answer "does this worker carry `butchr:shelved`"
- * (`EXEMPT_LABEL`, src/agents/parked.ts) from this payload alone — a caller
+ * (`EXEMPT_LABEL`, src/labels/plan.ts) from this payload alone — a caller
  * that needs the shelved-exemption has to pay for a SEPARATE `getIssue` per
  * non-Done worker to find out. That cost, and where it's paid, lives in
  * relationship.ts's own open-worker guard, not here — this function's only
