@@ -66,6 +66,16 @@ describe("nativeJiraRefs", () => {
   test("missing issuelinks (absent) and null parent produce no refs, never throw", () => {
     expect(nativeJiraRefs({ key: "BUTCHR-1", parent: null })).toEqual([]);
   });
+
+  test("FACTORY-488: excludes an Implements link with otherEnd 'outward' (a boss's implementer, routed via the related chain instead — jiraKindLinkedItems never represents it either)", () => {
+    const issue = { key: "BUTCHR-1", issuelinks: [link("Implements", "outward", "BUTCHR-2"), link("Blocks", "outward", "BUTCHR-3")], parent: null };
+    expect(nativeJiraRefs(issue).map((r) => (r as { key: string }).key)).toEqual(["BUTCHR-3"]);
+  });
+
+  test("FACTORY-488: an Implements link with otherEnd 'inward' (this issue is the implementer, hearing its own boss) is NOT excluded — only the outward direction is routed away", () => {
+    const issue = { key: "BUTCHR-1", issuelinks: [link("Implements", "inward", "BUTCHR-9")], parent: null };
+    expect(nativeJiraRefs(issue).map((r) => (r as { key: string }).key)).toEqual(["BUTCHR-9"]);
+  });
 });
 
 describe("resourceRefToLinkedItem", () => {
@@ -135,5 +145,15 @@ describe("managedLinkedItems", () => {
   test("no managed links at all -> empty array, one cheap store read", async () => {
     const owner = ref("jira-work-item:BUTCHR-1");
     expect(await managedLinkedItems(owner, [], fakeLinkStore())).toEqual([]);
+  });
+
+  test("FACTORY-488: a managed-tracked child that becomes natively Implements-linked (e.g. on adoption) stays 'managed'-origin — nativeJiraRefs excludes the Implements/outward link, so this keeps reporting it rather than silently dropping it (which `linked-eventing.ts`'s removal detection would otherwise read as \"no longer linked\")", async () => {
+    const owner = ref("jira-work-item:BUTCHR-1");
+    const store = fakeLinkStore();
+    await addLink(store, owner, ref("jira-work-item:BUTCHR-2"));
+    const issueBeforeAdoption = { key: "BUTCHR-1", issuelinks: [], parent: null };
+    expect(await managedLinkedItems(owner, nativeJiraRefs(issueBeforeAdoption), store)).toEqual([{ kind: "jira-key", target: "BUTCHR-2" }]);
+    const issueAfterAdoption = { key: "BUTCHR-1", issuelinks: [link("Implements", "outward", "BUTCHR-2")], parent: null };
+    expect(await managedLinkedItems(owner, nativeJiraRefs(issueAfterAdoption), store)).toEqual([{ kind: "jira-key", target: "BUTCHR-2" }]);
   });
 });
