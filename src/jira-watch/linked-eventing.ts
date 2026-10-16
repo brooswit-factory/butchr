@@ -861,7 +861,7 @@ export function createLinkedEventingState(): LinkedEventingState {
   // this exists alongside `watchSets`. Advanced only inside the SAME
   // `advance()` as every other per-owner state (delayed, not lost on a
   // rate-capped tick).
-  const issuelinkMembership = new Map<string, Map<string, string>>();
+  const issuelinkMembership = new Map<string, ReadonlyMap<string, string>>();
   const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
 
   // FACTORY-137 PUSH MODE — every map below is this instance's OWN (D9:
