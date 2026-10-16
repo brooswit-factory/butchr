@@ -188,10 +188,10 @@ export function prTransition(before: JiraIssue, after: JiraIssue): { from: strin
  *   that, like `[butchr:blocked]`, waits on an ANSWER reply.
  *
  * Every other current marker (`[butchr:reconcile]`, `[butchr:crashloop]`,
- * `[butchr:parked]`, `[butchr:abandoned]`, `[butchr:pinned]`,
+ * `[butchr:abandoned]`, `[butchr:pinned]`,
  * `[butchr:frozen]`, `[butchr:yieldloop]`, `[butchr:resume]`,
  * `[butchr:restored-degraded]`) is bookkeeping: an observational log line
- * for a human reader (even parked.ts's/abandoned.ts's boss-escalation
+ * for a human reader (even abandoned.ts's boss-escalation
  * stages are phrased as information, resolved by a human or a later
  * `shelve_worker`/`finish_worker` call, never by an agent replying to THIS
  * comment with an ANSWER) — none of these is swallowed by this change

@@ -1,5 +1,4 @@
-import { ADMISSION_PREFIX, AGENT_PREFIX, PR_PREFIX, type AdmissionLabel, type AgentLabel, type PrState } from "./plan.js";
-import { EXEMPT_LABEL } from "../agents/parked.js";
+import { ADMISSION_PREFIX, AGENT_PREFIX, PR_PREFIX, EXEMPT_LABEL, type AdmissionLabel, type AgentLabel, type PrState } from "./plan.js";
 import { ORPHAN_LABEL, MISSING_IMPLEMENTS_LABEL } from "../tools/relationship.js";
 
 /**

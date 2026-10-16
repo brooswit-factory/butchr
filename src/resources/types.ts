@@ -10,7 +10,7 @@
  *
  * Everything NOT named here (spawn, argv, panes, escalation, labels, docs)
  * stays SHARED across every resource type — see src/agents/workspace.ts,
- * src/agents/argv.ts, src/agents/herd.ts, src/agents/parked.ts, src/labels/*.
+ * src/agents/argv.ts, src/agents/herd.ts, src/labels/*.
  * A resource type's spawnConfig member only ever produces the
  * (already-shared) SpawnSpec those consume; it never re-implements them.
  *
@@ -30,7 +30,7 @@ import type { SpawnSpec } from "../agents/workspace.js";
  * predates genericity, back when `T` was always `JiraIssue`) and is kept
  * as-is rather than renamed — see src/daemon/loop.ts's `RelatedIssue` alias,
  * which is this same type under the name and default type param existing
- * callers (e.g. src/agents/parked.ts) already depend on.
+ * callers already depend on.
  */
 export interface RelatedResource<T> {
   issue: T;

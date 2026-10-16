@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, resolveBoss, type DocResult, type WorkerRef } from "./docs.js";
-import { EXEMPT_LABEL } from "../agents/parked.js";
+import { EXEMPT_LABEL } from "../labels/plan.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
@@ -3160,11 +3160,10 @@ export interface FileWhereItBelongsResult {
  * filed To Do, staffed by role exactly as jira_create_issue staffs it today,
  * and stays there until some future boss calls adopt_worker on it.
  *
- * NEVER LABELLED `EXEMPT_LABEL` (butchr:shelved): `parkedCandidates`
- * (src/agents/parked.ts) only ever walks tickets reachable by an Implements
- * link off the active set, and this ticket has none — the parked detector
- * structurally cannot see it, so that label here would be cargo-culted state
- * meaning nothing. Labelled `ORPHAN_LABEL` instead, which is what actually
+ * NEVER LABELLED `EXEMPT_LABEL` (butchr:shelved): this ticket has no
+ * Implements link to any boss yet, so the shelved exemption — which exists
+ * to mark a child deliberately left idle under a LIVE boss — would be
+ * cargo-culted state meaning nothing here. Labelled `ORPHAN_LABEL` instead, which is what actually
  * makes it discoverable (a saved JQL filter) — withdrawn by `adoptWorker` /
  * `adoptProjectWorker` the moment this ticket gains a boss and stops being
  * undirected (BUTCHR-108/BUTCHR-137); see the comment at those

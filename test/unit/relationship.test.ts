@@ -9,7 +9,7 @@ import {
   ORPHAN_HEADER_OPEN_LINE, ORPHAN_HEADER_CLOSE_LINE, HEADER_WITHDRAWN_MARKER, guardShortProse, SWALLOWED_ARGUMENT_RE,
   checkWorker, STAFFING_PENDING, STAFFING_NOT_ACTIVE, MISSING_IMPLEMENTS_LABEL,
 } from "../../src/tools/relationship.js";
-import { EXEMPT_LABEL } from "../../src/agents/parked.js";
+import { EXEMPT_LABEL } from "../../src/labels/plan.js";
 import { workspaceStopCause, persistIntentionalStop } from "../../src/agents/stop-cause.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BUTCHR_164_MANGLED_DESTINATION, BUTCHR_127_MANGLED_DESTINATION } from "../fixtures/swallowed-argument-specimens.js";
@@ -1730,7 +1730,7 @@ describe("fileWhereItBelongs: case A — destination is an existing epic key", (
     expect(created.description).toMatch(/Epic BUTCHR-1/);
     expect(created.description).toMatch(/Filed by: BUTCHR-7/);
     expect(created.labels).toContain(ORPHAN_LABEL);
-    expect(created.labels).not.toContain(EXEMPT_LABEL); // never cargo-culted — parkedCandidates can't see this ticket anyway
+    expect(created.labels).not.toContain(EXEMPT_LABEL); // never cargo-culted — this ticket has no Implements link to a boss anyway
     expect(created.bossKey).toBeUndefined(); // TRUE ORPHAN — no Implements link, ever
     expect(created.status).toBe("To Do"); // staffed by role, never transitioned
     expect(created.assignee).toBe(ROLES.task);

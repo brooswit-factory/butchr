@@ -25,11 +25,32 @@ export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX)
 export const isAdmissionLabel = (label: string): boolean => label.startsWith(ADMISSION_PREFIX);
 
 /**
- * BUTCHR-24: `butchr:shelved` (src/agents/parked.ts's `EXEMPT_LABEL`) is NOT
- * a daemon-owned label, deliberately — it is READ-ONLY for the DAEMON'S OWN
- * label machinery (this file, and the poll-loop reconciler and
- * `sweepStaleAgentLabels`, src/labels/sweep.ts, that it drives): that
- * machinery only ever READS it (to skip escalating a parked child) and must
+ * A ticket carrying this label is a deliberately-shelved backlog item under
+ * a live boss — a recorded decision in force right now, set when the
+ * decision is made and CLEARED when the decision is reversed (BUTCHR-50), not
+ * a history. Any actor may SET it — a human by hand, or `shelve_worker`
+ * (src/tools/relationship.ts), which is the vocabulary that standardises on
+ * it; `start_worker`/`finish_worker`/`adopt_worker(..., "start")` (same file)
+ * clear it as part of reversing the decision it records. A label set BY HAND
+ * is never cleared for anybody; whoever sets one that way owns clearing it
+ * when the ticket is reactivated.
+ *
+ * FACTORY-190: moved here from the now-retired `src/agents/parked.ts` (the
+ * dormant parked-ticket escalation detector, BUTCHR-24), whose own
+ * construction/wiring was removed because its sole production call site
+ * (src/daemon/index.ts) always supplied an empty `related` set and so could
+ * never produce a candidate — this label's semantics and every consumer
+ * (src/agents/stop-cause.ts, src/labels/registry.ts, src/tools/
+ * relationship.ts, and their regression tests) are unchanged by that
+ * removal.
+ */
+export const EXEMPT_LABEL = "butchr:shelved";
+
+/**
+ * BUTCHR-24: `butchr:shelved` is NOT a daemon-owned label, deliberately — it
+ * is READ-ONLY for the DAEMON'S OWN label machinery (this file, and the
+ * poll-loop reconciler and `sweepStaleAgentLabels`, src/labels/sweep.ts,
+ * that it drives): that machinery only ever READS it and must
  * never add or remove it itself. Do NOT fold it into `isDaemonLabel` below:
  * doing so would make `sweepStaleAgentLabels` treat it as daemon-owned and
  * silently strip a deliberate exemption the moment the ticket left the
