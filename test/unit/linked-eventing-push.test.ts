@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import type { NotifyReason } from "../../src/resources/types.js";
-import { createLinkedEventingState, type LinkedEventingDeps, type LinkedEventingMatch } from "../../src/jira-watch/linked-eventing.js";
+import { createLinkedEventingState, type LinkedEventingDeps, type LinkedEventingMatch, type ProjectLinkedEventingMatch } from "../../src/jira-watch/linked-eventing.js";
 
 const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
   parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "do it", linkedEventing: true, ...over }] })[0]!;
@@ -505,5 +505,59 @@ describe("FACTORY-137 T3/T4: dirty generation and rate-cap interaction", () => {
 
     expect(notified).toHaveLength(1); // exactly one notify for the one real change, despite the overlap attempt
     expect(searchCalls).toHaveLength(1); // the on-demand pass found nothing dirty left once serialized behind the tick -> no second fetch
+  });
+});
+
+describe("FACTORY-137 review round 2 (P2): an on-demand pass over a project MEMBER target must not reuse a stale member snapshot", () => {
+  const KEY_IN_RE = /^key in \((.*)\)$/;
+  const PROJECT_JQL_RE = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updated ASC$/;
+
+  test("a dirty project member is re-fetched fresh by runDirtyPass, not diffed against the regular tick's own cached member object", async () => {
+    const projRule: Rule = parseRules({ rules: [{ id: "mgrs", resourceProvider: "jira-project", query: '{"keys":["BUTCHR"]}', brief: "manage it", linkedEventing: true }] })[0]!;
+    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do", updated: "2026-10-01T00:00:00.000+0000" }) };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const state = createLinkedEventingState();
+    const { push } = fakePush();
+    const searchCalls: string[] = [];
+    const notified: Array<{ reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        searchCalls.push(jql);
+        const keyIn = KEY_IN_RE.exec(jql);
+        if (keyIn) return keyIn[1]!.split(",").map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+        const proj = PROJECT_JQL_RE.exec(jql);
+        if (proj) return (membersByProject[proj[1]!] ?? []).map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+        throw new Error(`fakeDeps: unexpected JQL ${JSON.stringify(jql)}`);
+      },
+      notify: async (_a, _b, reason) => { notified.push({ reason }); },
+      push,
+    };
+    const pm: ProjectLinkedEventingMatch = { agentKey: "jira-project:mgrs:BUTCHR", rule: projRule, projectKey: "BUTCHR" };
+
+    await state.runTick([], deps, [pm]); // tick 1: seeds the project watermark, searches nothing yet (real Jira window semantics)
+    membersByProject.BUTCHR = ["BUTCHR-1"]; // falls inside the next window
+    await state.runTick([], deps, [pm]); // tick 2: member discovered fresh via the project search, reported once, baseline seeded — and cached in THIS tick's own `memberFetchedByKey`
+    expect(notified).toHaveLength(1);
+
+    // The member falls back out of the window (nothing for polling to find
+    // next tick either way), but a REAL authoritative status change lands,
+    // signaled via a push notification instead of waiting for the next
+    // regular project tick.
+    membersByProject.BUTCHR = [];
+    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "In Progress", updated: "2026-10-01T00:05:00.000+0000" });
+    state.markDirty("jira:BUTCHR-1");
+    notified.length = 0;
+    const searchCallsBeforeDirtyPass = searchCalls.length;
+    await state.runDirtyPass(); // reuses tick 2's own PassContext (lastPassContext), WITHOUT rerunning project member discovery (D3)
+
+    // Must have performed a FRESH `key in (...)` fetch for BUTCHR-1 — not
+    // silently treated as "already fetched" using tick 2's now-stale cached
+    // member object — and delivered exactly one notification for the real
+    // change, with no further regular tick required.
+    const newKeyInCalls = searchCalls.slice(searchCallsBeforeDirtyPass).filter((c) => KEY_IN_RE.test(c) && c.includes("BUTCHR-1"));
+    expect(newKeyInCalls).toHaveLength(1);
+    expect(notified).toHaveLength(1);
+    const events = (notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } }).linked.events;
+    expect(events.some((e) => e.target === "BUTCHR-1" && e.detail.includes("In Progress"))).toBe(true);
   });
 });

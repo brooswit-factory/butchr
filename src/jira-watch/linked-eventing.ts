@@ -980,16 +980,36 @@ export function createLinkedEventingState(): LinkedEventingState {
     // every opted owner this tick — never one call per linked item, never
     // one per owner. BUTCHR-437: filtered to Jira-kind targets only.
     // BUTCHR-469 (review round 1 fix): a target already fetched by a
-    // project owner's own member-discovery search this tick is excluded
-    // (`memberFetchedByKey` — always empty for an on-demand pass, which
-    // never redoes discovery). FACTORY-137 (D2/T1): a covered, skippable
-    // target is excluded too — see `coverageSkip` above; the per-item loop
-    // below treats it as SKIPPED, never "unreadable".
+    // project owner's own member-discovery search THIS SAME REGULAR TICK is
+    // excluded — `ctx.memberFetchedByKey` holds that tick's own fresh
+    // member objects, so re-fetching them via this generic key-in call
+    // would be a redundant second fetch for data already in hand.
+    //
+    // FACTORY-137 review round 2 (P2) fix: that dedup is ONLY valid for a
+    // genuine regular tick (`!restrict`). `ctx` for an on-demand pass
+    // (`restrict` set) is `lastPassContext` — the PRIOR regular tick's own
+    // `PassContext`, reused WITHOUT rediscovery per D3's own "no fresh
+    // discovery calls" contract. Its `memberFetchedByKey` is therefore a
+    // STALE snapshot from that prior tick, not "already fetched this
+    // pass". Skipping a dirty member target's fetch here because it
+    // appears in that stale map would silently diff it against its own
+    // stale snapshot, find nothing, clear the dirty mark, and wait for the
+    // next regular project tick to ever notice — the exact "never skip
+    // without a trustworthy answer" discipline this module otherwise holds
+    // everywhere else. So: apply the member-dedup only when NOT restricted;
+    // an on-demand pass always re-fetches a dirty/resync-pending member
+    // through this SAME generic batched call instead (no discovery call is
+    // added — this is the ordinary per-tick Jira-kind fetch every target
+    // already goes through, just no longer skipped for a member specifically
+    // because of now-stale data).
+    // FACTORY-137 (D2/T1): a covered, skippable target is excluded too —
+    // see `coverageSkip` above; the per-item loop below treats it as
+    // SKIPPED, never "unreadable".
     const allTargets = new Set<string>();
     for (const [agentKey, items] of perOwnerItems) {
       void agentKey;
       for (const i of items) {
-        if (!JIRA_DISCOVERY_KINDS.has(i.kind) || ctx.memberFetchedByKey.has(i.target)) continue;
+        if (!JIRA_DISCOVERY_KINDS.has(i.kind) || (!restrict && ctx.memberFetchedByKey.has(i.target))) continue;
         if (ignoredByRestrict(i)) continue;
         const wk = watchKeyOfTarget.get(i.target);
         if (wk && coverageSkip.has(wk)) continue;
