@@ -186,7 +186,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   function buildFieldsPatch(): RuleFieldPatch {
     const patch: RuleFieldPatch = {};
     if (draftQuery !== rule.query) patch.query = draftQuery;
-    if (draftPermissionMode !== (rule.permissionMode ?? "")) patch.permissionMode = draftPermissionMode || undefined;
+    if (draftPermissionMode && draftPermissionMode !== (rule.permissionMode ?? "")) patch.permissionMode = draftPermissionMode;
     if (draftLizardMode !== (rule.lizardMode ?? false)) patch.lizardMode = draftLizardMode;
     if (draftRole !== (rule.role ?? "worker")) patch.role = draftRole;
     // FACTORY-846: diff against the rule's current (possibly-null) value —
