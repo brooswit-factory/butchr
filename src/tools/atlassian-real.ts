@@ -209,6 +209,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
         throw e;
       }),
 
+    // FACTORY-19: a dedicated existence check against the project ITSELF
+    // (GET /rest/api/3/project/{projectIdOrKey}), never the property
+    // endpoint — that's the whole point, see this op's own doc comment on
+    // AtlassianOps for why getProjectPropertyOrNull's 404 alone can't tell
+    // "no such project" from "project exists, property never written".
+    projectExists: (projectKey) =>
+      jira.projects.getProject({ projectIdOrKey: projectKey }).then(() => true).catch((e: unknown) => {
+        if (isNotFoundError(e)) return false;
+        throw e;
+      }),
+
     // getRemoteIssueLinks with a `globalId` 404s (jira.js throws NotFoundError)
     // when no such link exists, rather than resolving an empty result (MEASURED
     // live against BUTCHR-33) — every caller wants one "not found" shape, so

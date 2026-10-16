@@ -74,14 +74,22 @@
  * for what was actually verified live, if anything, against a scratch
  * project property).
  *
- * MISSING PROPERTY == EMPTY COLLECTION, not an error: `getProjectPropertyOrNull`
- * (not `getProjectProperty`) is used for exactly this reason — a genuine
- * Jira 404 (the property has never been written) resolves `null`, which
- * this module treats as `{ v: 1, links: [] }`. Any OTHER rejection (a
- * missing/wrong project key, a permission failure, a network error) still
- * rejects and propagates to the caller uncaught — see `docs/resource-links.md`
- * Decision 8's file-store analogue for why a store read must not silently
- * swallow a failure it cannot distinguish from "empty".
+ * MISSING PROPERTY ON AN EXISTING PROJECT == EMPTY COLLECTION, not an error;
+ * A MISSING/WRONG PROJECT KEY IS NOT: `getProjectPropertyOrNull` (not
+ * `getProjectProperty`) is used so that a genuine Jira 404 (the property has
+ * never been written) resolves `null` rather than rejecting, which this
+ * module treats as `{ v: 1, links: [] }` — but that same `null` is also what
+ * a nonexistent/invisible PROJECT key 404s to on that same endpoint, and
+ * conflating the two (FACTORY-18/FACTORY-19, found live) let `list` on a
+ * typo'd project key read as a real empty collection instead of an error,
+ * while `add`/`remove` already failed one step later at the write. `null`
+ * is therefore never trusted alone — `assertProjectExists` below resolves
+ * the ambiguity with a dedicated existence check (`ops.projectExists`)
+ * before treating a `null` read as emptiness. Any OTHER rejection (a
+ * permission failure, a network error) still rejects and propagates to the
+ * caller uncaught — see `docs/resource-links.md` Decision 8's file-store
+ * analogue for why a store read must not silently swallow a failure it
+ * cannot distinguish from "empty".
  */
 import type { AtlassianOps } from "../tools/atlassian.js";
 import type { LinkStore } from "./link-store.js";
@@ -125,9 +133,31 @@ function projectKeyFromOwnerKey(ownerKey: string): string {
   return ref.key;
 }
 
+/**
+ * FACTORY-19: `getProjectPropertyOrNull` resolving `null` is ambiguous — a
+ * genuinely empty, never-written property on an EXISTING project, or a
+ * project key that doesn't exist (or isn't visible to this credential) at
+ * all. Left unresolved, the latter silently read as the former: `list` on a
+ * typo'd/nonexistent project key returned an empty link list instead of an
+ * error, while `add`/`remove` already failed (the subsequent
+ * `setProjectProperty` write 404s). `ops.projectExists` is the dedicated
+ * check this resolves it with (see that op's own doc comment); when a given
+ * `AtlassianOps` doesn't implement it (optional, see that same comment),
+ * this falls back to the pre-FACTORY-19 behaviour of treating `null` as an
+ * empty collection unconditionally.
+ */
+async function assertProjectExists(ops: AtlassianOps, projectKey: string): Promise<void> {
+  if (!ops.projectExists) return;
+  if (await ops.projectExists(projectKey)) return;
+  throw new Error(`jira-project ${projectKey} does not exist, or is not visible to this credential — refusing to treat it as an empty link collection`);
+}
+
 async function readProperty(ops: AtlassianOps, projectKey: string): Promise<JiraProjectLinksProperty> {
   const raw = await ops.getProjectPropertyOrNull(projectKey, JIRA_PROJECT_LINKS_PROPERTY_KEY);
-  if (raw === null || raw === undefined) return emptyProperty();
+  if (raw === null || raw === undefined) {
+    await assertProjectExists(ops, projectKey);
+    return emptyProperty();
+  }
   if (typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`jira-project ${projectKey}'s "${JIRA_PROJECT_LINKS_PROPERTY_KEY}" property is malformed: expected a JSON object`);
   }
