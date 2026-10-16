@@ -34,6 +34,7 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,
+    notifyDeliveryMode: null,
     staffed: false,
     reason: "disabled",
     ...overrides,
@@ -219,6 +220,106 @@ describe("RuleEditDialog — FACTORY-730: edit an existing (non-ui-prefixed) rul
     fireEvent.click(getByRole("button", { name: "confirm" }));
     const error = await findByTestId("rule-edit-error");
     expect(error.textContent).toContain("etag mismatch");
+  });
+
+  // FACTORY-1010 — the notification-delivery select: channel/prompt save
+  // with no confirm step (never risky, same as the idle-poke knobs above),
+  // "Default" after an explicit value sends an actual `null` (clearing it,
+  // not merely omitting the field), and re-rendering with the reloaded DTO
+  // after each save proves the choice is actually persisted/displayed, not
+  // just accepted by the mock. Closes the independent review's own
+  // "focused interaction test" request.
+  test("FACTORY-1010: notification-delivery select saves channel/prompt with no confirm, reverting to Default sends an explicit null, and each step reflects in the reloaded rule", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+
+    // starts at "Default" (butchr's own fallback) — the fixture rule never set it
+    {
+      const { findByTestId, unmount } = render(
+        <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+      expect(select.value).toBe("");
+      unmount();
+    }
+
+    // Default -> channel, no confirm needed
+    let afterChannel = await api.listRules();
+    {
+      const current = afterChannel.rules.find((r) => r.id === "epics")!;
+      const { findByTestId, getByRole, queryByTestId, unmount } = render(
+        <RuleEditDialog api={api} rule={current} sourceEtag={afterChannel.sourceEtag} stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "channel" } });
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(queryByTestId("rule-edit-confirm")).toBeNull());
+      await waitFor(async () => {
+        afterChannel = await api.listRules();
+        expect(afterChannel.rules.find((r) => r.id === "epics")!.notifyDeliveryMode).toBe("channel");
+      });
+      unmount();
+    }
+
+    // reopening reflects the persisted "channel" choice
+    {
+      const current = afterChannel.rules.find((r) => r.id === "epics")!;
+      const { findByTestId, unmount } = render(
+        <RuleEditDialog api={api} rule={current} sourceEtag={afterChannel.sourceEtag} stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+      expect(select.value).toBe("channel");
+      unmount();
+    }
+
+    // channel -> prompt, no confirm needed
+    let afterPrompt = afterChannel;
+    {
+      const current = afterChannel.rules.find((r) => r.id === "epics")!;
+      const { findByTestId, getByRole, queryByTestId, unmount } = render(
+        <RuleEditDialog api={api} rule={current} sourceEtag={afterChannel.sourceEtag} stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+      expect(select.value).toBe("channel");
+      fireEvent.change(select, { target: { value: "prompt" } });
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(queryByTestId("rule-edit-confirm")).toBeNull());
+      await waitFor(async () => {
+        afterPrompt = await api.listRules();
+        expect(afterPrompt.rules.find((r) => r.id === "epics")!.notifyDeliveryMode).toBe("prompt");
+      });
+      unmount();
+    }
+
+    // prompt -> Default: an explicit null clear, not merely an omitted field
+    {
+      const current = afterPrompt.rules.find((r) => r.id === "epics")!;
+      const { findByTestId, getByRole, queryByTestId, unmount } = render(
+        <RuleEditDialog api={api} rule={current} sourceEtag={afterPrompt.sourceEtag} stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+      );
+      const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+      expect(select.value).toBe("prompt");
+      fireEvent.change(select, { target: { value: "" } });
+      fireEvent.click(getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(queryByTestId("rule-edit-confirm")).toBeNull());
+      await waitFor(async () => {
+        const reloaded = await api.listRules();
+        expect(reloaded.rules.find((r) => r.id === "epics")!.notifyDeliveryMode).toBeNull();
+      });
+      unmount();
+    }
+  });
+
+  test("FACTORY-1010: an unchanged omitted default sends no notifyDeliveryMode field, and triggers no write at all (no-op save discipline)", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+    const { findByTestId, getByRole } = render(
+      <RuleEditDialog api={api} rule={rule()} sourceEtag="fixture-etag-0" stale={false} canWrite onChanged={() => undefined} onClose={() => undefined} />,
+    );
+    const select = (await findByTestId("rule-edit-notify-delivery-mode-select")) as HTMLSelectElement;
+    expect(select.value).toBe("");
+    fireEvent.click(getByRole("button", { name: "Save" })); // nothing touched at all — buildFieldsPatch is empty, handleSave is a no-op
+    const before = await api.listRules();
+    expect(before.sourceEtag).toBe("fixture-etag-0"); // no write happened — the fixture's own etag only advances on a real write
+    expect(before.rules.find((r) => r.id === "epics")!.notifyDeliveryMode).toBeNull();
   });
 
   test("every control is disabled while stale is true", async () => {

@@ -74,7 +74,7 @@ function sliceAfter(marker: string, length = 600): string {
 
 describe("named per-seam checks", () => {
   test("jira-work rule engine (notifyRuleAgent)", () => {
-    const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1300);
+    const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1400);
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
@@ -130,9 +130,57 @@ describe("named per-seam checks", () => {
   });
 
   test("FACTORY-998: confluence-page loop (startConfluencePageLoop)", () => {
-    const block = sliceAfter("startConfluencePageLoop({");
+    const block = sliceAfter("startConfluencePageLoop({", 700);
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
+  });
+});
+
+/**
+ * FACTORY-1010 — every rule-owned seam (the seven above that staff agents
+ * FROM a `Rule`: jira-work, github-issue, github-pr, jira-idea,
+ * zendesk-ticket, filesystem, confluence-page) must thread the per-rule
+ * `Rule.notifyDeliveryMode` into its own `deliverNotice({...})` call via
+ * the shared `ruleNotifyDeliveryMode(agent)` lookup — never a second,
+ * independently-reimplemented lookup per seam (which could drift). The two
+ * NON-rule seams (idle-poke's per-ISSUE multi-rule merge, and the
+ * SessionDefinition-based managed-sessions loop) are deliberately NOT
+ * wired — see each one's own inline comment in src/daemon/index.ts for
+ * why — and this test proves that boundary is real, not just claimed in a
+ * comment that could silently go stale.
+ */
+describe("FACTORY-1010: per-rule notifyDeliveryMode is threaded through every rule-owned seam, and ONLY those", () => {
+  test("ruleNotifyDeliveryMode is defined once, decoding the agent key to look up its owning rule", () => {
+    expect(src).toContain("const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined =>");
+  });
+
+  test("mode: ruleNotifyDeliveryMode(agent) appears exactly 7 times — once per rule-owned seam, no seam keeps its own copy", () => {
+    expect(src.split("mode: ruleNotifyDeliveryMode(agent),").length - 1).toBe(7);
+  });
+
+  for (const marker of [
+    'const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)',
+    "startGithubIssueLoop({",
+    "startGithubPrLoop({",
+    "startJiraIdeaLoop({",
+    "startZendeskTicketLoop({",
+    "startFilesystemLoop({",
+    "startConfluencePageLoop({",
+  ]) {
+    test(`rule-owned seam at ${JSON.stringify(marker)} passes mode: ruleNotifyDeliveryMode(agent)`, () => {
+      const block = sliceAfter(marker, 1300);
+      expect(block).toContain("mode: ruleNotifyDeliveryMode(agent),");
+    });
+  }
+
+  test("the idle-poke seam deliberately does NOT read notifyDeliveryMode (documented out-of-scope: per-issue multi-rule merge, a different event family)", () => {
+    const block = sliceAfter("const deliverIdlePoke = async (issue: string, text: string)", 500);
+    expect(block).not.toContain("ruleNotifyDeliveryMode");
+  });
+
+  test("the managed-sessions seam deliberately does NOT read notifyDeliveryMode (documented out-of-scope: SessionDefinition, not a Rule)", () => {
+    const block = sliceAfter("startManagedSessionsLoop({");
+    expect(block).not.toContain("ruleNotifyDeliveryMode");
   });
 });

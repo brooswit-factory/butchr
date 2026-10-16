@@ -19,6 +19,7 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,
+    notifyDeliveryMode: null,
     staffed: true,
     reason: null,
     ...overrides,

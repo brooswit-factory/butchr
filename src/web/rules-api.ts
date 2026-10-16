@@ -22,7 +22,7 @@
  * one resource provider — see `Rule.id`'s own doc comment, `../rules/rules.ts`).
  */
 import type { RuleInventoryEntry, RulesFileState } from "../agents/query-agent-inventory.js";
-import type { Rule, RulePermissionMode } from "../rules/rules.js";
+import type { NotifyDeliveryMode, Rule, RulePermissionMode } from "../rules/rules.js";
 
 export const BRIEF_EXCERPT_MAX = 200;
 
@@ -104,6 +104,8 @@ export interface RulesApiRuleEntry {
   stalledMinutes: number | null;
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
+  /** FACTORY-1010: read off the raw `Rule` the same way as `permissionMode`/`lizardMode` above. `null` when absent — means today's channel-first/prompt-fallback `deliverNotice` behaviour, never necessarily `"channel"`. */
+  notifyDeliveryMode: NotifyDeliveryMode | null;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -180,6 +182,7 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       stalledMinutes: raw?.stalledMinutes ?? null,
       idlePokeMessage: raw?.idlePokeMessage ?? null,
       idlePokeEnabled: raw?.idlePokeEnabled ?? true,
+      notifyDeliveryMode: raw?.notifyDeliveryMode ?? null,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,
       whyUnstaffed: entry.reason,

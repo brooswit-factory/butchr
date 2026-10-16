@@ -35,6 +35,7 @@ import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRo
 import {
   PLACEHOLDER_QUERY,
   RateLimitError,
+  type NotifyDeliveryMode,
   type RuleAgentPreferencePatch,
   type RuleCapacityRolesCatalog,
   type RuleDto,
@@ -44,6 +45,19 @@ import {
   type RuleWriteResult,
   type RulesApi,
 } from "../api/rules.js";
+
+/**
+ * FACTORY-1010 — the plain two-value list, kept LOCAL rather than imported
+ * as a runtime VALUE from `../../../src/rules/rules.js`'s own
+ * `NOTIFY_DELIVERY_MODES` — see `FirstRuleSetup.tsx`'s own top comment for
+ * why a value import from that module (as opposed to a `type`-only one,
+ * which this file already does for `NotifyDeliveryMode` above) breaks the
+ * Vite client bundle. `RULE_PERMISSION_MODES` avoids the same hazard by
+ * living in the dependency-free leaf `agent-harness.ts`; this constant is
+ * small and stable enough that duplicating it here is simpler than moving
+ * it to a leaf of its own for one caller.
+ */
+const NOTIFY_DELIVERY_MODE_OPTIONS = ["channel", "prompt"] as const;
 import "./RulesView.css";
 
 export interface RuleEditDialogProps {
@@ -105,6 +119,11 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   const [draftIdlePokeMessage, setDraftIdlePokeMessage] = useState(rule.idlePokeMessage ?? "");
   // `idlePokeEnabled` is never `null` on `RuleDto` (`parseRules` always resolves it) — no inherit-ambiguity to protect, same as `lizardMode`.
   const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule.idlePokeEnabled ?? true);
+  // FACTORY-1010 — same empty-means-inherit contract as `draftPermissionMode`
+  // above: `rule.notifyDeliveryMode` is nullable (`null` means today's
+  // channel-first/prompt-fallback behaviour, not a concrete choice), so the
+  // draft starts at `""` for that case.
+  const [draftNotifyDeliveryMode, setDraftNotifyDeliveryMode] = useState<NotifyDeliveryMode | "">(rule.notifyDeliveryMode ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);
@@ -200,6 +219,12 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
     const currentIdlePokeMessage = rule.idlePokeMessage ?? "";
     if (draftIdlePokeMessage !== currentIdlePokeMessage && draftIdlePokeMessage !== "") patch.idlePokeMessage = draftIdlePokeMessage;
     if (draftIdlePokeEnabled !== (rule.idlePokeEnabled ?? true)) patch.idlePokeEnabled = draftIdlePokeEnabled;
+    // FACTORY-1010: unlike `permissionMode` above (which has no server-side
+    // clear path — see `RuleFieldPatch.notifyDeliveryMode`'s own doc comment,
+    // `../api/rules.js`), reverting the draft to "" DOES send an explicit
+    // `null` here, so "Default" actually clears a previously-set value
+    // instead of being silently dropped from the request body.
+    if (draftNotifyDeliveryMode !== (rule.notifyDeliveryMode ?? "")) patch.notifyDeliveryMode = draftNotifyDeliveryMode || null;
     if (canEditPreferences(rule)) {
       const entry: RuleAgentPreferencePatch = { harness: draftHarness };
       if (draftModel) entry.model = draftModel;
@@ -400,6 +425,31 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
               lizard mode is never a default — saving this needs an explicit confirm
             </p>
           )}
+
+          {/*
+           * FACTORY-1010 — per-rule notification delivery choice. "butchr's
+           * default" (the empty option) is today's channel-first,
+           * prompt-on-unavailable behaviour; the other two options pin this
+           * rule's agent(s) to exactly one transport, with no fallback to
+           * the other (see `Rule.notifyDeliveryMode`'s own doc comment,
+           * `../../../src/rules/rules.js`, for the non-fallback contract).
+           */}
+          <label htmlFor="rule-edit-notify-delivery-mode-select">notification delivery</label>
+          <select
+            id="rule-edit-notify-delivery-mode-select"
+            aria-label="notification delivery"
+            data-testid="rule-edit-notify-delivery-mode-select"
+            value={draftNotifyDeliveryMode}
+            onChange={(e) => setDraftNotifyDeliveryMode(e.target.value as NotifyDeliveryMode | "")}
+            disabled={disabled}
+          >
+            <option value="">butchr's default (channel, falling back to prompt)</option>
+            {NOTIFY_DELIVERY_MODE_OPTIONS.map((m) => (
+              <option key={m} value={m}>
+                {m === "channel" ? "channel only (no fallback)" : "direct prompt only (no fallback)"}
+              </option>
+            ))}
+          </select>
 
           <label htmlFor="rule-edit-capacity-toggle">Included in capacity</label>
           {/*

@@ -476,6 +476,62 @@ describe("writeRuleFields (PUT)", () => {
     expect(nextDoc.rules[0].idlePokeMessage).toBe("go check your ticket");
     expect(nextDoc.rules[0].idlePokeEnabled).toBe(false);
   });
+
+  /**
+   * FACTORY-1010 — independent review's own explicit ask (ticket comment):
+   * a PERSISTED round-trip, default -> channel -> prompt -> default,
+   * reloading through `loadRules` after each write and checking the
+   * reloaded `Rule.notifyDeliveryMode` itself, not just the raw JSON —
+   * proving both that `null` actually REMOVES the key (same `stalledMinutes`
+   * precedent `applyRuleFieldPatch` already uses, src/rules/rules-write-
+   * apply.ts) and that a removed key really does reload as `undefined`
+   * through the real parse path, restoring the omitted/default
+   * channel-first/prompt-fallback behaviour byte-for-byte.
+   */
+  test("FACTORY-1010: notifyDeliveryMode round-trips default -> channel -> prompt -> default (removed), each step reloaded through loadRules", async () => {
+    seed([UI_RULE]);
+    const deps = { env: env() };
+
+    // starting point: omitted entirely (UI_RULE never set it)
+    const loaded0 = loadRules(env());
+    expect(loaded0.rules[0]!.notifyDeliveryMode).toBeUndefined();
+    expect(JSON.parse(readFileSync(rulesFilePath(), "utf8")).rules[0]).not.toHaveProperty("notifyDeliveryMode");
+
+    // default -> channel
+    {
+      const patch: RuleFieldPatch = { notifyDeliveryMode: "channel" };
+      const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+      const etag = rulesEtag(env());
+      const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+      expect(outcome.ok).toBe(true);
+      expect(JSON.parse(readFileSync(rulesFilePath(), "utf8")).rules[0].notifyDeliveryMode).toBe("channel");
+      expect(loadRules(env()).rules[0]!.notifyDeliveryMode).toBe("channel");
+    }
+
+    // channel -> prompt
+    {
+      const patch: RuleFieldPatch = { notifyDeliveryMode: "prompt" };
+      const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+      const etag = rulesEtag(env());
+      const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+      expect(outcome.ok).toBe(true);
+      expect(JSON.parse(readFileSync(rulesFilePath(), "utf8")).rules[0].notifyDeliveryMode).toBe("prompt");
+      expect(loadRules(env()).rules[0]!.notifyDeliveryMode).toBe("prompt");
+    }
+
+    // prompt -> default (explicit null — REMOVES the key, never writes a literal `"notifyDeliveryMode": null`)
+    {
+      const patch: RuleFieldPatch = { notifyDeliveryMode: null };
+      const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
+      const etag = rulesEtag(env());
+      const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
+      expect(outcome.ok).toBe(true);
+      const finalRaw = JSON.parse(readFileSync(rulesFilePath(), "utf8")).rules[0];
+      expect(finalRaw).not.toHaveProperty("notifyDeliveryMode");
+      const reloaded = loadRules(env());
+      expect(reloaded.rules[0]!.notifyDeliveryMode).toBeUndefined();
+    }
+  });
 });
 
 describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true are never defaults — require confirm", () => {

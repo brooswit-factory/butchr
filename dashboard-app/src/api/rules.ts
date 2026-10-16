@@ -50,7 +50,8 @@
  * `realRulesApi`/`createFixturesRulesApi` BY NAME instead of this
  * flag-selected default: a test must never depend on which bundler ran it.
  */
-import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, ResourceProvider, RulePermissionMode } from "../../../src/rules/rules.js";
+import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, NotifyDeliveryMode, ResourceProvider, RulePermissionMode } from "../../../src/rules/rules.js";
+export type { NotifyDeliveryMode };
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, RULE_FORM_CATALOG, type RuleFormCatalogEntry } from "../../../src/rules/rule-form-catalog.js";
 
 export type { RuleFormCatalogEntry };
@@ -138,6 +139,8 @@ export interface RuleDto {
   idlePokeMinutes: number | null;
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
+  /** FACTORY-1010 — `null` when absent; means today's channel-first/prompt-fallback `deliverNotice` behaviour, never necessarily `"channel"` (see `Rule.notifyDeliveryMode`'s own doc comment, `../../../src/rules/rules.js`). */
+  notifyDeliveryMode: NotifyDeliveryMode | null;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
@@ -225,6 +228,8 @@ export interface RuleFieldPatch {
   idlePokeMinutes?: number;
   idlePokeMessage?: string;
   idlePokeEnabled?: boolean;
+  /** FACTORY-1010 — CONFIG SURFACE ONLY, never risky: no confirm is required. `null` clears it back to the omitted/default behaviour — `undefined` (the field simply absent) leaves whatever is currently set alone; see the server's own `RuleFieldPatch.notifyDeliveryMode` doc comment (`../../../src/rules/rules-write-registry.js`) for why `undefined` cannot also mean "clear". */
+  notifyDeliveryMode?: NotifyDeliveryMode | null;
 }
 
 /** `POST /api/rules/plan`'s own patch shape — the SAME `RuleFieldPatch` plus the one extra field only the dedicated enable route (and this report-only plan) ever considers. */
@@ -582,6 +587,7 @@ interface ServerRuleEntry {
   idlePokeMinutes: number | null;
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
+  notifyDeliveryMode: NotifyDeliveryMode | null;
   staffed: boolean | null;
   whyUnstaffed: string | null;
 }
@@ -608,6 +614,7 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       idlePokeMinutes: r.idlePokeMinutes,
       idlePokeMessage: r.idlePokeMessage,
       idlePokeEnabled: r.idlePokeEnabled,
+      notifyDeliveryMode: r.notifyDeliveryMode,
       staffed: r.staffed,
       reason: r.whyUnstaffed,
     })),
@@ -817,6 +824,7 @@ export function defaultRulesFixture(): RulesListResponse {
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
+        notifyDeliveryMode: null,
         staffed: true,
         reason: null,
       },
@@ -836,6 +844,7 @@ export function defaultRulesFixture(): RulesListResponse {
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
+        notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled",
       },
@@ -855,6 +864,7 @@ export function defaultRulesFixture(): RulesListResponse {
         idlePokeMinutes: 15,
         idlePokeMessage: null,
         idlePokeEnabled: false,
+        notifyDeliveryMode: null,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
       },
@@ -874,6 +884,7 @@ export function defaultRulesFixture(): RulesListResponse {
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
+        notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
       },
@@ -1109,6 +1120,12 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         idlePokeMinutes: patch.idlePokeMinutes ?? rule.idlePokeMinutes,
         idlePokeMessage: patch.idlePokeMessage ?? rule.idlePokeMessage,
         idlePokeEnabled: patch.idlePokeEnabled ?? rule.idlePokeEnabled,
+        // FACTORY-1010: `null` means an explicit clear (mirrors the real
+        // server's own null-means-remove handling, `./rules-write-apply.js`'s
+        // `stalledMinutes` precedent) — `??` alone would wrongly fall through
+        // to the rule's CURRENT value for an explicit `null`, since `??`
+        // treats `null` the same as `undefined`.
+        notifyDeliveryMode: patch.notifyDeliveryMode === null ? null : (patch.notifyDeliveryMode ?? rule.notifyDeliveryMode),
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
@@ -1211,6 +1228,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
+        notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled",
       };

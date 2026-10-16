@@ -15,6 +15,13 @@ import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
 import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js";
+// FACTORY-1010: a SEPARATE import statement from the one above on purpose —
+// test/unit/notify-deliver-seams.test.ts's own regex pins that exact
+// `import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js"`
+// line verbatim (acceptance D: "the shared gate is imported ... not
+// reimplemented locally"), so widening it inline would break that guard for
+// a reason unrelated to what it actually checks.
+import type { NotifyDeliveryMode } from "../notify/deliver.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
 import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "./health.js";
@@ -1785,12 +1792,25 @@ let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
 // updated in this same commit (7 -> 8) — see that test file's own doc
 // comment and this story's PR body for why that is the INTENDED outcome of
 // adding a seam, not a sign anything is wrong.
+// FACTORY-1010: deliberately does NOT read `Rule.notifyDeliveryMode` here.
+// This seam already resolves config across however many rules match one
+// ISSUE (`idlePokeRuleConfigByIssue`/`updateIdlePokeRuleConfig` above), a
+// different shape than every OTHER seam's one-rule-per-agent-key lookup
+// (`ruleNotifyDeliveryMode`) — merging a categorical transport choice the
+// same way `idlePokeEnabled`/`idlePokeMinutes`/`idlePokeMessage` already
+// merge is left to a follow-up rather than guessed at here. This is also a
+// stall-remediation wake nudge, not an update notification about a ticket
+// change, which is the event family this ticket's acceptance criteria name.
 const deliverIdlePoke = async (issue: string, text: string): Promise<{ via: "channel" | "prompt" }> => {
   const result = await deliverNotice({
     pushChannel: () => notifyAgent(mcp, issue, issue, text),
     nudgePrompt: () => herd.nudge(issue, text),
   });
   console.error(`  [notify] ${issue} ← idle-poke: ${renderNotifyDelivery(result)}`);
+  // FACTORY-1010: `result.via` is never `"none"` here — this call passes no
+  // explicit `mode`, and `"none"` is only ever returned for one (src/notify/
+  // deliver.ts's own doc comment on `NotifyDelivery`).
+  if (result.via === "none") throw new Error(`unreachable: deliverIdlePoke got via "none" without an explicit mode (${issue})`);
   return { via: result.via };
 };
 
@@ -2222,6 +2242,24 @@ if (getRules().some(r => r.enabled && r.resourceProvider === "jira-work")) void 
 // src/jira-watch/linked-eventing.ts's own top comment for why this is
 // "UNCHANGED IN SHAPE": the actual channel-push mechanism below is
 // untouched, only its `reason` branching gains one more case).
+// FACTORY-1010 — the per-rule explicit delivery choice (`Rule.notifyDeliveryMode`),
+// resolved once here and reused by every rule-owned `deliverNotice` seam
+// below. A direct lookup, never the idle-poke engine's own multi-rule-per-
+// ISSUE merge (`updateIdlePokeRuleConfig` below): an agent key carries
+// exactly the one rule that owns it (`decodeAnyAgentKey`'s own doc comment,
+// src/rules/agent-key.ts), so there is no "several rules matched one
+// agent" case to resolve here the way several rules CAN match one issue.
+// `undefined` — the absent case `deliverNotice` itself already treats as
+// today's channel-first/prompt-fallback behaviour — for a key that fails
+// to decode, or whose owning rule cannot be found (defensive; every real
+// agent key handed to a `deliver` closure was produced for a rule
+// `getRules()` still lists).
+const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined => {
+  const decoded = decodeAnyAgentKey(agent);
+  if (!decoded) return undefined;
+  return getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider)?.notifyDeliveryMode;
+};
+
 const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
   // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
   // for a query-level agent that's its own query key, shown as-is in
@@ -2239,6 +2277,7 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const result = await deliverNotice({
     pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
     nudgePrompt: () => herd.nudge(agent, msg),
+    mode: ruleNotifyDeliveryMode(agent),
   });
   const reasonTag = notifyReasonTag(reason);
   console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
@@ -2457,6 +2496,7 @@ startGithubIssueLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2483,6 +2523,7 @@ startGithubPrLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2520,6 +2561,7 @@ startJiraIdeaLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2545,6 +2587,7 @@ startZendeskTicketLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2570,6 +2613,7 @@ startFilesystemLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2599,6 +2643,7 @@ startConfluencePageLoop({
     const result = await deliverNotice({
       pushChannel: () => notifyAgent(mcp, agent, resource, msg),
       nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
     });
     console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
@@ -2614,6 +2659,12 @@ startConfluencePageLoop({
 // BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
 // read from rules.json, over the well-known definitions directory. Same
 // admission/health wiring shape as every rule loop above, its own bucket.
+//
+// FACTORY-1010: deliberately OUT of this ticket's scope — its agents come
+// from `SessionDefinition` manifests (src/resources/session-definition.ts),
+// never a `Rule`, so there is no `notifyDeliveryMode` to read here, and
+// `ruleNotifyDeliveryMode` is not called below (it would resolve to
+// `undefined` for any key it was handed anyway, byte-identical to today).
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
