@@ -1,31 +1,54 @@
-import { afterAll, describe, expect, test, mock } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
 import type { ProjectResourceDeps } from "../../src/resources/project.js";
 
-// FACTORY-137 (incidental fix, found while rebasing onto main): `mock.module`
-// is a PROCESS-WIDE patch, not scoped to this file — bun does not undo it
-// when the file finishes, and `mock.restore()` does NOT undo a `mock.module`
-// call either (verified directly: it only resets jest-style spies). Every
-// test above replaces "jira.js"/"confluence.js" with a stub lacking most of
-// the real client's surface (e.g. no `projectProperties`), so without
-// restoring it here, any OTHER test file that happens to run later in the
-// SAME bun test process and imports the real client (e.g.
-// test/unit/link-cli-jira-project.test.ts) silently gets this file's last
-// stub instead — order-dependent, so it can pass for a long time and then
-// fail the moment file-execution order shifts (exactly what happened here:
-// this PR's own new test files changed CI's worker distribution enough to
-// expose it). The real modules are snapshotted as plain-object COPIES, not
-// bare references — `mock.module` mutates the existing module namespace
-// object's properties IN PLACE rather than swapping in a new one, so a bare
-// `const real = await import(...)` reference would itself get silently
-// mutated by the very first `mock.module` call below and "restoring" it
-// would just reapply the mutated (fake) object. Restoring once, after every
-// test in this file has run, is enough — each test already calls
-// `mock.module` fresh before using the client, so nothing above needs its
-// own cleanup.
+/**
+ * FACTORY-77 (shared CI investigation, see also FACTORY-66): every test
+ * below calls `mock.module("jira.js", ...)` / `mock.module("confluence.js",
+ * ...)` to fake out `realAtlassian`'s two SDK clients, but none of them ever
+ * restored the real module afterward — `mock.module` patches the GLOBAL
+ * module registry, not a per-test sandbox, so a leaked fake stays resolvable
+ * to whichever OTHER test file imports "jira.js"/"confluence.js" next in the
+ * same process. Observed failure mode this produces when it leaks past this
+ * file: test/unit/link-cli-jira-project.test.ts's "malformed-config path
+ * (FACTORY-19)" tests construct a REAL `realAtlassian()` client and expect
+ * Zod to reject a malformed email at construction time — against the LAST
+ * fake `createCloudClient` stub this file installs (confirmed live on
+ * hosted CI: the leaked client's own keys matched this file's very last
+ * `mock.module("jira.js", ...)` call, `{ projects: { getProject } }`),
+ * construction never throws and a later real call crashes instead with
+ * "undefined is not an object (evaluating
+ * 'jira.projectProperties.getProjectProperty')" — exactly the shape seen on
+ * hosted CI (bun 1.4.3; not reproducible locally under bun 1.3.14, which
+ * happens to re-resolve the real module between files on its own — CI's bun
+ * does not).
+ *
+ * `mock.restore()` does NOT undo `mock.module`'s registry patch — Bun only
+ * documents it as resetting spy/mock FUNCTIONS (calls, implementations),
+ * never a module replacement, and hosted CI is the proof: the leaked fake
+ * from this file's own LAST mock.module("jira.js", ...) call survived an
+ * `afterEach(() => mock.restore())` here and was still resolvable from
+ * link-cli-jira-project.test.ts, a completely different file, later in the
+ * same process. The only way to actually undo a `mock.module` call is to
+ * `mock.module` the same specifier again with a factory that returns the
+ * REAL module.
+ *
+ * That capture must be a SPREAD COPY, not the bare namespace object:
+ * `await import("jira.js")` returns a live module-namespace binding, and
+ * `mock.module` was confirmed (live, by instrumenting both sides of this
+ * exact restore) to mutate that SAME live binding in place rather than
+ * swap in an unrelated object — so holding onto the raw namespace still
+ * observes every later mock.module call too, and re-registering it as the
+ * "real" module just re-installs whatever the most recent fake was. A
+ * `{ ...(await import(...)) }` spread reads every export's CURRENT value
+ * once, upfront, into a brand new plain object immune to any later mutation
+ * of the original binding — confirmed fixed under the same harness that
+ * reproduced the leak.
+ */
 const realJiraJs = { ...(await import("jira.js")) };
 const realConfluenceJs = { ...(await import("confluence.js")) };
-afterAll(() => {
+afterEach(() => {
+  mock.restore();
   mock.module("jira.js", () => realJiraJs);
   mock.module("confluence.js", () => realConfluenceJs);
 });

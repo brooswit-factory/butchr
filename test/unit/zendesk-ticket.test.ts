@@ -21,7 +21,7 @@ import { decodeAgentKey, encodeAgentKey } from "../../src/rules/agent-key.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { parseRules } from "../../src/rules/rules.js";
-import { createZendeskTicketEventRules, ownsZendeskTicketAgent, specForZendeskTicket, ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
+import { createZendeskTicketEventRules, ownsZendeskTicketAgent, specForZendeskTicket, ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing, zendeskTicketStaffingIfEnabled, type ZendeskTicketMatch } from "../../src/rules/zendesk-ticket-type.js";
 import { forJiraCallers, githubIssueTools } from "../../src/tools/github-issue.js";
 import { Refusal } from "../../src/tools/outcome.js";
 import { zendeskNoteTag, zendeskTicketTools } from "../../src/tools/zendesk-ticket.js";
@@ -214,6 +214,25 @@ describe("zendesk OAuth token loading", () => {
     const ok = zendeskTicketStaffing(rules, { ...env, ...ack }, io());
     expect(ok).toMatchObject({ run: true, subdomain: "acme", token: FAKE_TOKEN });
     expect(ok.rules.map((r) => r.id)).toEqual(["support"]);
+  });
+
+  // FACTORY-66 review round 4 (brooswit, PR #797, @ cf9645e5): the daemon
+  // used to call `zendeskTicketStaffing` directly as `applyProviderSwitch`'s
+  // own argument, so it (and its `loadZendeskAuth` token-file read) ran
+  // BEFORE the provider's own switch was consulted — a disabled provider
+  // with an enabled rule and the risk acknowledgement set still read the
+  // token file. `zendeskTicketStaffingIfEnabled` is the fix: the switch is
+  // checked FIRST, and the real staffing function is never called when off.
+  test("FACTORY-66 review round 4: zendeskTicketStaffingIfEnabled never reads the token file when the provider switch is off, even with an enabled rule and the risk acknowledgement set", () => {
+    let stats = 0;
+    const counting: ZendeskTokenFileIo = { ...io(), stat: (p) => { stats++; return io().stat(p); } };
+    const disabled = zendeskTicketStaffingIfEnabled(rules, { ...env, ...ack }, false, counting);
+    expect(disabled).toEqual({ run: false, rules: [rules.find((r) => r.id === "support")!], reason: null });
+    expect(stats).toBe(0); // never read — this is the regression this test pins
+    // Enabled still behaves exactly like calling zendeskTicketStaffing directly (identity, not a new mechanism).
+    const enabled = zendeskTicketStaffingIfEnabled(rules, { ...env, ...ack }, true, counting);
+    expect(enabled).toMatchObject({ run: true, subdomain: "acme", token: FAKE_TOKEN });
+    expect(stats).toBe(1);
   });
 });
 

@@ -79,6 +79,45 @@ describe("real daemon entry: setup mode", () => {
       rmSync(home, { recursive: true, force: true });
     }
   }, 30_000);
+
+  // FACTORY-66 review round 3 (brooswit, PR #797, @ 334430f6): an operator
+  // who switched off all four Atlassian-backed providers individually
+  // (BUTCHR_PROVIDER_JIRA_WORK_ENABLED et al.) instead of the coarser
+  // BUTCHR_ATLASSIAN_ENABLED used to still get routed into setup mode on a
+  // fresh install with no ATLASSIAN_* credentials — exactly backwards for
+  // someone who said, four times over, that they don't want Jira. Proven
+  // here by what it does NOT do (never answers /health's setupMode:true,
+  // never stays parked in setup mode's walk-through) rather than a full
+  // boot to a healthy /health: this sandbox has no real herdr socket, so
+  // the real daemon path legitimately refuses to start over THAT (same
+  // "Start herdr and retry" terminal state test/unit/seed-first-run-setup-
+  // integration.test.ts already exercises deliberately) — the point under
+  // test is which path it took, not whether herdr happens to be reachable.
+  test("FACTORY-66 review round 3: all four Atlassian-provider switches off, with zero ATLASSIAN_* credentials, takes the real-daemon path, never setup mode", async () => {
+    const port = freePort();
+    const { proc, home } = await spawnEntry({
+      BUTCHR_PROVIDER_JIRA_WORK_ENABLED: "false", BUTCHR_PROVIDER_JIRA_IDEA_ENABLED: "false",
+      BUTCHR_PROVIDER_JIRA_PROJECT_ENABLED: "false", BUTCHR_PROVIDER_CONFLUENCE_PAGE_ENABLED: "false",
+    }, port);
+    try {
+      // Setup mode would answer /health with 503 {setupMode:true} and stay
+      // up; the real-daemon path here instead exits (no reachable herdr)
+      // printing its own disabled-Atlassian line first. Race both signals.
+      let res: Response | undefined;
+      for (let i = 0; i < 40 && !res && proc.exitCode === null; i++) {
+        try { res = await fetch(`http://127.0.0.1:${port}/health`); } catch { await Bun.sleep(250); }
+      }
+      if (res) expect((await res.json() as { setupMode?: boolean }).setupMode).toBeFalsy();
+      const code = await Promise.race([proc.exited, Bun.sleep(10_000).then(() => "timeout" as const)]);
+      expect(code).toBe(1); // the real daemon's own herdr-unreachable refusal, never setup mode's quiet park
+      const stderr = await new Response(proc.stderr).text();
+      expect(stderr).toContain("Atlassian is disabled — every Atlassian-backed provider switch");
+      expect(stderr).toContain("Start herdr and retry");
+    } finally {
+      proc.kill();
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("poison model value", () => {

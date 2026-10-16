@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, validateAtlassianSiteShape } from "../../src/config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, validateAtlassianSiteShape, loadAtlassianConfig } from "../../src/config/config.js";
+import { PROVIDER_ENABLED_ENV_VAR } from "../../src/rules/provider-enablement.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
 import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
@@ -31,24 +32,115 @@ describe("loadConfig", () => {
   });
   test("reads the token from a file when ATLASSIAN_TOKEN_FILE is set", () => {
     const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t" }, (p) => { expect(p).toBe("/t"); return "filetok\n"; });
-    expect(c.atlassian.token).toBe("filetok");
+    expect(c.atlassian?.token).toBe("filetok");
   });
   test("honours BUTCHR_PORT and HERDR_SOCKET", () => {
     const c = loadConfig({ ...base, BUTCHR_PORT: "9000", HERDR_SOCKET: "/s.sock" }, noRead);
     expect(c.port).toBe(9000); expect(c.herdrSocket).toBe("/s.sock");
   });
-  test("throws on missing site/email/token and on a bad port", () => {
-    expect(() => loadConfig({ ...base, ATLASSIAN_SITE: undefined }, noRead)).toThrow(/ATLASSIAN_SITE/);
-    expect(() => loadConfig({ ...base, ATLASSIAN_EMAIL: "" }, noRead)).toThrow(/ATLASSIAN_EMAIL/);
-    expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN: undefined }, noRead)).toThrow(/ATLASSIAN_TOKEN/);
-    expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN_FILE: "/t" }, () => "  \n")).toThrow(/empty/);
+  // FACTORY-66: a partial/invalid Atlassian credential (missing field, bad
+  // site shape, empty token) used to throw out of `loadConfig` — fatal to
+  // the whole daemon (PR463/FACTORY-65's own boot-refusal path). It is now
+  // isolated: `atlassian` is `undefined` and `atlassianDisabledReason`
+  // names exactly what's wrong, same "optional, never a startup crash for
+  // unrelated config" contract `github`/`rocketchat` already had. Only a
+  // bad, UNRELATED knob (BUTCHR_PORT) still throws.
+  test("FACTORY-66: a partial/invalid Atlassian credential is isolated, not thrown — loadConfig never crashes over it", () => {
+    for (const env of [
+      { ...base, ATLASSIAN_SITE: undefined },
+      { ...base, ATLASSIAN_EMAIL: "" },
+      { ...base, ATLASSIAN_TOKEN: undefined },
+    ]) {
+      const c = loadConfig(env, noRead);
+      expect(c.atlassian).toBeUndefined();
+      expect(c.atlassianDisabledReason).toContain("misconfigured");
+    }
+    const cEmptyTokenFile = loadConfig({ ...base, ATLASSIAN_TOKEN_FILE: "/t" }, () => "  \n");
+    expect(cEmptyTokenFile.atlassian).toBeUndefined();
+    expect(cEmptyTokenFile.atlassianDisabledReason).toContain("empty");
     expect(() => loadConfig({ ...base, BUTCHR_PORT: "notaport" }, noRead)).toThrow(/BUTCHR_PORT/);
   });
-  test("FACTORY-665: rejects an ATLASSIAN_SITE that isn't exactly https://<name>.atlassian.net", () => {
+  test("FACTORY-665/FACTORY-66: an ATLASSIAN_SITE that isn't exactly https://<name>.atlassian.net disables Atlassian (isolated), never throws", () => {
     for (const bad of ["https://evil.example.com", "http://x.atlassian.net", "https://x.atlassian.net/extra", "https://x.atlassian.net:8443", "https://x.atlassian.net.evil.com", "https://.atlassian.net", "not-a-url"]) {
-      expect(() => loadConfig({ ...base, ATLASSIAN_SITE: bad }, noRead)).toThrow(/ATLASSIAN_SITE must look like/);
+      const c = loadConfig({ ...base, ATLASSIAN_SITE: bad }, noRead);
+      expect(c.atlassian).toBeUndefined();
+      expect(c.atlassianDisabledReason).toContain("ATLASSIAN_SITE must look like");
     }
     expect(() => loadConfig({ ...base, ATLASSIAN_SITE: "HTTPS://X.ATLASSIAN.NET" }, noRead)).not.toThrow();
+    expect(loadConfig({ ...base, ATLASSIAN_SITE: "HTTPS://X.ATLASSIAN.NET" }, noRead).atlassian).toBeDefined();
+  });
+  test("FACTORY-66: BUTCHR_ATLASSIAN_ENABLED=false disables Atlassian regardless of otherwise-complete credentials", () => {
+    for (const falsy of ["false", "0", "no", "off", "FALSE", " False "]) {
+      const c = loadConfig({ ...base, BUTCHR_ATLASSIAN_ENABLED: falsy }, noRead);
+      expect(c.atlassian).toBeUndefined();
+      expect(c.atlassianDisabledReason).toContain("disabled");
+    }
+    // Anything else (unset, "true", garbage) leaves today's presence-based behavior alone.
+    expect(loadConfig({ ...base, BUTCHR_ATLASSIAN_ENABLED: "true" }, noRead).atlassian).toBeDefined();
+  });
+  test("FACTORY-66: Atlassian is cleanly absent (no explicit-disable reason) when nothing at all is set", () => {
+    const c = loadConfig({ ATLASSIAN_SITE: undefined, ATLASSIAN_EMAIL: undefined, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: undefined }, noRead);
+    expect(c.atlassian).toBeUndefined();
+    expect(c.atlassianDisabledReason).toContain("not configured");
+  });
+  test("FACTORY-66: loadAtlassianConfig directly — the three non-throwing outcomes, and the one unaffected success path", () => {
+    expect(loadAtlassianConfig(base, noRead)).toEqual({ config: { site: "https://x.atlassian.net", email: "a@b.c", token: "tok" } });
+    expect(loadAtlassianConfig({}, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("not configured") });
+    expect(loadAtlassianConfig({ ...base, BUTCHR_ATLASSIAN_ENABLED: "false" }, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("disabled") });
+    expect(loadAtlassianConfig({ ...base, ATLASSIAN_EMAIL: undefined }, noRead)).toMatchObject({ config: undefined, disabledReason: expect.stringContaining("misconfigured") });
+  });
+  test("FACTORY-66 review round 2: providerEnabled defaults every registered provider to true, independently of BUTCHR_ATLASSIAN_ENABLED and of each other", () => {
+    const c = loadConfig(base, noRead);
+    expect(c.providerEnabled).toEqual({
+      "jira-work": true, "jira-idea": true, "jira-project": true, "confluence-page": true,
+      "github-issue": true, "github-pr": true, "zendesk-ticket": true, filesystem: true,
+    });
+  });
+  test("FACTORY-66 review round 2: a provider can be individually disabled while its credentials, siblings and BUTCHR_ATLASSIAN_ENABLED all stay untouched — the gap a single combined flag left", () => {
+    // Disable exactly ONE of the four Atlassian-backed providers (confluence-page); the other three, the credential itself, and every non-Atlassian provider are unaffected.
+    const c = loadConfig({ ...base, [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" }, noRead);
+    expect(c.atlassian).toBeDefined(); // the credential itself is untouched
+    expect(c.providerEnabled["confluence-page"]).toBe(false);
+    expect(c.providerEnabled["jira-work"]).toBe(true);
+    expect(c.providerEnabled["jira-idea"]).toBe(true);
+    expect(c.providerEnabled["jira-project"]).toBe(true);
+    expect(c.providerEnabled["github-issue"]).toBe(true);
+    expect(c.providerEnabled["github-pr"]).toBe(true);
+    expect(c.providerEnabled["zendesk-ticket"]).toBe(true);
+    expect(c.providerEnabled.filesystem).toBe(true);
+  });
+  test("FACTORY-66 review round 2: each of the eight providers' switches is settable independently of every other", () => {
+    for (const [provider, envVar] of Object.entries(PROVIDER_ENABLED_ENV_VAR)) {
+      const c = loadConfig({ ...base, [envVar]: "false" }, noRead);
+      for (const [otherProvider, enabled] of Object.entries(c.providerEnabled)) {
+        expect(enabled).toBe(otherProvider === provider ? false : true);
+      }
+    }
+  });
+  test("FACTORY-66 review round 2: describeConfig names exactly the switched-off providers, and nothing when every switch is at its default", () => {
+    expect(describeConfig(loadConfig(base, noRead))).not.toContain("providerSwitchOff");
+    const d = describeConfig(loadConfig({ ...base, [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false", [PROVIDER_ENABLED_ENV_VAR.filesystem]: "false" }, noRead));
+    expect(d).toContain("providerSwitchOff=github-pr,filesystem");
+  });
+  // FACTORY-66 review round 3 (brooswit, PR #797, @ 334430f6): "disabled
+  // must mean no own initialization, no credential requirement" — before
+  // this, `loadConfig` read/validated ATLASSIAN_TOKEN_FILE unconditionally,
+  // even when every Atlassian-backed provider's own switch was off, so a
+  // host with zero use for Atlassian still had its credential read (and a
+  // real client constructed downstream in daemon/index.ts) for nothing.
+  test("FACTORY-66 review round 3: all four Atlassian-backed provider switches off skips the credential read entirely, even with a valid ATLASSIAN_TOKEN_FILE set", () => {
+    const allAtlassianOff = { [PROVIDER_ENABLED_ENV_VAR["jira-work"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-idea"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-project"]]: "false", [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" };
+    const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t", ...allAtlassianOff }, noRead);
+    expect(c.atlassian).toBeUndefined();
+    expect(c.atlassianDisabledReason).toContain("every Atlassian-backed provider switch");
+    expect(c.atlassianDisabledReason).toContain("is off");
+  });
+  test("FACTORY-66 review round 3: ONE enabled Atlassian-backed sibling still reads/validates the shared credential normally, with the other three switched off", () => {
+    const threeOff = { [PROVIDER_ENABLED_ENV_VAR["jira-idea"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-project"]]: "false", [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" };
+    const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t", ...threeOff }, (p) => { expect(p).toBe("/t"); return "filetok\n"; });
+    expect(c.atlassian).toEqual({ site: "https://x.atlassian.net", email: "a@b.c", token: "filetok" });
+    expect(c.providerEnabled["jira-work"]).toBe(true);
+    expect(c.providerEnabled["jira-idea"]).toBe(false);
   });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
@@ -69,6 +161,39 @@ describe("loadConfig", () => {
     const d = describeConfig(loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme" }, () => "s3cr3t-gh-tok"));
     expect(d).not.toContain("s3cr3t-gh-tok");
     expect(d).toContain("orgs=acme");
+  });
+  // FACTORY-66: an unreadable GITHUB_TOKEN_FILE used to throw straight out of
+  // `loadConfig` — fatal to the ENTIRE daemon over one optional provider's
+  // bad file, even though `github` is documented as optional. It is now
+  // isolated: `github` stays `undefined` (same as merely unset) and
+  // `githubTokenReadError` names what went wrong, for the daemon to log.
+  test("FACTORY-66: an unreadable GITHUB_TOKEN_FILE isolates to github staying undefined, never throws", () => {
+    const boom = () => { throw new Error("ENOENT: no such file"); };
+    expect(() => loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme" }, boom)).not.toThrow();
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme" }, boom);
+    expect(c.github).toBeUndefined();
+    expect(c.githubTokenReadError).toContain("ENOENT");
+    expect(c.atlassian).toBeDefined(); // unrelated provider unaffected
+    const d = describeConfig(c);
+    expect(d).toContain("github=disabled");
+    expect(d).toContain("ENOENT");
+  });
+
+  // FACTORY-66 review round 3: github-issue and github-pr share ONE
+  // GITHUB_TOKEN_FILE — before this, it was read unconditionally whenever
+  // the file/orgs were set, even with BOTH providers' own switches off.
+  test("FACTORY-66 review round 3: GITHUB_TOKEN_FILE is never read when BOTH github-issue and github-pr switches are off", () => {
+    const bothOff = { [PROVIDER_ENABLED_ENV_VAR["github-issue"]]: "false", [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false" };
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme", ...bothOff }, noRead);
+    expect(c.github).toBeUndefined();
+    expect(c.githubTokenReadError).toBeUndefined(); // never attempted, not merely isolated
+  });
+  test("FACTORY-66 review round 3: ONE enabled github sibling still reads the shared token normally, with the other switched off", () => {
+    const prOff = { [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false" };
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme", ...prOff }, () => "ghtok\n");
+    expect(c.github).toEqual({ token: "ghtok", orgs: ["acme"] });
+    expect(c.providerEnabled["github-issue"]).toBe(true);
+    expect(c.providerEnabled["github-pr"]).toBe(false);
   });
 
   test("stalledMinutes defaults to 10, honours BUTCHR_STALLED_MINUTES, and rejects a non-positive value", () => {
