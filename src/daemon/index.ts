@@ -1871,7 +1871,14 @@ const quotaGate = createQuotaGate(
 // loop further down this file), so `ops.addComment` is the right seam —
 // same one every other daemon-side comment write uses, no second Atlassian
 // writer.
-const stallRemediation = createStallRemediator({
+// FACTORY-1016: `undefined` when BUTCHR_STALL_REMEDIATION_MODE=off (the
+// new default) — the same disables-entirely-when-omitted shape
+// `silentStop`/`idlePoke` already use, and src/labels/sync.ts's
+// `deps.stallRemediation?.check`/`?.forget` are already written to treat
+// an absent remediator as "do nothing" (no further change needed there).
+// This was previously unconditional, which is exactly the unwanted
+// automatic `[butchr:stall]` wake this ticket exists to stop.
+const stallRemediation = config.stallRemediationMode === "off" ? undefined : createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
@@ -2285,7 +2292,7 @@ const syncLabels = createLabelSync({
   agentStatuses: agentStatusesFeedingDashboard,
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
-  stallRemediation,
+  ...(stallRemediation ? { stallRemediation } : {}),
   ...(silentStop ? { silentStop } : {}),
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   coverage,
