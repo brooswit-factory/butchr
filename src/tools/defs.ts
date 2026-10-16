@@ -637,13 +637,13 @@ export function atlassianTools(
     },
     start_worker: {
       description:
-        "Move ONE OF THE CALLER'S OWN workers to In Progress. NOT the call that staffs an agent (BUTCHR-244 correction — this description used to claim otherwise): In Progress is one of the ACTIVE statuses the daemon's reconcile poll spawns agents FROM, on its own later, independent cadence — this call does not start an agent and cannot confirm one exists, or ever will (the spawn itself can fail, e.g. herdr's `agent_pane_busy`, with no path back to this caller). The result's `staffing` field says this in words; use `check_worker` on the key to actually find out. Also sends an In Review worker back to work. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot) — for a PROJECT caller (BUTCHR-71), \"one of your own workers\" means an Epic that is a MEMBER of your project (no link exists for that relationship); a Story or Task in your own project, or an Epic in a different one, is refused just as sharply. Replaces jira_transition(key, \"In Progress\") for this case.",
+        "Move ONE OF THE CALLER'S OWN workers to In Progress. NOT the call that staffs an agent (BUTCHR-244 correction — this description used to claim otherwise): In Progress is one of the ACTIVE statuses the daemon's reconcile poll spawns agents FROM, on its own later, independent cadence — this call does not start an agent and cannot confirm one exists, or ever will (the spawn itself can fail, e.g. herdr's `agent_pane_busy`, with no path back to this caller). The result's `staffing` field says this in words; use `check_worker` on the key to actually find out. Also sends an In Review worker back to work. Refuses a `key` that is not one of the caller's own workers, verified fresh via the Implements link (never a stale snapshot) — for a PROJECT caller (BUTCHR-71), \"one of your own workers\" means an Epic that is a MEMBER of your project (no link exists for that relationship); a Story or Task in your own project, or an Epic in a different one, is refused just as sharply. FACTORY-829: an unassigned key is now assigned by role (the same config `new_worker`/`adopt_worker` use) before the transition — never left unassigned, since the daemon's own admission search is assignee-scoped and would otherwise never see it again; refuses with an actionable error instead if no role is configured for its type. An already-assigned key is untouched. Replaces jira_transition(key, \"In Progress\") for this case.",
       input: { key: z.string() },
       handler: async (a, c) => {
         const { key } = a as { key: string };
         const who = requireCaller(c, "start_worker");
         audit(c, `start_worker ${key}`);
-        const r = await startWorker(ops, who, key);
+        const r = await startWorker(ops, roles, who, key);
         noted(c, [key]);
         return { ...orOk(r, {}), ok: true, key, status: "In Progress", staffing: STAFFING_PENDING };
       },
