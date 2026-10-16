@@ -701,6 +701,66 @@ describe("stop(): aborts in-flight request, cancels the reader, clears every tim
     client.stop();
   });
 
+  test("stop() then start() during a pending fetch leaves the NEW attempt's watchdog intact — a stale attempt's own clearWatchdog() must not clobber it (review-caught bug, round 2)", async () => {
+    // Same start/stop/start-during-a-pending-fetch shape as the test above, but this time
+    // checking the watchdog specifically: #1's stale `catch { clearWatchdog(); ... }` ran
+    // AFTER #2 had already armed its own connect-phase watchdog (both attempts share one
+    // `watchdogHandle` variable), so an ungated clearWatchdog() call from #1's stale
+    // continuation cancelled the timer #2 was relying on — silently reverting watchdog coverage
+    // for the very restart scenario the first round of this bug was about.
+    const clock = createFakeClock();
+    const gateway = createFakeGateway();
+    let releaseFirstFetch: (() => void) | undefined;
+    const firstFetchGate = new Promise<void>((resolve) => {
+      releaseFirstFetch = resolve;
+    });
+    gateway.queueCustom(
+      (signal) =>
+        new Promise<FakeResponse>((_, reject) => {
+          signal.addEventListener("abort", () => {
+            // #1's stale continuation resumes (and runs its clearWatchdog()) only after we
+            // explicitly release it below — letting the test control exactly when that race hits.
+            void firstFetchGate.then(() => reject(new Error("aborted")));
+          });
+        }),
+    );
+    // #2 also never responds (connect-phase watchdog is what must catch it), then goes live once
+    // the watchdog-triggered reconnect fires.
+    gateway.queueCustom(
+      (signal) =>
+        new Promise<FakeResponse>((_, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    gateway.queueLive();
+
+    const client = makeClient({ clock, fetch: gateway.fetch, watchdogMs: 1000, backoffBaseMs: 50, randomValues: [0.5] });
+    client.start(); // #1: fetch pending
+    await clock.advance(0);
+    expect(gateway.calls).toHaveLength(1);
+
+    client.stop(); // aborts #1 (its abort listener is now waiting on firstFetchGate, not yet rejecting)
+    client.start(); // #2: arms its OWN connect-phase watchdog
+    await clock.advance(0);
+    expect(gateway.calls).toHaveLength(2);
+
+    releaseFirstFetch!(); // let #1's stale continuation finally run its (now gen-guarded) clearWatchdog()
+    await clock.advance(0);
+
+    // If #1's clearWatchdog() had wrongly cancelled #2's timer, no watchdog would ever fire and
+    // this would advance forever with no third call. With the fix, #2's watchdog is untouched and
+    // fires at exactly 1000ms, aborting #2 and scheduling a reconnect ~25ms later (backoffBaseMs
+    // 50 * random 0.5).
+    await clock.advance(999);
+    expect(gateway.calls).toHaveLength(2);
+    await clock.advance(1); // t=1000: #2's watchdog fires -> abort -> reconnect scheduled
+    expect(gateway.calls).toHaveLength(2); // the reconnect itself hasn't fired yet
+    await clock.advance(25);
+    expect(gateway.calls).toHaveLength(3); // reconnect fired, hitting the third (queueLive) script
+    expect(client.state).toBe("live");
+    client.stop();
+  });
+
   test("a throwing onEvent listener does not lose the event's delivery or force a reconnect (review-caught bug)", async () => {
     const clock = createFakeClock();
     const gateway = createFakeGateway();
