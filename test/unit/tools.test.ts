@@ -1737,6 +1737,7 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
     issue?: unknown;
     commentsByKey?: Record<string, Array<{ id: string }>>;
     onStandDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void;
+    search?: (jql: string) => Promise<unknown>;
   } = {}) {
     const getIssueCommentsCalls: string[] = [];
     const ops: AtlassianOps = {
@@ -1745,7 +1746,7 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
         getIssueCommentsCalls.push(key);
         return { results: (opts.commentsByKey?.[key] ?? []) as any[] };
       },
-      search: async () => ({ ok: true }),
+      search: opts.search ?? (async () => ({ ok: true })),
       addComment: async () => ({ ok: true }),
       linkIssues: async () => ({ ok: true }),
       transition: async () => ({ ok: true }),
@@ -1828,6 +1829,46 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
     const result = await tools.stand_down!.handler({}, conn);
     expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7", "KAN-8"] });
     expect(observed[0]![1].get("KAN-8")).toEqual(["200"]);
+  });
+
+  // FACTORY-917: findWorkers (Implements-only) misses a worker linked ONLY
+  // by native Jira `parent` — mirrors FACTORY-909's own closing-guard test
+  // for the boss-side symmetry, but for the watch set instead.
+  test("FACTORY-917: also watches a worker linked ONLY by native Jira `parent` (no Implements link) — a parent-only child's events must still be able to wake this boss", async () => {
+    const observed: Array<[string, ReadonlyMap<string, readonly string[]>]> = [];
+    const { tools } = standDownRig({
+      issue: { key: "KAN-7", fields: { issuelinks: [] } },
+      commentsByKey: { "KAN-7": [{ id: "100" }], "KAN-9": [{ id: "300" }] },
+      onStandDown: (key, seen) => observed.push([key, seen]),
+      search: async (jql: string) => {
+        expect(jql).toContain('parent = "KAN-7"');
+        expect(jql).not.toContain("status != Done");
+        return { issues: [{ key: "KAN-9", fields: { status: { name: "To Do" }, summary: "parent-only child" } }] };
+      },
+    });
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const result = await tools.stand_down!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7", "KAN-9"] });
+    expect(observed[0]![1].get("KAN-9")).toEqual(["300"]);
+  });
+
+  test("FACTORY-917: a child carrying BOTH a native parent pointing here AND an Implements link is watched once, not twice", async () => {
+    const { tools } = standDownRig({
+      issue: {
+        key: "KAN-7",
+        fields: {
+          issuelinks: [
+            { type: { name: "Implements" }, outwardIssue: { key: "KAN-8", fields: { status: { name: "In Progress" }, summary: "s" } } },
+          ],
+        },
+      },
+      commentsByKey: { "KAN-7": [], "KAN-8": [] },
+      onStandDown: () => {},
+      search: async () => ({ issues: [{ key: "KAN-8", fields: { status: { name: "In Progress" }, summary: "s" } }] }),
+    });
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    const result = await tools.stand_down!.handler({}, conn);
+    expect(result).toEqual({ ok: true, key: "KAN-7", asleep: true, watching: ["KAN-7", "KAN-8"] });
   });
 
   test("the standDown effect is optional — omitting it still reads the snapshot but never claims the caller is asleep", async () => {

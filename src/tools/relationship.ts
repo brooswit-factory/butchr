@@ -204,6 +204,13 @@ function staffingFor(kind: Disposition["kind"]): string {
  * `findWorkers`' own return order — a caller with more than one live
  * sibling sharing this exact summary already has a pre-existing ambiguity
  * this check did not create and is not responsible for resolving.
+ *
+ * FACTORY-917: Implements-only, by itself — a caller's not-Done child linked
+ * ONLY by native Jira `parent` (no Implements link) does not appear in
+ * `findWorkers` and so cannot match here. `newWorker` below pairs this with
+ * `parentOnlyChildren` (I/O, paid at that call site) to cover that case too;
+ * this function itself stays exactly what it was — pure, I/O-free, costing
+ * nothing beyond the `getIssue` the caller already paid for.
  */
 function findDuplicateWorker(callerIssue: unknown, summary: string): WorkerRef | undefined {
   const trimmed = summary.trim();
@@ -516,32 +523,98 @@ async function openWorkers(ops: AtlassianOps, key: string, issue: unknown): Prom
  * Finding them needs a real JQL query.
  *
  * CHOSEN: option (i) from the ticket — an I/O-performing resolver at THIS
- * call site only (the closing guard behind finish_worker,
- * finish_without_a_boss, submit_to_boss), which can afford the cost.
- * `findWorkers` itself, `new_worker`'s duplicate-child idempotency check
- * (`findDuplicateWorker`), and `stand_down`'s watch set (src/tools/defs.ts)
- * are UNCHANGED and remain Implements-only — a known, deliberately-scoped
- * gap, not an oversight; see this ticket's PR body. None of those three is
- * the specific failure this guard exists to close (a boss closing itself
- * out from under a live, undetected child) — they are a weaker, pre-
- * existing staleness class (a duplicate filed, a wake missed) that this
- * change does not make any worse than it already is today.
+ * call site, which can afford the cost. `findWorkers` itself stays pure and
+ * I/O-free (see its own doc comment in docs.ts).
+ *
+ * FACTORY-917: `new_worker`'s duplicate-child idempotency check
+ * (`findDuplicateWorker` + `findParentOnlyDuplicateWorker`, this file) and
+ * `stand_down`'s watch set (src/tools/defs.ts) were Implements-only when
+ * this comment was first written — both now ALSO see parent-only children,
+ * via the same `parentOnlyChildren` JQL shape this function uses, each
+ * paying for its own search at its own call site. See each one's own doc
+ * comment for why paying there was the right call.
  *
  * `exclude` is every key already counted from the Implements-based view
  * above, so a child that carries BOTH a native parent pointing at `key` AND
  * an (agreeing) Implements link is never double-reported.
  */
 async function parentOnlyOpenWorkers(ops: AtlassianOps, key: string, exclude: ReadonlySet<string>): Promise<WorkerRef[]> {
-  const result = (await ops.search(`parent = "${key}" AND issuetype in (Story, Task) AND status != Done`, 200)) as {
+  const children = await parentOnlyChildren(ops, key, exclude, "status != Done");
+  return children.filter((c) => !c.labels.includes(EXEMPT_LABEL)).map((c) => ({ key: c.key, status: c.status, summary: c.summary }));
+}
+
+/**
+ * FACTORY-917: the one JQL shape behind every boss-side "children linked
+ * ONLY by native parent, not Implements" reader — `parentOnlyOpenWorkers`
+ * above (FACTORY-909's closing guard) and the two FACTORY-917 call sites
+ * below (`new_worker`'s duplicate check in `newWorker`, `stand_down`'s watch
+ * set in src/tools/defs.ts) all need this same view, filtered only by
+ * whatever `extraJql` each cares about — one reader, not three. `labels` is
+ * returned raw (never filtered here) because the three callers disagree on
+ * what to do with `EXEMPT_LABEL`: the closing guard excludes a shelved
+ * child from "open", but a shelved child still answers "does a matching
+ * ticket already exist" (duplicate check) and "should its events still
+ * reach me" (stand_down watch set) the same as any other child — filtering
+ * it out here would silently change THOSE callers' behavior to match a
+ * guard-specific rule that isn't theirs.
+ */
+async function parentOnlyChildren(
+  ops: AtlassianOps,
+  key: string,
+  exclude: ReadonlySet<string>,
+  extraJql?: string,
+): Promise<Array<{ key: string; status: string | undefined; summary: string | undefined; labels: string[] }>> {
+  const jql = `parent = "${key}" AND issuetype in (Story, Task)${extraJql ? ` AND ${extraJql}` : ""}`;
+  const result = (await ops.search(jql, 200)) as {
     issues?: Array<{ key?: string; fields?: { status?: { name?: string }; summary?: string; labels?: string[] } }>;
   };
-  const open: WorkerRef[] = [];
+  const out: Array<{ key: string; status: string | undefined; summary: string | undefined; labels: string[] }> = [];
   for (const i of result.issues ?? []) {
     if (!i.key || exclude.has(i.key)) continue;
-    if (i.fields?.labels?.includes(EXEMPT_LABEL)) continue;
-    open.push({ key: i.key, status: i.fields?.status?.name, summary: i.fields?.summary });
+    out.push({ key: i.key, status: i.fields?.status?.name, summary: i.fields?.summary, labels: i.fields?.labels ?? [] });
   }
-  return open;
+  return out;
+}
+
+/**
+ * FACTORY-917 — the parent-only half of `new_worker`'s duplicate-child
+ * check, paired with `findDuplicateWorker` (Implements-only, pure) at the
+ * `newWorker` call site below. DELIBERATELY PAID on this hot create path
+ * (recording the decision this ticket's own spec asks for): a missed
+ * duplicate here does not fail quietly the way a missed closing-guard child
+ * would — it files a second, visible ticket for work that may already be
+ * running, which costs more (a stray Story/Task, review burden, possibly a
+ * duplicate agent) than the one extra JQL search this adds to every
+ * `new_worker` call. Same `status != Done` match rule as
+ * `findDuplicateWorker` (a Done sibling is finished history, not a
+ * duplicate); unlike `parentOnlyOpenWorkers`, NOT filtered by
+ * `EXEMPT_LABEL` — a shelved parent-only child with a matching summary is
+ * still the same pre-existing ticket, exactly as a shelved Implements-linked
+ * one already is on the `findDuplicateWorker` side (that function never
+ * checks labels either).
+ */
+async function findParentOnlyDuplicateWorker(ops: AtlassianOps, key: string, exclude: ReadonlySet<string>, summary: string): Promise<{ key: string; status: string | undefined } | undefined> {
+  const trimmed = summary.trim();
+  const children = await parentOnlyChildren(ops, key, exclude, "status != Done");
+  const match = children.find((c) => (c.summary ?? "").trim() === trimmed);
+  return match ? { key: match.key, status: match.status } : undefined;
+}
+
+/**
+ * FACTORY-917 — `stand_down`'s own half of this ticket (src/tools/defs.ts):
+ * every one of `key`'s children linked ONLY by native Jira `parent` (no
+ * Implements link), as plain keys, NOT filtered to not-Done — `stand_down`'s
+ * watch set is built from `findWorkers`, which is likewise unfiltered by
+ * status (a Done worker's own ticket can still take a late comment), so the
+ * parent-only half has to match that totality rather than reuse
+ * `parentOnlyOpenWorkers`'s "status != Done" narrowing. `stand_down` is
+ * called on a wait path, right before the caller's own session is released
+ * to sleep — an extra search here is cheap relative to the sleep it
+ * precedes (this ticket's own spec), unlike the hot create path
+ * `findParentOnlyDuplicateWorker` above shares this JQL shape with.
+ */
+export async function parentOnlyWorkerKeys(ops: AtlassianOps, key: string, exclude: ReadonlySet<string>): Promise<string[]> {
+  return (await parentOnlyChildren(ops, key, exclude)).map((c) => c.key);
 }
 
 /**
@@ -702,14 +775,23 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // and cost. No write happens on this path at all, so a caller that needs
   // the existing worker's doc/status/staffing reads them separately
   // (get_doc / check_worker) against the returned `key`.
+  const implementsWorkers = findWorkers(callerIssue);
   const dup = findDuplicateWorker(callerIssue, input.summary);
-  if (dup) {
+  // FACTORY-917: the Implements-only check above cannot see a not-Done
+  // child linked ONLY by native Jira `parent` — pay one extra JQL search
+  // for that case too (see `findParentOnlyDuplicateWorker`'s own doc
+  // comment for why paying on this hot path is the right call). `exclude`
+  // is every key the Implements-only read above already covered, so a
+  // child carrying both links is never checked, or reported, twice.
+  const parentOnlyDup = dup ? undefined : await findParentOnlyDuplicateWorker(ops, callerKey, new Set(implementsWorkers.map((w) => w.key)), input.summary);
+  const foundDup = dup ?? parentOnlyDup;
+  if (foundDup) {
     return {
-      key: dup.key,
+      key: foundDup.key,
       implements: callerKey,
       created: false,
       duplicateReason:
-        `new_worker: ${callerKey} already has a not-Done worker (${dup.key}, status ${dup.status ?? "unknown"}) whose summary exactly matches (after trimming) the one requested — returning it instead of creating a twin. ` +
+        `new_worker: ${callerKey} already has a not-Done worker (${foundDup.key}, status ${foundDup.status ?? "unknown"}) whose summary exactly matches (after trimming) the one requested — returning it instead of creating a twin. ` +
         `Deliberate limitation (BUTCHR-244): there is no bypass in this increment; a caller that genuinely wants a second worker with an identical summary must differentiate the summary.`,
     };
   }

@@ -114,19 +114,23 @@ function makeWorld() {
         },
       };
     },
-    // FACTORY-909: the ONLY jql shape this fake needs to understand is the
-    // boss-side closing guard's own query (parentOnlyOpenWorkers,
-    // src/tools/relationship.ts) — `parent = "<key>" AND issuetype in
-    // (Story, Task) AND status != Done`. A loose key-extraction regex, not
-    // a real JQL parser: this fake world's job is to make the production
-    // call site's query behave like real Jira for the one shape it emits,
-    // not to be a general JQL engine.
+    // FACTORY-909/FACTORY-917: the ONLY jql shapes this fake needs to
+    // understand are `parentOnlyChildren`'s own query (src/tools/
+    // relationship.ts) — `parent = "<key>" AND issuetype in (Story, Task)`,
+    // optionally suffixed `AND status != Done` for the callers that ask for
+    // that (the boss-side closing guard and the new_worker duplicate check;
+    // `stand_down`'s watch set does NOT, and needs Done parent-only children
+    // back too). A loose key-extraction regex, not a real JQL parser: this
+    // fake world's job is to make the production call sites' queries behave
+    // like real Jira for the shapes they actually emit, not to be a general
+    // JQL engine.
     search: async (jql: string) => {
       const m = /parent\s*=\s*"([^"]+)"/.exec(jql);
       if (!m) return {};
       const parentKey = m[1];
+      const excludeDone = /status\s*!=\s*Done/.test(jql);
       const result = [...issues.entries()]
-        .filter(([, w]) => w.parentKey === parentKey && (w.issuetype === "Story" || w.issuetype === "Task") && w.status !== "Done")
+        .filter(([, w]) => w.parentKey === parentKey && (w.issuetype === "Story" || w.issuetype === "Task") && (!excludeDone || w.status !== "Done"))
         .map(([key, w]) => ({ key, fields: { status: { name: w.status }, summary: w.summary ?? `${key} summary`, labels: w.labels } }));
       return { issues: result };
     },
@@ -3132,6 +3136,50 @@ describe("newWorker: idempotency — a retry cannot produce a twin (BUTCHR-244)"
     expect(createIssueCalls).toBe(2);
     expect(first.key).not.toBe(second.key);
     expect(second.created).not.toBe(false);
+  });
+
+  // FACTORY-917: findDuplicateWorker alone (Implements-only) cannot see a
+  // not-Done child linked ONLY by native Jira `parent` — mirrors FACTORY-
+  // 909's own table-driven native-parent cases, but for the duplicate check.
+  test("FACTORY-917: a not-Done child linked ONLY by native Jira `parent` (no Implements link) with a matching summary is matched as a duplicate — no twin created", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    // BUTCHR-2 is parent-only: no Implements link at all, just Jira's native parent field.
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", parentKey: "BUTCHR-1", summary: "Do the thing", status: "In Progress" });
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const result = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(createIssueCalls).toBe(0);
+    expect(result.created).toBe(false);
+    expect(result.key).toBe("BUTCHR-2");
+    expect(result.duplicateReason).toContain("BUTCHR-2");
+  });
+
+  test("FACTORY-917: a DONE parent-only child with a matching summary does NOT block — a new ticket IS created", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", parentKey: "BUTCHR-1", summary: "Do the thing", status: "Done" });
+    let createIssueCalls = 0;
+    const spied: AtlassianOps = { ...ops, createIssue: async (...a) => { createIssueCalls++; return ops.createIssue(...a); } };
+    const result = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(createIssueCalls).toBe(1);
+    expect(result.created).not.toBe(false);
+    expect(result.key).not.toBe("BUTCHR-2");
+  });
+
+  test("FACTORY-917: a child carrying BOTH a native parent pointing here AND an Implements link is matched once via the Implements-based check — no extra JQL search is even needed to find it", async () => {
+    const { ops, addIssue, issues, setProjectProperty } = makeWorld();
+    setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", parentKey: "BUTCHR-1", summary: "Do the thing", status: "In Progress" });
+    let searchCalls = 0;
+    const spied: AtlassianOps = { ...ops, search: async (...a) => { searchCalls++; return ops.search(...a); } };
+    const result = await newWorker(spied, ROLES, "BUTCHR-1", { summary: "Do the thing", disposition: { kind: "start" } });
+    expect(result.created).toBe(false);
+    expect(result.key).toBe("BUTCHR-2");
+    expect(searchCalls).toBe(0); // the Implements-based findDuplicateWorker already matched — the parent-only JQL search is never paid for
   });
 });
 

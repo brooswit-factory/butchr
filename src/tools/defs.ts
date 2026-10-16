@@ -6,7 +6,7 @@ import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
   reportToBoss, askBoss, submitToBoss, finishWithoutABoss, fileWhereItBelongs, tellPeer, ASK_MARKER, CORRECTION_MARKER,
-  checkWorker, STAFFING_PENDING,
+  checkWorker, STAFFING_PENDING, parentOnlyWorkerKeys,
   type Disposition, type PeerIntent,
 } from "./relationship.js";
 import { isProjectId, isConfluencePageResourceId } from "../resources/id.js";
@@ -907,7 +907,16 @@ export function atlassianTools(
       handler: async (_a, c) => {
         const who = requireIssueCaller(c, "stand_down", "a project already has `check_in` for this same last-act purpose — use that instead; an issue's sleep/wake mechanism (BUTCHR-307) is a separate, in-memory registry from check_in's durable watermark");
         const issue = await ops.getIssue(who);
-        const keys = [who, ...findWorkers(issue).map((w) => w.key)];
+        const implementsWorkers = findWorkers(issue);
+        // FACTORY-917: findWorkers alone misses a worker linked ONLY by
+        // native Jira `parent` (no Implements link) — its status change,
+        // question or [butchr:blocked] escalation would otherwise never
+        // wake this boss. Paid unconditionally, like parentOnlyOpenWorkers
+        // (FACTORY-909): this call is on a wait path right before the
+        // caller's own session is released to sleep, so one extra search
+        // here is cheap relative to the sleep it precedes.
+        const parentOnlyKeys = await parentOnlyWorkerKeys(ops, who, new Set(implementsWorkers.map((w) => w.key)));
+        const keys = [who, ...implementsWorkers.map((w) => w.key), ...parentOnlyKeys];
         const seen = new Map<string, readonly string[]>();
         for (const key of keys) {
           const comments = await ops.getIssueComments(key);
