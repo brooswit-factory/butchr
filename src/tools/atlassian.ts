@@ -120,8 +120,7 @@ export interface AtlassianOps {
    * writes the result back. NEVER removes an existing label — there is no
    * other way to set a label on an issue that already exists (labels can
    * otherwise only be set at creation), and a naive replace would silently
-   * destroy whatever labels the ticket already carried (src/tools/relationship.ts,
-   * shelve_worker).
+   * destroy whatever labels the ticket already carried.
    */
   addLabels(key: string, labels: readonly string[]): Promise<unknown>;
 

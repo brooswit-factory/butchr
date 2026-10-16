@@ -85,25 +85,6 @@ work lifecycle via the reconcile loop: active ticket ⇒ running agent.
   starts the herdr workspace with that `cwd` — Claude Code auto-reads
   `CLAUDE.md` there. Kickoff prompt: **"follow your CLAUDE.md"**.
 
-## Shelving a worker (`butchr:shelved`)
-
-A deliberately-shelved backlog item — a staffed child a boss has put down on
-purpose rather than forgotten — can be marked with the `butchr:shelved` label
-(`EXEMPT_LABEL`, `src/labels/plan.ts`). Any actor may set it (a human by
-hand, or `shelve_worker`) — the daemon's own poll/sweep machinery only ever
-reads it, never adds or removes it. It means CURRENTLY shelved, a state
-rather than a history: `start_worker`/`finish_worker`/
-`adopt_worker(..., "start")` clear it as part of reversing the decision it
-recorded, so reactivating a worker also withdraws its exemption. A label set
-by hand, outside those verbs, is cleared by nobody but whoever set it.
-
-(FACTORY-190 retired the parked-ticket escalation detector that originally
-introduced this label, BUTCHR-24: its sole production call site always
-supplied an empty `related` set, so it could never actually produce a
-candidate to escalate. The label's semantics and every real consumer —
-`stop-cause.ts`, `labels/registry.ts`, `tools/relationship.ts` — are
-unchanged by that removal.)
-
 ## Tools: the daemon MCP is a thin proxy
 
 thatch tools proxy the de-facto SDKs — `jira.js` and `confluence.js` —

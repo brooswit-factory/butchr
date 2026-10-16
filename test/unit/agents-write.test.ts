@@ -5,12 +5,9 @@ import {
   doAgentStart,
   planAgentStop,
   doAgentStop,
-  planAgentShelve,
-  doAgentShelve,
   doAgentAdopt,
   doAgentPrioritize,
   validateStopRequestBody,
-  validateShelveRequestBody,
   validateAdoptRequestBody,
   validatePrioritizeRequestBody,
   type AgentWriteDeps,
@@ -210,55 +207,6 @@ describe("agents-write — FACTORY-666", () => {
     });
   });
 
-  describe("planAgentShelve / doAgentShelve", () => {
-    test("plan refuses an empty reason before ever resolving a boss or naming a confirmReason — writes nothing", async () => {
-      const world = makeOps();
-      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" });
-      const { herd } = makeHerd();
-      const plan = await planAgentShelve(deps(world, herd), "FACTORY-1", "   ");
-      expect(plan.ok).toBe(false);
-      if (!plan.ok) expect(plan.status).toBe(400);
-      expect(world.calls).toEqual([]);
-    });
-
-    test("plan reports requiresConfirm with a structured preview (key/boss/reason), never writes", async () => {
-      const world = makeOps();
-      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" });
-      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
-      const { herd } = makeHerd();
-      const plan = await planAgentShelve(deps(world, herd), "FACTORY-1", "operator is stepping in manually");
-      expect(plan.ok).toBe(true);
-      if (plan.ok) {
-        expect(plan.requiresConfirm).toBe(true);
-        expect(plan.confirmReason).toBe("agent-shelve");
-        expect(plan.preview).toEqual({ key: "FACTORY-1", boss: "FACTORY-BOSS", reason: "operator is stepping in manually" });
-      }
-      expect(world.calls).toEqual([]);
-    });
-
-    test("doAgentShelve labels, transitions to To Do, and posts the reason as a comment — in that order", async () => {
-      const world = makeOps();
-      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS", status: "In Progress" });
-      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
-      const { herd } = makeHerd();
-      const outcome = await doAgentShelve(deps(world, herd), "FACTORY-1", "operator is stepping in manually");
-      expect(outcome.ok).toBe(true);
-      expect(world.issues.get("FACTORY-1")?.status).toBe("To Do");
-      expect(world.issues.get("FACTORY-1")?.labels).toContain("butchr:shelved");
-      expect(world.calls).toEqual(["addLabels:FACTORY-1:butchr:shelved", "transition:FACTORY-1:To Do", "addComment:FACTORY-1"]);
-    });
-
-    test("doAgentShelve refuses, and writes nothing, on an empty reason even with an otherwise-valid boss", async () => {
-      const world = makeOps();
-      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" });
-      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
-      const { herd } = makeHerd();
-      const outcome = await doAgentShelve(deps(world, herd), "FACTORY-1", "");
-      expect(outcome.ok).toBe(false);
-      expect(world.calls).toEqual([]);
-    });
-  });
-
   describe("doAgentAdopt", () => {
     test("disposition start: links, assigns, transitions to In Progress", async () => {
       const world = makeOps();
@@ -269,12 +217,12 @@ describe("agents-write — FACTORY-666", () => {
       expect(outcome.ok).toBe(true);
     });
 
-    test("disposition shelve with no reason is refused and writes nothing", async () => {
+    test("legacy shelve disposition is refused even with a reason and writes nothing", async () => {
       const world = makeOps();
       world.addIssue("FACTORY-1", { issuetype: "Task" });
       world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
       const { herd } = makeHerd();
-      const outcome = await doAgentAdopt(deps(world, herd), "FACTORY-1", { bossKey: "FACTORY-BOSS", disposition: "shelve" });
+      const outcome = await doAgentAdopt(deps(world, herd), "FACTORY-1", { bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "later" } as unknown as Parameters<typeof doAgentAdopt>[2]);
       expect(outcome.ok).toBe(false);
       if (!outcome.ok) expect(outcome.status).toBe(400);
       expect(world.calls).toEqual([]);
@@ -317,10 +265,10 @@ describe("agents-write — FACTORY-666", () => {
   describe("agentSnapshot", () => {
     test("reports status/labels/boss plus live running state", async () => {
       const world = makeOps();
-      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS", status: "In Progress", labels: ["butchr:shelved"] });
+      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS", status: "In Progress", labels: ["team:platform"] });
       const { herd } = makeHerd({ "FACTORY-1": "pane-3" });
       const result = await agentSnapshot(deps(world, herd), "FACTORY-1");
-      expect(result).toEqual({ ok: true, key: "FACTORY-1", status: "In Progress", summary: "FACTORY-1 summary", labels: ["butchr:shelved"], boss: "FACTORY-BOSS", running: true, pane: "pane-3" });
+      expect(result).toEqual({ ok: true, key: "FACTORY-1", status: "In Progress", summary: "FACTORY-1 summary", labels: ["team:platform"], boss: "FACTORY-BOSS", running: true, pane: "pane-3" });
     });
 
     test("reports running: false and pane: null when no agent is live", async () => {
@@ -356,16 +304,9 @@ describe("agents-write — FACTORY-666", () => {
       expect(r.ok).toBe(false);
     });
 
-    test("validateShelveRequestBody: requires a string reason", () => {
-      expect(validateShelveRequestBody({ reason: "because" })).toEqual({ ok: true, reason: "because", confirm: false });
-      expect(validateShelveRequestBody({ reason: "because", confirm: true })).toEqual({ ok: true, reason: "because", confirm: true });
-      expect(validateShelveRequestBody({}).ok).toBe(false);
-      expect(validateShelveRequestBody({ reason: 5 }).ok).toBe(false);
-    });
-
     test("validateAdoptRequestBody: requires bossKey + a valid disposition", () => {
       expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "start" })).toEqual({ ok: true, input: { bossKey: "FACTORY-BOSS", disposition: "start" } });
-      expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "r" })).toEqual({ ok: true, input: { bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "r" } });
+      expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "r" }).ok).toBe(false);
       expect(validateAdoptRequestBody({ bossKey: "", disposition: "start" }).ok).toBe(false);
       expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "nope" }).ok).toBe(false);
       expect(validateAdoptRequestBody({}).ok).toBe(false);

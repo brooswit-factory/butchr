@@ -428,7 +428,7 @@ Surface enumerated from the tool registry in my own worktree,
 | `jira_transition`, `jira_set_priority`, `jira_assign` | write | small acks | no | REASONED, same basis as `jira_link_issues` — checked their handlers carry no doc/body echo |
 | `correct_worker` | write | archive comment explicitly chunked to stay under `JIRA_COMMENT_CHAR_LIMIT` (`src/tools/relationship.ts:1409-1481`) | no | REASONED — the chunking logic exists precisely to keep this bounded |
 | `tell_worker`, `report_to_boss`, `ask_boss`, `tell_peer` | write (post a comment) | comment text, same `JIRA_COMMENT_CHAR_LIMIT` | no | REASONED, same basis |
-| `new_worker`, `start_worker`, `shelve_worker`, `adopt_worker`, `finish_worker`, `prioritize_worker`, `check_in`, `submit_to_boss`, `finish_without_a_boss` | write | small acks | no | REASONED — none of these construct a return value from a large stored document or from unbounded caller input |
+| `new_worker`, `start_worker`, `adopt_worker`, `finish_worker`, `prioritize_worker`, `check_in`, `submit_to_boss`, `finish_without_a_boss` | write | small acks | no | REASONED — none of these construct a return value from a large stored document or from unbounded caller input |
 | `file_where_it_belongs` | write | creates a ticket; description bounded by `JIRA_DESCRIPTION_CHAR_LIMIT` | no | REASONED, same basis as `jira_create_issue` |
 
 **Superseded (BUTCHR-236, PR #298, 2026-09-10):** the `set_doc` row above

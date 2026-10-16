@@ -25,7 +25,6 @@ This is a breaking MCP surface change. The daemon no longer advertises the old h
 | new_worker, file_where_it_belongs | jira_create_issue with explicit fields; separately link, assign, comment or transition as the workflow requests |
 | adopt_worker | jira_link_issues and jira_assign, explicitly chosen by the workflow |
 | start_worker, submit_to_boss, finish_worker, finish_without_a_boss | jira_transition with explicit issue and status, after the workflow's required review |
-| shelve_worker | Record the hold and owner using jira_add_comment; transition only when instructed. Use jira_add_labels for an explicit shelf marker. On approved reactivation, use jira_remove_labels to clear butchr:shelved before transitioning; never remove approval or dependency holds |
 | prioritize_worker | jira_set_priority |
 | correct_worker | jira_update_issue; explicitly archive prior text in a comment when the workflow requires it |
 | check_worker | jira_get_issue plus existing session/PR evidence sources; issue status alone is not proof of agent activity |

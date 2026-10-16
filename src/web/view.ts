@@ -35,7 +35,7 @@ import { SettingProvidedByEnvironmentError } from "../settings/write-settings.js
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
 import type { DaemonLogsResult } from "./daemon-logs.js";
 import type { SetupStatusResponse, JiraWriteRequestOutcome, RateGate } from "./setup-api.js";
-import { validateStopRequestBody, validateShelveRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody, type AgentWriteOutcome, type AdoptInput } from "../agents/agents-write.js";
+import { validateStopRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody, type AgentWriteOutcome, type AdoptInput } from "../agents/agents-write.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
 
@@ -502,8 +502,6 @@ export interface ViewDeps {
     start: (issue: string) => Promise<AgentWriteOutcome>;
     planStop: (issue: string) => Promise<AgentWriteOutcome>;
     stop: (issue: string) => Promise<AgentWriteOutcome>;
-    planShelve: (issue: string, reason: string) => Promise<AgentWriteOutcome>;
-    shelve: (issue: string, reason: string) => Promise<AgentWriteOutcome>;
     adopt: (issue: string, input: AdoptInput) => Promise<AgentWriteOutcome>;
     prioritize: (issue: string, priority: string) => Promise<AgentWriteOutcome>;
   };
@@ -1703,51 +1701,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })
-    // FACTORY-666 — `POST /api/agents/:issue/shelve`. DESTRUCTIVE (AC2),
-    // same three-outcome plan-then-confirm shape as `stop` immediately
-    // above, PLUS a mandatory, non-empty `reason` (checked by
-    // `planAgentShelve`/`doAgentShelve` themselves — see `shelve_worker`'s
-    // own refusal) before a `confirmReason` is ever handed out.
-    .post("/api/agents/:issue/shelve", async ({ params, body, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.agentsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      let issue: string;
-      try { issue = decodeURIComponent(params.issue); } catch { set.status = 400; return { error: "malformed issue key" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const bad = bodyProblem(body);
-      if (bad) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: bad.error });
-        set.status = bad.status;
-        return { error: bad.error };
-      }
-      const parsed = validateShelveRequestBody(body);
-      if (!parsed.ok) {
-        auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: parsed.error });
-        set.status = 400;
-        return { error: parsed.error };
-      }
-      if (!parsed.confirm) {
-        const plan = await deps.agentsWrite.planShelve(issue, parsed.reason);
-        if (!plan.ok) {
-          auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, { ok: false, error: plan.error });
-          set.status = plan.status;
-          return { error: plan.error };
-        }
-        return plan; // outcome 2 — deliberately verbatim, never audited.
-      }
-      const outcome = await deps.agentsWrite.shelve(issue, parsed.reason);
-      auditOutcome(deps, { route: "POST /api/agents/:issue/shelve", action: "shelve (as boss)", ids: [issue], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
     // FACTORY-666 — `POST /api/agents/:issue/adopt`: `adopt_worker`'s own
     // effect, with the operator-supplied `bossKey` (the one action with no
     // current boss to derive). Not flagged destructive in this ticket's
-    // scope — no confirm step — but a "shelve" disposition still requires
-    // a non-empty `reason`, checked by `doAgentAdopt` itself.
+    // scope — no confirm step. Only the start disposition is supported.
     .post("/api/agents/:issue/adopt", async ({ params, body, set, request, server }) => {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);

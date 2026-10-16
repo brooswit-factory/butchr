@@ -24,7 +24,6 @@ function stubApi(overrides: Partial<AgentsApi>): AgentsApi {
     getSnapshot: unused("getSnapshot"),
     start: unused("start"),
     stop: unused("stop"),
-    shelve: unused("shelve"),
     adopt: unused("adopt"),
     prioritize: unused("prioritize"),
     ...overrides,
@@ -97,7 +96,7 @@ describe("AgentControlPanel — FACTORY-666", () => {
   });
 
   test("stop: the confirm step shows the respawn-risk note, and it persists after confirming (AC6-for-stop, review round 1 finding 2)", async () => {
-    const note = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll — shelve the ticket instead to keep it stopped";
+    const note = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll";
     let snapshotCalls = 0;
     const api = stubApi({
       getSnapshot: () => { snapshotCalls++; return Promise.resolve(snapshotCalls === 1 ? RUNNING_SNAPSHOT : IDLE_SNAPSHOT); },
@@ -117,14 +116,31 @@ describe("AgentControlPanel — FACTORY-666", () => {
     expect(postStopNote.textContent).toBe(note);
   });
 
-  test("shelve requires a non-empty reason before the button is enabled", async () => {
+  test("shelving controls and adoption disposition selector are absent", async () => {
     const api = stubApi({ getSnapshot: () => Promise.resolve(IDLE_SNAPSHOT) });
+    const { getByTestId, findByTestId, queryByTestId } = render(<AgentControlPanel api={api} canWrite />);
+    await loadIssue(getByTestId);
+    await findByTestId("agent-control-snapshot");
+    expect(queryByTestId("agent-control-shelve-button")).toBeNull();
+    expect(queryByTestId("agent-control-shelve-reason-input")).toBeNull();
+    expect(queryByTestId("agent-control-adopt-disposition-select")).toBeNull();
+    expect(queryByTestId("agent-control-adopt-reason-input")).toBeNull();
+  });
+
+  test("adoption explicitly sends start and refreshes the snapshot", async () => {
+    let received: unknown;
+    let snapshots = 0;
+    const api = stubApi({
+      getSnapshot: () => { snapshots++; return Promise.resolve(IDLE_SNAPSHOT); },
+      adopt: (issue, input) => { received = { issue, input }; return Promise.resolve({ ok: true }); },
+    });
     const { getByTestId, findByTestId } = render(<AgentControlPanel api={api} canWrite />);
     await loadIssue(getByTestId);
-    const shelveButton = await findByTestId("agent-control-shelve-button") as HTMLButtonElement;
-    expect(shelveButton.disabled).toBe(true);
-    fireEvent.input(getByTestId("agent-control-shelve-reason-input"), { target: { value: "operator stepping in" } });
-    await waitFor(() => expect((getByTestId("agent-control-shelve-button") as HTMLButtonElement).disabled).toBe(false));
+    await findByTestId("agent-control-adopt-button");
+    fireEvent.input(getByTestId("agent-control-adopt-boss-input"), { target: { value: " FACTORY-BOSS " } });
+    fireEvent.click(getByTestId("agent-control-adopt-button"));
+    await waitFor(() => expect(received).toEqual({ issue: "FACTORY-1", input: { bossKey: "FACTORY-BOSS", disposition: "start" } }));
+    await waitFor(() => expect(snapshots).toBe(2));
   });
 
   test("not running: shows the start button and the next-poll note (AC6), never a stop button", async () => {

@@ -2,7 +2,6 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AtlassianOps } from "./atlassian.js";
 import { findBossKey, findWorkers, findDoc, projectRootDoc, JIRA_KEY_RE, resolveBoss, type DocResult, type WorkerRef } from "./docs.js";
-import { EXEMPT_LABEL } from "../labels/plan.js";
 import { adfToText } from "../atlassian/client.js";
 import { isProjectId } from "../resources/id.js";
 import { speakOnOwnChannel, escapeStorageText } from "./speak.js";
@@ -20,8 +19,12 @@ export interface Roles {
   epic?: string;
 }
 
-/** `start`, or `shelve` with a reason. No default, no third option — see the glossary page's "two legitimate states of a new worker". */
-export type Disposition = { kind: "start" } | { kind: "shelve"; reason: string };
+export type Disposition = { kind: "start" };
+
+/** Reject legacy or malformed input before any reads or writes. */
+function requireStartDisposition(verb: string, disposition: Disposition): void {
+  if (disposition?.kind !== "start") throw new Refusal(`${verb}: disposition must be "start"; shelving is no longer supported`);
+}
 
 /** Every agent comment on this channel is prefixed with its identity tag — the same idiom `jira_add_comment` uses (src/tools/defs.ts), duplicated here (not imported) to keep this module's only dependency on defs.ts-shaped types structural, never a runtime import back to it. */
 function tagComment(who: string, text: string): string {
@@ -177,13 +180,6 @@ const CHILD_TYPE: Record<string, "Story" | "Task"> = { Epic: "Story", Story: "Ta
 export const STAFFING_PENDING =
   "pending: this call moved (or confirmed) the ticket into In Progress, one of the ACTIVE statuses the daemon's reconcile poll spawns agents from — it did NOT start an agent and cannot confirm one exists, or ever will (the spawn itself can fail; see the ticket's agent:* label). Check with check_worker.";
 
-export const STAFFING_NOT_ACTIVE =
-  "not staffed: this call left the ticket in a non-active status (e.g. shelved, To Do) — the reconciler only spawns agents for ACTIVE statuses (In Progress/In Review), so no agent will be started for it until something moves it there (e.g. start_worker).";
-
-/** `STAFFING_PENDING` for a "start" disposition, `STAFFING_NOT_ACTIVE` for "shelve" — see both constants' own comments. */
-function staffingFor(kind: Disposition["kind"]): string {
-  return kind === "start" ? STAFFING_PENDING : STAFFING_NOT_ACTIVE;
-}
 
 /**
  * BUTCHR-244: the match rule behind `new_worker`'s idempotency (issue-caller
@@ -356,39 +352,6 @@ async function resolveCollisionSide<T>(read: () => Promise<T>, whatFailed: strin
 }
 
 /**
- * Returns the fetched issue (not just void) so callers that need it for a
- * follow-up decision — `startWorker`/`finishWorker` checking for a stale
- * `EXEMPT_LABEL` — reuse this fetch instead of paying for a second one. A
- * worker that was never shelved must cost exactly what it cost before this
- * check existed.
- *
- * GROWS A PROJECT-CALLER BRANCH HERE (BUTCHR-71, Contract 3) so every verb
- * that routes through this one check — start_worker, shelve_worker,
- * finish_worker, prioritize_worker, tell_worker — gets project-caller
- * support UNIFORMLY, in one place, rather than each reimplementing it.
- *
- * For a PROJECT caller, ownership is MEMBERSHIP, not an Implements link (a
- * Jira PROJECT is not an issue, so none of the issue-link machinery reaches
- * it — confirmed against this repo: `linkIssues`/`findBossKey` are never
- * called with a project key anywhere in this file). Membership is read
- * straight off the worker's OWN `fields.project.key` — no second Jira call,
- * since `ops.getIssue(workerKey)` already carries it.
- *
- * MEMBERSHIP ALONE IS DELIBERATELY NOT ENOUGH, and this is the exact
- * shortcut a future reader will be tempted by: a project CONTAINS every
- * Story and Task filed under any of its Epics too (they share the same
- * Jira `project.key`), and a project boss has no business calling
- * `finish_worker`/`tell_worker`/etc. on one of THOSE — its own workers are
- * its Epics, one tier down, exactly like every other boss/worker pair in
- * this fleet. So this REQUIRES BOTH: the target is IN the caller's project,
- * AND the target IS an Epic. Either failing refuses, and the message says
- * WHICH — matching the sharpness of the issue-caller Implements-link check
- * below (the failure that check exists to prevent — a boss acting on a
- * stranger's ticket because one character of a key was wrong — has an
- * exact project-caller analogue here: acting on a ticket that merely
- * SHARES A PROJECT with the caller).
- */
-/**
  * FACTORY-909 (B) — the once-per-ticket, idempotent fallback warning: posts
  * exactly ONE `[butchr:missing-implements]` comment on `workerKey` (never a
  * second one — gated on the label already being present, read off the SAME
@@ -444,52 +407,7 @@ async function assertOwnWorker(ops: AtlassianOps, verb: string, callerKey: strin
   return issue;
 }
 
-/**
- * BUTCHR-193 — the shared "open worker" check behind all three closing
- * doors (finish_worker, finish_without_a_boss, submit_to_boss). ONE
- * DEFINITION, justified here, so a future reader who disagrees has exactly
- * one place to argue with: a worker is OPEN unless its status is Done, or
- * it carries `EXEMPT_LABEL` (`butchr:shelved`) — a recorded, reasoned
- * deferral (`shelve_worker`), not silent abandonment. To Do, In Progress and
- * In Review are ALL open: an In Review worker still has a live review hop
- * ahead of it (its own boss's `finish_worker`), and closing the boss out
- * from under that hop is exactly the shape of the BUTCHR-127/BUTCHR-159
- * defect this exists to catch — reaching a terminal state does not mean the
- * worker's own doorway has closed, only Done means that.
- *
- * COST, PER §2/§2b of this ticket's own spec (MEASURED, not assumed — see
- * `findWorkers`'s own doc comment in docs.ts): `issue`'s own payload already
- * carries every worker's key AND status via `findWorkers`, no extra Jira
- * call — so the common case (no workers, or every worker already Done)
- * costs EXACTLY ZERO extra reads, preserving whatever cost profile the
- * caller already had before this guard existed. The label read this
- * function needs to tell "genuinely open" from "deliberately shelved" is
- * NOT on that payload (MEASURED: the outward stub's hydrated field set
- * never includes `labels`) — so it is paid with one extra `getIssue` PER
- * NON-DONE WORKER, and only then: exactly the path where this is already
- * about to refuse, never the healthy common case.
- *
- * RE-CHECKS DONE against that same fresh fetch (review nit, BUTCHR-193):
- * the per-worker `getIssue` this function pays for the label read is also
- * a fresher, authoritative status than the stub's — free to use once paid
- * for. Without this, a worker whose stub status is stale or absent (a
- * status change landing between the boss's fetch and this one, or a stub
- * Jira genuinely never hydrates) would be reported open on stale data even
- * though the fresh read already shows Done — a false refusal, the same
- * inversion failure the anti-inversion tests guard against elsewhere.
- *
- * COST UPDATE, FACTORY-909: the "zero extra reads in the common case" claim
- * above is now narrower than it reads — this function ALSO always pays one
- * `ops.search` for `key`'s parent-only children (see `parentOnlyOpenWorkers`
- * below), on every call, not just the refusing path. That is a deliberate,
- * named choice (FACTORY-908's diagnosis required one): `findWorkers`'s
- * Implements-only view cannot see a child linked ONLY by Jira's native
- * parent field, and silently under-counting here is exactly the "loud
- * refusal becomes a silent premature Done" regression this ticket exists
- * to prevent — there is no "healthy case" where skipping that query is
- * safe, so it is not gated on `nonDone` being non-empty the way the
- * per-worker label fetch above is.
- */
+/** Closing guards use current status; historical labels cannot exempt open work. */
 async function openWorkers(ops: AtlassianOps, key: string, issue: unknown): Promise<WorkerRef[]> {
   const nonDone = findWorkers(issue).filter((w) => w.status !== "Done");
   const open: WorkerRef[] = [];
@@ -498,7 +416,7 @@ async function openWorkers(ops: AtlassianOps, key: string, issue: unknown): Prom
     seen.add(w.key);
     const full = await ops.getIssue(w.key);
     const status = statusOf(full) ?? w.status;
-    if (status !== "Done" && !labelsOf(full).includes(EXEMPT_LABEL)) {
+    if (status !== "Done") {
       open.push({ key: w.key, status, summary: summaryOf(full) ?? w.summary });
     }
   }
@@ -538,29 +456,18 @@ async function parentOnlyOpenWorkers(ops: AtlassianOps, key: string, exclude: Re
   const open: WorkerRef[] = [];
   for (const i of result.issues ?? []) {
     if (!i.key || exclude.has(i.key)) continue;
-    if (i.fields?.labels?.includes(EXEMPT_LABEL)) continue;
+
     open.push({ key: i.key, status: i.fields?.status?.name, summary: i.fields?.summary });
   }
   return open;
 }
 
-/**
- * The refusal message shared by all three closing doors — deliberately
- * matching the teaching voice `finishWithoutABoss`'s own has-a-boss refusal
- * already uses (see that function): names every offending worker WITH its
- * status, and BOTH discharge verbs by name, so an agent that hits this can
- * act without reading any ticket, this one included. No exemption, no
- * grandfather clause — BUTCHR-92's own rejected carve-out (see this ticket's
- * PR body) is exactly the shape this message refuses to offer: the only
- * ways through are finishing the worker for real, or recording a deliberate
- * deferral with `shelve_worker`.
- */
 function openWorkersRefusal(verb: string, key: string, open: WorkerRef[]): string {
   const plural = open.length > 1;
   const list = open.map((w) => `${w.key} (${w.status ?? "unknown status"})`).join(", ");
   return (
     `${verb}: ${key} still has open worker${plural ? "s" : ""} it undertook to close: ${list} — refusing. ` +
-    `For each: finish_worker it if the work is actually done, or shelve_worker(worker, reason) to record a deliberate deferral with a stated activation condition, not a silent one. ` +
+    `For each: finish_worker it if the work is actually done; otherwise keep the parent open until the work is resolved. ` +
     `A boss reaching Done or In Review while a worker it undertook to close is still open is the exact failure BUTCHR-193 exists to stop — it happened once already (BUTCHR-127/BUTCHR-159) and was only caught because a human remembered.`
   );
 }
@@ -609,7 +516,7 @@ export interface NewWorkerResult {
   member?: string;
   /** Absent ONLY when `created` is `false` — an idempotent duplicate return applied no disposition this call (the existing worker's own disposition, whatever it is, was already declared by whichever call actually created it). Present on every normal create. */
   disposition?: Disposition["kind"];
-  /** BUTCHR-244: what this call's own disposition write establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Absent ONLY when `created` is `false`, for the same reason `disposition` is: no disposition was applied this call. Present on every normal create. Never present alongside `created: false`. */
+  /** BUTCHR-244: what this call's own disposition write establishes about staffing — see `STAFFING_PENDING`'s own doc comments. Absent ONLY when `created` is `false`, for the same reason `disposition` is: no disposition was applied this call. Present on every normal create. Never present alongside `created: false`. */
   staffing?: string;
   /** BUTCHR-110: present ONLY when the caller's own accountId and the child's about-to-be-assigned accountId collide — see this file's own "tier-identity collision" section above. A distinct, greppable key so an agent that skims the result still catches it; absent entirely on a healthy hop (never present-but-empty). */
   identityCollision?: string;
@@ -636,63 +543,14 @@ export interface NewWorkerResult {
   duplicateReason?: string;
 }
 
-/**
- * Creates a worker one tier below `callerKey`: infers the child's issue type
- * from the caller's own type, the assignee from `roles`, and the project
- * from the caller's own.
- *
- * NO CONFLUENCE DOC STEP (FACTORY-84/FACTORY-86): this used to end with a
- * fourth step that lazily created a Confluence page for the new ticket,
- * nested under the caller's own doc. That step is gone — Butchr no longer
- * creates a per-ticket doc for anyone, ever, including a ticket it just
- * created itself. An agent that wants a page for this ticket creates one
- * explicitly with `confluence_create_page`.
- *
- * WRITE ORDER, AND WHY IT IS NOT THE ORDER THE VERBS ARE LISTED IN: the
- * ticket create is irreversible and first — everything else needs its key.
- * Everything AFTER it is ordered so each successive stopping point is LESS
- * HARMFUL than the last, not by convenience:
- *   1. Create the ticket — labels (the shelve exemption label included when
- *      the disposition is "shelve"), assignee and priority all in this one
- *      call. Irreversible.
- *   2. Implements link to `callerKey`. A ticket with no boss is the worst
- *      survivable state, so this closes immediately.
- *   3. The disposition — transition to In Progress for "start"; for
- *      "shelve" the label is already on from step 1, so this is just the
- *      reason comment. AFTER THIS STEP the ticket is a fully declared
- *      worker: it has a boss and it is RUNNING or SHELVED, never undeclared
- *      — which is the invariant this whole epic exists to hold, and this
- *      is now the LAST step this function takes.
- *
- * ROLLBACK covers steps 2 and 3, via `ops.deleteIssue` — the genuinely
- * damaging window, where the ticket exists but is not yet a declared
- * worker. MEASURED (BUTCHR-35): this daemon's credential does NOT currently
- * hold Jira's `DELETE_ISSUES` permission on this project (a `mypermissions`
- * read reports `havePermission: false`, and a live create-then-delete round
- * trip 403s). The delete is attempted anyway, because the refusal is a
- * PROJECT PERMISSION, not an API limitation: granting `Delete Issues` to
- * this daemon's Atlassian account upgrades this path to fully working with
- * no code change. Every caller must already handle it failing, and on
- * failure this reports a NAMED PARTIAL STATE (the surviving ticket key)
- * rather than pretending the write undid itself.
- *
- * WHAT A NORMAL RETURN MEANS, AND WHAT A THROW MEANS, HONESTLY: a NORMAL
- * RETURN always means a ticket that has a boss (step 2) and a declared
- * disposition (step 3) — never undeclared. A THROW after step 1 means one
- * of two things, distinguishable from the error text: (1) the link or
- * disposition write failed and the rollback delete SUCCEEDED — nothing
- * survives; or (2) that same failure happened and the rollback delete ALSO
- * FAILED — the error names exactly which ticket key needs manual cleanup.
- */
+/** Create, link, then activate. Roll back a failed link/transition; report failed cleanup. */
 export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
+  requireStartDisposition("new_worker", input.disposition);
   if (isProjectId(callerKey)) return newProjectWorker(ops, roles, callerKey, input);
 
   const { disposition } = input;
-  if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
-  }
+
   guardShortProse("new_worker", "summary", input.summary);
-  if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
 
   const callerIssue = await ops.getIssue(callerKey);
 
@@ -727,7 +585,6 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   const projectKey = projectKeyOf(callerIssue);
   if (!projectKey) throw new Refusal(`new_worker: could not read ${callerKey}'s own project key — refusing rather than guessing`);
 
-  // (1) create — irreversible; the shelve label, if any, lands HERE.
   const created = (await ops.createIssue({
     projectKey,
     issuetype: childType,
@@ -735,13 +592,11 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     ...(input.description ? { description: input.description } : {}),
     assignee: role,
     ...(input.priority ? { priority: input.priority } : {}),
-    ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
   if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to link or transition against nothing");
 
-  // Rollback for steps 2/3 only (see the function comment for why step 4
-  // never rolls back). Attempts the delete unconditionally — see
+  // Roll back failed linking or activation. Attempts deletion unconditionally; see
   // AtlassianOps.deleteIssue's doc comment for why a currently-refused
   // permission is not a reason to skip the attempt.
   const rollback = makeRollback(ops, "new_worker", key);
@@ -753,19 +608,11 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
     return rollback(`the Implements link to ${callerKey} failed (${(e as Error).message})`);
   }
 
-  // (3) disposition — after this, the ticket is a fully declared worker.
-  if (disposition.kind === "start") {
-    try {
-      await ops.transition(key, "In Progress");
-    } catch (e) {
-      return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
-    }
-  } else {
-    try {
-      await ops.addComment(key, tagComment(callerKey, disposition.reason));
-    } catch (e) {
-      return rollback(`the shelve reason comment failed to post (${(e as Error).message}); the exemption label was already applied at creation`);
-    }
+  // (3) activation; never silently substitute this for a rejected disposition.
+  try {
+    await ops.transition(key, "In Progress");
+  } catch (e) {
+    return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
   }
 
   // (3.5) BUTCHR-110: tier-identity collision — RECORD, never refuse (see
@@ -787,65 +634,17 @@ export async function newWorker(ops: AtlassianOps, roles: Roles, callerKey: stri
   // Confluence doc for a freshly created ticket — a brand-new ticket has no
   // existing doc to find, so there is nothing to report here. An agent that
   // wants a page creates one explicitly with confluence_create_page.
-  return { key, implements: callerKey, disposition: disposition.kind, staffing: staffingFor(disposition.kind), ...(identityCollision ? { identityCollision } : {}) };
+  return { key, implements: callerKey, disposition: disposition.kind, staffing: STAFFING_PENDING, ...(identityCollision ? { identityCollision } : {}) };
 }
 
-/**
- * PROJECT caller -> creates an EPIC, one tier below. See `newWorker`'s own
- * doc comment for the general shape (disposition validation, no Confluence
- * doc step) — this differs from it in exactly the ways BUTCHR-71's Contract
- * 2 calls out, both DELIBERATE, not oversights:
- *
- *  1. NO IMPLEMENTS LINK, SO THE WRITE ORDER COLLAPSES FROM THREE STEPS TO
- *     TWO. A Jira PROJECT is not an issue, so none of the issue-link
- *     machinery (`ops.linkIssues`) reaches it — confirmed by this file: no
- *     call below ever links a project key to anything. The boss/worker
- *     relationship here is MEMBERSHIP IN THE PROJECT, which is already true
- *     the INSTANT `ops.createIssue` lands the ticket in `projectKey` — there
- *     is no separate "link" write establishing it afterward, unlike the
- *     issue-caller path's step 2. So the order here is: (1) create, (2)
- *     disposition.
- *  2. ROLLBACK STILL COVERS THE DISPOSITION STEP, mirroring `newWorker`'s
- *     own reasoning even with one fewer step to protect: between create and
- *     disposition, the ticket exists but is not yet a DECLARED worker (no
- *     RUNNING/SHELVED state on record) — the same genuinely damaging window
- *     `newWorker`'s rollback exists for, just without a link step ahead of
- *     it.
- *  3. `member`, NOT `implements`, IN THE RESULT. Reporting `implements:
- *     projectKey` would be a LIE — no such link exists (see 1 above) — so
- *     the result carries `member` instead (see `NewWorkerResult`'s own doc
- *     comment); `implements` is simply omitted rather than set to a value
- *     that would read as true and isn't.
- *
- * BUTCHR-244: DELIBERATELY DOES NOT GET THE ISSUE-CALLER PATH'S IDEMPOTENCY
- * CHECK (`findDuplicateWorker`) — said explicitly here, not left implied,
- * per that ticket's own instruction to state a materially-different
- * boundary rather than half-do it. `newWorker`'s check is free because a
- * SINGLE `ops.getIssue(callerKey)` call already embeds every child's
- * summary on the SAME payload it fetches for type/project inference — that
- * shortcut exists only because the caller is an ISSUE with `issuelinks`. A
- * PROJECT is not an issue (see point 1 above): it has no `getIssue` payload
- * and no `issuelinks` at all, so there is no equivalent free read here —
- * finding this project's own existing Epics by summary would need a NEW
- * JQL search (`project = X AND issuetype = Epic`), which is exactly the
- * added Jira round trip BUTCHR-244 rules out for the issue-caller path.
- * Adding it here anyway would be a genuinely different (costlier) feature,
- * not a symmetric extension of the free one — so this path stays as it was,
- * un-deduplicated, rather than silently adding a cost the ticket didn't ask
- * for.
- */
 async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: string, input: NewWorkerInput): Promise<NewWorkerResult> {
   const { disposition } = input;
-  if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Refusal("new_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
-  }
+
   guardShortProse("new_worker", "summary", input.summary);
-  if (disposition.kind === "shelve") guardShortProse("new_worker", "reason", disposition.reason);
+
   const role = roles.epic;
   if (!role) throw new Refusal(noRoleMsg("new_worker", "Epic"));
 
-  // (1) create — irreversible; the shelve label, if any, lands HERE.
-  // Membership in `projectKey` is already real the instant this returns.
   const created = (await ops.createIssue({
     projectKey,
     issuetype: "Epic",
@@ -853,29 +652,16 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
     ...(input.description ? { description: input.description } : {}),
     assignee: role,
     ...(input.priority ? { priority: input.priority } : {}),
-    ...(disposition.kind === "shelve" ? { labels: [EXEMPT_LABEL] } : {}),
   })) as { key?: string };
   const key = created.key;
   if (!key) throw new Refusal("new_worker: create response carried no issue key — refusing to transition against nothing");
 
   const rollback = makeRollback(ops, "new_worker", key);
 
-  // (2) disposition — after this, the epic is a fully declared worker
-  // (membership + a declared RUNNING/SHELVED state). See the function doc
-  // comment for why rollback still covers this step despite there being no
-  // link step ahead of it.
-  if (disposition.kind === "start") {
-    try {
-      await ops.transition(key, "In Progress");
-    } catch (e) {
-      return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
-    }
-  } else {
-    try {
-      await ops.addComment(key, tagComment(projectKey, disposition.reason));
-    } catch (e) {
-      return rollback(`the shelve reason comment failed to post (${(e as Error).message}); the exemption label was already applied at creation`);
-    }
+  try {
+    await ops.transition(key, "In Progress");
+  } catch (e) {
+    return rollback(`the disposition transition to In Progress failed (${(e as Error).message})`);
   }
 
   // (2.5) BUTCHR-110: tier-identity collision — RECORD, never refuse. For a
@@ -896,50 +682,16 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   // NO DOC STEP (FACTORY-84/FACTORY-86) — see newWorker's own comment
   // (same reasoning): a freshly created epic has no existing doc to find.
   return {
-    key, member: projectKey, disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key, member: projectKey, disposition: disposition.kind, staffing: STAFFING_PENDING,
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
   };
 }
 
-/**
- * Worker -> In Progress. Refuses a key that is not one of the caller's own
- * workers. NOT the call that staffs an agent (BUTCHR-244 correction — this
- * doc comment used to claim otherwise): it moves the ticket into In
- * Progress, one of `src/reconcile/plan.ts`'s ACTIVE_STATUSES, which makes it
- * a candidate the daemon's own later, independent reconcile poll spawns an
- * agent FROM — this call neither starts one nor can confirm one exists. See
- * `STAFFING_PENDING` and `check_worker`. Also reactivates a shelved worker
- * and sends an In Review worker back to work.
- *
- * CLEARS `EXEMPT_LABEL` (`butchr:shelved`) FIRST, ONLY IF PRESENT, THEN
- * TRANSITIONS — this is the fix for BUTCHR-50: the label means CURRENTLY
- * shelved, a state, not a history, so the verb that reverses a shelve is the
- * verb that withdraws the declaration. Ordering (not just presence) is the
- * design decision, by the same "order writes by how bad it is to stop
- * halfway" principle shelveWorker's own comment and newWorker's step
- * ordering already use: transitioning first and then failing the label
- * removal would leave an In Progress ticket silently carrying a stale
- * exemption — exactly the blind spot this fix exists to close. Clearing
- * first and then failing the transition instead leaves a To Do, assigned,
- * UNEXEMPT child under a live boss, which the parked detector reports
- * loudly. Never leave a partial state where the detector is silently wrong;
- * prefer the one where it is loudly right. Skipped entirely (zero extra
- * Jira calls) when the label isn't present, reusing assertOwnWorker's fetch.
- */
+/** Explicit reactivation supersedes a prior stop marker, without changing labels. */
 export async function startWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  const issue = await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
-  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
-    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
-  }
-  // FACTORY-849/FACTORY-852: clears any stop-cause marker the worker left
-  // on itself (shelve_worker, submit_to_boss, …) — same ordering/reasoning
-  // as the EXEMPT_LABEL clear immediately above: reactivating a worker
-  // (a shelved one, or an In Review one sent back for another round — see
-  // this function's own doc comment) is the one write site this story's
-  // scope reaches where a PRIOR intentional-stop record is provably about
-  // to go stale, so it is superseded here rather than left to misclassify
-  // a later, genuinely unintended stop. Best-effort, never throws.
+  await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+
   clearIntentionalStop(workerKey);
   return ops.transition(workerKey, "In Progress");
 }
@@ -1229,33 +981,11 @@ export async function checkWorker(
   };
 }
 
-/**
- * Worker -> Done. Refuses a key that is not one of the caller's own workers.
- * A worker never finishes itself — see submit_to_boss; the review hop is the
- * point.
- *
- * BUTCHR-193: ALSO REFUSES WHEN THE WORKER BEING CLOSED STILL HAS OPEN
- * WORKERS OF ITS OWN — the guard looks at the WORKER's own children (the
- * caller's grandchildren), not the caller's, since it is the worker's own
- * undertaking to close ITS workers that this call is about to make
- * unreachable. Reuses the fetch `assertOwnWorker` already made — see
- * `openWorkers`'s own doc comment for the exact cost. The message names
- * every offending worker with its status and both discharge paths
- * (`finish_worker`, `shelve_worker`) by name.
- *
- * CLEARS `EXEMPT_LABEL` FIRST, ONLY IF PRESENT, THEN TRANSITIONS — same
- * ordering and reasoning as `startWorker` above. Done is not shelved: a
- * finished ticket that still carries the exemption is the exact residue this
- * ticket exists to stop producing (BUTCHR-28/-29/-30/-31, all Done and all
- * still carrying it before this fix).
- */
 export async function finishWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
   const issue = await assertOwnWorker(ops, "finish_worker", callerKey, workerKey);
   const open = await openWorkers(ops, workerKey, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_worker", workerKey, open));
-  if (labelsOf(issue).includes(EXEMPT_LABEL)) {
-    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
-  }
+
   const result = await ops.transition(workerKey, "Done");
   // FACTORY-849/FACTORY-852: the worker's work just ended BY butchr's OWN
   // act, not by the worker's own stand_down/submit_to_boss — record it on
@@ -1265,41 +995,13 @@ export async function finishWorker(ops: AtlassianOps, callerKey: string, workerK
   return result;
 }
 
-/**
- * Moves the worker to To Do, ADDS the exemption label (additively — never
- * drops labels the ticket already carries), and posts `reason` as a comment
- * — all as one tool call. Refuses a key that is not one of the caller's own
- * workers, and refuses an empty reason.
- */
-export async function shelveWorker(ops: AtlassianOps, callerKey: string, workerKey: string, reason: string): Promise<void> {
-  if (!reason.trim()) throw new Refusal("shelve_worker: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
-  guardShortProse("shelve_worker", "reason", reason);
-  await assertOwnWorker(ops, "shelve_worker", callerKey, workerKey);
-  // LABEL BEFORE TRANSITION, on purpose (order the writes by how bad it is to
-  // stop there, the same principle newWorker uses): if the label write fails
-  // after the transition, the ticket is left To Do, assigned, under a live
-  // boss, with NO exemption label — a textbook parked child, indistinguishable
-  // from one nobody ever declared. Labelling first means a partial failure
-  // instead leaves the ticket In Progress carrying an inert label — harmless,
-  // since the parked-ticket detector only ever looks at To Do tickets.
-  await ops.addLabels(workerKey, [EXEMPT_LABEL]);
-  await ops.transition(workerKey, "To Do");
-  await ops.addComment(workerKey, tagComment(callerKey, reason));
-  // FACTORY-849/FACTORY-852: recorded last, after every Jira write above
-  // has landed — a shelve is already, independently, intentional via
-  // EXEMPT_LABEL at classify time (see classifyStop, src/agents/stop-cause.ts),
-  // so this record is belt-and-suspenders for a reader that only has the
-  // marker (e.g. the label was since stripped by hand). Best-effort, never throws.
-  recordIntentionalStop(workerKey, "shelve_worker");
-}
-
 export interface AdoptWorkerResult {
   key: string;
   alreadyAdopted: boolean;
   /** Present ONLY if the adopted ticket already had a Confluence doc linked to it BEFORE this call — adopting one never creates one (FACTORY-84/FACTORY-86). Absent is the ordinary case for a ticket adopted after this change. */
   doc?: DocResult;
   disposition: Disposition["kind"];
-  /** BUTCHR-244: what THIS call's disposition establishes about staffing — see `STAFFING_PENDING`/`STAFFING_NOT_ACTIVE`'s own doc comments. Reported even on a fully idempotent re-adoption (`alreadyAdopted`): it states a fact about the worker's CURRENT declared state, not only about a write this call made. */
+  /** BUTCHR-244: what THIS call's disposition establishes about staffing — see `STAFFING_PENDING`'s own doc comments. Reported even on a fully idempotent re-adoption (`alreadyAdopted`): it states a fact about the worker's CURRENT declared state, not only about a write this call made. */
   staffing: string;
   /** BUTCHR-110: present ONLY when the caller's own accountId and the adopted ticket's about-to-be-assigned accountId collide — see the "tier-identity collision" section near the top of this file. Computed and reported on EVERY call (including a fully idempotent re-adoption), because it states a fact about current state, not an action taken — but the underlying ticket COMMENT is only (re-)posted when this call does real adoption work (`!alreadyAdopted`); see the comment at this field's call site for why. */
   identityCollision?: string;
@@ -1311,67 +1013,10 @@ export interface AdoptWorkerResult {
   orphanHeaderNotWithdrawn?: string;
 }
 
-/**
- * Takes ownership of an existing ticket: infers the assignee from the
- * ADOPTED ticket's own type and links it (Implements, outward) to
- * `callerKey`. IDEMPOTENT on the FULL adopted state — link, assignee
- * AND disposition — not on the link alone: `alreadyAdopted` is true only
- * when the ticket is already linked to `callerKey`, already assigned by
- * role, and already sitting in the state its disposition names (In Progress
- * for "start"; To Do WITH the exemption label for "shelve" — matching the
- * glossary's own definition of SHELVED). Only then are the assign/link/
- * disposition writes skipped entirely.
- *
- * THIS MATTERS BEYOND ORDINARY IDEMPOTENCE: it is the documented recovery
- * path from `newWorker`'s own worst-case partial state. On a deployment
- * where `deleteIssue` is refused (measured, BUTCHR-35), a step-2/3 failure
- * in `newWorker` can leave a ticket that is linked and assigned but NOT yet
- * declared (no disposition applied) — an undeclared worker under a live
- * boss, exactly what the parked-ticket detector exists to catch. The
- * documented repair is calling `adopt_worker` again with a disposition. If
- * "already adopted" were decided from the link alone, that repair call
- * would see the link, call itself done, and silently skip the disposition
- * — leaving the worker undeclared FOREVER while reporting success. Deciding
- * from the full state closes that: a linked-but-undeclared ticket is NOT
- * "already adopted", so the disposition is applied for real.
- *
- * `findDoc` still runs unconditionally, regardless of `alreadyAdopted`, but
- * ONLY TO READ (FACTORY-84/FACTORY-86) — it reports the adopted ticket's
- * doc on the result IF ONE ALREADY EXISTS, and never creates one for a
- * ticket that has none. Refuses a ticket already linked to a DIFFERENT
- * boss.
- *
- * A `disposition: "start"` ALSO CLEARS `EXEMPT_LABEL` (`butchr:shelved`)
- * whenever the adopted ticket carries it, whether or not this call is
- * otherwise a no-op (BUTCHR-50) — see the comment at the removeLabels call
- * below for why that check is not gated on `alreadyAdopted`.
- *
- * SEPARATELY, THIS CALL ALSO CLEARS `ORPHAN_LABEL` (`butchr:orphan`)
- * whenever the adopted ticket carries it — for BOTH dispositions, unlike
- * `EXEMPT_LABEL` above, and likewise not gated on `alreadyAdopted`
- * (BUTCHR-108/BUTCHR-137). `ORPHAN_LABEL` means UNDIRECTED, not shelved, and
- * a ticket adopted with `"shelve"` is exactly as directed as one adopted
- * with `"start"` — it has a boss, a link, and a recorded decision either
- * way. See the comment at that removeLabels call below for the full
- * argument.
- *
- * THE REASON COMMENT IS NOT PART OF "STATE ALREADY MATCHES, SKIP IT": for a
- * "shelve" disposition, the reason is posted whenever this call does ANY
- * real adoption work at all (`!alreadyAdopted`) — even if the ticket
- * already happens to be To Do with the exemption label already on it (set
- * by a human, or by a boss that has since died). The label is STATE; the
- * reason is a DECLARATION this caller is making on its own authority as
- * part of taking ownership, and skipping it whenever the label happened to
- * already be present would adopt an orphan straight into "shelved, with no
- * activation condition on record" — the one state the glossary says must
- * never exist. Only a genuinely idempotent re-adoption (`alreadyAdopted`)
- * skips the comment.
- */
+/** Adopt and activate idempotently; retire orphan metadata even on a no-op adoption. */
 export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string, disposition: Disposition): Promise<AdoptWorkerResult> {
-  if (disposition.kind === "shelve" && !disposition.reason.trim()) {
-    throw new Refusal("adopt_worker: a \"shelve\" disposition requires a non-empty reason — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot");
-  }
-  if (disposition.kind === "shelve") guardShortProse("adopt_worker", "reason", disposition.reason);
+  requireStartDisposition("adopt_worker", disposition);
+
   if (isProjectId(callerKey)) return adoptProjectWorker(ops, roles, callerKey, workerKey, disposition);
 
   const issue = await ops.getIssue(workerKey);
@@ -1391,8 +1036,7 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const linkedCorrectly = existingBoss === callerKey;
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
   const currentStatus = statusOf(issue);
-  const dispositionAlreadyApplied =
-    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labels.includes(EXEMPT_LABEL);
+  const dispositionAlreadyApplied = currentStatus === "In Progress";
   const alreadyAdopted = linkedCorrectly && assignedCorrectly && dispositionAlreadyApplied;
 
   if (!alreadyAdopted) {
@@ -1423,18 +1067,6 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
   const collisionMsg = callerType
     ? collisionBetween(callerIssueSide(callerType, callerKey, roles, callerAccountId), childSide(issuetype, role))
     : undefined;
-  // THE COMMENT IS POSTED ONLY WHEN THIS CALL DOES REAL ADOPTION WORK
-  // (`!alreadyAdopted`) — deliberately mirroring the shelve-reason comment's
-  // OWN idiom just above (and its own doc comment on `adoptWorker`): a fully
-  // idempotent re-adoption changes nothing else about the ticket, and
-  // re-posting an identical collision comment on every subsequent no-op
-  // check (e.g. a boss re-adopting on every restart to reconcile state)
-  // would spam the ticket with duplicates carrying no new information. The
-  // RESULT FIELD and the AUDIT LINE (written by the caller in
-  // src/tools/defs.ts from this field) are NOT gated the same way — both
-  // are read-only per call, cost nothing to repeat, and "loud on every
-  // call that could go wrong" is the point — so they are computed here
-  // regardless of `alreadyAdopted`.
   const identityCollision = collisionMsg
     ? alreadyAdopted
       ? `${collisionMsg} (not reposted as a ticket comment: this call is a fully idempotent re-adoption doing no other write — the trace comment is written on the call this hop is actually adopted, not on every subsequent no-op check)`
@@ -1443,92 +1075,20 @@ export async function adoptWorker(ops: AtlassianOps, roles: Roles, callerKey: st
 
   const doc = (await findDoc(ops, workerKey)) ?? undefined;
 
-  // CLEARS ORPHAN_LABEL WHENEVER IT'S PRESENT — REGARDLESS OF DISPOSITION,
-  // AND NOT GATED ON `alreadyAdopted` EITHER (BUTCHR-108/BUTCHR-137). The
-  // gating on EXEMPT_LABEL just below is specific to what THAT label means
-  // (CURRENTLY shelved, a state only "start" reverses); ORPHAN_LABEL means
-  // something different — UNDIRECTED — and a ticket adopted with "shelve" is
-  // exactly as directed as one adopted with "start": either way it now has a
-  // boss, a link, and a recorded decision, so this clear runs for BOTH. Reuses
-  // `labels` from the fetch above — no extra Jira call. Not gated on
-  // `alreadyAdopted`, by the same BUTCHR-50 argument EXEMPT_LABEL's own clear
-  // makes below: an otherwise fully idempotent re-adoption must still clear a
-  // stale orphan label, or a live, directed ticket keeps silently polluting
-  // the undirected-ticket query forever — exactly the residue this fix
-  // exists to stop producing. Cleared BEFORE any transition below — same
-  // "never leave a partial state where the detector is silently wrong"
-  // ordering EXEMPT_LABEL's own clear and startWorker's comment already use.
   if (labels.includes(ORPHAN_LABEL)) {
     await ops.removeLabels(workerKey, [ORPHAN_LABEL]);
   }
 
-  // BUTCHR-151/BUTCHR-157: retire a stale [ORPHAN] description header, for
-  // BOTH dispositions — the same "adopted with 'shelve' is exactly as
-  // directed as adopted with 'start'" reasoning the ORPHAN_LABEL clear just
-  // above already uses — and NOT gated on `alreadyAdopted`, same reason: an
-  // otherwise fully idempotent re-adoption still retires a header that
-  // somehow survived a previous adoption (e.g. this daemon ran an older
-  // version of this function then), rather than leaving the prose stale
-  // forever with no other reachable remedy (mirroring ORPHAN_LABEL's own
-  // "only reachable remedy is a re-adoption" argument). GATED ON THE
-  // DESCRIPTION ITSELF, not on `labels.includes(ORPHAN_LABEL)` — deliberately
-  // decoupled from the label's presence: a ticket whose orphan label was
-  // already cleared by some other means but whose header was not must still
-  // get its header looked at here, and gating on the label would silently
-  // skip exactly that case. `retireOrphanHeader` never throws (see its own
-  // doc comment) — a failure in this secondary concern is reported on the
-  // result, never allowed to abort or corrupt the adoption already in
-  // progress (the ordering/partial-state discipline this function's own doc
-  // comment and the `resolveCollisionSide` guard above already hold to).
   const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, callerKey);
 
-  // CLEARS EXEMPT_LABEL FOR A "start" DISPOSITION WHENEVER IT'S PRESENT — NOT
-  // gated on `alreadyAdopted`. Reuses `labels` from the fetch above (BUTCHR-50:
-  // this path already reads the issue and computes labelsOf(issue), so this
-  // costs no extra Jira call). Adopting a ticket that already carries the
-  // label straight into (or already sitting in) In Progress reproduces the
-  // identical bug startWorker fixes, through a second door — even a fully
-  // idempotent re-adoption (already linked, assigned, and In Progress) must
-  // not leave a live ticket silently carrying a stale exemption, which is
-  // exactly the residue this fix exists to stop producing. Cleared BEFORE any
-  // transition below — same ordering reasoning as startWorker's own comment:
-  // never leave a partial state where the detector is silently wrong.
-  if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
-    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
-  }
   // FACTORY-849/FACTORY-852: same reactivation-clears-the-marker reasoning
   // as startWorker's own clearIntentionalStop call, for the same disposition.
-  if (disposition.kind === "start") clearIntentionalStop(workerKey);
+  clearIntentionalStop(workerKey);
 
-  // NOTE: the reason comment for "shelve" is posted whenever this call is
-  // doing ANY real adoption work (!alreadyAdopted) — NOT gated on
-  // `dispositionAlreadyApplied` the way the transition/label are. Those two
-  // are STATE (already To Do + labelled — cheap to check, safe to skip
-  // re-writing); the reason is a DECLARATION this caller is making right
-  // now, on ITS OWN authority, as part of taking ownership. A ticket can
-  // already carry the label (set by a human, or by a boss that has since
-  // died) while this boss has never written down why IT is shelving it — if
-  // the comment were skipped whenever the label happens to already be
-  // there, exactly that ticket (adopting an orphan that already carries the
-  // exemption label) would end up SHELVED with no activation condition on
-  // record at all, which is the one state the glossary says must never
-  // exist. Only `alreadyAdopted` (a true no-op re-adoption by the same
-  // caller) may skip it.
-  if (!alreadyAdopted) {
-    if (disposition.kind === "start") {
-      if (!dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
-    } else {
-      if (!dispositionAlreadyApplied) {
-        // Label before transition — see shelveWorker's comment for why.
-        await ops.addLabels(workerKey, [EXEMPT_LABEL]);
-        if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
-      }
-      await ops.addComment(workerKey, tagComment(callerKey, disposition.reason));
-    }
-  }
+  if (!alreadyAdopted && !dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
 
   return {
-    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: STAFFING_PENDING,
     ...(identityCollision ? { identityCollision } : {}),
     ...(callerRead.unknown ? { identityUnknown: callerRead.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
@@ -1578,8 +1138,7 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   const labels = labelsOf(issue);
   const assignedCorrectly = assigneeAccountIdOf(issue) === role;
   const currentStatus = statusOf(issue);
-  const dispositionAlreadyApplied =
-    disposition.kind === "start" ? currentStatus === "In Progress" : currentStatus === "To Do" && labels.includes(EXEMPT_LABEL);
+  const dispositionAlreadyApplied = currentStatus === "In Progress";
   // MEMBERSHIP IS ALREADY GIVEN (checked above) — the idempotence test here
   // mirrors the issue-caller path's OWN reasoning: membership is a
   // structural fact of the ticket, not a declared act, so it is never part
@@ -1629,30 +1188,13 @@ async function adoptProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: s
   // already fetched for this path's own idempotence check.
   const headerOutcome = await retireOrphanHeader(ops, issue, workerKey, projectKey);
 
-  // Same BUTCHR-50 fix as the issue-caller path: clear a stale EXEMPT_LABEL
-  // on a "start" disposition whenever it's present, not gated on
-  // `alreadyAdopted` — see adoptWorker's own comment on this for the full
-  // reasoning (reproduces the identical bug through a second door if skipped).
-  if (disposition.kind === "start" && labels.includes(EXEMPT_LABEL)) {
-    await ops.removeLabels(workerKey, [EXEMPT_LABEL]);
-  }
   // FACTORY-849/FACTORY-852: same reactivation-clears-the-marker reasoning as the issue-caller path above.
-  if (disposition.kind === "start") clearIntentionalStop(workerKey);
+  clearIntentionalStop(workerKey);
 
-  if (!alreadyAdopted) {
-    if (disposition.kind === "start") {
-      if (!dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
-    } else {
-      if (!dispositionAlreadyApplied) {
-        await ops.addLabels(workerKey, [EXEMPT_LABEL]);
-        if (currentStatus !== "To Do") await ops.transition(workerKey, "To Do");
-      }
-      await ops.addComment(workerKey, tagComment(projectKey, disposition.reason));
-    }
-  }
+  if (!alreadyAdopted && !dispositionAlreadyApplied) await ops.transition(workerKey, "In Progress");
 
   return {
-    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: staffingFor(disposition.kind),
+    key: workerKey, alreadyAdopted, ...(doc ? { doc } : {}), disposition: disposition.kind, staffing: STAFFING_PENDING,
     ...(identityCollision ? { identityCollision } : {}),
     ...(me.unknown ? { identityUnknown: me.unknown } : {}),
     ...(headerOutcome?.retired ? { orphanHeaderWithdrawn: headerOutcome.message } : {}),
@@ -2095,126 +1637,6 @@ function rewriteWorkspaceBriefSummary(spec: SpawnSpec): { outcome: "no-workspace
   return { outcome: rewrote ? "rewritten" : "no-workspace-on-disk" };
 }
 
-/**
- * Corrects ONE OF THE CALLER'S OWN workers' description and/or summary IN
- * PLACE — a REPLACE, never an append — after archiving the superseded text
- * as a comment first. Built for BUTCHR-41: no agent in this fleet could
- * previously edit a ticket's most-read text, so every correction was a
- * comment posted UNDERNEATH text that stayed wrong forever, and an agent
- * that reads the description carefully and the comments quickly (the
- * normal, correct ratio) built the wrong thing while believing it had read
- * the ticket. Nothing errored. The design decision this implements — an
- * edit verb, chosen over an append-only rendered correction block and over
- * moving the authoritative brief into the doc — was argued and approved on
- * BUTCHR-41 before this was built; that ticket carries the reasoning, this
- * comment states the contract and the ordering.
- *
- * TWO LEGITIMATE USE CASES, ONE VERB, ONE MARKER — do not read `why` as
- * "what was wrong" only. A boss also reaches for this when it holds a
- * genuinely NEW fact its worker's ticket predates — a late-arriving
- * requirement added AFTER the child was already filed — which is not an
- * error in the original text, just text that stopped being current. Both
- * are "the text changed, and here is why"; only the first is "wrong". Kept
- * as ONE verb and ONE marker (`CORRECTION_MARKER`) rather than splitting a
- * second one for the additive case: two markers means two greps, and
- * someone eventually runs only one and gets a confidently incomplete
- * answer, which is worse than no answer. The archive wording below reflects
- * this — it calls the old text the PREVIOUS VERSION, never "the wrong
- * text", because "superseded" is accurate for both cases and "wrong" is
- * accurate for only one.
- *
- * REFUSALS, IN THE ORDER THEY ARE CHECKED — cheapest, no-Jira-read checks
- * first, exactly as `shelveWorker` orders its own reason check before its
- * ownership read:
- *   1. `workerKey === callerKey` — refused BEFORE any Jira read, the same
- *      shape `prioritizeWorker` already refuses for: your own brief is your
- *      boss's judgment, never your own. An agent that could rewrite its own
- *      definition of done could launder a failure into a success, and the
- *      resulting ticket would be indistinguishable from one that was always
- *      right — a WORSE artefact than the stale text this verb exists to
- *      fix, because stale text is at least honestly wrong. The route up
- *      still exists and is unchanged: ask_boss / report_to_boss.
- *   2. neither `description` nor `summary` given — a correction that
- *      corrects nothing is a mistake, not a no-op.
- *   3. `why` empty or whitespace-only — same discipline `shelveWorker`
- *      already applies to its own `reason`: an intention nobody wrote down
- *      is indistinguishable six weeks later from a mistake.
- *   4. oversized `description`/`summary` — BUTCHR-136: refused against the
- *      REAL, documented Jira Cloud limits (`JIRA_DESCRIPTION_CHAR_LIMIT`,
- *      `JIRA_SUMMARY_CHAR_LIMIT`) BEFORE the archive comment is posted, so
- *      an oversized correction leaves the worker byte-for-byte untouched
- *      instead of an archive comment with no replacement to match it. This
- *      is a cheap, no-Jira-read check like 1-3 above, so it belongs here,
- *      not after the ownership read.
- *   5. `assertOwnWorker` — the existing ownership helper, reused unchanged;
- *      this is the only place ownership is checked, on purpose.
- *
- * WHEN THE REPLACE FAILS FOR ANY OTHER REASON — a pre-check on size cannot
- * cover a transient network fault, a permissions change, or any other
- * ground Jira might reject on. In that case the archive already stands, so
- * the catch below posts a best-effort `CORRECTION_REJECTED_MARKER`
- * follow-up comment marking that archive as recording a write that was
- * REJECTED, then re-throws the ORIGINAL error unchanged. "Best-effort"
- * means exactly that: the follow-up post is wrapped in its own try/catch
- * that swallows its own failure — a reader who never sees the annotation
- * still gets the original, already-correct error, never a secondary one
- * about the annotation itself failing.
- *
- * ARCHIVE BEFORE OVERWRITE — THE ORDERING IS THE DESIGN, not decoration:
- * this reads the worker's CURRENT description/summary, posts them as a
- * `CORRECTION_MARKER`-tagged comment, and ONLY THEN performs the edit. If
- * the archive comment fails, this REFUSES and does not edit. Stated so the
- * ordering can be CHECKED, not trusted, the same standard `newWorker`'s own
- * comment holds itself to: archive fails -> nothing is destroyed, the call
- * refuses, the worker is unchanged; edit fails AFTER a successful archive
- * -> one harmless extra comment sits on the worker, its description/summary
- * are UNCHANGED, and retrying is safe. This is why no separate rendered
- * "correction block" is needed: the audit trail lives in the COMMENT
- * STREAM, which this factory already treats as the event log, and the
- * description holds what is true now. Today the truth is a comment under
- * wrong text; after this call, the wrong text is a comment under the
- * truth — that inversion is the entire point.
- *
- * TWO FIELDS, TWO DIFFERENT REACHES — NOT THE SAME PROBLEM, and this is the
- * honest half of the feature, stated in `result.message`, not just here:
- * A DESCRIPTION is read LIVE — every read goes through `jira_get_issue`, so
- * correcting it reaches every future reader, including an agent that spawns
- * later, with no further action by anyone. A SUMMARY is SNAPSHOTTED — the
- * workspace builder interpolates it into `brief.md` ONLY at workspace-build
- * time (verified: `briefs/CLAUDE.md` carries no `{{SUMMARY}}` placeholder at
- * all — an earlier version of this exact comment and this exact success
- * message both claimed "brief.md/CLAUDE.md", which was simply false for the
- * CLAUDE.md half; fixed by BUTCHR-169, which found itself repeating that
- * same false claim to a caller mid-investigation of the bug it names). So
- * correcting a summary updates Jira, the board and every future read, AND
- * (BUTCHR-169: see `rewriteWorkspaceBriefSummary` below,
- * `WORKSPACE_REGISTRY.SUMMARY` in src/workspace/registry.ts) best-effort
- * REGENERATES `brief.md` for any workspace already on disk for the worker —
- * but this can NEVER reach a RUNNING agent's already-loaded context, because
- * no file rewrite can edit a process's memory; that gap is not "out of
- * scope", it is structurally unclosable by this mechanism. `result.message`
- * names both halves — what the rewrite achieved (or why it didn't apply/
- * failed) and the running-agent gap it cannot close — and points at
- * `tell_worker` as the only channel that can close the second half.
- *
- * WHO MAY CORRECT AN EPIC'S DESCRIPTION, STATED AS WHAT `assertOwnWorker`
- * ACTUALLY CHECKS, NOT AS WHICH TIERS HAPPEN TO EXIST TODAY: a PROJECT
- * caller may correct a target that is BOTH a member of its own project AND
- * an Epic — so a project agent CAN correct one of its own epics'
- * descriptions with this verb. Refusal 1 above is unaffected and
- * unconditional at every tier, project callers included: it only stops a
- * ticket from correcting ITSELF (`workerKey === callerKey`) — nobody
- * corrects themselves, an epic being corrected by its own project is not an
- * exception to that. Where `assertOwnWorker` accepts no caller for a given
- * ticket, the recourse is a person editing it directly in the Jira UI — the
- * same "the human is the fallback, not the first responder" arrangement
- * this fleet already runs on elsewhere, and the intended path here, not a
- * workaround. This comment previously claimed no agent could ever correct
- * an epic this way, on the premise that stood before BUTCHR-62 shipped the
- * project tier; that premise no longer holds, and the claim built on it was
- * corrected under BUTCHR-88. See BUTCHR-53's review comments on BUTCHR-41
- * for the original ruling this refines.
- */
 export async function correctWorker(ops: AtlassianOps, callerKey: string, workerKey: string, input: CorrectWorkerInput): Promise<CorrectWorkerResult> {
   if (workerKey === callerKey) {
     throw new Refusal(
@@ -2628,62 +2050,6 @@ export async function submitToBoss(ops: AtlassianOps, callerKey: string): Promis
 // Self-close: finish_without_a_boss
 // ---------------------------------------------------------------------------
 
-/**
- * The caller's OWN ticket -> Done, but ONLY when the caller HAS NO BOSS.
- * Every other route to Done goes through a review hop: `submit_to_boss`
- * only ever targets In Review, and `finish_worker` only fires from a boss
- * closing one of its OWN workers. Neither reaches a ticket with no boss at
- * all (today, in practice, an Epic) — that ticket has nobody to submit to
- * and nobody who will ever call `finish_worker` on it. This verb is the
- * dedicated route for exactly that one case, and no other.
- *
- * NO ARGUMENTS: like `submit_to_boss`, the only ticket this can ever act on
- * is the caller's own (`x-issue`), so there is nothing to get wrong.
- *
- * THE REFUSAL IS THE FEATURE, NOT A GUARD. A worker never finishes itself —
- * that is the entire point of the boss/worker asymmetry (`finish_worker`'s
- * own doc comment), and this verb exists to hold that line for the one
- * caller shape that could otherwise slip past it: a ticket with a boss has
- * no business reaching for a "no boss" verb, so refusing it here converts
- * "a worker never finishes itself" from a sentence in a brief into a call
- * that fails, the same move `prioritize_worker` makes refusing the caller's
- * own key. Every Done in this system, apart from this one deliberate
- * exception, requires a SECOND IDENTITY to have looked at the work before
- * it closes; a caller with a boss already has that second identity waiting
- * (`submit_to_boss`, then its boss's `finish_worker`), so it is refused here
- * and pointed at the path that actually gets its work reviewed.
- *
- * DESIGNED TO BECOME OBSOLETE, NOT ABANDONED. This system's design decisions
- * record a planned tier ABOVE epics (a "project" level) that does not exist
- * yet. If it did, an epic would have a boss like everything else, would call
- * `submit_to_boss` and let that boss call `finish_worker` on it, and this
- * verb would simply have no caller left — a ticket with a boss can never use
- * it, so the day every top-level ticket has one, this narrows to nothing ON
- * ITS OWN, with no removal needed. A future reader who finds this verb with
- * zero callers should read that as the tier having arrived, not as dead code
- * nobody cleaned up.
- *
- * OPEN QUESTION THIS DOES NOT SETTLE, AND IS NOT THIS VERB'S TO SETTLE:
- * whether a top-level ticket SHOULD be able to close itself at all, with no
- * second identity ever looking, is a real question — every other Done here
- * requires a review hop, and a bossless ticket's self-close has none. This
- * verb only formalizes what `jira_transition` already lets happen today; it
- * takes no position on whether that's the right end state, and that
- * question belongs to whoever decides if and when the project tier above
- * epics gets built — a human call, not an agent's to make by building or
- * not building this.
- *
- * BUTCHR-193: ALSO REFUSES WHEN THE CALLER STILL HAS OPEN WORKERS OF ITS
- * OWN — ADDITIVE AND ORTHOGONAL to the has-a-boss refusal above, which this
- * leaves byte-identical (condition, message, and position): that refusal
- * narrows the UPWARD precondition (BUTCHR-92's still-shelved narrowing,
- * refuse a caller that HAS a boss); this adds a DOWNWARD one (refuse a
- * caller that HAS OPEN WORKERS). They compose without touching each other.
- * See `openWorkers` for what "open" means and its cost, and this ticket's
- * PR body for why this does not reproduce BUTCHR-92's circle: that circle
- * had no exit for ANY caller; this refusal always has one — finish_worker
- * the worker for real, or shelve_worker it with a reason.
- */
 export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): Promise<unknown> {
   const issue = await ops.getIssue(callerKey);
   // FACTORY-909: resolveBoss, not plain findBossKey — a parent-only Story
@@ -2701,12 +2067,6 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
   const open = await openWorkers(ops, callerKey, issue);
   if (open.length > 0) throw new Refusal(openWorkersRefusal("finish_without_a_boss", callerKey, open));
   const result = await ops.transition(callerKey, "Done");
-  // FACTORY-849/FACTORY-852: the OTHER "finished its turn" write site
-  // FACTORY-849 names explicitly (moving its own ticket to Done). Already
-  // independently intentional via ticketStatus === "Done" at classify time
-  // (see classifyStop, src/agents/stop-cause.ts) — this record is
-  // belt-and-suspenders, same reasoning as shelveWorker's own. Best-effort,
-  // never throws.
   recordIntentionalStop(callerKey, "finish_without_a_boss");
   return result;
 }
@@ -2715,20 +2075,6 @@ export async function finishWithoutABoss(ops: AtlassianOps, callerKey: string): 
 // The deliberate-orphan escape: file_where_it_belongs
 // ---------------------------------------------------------------------------
 
-/**
- * `butchr:orphan` — makes "show me every undirected ticket" a one-line JQL
- * filter. Applied exactly once, at creation, by `fileWhereItBelongs`.
- * WITHDRAWN by `adoptWorker` / `adoptProjectWorker` (BUTCHR-108/BUTCHR-137)
- * the moment the ticket gains a boss — for either disposition, not gated on
- * idempotence — see the comment at those `removeLabels` calls for the full
- * reasoning.
- *
- * Never combined with `EXEMPT_LABEL` (`butchr:shelved`) IN THE SAME CALL:
- * `fileWhereItBelongs` never applies `EXEMPT_LABEL` at creation (see its own
- * doc comment for why an orphan can't trip the parked-ticket detector), and
- * `adoptWorker`'s `"shelve"` path withdraws `ORPHAN_LABEL` in the same call
- * it adds `EXEMPT_LABEL` — so a live ticket never ends up carrying both.
- */
 export const ORPHAN_LABEL = "butchr:orphan";
 
 /**
@@ -2873,131 +2219,6 @@ function orphanHeader(destination: OrphanDestination, filerKey: string): string 
   return [ORPHAN_HEADER_OPEN_LINE, `Filed by: ${filerKey}`, `Destination: ${where}`, ORPHAN_HEADER_CLOSE_LINE].join("\n");
 }
 
-/**
- * The declared withdrawal owner for the `[ORPHAN]` description header
- * (BUTCHR-151/BUTCHR-157) — `HEADER_REGISTRY["orphan"].withdrawnBy` in
- * `src/headers/registry.ts` names this function by name. Called from BOTH
- * `adoptWorker` and `adoptProjectWorker`, for BOTH dispositions, in the same
- * spirit as the `ORPHAN_LABEL` clear those two functions already make —
- * "the header must not outlive the same call" the label withdrawal fires in.
- *
- * NEVER THROWS. Every branch returns a result describing what happened; the
- * one exception is a truly unexpected bug, which callers must treat the same
- * way they already treat `resolveCollisionSide`'s guarded reads — reported,
- * never allowed to abort or corrupt the adoption in progress. See the two
- * call sites for how the result is folded into `AdoptWorkerResult` without
- * ever throwing.
- *
- * UNGUARDED AT ITS CALL SITE, UNLIKE `resolveCollisionSide`'s read, AND WHY
- * THAT'S FINE (noted in review, BUTCHR-157): this runs before the
- * disposition is applied, same position `resolveCollisionSide`'s guarded
- * read occupies. The difference is that both Jira writes IN HERE are
- * already individually wrapped in their own try/catch, so nothing inside
- * this function can propagate a throw up to its caller — a `resolveCollisionSide`-style
- * wrapper would only be defending against a bug in this function's own
- * control flow, not against a live Jira call, and would just move the same
- * guarantee one frame out for no new coverage.
- *
- *
- * SURGICAL BY CONSTRUCTION — never touches the ticket at all unless it can
- * find the header UNAMBIGUOUSLY:
- *   - ABSENT (the overwhelmingly common case: any ticket not created by
- *     `fileWhereItBelongs`, or one whose header was already retired):
- *     `text` does not begin, at position 0, with `ORPHAN_HEADER_OPEN_LINE`.
- *     Silent no-op — `undefined` is returned, not a result object, so
- *     callers can skip folding anything into `AdoptWorkerResult` at all in
- *     the common case (matching how `identityCollision`/`identityUnknown`
- *     are only ever present on a call where there was something to say).
- *   - HAND-EDITED: the opening line is present at position 0 but
- *     `ORPHAN_HEADER_CLOSE_LINE` cannot be found anywhere after it — the
- *     block was partially edited (or the two lines separated by unrelated
- *     text) and this function cannot safely guess where "the header" ends.
- *     Refuses to touch the description; reports why.
- *   - APPEARS TWICE: `ORPHAN_HEADER_OPEN_LINE` occurs a second time anywhere
- *     in the text (header duplicated, or reappearing further down in a body
- *     someone pasted). Refuses to guess which occurrence is real; reports
- *     why. (A quoted MENTION of the header inside unrelated prose — e.g. a
- *     ticket discussing this very defect — cannot trigger this: the check
- *     requires the OPEN line to sit at position 0 to engage at all, and a
- *     quote embedded mid-body never does.)
- *   - HEADER RELOCATED, NOT AT THE START: if a human has moved the header
- *     block away from position 0 (or it was never there — same bytes,
- *     different origin), this function treats it as ABSENT, not "found
- *     elsewhere" — deliberately: text that merely CONTAINS the header's
- *     wording, not at the very start where `fileWhereItBelongs` always
- *     places it, is no longer distinguishable from a ticket quoting it as
- *     history (see BUTCHR-144's own `[correction]` comment for a real
- *     example of exactly that). Never guessed at; always left alone.
- *
- * ARCHIVE BEFORE OVERWRITE, LIKE `correctWorker` — BUT ITS OWN, LIGHTER
- * MECHANISM, ARGUED HERE RATHER THAN REUSED, AND WHY: `correctWorker`'s
- * chained-archive machinery (`postCorrectionArchive`, `JIRA_COMMENT_CHAR_
- * LIMIT` splitting) exists because a human-authored description can run
- * close to Jira's 32767-character field limit, so its own archive comment
- * can too. A description HEADER, by contrast, is fixed, small, machine-
- * generated boilerplate — four lines plus one filer's destination reason —
- * with no realistic path to Jira's comment cap; building or reusing chaining
- * for it would defend a limit this shape cannot reach. So this posts ONE
- * plain comment, under its OWN marker (`HEADER_WITHDRAWN_MARKER`, not
- * `CORRECTION_MARKER` — see that constant's own comment for why they must
- * stay distinct), and if that single comment is ever rejected as oversized
- * (it never has been, and is not expected to be), this reports the failure
- * honestly rather than silently truncating or attempting to chain — the
- * same "say what happened, never pretend" standard as everything else here.
- *
- * WHY THE DESCRIPTION IS REWRITTEN AT ALL, RATHER THAN DELETED TO BLANK:
- * `[ORPHAN] … nobody owns it` is replaced with a TRUTHFUL SUCCESSOR line —
- * `registry.ts`'s own doc-title marker is the model this follows (the
- * `[unwritten]` marker is retired by being REPLACED with a real, outcome-
- * shaped title, never blanked) — so the description keeps asserting
- * something, and that something is now true. The filer's identity is parsed
- * back out of the retired header text itself (`Filed by: …`) rather than
- * threaded through as a new parameter, so this function's only inputs are
- * what `adoptWorker`/`adoptProjectWorker` already have in hand.
- *
- * THE SUCCESSOR IS ITSELF A REGISTERED HEADER (`"adopted"` in
- * `DescriptionHeaderKind`/`HEADER_REGISTRY`) — CAUGHT IN REVIEW, NOT
- * DESIGNED IN FROM THE START (BUTCHR-157, 2026-09-02): the first version of
- * this text asserted PRESENT-TENSE, LIVE facts — "This ticket HAS a boss
- * (X)" and "(disposition: Y)" — which are exactly the shape of cached
- * assertion this whole ticket exists to stop shipping: "has a boss" can be
- * falsified by a later `jira_link_issues` re-parent, and "(disposition: Y)"
- * goes stale the moment a `"shelve"`-adopted ticket is later sent through
- * `start_worker` (which transitions and clears `EXEMPT_LABEL` but never
- * touches the description). Worse, that version's opening line was a
- * template literal WITH substitutions, which `ts.isStringLiteralLike` does
- * not match — so it was invisible to this PR's own scanner, on day one, in
- * the change that introduces the detector. Both defects are fixed together:
- * the wording below asserts ONLY HISTORICAL, TIME-INVARIANT facts — an
- * adoption EVENT that happened at a timestamp, never a claim about who owns
- * the ticket NOW — so it can never go stale and `HEADER_REGISTRY["adopted"]`
- * declares `withdrawnBy: null` honestly; and its opening line
- * (`ADOPTED_HEADER_OPEN_LINE`) is hoisted into its own whole-literal
- * constant, so the scanner catches it the same way it catches `[ORPHAN]`'s.
- *
- * WHAT "BYTE FOR BYTE" MEANS HERE, REASONED EXPLICITLY (Requirement 5): Jira
- * descriptions are ADF, not plain text. This reads via `adfToText` (the same
- * flattening `correctWorker` already uses) and writes via `ops.correctText`,
- * whose real implementation (`adfForCorrection` in `atlassian-real.ts`)
- * ALWAYS re-wraps whatever plain text it is given as a SINGLE paragraph, a
- * SINGLE text node — this is a pre-existing property of `correctText` itself
- * (the only description-replace primitive this codebase has), not something
- * this function introduces. Any rich ADF structure below the header — real
- * multiple paragraphs, headings, bullet lists, bold/italic marks — is
- * already collapsed to plain text by `adfToText` before this function ever
- * sees it, and was already collapsed the same way for every `correct_worker`
- * call that has ever run in this fleet. So "preserve everything below the
- * header, byte for byte" is honoured at the granularity this codebase's one
- * write primitive actually offers: the FLATTENED PLAIN TEXT below the header
- * is preserved character-for-character, untouched, never re-derived or
- * summarized — this function slices `text`, it never re-generates it. A
- * freshly-filed orphan (the overwhelmingly common case this function acts
- * on) round-trips perfectly regardless: `fileWhereItBelongs` itself builds
- * the whole description as ONE plain string handed to `adf()`, which
- * produces exactly one paragraph, one text node — so `adfToText` recovers
- * that exact string with no loss to begin with, and there is nothing this
- * function's own rewrite could newly destroy.
- */
 async function retireOrphanHeader(
   ops: AtlassianOps,
   issue: unknown,
@@ -3145,94 +2366,6 @@ export interface FileWhereItBelongsResult {
   noticeTarget: string;
 }
 
-/**
- * The successor to `jira_create_issue`'s `implements: "none"` deliberate-
- * orphan escape (still an unchanged alias this release — see defs.ts). Files
- * a ticket that is explicitly NOT the caller's: no Implements link is ever
- * made, to the destination or to anything else. Was named
- * `file_for_another_boss` during design; renamed before shipping because
- * that name asserts there IS another boss, which is false in the "needs a
- * new epic" case — see the glossary entry for the full reasoning.
- *
- * NO DISPOSITION PARAMETER, unlike new_worker/adopt_worker — argued, not
- * omitted: a disposition answers "what happens to MY worker", and nobody can
- * answer that for a ticket that is by definition not the caller's. It is
- * filed To Do, staffed by role exactly as jira_create_issue staffs it today,
- * and stays there until some future boss calls adopt_worker on it.
- *
- * NEVER LABELLED `EXEMPT_LABEL` (butchr:shelved): this ticket has no
- * Implements link to any boss yet, so the shelved exemption — which exists
- * to mark a child deliberately left idle under a LIVE boss — would be
- * cargo-culted state meaning nothing here. Labelled `ORPHAN_LABEL` instead, which is what actually
- * makes it discoverable (a saved JQL filter) — withdrawn by `adoptWorker` /
- * `adoptProjectWorker` the moment this ticket gains a boss and stops being
- * undirected (BUTCHR-108/BUTCHR-137); see the comment at those
- * `removeLabels` calls.
- *
- * WRITE ORDER, AND WHY: unlike new_worker, there is no "worst survivable
- * state" to protect against here, because this ticket never gets a boss link
- * at all — the one thing that makes a half-finished new_worker call
- * dangerous (a linked-but-undeclared child a live boss waits on forever)
- * cannot happen to an orphan by construction. So the ordering question here
- * is narrower: which is worse, a real ticket whose destination is on it but
- * whose human notice never fired, or a notice that points at a ticket that
- * doesn't exist? The second is actively misleading — a dangling reference a
- * human can't even open — while the first is merely quiet: the ticket is
- * still fully self-documenting (destination in its own description,
- * ORPHAN_LABEL for the saved-filter route) and findable with zero
- * cooperation from anything downstream. So:
- *   1. CREATE — summary, issuetype, assignee (by role), priority, and a
- *      description with the destination header ALREADY BAKED IN, plus
- *      ORPHAN_LABEL — all in the one call. Irreversible, and there is no
- *      window, ever, where this ticket exists without its destination
- *      recorded on it: both land in the same write.
- *   2. NOTICE — best-effort comment: case A on the named epic, case B on the
- *      topmost ticket in the CALLER's own Implements chain (walked fresh,
- *      never the orphan's own — it has none). Creates NO link either way;
- *      case B in particular must never re-parent the ticket onto whatever it
- *      lands on, or this verb becomes the exact suppression-by-quiet-
- *      adoption it exists to prevent.
- *
- * NO DOC STEP (FACTORY-84/FACTORY-86): this used to end with a third step
- * that lazily created a Confluence doc for the new orphan, nested under the
- * project root doc. That step is gone — Butchr no longer creates a
- * per-ticket doc for anyone, including a ticket it just created itself.
- *
- * WHAT A THROW AFTER STEP 1 MEANS, HONESTLY: the ticket, its destination and
- * ORPHAN_LABEL all survive untouched — there is nothing to roll back, and
- * nothing here ever attempts to. The error names the notice failure and what
- * a caller can do about it: re-post it by hand with jira_add_comment.
- *
- * A KNOWN NARROWING IN CASE B, RECORDED RATHER THAN FIXED (found in review of
- * BUTCHR-37, after that branch had already merged — a defect in the original
- * spec, not in that implementation): case B's guarantee is "a person sees
- * it" only when the CALLER's own Implements chain is intact and bottoms out
- * at an Epic, which is human-watched. `topmostBoss` walks that chain and
- * returns whatever key has no boss above it — if the CALLER ITSELF is a
- * bossless Story (an orphan filing an orphan), that key is the caller's own,
- * and the notice lands on an agent-owned ticket nobody human is watching.
- * The guarantee silently degrades from "a person sees it" to "an agent sees
- * it". This is rare — it needs an orphan to be doing the filing — and it is
- * inherent to how the walk is specified (find the topmost ticket in MY OWN
- * chain), not a bug in the walk itself. NOT fixed here: no fallback, no
- * config key, no human/root-key lookup added for it — matching this file's
- * own standard elsewhere (see `newWorker`'s three throws and its measured
- * `DELETE_ISSUES` refusal) of stating a known limitation rather than
- * silently accepting it or quietly patching around it.
- *
- * CASE B'S MISSING LINK IS DELIBERATE, AND IT WILL NOT FEEL DELIBERATE TO
- * WHOEVER READS IT NEXT — that is exactly why this is spelled out rather than
- * left to the "creates NO link" line above to carry alone. A notice arrives
- * on someone's ticket announcing unowned work; the natural, helpful,
- * courteous reflex on reading it is to link the orphan so it has a home. THAT
- * REFLEX IS THE FAILURE this verb exists to prevent — the same
- * suppression-by-quiet-adoption named above, just arriving as a well-meaning
- * "fix" instead of a bug. Nothing about the missing link is an oversight: do
- * not add it, ever, from inside this function. The fact that adding it feels
- * like a kindness is precisely the reason the warning has to be this
- * explicit — a reader who understands WHY they want to change this is far
- * less likely to than one who is only told not to.
- */
 export async function fileWhereItBelongs(ops: AtlassianOps, roles: Roles, callerKey: string, input: FileWhereItBelongsInput): Promise<FileWhereItBelongsResult> {
   const destination = classifyDestination(input.destination);
   guardShortProse("file_where_it_belongs", "summary", input.summary);

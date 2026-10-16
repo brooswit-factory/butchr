@@ -109,7 +109,7 @@ Use your workspace ENVIRONMENT.md for environment facts; another agent may run
 on a different host or commit. Cite evidence and ask readers to verify paths
 against their own checkout. Factory guidance: https://wroosbit.atlassian.net/wiki/spaces/ASSIST
 
-For authorized reactivation, inspect existing labels and use `jira_remove_labels` (key, labels) to clear the butchr:shelved marker before transitioning to In Progress. Use `jira_add_labels` (key, labels) when the workflow requests a label. Do not remove holds or cancellation markers without authorization.
+Use `jira_add_labels` or `jira_remove_labels` (key, labels) when the workflow requests a label change. Inspect existing labels first and preserve unrelated labels. Do not remove holds or cancellation markers without authorization.
 
 For this project resource, the before-stop comment belongs on the explicitly
 identified project discussion page via `confluence_add_comment`, or the issue

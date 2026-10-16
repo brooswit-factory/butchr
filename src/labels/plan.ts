@@ -24,56 +24,9 @@ export const isAgentLabel = (label: string): boolean => label.startsWith(AGENT_P
 export const isPrLabel = (label: string): boolean => label.startsWith(PR_PREFIX);
 export const isAdmissionLabel = (label: string): boolean => label.startsWith(ADMISSION_PREFIX);
 
-/**
- * A ticket carrying this label is a deliberately-shelved backlog item under
- * a live boss — a recorded decision in force right now, set when the
- * decision is made and CLEARED when the decision is reversed (BUTCHR-50), not
- * a history. Any actor may SET it — a human by hand, or `shelve_worker`
- * (src/tools/relationship.ts), which is the vocabulary that standardises on
- * it; `start_worker`/`finish_worker`/`adopt_worker(..., "start")` (same file)
- * clear it as part of reversing the decision it records. A label set BY HAND
- * is never cleared for anybody; whoever sets one that way owns clearing it
- * when the ticket is reactivated.
- *
- * FACTORY-190: moved here from the now-retired `src/agents/parked.ts` (the
- * dormant parked-ticket escalation detector, BUTCHR-24), whose own
- * construction/wiring was removed because its sole production call site
- * (src/daemon/index.ts) always supplied an empty `related` set and so could
- * never produce a candidate — this label's semantics and every consumer
- * (src/agents/stop-cause.ts, src/labels/registry.ts, src/tools/
- * relationship.ts, and their regression tests) are unchanged by that
- * removal.
- */
-export const EXEMPT_LABEL = "butchr:shelved";
 
-/**
- * BUTCHR-24: `butchr:shelved` is NOT a daemon-owned label, deliberately — it
- * is READ-ONLY for the DAEMON'S OWN label machinery (this file, and the
- * poll-loop reconciler and `sweepStaleAgentLabels`, src/labels/sweep.ts,
- * that it drives): that machinery only ever READS it and must
- * never add or remove it itself. Do NOT fold it into `isDaemonLabel` below:
- * doing so would make `sweepStaleAgentLabels` treat it as daemon-owned and
- * silently strip a deliberate exemption the moment the ticket left the
- * active statuses. Pinned by a test in test/unit/labels-plan.test.ts.
- *
- * This is narrower than "nobody but a human ever writes it" (BUTCHR-50): the
- * relationship TOOLS — `shelve_worker` sets it, `start_worker`/
- * `finish_worker`/`adopt_worker(..., "start")` clear it — own its lifecycle
- * as an explicit, agent-invoked verb, which is a different actor from the
- * daemon's own unattended poll/sweep machinery this file guards against. A
- * label set by hand (never through those verbs) is cleared by nobody but
- * whoever set it.
- *
- * `butchr:orphan` (src/tools/relationship.ts's `ORPHAN_LABEL`) is likewise
- * NOT daemon-owned, for the same reason and by the same test — not folded
- * into `isDaemonLabel` below, so the sweep never touches it either
- * (BUTCHR-108/BUTCHR-137). `file_where_it_belongs` applies it once, at
- * creation; `adopt_worker` (both the issue-caller and PROJECT-caller paths,
- * both dispositions) is now its withdrawal site — the first one this label
- * has ever had. Same category as `butchr:shelved`: an explicit,
- * agent-invoked relationship verb owns the lifecycle, never this file's own
- * unattended machinery.
- */
+
+
 export const isDaemonLabel = (label: string): boolean => isAgentLabel(label) || isPrLabel(label) || isAdmissionLabel(label);
 
 /**

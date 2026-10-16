@@ -74,7 +74,7 @@ import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMe
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { providerAtlassianTools } from "../tools/provider-atlassian.js";
-import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
 import { isAgentLabel } from "../labels/plan.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
@@ -1184,7 +1184,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop,
   // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
   // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
   // (process control) — no second Jira client, no second herdr client.
@@ -1193,8 +1193,6 @@ const { app, mcp } = buildApp({
     start: (issue) => doAgentStart(agentWriteDeps, issue),
     planStop: (issue) => planAgentStop(agentWriteDeps, issue),
     stop: (issue) => doAgentStop(agentWriteDeps, issue),
-    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
-    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
     adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
     prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
   },
