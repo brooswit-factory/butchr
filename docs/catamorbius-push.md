@@ -362,16 +362,319 @@ except for the read-only probe noted last:
 No divergence between the gateway's documented contract and its actual
 behaviour was found during any of the above.
 
-## Limits — what this task deliberately does not do
+## Limits of the client alone (task 1) — see below for what task 2 adds
 
-- No daemon wiring: nothing constructs or starts this client outside its
-  own tests. Task 2 (FACTORY-137) does that.
 - No mapping for `confluence-page`, `webpage`, `filesystem`, or
-  `jira-project` — the gateway has no adapter for any of them.
+  `jira-project` — the gateway has no adapter for any of them, and task 2
+  does not add one: these four stay polling-only, unconditionally, forever.
 - Production end-to-end proof is not obtainable: no real GitHub or Jira
   webhooks are registered against the deployed gateway (public ingress is
   not built), so no real provider traffic flows through it. The evidence
-  above is a scratch instance plus signed synthetic deliveries, not
-  production traffic.
-- TTLs, dirty tracking, and fallback decisions for a caller that uses this
-  client are task 2's responsibility, not this one's.
+  above (and task 2's own, below) is a scratch instance plus signed
+  synthetic deliveries, not production traffic — a healthy connection is
+  never proof that any provider's webhooks are actually registered and
+  flowing.
+
+---
+
+# Push mode wired into linked-eventing (FACTORY-137, task 2/2)
+
+Task 2 makes push a real, opt-in change-detection mode for butchr's
+linked-resource watchers (`src/jira-watch/linked-eventing.ts`,
+BUTCHR-436/437/469/FACTORY-9/53/71), with the existing polling path as a
+transparent, always-present fallback. **Goal, restated from the ticket:** a
+consumer of a `LinkedChangeEvent` cannot tell which mechanism produced it.
+Butchr owns the one connection centrally (`src/catamorbius/
+push-controller.ts`); agents never see it; no agent-facing MCP was added.
+
+## Architecture: hint, then refetch (D1)
+
+A Catamorbius notification never updates a baseline directly. It only marks
+a **watch key** (`src/catamorbius/mapping.ts`'s normalized identity) dirty.
+The target is then fetched through the SAME fetchers `runTick` already
+uses, diffed against the SAME baseline, delivered through the SAME
+coalescer/rate-cap/notify. **Why:** the gateway is not the authoritative
+state source, webhook delivery can be delayed, duplicated, and reordered,
+and a second webhook-payload-to-snapshot normalizer would drift from the
+fetchers over time. With hint-then-refetch, duplicates and out-of-order
+delivery are harmless by construction — the diff is idempotent regardless
+of how many times, or in what order, a dirty mark arrives.
+
+## The coverage predicate (D2)
+
+A `(target, owner)` pair is **COVERED** iff ALL of:
+
+1. The target maps to a watch key (`watchKeyForResource` — only
+   `issuelink`/`parent`/`jira-key` items, normalized to a Jira watch key,
+   and `github-issue`/`github-pr` items, ever do).
+2. Its provider is **explicitly enabled** — `CATAMORBIUS_PROVIDERS`, values
+   `jira`/`github`, **default empty**. **Why default empty, not "everything
+   mappable":** a healthy SSE connection does not prove any provider's
+   webhooks are actually registered and flowing. As of this writing, NO
+   provider webhooks are registered against the deployed gateway at all —
+   covering a target against a gateway receiving nothing would silently
+   turn 15-60s polling into 10-minute (TTL) latency polling, a real
+   regression dressed up as a feature. An operator enabling `jira` must also
+   know a Jira webhook may be JQL-filtered server-side and so may not cover
+   every watched issue — say so again in the RUNBOOK below.
+3. The connection is **covering right now** — `state === "live"`, or
+   `"reconnecting"` within the still-active grace window (D5).
+
+A covered target is fetched in a pass only if it has no baseline yet (for
+ANY of its owners), OR is dirty, OR its TTL has expired, OR a resync is
+pending. **Otherwise it is skipped: no fetch at all.** This is the actual
+savings D2 exists for — a Confluence/webpage/filesystem/`jira-project`
+target (uncovered, always, no adapter exists) keeps polling at its existing
+cadence completely unchanged; an uncovered `github`/`jira` target (provider
+disabled, or the connection down) does too.
+
+## The on-demand pass (D3)
+
+Skipping saves API calls but adds no latency benefit on its own — a dirty
+mark that only gates the NEXT SCHEDULED tick (15s/60s) is no faster than
+just... polling. `LinkedEventingState.runDirtyPass()` closes that gap: it
+re-runs the exact same fetch/diff/notify pipeline, restricted to whatever is
+currently dirty or resync-pending, reusing the triggering `runTick` call's
+own already-discovered items — **no fresh discovery** (no member search, no
+remote-links call, no managed-link listing). `runTick` and `runDirtyPass`
+are serialized against each other (a plain promise-chain mutex) so they can
+never double-diff the same baselines.
+
+`runDirtyPass` is itself debounced (D6, `CATAMORBIUS_DEBOUNCE_MS`, default
+2000ms): every call within the window shares the one resulting pass's
+promise, so a burst of N notifications becomes one fetch, not N.
+
+## TTL authoritative refresh (D4)
+
+`CATAMORBIUS_TTL_MS` (default 600000 — 10 minutes), plus optional
+`CATAMORBIUS_TTL_JIRA_MS`/`CATAMORBIUS_TTL_GITHUB_MS` overrides. **Global
+plus per-provider-type, never per-rule or per-subscription:** the Jira-kind
+fetch is shared across every owner watching a target (one batched
+`key in (...)` search), so a per-rule TTL has no coherent meaning for a
+fetch that isn't owned by any one rule; subscriptions are internal and have
+no operator-visible identity; provider type is the one axis on which
+webhook reliability and API cost genuinely differ. TTL is evaluated **when a
+pass runs**, so the true refresh period is the TTL rounded up to the next
+pass that actually considers that target. A settled fetch (`ok`,
+`not-modified`, or `unreadable` — never a transient error, never a failed
+batch) resets the TTL clock. Malformed/non-positive values fail daemon
+startup loudly; the validation floor is 1ms (a sanity floor against a
+nonsensical value, not a performance opinion about how aggressive is "too
+aggressive" for a deployment this code knows nothing about).
+
+## Disconnect, grace, and resync (D5)
+
+Owned by `src/catamorbius/push-controller.ts`, one layer above
+linked-eventing:
+
+- **`everLiveInProcess`**, tracked from the client's own `onStateChange` —
+  deliberately broader than the client's own per-`start()`-call `everLive`,
+  which resets on every `stop()`+`start()`. Never reset for the life of the
+  controller.
+- **Grace** (`CATAMORBIUS_GRACE_MS`, default 60000): after having been live,
+  covered targets STAY covered while the client is `reconnecting`, for up to
+  this long. If the client is still not live when grace expires, every
+  covered target reverts to full polling until it is live again — one
+  rate-limited WARNING per transition (`stats().degrades`), never per retry.
+- **Before the first live connection, and while `unauthorized`/`unavailable`,
+  targets are uncovered immediately — no grace.** A bad token or an
+  unconfigured gateway does not get less bad by waiting.
+- **Resync**: when the client becomes live again after having been live
+  before (a genuine reconnection, not the very first connection this
+  process makes), OR the client's own `onResyncRequired` fires
+  (`cursor-dropped` or `seq-went-backwards`), every covered target is marked
+  resync-pending. The next pass (regular or on-demand) force-fetches ALL of
+  them, once, then returns to skipping. `resyncPending` is STICKY: it
+  survives until a pass actually runs WHILE covering with no search
+  failure — it is never consumed by a pass that ran while nothing was
+  covered.
+
+## Duplicates, ordering, bursts (D6)
+
+Transport dedup (a bounded recent-CloudEvent-id set, plus a seq-monotonic
+guard reset on every resync signal) lives in the push controller — a
+best-effort optimization and counter (`stats().deduped`), not the
+correctness guarantee. The correctness guarantee is D1's own idempotent
+diff: even a dedup miss just costs one redundant, harmless fetch. The
+trailing debounce (D3's own text above) is the "N notifications become one
+fetch" mechanism.
+
+## A change the stream missed (D7)
+
+A genuine change found by a TTL- or resync-forced fetch of a target that
+was NOT dirty at fetch start is delivered as the **exact same**
+`LinkedChangeEvent`, with the exact same detail text, polling would have
+produced. Provenance lives only in logs (one WARNING, rate-limited to once
+per 60 seconds per instance, naming the provider kind, never payload
+contents) and in a counter (`stats().streamMissed`) — never in the event
+itself. This is also the operator's own signal, watched for in the RUNBOOK
+below, that a provider's webhooks are not actually covering something they
+should be.
+
+## Persistence (D8) — none, unchanged from polling
+
+Baselines are in-memory today (unchanged by this ticket), so a daemon
+restart reseeds silently, exactly like polling always has. No cursor or TTL
+timestamp is persisted. At daemon start the client connects live-only (no
+resume cursor yet) — correctness across that boundary comes from ordering
+(a target is registered as watched before its first fetch starts; see T2 in
+the code), not from anything persisted.
+
+## Config and enable (D9)
+
+Off unless `CATAMORBIUS_URL` (task 1) is configured AND at least one
+provider is named in `CATAMORBIUS_PROVIDERS`. See `.env.example` for every
+knob and its default. **The token-file-read split** (this ticket's own
+pre-start correction, item B1): `loadCatamorbiusConfig` (task 1) lets a
+throwing `readFile` propagate raw, uncaught — it does NOT itself implement
+"an unreadable token file disables the feature with one WARNING." That
+split lives in `src/catamorbius/push-config.ts#loadCatamorbiusFullConfig`
+instead, deliberately NOT inside the task-1 loader (whose own tests this
+ticket's brief says not to weaken): only the `readFile` call ITSELF
+throwing (the file doesn't exist, or isn't readable) is caught and
+degrades. A missing `CATAMORBIUS_TOKEN_FILE` variable and an empty token
+(after trim) are config MISTAKES, not read failures, and stay loud startup
+failures — a judgment call made by this ticket's implementer, flagged for
+the story to confirm.
+
+One connection per daemon (`CatamorbiusPushController` is a singleton,
+constructed once in `src/daemon/index.ts`); each `createLinkedEventingState()`
+call site (the issue-tier rule loop, the `jira-project` loop, and the
+managed-session loop — three today) registers itself with it as its own
+consumer, because baselines — and therefore dirty/TTL/resync state — are
+per INSTANCE. The client's own `start()` never blocks or throws into daemon
+startup; only the synchronous config parse can fail startup (loudly, same
+as every other misconfigured opted-in feature in this file). The daemon's
+own `SIGTERM`/`SIGINT` handlers call `stop()` — this daemon had no existing
+graceful-shutdown hook to attach to before this ticket; a new, minimal one
+was added, scoped to exactly this concern.
+
+## Stats — two levels, deliberately
+
+`CatamorbiusPushController.stats()`: `notificationsReceived`, `unmapped`,
+`deduped`, `degrades`, `resyncs` — connection/stream-level facts, true once
+for the whole daemon. Each `LinkedEventingState.stats()`: `dirtyMarks`,
+`onDemandPasses`, `ttlRefreshes`, `streamMissed` — per-instance facts, since
+baselines (and therefore what counts as "dirty" or "due for a TTL refresh")
+are per instance. Not a single combined accessor: the two live at genuinely
+different scopes, and folding them into one shape would either duplicate
+the connection-level counters three times (once per instance) or force one
+arbitrary instance to "own" them.
+
+## RUNBOOK: enabling push mode on a live daemon
+
+**This ticket does not perform this step on any live daemon — an operator
+does, deliberately, after reading this.**
+
+**Prerequisites — verify ALL of these before setting `CATAMORBIUS_PROVIDERS`:**
+
+1. Real provider webhooks are registered against your deployed Catamorbius
+   gateway, for EVERY provider you are about to enable, and cover EVERY
+   Jira project / GitHub repo this daemon watches. A Jira webhook may be
+   JQL-filtered — if yours is, it may not cover every watched issue; verify
+   the filter, not just that a webhook exists.
+2. The gateway is reachable from this daemon (`CATAMORBIUS_URL` correct;
+   `probe()`/`GET /healthz` succeeds).
+3. The token file (`CATAMORBIUS_TOKEN_FILE`) is readable by the daemon's own
+   Unix account.
+
+**A healthy connection does not prove events are flowing.** `state: "live"`
+only means the SSE stream is open — it says nothing about whether any
+provider is actually delivering webhooks into it. The one thing that
+actually tells you push is doing its job is the ABSENCE of the D7 warning
+below over time.
+
+**Enable:** set `CATAMORBIUS_PROVIDERS` (e.g. `jira,github`) and restart the
+daemon. Watch startup logs for `[catamorbius] push mode enabled: providers=...`.
+
+**Verify:** watch for `WARNING: [catamorbius] the event stream missed a
+change (...)` — this is the detector. Frequent occurrences for a provider
+you just enabled mean its webhooks are not actually covering what you think
+they cover; investigate the webhook registration/filter before trusting
+push for that provider. Its absence over a reasonable observation window
+(long enough to see several real changes go through) is the closest thing
+to positive confirmation this design offers.
+
+**Roll back:** clear `CATAMORBIUS_PROVIDERS` (or `CATAMORBIUS_URL` itself)
+and restart. Every covered target reverts to full polling identically to
+how it behaved before push mode was ever enabled — nothing about the
+polling path itself was changed by this ticket.
+
+## AC5: end-to-end evidence gathered for task 2
+
+`scripts/verify-catamorbius-push-e2e.ts` is the AC5 script: it skips
+(exit 0, no assertions) unless `CATAMORBIUS_SCRATCH_DIR` points at a
+checkout/worktree of `brooswit-factory/catamorbius` (see "Standing up a
+scratch gateway" above for how to create one); it then starts and stops
+its OWN gateway process on a random port with freshly generated
+tokens/secrets — never the deployed gateway — and drives the REAL client
+(task 1) + the REAL `CatamorbiusPushController` + a REAL
+`LinkedEventingState`, with a fake `search`/`notify` pair standing in for
+Jira, through the six AC5 points. Run it with:
+
+```sh
+CATAMORBIUS_SCRATCH_DIR=/path/to/catamorbius/worktree \
+  bun run scripts/verify-catamorbius-push-e2e.ts
+```
+
+Transcript from a real run against a scratch instance built exactly as
+described above (catamorbius commit `6788ed3`, the tip of its `main` at
+the time this evidence was gathered — re-verify at your own checkout):
+
+1. **Baseline established.** First `runTick` performed exactly 1 search
+   call (the batched `key in (...)` fetch) and produced 0 notifies — D1's
+   "first sighting seeds silently."
+2. **A signed webhook produces one notify within debounce + fetch time.**
+   A signed `POST /webhooks/jira` for the watched target (with its status
+   changed in the fake fetcher's backing world) produced exactly one
+   notify **256ms** after the POST (`debounceMs: 200` plus client
+   delivery + fetch time), carrying the SAME `LinkedChangeEvent` shape
+   polling produces: `{"target":"KAN-5","kind":"issuelink","detail":
+   "status changed from \"To Do\" to \"In Progress\""}`.
+3. **Duplicates and reconnect-redelivery produce no second notify.** The
+   identical delivery (same body, same `x-atlassian-webhook-identifier`)
+   posted twice produced 0 additional notifies (gateway-side `(source,
+   id)` dedupe — no second row, nothing new to deliver). A `stop()` +
+   `start()` reconnect (forcing the D5 "live again" resync pass) also
+   produced 0 notifies, since nothing had actually changed since the
+   resync.
+4. **Killing the gateway degrades to polling after the grace period.**
+   Killing the scratch gateway process flipped `coverage.isCoveringNow()`
+   to `false` within the 3000ms grace window. The next two simulated
+   regular ticks each performed exactly 1 search call (2 total) — plain,
+   unconditional per-tick polling, unchanged from pre-FACTORY-137
+   behaviour.
+5. **Restart on the same database file: resume, one resync, then
+   skipping resumes.** Restarting the gateway process against the SAME
+   sqlite file brought the client back to `live`; the D5 "live again"
+   forced-resync pass ran once. A subsequent regular tick on the
+   still-clean target performed 0 additional fetches — skipping had
+   resumed.
+6. **A change made with no delivery is found by the TTL refresh (D7).**
+   The fake fetcher's backing world was changed with NO webhook sent
+   (simulating a missed delivery). After the 2000ms TTL elapsed, the next
+   tick fetched and emitted the SAME event shape polling would
+   (`{"target":"KAN-5","kind":"issuelink","detail":"status changed from
+   \"In Progress\" to \"Done\""}`), logged exactly one rate-limited
+   WARNING (`the event stream missed a change (issuelink, provider
+   jira) — found by a TTL/resync refresh instead`), and incremented
+   `stats().streamMissed` to 1. Final counters for the run:
+   `{"dirtyMarks":2,"onDemandPasses":4,"ttlRefreshes":1,"streamMissed":1}`.
+
+No divergence between the documented D1-D9 behaviour and what was
+actually observed was found during this run.
+
+## Limits — what task 2 deliberately does not do
+
+- Does not change any owner's PRIMARY polling cadence or mechanism.
+- Does not add push coverage for `jira-project` as a link TARGET, project-
+  member discovery, or Confluence/webpage/filesystem — all four stay
+  polling-only, unconditionally (task 1's own limit, restated: the gateway
+  has no adapter for any of them).
+- No production end-to-end proof exists (see task 1's own limits section
+  above) — the evidence for this task is a scratch gateway plus signed
+  synthetic deliveries (a script/opt-in test, skipped when no scratch
+  gateway checkout is configured), never presented as production proof.
+- Does not edit any live daemon config, environment, or systemd unit —
+  enabling this on a real deployment is the operator's own step, per the
+  RUNBOOK above.

@@ -565,6 +565,16 @@ notification mechanism was built; every piece below extends that module's
 existing coalescer, per-(owner,target) baseline store, and
 `maxLinkedTurnsPerHour` rate cap in place.
 
+**Polling is not the only mode.** FACTORY-137 (story FACTORY-22) added an
+OPT-IN push mode on top of this exact same pipeline — a Catamorbius webhook
+event marks a covered target dirty, skipping the wait for the next poll
+tick, with the poll path itself as the permanent, always-present fallback
+(and the only path at all for a target Catamorbius has no adapter for:
+`confluence-page`, `webpage`, `filesystem`, `jira-project`). See
+`docs/catamorbius-push.md` for the full architecture; nothing below this
+paragraph changes when push mode is off, unconfigured, or covers only some
+targets.
+
 **Scope, as of FACTORY-9: `jira-work-item` owners only — since widened.** At
 the time this story shipped, the only live owner `createRuleResourceType`'s
 `runTick` call ran for was a `jira-work-item` (`RuleMatch`); `jira-project`

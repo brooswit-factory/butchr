@@ -126,6 +126,9 @@ import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessio
 import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
 import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
+import { loadCatamorbiusFullConfig } from "../catamorbius/push-config.js";
+import { createCatamorbiusPushController, type CatamorbiusPushController } from "../catamorbius/push-controller.js";
+import type { LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
@@ -270,6 +273,47 @@ if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console
 // (never routed through `Config`, matching that module's own convention —
 // see this ticket's own doc for why Zendesk config isn't centralized there).
 const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
+
+// FACTORY-137 (D9): Catamorbius push mode — off unless CATAMORBIUS_URL is
+// configured AND at least one provider is enabled via CATAMORBIUS_PROVIDERS
+// (see src/catamorbius/push-config.ts). A malformed value (bad URL, a
+// non-positive numeric knob, an unknown provider name) fails daemon startup
+// loudly, same as every other opted-in config block in this file already
+// does; an unreadable token file degrades to "push disabled, poll instead"
+// with one WARNING (see that module's own header for why that one case,
+// and only that one, does not throw). The client's own `start()` never
+// blocks or throws into daemon startup (task 1's own contract) — only this
+// SYNCHRONOUS config parse can fail startup, never the connection itself.
+let catamorbiusPush: CatamorbiusPushController | undefined;
+try {
+  const catamorbiusFullConfig = loadCatamorbiusFullConfig(
+    process.env as Record<string, string | undefined>,
+    (p) => readFileSync(p, "utf8"),
+    (line) => console.error(line),
+  );
+  if (catamorbiusFullConfig) {
+    catamorbiusPush = createCatamorbiusPushController(catamorbiusFullConfig, {
+      clientDeps: { fetch, now: Date.now, setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h as never), random: Math.random },
+      log: (line) => console.error(line),
+    });
+    catamorbiusPush.start();
+    console.error(`  [catamorbius] push mode enabled: providers=${catamorbiusFullConfig.push.providers.join(",")}, ttl=${catamorbiusFullConfig.push.ttlMs}ms, grace=${catamorbiusFullConfig.push.graceMs}ms, debounce=${catamorbiusFullConfig.push.debounceMs}ms`);
+  }
+} catch (e) {
+  console.error(`butchr: ${(e as Error).message}`);
+  console.error("See .env.example for the required CATAMORBIUS_* configuration.");
+  process.exit(1);
+}
+// D9: "the daemon stop path stops it" — this daemon has no other graceful
+// shutdown hook to attach to (verified: no existing SIGTERM/SIGINT handler
+// anywhere in this file), so this is a new, minimal one, scoped to exactly
+// this one concern. `stop()` is idempotent and synchronous (clears timers,
+// aborts any in-flight request) — safe to call from a signal handler.
+if (catamorbiusPush) {
+  const stopPush = catamorbiusPush;
+  process.on("SIGTERM", () => stopPush.stop());
+  process.on("SIGINT", () => stopPush.stop());
+}
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -2296,6 +2340,8 @@ const ruleResourceType = createRuleResourceType({
   // `createLinkStore`'s own doc comment, src/resources/link-store.ts).
   linkStore: createLinkStore(defaultLinksStorePath()),
   notify: notifyRuleAgent,
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 
 // FACTORY-772: wrapped in a function, rather than called inline once, so
@@ -2667,6 +2713,8 @@ startManagedSessionsLoop({
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
@@ -3289,6 +3337,8 @@ const projectType = createJiraProjectResourceType({
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
+  // FACTORY-137
+  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 // FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
 // matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
