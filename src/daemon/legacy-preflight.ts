@@ -4,7 +4,7 @@
  *
  * No rule loop owns such an agent (`ownsId` never matches a bare issue key),
  * so none can stop or respawn it, yet the admission census counts every
- * resident pane against `BUTCHR_MAX_AGENTS`. Running beside them would
+ * resident pane. Running beside them would
  * silently shrink or oversubscribe the cap. Adopting them would rewrite their
  * identity. So the daemon names them and exits; the operator stops them.
  *
@@ -40,7 +40,7 @@ export async function legacyAgentPreflight(list: () => Promise<readonly Prefligh
   let agents: readonly PreflightAgent[];
   try { agents = await list(); }
   catch (e) {
-    return { ok: false, message: `startup preflight could not list herdr agents to check for legacy workspace agents: ${(e as Error)?.message ?? e}. Refusing to start: live legacy agents would count against BUTCHR_MAX_AGENTS with no loop to manage them. Start herdr and retry.` };
+    return { ok: false, message: `startup preflight could not list herdr agents to check for legacy workspace agents: ${(e as Error)?.message ?? e}. Refusing to start: live legacy agents would consume host resources with no loop to manage them. Start herdr and retry.` };
   }
   const legacy = legacyAgents(agents, root);
   if (!legacy.length) return { ok: true };
@@ -49,7 +49,7 @@ export async function legacyAgentPreflight(list: () => Promise<readonly Prefligh
     message: [
       `startup preflight: ${legacy.length} agent(s) still running in legacy flat workspaces under ${root}. Refusing to start.`,
       ...legacy.map((a) => `  ${a.id}: pane ${a.pane ?? "?"} in ${a.cwd}`),
-      "No rule loop owns these agents, so none would stop or respawn them, yet each counts against BUTCHR_MAX_AGENTS.",
+      "No rule loop owns these agents, so none would stop or respawn them, yet each keeps consuming host resources.",
       "Butchr does not stop or adopt them. Stop each one yourself (for example `herdr pane close <pane>`), then start the daemon again.",
       "Their workspace directories are kept on disk; nothing there is deleted or rewritten.",
     ].join("\n"),

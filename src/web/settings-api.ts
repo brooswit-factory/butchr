@@ -92,7 +92,6 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_LIZARD_APPROVAL_SOUND_PATH", description: "Local file path override for the lizard-mode approval sound; defaults to drovr's bundled asset.", secret: false },
   { key: "BUTCHR_PERMISSION_ANSWER_CANARY_PANE", description: "When set, narrows permission-answer eligibility to exactly this one pane label.", secret: false },
   { key: "BUTCHR_PROJECT_ALLOWLIST", description: "Comma-separated Jira project keys the project tier is allowed to staff. Default empty (none staffed).", secret: false },
-  { key: "BUTCHR_MAX_AGENTS", description: "Fixed cap on agents this daemon keeps resident at once.", secret: false },
   { key: "BUTCHR_RESTORED_RESUME", description: "Policy for which managed-session agents may resume after a restore: off, all, or a comma-separated list.", secret: false },
 ];
 

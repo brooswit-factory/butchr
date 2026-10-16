@@ -2,7 +2,7 @@
  * FACTORY-621 (GitHub issue #616) — `butchr rules check [file]`: validate a
  * rules file and dry-run each enabled Jira-backed rule's query, with NOTHING
  * else touched. A brand-new user pointed at their own account can otherwise
- * have `maxAgents` real tickets staffed on the very first poll with no way
+ * have every matching ticket staffed on the very first poll with no way
  * to see that coming (docs/rules.example.json's own convention is
  * `assignee = currentUser()`); this command answers "what would happen"
  * before the daemon ever runs.
@@ -60,7 +60,6 @@ a validation problem.`;
 
 /** The Jira capability this command needs — ONLY a read, never a write or spawn (see this file's own top comment). */
 export interface RulesCheckJiraEnv {
-  maxAgents: number;
   search: (jql: string) => Promise<JiraIssue[]>;
 }
 
@@ -87,7 +86,7 @@ export function createJiraEnv(
 ): RulesCheckJiraEnv {
   const config: Config = loadConfig(env, readFile);
   const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, fetchImpl);
-  return { maxAgents: config.maxAgents, search: (jql) => atlassian.searchAll(jql) };
+  return { search: (jql) => atlassian.searchAll(jql) };
 }
 
 function defaultIo(): RulesCliIo {
@@ -147,9 +146,6 @@ async function dryRunJiraRules(
     }
     stdout(`  would staff ${matches.length} ticket(s):`);
     for (const issue of matches) stdout(formatMatch(issue));
-    if (matches.length > jira.maxAgents) {
-      stdout(`  WARNING: ${matches.length} match(es) exceed maxAgents=${jira.maxAgents} — only ${jira.maxAgents} would run across the WHOLE fleet this poll; the rest wait for capacity (see BUTCHR_MAX_AGENTS)`);
-    }
   }
   return total;
 }

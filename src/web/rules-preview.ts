@@ -31,7 +31,7 @@ export const DEFAULT_PREVIEW_TIMEOUT_MS = 15_000;
 export const DEFAULT_PREVIEW_RATE_LIMIT_MS = 2_000;
 
 export type RulesPreviewResult =
-  | { ok: true; keys: string[]; total: number; cap: number; warning: string | null }
+  | { ok: true; keys: string[]; total: number; cap: number }
   | { ok: false; status: number; error: string };
 
 export interface RulesPreviewDeps {
@@ -46,7 +46,6 @@ export interface RulesPreviewDeps {
   rules: () => readonly Rule[];
   /** `AtlassianClient#searchAll`, bound — the ONLY Jira capability this module ever calls (a GET search), same discipline as `rules-cli.ts`'s own `RulesCheckJiraEnv`. */
   search: (jql: string) => Promise<JiraIssue[]>;
-  maxAgents: number;
   now?: () => number;
   cap?: number;
   timeoutMs?: number;
@@ -131,9 +130,6 @@ export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, query
 
     const total = issues.length;
     const keys = issues.slice(0, cap).map((i) => i.key);
-    const warning = total > deps.maxAgents
-      ? `this rule would staff ${total} real ticket(s), exceeding maxAgents=${deps.maxAgents} — only ${deps.maxAgents} would run across the whole fleet this poll`
-      : null;
-    return { ok: true, keys, total, cap, warning };
+    return { ok: true, keys, total, cap };
   };
 }
