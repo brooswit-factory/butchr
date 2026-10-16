@@ -60,7 +60,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(1);
     expect(notified[0]!.agent).toBe("jira-work:task:BUTCHR-1");
     const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of t2)' }]);
   });
 
   test("a burst of N simultaneous linked changes in one tick produces exactly ONE coalesced message", async () => {
@@ -113,7 +113,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     await state.runTick([m], deps); // the same outstanding change (Done, never delivered) is re-detected and delivered
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("an agent's own edit to a linked ticket does not notify itself (own-write echo)", async () => {
@@ -134,7 +134,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
     const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' }]);
   });
 
   test("a daemon-label-only change on a linked ticket does not notify", async () => {
@@ -202,6 +202,121 @@ describe("BUTCHR-436: linked-change eventing", () => {
 
     await state.runTick([match("jira-work:task:BUTCHR-1", r, owner())], deps); // still absent — must not re-report
     expect(notified).toHaveLength(1);
+  });
+
+  test("FACTORY-833 (ask #2): a removed issuelink names its own provider link id, not just the target key — distinct links to distinct targets carry distinct ids", async () => {
+    let withLinks = true;
+    const owner = () => issue("BUTCHR-1", {
+      issuelinks: (withLinks ? [
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-2", id: "11502" },
+        { type: "Implements", otherEnd: "inward", key: "BUTCHR-3", id: "12027" },
+      ] : []) as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2"), "BUTCHR-3": issue("BUTCHR-3") };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const r = rule();
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner())], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    withLinks = false;
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner())], deps); // both removed in the same tick
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect([...reason.linked.events].sort((a, b) => a.target.localeCompare(b.target))).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: "no longer linked", linkId: "11502" },
+      { target: "BUTCHR-3", kind: "issuelink", detail: "no longer linked", linkId: "12027" },
+    ]);
+  });
+
+  test("FACTORY-833 (ask #2): an issuelink with no id (a test-fixture/legacy shape) never fabricates one — linkId absent, never invented", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never }); // no `id`
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect(reason.linked.events[0]!.linkId).toBeUndefined();
+    expect(Object.keys(reason.linked.events[0]!)).not.toContain("linkId");
+  });
+
+  test("FACTORY-833 (ask #3): a status change's detail names WHEN the issue's own `updated` field actually moved to, so a transition detected late never reads as freshly-happened", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "Backlog", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed
+    // The real transition happened at "t2" (its own `updated`), but this
+    // owner's tick doesn't run until much later — the detail must still
+    // name "t2", not imply the transition is as fresh as this tick's own
+    // wall-clock time.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t2" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "Backlog" to "Done" (as of t2)' }]);
+  });
+
+  test("FACTORY-833: a rate-capped target that keeps changing status while held reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, { now });
+    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const m = match("jira-work:task:BUTCHR-1", r, owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps); // uses the one allowed turn
+    expect(notified).toHaveLength(1);
+
+    // Two further real transitions land WHILE capped — delayed, not lost;
+    // the diff this module coalesces is against the LAST delivered
+    // baseline, so the eventual delivery reports the NET transition
+    // (before -> final), with the FINAL transition's own timestamp, never
+    // the intermediate "t3" or a fabricated "right now".
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Review", updated: "t3" });
+    await state.runTick([m], deps); // capped
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t4" });
+    await state.runTick([m], deps); // still capped
+    expect(notified).toHaveLength(1);
+    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
+
+    now.value += 61 * 60_000;
+    await state.runTick([m], deps); // delivered now
+    expect(notified).toHaveLength(2);
+    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t4)' }]);
+  });
+
+  test("FACTORY-833: two DISTINCT issuelinks (different relationship types) to the SAME target collapse to one watched item (existing dedup-by-target contract) and carry the FIRST link's own id, never a fabricated or merged one", async () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2", id: "100" },
+        { type: "Relates", otherEnd: "outward", key: "BUTCHR-2", id: "200" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed — one watcher, not two
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1); // ONE event line, not two, for the one target
+    const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string; linkId?: string }[] } };
+    expect(reason.linked.events).toHaveLength(1);
+    expect(reason.linked.events[0]!.linkId).toBe("100"); // first occurrence (Blocks) wins, same convention `discoverLinkedItems` already uses for kind
   });
 
   test("maxLinkedItems is respected: a resource never polls more linked items than its cap, remote links included", async () => {
@@ -366,7 +481,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
     expect(reason.linked.events).toEqual([
-      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' },
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' },
       { target: "BUTCHR-404", kind: "issuelink", detail: "unreadable" },
     ]);
   });

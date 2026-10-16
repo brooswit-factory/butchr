@@ -330,8 +330,16 @@ function parseIssueLinks(raw: any[] | undefined): IssueLink[] {
     // `outwardIssue`; every other field on the stub's own `fields` object
     // (e.g. `labels` — confirmed NEVER present, in either direction) is
     // deliberately still discarded, exactly as before this change.
-    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key, ...(l.outwardIssue.fields?.status?.name !== undefined ? { status: l.outwardIssue.fields.status.name } : {}) });
-    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key, ...(l.inwardIssue.fields?.status?.name !== undefined ? { status: l.inwardIssue.fields.status.name } : {}) });
+    // FACTORY-833: `l.id` is the issueLink's OWN id (top-level on the raw
+    // link object, distinct from `inwardIssue`/`outwardIssue`'s own issue
+    // id) — carried through as a plain string so a consumer can name WHICH
+    // link it means. Coerced with `String(...)`, never trusted to already
+    // be a string: Jira's own REST docs type this field as a string, but
+    // nothing here re-verifies that against a live payload, so this stays
+    // defensive rather than assuming the schema.
+    const id = l.id !== undefined ? { id: String(l.id) } : {};
+    if (l.outwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "outward", key: l.outwardIssue.key, ...id, ...(l.outwardIssue.fields?.status?.name !== undefined ? { status: l.outwardIssue.fields.status.name } : {}) });
+    else if (l.inwardIssue) out.push({ type: l.type?.name ?? "", otherEnd: "inward", key: l.inwardIssue.key, ...id, ...(l.inwardIssue.fields?.status?.name !== undefined ? { status: l.inwardIssue.fields.status.name } : {}) });
   }
   return out;
 }

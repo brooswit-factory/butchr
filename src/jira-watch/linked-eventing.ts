@@ -415,17 +415,35 @@ function commentChangedBetween(before: JiraSnapshot, after: JiraSnapshot): boole
   return before.commentCursor !== undefined && after.commentCursor !== undefined && before.commentCursor !== after.commentCursor;
 }
 
+/**
+ * FACTORY-833 (ticket ask #3): every branch here now names WHEN the
+ * underlying Jira `updated` timestamp actually moved to, not just WHAT
+ * changed — the filer's second report showed a transition that happened
+ * roughly 50 minutes before the notice reporting it, with nothing in the
+ * message itself to tell a reader "this already happened a while ago" from
+ * "this just happened." `after.updated` is the issue's own field, already
+ * on every snapshot (`snapshotOf`) — never a new fetch, never guessed. This
+ * is the "accurate transition timestamps" half of the ticket's ask, chosen
+ * over "suppress stale transitions" because suppression risks silently
+ * dropping a real, still-unread change a rate-capped or slow-polling owner
+ * genuinely needs to hear about — see this module's own top comment
+ * ("DELAYED, NOT LOST") for why this module already treats "never silently
+ * drop a genuine change" as load-bearing elsewhere. A reader who sees an
+ * old timestamp can correctly judge staleness themselves instead of being
+ * told a false "nothing to worry about."
+ */
 function changeDetail(before: JiraSnapshot, after: JiraSnapshot): string {
-  if (before.status !== after.status) return `status changed from "${before.status}" to "${after.status}"`;
+  const asOf = ` (as of ${after.updated})`;
+  if (before.status !== after.status) return `status changed from "${before.status}" to "${after.status}"${asOf}`;
   // FACTORY-9: checked before the generic summary/"updated" fallback — a new
   // (or removed) comment is a specific, actionable fact worth naming, not
   // just folded into a bare "updated" the way it silently was before this
   // story added comment detection to this snapshot. BUTCHR-351 precedent
   // (`src/agents/change-nudge.ts`'s own `reasonClause`): `null` means the
   // newest comment slot is now empty — a deletion, not an addition.
-  if (commentChangedBetween(before, after)) return after.commentCursor === null ? "had a comment removed" : "got a new comment";
-  if (before.summary !== after.summary) return "summary changed";
-  return "updated";
+  if (commentChangedBetween(before, after)) return (after.commentCursor === null ? "had a comment removed" : "got a new comment") + asOf;
+  if (before.summary !== after.summary) return `summary changed${asOf}`;
+  return `updated${asOf}`;
 }
 
 /** BUTCHR-437: the agent-facing detail phrase for a genuine external-kind change — `before`/`after` are the two opaque fingerprints (see `external-poll.ts`'s own doc comment); only Confluence's is human-meaningful (a version NUMBER), so only that kind names the two values. */
@@ -649,7 +667,12 @@ function jqlRelativeMinutesSince(watermark: number, now: number): number {
 /** A fresh, empty linked-eventing state — one instance per daemon lifetime (mirrors `createLinkedDiscoveryTracker`/`createOwnWriteLedger`'s own "one instance, closed over, reused every poll" shape). */
 export function createLinkedEventingState(): LinkedEventingState {
   const baselines = new Map<string, Baseline>();
-  const watchSets = new Map<string, Map<string, string>>();
+  // FACTORY-833: value is `{ kind, linkId? }`, not a bare kind string, so a
+  // removal event (the only consumer of a watch-set ENTRY's own stored
+  // kind) can also report the removed link's own provider id when it had
+  // one — the id as last observed, which is exactly right for a removal
+  // (there is no fresher read to prefer; the link is gone).
+  const watchSets = new Map<string, Map<string, { kind: string; linkId?: string }>>();
   const unreadableOwners = new Map<string, Set<string>>();
   const turns = new Map<string, number[]>();
   // BUTCHR-437: last time (per owner) this state actually ATTEMPTED an
@@ -1031,7 +1054,7 @@ export function createLinkedEventingState(): LinkedEventingState {
         if (!prevSet) continue;
         const keptTargets = new Set(trackedKept(entry.agentKey, perOwnerItems.get(entry.agentKey)!).map((i) => i.target));
         const gone: LinkedChangeEvent[] = [];
-        for (const [target, kind] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind, detail: "no longer linked" });
+        for (const [target, info] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
         if (gone.length) removedByOwner.set(entry.agentKey, gone);
       }
 
@@ -1129,7 +1152,7 @@ export function createLinkedEventingState(): LinkedEventingState {
               // unreadable is carried as context only — see this module's own
               // top comment.
               nowUnreadable.add(item.target);
-              const event: LinkedChangeEvent = { target: item.target, kind: item.kind, detail: "unreadable" };
+              const event: LinkedChangeEvent = { target: item.target, kind: item.kind, detail: "unreadable", ...(item.linkId ? { linkId: item.linkId } : {}) };
               if (wasUnreadable.has(item.target)) stillUnreadable.push(event);
               else triggering.push(event);
               continue;
@@ -1157,7 +1180,7 @@ export function createLinkedEventingState(): LinkedEventingState {
               if (memberTargetsByOwner.get(entry.agentKey)?.has(item.target)) {
                 const watermark = usedWatermarkByOwner.get(entry.agentKey);
                 const detail = watermark === undefined ? "updated" : `updated since ${new Date(watermark).toISOString()}`;
-                triggering.push({ target: item.target, kind: item.kind, detail });
+                triggering.push({ target: item.target, kind: item.kind, detail, ...(item.linkId ? { linkId: item.linkId } : {}) });
                 toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
                 continue;
               }
@@ -1186,7 +1209,7 @@ export function createLinkedEventingState(): LinkedEventingState {
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap })); // own-write echo
               continue;
             }
-            triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap) });
+            triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap), ...(item.linkId ? { linkId: item.linkId } : {}) });
             toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
             continue;
           }
@@ -1258,7 +1281,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           // `toAdvance` closure above (baselines for whatever WAS
           // successfully read this tick) still runs normally.
           if (!linkFetchFailedOwners.has(entry.agentKey)) {
-            watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, i.kind])));
+            watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, { kind: i.kind, ...(i.linkId ? { linkId: i.linkId } : {}) }])));
           }
           // BUTCHR-469: commit this tick's project-watermark advance too,
           // deferred exactly like every other piece of state above — never

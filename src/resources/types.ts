@@ -267,6 +267,16 @@ export interface LinkedChangeEvent {
   kind: string;
   /** What happened, already rendered ("status changed from X to Y", "unreadable", "no longer linked", …) — see `src/jira-watch/linked-eventing.ts`'s own doc comment for the exact phrases used. */
   detail: string;
+  /**
+   * FACTORY-833: the provider's own id for this specific link (`LinkedItem.linkId`,
+   * src/resources/linked-discovery.ts — a Jira `issueLink.id`/remote-link id,
+   * never a fabricated one), when the kind that produced this event carries
+   * one. Absent for a kind with no comparable provider id (`parent`,
+   * `jira-key`, a managed link, any external kind). Disambiguates two
+   * DISTINCT links that otherwise render identically (same `target`, same
+   * `kind`) — see `linkedChangeNudge`'s own doc comment for the rendering.
+   */
+  linkId?: string;
 }
 
 export type EventVerdict = { deliver: false } | { deliver: true; reason?: NotifyReason };

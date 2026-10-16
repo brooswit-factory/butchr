@@ -984,3 +984,53 @@ but it visibly trades against "a director is woken when anything in its
 project changes." The knob to loosen this for a managed session does not
 exist yet (see follow-ups above). Once deployed, rate-capped lines appear
 in the journal for managed sessions for the first time.
+
+## Decision 10 — Link identity and transition timestamps in the delivered notice (FACTORY-833)
+
+FACTORY-833's filer flagged two usability gaps in the coalesced
+`linkedChangeNudge` message (`src/agents/change-nudge.ts`): a line like
+`FACTORY-18 (jira-key): no longer linked` names the linked TARGET but not
+WHICH of that target's own links is meant (a ticket can sit in more than
+one chain), and a status-change line like `status changed from "Backlog"
+to "Done"` carries no indication of WHEN that transition actually
+happened, so a transition detected late (a rate-capped tick, a slow poll
+cycle) reads exactly like one that just happened.
+
+**Link identity.** `LinkedItem` (`src/resources/linked-discovery.ts`) and
+`LinkedChangeEvent` (`src/resources/types.ts`) both gained an optional
+`linkId` — the PROVIDER's own id for that specific link
+(`IssueLink.id`/`JiraRemoteLink.id`, both already present on Jira's raw
+payload, previously discarded by `parseIssueLinks`), never a fabricated
+one. A kind with no comparable provider id (`parent`, `jira-key` member
+discovery, a managed link, any BUTCHR-437 external kind) simply never
+carries one — `linkedChangeNudge` renders `(${kind} ${linkId})` only when
+present, `(${kind})` otherwise, so every existing caller/test that never
+sees a `linkId` is unaffected. `watchSets`
+(`src/jira-watch/linked-eventing.ts`) now stores `{ kind, linkId? }` per
+target instead of a bare kind string, so a REMOVAL event can still report
+the removed link's own id — the id as last observed, which is correct for
+a removal (there is no fresher read to prefer).
+
+De-dup is UNCHANGED: `discoverLinkedItems` still collapses two distinct
+links sharing the same `target` to one `LinkedItem`, first occurrence's
+kind (and now `linkId`) wins — see `test/unit/linked-eventing.test.ts`'s
+own regression for this. This decision does not attempt to watch or
+report more than one link per (owner, target) pair; it only names, for
+whichever one IS watched, which link that is.
+
+**Transition timestamps.** `changeDetail` (`src/jira-watch/linked-eventing.ts`)
+now appends `(as of <updated>)` to every status/comment/summary detail
+line, using the linked issue's own `updated` field (already on every
+`JiraSnapshot` — no new fetch). Chosen over suppressing a stale transition
+outright: suppression risks silently dropping a real, still-unread change
+a rate-capped or slow-polling owner genuinely needs to hear about, which
+this module already treats as unacceptable elsewhere (see the "DELAYED,
+NOT LOST" discipline in `linked-eventing.ts`'s own top comment). Naming
+the real timestamp lets the reader judge staleness themselves instead of
+being told nothing.
+
+**Not done here:** suppressing a stale transition outright was considered
+and rejected (see above) rather than left unexplored. Whether the
+2026-10-08 observation that prompted this ticket came from a daemon
+running code older than FACTORY-9's fix (merged 2026-09-26) remains
+unverified — no fleet/daemon access from this work.
