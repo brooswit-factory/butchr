@@ -247,6 +247,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MODE/);
   });
 
+  test("FACTORY-1016: stallRemediationMode defaults to off (never wires the automatic wake comment), honours live, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).stallRemediationMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_STALL_REMEDIATION_MODE: "off" }, noRead).stallRemediationMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_STALL_REMEDIATION_MODE: "live" }, noRead).stallRemediationMode).toBe("live");
+    expect(() => loadConfig({ ...base, BUTCHR_STALL_REMEDIATION_MODE: "dry-run" }, noRead)).toThrow(/BUTCHR_STALL_REMEDIATION_MODE/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALL_REMEDIATION_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_STALL_REMEDIATION_MODE/);
+  });
+
   test("FACTORY-845: idlePokeSuppressMinutes defaults to 5, honours BUTCHR_IDLE_POKE_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
     expect(loadConfig(base, noRead).idlePokeSuppressMinutes).toBe(5);
     expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "15" }, noRead).idlePokeSuppressMinutes).toBe(15);
