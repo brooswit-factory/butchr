@@ -1236,7 +1236,28 @@ export function createLinkedEventingState(): LinkedEventingState {
         if (triggering.length) eventsByOwner.set(entry.agentKey, [...triggering, ...stillUnreadable]);
         advanceByOwner.set(entry.agentKey, () => {
           for (const fn of toAdvance) fn();
-          watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, i.kind])));
+          // FACTORY-833 (review round 1): an owner whose remote-link or
+          // managed-link fetch failed this tick must NOT have its watch set
+          // overwritten here — `kept` this tick is already shrunk by that
+          // failure, and committing it as the new watch set would silently
+          // adopt the shrunk membership as ground truth: a genuine removal
+          // that happened during the SAME failed tick would never surface
+          // (the next tick's `prevSet` would already be missing the target,
+          // so the comparison sees nothing to report), and any OTHER target
+          // from an unrelated, successfully-read source that was also
+          // removed this exact tick would be lost the same way, since
+          // `removedByOwner`'s own skip above (see that loop's own comment)
+          // never computed it either. Leaving the watch set exactly as it
+          // was — untouched, not even re-written to itself — means the
+          // NEXT successful tick's `prevSet` is still the last genuinely
+          // observed membership, so a removal that occurred during the
+          // failure window is correctly caught then, once, same as any
+          // other delayed-not-lost state in this module. Every other
+          // `toAdvance` closure above (baselines for whatever WAS
+          // successfully read this tick) still runs normally.
+          if (!linkFetchFailedOwners.has(entry.agentKey)) {
+            watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, i.kind])));
+          }
           // BUTCHR-469: commit this tick's project-watermark advance too,
           // deferred exactly like every other piece of state above — never
           // on a rate-capped tick (the loop below only calls `advance()`
