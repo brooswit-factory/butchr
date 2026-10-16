@@ -81,20 +81,31 @@ describe("malformed-config path (FACTORY-19): a bad ATLASSIAN_EMAIL", () => {
     }
   });
 
-  test("jiraProjectStoreFromEnv itself throws ONE single-line error, not jira.js's multi-line Zod dump", () => {
+  test("jiraProjectStoreFromEnv itself throws ONE single-line error, not jira.js's multi-line Zod dump", async () => {
     let caught: Error | undefined;
-    console.error("FACTORY-77-DIAG", JSON.stringify({
-      ATLASSIAN_SITE: process.env.ATLASSIAN_SITE,
-      ATLASSIAN_EMAIL: process.env.ATLASSIAN_EMAIL,
-      ATLASSIAN_TOKEN: process.env.ATLASSIAN_TOKEN,
-      ATLASSIAN_TOKEN_FILE: process.env.ATLASSIAN_TOKEN_FILE,
-    }));
+    try {
+      const jiraJs: any = await import("jira.js");
+      const jiraJsPkg = await import("jira.js/package.json", { with: { type: "json" } } as any).catch(() => undefined);
+      let directThrow: unknown;
+      try {
+        jiraJs.createCloudClient({ host: "https://x.atlassian.net", auth: { type: "basic", email: "not-an-email", apiToken: "t" } });
+      } catch (e) {
+        directThrow = e;
+      }
+      console.error("FACTORY-77-DIAG2", JSON.stringify({
+        jiraJsVersion: (jiraJsPkg as any)?.default?.version ?? (jiraJsPkg as any)?.version,
+        hasCreateCloudClient: typeof jiraJs.createCloudClient,
+        directThrowName: (directThrow as any)?.name,
+        directThrowMessage: typeof (directThrow as any)?.message === "string" ? (directThrow as any).message.slice(0, 300) : String(directThrow),
+      }));
+    } catch (diagErr) {
+      console.error("FACTORY-77-DIAG2-ERROR", String(diagErr));
+    }
     try {
       jiraProjectStoreFromEnv();
     } catch (e) {
       caught = e as Error;
     }
-    console.error("FACTORY-77-DIAG result", JSON.stringify({ caught: !!caught, name: caught?.name, message: caught?.message }));
     expect(caught).toBeDefined();
     expect(caught!.message).not.toContain("\n");
     expect(caught!.message).toMatch(/invalid Atlassian credentials/);
