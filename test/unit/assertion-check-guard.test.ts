@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
 import { buildWorkspace, knownBriefTypes } from "../../src/agents/workspace.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -125,7 +126,23 @@ function docExists(): boolean {
 // names the diff-based check WITHOUT this exact trailing guard has
 // reintroduced the trap this ticket closed, even if the rest of the
 // sentence is intact.
-const SAFE_COMMAND = "git diff <base>...<head> -- test/ | grep '^-.*expect(' || true";
+//
+// FACTORY-901: the grep pattern and pathspec changed from the original
+// `-- test/ | grep '^-.*expect('`. That form was found to ALWAYS report
+// "clean", two independent ways, on a repo whose tests are colocated (not
+// under `test/`) and/or do not use an `expect(...)`-shaped assertion
+// library (e.g. node:assert) — an empty match from "nothing removed" and
+// an empty match from "the check doesn't apply here" are indistinguishable
+// under the old command, and it silently reports the reassuring one.
+//
+// A first fix (widen the pathspec, drop the library-specific pattern) was
+// itself found, on review of PR #792, to still miss a mixed `.test.ts`/
+// `.spec.ts` suite — see the "mixed test-file naming" behavioral test
+// below, which reproduces that exact false-clean case and is why there is
+// now no pathspec at all: a pathspec can always be a guess shy of
+// whatever naming convention a given repo actually uses, so the command
+// runs over the whole diff instead.
+const SAFE_COMMAND = "git diff <base>...<head> | grep -E '^-[^-]' || true";
 
 // The two claims the guidance must make alongside the command — that the
 // tally is not safe to compare, and that the command's output is a prompt
@@ -196,5 +213,83 @@ describe("BUTCHR-225: total type coverage of the derived brief family (assertion
     // isolate. A sentinel guaranteed never to collide with a real brief
     // type name keeps this test's failure meaning exactly one thing.
     expect(findUnaccountedBriefTypes(["__not_a_real_brief_type__"], ASSERTED_TYPES, TYPE_EXCLUSIONS)).toEqual(["__not_a_real_brief_type__"]);
+  });
+});
+
+/**
+ * FACTORY-901, raised on PR #792's review: pinning SAFE_COMMAND's literal
+ * text cannot detect a defect in what the command actually DOES. This
+ * section runs the real command, via a real `git diff`, against a real
+ * two-commit fixture built in a scratch repo — the same discipline the
+ * doc's own "Method" section used to verify each defect by direct
+ * reproduction rather than by inheriting a hypothesis.
+ */
+function runGitCommand(cwd: string, args: readonly string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8" });
+}
+
+function initScratchRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "assertion-check-behavior-"));
+  runGitCommand(dir, ["init", "-q"]);
+  runGitCommand(dir, ["config", "user.email", "test@example.com"]);
+  runGitCommand(dir, ["config", "user.name", "test"]);
+  return dir;
+}
+
+function commitAll(dir: string, message: string): string {
+  runGitCommand(dir, ["add", "-A"]);
+  runGitCommand(dir, ["commit", "-q", "-m", message]);
+  return runGitCommand(dir, ["rev-parse", "HEAD"]).trim();
+}
+
+// Runs the actual SAFE_COMMAND (base/head substituted) through a real shell,
+// exactly as a reviewer would paste it — not a reimplementation of its
+// pieces in TypeScript, which could drift from what the string in the
+// briefs actually does.
+function runSafeCommand(dir: string, base: string, head: string): string {
+  const command = SAFE_COMMAND.replace("<base>", base).replace("<head>", head);
+  return execFileSync("sh", ["-c", command], { cwd: dir, encoding: "utf8" });
+}
+
+describe("SAFE_COMMAND behavior on a real diff (FACTORY-901 PR #792 review)", () => {
+  test("mixed test-file naming: a removed assertion in a .spec.ts file is NOT hidden by an untouched .test.ts file alongside it", () => {
+    const dir = initScratchRepo();
+    writeFileSync(join(dir, "covered.test.ts"), 'test("covered", () => { assert.equal(1, 1); });\n');
+    writeFileSync(join(dir, "omitted.spec.ts"), 'test("important", () => { assert.equal(actual, expected); });\n');
+    const base = commitAll(dir, "base");
+
+    // covered.test.ts: comment-only change (nothing removed here).
+    writeFileSync(join(dir, "covered.test.ts"), '// unrelated note\ntest("covered", () => { assert.equal(1, 1); });\n');
+    // omitted.spec.ts: the real regression — the assertion line is removed.
+    writeFileSync(join(dir, "omitted.spec.ts"), 'test("important", () => {});\n');
+    const head = commitAll(dir, "head");
+
+    const output = runSafeCommand(dir, base, head);
+    expect(output, "the removed assert.equal(...) line in omitted.spec.ts must be visible — a pathspec that only matched covered.test.ts would print nothing here").toContain("assert.equal(actual, expected)");
+  });
+
+  test("sanity: a diff that removes nothing prints nothing (the || true guard does not manufacture false positives)", () => {
+    const dir = initScratchRepo();
+    writeFileSync(join(dir, "covered.test.ts"), 'test("covered", () => { assert.equal(1, 1); });\n');
+    writeFileSync(join(dir, "omitted.spec.ts"), 'test("important", () => { assert.equal(actual, expected); });\n');
+    const base = commitAll(dir, "base");
+
+    writeFileSync(join(dir, "covered.test.ts"), '// unrelated note\ntest("covered", () => { assert.equal(1, 1); });\n');
+    const head = commitAll(dir, "head");
+
+    expect(runSafeCommand(dir, base, head)).toBe("");
+  });
+
+  test("sanity: a real removal in a conventionally-named test/ file is still caught (no regression on the common case)", () => {
+    const dir = initScratchRepo();
+    writeFileSync(join(dir, "app.ts"), "export const x = 1;\n");
+    const base = commitAll(dir, "base");
+    writeFileSync(join(dir, "app.ts"), 'export const x = 1;\nexpect(x).toBe(1);\n');
+    const headWithAssertion = commitAll(dir, "add assertion");
+    writeFileSync(join(dir, "app.ts"), "export const x = 1;\n");
+    const headWithoutAssertion = commitAll(dir, "remove assertion");
+
+    const output = runSafeCommand(dir, headWithAssertion, headWithoutAssertion);
+    expect(output).toContain("expect(x).toBe(1)");
   });
 });

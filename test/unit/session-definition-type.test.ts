@@ -320,6 +320,62 @@ describe("PR #394 review fix 3, end-to-end: a genuinely nonexistent well-known d
   });
 });
 
+// FACTORY-807: the gap this closes is structural, not behavioural — every
+// existing test above either drives `searchSessionDefinitions` directly with
+// its own inline callbacks, or calls a `once*` helper directly with its own
+// sink, so nothing proves the FACTORY (`createManagedSessionResourceType`)
+// actually passes each one through to `deps.log` at its own call site. If a
+// future edit drops a trailing argument there, or wires a helper but forgets
+// to pass it, every test above still passes and that channel goes quiet in
+// the daemon — this describe block is the regression guard for exactly that.
+describe("FACTORY-807: every once* log channel reaches deps.log end-to-end through the factory, not just when a helper is called directly", () => {
+  test("one search() exercises every channel — invalid, frozen, skipped-non-definition, deprecated-tier, oversized, and the BUTCHR-455 hidden silent contract — all via deps.log", async () => {
+    const oversized = absPath("defs", `${"d".repeat(300)}.json`);
+    const files: Record<string, string> = {
+      [absPath("defs", "good.json")]: JSON.stringify(goodDef()), // valid, non-frozen, tier-based -> eligible AND reported via onDeprecatedTier
+      [absPath("defs", "bad.json")]: "not json", // invalid
+      [absPath("defs", "frozen.json")]: JSON.stringify(goodDef({ frozen: true })), // frozen
+      [absPath("defs", "notes.txt")]: "ignore me", // skipped non-definition file
+      [absPath("defs", ".hidden.json")]: JSON.stringify(goodDef()), // BUTCHR-455: hidden — never a candidate, never logged, even here
+      [oversized]: JSON.stringify(goodDef()), // oversized
+    };
+    const rule = builtinManagedSessionsRule(absPath("defs"));
+    const logs: string[] = [];
+    const type = createManagedSessionResourceType({
+      rule,
+      list: async () => Object.keys(files).map((p) => res(p)),
+      read: async (p) => { if (!(p in files)) throw new Error(`ENOENT: no such file ${p}`); return files[p]!; },
+      log: (l) => logs.push(l),
+    });
+
+    const units = await type.discovery.search();
+    expect(units.map((u) => type.discovery.idOf(u))).toEqual([
+      encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "good.json") }),
+    ]);
+
+    expect(logs.some((l) => l.includes("not a valid definition") && l.includes(absPath("defs", "bad.json")))).toBe(true);
+    expect(logs.some((l) => l.includes("is frozen") && l.includes(absPath("defs", "frozen.json")))).toBe(true);
+    expect(logs.some((l) => l.includes("not a definition file") && l.includes(absPath("defs", "notes.txt")))).toBe(true);
+    expect(logs.some((l) => l.includes("deprecated") && l.includes(absPath("defs", "good.json")))).toBe(true);
+    expect(logs.some((l) => l.includes("directory-name limit") && l.includes(oversized))).toBe(true);
+    // BUTCHR-455's silent contract holds even at the factory level: a hidden basename is never a candidate, never logged, no matter which channel it would otherwise have hit.
+    expect(logs.some((l) => l.includes(absPath("defs", ".hidden.json")))).toBe(false);
+
+    const countAfterFirst = logs.length;
+    await type.discovery.search(); // same fixture again, through the SAME factory instance (same onceX closures, not fresh ones)
+    expect(logs.length).toBe(countAfterFirst); // the once-per-path dedup holds across repeated search() calls made through the factory, not only when a helper is exercised directly
+  });
+
+  test("onMissingRoot reaches deps.log through the factory against the REAL listFilesystemResources, exactly once across repeated search() calls", async () => {
+    const rule = builtinManagedSessionsRule(absPath("definitely", "does", "not", "exist", "on", "this", "machine"));
+    const logs: string[] = [];
+    const type = createManagedSessionResourceType({ rule, list: listFilesystemResources, read: async () => "", log: (l) => logs.push(l) });
+    expect(await type.discovery.search()).toEqual([]);
+    expect(await type.discovery.search()).toEqual([]);
+    expect(logs.filter((l) => l.includes("does not exist yet")).length).toBe(1);
+  });
+});
+
 describe("specForSessionDefinition", () => {
   test("builds a SpawnSpec carrying the definition's cwd/permissionMode/vendor+tier-as-model/brief", () => {
     const rule = builtinManagedSessionsRule(absPath("defs"));

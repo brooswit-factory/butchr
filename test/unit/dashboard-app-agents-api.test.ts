@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { realAgentsApi } from "../../dashboard-app/src/api/agents.js";
-import { validateStopRequestBody, validateShelveRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody } from "../../src/agents/agents-write.js";
+import { validateStopRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody } from "../../src/agents/agents-write.js";
 
 /**
  * FACTORY-666 (AC7) — the same cross-contract proof `dashboard-app-rules-
@@ -41,14 +41,8 @@ describe("realAgentsApi — FACTORY-666: wire bodies match the server's own vali
     expect(validateStopRequestBody(wireBody)).toEqual({ ok: true, confirm: true });
   });
 
-  test("shelve's wire body (reason + confirm) is accepted by validateShelveRequestBody", async () => {
-    let sentBody: string | undefined;
-    captureFetch((_url, init) => { sentBody = String(init?.body); return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } }); });
-    await realAgentsApi.shelve("FACTORY-1", "operator is stepping in manually", true);
-    const wireBody = JSON.parse(sentBody!);
-    expect(wireBody).toEqual({ reason: "operator is stepping in manually", confirm: true });
-    const result = validateShelveRequestBody(wireBody);
-    expect(result).toEqual({ ok: true, reason: "operator is stepping in manually", confirm: true });
+  test("the client exposes no shelving operation", () => {
+    expect("shelve" in realAgentsApi).toBe(false);
   });
 
   test("adopt's wire body (disposition: start, no reason) is accepted by validateAdoptRequestBody", async () => {
@@ -62,15 +56,8 @@ describe("realAgentsApi — FACTORY-666: wire bodies match the server's own vali
     if (result.ok) expect(result.input).toEqual({ bossKey: "FACTORY-BOSS", disposition: "start" });
   });
 
-  test("adopt's wire body (disposition: shelve, with reason) is accepted by validateAdoptRequestBody", async () => {
-    let sentBody: string | undefined;
-    captureFetch((_url, init) => { sentBody = String(init?.body); return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } }); });
-    await realAgentsApi.adopt("FACTORY-1", { bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "orphan cleanup" });
-    const wireBody = JSON.parse(sentBody!);
-    expect(wireBody).toEqual({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "orphan cleanup" });
-    const result = validateAdoptRequestBody(wireBody);
-    expect(result.ok).toBe(true);
-    if (result.ok) expect(result.input).toEqual({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "orphan cleanup" });
+  test("legacy adopt bodies cannot silently start a worker", () => {
+    expect(validateAdoptRequestBody({ bossKey: "FACTORY-BOSS", disposition: "shelve", reason: "later" }).ok).toBe(false);
   });
 
   test("prioritize's wire body is accepted by validatePrioritizeRequestBody", async () => {
@@ -102,7 +89,7 @@ describe("realAgentsApi — FACTORY-666: wire bodies match the server's own vali
   });
 
   test("a server refusal's error message reaches the caller verbatim as the thrown Error's message (AC4)", async () => {
-    captureFetch(() => new Response(JSON.stringify({ error: "FACTORY-1 has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting, shelving or prioritizing it" }), { status: 409, headers: { "content-type": "application/json" } }));
-    await expect(realAgentsApi.start("FACTORY-1")).rejects.toThrow("FACTORY-1 has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting, shelving or prioritizing it");
+    captureFetch(() => new Response(JSON.stringify({ error: "FACTORY-1 has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting or prioritizing it" }), { status: 409, headers: { "content-type": "application/json" } }));
+    await expect(realAgentsApi.start("FACTORY-1")).rejects.toThrow("FACTORY-1 has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting or prioritizing it");
   });
 });

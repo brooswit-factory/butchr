@@ -294,7 +294,7 @@ export interface Config {
    * as every other piece of `createIssueEventRules`'s own cross-poll state
    * (`commentCursor`, `pendingRecheck`) — lost on daemon restart, which is
    * an accepted tradeoff this ticket shares with those, not a new one.
-   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above.
+   * Default 10, same family as `stalledMinutes` above.
    */
   blockedWakeDebounceMinutes: number;
   /**
@@ -386,22 +386,14 @@ export interface Config {
    */
   idlePokeMaxPerPoll: number;
   /**
-   * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
-   * a live (In Progress) boss before the parked-ticket detector's stage 1
-   * escalation comment fires (see src/agents/parked.ts) — also the interval
-   * between each subsequent stage. Default 10.
-   */
-  parkedMinutes: number;
-  /**
    * BUTCHR-200: minutes a worker must sit continuously ABANDONED (its own
    * Implements boss observed Done while it is still open) before the
    * abandoned-worker detector's stage 1 escalation comment fires (see
    * src/agents/abandoned.ts) — also the interval between each subsequent
-   * stage. Deliberately NOT `parked.ts`'s default (10): unlike a To-Do child
-   * under a live boss (never legitimate), a boss closing moments before it
-   * discharges its last worker is a real ordering race, not a fault — too
-   * short a threshold would fire on that race routinely. Default 30: three
-   * times `parkedMinutes`, comfortably clear of any conceivable race
+   * stage. Unlike a To-Do child under a live boss (never legitimate), a
+   * boss closing moments before it discharges its last worker is a real
+   * ordering race, not a fault — too short a threshold would fire on that
+   * race routinely. Default 30: comfortably clear of any conceivable race
    * (seconds, not minutes, given this daemon's own 15s poll cadence) while
    * still surfacing the state roughly 4-5x faster than the one historical
    * instance this detector exists for (BUTCHR-127/BUTCHR-159, discharged by
@@ -413,7 +405,7 @@ export interface Config {
    * STILL RUNNING, continuously, before `atRest` (src/reconcile/plan.ts)
    * stops protecting it indefinitely and the frozen-asleep detector (see
    * src/agents/frozen-asleep.ts) posts its complaint and marks it reapable.
-   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above and
+   * Default 10, same family as `stalledMinutes` above and
    * for the same reason: the race this bounds (a woken agent's
    * advance-watermark-then-exit) is milliseconds to seconds, and the
    * project tier's own poll cadence (`PROJECT_POLL_INTERVAL_MS`,
@@ -810,7 +802,6 @@ export interface ConfigEnv {
   BUTCHR_IDLE_POKE_MODE?: string | undefined;
   BUTCHR_IDLE_POKE_SUPPRESS_MINUTES?: string | undefined;
   BUTCHR_IDLE_POKE_MAX_PER_POLL?: string | undefined;
-  BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
   BUTCHR_CRASHLOOP_COUNT?: string | undefined;
@@ -1023,9 +1014,6 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const idlePokeMaxPerPoll = env.BUTCHR_IDLE_POKE_MAX_PER_POLL ? Number(env.BUTCHR_IDLE_POKE_MAX_PER_POLL) : 3;
   if (!Number.isInteger(idlePokeMaxPerPoll) || idlePokeMaxPerPoll <= 0) throw new Error(`BUTCHR_IDLE_POKE_MAX_PER_POLL is not a positive integer: ${env.BUTCHR_IDLE_POKE_MAX_PER_POLL}`);
 
-  const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
-  if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
-
   const abandonedMinutes = env.BUTCHR_ABANDONED_MINUTES ? Number(env.BUTCHR_ABANDONED_MINUTES) : 30;
   if (!Number.isFinite(abandonedMinutes) || abandonedMinutes <= 0) throw new Error(`BUTCHR_ABANDONED_MINUTES is not a positive number: ${env.BUTCHR_ABANDONED_MINUTES}`);
 
@@ -1108,7 +1096,6 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     idlePokeMode,
     idlePokeSuppressMinutes,
     idlePokeMaxPerPoll,
-    parkedMinutes,
     abandonedMinutes,
     atRestMinutes,
     crashLoopCount,
@@ -1384,7 +1371,7 @@ export const describeConfig = (c: Config): string =>
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
   `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
+  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +

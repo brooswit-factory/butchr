@@ -1,12 +1,12 @@
 /**
  * FACTORY-666 (epic FACTORY-659, story FACTORY-802, slice A1) — the
- * dashboard's agent-control panel: start, stop, shelve, adopt and
+ * dashboard's agent-control panel: start, stop, adopt and
  * prioritize a fleet worker ticket (a Task/Story/Epic in Jira) instead of
  * the CLI/MCP. Deliberately OUT of scope (recorded on the ticket, agreed by
  * the epic owner): "send text to an agent pane" — that capability injects
  * instructions into a live agent and needs agentsafety's own review first.
  *
- * ONE ROUND TRIP, TWO CALLS for the destructive actions (stop/shelve), same
+ * ONE ROUND TRIP, TWO CALLS for the destructive actions (stop), same
  * idiom `CreateRuleDialog.tsx` already uses for its own combined plan-then-
  * confirm route: the first call omits `confirm`, the server's own 200
  * response IS the dry-run preview (`requiresConfirm`/`confirmReason`/
@@ -45,11 +45,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
 
   const [stopPlan, setStopPlan] = useState<AgentActionPlan | null>(null);
   const [stopNote, setStopNote] = useState<string | null>(null);
-  const [shelveReason, setShelveReason] = useState("");
-  const [shelvePlan, setShelvePlan] = useState<AgentActionPlan | null>(null);
   const [adoptBossKey, setAdoptBossKey] = useState("");
-  const [adoptDisposition, setAdoptDisposition] = useState<"start" | "shelve">("start");
-  const [adoptReason, setAdoptReason] = useState("");
   const [priorityInput, setPriorityInput] = useState("");
 
   const disabled = busy || !canWrite;
@@ -62,7 +58,6 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
       .then((s) => {
         setSnapshot(s);
         setStopPlan(null);
-        setShelvePlan(null);
       })
       .catch((e: unknown) => { setSnapshot(null); setError(describeError(e)); })
       .finally(() => setLoading(false));
@@ -104,24 +99,11 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
     );
   }
 
-  function doShelve(confirm: boolean) {
-    if (!snapshot) return;
-    runAction(
-      () => api.shelve(snapshot.key, shelveReason, confirm),
-      (result) => {
-        if (isPlan(result)) { setShelvePlan(result); return; }
-        setShelvePlan(null);
-        setShelveReason("");
-        refresh();
-      },
-    );
-  }
-
   function doAdopt() {
     if (!snapshot) return;
     runAction(
-      () => api.adopt(snapshot.key, { bossKey: adoptBossKey.trim(), disposition: adoptDisposition, ...(adoptDisposition === "shelve" ? { reason: adoptReason } : {}) }),
-      () => { setAdoptBossKey(""); setAdoptReason(""); refresh(); },
+      () => api.adopt(snapshot.key, { bossKey: adoptBossKey.trim(), disposition: "start" }),
+      () => { setAdoptBossKey(""); refresh(); },
     );
   }
 
@@ -197,34 +179,6 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
           )}
 
           <div>
-            <label htmlFor="agent-control-shelve-reason">shelve reason</label>
-            <input
-              id="agent-control-shelve-reason"
-              type="text"
-              aria-label="shelve reason"
-              data-testid="agent-control-shelve-reason-input"
-              value={shelveReason}
-              onInput={(e) => setShelveReason((e.target as HTMLInputElement).value)}
-              disabled={disabled}
-            />
-            {shelvePlan === null ? (
-              <Button onPress={() => doShelve(false)} isDisabled={disabled || shelveReason.trim() === ""} data-testid="agent-control-shelve-button">
-                shelve
-              </Button>
-            ) : (
-              <div data-testid="agent-control-shelve-confirm">
-                <p>confirm shelve: {snapshot.key} will move to To Do, labeled shelved, under boss {String(shelvePlan.preview.boss ?? "")}</p>
-                <Button variant="primary" onPress={() => doShelve(true)} isDisabled={disabled} data-testid="agent-control-shelve-confirm-button">
-                  confirm shelve
-                </Button>
-                <Button onPress={() => setShelvePlan(null)} isDisabled={disabled}>
-                  cancel
-                </Button>
-              </div>
-            )}
-          </div>
-
-          <div>
             <label htmlFor="agent-control-adopt-boss">adopt under boss</label>
             <input
               id="agent-control-adopt-boss"
@@ -236,29 +190,9 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
               onInput={(e) => setAdoptBossKey((e.target as HTMLInputElement).value)}
               disabled={disabled}
             />
-            <select
-              aria-label="adopt disposition"
-              data-testid="agent-control-adopt-disposition-select"
-              value={adoptDisposition}
-              onChange={(e) => setAdoptDisposition(e.target.value as "start" | "shelve")}
-              disabled={disabled}
-            >
-              <option value="start">start</option>
-              <option value="shelve">shelve</option>
-            </select>
-            {adoptDisposition === "shelve" && (
-              <input
-                type="text"
-                aria-label="adopt shelve reason"
-                data-testid="agent-control-adopt-reason-input"
-                value={adoptReason}
-                onInput={(e) => setAdoptReason((e.target as HTMLInputElement).value)}
-                disabled={disabled}
-              />
-            )}
             <Button
               onPress={doAdopt}
-              isDisabled={disabled || adoptBossKey.trim() === "" || (adoptDisposition === "shelve" && adoptReason.trim() === "")}
+              isDisabled={disabled || adoptBossKey.trim() === ""}
               data-testid="agent-control-adopt-button"
             >
               adopt

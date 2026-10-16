@@ -5,7 +5,7 @@
  * see that module's own header for the shared design this one repeats.
  *
  * What it deliberately does NOT get, same reasoning as `github-issue-loop.ts`:
- * label sync, the parked/abandoned/stall detectors, respawn and crash-loop
+ * label sync, the abandoned/stall detectors, respawn and crash-loop
  * comments. Every one of those writes to Jira, and a GitHub pull request is
  * not a Jira ticket. `ownsId` scopes reconciliation to `github-pr` agents,
  * and the other loops scope themselves to their own providers, so none can

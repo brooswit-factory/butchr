@@ -10,7 +10,7 @@
  * Jira ticket in sight can still wake its agent.
  *
  * SCOPE, deliberately narrow (per the ticket's own split): story FACTORY-992
- * (sibling, still SHELVED as of this writing — see that ticket) owns the
+ * (sibling — see that ticket for current status) owns the
  * full provider — real discovery (`{ancestor: pageId}` child-page
  * enumeration via `AtlassianOps.getChildPages`), activation, and spawn
  * config tuned for a real Confluence-backed agent. `RESOURCE_PROVIDERS`

@@ -5,7 +5,7 @@
  *
  * It searches through the same Jira client as `jira-work` but staffs only
  * proven Product Discovery ideas (src/rules/jira-idea-type.ts), and gets none
- * of the work loop's label sync, parked/abandoned/stall detectors, or
+ * of the work loop's label sync, abandoned/stall detectors, or
  * respawn and crash-loop comments — those write work-item conventions onto
  * the ticket. `ownsId` scopes reconciliation to `jira-idea` agents, and the
  * other loops scope themselves, so no loop can stop another's agents.
