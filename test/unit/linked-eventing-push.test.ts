@@ -92,7 +92,14 @@ describe("FACTORY-137 D2: coverage skip — a clean covered target is not fetche
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
     const reason = notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' }]);
+    // FACTORY-833 (review round 1, PR #800, replayed onto main): changeDetail
+    // now appends "(as of <observedAt.statusAt>)" to a status transition's
+    // detail text — see that function's own doc comment for why (a rate-capped
+    // transition must not inherit a later, unrelated edit's own `updated`
+    // time). The timestamp here is the fixed `updated` this suite's `issue()`
+    // helper defaults to, since `world["BUTCHR-2"]`'s only edit in this test
+    // is the status change itself.
+    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("provider disabled -> uncovered, unchanged polling every tick", async () => {

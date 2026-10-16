@@ -91,7 +91,7 @@ describe("FACTORY-9: managed links reconciled into watchers via the existing lin
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("no linkStore wired: managed links are never reconciled (the existing 'omitted dep' shape) — zero behavior change for callers/tests that don't set it", async () => {
@@ -120,7 +120,7 @@ describe("FACTORY-9: managed links reconciled into watchers via the existing lin
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1); // not two — the managed duplicate produced no second watcher
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress"' }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("no-change tick and the SAME outstanding change across two ticks both produce no duplicate notify", async () => {
@@ -194,7 +194,7 @@ describe("FACTORY-9: managed links reconciled into watchers via the existing lin
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
     await state.runTick([m], deps); // a genuine change against the FRESH baseline
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "In Review" to "Done"' }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "In Review" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("a managed link to a confluence-page target (bare id) is watched via the existing Confluence poller", async () => {
@@ -325,7 +325,7 @@ describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot",
     commentsByKey["BUTCHR-2"] = [{ id: "c2", body: "second", created: "t2", authorEmail: null }, { id: "c1", body: "first", created: "t1", authorEmail: null }];
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment" }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment (as of t2)" }]);
   });
 
   test("without deps.comments wired, a comment-driven bump still shows (via `updated`) but only as generic 'updated' — unchanged pre-FACTORY-9 behavior", async () => {
@@ -339,7 +339,7 @@ describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot",
     world["BUTCHR-2"] = issue("BUTCHR-2", { updated: "t2" }); // simulates a comment bump with no comments() dep to confirm it
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "updated" }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "updated (as of t2)" }]);
   });
 
   test("a comment deletion (newest comment id disappears/changes to none) is reported as 'had a comment removed'", async () => {
@@ -354,7 +354,7 @@ describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot",
     world["BUTCHR-2"] = issue("BUTCHR-2", { updated: "t2" });
     commentsByKey["BUTCHR-2"] = [];
     await state.runTick([m], deps);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "had a comment removed" }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "had a comment removed (as of t2)" }]);
   });
 
   test("a failed comment fetch for one target fails open (logs, leaves commentCursor unchecked) without blocking the tick", async () => {
@@ -382,7 +382,7 @@ describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot",
     commentsByKey["BUTCHR-2"] = [{ id: "c2", body: "second", created: "t2", authorEmail: null }, { id: "c1", body: "first", created: "t1", authorEmail: null }];
     await state.runTick([m], deps);
     expect(notified).toHaveLength(1); // NOT suppressed — a real comment is never "just label noise"
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment" }]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: "got a new comment (as of t2)" }]);
   });
 });
 
@@ -419,7 +419,7 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     now.value += 61 * 60_000;
     await state.runTick([m], deps); // the same outstanding change is re-detected and delivered
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "In Progress" to "Done"' }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("cross-daemon epic hears its story's move to In Review via related:, even with its OWN managed-link budget exhausted by unrelated managed-link churn", async () => {
@@ -510,7 +510,7 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
     await state.runTick([match("jira-work:task:BUTCHR-1", rule(), ownerAfterAdoption)], deps);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "To Do" to "Done"' }]); // reported as a status change, never "no longer linked"
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "To Do" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]); // reported as a status change, never "no longer linked"
 
     // A genuine subscription removal (the Implements link is still intact in
     // Jira) DOES still report removal — this mechanism is the only thing

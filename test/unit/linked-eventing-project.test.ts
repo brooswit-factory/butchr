@@ -154,7 +154,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
       membersByProject.BUTCHR = ["BUTCHR-1"]; // changed again — back in the window
       await state.runTick([], deps, [m]);
       expect(notified).toHaveLength(2);
-      expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // a real diff, not the generic first-appearance phrasing
+      expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]); // a real diff, not the generic first-appearance phrasing
     });
 
     test("survives a daemon restart: a fresh state (no baselines, no watermark) still reports the member's next real change instead of re-swallowing it", async () => {
@@ -267,7 +267,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     membersByProject.BUTCHR = ["BUTCHR-9"];
     await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress"' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
   });
 
   test("coalescing: many members changing in one tick produce ONE nudge for the project owner", async () => {
@@ -311,7 +311,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     now.value += 61 * 60_000;
     await state.runTick([], deps, [m]); // the same outstanding change is re-detected (BUTCHR-1 still in the held window) and delivered
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done"' }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
   test("review round 1 regression: a member dropped by maxLinkedItems holds this owner's ENTIRE watermark — the capped member is retried, not lost, once room exists", async () => {
@@ -497,7 +497,7 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     membersByProject.BUTCHR = ["BUTCHR-1"]; // the new comment bumped `updated`, so it's back in the window
     await state.runTick([], deps, [m]);
     expect(notified).toHaveLength(2);
-    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment" }]);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "got a new comment (as of t2)" }]);
   });
 
   test("the member-discovery search's own already-fetched issue data is reused directly, without a second 'key in (...)' call for the same key", async () => {

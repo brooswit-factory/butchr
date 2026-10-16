@@ -455,7 +455,7 @@ export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: rea
   if (remoteLinks) {
     for (const l of remoteLinks) {
       const key = jiraBrowseKey(l.url);
-      if (key && key !== match.issue.key) remoteKeyItems.push({ kind: "remote-link", target: key });
+      if (key && key !== match.issue.key) remoteKeyItems.push({ kind: "remote-link", target: key, linkId: l.id });
     }
   }
   const seen = new Set<string>();
@@ -505,17 +505,48 @@ function commentChangedBetween(before: JiraSnapshot, after: JiraSnapshot): boole
   return before.commentCursor !== undefined && after.commentCursor !== undefined && before.commentCursor !== after.commentCursor;
 }
 
-function changeDetail(before: JiraSnapshot, after: JiraSnapshot): string {
-  if (before.status !== after.status) return `status changed from "${before.status}" to "${after.status}"`;
+/**
+ * FACTORY-833 (ticket ask #3): every branch here now names WHEN the
+ * changed field actually moved, not just WHAT changed — the filer's
+ * second report showed a transition that happened roughly 50 minutes
+ * before the notice reporting it, with nothing in the message itself to
+ * tell a reader "this already happened a while ago" from "this just
+ * happened." This is the "accurate transition timestamps" half of the
+ * ticket's ask, chosen over "suppress stale transitions" because
+ * suppression risks silently dropping a real, still-unread change a
+ * rate-capped or slow-polling owner genuinely needs to hear about — see
+ * this module's own top comment ("DELAYED, NOT LOST") for why this module
+ * already treats "never silently drop a genuine change" as load-bearing
+ * elsewhere.
+ *
+ * `asOf` is NOT simply `after.updated` (review round 1, PR #800): Jira's
+ * `updated` is bumped by ANY field changing, not specifically the one this
+ * line reports — a status transition held by the rate cap, followed by a
+ * LATER unrelated edit (a comment, a label) with status unchanged, would
+ * have `after.updated` reflect that later unrelated edit's own time, not
+ * the status transition's, falsely implying the transition is as recent
+ * as the unrelated edit. `observed` carries THREE independent timestamps
+ * (`statusAt`/`summaryAt`/`commentAt`, from `runTick`'s own per-tick
+ * observation-tracking — see `observedAt`'s own doc comment above), each
+ * frozen at the moment its OWN field last actually differed from the
+ * previously observed value, immediately on every tick regardless of
+ * rate-capping — so whichever branch fires below names the time THAT
+ * field moved, never a later unrelated bump to a different field. The
+ * generic "updated" fallback has no specific field to shadow — none of
+ * status/summary/comment differ from the baseline, so `after.updated`
+ * IS the only fact being reported, used directly rather than frozen.
+ */
+function changeDetail(before: JiraSnapshot, after: JiraSnapshot, observed: { statusAt: string; summaryAt: string; commentAt: string }): string {
+  if (before.status !== after.status) return `status changed from "${before.status}" to "${after.status}" (as of ${observed.statusAt})`;
   // FACTORY-9: checked before the generic summary/"updated" fallback — a new
   // (or removed) comment is a specific, actionable fact worth naming, not
   // just folded into a bare "updated" the way it silently was before this
   // story added comment detection to this snapshot. BUTCHR-351 precedent
   // (`src/agents/change-nudge.ts`'s own `reasonClause`): `null` means the
   // newest comment slot is now empty — a deletion, not an addition.
-  if (commentChangedBetween(before, after)) return after.commentCursor === null ? "had a comment removed" : "got a new comment";
-  if (before.summary !== after.summary) return "summary changed";
-  return "updated";
+  if (commentChangedBetween(before, after)) return (after.commentCursor === null ? "had a comment removed" : "got a new comment") + ` (as of ${observed.commentAt})`;
+  if (before.summary !== after.summary) return `summary changed (as of ${observed.summaryAt})`;
+  return `updated (as of ${after.updated})`;
 }
 
 /** BUTCHR-437: the agent-facing detail phrase for a genuine external-kind change — `before`/`after` are the two opaque fingerprints (see `external-poll.ts`'s own doc comment); only Confluence's is human-meaningful (a version NUMBER), so only that kind names the two values. */
@@ -790,7 +821,12 @@ function jqlRelativeMinutesSince(watermark: number, now: number): number {
 /** A fresh, empty linked-eventing state — one instance per daemon lifetime (mirrors `createLinkedDiscoveryTracker`/`createOwnWriteLedger`'s own "one instance, closed over, reused every poll" shape). */
 export function createLinkedEventingState(): LinkedEventingState {
   const baselines = new Map<string, Baseline>();
-  const watchSets = new Map<string, Map<string, string>>();
+  // FACTORY-833: value is `{ kind, linkId? }`, not a bare kind string, so a
+  // removal event (the only consumer of a watch-set ENTRY's own stored
+  // kind) can also report the removed link's own provider id when it had
+  // one — the id as last observed, which is exactly right for a removal
+  // (there is no fresher read to prefer; the link is gone).
+  const watchSets = new Map<string, Map<string, { kind: string; linkId?: string }>>();
   const unreadableOwners = new Map<string, Set<string>>();
   const turns = new Map<string, number[]>();
   // BUTCHR-437: last time (per owner) this state actually ATTEMPTED an
@@ -805,6 +841,27 @@ export function createLinkedEventingState(): LinkedEventingState {
   // restart, which is exactly what makes the "first sighting" branch below
   // also cover a restart, not only a genuinely new project owner.
   const projectWatermarks = new Map<string, number>();
+  // FACTORY-833 (review round 1, PR #800): per (owner, target), the last
+  // OBSERVED value of status/summary/commentCursor, each with ITS OWN
+  // `updated` timestamp frozen at the tick that field was last seen to
+  // actually differ from the previously observed value — distinct from
+  // `baselines`, which only advances on a genuinely delivered tick. This
+  // map updates EVERY tick, immediately, regardless of rate-capping or
+  // delivery (the same "delayed, not lost" exception `lastExternalPollAt`
+  // above already documents for a different field). Three INDEPENDENT
+  // timestamps, not one shared one: a status transition held by the rate
+  // cap must not inherit a LATER tick's unrelated summary/comment edit's
+  // own `updated` value (or vice versa) — see `changeDetail`'s own doc
+  // comment for the concrete repro this closes.
+  const observedAt = new Map<string, { status: string; statusAt: string; summary: string; summaryAt: string; commentCursor: string | null | undefined; commentAt: string }>();
+  // FACTORY-833 (review round 2, PR #800): per issue owner, the last
+  // GENUINELY OBSERVED native-issuelink membership, keyed by the Jira
+  // issueLink's OWN id — see `issuelinkIdsThisTick`'s own doc comment
+  // (this tick's scratch counterpart, computed fresh every tick) for why
+  // this exists alongside `watchSets`. Advanced only inside the SAME
+  // `advance()` as every other per-owner state (delayed, not lost on a
+  // rate-capped tick).
+  const issuelinkMembership = new Map<string, Map<string, string>>();
   const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
 
   // FACTORY-137 PUSH MODE — every map below is this instance's OWN (D9:
@@ -857,6 +914,21 @@ export function createLinkedEventingState(): LinkedEventingState {
     // replays the SAME last-known fetch-failure set instead of assuming
     // everything succeeded.
     linkFetchFailedOwners: ReadonlySet<string>;
+    // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
+    // discovery's own native-issuelink membership per issue owner, keyed by
+    // the Jira issueLink's OWN id — see `issuelinkMembership`'s own doc
+    // comment (outer scope, above) for why this exists alongside
+    // `linkFetchFailedOwners`/`watchSets`. Carried through `PassContext`
+    // exactly like every other discovery-time fact: an on-demand pass never
+    // recomputes it (D3's own "no rediscovery" contract — a project/issue
+    // owner's own `m.issue.issuelinks` can only change via a fresh Jira
+    // fetch that an on-demand pass never performs for the OWNER object
+    // itself, only for its linked TARGETS), it simply replays the last
+    // `runTick`'s own observation, same as `removedByOwner`'s target-level
+    // removal detection already does one `ctx` field over (that comparison
+    // is also naturally a no-op during an on-demand pass, since nothing in
+    // `kept` changed since the last `runTick` that built it).
+    issuelinkIdsThisTick: ReadonlyMap<string, ReadonlyMap<string, string>>;
     deps: LinkedEventingDeps;
   }
 
@@ -1120,8 +1192,34 @@ export function createLinkedEventingState(): LinkedEventingState {
       if (!prevSet) continue;
       const keptTargets = new Set(trackedKept(entry.agentKey, kept).map((i) => i.target));
       const gone: LinkedChangeEvent[] = [];
-      for (const [target, kind] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind, detail: "no longer linked" });
+      for (const [target, info] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
       if (gone.length) removedByOwner.set(entry.agentKey, gone);
+    }
+
+    // FACTORY-833 (review round 2, PR #800, replayed onto main): removal at
+    // the SPECIFIC native-issuelink-id granularity, independent of
+    // `removedByOwner` above — see `PassContext.issuelinkIdsThisTick`'s own
+    // doc comment for why. Only ever populated for an issue owner (project
+    // owners never appear in `ctx.issuelinkIdsThisTick`, which is built
+    // solely from `opted`'s own `m.issue.issuelinks` at discovery time). A
+    // linkId present in the PRIOR pass's membership but absent from THIS
+    // pass's is reported here, even when its target remains linked overall
+    // via a sibling id — the case `removedByOwner`'s target-level,
+    // dedup-by-target `watchSets` can never see, since `kept` only ever
+    // keeps ONE item per target. Reused as-is (not recomputed) during an
+    // on-demand pass: `ctx.issuelinkIdsThisTick` is a discovery-time fact
+    // carried through `PassContext` exactly like `removedByOwner`'s own
+    // target-level comparison just above, so this is naturally a no-op
+    // during an on-demand pass too — nothing in `kept`/`m.issue.issuelinks`
+    // changed since the last `runTick` that built this `ctx`.
+    const issuelinkRemovedByOwner = new Map<string, LinkedChangeEvent[]>();
+    for (const entry of ownerEntries) {
+      const prevIds = issuelinkMembership.get(entry.agentKey);
+      if (!prevIds) continue;
+      const currentIds = ctx.issuelinkIdsThisTick.get(entry.agentKey) ?? new Map<string, string>();
+      const gone: LinkedChangeEvent[] = [];
+      for (const [linkId, target] of prevIds) if (!currentIds.has(linkId)) gone.push({ target, kind: "issuelink", detail: "no longer linked", linkId });
+      if (gone.length) issuelinkRemovedByOwner.set(entry.agentKey, gone);
     }
 
     // BUTCHR-437 (PR #401 review round 1): poll-cadence gate for the THREE
@@ -1193,7 +1291,21 @@ export function createLinkedEventingState(): LinkedEventingState {
       const kept = perOwnerItems.get(entry.agentKey) ?? [];
       const wasUnreadable = unreadableOwners.get(entry.agentKey) ?? new Set<string>();
       const removedThisTick = removedByOwner.get(entry.agentKey) ?? [];
-      const triggering: LinkedChangeEvent[] = [...removedThisTick];
+      // FACTORY-833 (review round 2, PR #800, replayed onto main): the
+      // generic target-level removal line is suppressed for `issuelink`
+      // kind specifically — the more precise per-linkId mechanism above
+      // reports it instead, by provider id, even when several distinct
+      // links to the same target are involved. `removedThisTick` itself
+      // (unfiltered) still drives baseline/observedAt/unreadable cleanup
+      // just below, unchanged — only the user-FACING line is replaced,
+      // never the bookkeeping. Suppressed ONLY when a linkId was actually
+      // available (meaning the more precise per-id mechanism above could,
+      // and did, track it) — an issuelink with no id (a provider payload
+      // gap, or a test fixture built without one) is never tracked by that
+      // mechanism at all, so its generic target-level removal line is the
+      // only one that will ever fire and must not be dropped.
+      const issuelinkRemovedThisTick = issuelinkRemovedByOwner.get(entry.agentKey) ?? [];
+      const triggering: LinkedChangeEvent[] = [...removedThisTick.filter((e) => !(e.kind === "issuelink" && e.linkId !== undefined)), ...issuelinkRemovedThisTick];
       const stillUnreadable: LinkedChangeEvent[] = [];
       const toAdvance: Array<() => void> = [];
       const nowUnreadable = new Set<string>();
@@ -1205,7 +1317,8 @@ export function createLinkedEventingState(): LinkedEventingState {
       for (const ev of removedThisTick) {
         toAdvance.push(() => {
           baselines.delete(baselineKey(entry.agentKey, ev.target));
-          unreadableOwners.get(entry.agentKey)?.delete(ev.target);
+          unreadableOwners.get(entry.agentKey)?.delete(ev.target); // same leak, same fix: a re-added target must not inherit a stale unreadable/readable transition state
+          observedAt.delete(baselineKey(entry.agentKey, ev.target)); // FACTORY-833: same leak class — a re-added target must not inherit a stale observed-at either
         });
       }
 
@@ -1223,7 +1336,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             nowUnreadable.add(item.target);
             noteTouched(item.target, entry.agentKey);
             settleTtl(item.target); // D4: "unreadable" is a settled outcome too
-            const event: LinkedChangeEvent = { target: item.target, kind: item.kind, detail: "unreadable" };
+            const event: LinkedChangeEvent = { target: item.target, kind: item.kind, detail: "unreadable", ...(item.linkId ? { linkId: item.linkId } : {}) };
             if (wasUnreadable.has(item.target)) stillUnreadable.push(event);
             else triggering.push(event);
             continue;
@@ -1233,6 +1346,23 @@ export function createLinkedEventingState(): LinkedEventingState {
           if (wasUnreadable.has(item.target)) toAdvance.push(() => unreadableOwners.get(entry.agentKey)?.delete(item.target));
           const snap = snapshotOf(issue, commentCursorByTarget.get(item.target));
           const bkey = baselineKey(entry.agentKey, item.target);
+          // FACTORY-833 (review round 1, PR #800, replayed onto main):
+          // updated immediately, every PASS (regular tick or on-demand —
+          // both run this same per-item loop), BEFORE any rate-cap/
+          // suppress/delivery decision — see `observedAt`'s own doc
+          // comment (outer scope) above. Each of the three timestamps only
+          // moves when ITS OWN field actually differs from the last
+          // observed value for THAT field — an unrelated field bumping
+          // `updated` never touches the other two fields' own frozen
+          // timestamps, which is exactly what keeps a held transition's
+          // `asOf` from inheriting a later, unrelated edit's `updated`
+          // value.
+          const prevObserved = observedAt.get(bkey);
+          observedAt.set(bkey, {
+            status: snap.status, statusAt: (!prevObserved || prevObserved.status !== snap.status) ? snap.updated : prevObserved.statusAt,
+            summary: snap.summary, summaryAt: (!prevObserved || prevObserved.summary !== snap.summary) ? snap.updated : prevObserved.summaryAt,
+            commentCursor: snap.commentCursor, commentAt: (!prevObserved || prevObserved.commentCursor !== snap.commentCursor) ? snap.updated : prevObserved.commentAt,
+          });
           const beforeRaw = baselines.get(bkey);
           const before = beforeRaw?.kind === "jira" ? beforeRaw.snapshot : undefined;
           if (!before) {
@@ -1242,7 +1372,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             if (ctx.memberTargetsByOwner.get(entry.agentKey)?.has(item.target)) {
               const watermark = ctx.usedWatermarkByOwner.get(entry.agentKey);
               const detail = watermark === undefined ? "updated" : `updated since ${new Date(watermark).toISOString()}`;
-              triggering.push({ target: item.target, kind: item.kind, detail });
+              triggering.push({ target: item.target, kind: item.kind, detail, ...(item.linkId ? { linkId: item.linkId } : {}) });
               toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
               continue;
             }
@@ -1261,7 +1391,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             continue;
           }
           noteIfStreamMissed(item.target, item.kind);
-          triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap) });
+          triggering.push({ target: item.target, kind: item.kind, detail: changeDetail(before, snap, observedAt.get(bkey)!), ...(item.linkId ? { linkId: item.linkId } : {}) });
           toAdvance.push(() => baselines.set(bkey, { kind: "jira", snapshot: snap }));
           continue;
         }
@@ -1326,8 +1456,21 @@ export function createLinkedEventingState(): LinkedEventingState {
         // other `toAdvance` closure above (baselines for whatever WAS
         // successfully read this tick) still runs normally.
         if (!ctx.linkFetchFailedOwners.has(entry.agentKey)) {
-          watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, i.kind])));
+          watchSets.set(entry.agentKey, new Map(trackedKept(entry.agentKey, kept).map((i) => [i.target, { kind: i.kind, ...(i.linkId ? { linkId: i.linkId } : {}) }])));
         }
+        // FACTORY-833 (review round 2, PR #800, replayed onto main): commit
+        // this pass's native-issuelink membership too, same "delayed, not
+        // lost" discipline as `watchSets` just above — but UNCONDITIONAL,
+        // never gated on `ctx.linkFetchFailedOwners`: `issuelinkIdsThisTick`
+        // is built straight from `m.issue.issuelinks` at discovery time, a
+        // completely different data source from the remote-links/managed-
+        // link fetches that failure set tracks, so a broken link store has
+        // no bearing on it. A project owner never appears in
+        // `ctx.issuelinkIdsThisTick` (built solely from `opted`'s own issue
+        // owners), so this simply advances it to an empty map every pass
+        // for one — an empty-to-empty comparison forever, never producing a
+        // spurious event.
+        issuelinkMembership.set(entry.agentKey, ctx.issuelinkIdsThisTick.get(entry.agentKey) ?? new Map());
         const wm = ctx.nextProjectWatermark.get(entry.agentKey);
         if (wm !== undefined) projectWatermarks.set(entry.agentKey, wm);
       });
@@ -1430,6 +1573,37 @@ export function createLinkedEventingState(): LinkedEventingState {
         // is missing from it) reports a false "no longer linked" for
         // something that never actually changed.
         const linkFetchFailedOwners = new Set<string>();
+        // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
+        // tick's own native-issuelink membership, per issue owner — keyed
+        // by the Jira issueLink's OWN id, not by target, so two DISTINCT
+        // issuelinks sharing a target (e.g. "Blocks" id 100 and "Relates"
+        // id 200, both to BUTCHR-2) are each tracked independently.
+        // `jiraKindLinkedItems`'s own discovery/`kept` path still collapses
+        // same-target items to ONE `LinkedItem` (first occurrence wins) for
+        // status-diffing/fetching purposes — that stays unchanged, since a
+        // target's status is a single fact regardless of how many links
+        // point at it. This map exists ONLY so a SPECIFIC link's removal
+        // (one of several to the same target) is still reported, instead
+        // of being silently absorbed because the TARGET remains linked via
+        // a sibling link. Built straight from `m.issue.issuelinks` (never
+        // from `kept`, which has already lost the information this
+        // needs), excluding whatever `watchedKeys` already routes via
+        // `related:` — the SAME exclusion `jiraKindLinkedItems` itself
+        // applies, so this never double-reports a target `related:`
+        // already covers independently. A link with no `id` (a provider
+        // payload gap, or a hand-built test fixture) is simply never
+        // tracked here — never a fabricated id. Threaded into `PassContext`
+        // below exactly like `linkFetchFailedOwners` above.
+        const issuelinkIdsThisTick = new Map<string, Map<string, string>>();
+        for (const m of opted) {
+          const routedByRelated = new Set(watchedKeys(m.issue.issuelinks ?? []));
+          const ids = new Map<string, string>();
+          for (const l of m.issue.issuelinks ?? []) {
+            if (l.id === undefined || routedByRelated.has(l.key)) continue;
+            ids.set(l.id, l.key);
+          }
+          issuelinkIdsThisTick.set(m.agentKey, ids);
+        }
 
         for (const m of opted) {
           let remoteLinks: JiraRemoteLink[] | undefined;
@@ -1576,7 +1750,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey, notifyAgentKey: m.notifyAgentKey ?? m.agentKey })),
         ];
 
-        const ctx: PassContext = { ownerEntries, perOwnerItems, managedTargetsByOwner, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, deps };
+        const ctx: PassContext = { ownerEntries, perOwnerItems, managedTargetsByOwner, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, issuelinkIdsThisTick, deps };
         lastPassContext = ctx;
         await runOwnerPass(ctx, undefined);
       });
