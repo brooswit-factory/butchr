@@ -92,6 +92,24 @@ export interface RuleResourceDeps {
    * above; omitted, no managed link is ever reconciled into a watcher.
    */
   linkStore?: LinkedEventingDeps["linkStore"];
+  /**
+   * FACTORY-137 (D2): the daemon's Catamorbius push controller's read-only
+   * coverage query — passed straight through to `runTick`, same as every
+   * other linked-eventing dep above. Optional; omitted, push mode never
+   * activates for this rule type (every existing caller/test).
+   */
+  push?: LinkedEventingDeps["push"];
+  setTimeout?: LinkedEventingDeps["setTimeout"];
+  clearTimeout?: LinkedEventingDeps["clearTimeout"];
+  /**
+   * FACTORY-137: called ONCE, synchronously, right after this call's own
+   * `LinkedEventingState` is constructed — lets the daemon register it with
+   * the push controller (`registerConsumer`) so a Catamorbius event can
+   * reach it (`markDirty`/`requestResync`/`runDirtyPass`) and so its own
+   * `stats()` can be surfaced. Optional; omitted, this instance simply
+   * never receives push signals (byte-identical to pre-FACTORY-137).
+   */
+  onLinkedEventingState?: (state: LinkedEventingState) => void;
 }
 
 /**
@@ -470,6 +488,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
   const linkedDiscoveryTracker = createLinkedDiscoveryTracker();
   const linkedEventingState: LinkedEventingState = createLinkedEventingState();
+  deps.onLinkedEventingState?.(linkedEventingState);
   return {
     discovery: {
       idOf: unitAgentKey,
@@ -552,6 +571,10 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
               ...(deps.filesystem ? { filesystem: deps.filesystem } : {}),
               ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
               ...(deps.comments ? { comments: deps.comments } : {}),
+              // FACTORY-137
+              ...(deps.push ? { push: deps.push } : {}),
+              ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
+              ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
             });
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] tick threw: ${(e as Error)?.message ?? e}`);
