@@ -770,3 +770,37 @@ describe("jira_get_comments delivers readable bodies end-to-end (FACTORY-1008)",
     await expect(Promise.resolve().then(() => tool.handler({ key: "KAN-9" }, { headers: {} } as any))).rejects.toThrow(/before reported total 3/);
   });
 });
+
+describe("realAtlassian projectExists (FACTORY-19)", () => {
+  function rig(getProject: (p: unknown) => Promise<unknown>, notFound: (e: unknown) => boolean) {
+    mock.module("jira.js", () => ({
+      createCloudClient: () => ({ projects: { getProject } }),
+      isNotFoundError: notFound,
+    }));
+  }
+
+  test("resolves true when the project read succeeds", async () => {
+    const calls: unknown[] = [];
+    rig((p) => { calls.push(p); return Promise.resolve({ key: "PROJ" }); }, () => false);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    expect(await ops.projectExists!("PROJ")).toBe(true);
+    expect(calls).toEqual([{ projectIdOrKey: "PROJ" }]);
+  });
+
+  test("resolves false on a genuine not-found, same isNotFoundError check the neighbouring not-found ops use", async () => {
+    const notFoundErr = new Error("404");
+    rig(() => Promise.reject(notFoundErr), (e) => e === notFoundErr);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    expect(await ops.projectExists!("NOPE")).toBe(false);
+  });
+
+  test("any OTHER rejection (not a not-found) still propagates uncaught", async () => {
+    const serverErr = new Error("Atlassian 500");
+    rig(() => Promise.reject(serverErr), () => false);
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.projectExists!("PROJ")).rejects.toThrow(/Atlassian 500/);
+  });
+});
