@@ -4,19 +4,30 @@ import type { ProjectResourceDeps } from "../../src/resources/project.js";
 
 // FACTORY-137 (incidental fix, found while rebasing onto main): `mock.module`
 // is a PROCESS-WIDE patch, not scoped to this file — bun does not undo it
-// when the file finishes. Every test above replaces "jira.js"/"confluence.js"
-// with a stub lacking most of the real client's surface (e.g. no
-// `projectProperties`), so without restoring it here, any OTHER test file
-// that happens to run later in the SAME bun test process and imports the
-// real client (e.g. test/unit/link-cli-jira-project.test.ts) silently gets
-// this file's last stub instead — order-dependent, so it can pass for a long
-// time and then fail the moment file-execution order shifts (exactly what
-// happened here: this PR's own new test files changed CI's worker
-// distribution enough to expose it). Restoring once, after every test in
-// this file has run, is enough — each test already calls `mock.module`
-// fresh before using the client, so nothing above needs its own cleanup.
+// when the file finishes, and `mock.restore()` does NOT undo a `mock.module`
+// call either (verified directly: it only resets jest-style spies). Every
+// test above replaces "jira.js"/"confluence.js" with a stub lacking most of
+// the real client's surface (e.g. no `projectProperties`), so without
+// restoring it here, any OTHER test file that happens to run later in the
+// SAME bun test process and imports the real client (e.g.
+// test/unit/link-cli-jira-project.test.ts) silently gets this file's last
+// stub instead — order-dependent, so it can pass for a long time and then
+// fail the moment file-execution order shifts (exactly what happened here:
+// this PR's own new test files changed CI's worker distribution enough to
+// expose it). The real modules are snapshotted as plain-object COPIES, not
+// bare references — `mock.module` mutates the existing module namespace
+// object's properties IN PLACE rather than swapping in a new one, so a bare
+// `const real = await import(...)` reference would itself get silently
+// mutated by the very first `mock.module` call below and "restoring" it
+// would just reapply the mutated (fake) object. Restoring once, after every
+// test in this file has run, is enough — each test already calls
+// `mock.module` fresh before using the client, so nothing above needs its
+// own cleanup.
+const realJiraJs = { ...(await import("jira.js")) };
+const realConfluenceJs = { ...(await import("confluence.js")) };
 afterAll(() => {
-  mock.restore();
+  mock.module("jira.js", () => realJiraJs);
+  mock.module("confluence.js", () => realConfluenceJs);
 });
 
 describe("realAtlassian confluence page ops", () => {
