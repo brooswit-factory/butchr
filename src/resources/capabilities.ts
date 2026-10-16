@@ -5,7 +5,7 @@
  * supports today — `capabilitiesOf`/`supports` — and gets a typed,
  * programmatically detectable failure (`UnsupportedCapabilityError`) rather
  * than a silent no-op or a faked result when it invokes one that isn't. See
- * docs/provider-capabilities.md for the full 8x6 inventory this table is
+ * docs/provider-capabilities.md for the full 10x7 inventory this table is
  * built from, file:function evidence per cell, and every deviation from the
  * original handoff proposal.
  *
@@ -53,8 +53,17 @@ export const CAPABILITY_PROVIDERS = [
 ] as const;
 export type CapabilityProvider = (typeof CAPABILITY_PROVIDERS)[number];
 
-/** The six capability categories this ticket's inventory covers. */
-export const CAPABILITIES = ["query", "read", "snapshot", "comments", "links", "createTask"] as const;
+/**
+ * The capability categories this inventory covers. `catamorbiusPush`
+ * (FACTORY-134, implementing story FACTORY-22) is the seventh: it declares
+ * only that a Catamorbius CloudEvent → watch-key MAPPING exists for this
+ * provider (`src/catamorbius/mapping.ts`) — NEVER that a Catamorbius
+ * gateway is configured or reachable, which is a dynamic, per-deployment
+ * fact this static table cannot and does not encode. See
+ * docs/catamorbius-push.md for the mapping rules and docs/provider-
+ * capabilities.md for this cell's own row in the inventory.
+ */
+export const CAPABILITIES = ["query", "read", "snapshot", "comments", "links", "createTask", "catamorbiusPush"] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
 /**
@@ -98,9 +107,9 @@ export class UnsupportedCapabilityError extends Error {
  * this table only carries the boolean a caller can safely act on.
  */
 const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
-  "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
   // FACTORY-998: `query` flipped true — a real provider/rule now exists
   // (src/rules/confluence-page-type.ts, `{"ancestor": "<page id>"}`), usable
   // by a caller with zero provider-specific knowledge the same way every
@@ -110,19 +119,19 @@ const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   // page CONTENT is read via `get_my_confluence_page`
   // (FACTORY-993/996, src/tools/defs.ts), a self-only verb with no
   // provider-agnostic entry point, not through a shared `read` capability.
-  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
-  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
   // FACTORY-1009: query/read/comments mirror zendesk-ticket's own row — a
   // real REST client exists for all three (trello-card.ts), reusable by a
   // zero-provider-knowledge caller through comments.ts the same way. `links`
   // stays false (no ResourceRef/link-store integration, same reason
   // zendesk-ticket's does); no event-rules/poll wiring exists, so `snapshot`
   // is the plain "absent" case, not a flip under "The snapshot bar".
-  "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
-  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
+  "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
 };
 
 /** Every capability `ref`'s provider truthfully supports today, in `CAPABILITIES` order. */
