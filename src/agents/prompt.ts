@@ -15,6 +15,23 @@ export interface Prompt {
 const QUESTION_TAIL = 6;
 
 /**
+ * The horizontal rule Claude Code draws to open a dialog's own frame —
+ * confirmed live in EVERY real capture in this repo's corpus (84/84 escalation
+ * and unrecognised captures under `.captures/`, FACTORY-481): a `─+` line sits
+ * directly above the dialog's own content (a bare question, or a title/tab bar
+ * then the question) in every one, with arbitrary agent/tool/notification
+ * chatter above the rule and nothing but the dialog itself below it. Anchoring
+ * `question` to start fresh after the LAST such rule (see the reset in the
+ * scan loops below) is what makes `question` — and so `fingerprint`, which is
+ * a pure function of `question` + `options` — invariant to how much chatter
+ * scrolled in above the dialog, however much of it there is. Not every real
+ * dialog carries a rule (the un-numbered branch's synthetic startup-dialog
+ * fixtures below have none), so this is a refinement of the tail bound below,
+ * not a replacement for it: with no rule, `QUESTION_TAIL` still caps it.
+ */
+const RULE = /^─+$/;
+
+/**
  * A real Claude Code selection dialog always ends with this footer,
  * IMMEDIATELY after its last option (blank lines allowed in between, never
  * other content). It is NOT enough to check that this phrase merely occurs
@@ -68,7 +85,11 @@ export function parsePrompt(text: string): Prompt | null {
       if (m[1]) { current = idx; cursorCount++; }
       options[idx - 1] = m[3]!.trim();
       lastOptionLineIdx = li;
-    } else if (line.trim() && !/^(Enter to confirm|Esc to cancel|─+|·)/.test(line.trim())) {
+    } else if (options.length === 0 && RULE.test(line.trim())) {
+      // A fresh dialog frame starts here — whatever we accumulated so far
+      // was chatter above THIS rule, not the question below it.
+      questionLines.length = 0;
+    } else if (line.trim() && !/^(Enter to confirm|Esc to cancel|·)/.test(line.trim())) {
       if (options.length === 0) questionLines.push(line.trim());
     }
   }
@@ -144,7 +165,14 @@ function parseUnnumbered(lines: string[]): Prompt | null {
     seen++;
     if (/^\s*(❯|>)\s+/.test(lines[j]!)) { cur = options.length - seen + 1; break; }
   }
-  const question = lines.slice(0, footerIdx - options.length).map((l) => l.trim())
+  // Same frame anchor as parsePrompt's numbered branch (see RULE above):
+  // chatter above the dialog's own opening rule must never reach `question`,
+  // however much of it there is. Start from just after the LAST rule line
+  // preceding the options, not from the top of the pane.
+  const preLines = lines.slice(0, footerIdx - options.length);
+  let ruleIdx = -1;
+  for (let j = 0; j < preLines.length; j++) if (RULE.test(preLines[j]!.trim())) ruleIdx = j;
+  const question = preLines.slice(ruleIdx + 1).map((l) => l.trim())
     .filter((t) => t && !/^(─+|·)/.test(t)).slice(-QUESTION_TAIL).join(" ").trim();
   return { question, options, current: cur };
 }

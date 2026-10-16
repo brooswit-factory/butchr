@@ -1,0 +1,53 @@
+# butchr session-limit capture (real, FACTORY-481 fixture)
+# issue: BUTCHR-316
+# pane: w75:p1
+# agent_status: done
+# captured-at: 2026-09-11T07:32:25.892Z
+# trigger: unrecognised (phrase present, suppressed: a ⎿-prefixed refusal's own wrap continuation is followed by further content ("paste again to expand                               ✔ Update") — looks like a fuller quoted/embedded rendering (more ticket prose, or a truncation tail), not a live banner)
+# provenance: copied verbatim from this daemon's own BUTCHR_CAPTURE_DIR corpus
+# (FACTORY-481 fixture, negative case). Chosen because it carries butchr's OWN
+# notification chatter interleaved in the scrollback (the `← butchr: [butchr]
+# ...` and `❯ [butchr] ...` lines below are the daemon's own tell_worker/
+# notification text landing in the pane) ending in a rule-framed composer
+# area — but no option/footer dialog shape at all. A real negative: this
+# capture was saved BECAUSE the daemon did not recognize it as a live prompt.
+# --- pane text follows verbatim (ANSI already stripped) ---
+
+     … +39 lines (ctrl+o to expand)
+
+● My review worktree is removed, branch clean at 26f43c5, PR #347 open with 3 commits.
+  Reporting the delivery and submitting:
+
+  Called butchr (ctrl+o to expand)
+  ⎿  You've hit your session limit · resets 2:10am (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+
+✻ Worked for 12m 50s · done 12:31 AM
+
+← butchr: [butchr] BUTCHR-316: your PR's review state changed pr:none…
+  ⎿  You've hit your session limit · resets 2:10am (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+
+✻ Cooked for 0s · done 12:32 AM
+
+❯ [butchr] BUTCHR-316: your PR's review state changed pr:none → pr:open. Before merging,
+  verify the last decisive review's own reviews[].commit.oid against your current head — an
+  approval is recorded against a sha, and the branch may have moved since. A mismatch is a
+  real signal (don't merge); a match is not sufficient on its own: it doesn't mean nothing
+  unreviewed landed (a clean base-merge brings in main's own content, not this PR's
+  reviewer's read of it), and reviews[].commit.oid can take ~30-56s to catch up after a
+  base-merge, so a read taken right after your own push may just be racing that update — wait
+  it out. If in doubt, ask for a re-review or point at the ticket's own [review] comment,
+  pasted (never retyped) from the API — GitHub can't rewrite it, but a hand-typed one can be
+  wrong; your brief has the full caveat. Act: approved → merge your own PR; changes-requested
+  → read the review, fix, push, ask for a re-review; merged → do your post-merge duties.
+  ⎿  You've hit your session limit · resets 2:10am (America/Los_Angeles)
+     /usage-credits to finish what you’re working on.
+
+✻ Brewed for 0s · done 12:32 AM
+
+──────────────────────────────────────────────────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────────────────────────────────────────────────
+  paste again to expand                               ✔ Update installed · Restart to update
+                                                                                         /rc
