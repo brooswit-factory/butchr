@@ -1,0 +1,43 @@
+# butchr escalation capture (real, FACTORY-481 fixture)
+# issue: FACTORY-146
+# pane: wQ:p1
+# captured-at: 2026-09-27T03:06:19.553Z
+# provenance: copied verbatim from this daemon's own BUTCHR_CAPTURE_DIR corpus
+# (default .captures/ under the workspace root — see src/config/config.ts) —
+# a REAL escalation capture, not reconstructed. Chosen for FACTORY-481
+# (butchr parsePrompt question/fingerprint anchoring) because its shape is
+# the single most common one in that corpus: ordinary tool-call/narration
+# scrollback, a "❯ /rate-limit-options" composer echo, a blank line, a rule
+# line, then the dialog's own one-line question, then the numbered menu and
+# footer. The scrollback above the rule is exactly the kind of butchr/agent
+# chatter the ticket describes (tool-call output, "Called butchr", a
+# "✻ Baked for Ns · done" status line) sitting directly above the dialog.
+# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---
+
+
+● Bash(cd /home/booswrit/code/brooswit/butchr && git fetch origin 2>&1|tail -1; echo "===
+      FACTORY-127 commits ==="; git log --oneline --all --grep='FACTORY-127' | head…)
+  ⎿     2d8b84b..0c20c60  main        -> origin/main
+     === FACTORY-127 commits ===
+     7cac8ad FACTORY-129: remove unconditional jira-project permissionMode "auto"
+     … +11 lines (ctrl+o to expand)
+  ⎿  Shell cwd was reset to /home/booswrit/butchr-workspaces/jira-work/bugs/FACTORY-146
+
+● Verified: FACTORY-127's merge isn't in 94203ff, and main is now 64 commits ahead. Their
+  finding holds. Approving it.
+
+  Called butchr (ctrl+o to expand)
+  ⎿  You've hit your weekly limit · resets Oct 1, 8am (America/Los_Angeles)
+
+✻ Baked for 1m 35s · done 8:06 PM
+
+❯ /rate-limit-options
+
+──────────────────────────────────────────────────────────────────────────────────────────────
+  What do you want to do?
+
+  ❯ 1. Stop and wait for limit to reset
+    2. Wait here, then continue automatically at Oct 1, 8am
+    3. Switch to usage credits
+
+  Enter to confirm · Esc to cancel
