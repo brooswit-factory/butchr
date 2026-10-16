@@ -238,3 +238,22 @@ export function zendeskTicketStaffing(rules: readonly Rule[], env: ZendeskAuthEn
   if (!auth.ok) return { run: false, rules: enabled, reason: `zendesk-ticket rules not staffed (${ids}): ${auth.reason}` };
   return { run: true, rules: enabled, subdomain: auth.subdomain, token: auth.token };
 }
+
+/**
+ * FACTORY-66 review round 4 (brooswit, PR #797, @ cf9645e5) — the caller
+ * (`src/daemon/index.ts`) used to pass `zendeskTicketStaffing(rules, env,
+ * io)` directly as `applyProviderSwitch`'s own argument, so the switch
+ * (`src/rules/provider-enablement.ts`) was only ever consulted AFTER
+ * `zendeskTicketStaffing` had already run — including its own
+ * `loadZendeskAuth` token-file read, whenever an enabled rule and the risk
+ * acknowledgement were both present. A disabled provider must not read
+ * that credential at all. This wraps the same call with the switch
+ * checked FIRST: off, the real staffing function (and its credential
+ * read) is never invoked — a cheap rule-only filter stands in instead,
+ * naming the same affected rules `applyProviderSwitch`'s own disabled
+ * branch expects to report.
+ */
+export function zendeskTicketStaffingIfEnabled(rules: readonly Rule[], env: ZendeskAuthEnv, enabled: boolean, io?: ZendeskTokenFileIo): ZendeskTicketStaffing {
+  if (!enabled) return { run: false, rules: rules.filter((r) => r.enabled && r.resourceProvider === "zendesk-ticket"), reason: null };
+  return zendeskTicketStaffing(rules, env, io);
+}

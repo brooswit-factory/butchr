@@ -29,6 +29,7 @@
 import { constants as fsConstants } from "node:fs";
 import { stat } from "node:fs/promises";
 import { isAllowlistedSettingsKey } from "../settings/settings-file.js";
+import { PROVIDER_ENABLED_ENV_VAR } from "../rules/provider-enablement.js";
 
 export const SECRET_KEY_RE = /token|secret|password|key/i;
 
@@ -94,6 +95,19 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_PROJECT_ALLOWLIST", description: "Comma-separated Jira project keys the project tier is allowed to staff. Default empty (none staffed).", secret: false },
   { key: "BUTCHR_MAX_AGENTS", description: "Fixed cap on agents this daemon keeps resident at once.", secret: false },
   { key: "BUTCHR_RESTORED_RESUME", description: "Policy for which managed-session agents may resume after a restore: off, all, or a comma-separated list.", secret: false },
+  { key: "BUTCHR_ATLASSIAN_ENABLED", description: "Explicit kill switch for the whole Atlassian credential (jira-work/jira-idea/jira-project/confluence-page together). Default enabled.", secret: false },
+  // FACTORY-66 review round 2: one independent switch per registered
+  // provider — see `PROVIDER_ENABLED_ENV_VAR`'s own doc comment
+  // (`../rules/provider-enablement.ts`), the single source of truth for
+  // these exact names.
+  { key: PROVIDER_ENABLED_ENV_VAR["jira-work"], description: "Independent on/off switch for the jira-work rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["jira-idea"], description: "Independent on/off switch for the jira-idea rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["jira-project"], description: "Independent on/off switch for the jira-project rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["confluence-page"], description: "Independent on/off switch for the confluence-page rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["github-issue"], description: "Independent on/off switch for the github-issue rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["github-pr"], description: "Independent on/off switch for the github-pr rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR["zendesk-ticket"], description: "Independent on/off switch for the zendesk-ticket rule provider. Default enabled.", secret: false },
+  { key: PROVIDER_ENABLED_ENV_VAR.filesystem, description: "Independent on/off switch for the filesystem rule provider. Default enabled.", secret: false },
 ];
 
 /**

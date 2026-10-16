@@ -32,6 +32,7 @@
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { PROVIDER_ENABLED_ENV_VAR } from "../rules/provider-enablement.js";
 
 export type SettingsFileEnv = Record<string, string | undefined> & { XDG_CONFIG_HOME?: string | undefined; HOME?: string | undefined; BUTCHR_SETTINGS_FILE?: string | undefined };
 
@@ -44,7 +45,7 @@ export function settingsFilePath(env: SettingsFileEnv = process.env): string {
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,63}$/;
 
-export type AllowlistKind = "provider" | "providerOrder" | "model" | "positiveIntWithCeiling" | "positiveMsWithFloor";
+export type AllowlistKind = "provider" | "providerOrder" | "model" | "positiveIntWithCeiling" | "positiveMsWithFloor" | "boolean";
 
 export interface AllowlistKeyDef {
   key: string;
@@ -81,6 +82,13 @@ export const SETTINGS_ALLOWLIST: readonly AllowlistKeyDef[] = [
   { key: "BUTCHR_AGENT_PROVIDERS_TASK", kind: "providerOrder" },
   { key: "BUTCHR_AGENT_MODEL", kind: "model" },
   { key: "BUTCHR_POLL_STALE_MS", kind: "positiveMsWithFloor" },
+  // FACTORY-66 review round 2: one independent on/off switch per
+  // registered provider (`PROVIDER_ENABLED_ENV_VAR`,
+  // `../rules/provider-enablement.ts` — the single source of truth for
+  // these exact names) — persisted/validated through this SAME settings
+  // surface every other butchr toggle already uses, never a new ad hoc
+  // mechanism.
+  ...Object.values(PROVIDER_ENABLED_ENV_VAR).map((key) => ({ key, kind: "boolean" as const })),
 ];
 
 const ALLOWLIST_BY_KEY = new Map(SETTINGS_ALLOWLIST.map((d) => [d.key, d] as const));
@@ -140,6 +148,17 @@ export function validateSettingValue(key: string, rawValue: string, confirm = fa
       if (n < POLL_STALE_MS_FLOOR) return { ok: false, error: `${key}=${n} is below the floor (${POLL_STALE_MS_FLOOR}ms) — refusing a sub-second poll-staleness tolerance` };
       return { ok: true, normalized: String(n) };
     }
+    // FACTORY-66 review round 2: the per-provider switches. Deliberately
+    // strict here — exactly "true"/"false" — unlike the lenient
+    // "false"/"0"/"no"/"off" convention `parseProviderEnabledMap`
+    // (`../rules/provider-enablement.ts`) accepts for a hand-set env var:
+    // this is the WRITE/persisted-value path (a settings.json entry or a
+    // PUT /api/settings/:key body), where one canonical spelling avoids
+    // round-tripping "0" back out as "0" forever and reads unambiguously
+    // in the dashboard's settings UI.
+    case "boolean":
+      if (value !== "true" && value !== "false") return { ok: false, error: `${key} must be "true" or "false"` };
+      return { ok: true, normalized: value };
   }
 }
 

@@ -171,7 +171,7 @@ let restarted: { site: string; email: string; token: string } | null = null;
 let restartError: string | null = null;
 try {
   const cfg = loadConfig(effectiveEnv, (p) => readFileSync(p, "utf8"));
-  restarted = cfg.atlassian;
+  restarted = cfg.atlassian ?? null;
 } catch (e) {
   restartError = (e as Error).message;
 }

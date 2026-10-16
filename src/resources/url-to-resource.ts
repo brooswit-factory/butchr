@@ -101,9 +101,12 @@ export interface UrlToResourceDeps {
    * This daemon's own configured Jira site host (`Config.atlassian.site`'s
    * own host, e.g. `"acme.atlassian.net"`), LOWER-CASED by the caller — a
    * Jira URL on any other host, including a lookalike or another real
-   * Atlassian site, resolves to no resource.
+   * Atlassian site, resolves to no resource. `undefined` when this daemon
+   * has Atlassian disabled (FACTORY-66, `Config.atlassian`) — every Jira
+   * URL then resolves to no resource too, same as an unconfigured Zendesk
+   * subdomain below.
    */
-  jiraHost: string;
+  jiraHost?: string | undefined;
   /**
    * This daemon's own configured Zendesk subdomain (`ZENDESK_SUBDOMAIN`,
    * `zendesk-ticket.ts`), when Zendesk is configured at all — `undefined`
@@ -130,7 +133,7 @@ function jiraKeyCandidate(u: URL): string | null {
   return selected ?? null;
 }
 
-function resolveJiraWorkItem(u: URL, jiraHost: string): ResourceIdentity | null {
+function resolveJiraWorkItem(u: URL, jiraHost: string | undefined): ResourceIdentity | null {
   if (u.hostname !== jiraHost) return null;
   const candidate = jiraKeyCandidate(u);
   if (!candidate) return null;
@@ -149,7 +152,7 @@ function jiraProjectKeyCandidate(u: URL): string | null {
   return project ? project[1]! : null;
 }
 
-function resolveJiraProject(u: URL, jiraHost: string): ResourceIdentity | null {
+function resolveJiraProject(u: URL, jiraHost: string | undefined): ResourceIdentity | null {
   if (u.hostname !== jiraHost) return null;
   const candidate = jiraProjectKeyCandidate(u);
   if (!candidate) return null;
