@@ -145,6 +145,51 @@ describe("FACTORY-137 D2: coverage skip — a clean covered target is not fetche
     await state.runTick([m], deps); // skipped again
     expect(notified).toHaveLength(0); // never an "unreadable" notification
   });
+
+  test("AC1/C2 (review fix round 1): IDENTICAL before/after input through polling-only runTick and through push mode yields deep-equal notify payloads, and a clean covered target is confirmed not fetched by fetch count", async () => {
+    // Two fully independent instances/worlds — the only thing shared is the
+    // exact same owner shape and the exact same before -> after status
+    // change, driven through each path separately.
+    const buildOwnerAndWorld = (): { owner: JiraIssue; world: Record<string, JiraIssue> } => ({
+      owner: issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never }),
+      world: { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) },
+    });
+
+    // (i) TODAY'S POLLING-ONLY PATH: no `push` dep at all (pre-FACTORY-137 — every existing caller/test's own shape).
+    const pollState = createLinkedEventingState();
+    const { owner: pollOwner, world: pollWorld } = buildOwnerAndWorld();
+    const pollFixture = fakeDeps(pollWorld);
+    const pollMatch = match("jira-work:task:BUTCHR-1", rule(), pollOwner);
+    await pollState.runTick([pollMatch], pollFixture.deps); // seed
+    pollWorld["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
+    await pollState.runTick([pollMatch], pollFixture.deps); // polling always re-fetches and diffs
+
+    // (ii) PUSH MODE: mapped + provider enabled + client live -> the SAME before/after state, delivered via markDirty instead of a blind re-fetch.
+    const pushState = createLinkedEventingState();
+    const { owner: pushOwner, world: pushWorld } = buildOwnerAndWorld();
+    const { push } = fakePush();
+    const pushFixture = fakeDeps(pushWorld, { push });
+    const pushMatch = match("jira-work:task:BUTCHR-1", rule(), pushOwner);
+    await pushState.runTick([pushMatch], pushFixture.deps); // seed
+    pushState.markDirty("jira:BUTCHR-2");
+    pushWorld["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
+    await pushState.runTick([pushMatch], pushFixture.deps);
+
+    expect(pollFixture.notified).toHaveLength(1);
+    expect(pushFixture.notified).toHaveLength(1);
+    // The ticket's own goal statement: "a consumer of a change event cannot
+    // tell which mechanism produced it" — proven here by deep equality of
+    // the ACTUAL `deps.notify` payload, not a hand-copied literal.
+    expect(pushFixture.notified[0]!.reason).toEqual(pollFixture.notified[0]!.reason);
+    expect(pushFixture.notified[0]!.agent).toEqual(pollFixture.notified[0]!.agent);
+    expect(pushFixture.notified[0]!.about).toEqual(pollFixture.notified[0]!.about);
+
+    // AC1's own fetch-count requirement: with the push-mode target now clean
+    // again, the NEXT regular tick must perform NO additional fetch.
+    const searchCallsBeforeCleanTick = pushFixture.searchCalls.length;
+    await pushState.runTick([pushMatch], pushFixture.deps);
+    expect(pushFixture.searchCalls).toHaveLength(searchCallsBeforeCleanTick);
+  });
 });
 
 describe("FACTORY-137 D4: TTL authoritative refresh", () => {
@@ -411,5 +456,54 @@ describe("FACTORY-137 T3/T4: dirty generation and rate-cap interaction", () => {
     // identical mark/pass cycle must not throw or accumulate observable state.
     state.markDirty("jira:NOBODY-1");
     await state.runDirtyPass();
+  });
+
+  test("T10 (review fix round 1): a regular tick and an on-demand pass held concurrently, racing over the SAME real change, produce exactly one notification", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { push } = fakePush();
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    // Seed with ordinary (non-gated) deps.
+    const seed = fakeDeps(world, { push });
+    await state.runTick([m], seed.deps);
+
+    // A controllable gate on the search call, so a regular `runTick` can be
+    // held mid-fetch while `runDirtyPass()` is invoked "concurrently" —
+    // `serialize()` (this module's own promise-chain mutex) must make the
+    // on-demand pass wait for the in-flight tick rather than run alongside it.
+    let gate: Promise<void> | undefined;
+    let releaseGate: (() => void) | undefined;
+    const notified: NotifyReason[] = [];
+    const searchCalls: string[] = [];
+    const racingDeps: LinkedEventingDeps = {
+      search: async (jql) => {
+        searchCalls.push(jql);
+        if (gate) await gate;
+        const mm = /^key in \((.*)\)$/.exec(jql);
+        const keys = mm ? mm[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (_a, _b, reason) => { notified.push(reason); },
+      push,
+    };
+
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" }); // the ONE real change
+    state.markDirty("jira:BUTCHR-2");
+
+    gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    const tickPromise = state.runTick([m], racingDeps); // regular tick starts, blocks mid-fetch (dirty -> it's in the restrict set already)
+    await Promise.resolve();
+    await Promise.resolve(); // let it reach the gated search call
+
+    const dirtyPassPromise = state.runDirtyPass(); // attempted WHILE the tick is still in flight
+    releaseGate?.();
+    gate = undefined;
+    await tickPromise;
+    await dirtyPassPromise;
+
+    expect(notified).toHaveLength(1); // exactly one notify for the one real change, despite the overlap attempt
+    expect(searchCalls).toHaveLength(1); // the on-demand pass found nothing dirty left once serialized behind the tick -> no second fetch
   });
 });

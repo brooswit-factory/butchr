@@ -118,6 +118,63 @@ describe("createCatamorbiusPushController: coverage", () => {
     expect(controller.coverage.isProviderEnabled("jira")).toBe(true);
     expect(controller.coverage.isProviderEnabled("github")).toBe(true);
   });
+
+  test("review fix: an initial connection failure (connecting -> reconnecting, having NEVER been live) never counts as covered", () => {
+    // The real client's own `scheduleReconnect` sets state "reconnecting"
+    // unconditionally — including right after the FIRST connection attempt
+    // ever fails (see client.ts's own `connectOnce`: `catch { ...
+    // scheduleReconnect(myGen); }` runs before `everLive` is ever set). A
+    // gateway that has never once answered must NOT grant grace coverage to
+    // an already-seeded target — D2(3)/D5 both require "has been live at
+    // least once in this process" before `reconnecting` can count.
+    const { client, setState } = fakeClient();
+    const clock = fakeClock();
+    const controller = createCatamorbiusPushController(config, { createClient: () => client, clientDeps: { fetch: (() => {}) as never, ...clock } });
+    controller.start();
+    setState("connecting");
+    setState("reconnecting"); // never passed through "live" first
+    expect(controller.coverage.isCoveringNow()).toBe(false);
+    clock.advance(1_000); // well within the 60s grace window — must still be false
+    expect(controller.coverage.isCoveringNow()).toBe(false);
+    expect(controller.stats().degrades).toBe(0); // nothing to degrade FROM — it was never covering
+  });
+
+  test("review fix: once live, a later reconnect still gets grace coverage (the fix is scoped to BEFORE first-live, not a general grace removal)", () => {
+    const { client, setState } = fakeClient();
+    const clock = fakeClock();
+    const controller = createCatamorbiusPushController(config, { createClient: () => client, clientDeps: { fetch: (() => {}) as never, ...clock } });
+    controller.start();
+    setState("live");
+    setState("reconnecting");
+    expect(controller.coverage.isCoveringNow()).toBe(true); // within grace, same as the existing "covering once live" test
+  });
+});
+
+describe("createCatamorbiusPushController: onEvent handler isolation (review fix)", () => {
+  test("a throwing consumer's markDirty is caught, logged, and counted — other consumers still get marked, the process never crashes", async () => {
+    const { client, setState, emitEvent } = fakeClient();
+    const clock = fakeClock();
+    const logs: string[] = [];
+    const controller = createCatamorbiusPushController(config, { createClient: () => client, clientDeps: { fetch: (() => {}) as never, ...clock }, log: (l) => logs.push(l) });
+    controller.start();
+    setState("live");
+    const throwing: PushConsumer = {
+      markDirty: () => { throw new Error("boom"); },
+      requestResync: () => {},
+      runDirtyPass: async () => {},
+    };
+    const healthy = fakeConsumer();
+    controller.registerConsumer(throwing);
+    controller.registerConsumer(healthy);
+    // markDirty is called in registration order (a Set preserves insertion
+    // order) — `throwing` is marked first and throws, so without the fix
+    // `healthy` would never even be reached.
+    expect(() => emitEvent({ seq: 1, event: { id: "e1", source: "//jira/site", subject: "KAN-5" } })).not.toThrow();
+    await Promise.resolve();
+    expect(controller.stats().handlerErrors).toBe(1);
+    expect(logs.some((l) => l.includes("markDirty threw"))).toBe(true);
+    expect(healthy.dirtyMarks).toEqual(["jira:KAN-5"]); // isolated — the other consumer still got it
+  });
 });
 
 describe("createCatamorbiusPushController: dirty/resync broadcast", () => {

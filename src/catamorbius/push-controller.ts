@@ -33,6 +33,8 @@ export interface CatamorbiusPushStats {
   deduped: number;
   degrades: number;
   resyncs: number;
+  /** Review fix (PR #790, round 1): the client's own `notify()` helper (client.ts) swallows ANY throwing listener with no error sink — "a bug in your onEvent handler will be silent" is the ticket's own pre-start correction (item B2's closing note). Without this counter + the log in `client.onEvent` below, a bug here would drop a notification with zero observable trace. */
+  handlerErrors: number;
 }
 
 /** The read-only, per-tick query surface `LinkedEventingDeps.push` (src/jira-watch/linked-eventing.ts) is typed against — deliberately NOTHING mutable here; dirty/resync delivery is push (via `registerConsumer`), not pull. */
@@ -119,7 +121,7 @@ export function createCatamorbiusPushController(config: CatamorbiusFullConfig, d
   const recentIds = createRecentIdSet(RECENT_EVENT_ID_CAPACITY);
   let lastSeqSeen: number | null = null;
 
-  const stats: CatamorbiusPushStats = { notificationsReceived: 0, unmapped: 0, deduped: 0, degrades: 0, resyncs: 0 };
+  const stats: CatamorbiusPushStats = { notificationsReceived: 0, unmapped: 0, deduped: 0, degrades: 0, resyncs: 0, handlerErrors: 0 };
 
   let everLiveInProcess = false;
   let graceDeadline: number | null = null; // set on entering "reconnecting"; cleared on "live" or on any terminal/idle state
@@ -133,7 +135,22 @@ export function createCatamorbiusPushController(config: CatamorbiusFullConfig, d
     }
   }
 
+  /**
+   * Review fix (PR #790, round 1): D2(3)/D5 both require "has been live at
+   * least once in this process" BEFORE a `reconnecting` state can count as
+   * covered — "Before the first live connection... targets are uncovered
+   * immediately (no grace)" (D5's own text). The client's own state machine
+   * does not honor that distinction: `scheduleReconnect` sets `reconnecting`
+   * unconditionally, including after the FIRST connection attempt ever
+   * fails (gateway unreachable at startup) — see client.ts's own
+   * `connectOnce`/`scheduleReconnect`. Without the `everLiveInProcess` gate
+   * below, a gateway that has never once answered would still grant grace
+   * coverage to every already-seeded (baselined) target, silently
+   * suppressing their normal polling fetches even though push has NEVER
+   * actually worked this process.
+   */
   function isCoveringNow(): boolean {
+    if (!everLiveInProcess) return false;
     const state = client.state;
     if (state === "live") return true;
     if (state === "reconnecting") return graceDeadline !== null && deps.clientDeps.now() < graceDeadline;
@@ -193,36 +210,67 @@ export function createCatamorbiusPushController(config: CatamorbiusFullConfig, d
     broadcastResync();
   });
 
+  // Review fix (PR #790, round 1): the client's own `notify()` helper
+  // (client.ts) isolates each listener with a bare `try { l(arg) } catch {}`
+  // — ANY throw in here (a bug in `watchKeysForEvent`, in the dedupe/mapping
+  // logic below) is swallowed with ZERO trace, silently dropping the
+  // notification it was handling. The pre-start correction's own closing
+  // note calls this out explicitly: "Log inside your own handler and count
+  // it in stats()." This outer try/catch, and `handlerErrors` above, are
+  // that log/count — never rethrown (rethrowing here would just hand the
+  // exception back to the client's swallow-and-ignore `notify`, gaining
+  // nothing). Each consumer's own `markDirty` call is ADDITIONALLY isolated
+  // individually below, so one bad consumer doesn't cost every OTHER
+  // registered consumer this same event too.
   client.onEvent(({ seq, event }) => {
-    stats.notificationsReceived += 1;
-    if (lastSeqSeen !== null && seq <= lastSeqSeen) {
-      stats.deduped += 1;
-      return;
-    }
-    lastSeqSeen = seq;
-    if (!isCatamorbiusCloudEvent(event)) {
-      stats.unmapped += 1;
-      return;
-    }
-    const id = typeof event.id === "string" ? event.id : undefined;
-    if (id !== undefined) {
-      if (recentIds.has(id)) {
+    try {
+      stats.notificationsReceived += 1;
+      if (lastSeqSeen !== null && seq <= lastSeqSeen) {
         stats.deduped += 1;
         return;
       }
-      recentIds.add(id);
+      lastSeqSeen = seq;
+      if (!isCatamorbiusCloudEvent(event)) {
+        stats.unmapped += 1;
+        return;
+      }
+      const id = typeof event.id === "string" ? event.id : undefined;
+      if (id !== undefined) {
+        if (recentIds.has(id)) {
+          stats.deduped += 1;
+          return;
+        }
+        recentIds.add(id);
+      }
+      const keys = watchKeysForEvent(event);
+      if (keys.length === 0) {
+        stats.unmapped += 1;
+        return;
+      }
+      // Each consumer's own `markDirty` is isolated individually (not just
+      // by the outer try/catch) — same reasoning as the client's own
+      // per-listener isolation (client.ts's `notify` helper): one
+      // misbehaving consumer must not cost every OTHER registered consumer
+      // this same event too.
+      for (const key of keys) {
+        for (const c of consumers) {
+          try {
+            c.markDirty(key);
+          } catch (e) {
+            stats.handlerErrors += 1;
+            log(`  WARNING: [catamorbius] a consumer's markDirty threw, that consumer's notification lost: ${(e as Error)?.message ?? e}`);
+          }
+        }
+      }
+      // D3/D6: debounce lives per-consumer (each `LinkedEventingState`'s own
+      // `runDirtyPass` schedules itself) — see linked-eventing.ts's own
+      // `markDirty` doc comment for why this controller does not also
+      // maintain a second, redundant debounce timer here.
+      for (const c of consumers) void c.runDirtyPass().catch((e) => log(`  WARNING: [catamorbius] on-demand pass threw: ${(e as Error)?.message ?? e}`));
+    } catch (e) {
+      stats.handlerErrors += 1;
+      log(`  WARNING: [catamorbius] onEvent handler threw, notification lost: ${(e as Error)?.message ?? e}`);
     }
-    const keys = watchKeysForEvent(event);
-    if (keys.length === 0) {
-      stats.unmapped += 1;
-      return;
-    }
-    for (const key of keys) for (const c of consumers) c.markDirty(key);
-    // D3/D6: debounce lives per-consumer (each `LinkedEventingState`'s own
-    // `runDirtyPass` schedules itself) — see linked-eventing.ts's own
-    // `markDirty` doc comment for why this controller does not also
-    // maintain a second, redundant debounce timer here.
-    for (const c of consumers) void c.runDirtyPass().catch((e) => log(`  WARNING: [catamorbius] on-demand pass threw: ${(e as Error)?.message ?? e}`));
   });
 
   return {
