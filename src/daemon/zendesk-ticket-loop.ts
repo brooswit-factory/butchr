@@ -43,10 +43,6 @@ export interface ZendeskTicketLoopDeps {
   /** Deliver one message to one agent (channel push and pane prompt). */
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
   suppress?: (resource: string, updated: string, watcher: string) => boolean;
-  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  onAdmitted?: (succeeded: readonly string[]) => void;
-  reserveAdmission?: (ids: readonly string[]) => void;
-  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment (src/daemon/loop.ts) — threaded straight through. Optional; omitted, no account lifecycle runs. */
   account?: AccountLifecycleHooks;
@@ -87,10 +83,6 @@ export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
       await deps.deliver(agent, resource, zendeskTicketNudge(resource, reason));
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
-    ...(deps.admission ? { admission: deps.admission } : {}),
-    ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
-    ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
-    ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     ...(deps.account ? { account: deps.account } : {}),
     log: deps.log,

@@ -103,7 +103,7 @@ export interface SpawnSpec {
    *    agent id by assuming the fixed `workspaceDirFor` 1-or-3-deep shape.
    *    A pane at an ARBITRARY operator directory returns `null` there — it
    *    would be permanently invisible to `runningIssues()`, which EVERY
-   *    reconciliation call (`scopedHerd`, admission residency, the
+   *    reconciliation call (`scopedHerd`, the residency guard, the
    *    daemon's own no-double-owner guarantee) is built on. This is core,
    *    heavily-shared daemon machinery every other provider also depends
    *    on — not something to patch around under review pressure.
@@ -658,7 +658,7 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot(), p
  * this ticket, via the second (segment-decode) branch — the whole reason
  * `workspaceDirFor` above leaves an unmigrated workspace at its OLD path
  * rather than silently expecting it at the new one. Legacy ids are still
- * reported so legacy agents stay visible (dashboard, admission census); the
+ * reported so legacy agents stay visible (dashboard, residency census); the
  * rule loop's `ownsId` is what keeps it from ever stopping or adopting
  * them.
  */

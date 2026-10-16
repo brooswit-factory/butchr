@@ -133,7 +133,7 @@ export interface AccountLifecycleHooks {
 
 export interface AccountLifecycleDeps {
   manager: AccountManager;
-  /** This agent id's rule's account policy. `"none"` for anything unrecognised (a legacy/bare id, or a rule since removed) — same fail-safe discipline as `AdmissionControllerDeps.roleOf` (src/agents/admission.ts): an id this daemon cannot identify must never provision an account for itself. */
+  /** This agent id's rule's account policy. `"none"` for anything unrecognised (a legacy/bare id, or a rule since removed) — an id this daemon cannot identify must never provision an account for itself. */
   policyOf: (id: string) => AccountPolicy;
   /** Writes the batched (account name, token file path) manifest Nexus reads to register accounts with rocketr — `../accounts/nexus-manifest.ts`. */
   manifestPublisher: NexusManifestPublisher;

@@ -55,10 +55,6 @@ export interface ManagedSessionsLoopDeps {
   exists?: (path: string) => Promise<boolean>;
   herd: Herd;
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
-  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  onAdmitted?: (succeeded: readonly string[]) => void;
-  reserveAdmission?: (ids: readonly string[]) => void;
-  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   /**
    * FACTORY-47: same seam as `ReconcileOptions.checkCrashLoop`/
@@ -179,10 +175,6 @@ export function startManagedSessionsLoop(deps: ManagedSessionsLoopDeps): Stop {
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
     ...(account ? { account } : {}),
-    ...(deps.admission ? { admission: deps.admission } : {}),
-    ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
-    ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
-    ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     ...(deps.checkCrashLoop ? { checkCrashLoop: deps.checkCrashLoop } : {}),
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),

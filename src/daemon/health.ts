@@ -228,7 +228,7 @@ export interface HealthStatus {
    * ticking fine; the retained snapshot means the diff simply re-fires on a
    * later poll, no change lost. Monotonically increasing for the daemon's
    * lifetime (never reset), same convention as every other lifetime count
-   * in this codebase (e.g. `AdmissionSnapshot`'s own counters) — a consumer
+   * in this codebase — a consumer
    * graphing this over time watches its RATE, not its absolute value.
    * Absent entirely when the caller doesn't pass one to `combineHealth`
    * (e.g. every existing test fixture in this file's own test suite,

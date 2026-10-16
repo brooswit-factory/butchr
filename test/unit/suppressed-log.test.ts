@@ -11,7 +11,7 @@ import { OUTCOME_TAG } from "../../src/tools/outcome.js";
 /**
  * BUTCHR-350 (§3A/§3B, AC2): `[notify-suppressed]` is a brand-new tag — no
  * prior line ever carried it, so there is no OLD format to stay
- * bidirectionally distinct from (unlike `[tools2]`/`[admission2]`'s own
+ * bidirectionally distinct from (unlike `[tools2]`'s own
  * BUTCHR-343 history). What AC2 still demands here: the reader must be
  * anchored to the line's own start (tolerating only a genuine `journalctl`
  * transport prefix), must be pinned against the REAL emitter's output (not

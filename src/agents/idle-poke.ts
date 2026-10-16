@@ -109,7 +109,7 @@ import { RateCap, HOUR_MS, type CommentRow } from "./escalation-helper.js";
  * GUARD 5 (`enabled: false`) and THE FIRST-ENABLE BURST (a fleet-wide
  * per-poll cap, `maxPokesPerPoll`) and DRY-RUN are all handled in `check`
  * below — see each guard's own inline comment for the reasoning, and this
- * story's PR body for the sizing argument against the admission-cap figure
+ * story's PR body for the sizing argument against the then-current cap figure
  * (FACTORY-845's ticket comment 32xxx) and the dry-run-default argument.
  */
 
@@ -162,7 +162,7 @@ export interface IdlePokeDeps {
    * unpredicted burst (not just a cold start), at the cost of delaying some
    * legitimate pokes when the cap is hit — see this story's PR body for
    * the full trade argument and the sizing against the measured ~23-of-24
-   * admission-cap resident population.
+   * resident population at the time.
    */
   maxPokesPerPoll: number;
   comments: (issue: string) => Promise<readonly CommentRow[]>;

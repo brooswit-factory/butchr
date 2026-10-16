@@ -694,7 +694,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // `herd.resumeInPlace()` FIRST, entirely OUTSIDE the RespawnGuard/stop/
     // spawn machinery below — a "deferred"/"stuck" outcome is not a respawn
     // ATTEMPT at all (nothing was stopped, nothing was spawned), so it must
-    // never consume a guard admission slot or trip the "respawned again
+    // never consume a RespawnGuard slot or trip the "respawned again
     // within N polls" suppression warning; only "unresumable" falls through
     // to today's stop-then-fresh-spawn path, with `reason` overridden to an
     // honest, distinct explanation.
@@ -730,7 +730,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
           const count = resumeDeferGuard.count(issue);
           if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
         }
-        continue; // no stop, no spawn, no guard admission — retried next poll
+        continue; // no stop, no spawn, no RespawnGuard slot consumed — retried next poll
       }
       resumeDeferGuard.clear(issue); // no-op for a restored-pane issue, which never populates this guard
       if (outcome === "resumed") {

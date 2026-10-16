@@ -14,7 +14,7 @@ import { mapAgentStatus } from "../labels/plan.js";
  * doc/PART 1 for the full derivation of why every OTHER detector on
  * `ReconcileOptions` structurally cannot see this shape (`checkFrozenAsleep`/
  * `checkDeclaredDone` only ever see `atRest`, which an `"active"` verdict is
- * never a member of; `checkCrashLoop`/`admission` only ever see spawn
+ * never a member of; `checkCrashLoop` only ever sees spawn
  * candidates; `checkReconcileFailure` only ever sees a rejected operation;
  * `checkReap` only ever sees ids with NO agent).
  *

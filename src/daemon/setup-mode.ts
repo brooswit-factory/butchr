@@ -86,7 +86,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     open: unused,
     openPane: unused,
     health: () => ({ ok: false, components: [], setupMode: true } as HealthStatus & { setupMode: true }), // 503 on purpose: not a working daemon yet
-    dashboard: async () => ({ checked: false, declinedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
+    dashboard: async () => ({ checked: false, declinedAt: new Date().toISOString(), rows: [] }),
     header: () => ({ build: null }),
     resourceLink: async () => ({ ok: false, error: "not configured (setup mode)" }),
     configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),

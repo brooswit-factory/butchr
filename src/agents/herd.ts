@@ -534,17 +534,18 @@ export function restoredResumeEnabledFor(policy: RestoredResumePolicy, agentName
  * rule is unaffected by anything below.
  *
  * BUTCHR-334 — THE CROSS-INSTRUMENT RULE, WITH ITS RESPAWN TERM: comparing
- * this tag's count against `[admission2]`'s own `admitted=` field (BUTCHR-320
- * falsifier 2) is a DIFFERENT, narrower claim than the bare rule above, and
- * "attempts == admitted" is FALSE on any poll containing a respawn.
+ * this tag's count against the poll's own spawn-candidate count is a
+ * DIFFERENT, narrower claim than the bare rule above, and
+ * "attempts == candidates" is FALSE on any poll containing a respawn.
  * `herd.spawn()` is called from TWO places in `reconcileNow`
- * (src/daemon/loop.ts): the ordinary plan-spawn loop, whose candidates ARE
- * admission-controlled, and the respawn loop, which is NOT —
- * `ReconcileOptions.admission`'s own doc comment says so explicitly:
- * "`plan.stop`/`plan.respawn` are never touched: only the spawn candidate
- * list is admission-controlled." The TRUE rule, for one poll:
+ * (src/daemon/loop.ts): the ordinary plan-spawn loop, and the respawn loop,
+ * which is a separate code path (`plan.respawn`, never `plan.spawn`).
+ * (FACTORY-1013 removed the `[admission2]` line this rule was originally
+ * written against, along with the capacity admission system that emitted it;
+ * the arithmetic below is the same rule stated against `plan.spawn` itself.)
+ * The TRUE rule, for one poll:
  *
- *   attempts under [spawn]  ==  admitted from [admission2]'s `admitted=`
+ *   attempts under [spawn]  ==  this poll's own plan.spawn candidates
  *                              +  respawn attempts this same poll
  *
  * Every outcome line under this tag now carries `origin=spawn` or
@@ -713,7 +714,7 @@ export class HerdrHerd implements Herd {
      * BUTCHR-320: emits exactly one `SPAWN_TAG` outcome line per `spawn()`
      * call — see that method's own doc comment. Optional, following this
      * codebase's existing `log?: (line: string) => void` convention (e.g.
-     * `AdmissionControllerDeps`, `ReconcileFailureDetectorDeps`); omitted,
+     * `ReconcileFailureDetectorDeps`); omitted,
      * spawn attempts are simply never logged (every caller/test before this
      * ticket).
      */
@@ -1162,7 +1163,7 @@ export class HerdrHerd implements Herd {
    * SAME tag, and the cross-instrument check (falsifier 2) counts all three
    * outcomes as "attempts". Re-derived at this commit: BUTCHR-287's own
    * residency guard (residency-guard.ts) filters an already-resident
-   * candidate out of `plan.spawn` BEFORE admission — but it consults a
+   * candidate out of `plan.spawn` BEFORE the spawn loop — but it consults a
    * DIFFERENT signal (a live process in the issue's own workspace directory)
    * than this check (`byIssue()`, i.e. `agent.list()`), and `plan.spawn`
    * itself is computed from an `agent.list()` snapshot taken once at the top
@@ -1223,10 +1224,10 @@ export class HerdrHerd implements Herd {
       // the try now, not before it. `byIssue()` is `agent.list()` with no
       // error handling of its own, and it is the THIRD OR LATER
       // `agent.list()` call of the poll (after `reconcileNow`'s own snapshot
-      // and admission's `residency()` read), so a transient herdr hiccup
+      // and the residency guard's own census), so a transient herdr hiccup
       // reaching exactly here — a first-class expected event in this
       // codebase, see `staleIssues()`'s own "herdr hiccup / pane gone —
-      // unknown, not stale" and `MAX_IMPLAUSIBLE_POLLS`'s own doc comment —
+      // unknown, not stale" —
       // used to reject `spawn()` having emitted NO line at all: a silent
       // failure surviving inside the very fix for silent failures. `return`
       // still exits the no-op path before the `catch` below, so the three
@@ -2309,9 +2310,8 @@ export class HerdrHerd implements Herd {
    * (a whole-herd sweep, via `groupOwnedPanes` rather than `panesFor` —
    * residency-census.ts), built on the exact same primitives as
    * `residency()`. Exposed so a future consumer needing only "which issues
-   * are alive right now" (e.g. BUTCHR-284's admission cap, whose own
-   * `residency` dependency is already shaped `() => Promise<readonly
-   * string[]>`) can point at it with a one-line change — NOT wired to
+   * are alive right now" (shaped `() => Promise<readonly string[]>`) can
+   * point at it with a one-line change — NOT wired to
    * anything in this ticket; that wiring is a deliberate follow-up owned
    * elsewhere (see this ticket's own report for why).
    *

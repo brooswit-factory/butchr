@@ -6,7 +6,7 @@ const TAG = "[residency]";
 
 /**
  * BUTCHR-287: how many consecutive suspicious-and-unknown polls a candidate
- * is withheld before this guard gives up and spawns it anyway. See
+ * is skipped before this guard gives up and spawns it anyway. See
  * `filter`'s own doc comment for why an unbounded withhold here would be
  * its own liveness hazard — same "must never freeze the fleet forever"
  * rule the ticket states for this whole guard. Not persisted (this
@@ -47,7 +47,7 @@ export interface ResidencyGuard {
    * one for no real benefit, only accidental coupling.
    *
    * Returns the subset of `spawning` to ACTUALLY hand to `herd.spawn` this
-   * poll. A withheld id is skipped THIS POLL ONLY — it is never removed
+   * poll. A skipped id is held back THIS POLL ONLY — it is never removed
    * from `desired`, so `planReconcile` offers it again next poll exactly
    * as before (design note 3 / the BUTCHR-218 liveness trap this ticket's
    * own DoD names explicitly: a guard that achieves safety by shrinking
@@ -64,7 +64,7 @@ export function createResidencyGuard(deps: ResidencyGuardDeps): ResidencyGuard {
 
   async function filter(spawning: readonly string[], desired: readonly string[]): Promise<readonly string[]> {
     // PRUNE FIRST (review finding, PR #310): every tracked id that is NOT a
-    // candidate this poll. Without this, an id withheld at streak 1..N-1 that
+    // candidate this poll. Without this, an id skipped at streak 1..N-1 that
     // then leaves `desired` — its ticket finished, or it was spawned — keeps a
     // stale entry forever, and if that key ever returns during a later
     // fleet-wide-unknown episode it resumes from the stale count and decays
@@ -79,7 +79,7 @@ export function createResidencyGuard(deps: ResidencyGuardDeps): ResidencyGuard {
     // its own top comment explains why pruning on plan.spawn absence would
     // silently reset its counter and disable the alarm). The difference is
     // what each counter means: this streak counts CONSECUTIVE polls in which
-    // this candidate was withheld as unknown-under-suspicion, and a withheld
+    // this candidate was skipped as unknown-under-suspicion, and a skipped
     // candidate necessarily reappears in the next poll's `plan.spawn` (it was
     // never spawned, and `desired` is never shrunk — see `filter`'s own doc
     // comment). So absence from `spawning` means the run genuinely ended:

@@ -30,7 +30,7 @@ import type { CurrencyVerdict } from "../agents/build-currency.js";
  * actually lands after the interval has elapsed, at most once per interval —
  * which is the acceptance criterion, with no extra timer plumbing. So
  * `snapshot()` is synchronous, like `CoverageTracker.snapshot` and
- * `AdmissionController.snapshot`, and it cannot hang for a reason it does
+ * `CoverageTracker.snapshot`, and it cannot hang for a reason it does
  * not already have: it inherits `computeBuildCurrency`'s own bound rather
  * than inventing a second one.
  *

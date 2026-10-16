@@ -3,7 +3,7 @@
  * (`<workspace root>/<ISSUE>`) are still live.
  *
  * No rule loop owns such an agent (`ownsId` never matches a bare issue key),
- * so none can stop or respawn it, yet the admission census counts every
+ * so none can stop or respawn it, yet the host still carries every
  * resident pane. Running beside them would
  * silently shrink or oversubscribe the cap. Adopting them would rewrite their
  * identity. So the daemon names them and exits; the operator stops them.

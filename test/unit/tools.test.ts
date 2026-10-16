@@ -2651,10 +2651,10 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
 
 // BUTCHR-336: backstop for the MECHANISM sentence — a lightweight guard so
 // deleting the sentence from a tool description also fails something, not
-// just the reader's trust. The REAL pin is the ordering behaviour itself,
-// in test/unit/admission.test.ts's "priority is not an admission-order
-// input" describe block; this only proves the boss-facing prose is present,
-// not that the mechanism it describes is true.
+// just the reader's trust. The REAL pin is the ordering behaviour itself —
+// nothing in the reconcile path reads a Jira priority at all; this only
+// proves the boss-facing prose is present, not that the mechanism it
+// describes is true.
 describe("BUTCHR-336: every boss-facing priority surface states the staffing-order mechanism", () => {
   const MECHANISM_CLAUSE = "priority is not read by reconcile, so it does not change which ticket is staffed first";
 
@@ -2667,9 +2667,9 @@ describe("BUTCHR-336: every boss-facing priority surface states the staffing-ord
 });
 
 // Every brief teaching the current priority operation must explain its actual
-// admission effect. Derive from the advertised verb, independent of caller role.
+// staffing-order effect. Derive from the advertised verb, independent of caller role.
 // Collapse whitespace because shipped briefs may hard-wrap the mechanism.
-describe("BUTCHR-299: every brief teaching explicit priority changes states the admission mechanism", () => {
+describe("BUTCHR-299: every brief teaching explicit priority changes states the staffing-order mechanism", () => {
   const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
   const GUIDANCE = "`jira_set_priority`";
   const MECHANISM_CLAUSE = "priority is not read by reconcile, so it does not change which ticket is staffed first";

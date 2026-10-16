@@ -110,7 +110,7 @@ export async function agentSnapshot(deps: AgentWriteDeps, issue: string): Promis
   };
 }
 
-/** `start_worker`'s own effect (status -> In Progress), called under the worker's OWN current boss — never destructive (nothing stops or changes irreversibly), so no confirm step. Where the operator sees this take effect: the Jira transition is immediate, but admission into a RUNNING agent still goes through the daemon's own capacity-capped reconcile poll — see this route's own "takes effect after the next poll" UI note (`src/web/view.ts`). */
+/** `start_worker`'s own effect (status -> In Progress), called under the worker's OWN current boss — never destructive (nothing stops or changes irreversibly), so no confirm step. Where the operator sees this take effect: the Jira transition is immediate, but a RUNNING agent still has to be started by the daemon's own next reconcile poll — see this route's own "takes effect after the next poll" UI note (`src/web/view.ts`). */
 export async function doAgentStart(deps: AgentWriteDeps, issue: string): Promise<AgentWriteOutcome> {
   const boss = await resolveCallerBoss(deps, issue);
   if (!boss.ok) return boss;

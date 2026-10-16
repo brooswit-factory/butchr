@@ -35,10 +35,6 @@ export interface ConfluencePageLoopDeps {
   herd: Herd;
   /** Deliver one message to one agent (channel push and pane prompt). */
   deliver: (agent: string, resource: string, message: string) => Promise<void>;
-  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  onAdmitted?: (succeeded: readonly string[]) => void;
-  reserveAdmission?: (ids: readonly string[]) => void;
-  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
   log: (line: string) => void;
   intervalMs?: number;
@@ -82,10 +78,6 @@ export function startConfluencePageLoop(deps: ConfluencePageLoopDeps): Stop {
       await deps.deliver(agent, resource, confluencePageNudge(resource, reason));
     },
     onRespawn: (agent, reason) => deps.log(`[reconcile] ${agent} respawned: ${reason}`),
-    ...(deps.admission ? { admission: deps.admission } : {}),
-    ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
-    ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
-    ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? CONFLUENCE_PAGE_POLL_MS,

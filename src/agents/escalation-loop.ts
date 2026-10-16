@@ -329,7 +329,7 @@ export interface Escalator {
    * FACTORY-45: every managed-session pane CURRENTLY marked stalled — an
    * escalated (logged), not-yet-resolved dialog on a keyless managed-session
    * pane. Read by `src/daemon/index.ts`'s `/health` wiring (a sibling field,
-   * same "additive, never flips `ok`" pattern `admission`/`coverage` already
+   * same "additive, never flips `ok`" pattern `coverage` already
    * use — see src/daemon/health.ts) so an operator has a status SURFACE to
    * find a blocked managed session on, not only the journal line. A pure
    * snapshot of this instance's own in-memory tracking; empty when nothing

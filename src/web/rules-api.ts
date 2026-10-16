@@ -8,7 +8,7 @@
  * entry `/configurations` already computes (`buildQueryAgentInventory`),
  * never a second staffing decision.
  *
- * SPEC CHANGE (a), agentsafety review 2026-10-05: no `title`/`maxAgents`
+ * SPEC CHANGE (a), agentsafety review 2026-10-05: no `title`/`maxAgents`-style
  * field — neither exists on `Rule`. The real fields are `execution`,
  * `account`, `agentPreferences`, `linkedEventing`, `mcpServerNames`
  * — copied verbatim from `RuleInventoryEntry`, never invented.
