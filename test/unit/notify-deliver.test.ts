@@ -164,3 +164,166 @@ describe("renderNotifyDelivery: acceptance F — the three distinguishable [noti
     );
   });
 });
+
+/**
+ * FACTORY-1010 — the per-rule explicit delivery choice (`deps.mode`). Every
+ * test above passes NO `mode` at all and must keep passing byte-for-byte
+ * (that is the acceptance criterion "omitted preserves current behaviour
+ * exactly") — these tests exercise the two NEW explicit branches only.
+ */
+describe("deliverNotice: FACTORY-1010 — mode: \"prompt\" sends ONLY the prompt, never touching the channel", () => {
+  test("never calls pushChannel at all, even when it would have succeeded", async () => {
+    let pushCalls = 0;
+    const result = await deliverNotice({
+      pushChannel: async () => { pushCalls++; return ok(["conn-1"]); },
+      nudgePrompt: async () => ({ delivered: true }),
+      mode: "prompt",
+    });
+    expect(pushCalls).toBe(0);
+    expect(result).toEqual({ via: "prompt", delivered: true });
+  });
+
+  test("delivered: false, with no fallbackReason — it never tried the channel to have a reason about", async () => {
+    const result = await deliverNotice({
+      pushChannel: async () => { throw new Error("must never be called"); },
+      nudgePrompt: async () => ({ delivered: false }),
+      mode: "prompt",
+    });
+    expect(result).toEqual({ via: "prompt", delivered: false });
+    expect("fallbackReason" in result).toBe(false);
+  });
+
+  test("nudgePrompt rejecting is treated as not-delivered, never throws out of the gate", async () => {
+    const result = await deliverNotice({
+      pushChannel: async () => { throw new Error("must never be called"); },
+      nudgePrompt: async () => { throw new Error("pane gone"); },
+      mode: "prompt",
+    });
+    expect(result).toEqual({ via: "prompt", delivered: false });
+  });
+
+  test("carries a session-limit refusal through, same as the default fallback path", () => {
+    const refusal: NonNullable<NudgeResult["refusal"]> = { resetsAt: 1_700_000_000_000, raw: "5-hour limit reached ∙ resets 3am" };
+    return deliverNotice({
+      pushChannel: async () => { throw new Error("must never be called"); },
+      nudgePrompt: async () => ({ delivered: true, refusal }),
+      mode: "prompt",
+    }).then((result) => {
+      expect(result).toEqual({ via: "prompt", delivered: true, refusal });
+    });
+  });
+});
+
+describe("deliverNotice: FACTORY-1010 — mode: \"channel\" sends ONLY the channel, never falling back to the prompt", () => {
+  test("a successful channel push delivers, DISTINGUISHABLY from the default/omitted-mode success — `explicit: true` names that this was a configured choice, not just the channel happening to be tried first", async () => {
+    let nudgeCalls = 0;
+    const result = await deliverNotice({
+      pushChannel: async () => ok(["conn-1"]),
+      nudgePrompt: async () => { nudgeCalls++; return { delivered: true }; },
+      mode: "channel",
+    });
+    expect(result).toEqual({ via: "channel", explicit: true });
+    expect(nudgeCalls).toBe(0);
+  });
+
+  test("a DEFAULT-mode channel success keeps the exact pre-existing shape — no `explicit` field leaks in when no mode was requested", async () => {
+    const result = await deliverNotice({
+      pushChannel: async () => ok(["conn-1"]),
+      nudgePrompt: async () => ({ delivered: true }),
+    });
+    expect(result).toEqual({ via: "channel" });
+    expect("explicit" in result).toBe(false);
+  });
+
+  test("channel unavailable (empty sent): a clear non-delivery result, never falls back to the prompt", async () => {
+    let nudgeCalls = 0;
+    const result = await deliverNotice({
+      pushChannel: async () => ok([]),
+      nudgePrompt: async () => { nudgeCalls++; return { delivered: true }; },
+      mode: "channel",
+    });
+    expect(result).toEqual({ via: "none", reason: "no channel attached" });
+    expect(nudgeCalls).toBe(0); // the actual regression this mode exists to prevent: no alternate-transport fallback
+  });
+
+  test("channel push throws: a clear non-delivery result naming the thrown reason, never falls back", async () => {
+    let nudgeCalls = 0;
+    const result = await deliverNotice({
+      pushChannel: async () => { throw new Error("boom"); },
+      nudgePrompt: async () => { nudgeCalls++; return { delivered: true }; },
+      mode: "channel",
+    });
+    expect(result).toEqual({ via: "none", reason: "channel push threw: boom" });
+    expect(nudgeCalls).toBe(0);
+  });
+
+  test("every sent id also refused: a clear non-delivery result, never falls back", async () => {
+    let nudgeCalls = 0;
+    const result = await deliverNotice({
+      pushChannel: async () => ok(["conn-1"], [{ id: "conn-1", reason: "closed-mid-send" }]),
+      nudgePrompt: async () => { nudgeCalls++; return { delivered: true }; },
+      mode: "channel",
+    });
+    expect(result).toEqual({ via: "none", reason: "channel reported sent but every connection was also refused" });
+    expect(nudgeCalls).toBe(0);
+  });
+});
+
+describe("renderNotifyDelivery: FACTORY-1010 — explicit-mode outcomes render distinctly from the default fallback phrasing", () => {
+  test("explicit prompt mode, delivered", () => {
+    expect(renderNotifyDelivery({ via: "prompt", delivered: true })).toBe("Direct prompt (explicit mode): delivered");
+  });
+
+  test("explicit prompt mode, not delivered", () => {
+    expect(renderNotifyDelivery({ via: "prompt", delivered: false })).toBe("Direct prompt (explicit mode): refused/absent");
+  });
+
+  test("explicit prompt mode, session-limit refusal", () => {
+    const d: NotifyDelivery = { via: "prompt", delivered: true, refusal: { resetsAt: 1_700_000_000_000, raw: "5-hour limit reached" } };
+    expect(renderNotifyDelivery(d)).toBe(`Direct prompt (explicit mode): refused (session limit, resets ${new Date(1_700_000_000_000).toISOString()})`);
+  });
+
+  test("explicit channel-only mode, no delivery", () => {
+    expect(renderNotifyDelivery({ via: "none", reason: "no channel attached" })).toBe(
+      "Claude channel unavailable (no channel attached); explicit channel-only mode, no prompt fallback attempted",
+    );
+  });
+
+  test("default/omitted mode, channel success — unchanged phrasing", () => {
+    expect(renderNotifyDelivery({ via: "channel" })).toBe("Claude channel delivered");
+  });
+
+  test("explicit channel mode, success — DISTINCT phrasing from the default success above, naming this was a configured choice", () => {
+    expect(renderNotifyDelivery({ via: "channel", explicit: true })).toBe("Claude channel delivered (explicit mode)");
+  });
+});
+
+/**
+ * FACTORY-1010 acceptance: "Verify results distinguish configured choice,
+ * attempted transport, transport receipt and actual subsequent worker turn
+ * when available." A persisted round-trip across the three states a rule's
+ * `notifyDeliveryMode` can take, proving the GATE's own behaviour changes
+ * correctly as `mode` changes — the rules-file round-trip itself (absent ->
+ * "channel" -> "prompt" -> removed/absent again) is covered separately in
+ * test/unit/rules-write.test.ts per the independent review's own request.
+ */
+describe("deliverNotice: FACTORY-1010 — default -> channel -> prompt -> default, same deps each time", () => {
+  test("the SAME pushChannel/nudgePrompt pair behaves differently as only `mode` changes, and reverting to no mode restores the original fallback behaviour", async () => {
+    const deps = {
+      pushChannel: async () => ok([]), // channel always unavailable in this scenario
+      nudgePrompt: async () => ({ delivered: true }),
+    };
+
+    const byDefault = await deliverNotice(deps); // no mode at all
+    expect(byDefault).toEqual({ via: "prompt", fallbackReason: "no channel attached", delivered: true });
+
+    const explicitChannel = await deliverNotice({ ...deps, mode: "channel" });
+    expect(explicitChannel).toEqual({ via: "none", reason: "no channel attached" });
+
+    const explicitPrompt = await deliverNotice({ ...deps, mode: "prompt" });
+    expect(explicitPrompt).toEqual({ via: "prompt", delivered: true });
+
+    const backToDefault = await deliverNotice({ ...deps, mode: undefined });
+    expect(backToDefault).toEqual(byDefault);
+  });
+});

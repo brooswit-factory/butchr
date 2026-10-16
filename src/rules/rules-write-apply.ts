@@ -168,6 +168,9 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   else if (patch.stalledMinutes !== undefined) next.stalledMinutes = patch.stalledMinutes;
   if (patch.idlePokeMessage !== undefined) next.idlePokeMessage = patch.idlePokeMessage;
   if (patch.idlePokeEnabled !== undefined) next.idlePokeEnabled = patch.idlePokeEnabled;
+  // FACTORY-1010: same null-means-remove precedent as `stalledMinutes` above.
+  if (patch.notifyDeliveryMode === null) delete next.notifyDeliveryMode;
+  else if (patch.notifyDeliveryMode !== undefined) next.notifyDeliveryMode = patch.notifyDeliveryMode;
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {

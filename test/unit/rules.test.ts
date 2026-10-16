@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, DEFAULT_IDLE_POKE_MESSAGE, DEFAULT_IDLE_POKE_MINUTES,
-  encodeAgentKey, encodeQueryAgentKey, EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules,
+  encodeAgentKey, encodeQueryAgentKey, EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, NOTIFY_DELIVERY_MODES, parseRules,
   RESOURCE_PROVIDERS, RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
@@ -707,6 +707,42 @@ describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour cha
       const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false }] });
       expect(r).toMatchObject({ resourceProvider, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false });
+    }
+  });
+});
+
+// FACTORY-1010: `Rule.notifyDeliveryMode` — the per-rule explicit choice
+// between the agent's MCP channel and a direct typed prompt for every
+// update/notification `deliverNotice` seam this rule owns. Same
+// absent-means-absent house style as `permissionMode`/`lizardMode` above:
+// omitted must stay today's channel-first/prompt-fallback behaviour
+// byte-for-byte, so there is deliberately no default resolved here.
+describe("notifyDeliveryMode (FACTORY-1010 — per-rule explicit delivery choice)", () => {
+  test("omitted stays absent — today's channel-first/prompt-fallback behaviour, unchanged", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.notifyDeliveryMode).toBeUndefined();
+  });
+
+  test("accepts and keeps each valid value", () => {
+    for (const mode of NOTIFY_DELIVERY_MODES) {
+      const [r] = parseRules({ rules: [{ ...minimal, notifyDeliveryMode: mode }] });
+      expect(r!.notifyDeliveryMode).toBe(mode);
+    }
+  });
+
+  test("rejects any value outside the two supported transports", () => {
+    for (const bad of ["both", "none", "Channel", "", 1, true, null]) {
+      expect(() => parseRules({ rules: [{ ...minimal, notifyDeliveryMode: bad }] }, "f.json")).toThrow("f.json: rules[0].notifyDeliveryMode must be one of channel, prompt");
+    }
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role and the idle-poke knobs above", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      for (const mode of NOTIFY_DELIVERY_MODES) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, notifyDeliveryMode: mode }] });
+        expect(r).toMatchObject({ resourceProvider, notifyDeliveryMode: mode });
+      }
     }
   });
 });
