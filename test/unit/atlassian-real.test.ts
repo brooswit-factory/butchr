@@ -1,6 +1,29 @@
-import { describe, expect, test, mock } from "bun:test";
+import { afterEach, describe, expect, test, mock } from "bun:test";
 import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
 import type { ProjectResourceDeps } from "../../src/resources/project.js";
+
+/**
+ * FACTORY-77 (shared CI investigation, see also FACTORY-66): every test
+ * below calls `mock.module("jira.js", ...)` / `mock.module("confluence.js",
+ * ...)` to fake out `realAtlassian`'s two SDK clients, but none of them ever
+ * restored the real module afterward — `mock.module` patches the GLOBAL
+ * module registry, not a per-test sandbox, so a leaked fake stays resolvable
+ * to whichever OTHER test file imports "jira.js"/"confluence.js" next in the
+ * same process. Observed failure mode this produces when it leaks past this
+ * file: test/unit/link-cli-jira-project.test.ts's "malformed-config path
+ * (FACTORY-19)" tests construct a REAL `realAtlassian()` client and expect
+ * Zod to reject a malformed email at construction time — against one of
+ * this file's fake `createCloudClient` stubs (none of which validate
+ * anything, and most don't define `projectProperties` at all), construction
+ * never throws and a later real call crashes instead with "undefined is not
+ * an object (evaluating 'jira.projectProperties.getProjectProperty')" —
+ * exactly the shape seen on hosted CI. `mock.restore()` undoes `mock.module`
+ * along with every other mock this file creates, so one `afterEach` here is
+ * enough to stop any of this file's fakes from outliving it.
+ */
+afterEach(() => {
+  mock.restore();
+});
 
 describe("realAtlassian confluence page ops", () => {
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {
