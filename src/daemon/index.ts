@@ -130,7 +130,7 @@ import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } f
 import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
 import { loadCatamorbiusFullConfig } from "../catamorbius/push-config.js";
-import { createCatamorbiusPushController, type CatamorbiusPushController } from "../catamorbius/push-controller.js";
+import { createCatamorbiusPushController, attachProcessShutdown, type CatamorbiusPushController } from "../catamorbius/push-controller.js";
 import type { LinkedEventingState } from "../jira-watch/linked-eventing.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
@@ -346,16 +346,16 @@ try {
   console.error("See .env.example for the required CATAMORBIUS_* configuration.");
   process.exit(1);
 }
-// D9: "the daemon stop path stops it" — this daemon has no other graceful
-// shutdown hook to attach to (verified: no existing SIGTERM/SIGINT handler
-// anywhere in this file), so this is a new, minimal one, scoped to exactly
-// this one concern. `stop()` is idempotent and synchronous (clears timers,
-// aborts any in-flight request) — safe to call from a signal handler.
-if (catamorbiusPush) {
-  const stopPush = catamorbiusPush;
-  process.on("SIGTERM", () => stopPush.stop());
-  process.on("SIGINT", () => stopPush.stop());
-}
+// D9: "the daemon stop path stops it" — this daemon had no existing
+// SIGTERM/SIGINT handler before this ticket, so the platform default
+// (terminate immediately) was the whole daemon's effective shutdown
+// contract. `attachProcessShutdown` stops the push client THEN exits,
+// preserving that default instead of silently replacing it — see its own
+// doc comment (src/catamorbius/push-controller.ts) for the regression this
+// fixes (readiness review on PR #805's current head: the original version
+// here only called `stop()` and never exited, leaving the whole daemon
+// running forever on SIGTERM/SIGINT once push mode was enabled).
+if (catamorbiusPush) attachProcessShutdown(catamorbiusPush);
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;

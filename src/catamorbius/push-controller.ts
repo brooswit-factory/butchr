@@ -295,3 +295,35 @@ export function createCatamorbiusPushController(config: CatamorbiusFullConfig, d
     clientState: () => client.state,
   };
 }
+
+/**
+ * Readiness review on PR #805's current head found a real shutdown
+ * regression: registering a `process.on("SIGTERM"/"SIGINT", ...)` handler
+ * REPLACES Node/Bun's own default behaviour for that signal, which is to
+ * terminate the process immediately. Before this ticket there was no
+ * existing SIGTERM/SIGINT handler anywhere in the daemon (verified at the
+ * time — see src/daemon/index.ts's own call site comment), so the
+ * daemon's effective shutdown contract WAS "the platform default: exit".
+ * Wiring `process.on("SIGTERM", () => controller.stop())` directly (what
+ * this ticket originally shipped) satisfies D9's "the daemon stop path
+ * stops it" for the push client alone, but SILENTLY drops the default
+ * exit behaviour for the whole process — every server/poll timer/loop
+ * then keeps the daemon running forever on a signal that used to kill it.
+ * This helper restores the platform default explicitly: stop the push
+ * client (idempotent and synchronous, per `stop()`'s own contract) and
+ * THEN exit, so an operator's `systemctl stop`/Ctrl-C still terminates the
+ * daemon exactly as before this ticket, with the one addition of a clean
+ * push-client stop first. Exported (rather than inlined at the
+ * `process.on` call site in src/daemon/index.ts) specifically so it can be
+ * exercised as a real child process in a regression test without having
+ * to boot the rest of the daemon (herdr preflight, Jira config, etc.) —
+ * see test/unit/catamorbius/push-controller-shutdown.test.ts.
+ */
+export function attachProcessShutdown(controller: Pick<CatamorbiusPushController, "stop">, proc: Pick<typeof process, "on" | "exit"> = process): void {
+  const shutdown = (): void => {
+    controller.stop();
+    proc.exit(0);
+  };
+  proc.on("SIGTERM", shutdown);
+  proc.on("SIGINT", shutdown);
+}
