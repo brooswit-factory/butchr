@@ -1,0 +1,5 @@
+bump: patch
+
+### Removed
+- **Removed dead `AtlassianOps.createPageWithLabel`/`getPageLabels` and the raw `confluence.js/core` v1 client (`wikiRaw`) that existed solely to drive `createPageWithLabel` (src/tools/atlassian.ts, src/tools/atlassian-real.ts, FACTORY-94).** Their only caller was `ensureDoc`'s per-ticket auto-create/label path, retired by FACTORY-84/FACTORY-86; no production caller remains. `getChildPages` is deliberately PRESERVED this pass — FACTORY-998/FACTORY-992's `confluence-page` rule loop (src/rules/confluence-page-type.ts) calls it directly, so it is current, not dead, superseding the September assessment that had grouped it with the other two. `wiki` (v2) and `wiki1` (v1 CQL search) are retained and still used elsewhere.
+- Dropped the now-unstatable "never called" test assertions for the two removed methods across ~15 fake-implementation test files (pure interface-shape stubs); kept every still-meaningful neighbouring assertion (e.g. `docs.test.ts` still asserts `upsertRemoteLink` is never called), and kept `getChildPages`'s own fakes and assertions intact everywhere.

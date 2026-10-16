@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { ApiError } from "confluence.js/core";
 import { getDoc, setDoc, findDoc, labelForKey, JIRA_KEY_RE, projectRootDoc, getProjectDoc, setProjectDoc, DOC_BODY_CHAR_BUDGET, nativeParentOf, isEligibleParentTier, resolveBoss, getConfluencePageDocById } from "../../src/tools/docs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
@@ -9,18 +8,18 @@ import type { AtlassianOps } from "../../src/tools/atlassian.js";
  * across calls in a way the simple call-recording `rig()` in tools.test.ts
  * isn't built for — this fake exists for that reason, not as a second
  * version of that one. Everything docs.ts doesn't touch (search, addComment,
- * …) is stubbed since it's never called. `createPageWithLabel`/
- * `getChildPages`/`getPageLabels` remain on this fake even though nothing in
- * docs.ts calls them anymore post-FACTORY-86 (they backed `ensureDoc`'s
- * retired creation path) — kept only because they're still part of the
- * `AtlassianOps` interface every fake must implement in full.
+ * …) is stubbed since it's never called. `getChildPages` remains on this
+ * fake even though nothing in docs.ts calls it anymore post-FACTORY-86 (it
+ * backed `ensureDoc`'s retired creation path) — kept only because it's
+ * still part of the `AtlassianOps` interface every fake must implement in
+ * full (and is now also exercised directly by the `confluence-page` rule
+ * loop's own tests, not this file's).
  */
 function makeWorld(opts: { childPageSize?: number } = {}) {
   const childPageSize = opts.childPageSize ?? 50;
   const issues = new Map<string, { summary: string; bossKey?: string; remoteLink?: { title: string; url: string } }>();
   const pages = new Map<string, { parentId: string; title: string; body: string; labels: string[]; version: number }>();
   const projectProperties = new Map<string, unknown>();
-  let nextId = 100;
   let upsertRemoteLinkCalls = 0;
 
   function addIssue(key: string, summary: string, bossKey?: string) {
@@ -98,14 +97,6 @@ function makeWorld(opts: { childPageSize?: number } = {}) {
         results: slice.map((id) => ({ id, title: pages.get(id)!.title })),
         ...(nextIndex < all.length ? { nextCursor: String(nextIndex) } : {}),
       };
-    },
-    getPageLabels: async (pageId: string) => pages.get(pageId)?.labels ?? [],
-    createPageWithLabel: async (p) => {
-      const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
-      if (titleTaken) throw new ApiError("A page with this title already exists", 400, "Bad Request", {});
-      const id = String(nextId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-      return { id, title: p.title, url: pageUrl(id) };
     },
   commentOnPage: async () => ({ ok: true }),
   getPageComments: async () => ({ results: [] }),
@@ -540,24 +531,18 @@ describe("docs.ts: findDoc — never creates, links, or infers a space/parent (F
     await expect(findDoc(ops, "not-a-key")).rejects.toThrow(/not a valid Jira key/);
   });
 
-  test("never calls createPageWithLabel/getChildPages/getPageLabels/upsertRemoteLink — the retired creation machinery is never reached", async () => {
+  test("never calls getChildPages/upsertRemoteLink — the retired creation machinery is never reached", async () => {
     const { ops, addIssue } = makeWorld();
     addIssue("BUTCHR-51", "instrumented");
-    let createCalled = false;
     let childPagesCalled = false;
-    let pageLabelsCalled = false;
     let upsertCalled = false;
     const instrumentedOps: AtlassianOps = {
       ...ops,
-      createPageWithLabel: async (p) => { createCalled = true; return ops.createPageWithLabel(p); },
       getChildPages: async (id, cursor) => { childPagesCalled = true; return ops.getChildPages(id, cursor); },
-      getPageLabels: async (id) => { pageLabelsCalled = true; return ops.getPageLabels(id); },
       upsertRemoteLink: async (key, globalId, relationship, object) => { upsertCalled = true; return ops.upsertRemoteLink(key, globalId, relationship, object); },
     };
     await findDoc(instrumentedOps, "BUTCHR-51");
-    expect(createCalled).toBe(false);
     expect(childPagesCalled).toBe(false);
-    expect(pageLabelsCalled).toBe(false);
     expect(upsertCalled).toBe(false);
   });
 });
