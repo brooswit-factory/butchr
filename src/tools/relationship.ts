@@ -688,9 +688,52 @@ async function newProjectWorker(ops: AtlassianOps, roles: Roles, projectKey: str
   };
 }
 
-/** Explicit reactivation supersedes a prior stop marker, without changing labels. */
-export async function startWorker(ops: AtlassianOps, callerKey: string, workerKey: string): Promise<unknown> {
-  await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+/**
+ * Explicit reactivation supersedes a prior stop marker, without changing labels.
+ *
+ * FACTORY-829: this used to transition straight to "In Progress" with no
+ * regard for the assignee field at all — fine for a worker `new_worker`/
+ * `adopt_worker` already assigned, but a ticket reaching this call any
+ * OTHER way (the dashboard's "Start" button, `doAgentStart` in
+ * agents-write.ts, is the live one — `defs.ts`'s own `atlassianTools`
+ * wiring to `startWorker` is dead on the daemon's current path) could stay
+ * unassigned forever. The fleet's own admission search is assignee-scoped
+ * (`ISSUE_JQL`, src/resources/issue.ts: `assignee = currentUser() AND
+ * status IN (...)`), so an unassigned "In Progress" ticket is permanently
+ * invisible to it — never spawned, never respawned, and no detector
+ * notices, since nothing ever looks at it again. Fixed here, not at
+ * `doAgentStart`, because this is the one place EVERY current and future
+ * caller of `startWorker` shares.
+ *
+ * An ALREADY-assigned worker is untouched — this never reassigns a
+ * legitimate existing owner, it only fills in a MISSING one, the same
+ * "assign only when not already assigned" discipline `adoptWorker` already
+ * uses just above. The role to assign by is resolved the same way
+ * `adoptWorker`/`newWorker` already do: by issue type, off the SAME
+ * `Roles` config (`roles.story`/`roles.task`/`roles.epic`) — never
+ * `currentUser()`, which would blindly reassign across whatever account
+ * boundary an operator's role config is deliberately drawing. No role
+ * configured for this type means no safe assignee can be determined, so
+ * this refuses clearly (same `noRoleMsg` shape `adopt_worker`/`new_worker`
+ * already use) rather than silently leaving — or worse, half-fixing — an
+ * unassigned active ticket.
+ */
+export async function startWorker(ops: AtlassianOps, roles: Roles, callerKey: string, workerKey: string): Promise<unknown> {
+  const issue = await assertOwnWorker(ops, "start_worker", callerKey, workerKey);
+
+  if (!assigneeAccountIdOf(issue)) {
+    const issuetype = issuetypeOf(issue);
+    const role = issuetype === "Epic" ? roles.epic : issuetype === "Story" ? roles.story : issuetype === "Task" ? roles.task : undefined;
+    if (!role) {
+      throw new Refusal(
+        (issuetype === "Story" || issuetype === "Task" || issuetype === "Epic"
+          ? noRoleMsg("start_worker", issuetype)
+          : `start_worker: ${workerKey}'s issue type ("${issuetype ?? "unknown"}") has no configured role to assign it by`) +
+          ` — refusing to move an unassigned ticket to In Progress, where it would become invisible to the fleet's own assignee-scoped admission search (FACTORY-829)`,
+      );
+    }
+    await ops.assign(workerKey, role);
+  }
 
   clearIntentionalStop(workerKey);
   return ops.transition(workerKey, "In Progress");

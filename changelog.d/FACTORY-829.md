@@ -1,0 +1,4 @@
+bump: patch
+
+### Fixed
+- **`start_worker` moved a worker to In Progress without ever assigning it, leaving it permanently invisible to the fleet's own assignee-scoped admission search (`ISSUE_JQL`) — never spawned, never respawned, and no detector noticed, since nothing ever looked at it again (FACTORY-829).** Live, reachable via the dashboard's "Start" button (`doAgentStart`, `src/agents/agents-write.ts`), not only the legacy `atlassianTools`/`defs.ts` wiring. `startWorker` now resolves a missing assignee by role (the same `Roles` config `new_worker`/`adopt_worker` already use — never `currentUser()`, which would blindly reassign across an operator's configured account boundary) before transitioning, or refuses clearly, naming the missing role env var, and never transitions a still-unassigned ticket. An already-assigned worker, and one whose assignment attempt fails, is left exactly as it was.
