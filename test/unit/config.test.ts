@@ -122,6 +122,26 @@ describe("loadConfig", () => {
     const d = describeConfig(loadConfig({ ...base, [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false", [PROVIDER_ENABLED_ENV_VAR.filesystem]: "false" }, noRead));
     expect(d).toContain("providerSwitchOff=github-pr,filesystem");
   });
+  // FACTORY-66 review round 3 (brooswit, PR #797, @ 334430f6): "disabled
+  // must mean no own initialization, no credential requirement" — before
+  // this, `loadConfig` read/validated ATLASSIAN_TOKEN_FILE unconditionally,
+  // even when every Atlassian-backed provider's own switch was off, so a
+  // host with zero use for Atlassian still had its credential read (and a
+  // real client constructed downstream in daemon/index.ts) for nothing.
+  test("FACTORY-66 review round 3: all four Atlassian-backed provider switches off skips the credential read entirely, even with a valid ATLASSIAN_TOKEN_FILE set", () => {
+    const allAtlassianOff = { [PROVIDER_ENABLED_ENV_VAR["jira-work"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-idea"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-project"]]: "false", [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" };
+    const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t", ...allAtlassianOff }, noRead);
+    expect(c.atlassian).toBeUndefined();
+    expect(c.atlassianDisabledReason).toContain("every Atlassian-backed provider switch");
+    expect(c.atlassianDisabledReason).toContain("is off");
+  });
+  test("FACTORY-66 review round 3: ONE enabled Atlassian-backed sibling still reads/validates the shared credential normally, with the other three switched off", () => {
+    const threeOff = { [PROVIDER_ENABLED_ENV_VAR["jira-idea"]]: "false", [PROVIDER_ENABLED_ENV_VAR["jira-project"]]: "false", [PROVIDER_ENABLED_ENV_VAR["confluence-page"]]: "false" };
+    const c = loadConfig({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t", ...threeOff }, (p) => { expect(p).toBe("/t"); return "filetok\n"; });
+    expect(c.atlassian).toEqual({ site: "https://x.atlassian.net", email: "a@b.c", token: "filetok" });
+    expect(c.providerEnabled["jira-work"]).toBe(true);
+    expect(c.providerEnabled["jira-idea"]).toBe(false);
+  });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
     expect(d).not.toContain("s3cr3t-VALUE"); expect(d).toContain("***"); expect(d).toContain("12 chars");
@@ -157,6 +177,23 @@ describe("loadConfig", () => {
     const d = describeConfig(c);
     expect(d).toContain("github=disabled");
     expect(d).toContain("ENOENT");
+  });
+
+  // FACTORY-66 review round 3: github-issue and github-pr share ONE
+  // GITHUB_TOKEN_FILE — before this, it was read unconditionally whenever
+  // the file/orgs were set, even with BOTH providers' own switches off.
+  test("FACTORY-66 review round 3: GITHUB_TOKEN_FILE is never read when BOTH github-issue and github-pr switches are off", () => {
+    const bothOff = { [PROVIDER_ENABLED_ENV_VAR["github-issue"]]: "false", [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false" };
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme", ...bothOff }, noRead);
+    expect(c.github).toBeUndefined();
+    expect(c.githubTokenReadError).toBeUndefined(); // never attempted, not merely isolated
+  });
+  test("FACTORY-66 review round 3: ONE enabled github sibling still reads the shared token normally, with the other switched off", () => {
+    const prOff = { [PROVIDER_ENABLED_ENV_VAR["github-pr"]]: "false" };
+    const c = loadConfig({ ...base, GITHUB_TOKEN_FILE: "/gh", BUTCHR_GITHUB_ORGS: "acme", ...prOff }, () => "ghtok\n");
+    expect(c.github).toEqual({ token: "ghtok", orgs: ["acme"] });
+    expect(c.providerEnabled["github-issue"]).toBe(true);
+    expect(c.providerEnabled["github-pr"]).toBe(false);
   });
 
   test("stalledMinutes defaults to 10, honours BUTCHR_STALLED_MINUTES, and rejects a non-positive value", () => {

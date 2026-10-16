@@ -859,13 +859,28 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     : restoredResumeRaw === "off" || restoredResumeRaw === "all"
     ? restoredResumeRaw
     : new Set(restoredResumeRaw.split(",").map((name) => name.trim()).filter(Boolean));
-  const atlassianResult = loadAtlassianConfig(env, readFile);
+  // FACTORY-66 review round 3 (brooswit, PR #797, @ 334430f6): computed
+  // BEFORE any credential file read below, not after — a provider whose own
+  // switch is off, with no enabled sibling sharing its credential, must
+  // never touch disk for that credential at all (the review's "disabled
+  // must mean no own initialization, no credential requirement" finding).
+  // See `Config.providerEnabled`'s own doc comment.
+  const providerEnabled = parseProviderEnabledMap(env as Record<string, string | undefined>);
+
+  // FACTORY-66 review round 3: Atlassian's four providers share ONE
+  // credential (`ATLASSIAN_BACKED_PROVIDERS`) — keep reading/validating it
+  // normally whenever AT LEAST ONE of the four is enabled (an enabled
+  // sibling's credential need is preserved), but skip the read/validation
+  // entirely, isolated exactly like an explicit `BUTCHR_ATLASSIAN_ENABLED=false`,
+  // when all four are off. Without this, a host with every Atlassian
+  // provider switched off still read ATLASSIAN_TOKEN_FILE and constructed a
+  // real `Config.atlassian` that nothing was allowed to use.
+  const anyAtlassianProviderEnabled = providerEnabled["jira-work"] || providerEnabled["jira-idea"] || providerEnabled["jira-project"] || providerEnabled["confluence-page"];
+  const atlassianResult: AtlassianConfigResult = anyAtlassianProviderEnabled
+    ? loadAtlassianConfig(env, readFile)
+    : { config: undefined, disabledReason: `Atlassian is disabled — every Atlassian-backed provider switch (jira-work, jira-idea, jira-project, confluence-page) is off — ${ATLASSIAN_BACKED_PROVIDERS}` };
   const atlassian = atlassianResult.config;
   const atlassianDisabledReason = atlassianResult.disabledReason;
-
-  // FACTORY-66 review round 2: one independent switch per registered
-  // provider — see `Config.providerEnabled`'s own doc comment.
-  const providerEnabled = parseProviderEnabledMap(env as Record<string, string | undefined>);
 
   const port = parsePort(env);
 
@@ -876,9 +891,14 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   // token file for it must never fail `loadConfig`/take down the whole
   // daemon, same contract `loadAtlassianConfig` above now also honours for
   // Atlassian's own (mandatory-shaped, but no-longer-fatal) token read.
+  // FACTORY-66 review round 3: github-issue and github-pr share this ONE
+  // token/org config — skip the read entirely (same "no credential
+  // requirement" contract as Atlassian above) when BOTH are switched off;
+  // an enabled sibling's need keeps the read happening as before.
+  const anyGithubProviderEnabled = providerEnabled["github-issue"] || providerEnabled["github-pr"];
   let githubToken: string | undefined;
   let githubTokenReadError: string | undefined;
-  if (env.GITHUB_TOKEN_FILE) {
+  if (anyGithubProviderEnabled && env.GITHUB_TOKEN_FILE) {
     try {
       githubToken = readFile(env.GITHUB_TOKEN_FILE).trim();
     } catch (e) {

@@ -1,6 +1,6 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { atlassianProviderStaffing } from '../rules/atlassian-staffing.js';
-import { applyProviderSwitch } from '../rules/provider-enablement.js';
+import { applyProviderSwitch, parseProviderEnabledMap } from '../rules/provider-enablement.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
@@ -245,7 +245,20 @@ const atlassianExplicitlyDisabled = (() => {
   const v = effectiveEnv.BUTCHR_ATLASSIAN_ENABLED?.trim().toLowerCase();
   return v === "false" || v === "0" || v === "no" || v === "off";
 })();
-if (!atlassianExplicitlyDisabled && !isAtlassianConfigured(effectiveJiraEnv)) {
+// FACTORY-66 review round 3 (brooswit, PR #797, @ 334430f6): the coarse
+// `atlassianExplicitlyDisabled` check above only knows about
+// `BUTCHR_ATLASSIAN_ENABLED` — an operator who instead switched off all
+// four Atlassian-backed providers individually (`BUTCHR_PROVIDER_JIRA_WORK_ENABLED`
+// etc.) with no ATLASSIAN_* credentials set either used to still get routed
+// into setup mode, which exists to walk a fresh install THROUGH configuring
+// Atlassian — exactly backwards for someone who just said, four times over,
+// that they don't want it. Bypasses setup mode the same way an explicit
+// `BUTCHR_ATLASSIAN_ENABLED=false` already does.
+const allAtlassianProviderSwitchesOff = (() => {
+  const providerEnabledPreCheck = parseProviderEnabledMap(effectiveJiraEnv as Record<string, string | undefined>);
+  return !providerEnabledPreCheck["jira-work"] && !providerEnabledPreCheck["jira-idea"] && !providerEnabledPreCheck["jira-project"] && !providerEnabledPreCheck["confluence-page"];
+})();
+if (!atlassianExplicitlyDisabled && !allAtlassianProviderSwitchesOff && !isAtlassianConfigured(effectiveJiraEnv)) {
   // Setup mode ONLY for a truly fresh install (no site, email, token, identity file or managed token file at all).
   // FACTORY-66: a PARTIAL state used to exit(1) loudly here (PR463/FACTORY-65's
   // own boot-refusal path) — that made one misconfigured credential a
@@ -712,20 +725,28 @@ const atlassian = config.atlassian
 // ever reject.
 const ideaRules = jiraIdeaRules(getRules());
 const jiraIdeas = jiraIdeaStaffing.run ? createJiraIdeaClient(atlassian) : undefined;
-// Tool connections are independent of agent staffing. Reuse clients where possible;
-// keep the same credentials, organization/account boundaries and Zendesk opt-in.
-const githubToolIssues = githubIssues ?? (config.github
+// Tool connections are independent of agent staffing (an agent may still
+// want `*_tools` available with zero enabled rules for that provider) but
+// NOT independent of this provider's own enablement switch — FACTORY-66
+// review round 3 (brooswit, PR #797, @ 334430f6): each fallback below used
+// to construct a client whenever the shared credential existed, regardless
+// of `config.providerEnabled`, so switching e.g. github-pr off while
+// github-issue stayed on left `githubToolPrs` constructed and its tools
+// registered anyway. Reuse clients where possible; keep the same
+// credentials, organization/account boundaries and Zendesk opt-in.
+const githubToolIssues = githubIssues ?? (config.github && config.providerEnabled["github-issue"]
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
-const githubToolPrs = githubPrs ?? (config.github
+const githubToolPrs = githubPrs ?? (config.github && config.providerEnabled["github-pr"]
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
 // FACTORY-66: tool registration (unlike the poll loop above) is fine to
 // construct even with zero jira-idea RULES — an agent may still want
 // `jira_idea_*` tools available — but it must still require Atlassian
-// itself to be configured; without that this constructed a client against
-// the stub (or, before this ticket, unconditionally real) that could only
-// ever reject every call.
-const jiraToolIdeas = config.atlassian ? (jiraIdeas ?? createJiraIdeaClient(atlassian)) : undefined;
-const zendeskToolAuth = !zendeskTickets && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
+// itself to be configured AND jira-idea's own switch to be on; without
+// the latter this constructed a client (against the real shared Atlassian
+// client, if some OTHER Atlassian-backed provider kept it real) that
+// jira-idea's own switch said should not exist.
+const jiraToolIdeas = (config.atlassian && config.providerEnabled["jira-idea"]) ? (jiraIdeas ?? createJiraIdeaClient(atlassian)) : undefined;
+const zendeskToolAuth = !zendeskTickets && config.providerEnabled["zendesk-ticket"] && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
   ? loadZendeskAuth(process.env) : undefined;
 const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskToolAuth.subdomain, token: zendeskToolAuth.token }) : undefined);
