@@ -236,6 +236,36 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(notified).toHaveLength(0); // nothing to report yet for either owner (seed poll)
   });
 
+  test("FACTORY-833: a failed remote-links fetch, on a LATER tick, must not report an already-tracked remote-linked target as 'no longer linked'", async () => {
+    const owner = issue("BUTCHR-1");
+    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
+    const state = createLinkedEventingState();
+    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
+    const { deps, notified, logs } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": [remoteLink] } });
+    const r = rule({ linkedRemoteLinks: true });
+
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // seed: BUTCHR-9 discovered via remote link, no prior baseline
+    expect(notified).toHaveLength(0);
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps); // unchanged
+    expect(notified).toHaveLength(0);
+
+    // The remote-links fetch now fails transiently. Without BUTCHR-9's own
+    // real link having been touched, this must NOT synthesize a "no longer
+    // linked" for it — the target simply failed to re-fetch this tick, that
+    // is not positive evidence of removal.
+    deps.remoteLinks = async () => { throw new Error("timeout"); };
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] remote-links fetch failed"))).toBe(true);
+    expect(notified).toHaveLength(0); // the false positive this ticket reports
+
+    // Once the fetch recovers, BUTCHR-9 is still linked and unchanged — no
+    // spurious "re-added" or "changed" event from the baseline having been
+    // preserved through the failed tick.
+    deps.remoteLinks = async (key) => [remoteLink].filter(() => key === "BUTCHR-1");
+    await state.runTick([match("jira-work:task:BUTCHR-1", r, owner)], deps);
+    expect(notified).toHaveLength(0);
+  });
+
   test("a failed batched linked-item search fails open (logs a WARNING and skips the tick — no notify, no false 'unreadable' report for a healthy link)", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2") };

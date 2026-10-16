@@ -707,6 +707,17 @@ export function createLinkedEventingState(): LinkedEventingState {
       // committed only inside a genuinely-delivered-or-consumed owner's own
       // `advance()`, never on a rate-capped or failed tick.
       const nextProjectWatermark = new Map<string, number>();
+      // FACTORY-833: an owner whose remote-links or managed-link fetch threw
+      // THIS TICK — see the removal-detection skip below for why. Without
+      // this, a transient failure of either fetch silently yields `[]` for
+      // just that source, that source's previously-tracked targets vanish
+      // from `kept`, and removal detection (which only ever sees `kept`, not
+      // WHY a target is missing from it) reports a false "no longer linked"
+      // for something that never actually changed — the exact bug class this
+      // ticket describes ("if any read failure can masquerade as an empty
+      // set, that is the bug"), just via a different fetch than the batched
+      // Jira search `searchFailed` above already guards.
+      const linkFetchFailedOwners = new Set<string>();
 
       for (const m of opted) {
         let remoteLinks: JiraRemoteLink[] | undefined;
@@ -715,6 +726,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             remoteLinks = await deps.remoteLinks(m.issue.key);
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] remote-links fetch failed for ${m.agentKey} (${m.issue.key}): ${(e as Error)?.message ?? e}`);
+            linkFetchFailedOwners.add(m.agentKey);
           }
         }
         // FACTORY-9: this owner's butchr-MANAGED links (FACTORY-4), reconciled
@@ -730,6 +742,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             managedItems = await managedLinkedItems(jiraWorkItemOwnerRef(m.issue), nativeJiraRefs(m.issue), deps.linkStore, deps.log);
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.issue.key}): ${(e as Error)?.message ?? e}`);
+            linkFetchFailedOwners.add(m.agentKey);
           }
         }
         // BUTCHR-437: description-derived Confluence/GitHub/webpage items are
@@ -836,6 +849,7 @@ export function createLinkedEventingState(): LinkedEventingState {
             managedItems = await managedLinkedItems(jiraProjectOwnerRef(m.projectKey), [], deps.linkStore, deps.log);
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.projectKey}): ${(e as Error)?.message ?? e}`);
+            linkFetchFailedOwners.add(m.agentKey);
           }
         }
         managedTargetsByOwner.set(m.agentKey, new Set(managedItems.map((i) => i.target)));
@@ -990,6 +1004,27 @@ export function createLinkedEventingState(): LinkedEventingState {
       // Removed-link candidates, against each owner's watch set as of the LAST poll this ran for it — read before anything below mutates that set. BUTCHR-469: compared against `trackedKept`, not raw `kept` — see that helper's own doc comment for why a project owner's member-sourced items must never surface here.
       const removedByOwner = new Map<string, LinkedChangeEvent[]>();
       for (const entry of ownerEntries) {
+        // FACTORY-833: an owner whose remote-link or managed-link fetch
+        // threw THIS TICK (`linkFetchFailedOwners` above) gets NO removal
+        // detection this tick — that fetch's own previously-tracked targets
+        // are simply absent from `kept` because the read failed, not
+        // because anything was actually unlinked, and `kept` carries no way
+        // to tell those two apart from here. Skipping removal-detection
+        // ONLY (every other per-item change/comment/unreadable check below
+        // still runs normally, and for a project owner member discovery is
+        // untouched — it never depends on the link store) is the narrowest
+        // fix for the false "no longer linked" this ticket reports: a
+        // broken managed-link store must still fail open for everything
+        // ELSE an owner's tick does (the pre-existing, still-covered
+        // contract — see linked-eventing-project.test.ts's own "fails open
+        // ... without blocking ... member discovery" case), just not for a
+        // claim this tick cannot actually back up. `watchSets` below still
+        // advances to this tick's (fetch-failure-shrunk) `kept` regardless
+        // — delayed, not lost: once the fetch recovers, the target simply
+        // reappears in `kept` next tick with its baseline intact (never
+        // deleted, since no removal event ever fired for it), so no
+        // spurious "re-added" fires either.
+        if (linkFetchFailedOwners.has(entry.agentKey)) continue;
         const prevSet = watchSets.get(entry.agentKey);
         if (!prevSet) continue;
         const keptTargets = new Set(trackedKept(entry.agentKey, perOwnerItems.get(entry.agentKey)!).map((i) => i.target));
