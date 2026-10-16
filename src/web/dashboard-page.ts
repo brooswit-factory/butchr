@@ -1,8 +1,8 @@
 /**
  * BUTCHR-339: the butchr dashboard PAGE — a pure, synchronous, server-side
  * render of the real `/dashboard` response (`src/agents/dashboard.ts`), one
- * row per agent plus one per withheld ticket, exactly two links (terminal
- * attach, resource), and no I/O of its own.
+ * row per agent, exactly two links (terminal attach, resource), and no I/O
+ * of its own.
  *
  * WHY THIS EXISTS AS A SEPARATE MODULE FROM `src/web/page.ts`: that file is a
  * template string with the rendering logic inside BROWSER JavaScript —
@@ -12,19 +12,19 @@
  * can drive it directly against response shapes the real endpoint produces
  * and assert on the returned HTML string.
  *
- * THE THREE ABSENCES THIS RENDER FUNCTION MUST NEVER CONFLATE (the ticket's
+ * THE TWO ABSENCES THIS RENDER FUNCTION MUST NEVER CONFLATE (the ticket's
  * own framing, repeated here because it is the module's entire job):
  *   - KNOWN: the value is there — rendered plainly, no warning styling.
  *   - COULD NOT CHECK: a read failed, was untrusted, or has never happened —
  *     rendered with the `cnc` class, and the literal words "could not check"
  *     somewhere in its text, never styled like a known value.
- *   - NOT APPLICABLE: there is no agent for a withheld row, so `pane`/
- *     `agentStatus` don't exist to report — rendered with the `na` class and
- *     a dash, never the `cnc` styling (nothing failed).
- * A single withheld row can carry a could-not-check `tier.issuetype` AND a
- * not-applicable `agentFields` marker at once — see `renderWithheldRow`, and
- * the dedicated test in `dashboard-page.test.ts` that builds exactly that
- * row and asserts both classes appear, distinctly.
+ *
+ * FACTORY-1013: a THIRD absence ("not applicable" — a withheld row's missing
+ * agent, under the deleted capacity admission cap) is gone with the cap
+ * itself. There are no agentless rows any more: every matched resource is
+ * reconciled into its agent, so the admission panel, the withheld row kind
+ * and the `na` marker were all removed rather than left rendering a figure
+ * nothing produces.
  *
  * NEVER A JIRA LABEL: this module imports nothing from `src/labels/*` and
  * never will — every status/tier value it renders comes from the
@@ -34,7 +34,7 @@
  * label") never happens is to make it a missing import, not a discipline.
  */
 import { ICON_HEAD_TAGS, ICON_MARK } from "./icons.js";
-import type { AdmissionView, DashboardResponse, AgentDashboardRow, WithheldDashboardRow, TierField } from "../agents/dashboard.js";
+import type { DashboardResponse, AgentDashboardRow, TierField } from "../agents/dashboard.js";
 import type { StatusFloor } from "../agents/status-floor.js";
 import { humanDuration } from "../agents/status-floor.js";
 import type { CurrencyReport } from "../daemon/currency.js";
@@ -143,13 +143,13 @@ function renderFloor(floor: StatusFloor, now: number, label: string): string {
   return `<div class="floor" title="${esc(label)} since ${esc(floor.since)}"><span class="floorval">${esc(text)}</span>${inexactNote}</div>`;
 }
 
-/** The page/row freshness badge. `stale` (the RESPONSE's own `checked === false`) changes both the wording and the class: a carried-forward row must read "at least X, as of <its own confirmedAt>" and never look like a fresh, current confirmation (mutation 5's row-level twin, and the ticket's own explicit wording). `extraAttrs`, when given, is spliced verbatim into the opening tag (used by a withheld row to carry its own `data-source`). */
-function renderFreshness(iso: string, now: number, stale: boolean, verb: string, extraAttrs = ""): string {
+/** The page/row freshness badge. `stale` (the RESPONSE's own `checked === false`) changes both the wording and the class: a carried-forward row must read "at least X, as of <its own confirmedAt>" and never look like a fresh, current confirmation (mutation 5's row-level twin, and the ticket's own explicit wording). */
+function renderFreshness(iso: string, now: number, stale: boolean, verb: string): string {
   const age = ageText(iso, now);
   if (stale) {
-    return `<span class="conf cnc"${extraAttrs} title="${esc(iso)}">STALE — at least ${esc(age)} old, as of ${esc(iso)}</span>`;
+    return `<span class="conf cnc" title="${esc(iso)}">STALE — at least ${esc(age)} old, as of ${esc(iso)}</span>`;
   }
-  return `<span class="conf known"${extraAttrs} title="${esc(iso)}">${esc(verb)} ${esc(age)} ago</span>`;
+  return `<span class="conf known" title="${esc(iso)}">${esc(verb)} ${esc(age)} ago</span>`;
 }
 
 /**
@@ -210,74 +210,6 @@ function renderAgentRow(row: AgentDashboardRow, stale: boolean, opts: RenderDash
     `<a class="link" href="${esc(opts.terminalLinkHref(row.pane))}">open terminal</a>` +
     `<a class="link" href="${esc(opts.resourceLinkHref(row.resourceKey))}">resource</a>` +
     renderConfigBackLink(row.resourceKey, opts) +
-    `</div>`
-  );
-}
-
-/** A withheld row's "no agent" marker — the NOT-APPLICABLE case, deliberately never the `cnc` class (nothing failed; see the module header). Rendered alongside — never instead of — a could-not-check `tier`, so a row carrying both is visually distinguishable at a glance (the ticket's own "a single row can carry both" requirement). */
-function renderNotApplicable(reason: string): string {
-  return `<span class="na" title="${esc(reason)}">no agent — n/a</span>`;
-}
-
-/**
- * `sourceDeclined`: whether THIS ROW's OWN `source` currently reports
- * `census.checked === false` on `response.admission` (see `renderDashboard`'s
- * own `declinedSources` set). A withheld row's `confirmedAt` is its census
- * bucket's own observation time — independent of the response-level
- * `checked` flag, which is a DIFFERENT signal (the agent-list read, not this
- * source's census) — so it is NEVER driven by that flag (BUTCHR-266's review
- * confirmed this reasoning). But when the row's OWN source has since
- * declined, `updateWithheldRows` carries that row forward byte-identical
- * (src/agents/dashboard.ts) — so its `confirmedAt` stops advancing while
- * still rendering with calm, "known" styling unless something says
- * otherwise. `sourceDeclined` is that something: it reuses the SAME
- * `data-source` tie the admission panel already renders, so a row's own
- * freshness badge goes STALE in lockstep with its source's own panel entry,
- * never smeared onto rows from a source that is still checking in fine.
- */
-function renderWithheldRow(row: WithheldDashboardRow, opts: RenderDashboardOpts, sourceDeclined: boolean): string {
-  const tier = renderTier(row.tier);
-  return (
-    `<div class="row withheld">` +
-    `<span class="key">${esc(row.resourceKey)}</span>` +
-    `<span class="tier ${tier.cnc ? "cnc" : "known"}">${tier.cnc ? "COULD NOT CHECK" : esc(tier.text)}</span>` +
-    `<span class="st waiting">waiting for a slot</span>` +
-    renderFloor(row.waiting, opts.now, "withheld") +
-    renderFreshness(row.confirmedAt, opts.now, sourceDeclined, "observed", ` data-source="${esc(row.source)}"`) +
-    renderNotApplicable(row.agentFields.reason) +
-    `<a class="link" href="${esc(opts.resourceLinkHref(row.resourceKey))}">resource</a>` +
-    `</div>`
-  );
-}
-
-/**
- * The admission panel: cap, residency, and EACH source's census state ON ITS
- * OWN (requirement 4). Deliberately no aggregate "census OK" computation
- * here — mirrors `AdmissionView`'s own doc comment: a source's `cnc` class
- * never touches another source's `known` one (mutation 3), which is why each
- * source renders as its own `<div>` carrying its own `data-source`.
- */
-function renderAdmission(admission: AdmissionView, now: number): string {
-  const residencyHtml =
-    admission.residency === null
-      ? `<span class="cnc">could not check (no trusted census yet)</span>`
-      : `<span class="known">${admission.residency}</span>`;
-  // BUTCHR-398: workers/sentinels reported separately — a sentinel never
-  // counts toward `cap`/`residency` above, so it is rendered as its own
-  // figure, never folded into the worker count.
-  const sentinelsHtml = admission.sentinels === null ? `<span class="cnc">?</span>` : `<span class="known">${admission.sentinels}</span>`;
-  const sourceRows = admission.sources
-    .map((s) => {
-      if (s.census.checked) {
-        return `<div class="admsrc known" data-source="${esc(s.source)}">${esc(s.source)}: checked (confirmed ${esc(ageText(s.census.confirmedAt, now))} ago)</div>`;
-      }
-      return `<div class="admsrc cnc" data-source="${esc(s.source)}">${esc(s.source)}: COULD NOT CHECK — ${esc(s.census.reason)} (as of ${esc(ageText(s.census.declinedAt, now))} ago)</div>`;
-    })
-    .join("");
-  return (
-    `<div class="admission">` +
-    `<div class="admcap">admission cap: ${admission.cap} · residency(workers): ${residencyHtml} · sentinels: ${sentinelsHtml}</div>` +
-    `<div class="admsources">${sourceRows || '<div class="admsrc none">no census sources declared</div>'}</div>` +
     `</div>`
   );
 }
@@ -352,15 +284,7 @@ const STYLE = `
  .pagefresh{font-size:12px;margin-bottom:6px}
  .pagefresh.known{color:#8b949e}
  .pagefresh.cnc.banner{display:block;background:#3a1e12;color:#f0b429;font-size:13px;font-weight:600;padding:10px 12px;border:1px solid #f0b429;border-radius:8px;margin-bottom:12px}
- .admission{font-size:12px;color:#8b949e;margin-bottom:16px;padding:8px 12px;border:1px solid #21262d;border-radius:8px}
- .admcap{margin-bottom:4px}
- .admcap .cnc{color:#f0b429;font-weight:600}
- .admcap .known{color:#c9d1d9}
- .admsrc.cnc{color:#f0b429}
- .admsrc.known{color:#3fb950}
- .admsrc.none{color:#6e7681}
  .row{display:flex;gap:12px;align-items:center;padding:10px 12px;border:1px solid #21262d;border-radius:8px;margin:6px 0;flex-wrap:wrap}
- .row.withheld{border-style:dashed;border-color:#a371f7}
  .key{font-weight:600;color:#58a6ff;min-width:90px}
  .tier{font-size:12px;color:#8b949e}
  .tier.cnc{color:#f0b429;font-weight:600}
@@ -374,7 +298,6 @@ const STYLE = `
  .inexact{font-size:11px;font-weight:400;color:#e3893a}
  .conf{font-size:11px;color:#6e7681}
  .conf.cnc{color:#f0b429;font-weight:600}
- .na{font-size:12px;color:#6e7681;font-style:italic}
  .link{font-size:12px;color:#58a6ff;text-decoration:none;border:1px solid #30363d;padding:2px 8px;border-radius:6px}
  .link:hover{background:#161b22}
  .empty{color:#6e7681;padding:12px 0}
@@ -393,26 +316,18 @@ const STYLE = `
  * `/configurations`, regardless of `rows` — a config entry with no live
  * agent (a disabled rule, an unstaffed rule, an archived session) has no
  * per-row back-link at all, and the whole point of the Configurations view
- * is to show exactly those, so an operator on an empty (or all-withheld)
- * `/` must still have a way in that isn't typing the URL by hand.
+ * is to show exactly those, so an operator on an empty `/` must still have
+ * a way in that isn't typing the URL by hand.
  */
 export function renderDashboard(response: DashboardResponse, opts: RenderDashboardOpts): string {
   const stale = !response.checked;
-  // Which sources currently report `census.checked === false` — a withheld
-  // row's OWN freshness badge goes stale in lockstep with its own source's
-  // panel entry (see `renderWithheldRow`'s own doc comment), never any
-  // other source's, and never the whole-response `checked` flag.
-  const declinedSources = new Set(response.admission.sources.filter((s) => !s.census.checked).map((s) => s.source));
-  const rowsHtml = response.rows
-    .map((row) => (row.kind === "agent" ? renderAgentRow(row, stale, opts) : renderWithheldRow(row, opts, declinedSources.has(row.source))))
-    .join("");
+  const rowsHtml = response.rows.map((row) => renderAgentRow(row, stale, opts)).join("");
   const refresh = opts.refreshSeconds ?? 5;
   return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr dashboard</title>${ICON_HEAD_TAGS}
 <style>${STYLE}</style></head><body>
 <h1>${ICON_MARK}butchr — dashboard</h1>
 ${renderBuildHeader(opts.header, opts.now)}
 ${renderPageBanner(response, opts.now)}
-${renderAdmission(response.admission, opts.now)}
 <div id="rows">${rowsHtml}</div>
 <div class="hint">"open terminal" attaches a terminal to that agent (fire-and-forget — a launch is not a confirmation a window appeared) · "resource" opens its Jira issue or Confluence project doc · refreshes every ${refresh}s · <a class="link" href="/configurations">configurations</a></div>
 </body></html>`;

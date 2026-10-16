@@ -227,7 +227,6 @@ function renderSessionRow(entry: SessionDefinitionInventoryEntry, rows: readonly
     `<span class="permmode">${naOr(entry.permissionMode)}</span>` +
     `<span class="exec">${naOr(entry.execution)}</span>` +
     `<span class="account">${naOr(entry.account)}</span>` +
-    `<span class="role">${naOr(entry.role)}</span>` +
     `<span class="workdir">${naOr(entry.workingDirectory)}</span>` +
     `<span class="mcp">mcp: ${naOr(mcp)}</span>` +
     `<span class="manifestfrozen">manifestFrozen: ${boolOr(entry.manifestFrozen)}</span>` +
@@ -264,7 +263,7 @@ const STYLE = `
  .row.archived{border-color:#a371f7}
  .row.invalid{border-color:#f0b429}
  .key{font-weight:600;color:#58a6ff;min-width:90px}
- .provider,.exec,.account,.role,.permmode,.workdir,.query{font-size:12px;color:#8b949e}
+ .provider,.exec,.account,.permmode,.workdir,.query{font-size:12px;color:#8b949e}
  .known{color:#3fb950}
  .cnc{color:#f0b429;font-weight:600}
  .off{color:#6e7681}

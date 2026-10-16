@@ -18,7 +18,7 @@ import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type Writ
 import type { WriteRateLimitOutcome } from "./write-rate-limit.js";
 import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, type RuleCreateInput } from "../rules/rules-write-registry.js";
-import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
+import { type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
 import type { SessionDefinitionsWriteOutcome } from "../resources/session-definitions-write.js";
 import type { LinksWriteOutcome } from "../resources/links-write.js";
@@ -552,7 +552,6 @@ function buildFieldDiffSummary(current: Rule | undefined, patch: RuleFieldPatch)
   if (patch.query !== undefined) parts.push(`query: ${show(current?.query)} -> ${show(patch.query)}`);
   if (patch.permissionMode !== undefined) parts.push(`permissionMode: ${show(current?.permissionMode)} -> ${show(patch.permissionMode)}`);
   if (patch.lizardMode !== undefined) parts.push(`lizardMode: ${show(current?.lizardMode)} -> ${show(patch.lizardMode)}`);
-  if (patch.role !== undefined) parts.push(`role: ${show(current?.role)} -> ${show(patch.role)}`);
   // FACTORY-846: same one-line-per-changed-field treatment as permissionMode/lizardMode above.
   if (patch.idlePokeMinutes !== undefined) parts.push(`idlePokeMinutes: ${show(current?.idlePokeMinutes)} -> ${show(patch.idlePokeMinutes)}`);
   if (patch.stalledMinutes !== undefined) parts.push(`stalledMinutes: ${show(current?.stalledMinutes)} -> ${show(patch.stalledMinutes)}`);
@@ -870,13 +869,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
       if (!deps.rulesCatalog) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       set.headers["cache-control"] = "no-store";
-      // FACTORY-817: `role` ("Included in capacity") is not per-harness like
-      // the rest of this catalog — one global pair of allowed values plus
-      // the engine's own default, documented here so the UI never hardcodes
-      // either (`AGENT_ROLES`/the `"worker"` default both come straight off
-      // `../rules/rules.js`'s own `Rule.role` doc comment, never a second,
-      // hand-maintained copy).
-      return { harnesses: deps.rulesCatalog(), capacityRoles: { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT } };
+      // FACTORY-1013: `capacityRoles` ("Included in capacity") is gone from
+      // this catalog along with the capacity admission system it configured
+      // — the rule form has no such toggle any more.
+      return { harnesses: deps.rulesCatalog() };
     })
     // FACTORY-660 — the rules page's read-only dry-run preview. A GET that
     // DOES do outbound Jira reads (SPEC CHANGE (b): counts and ticket keys
@@ -1486,8 +1482,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // this file) + the generic write-flood limiter (shared with the rules
     // write routes — this is the same "local operator, same budget"
     // trust model). `confirm` is the escape hatch for a ceiling/floor
-    // crossing (e.g. raising BUTCHR_MAX_AGENTS past its confirm ceiling —
-    // see `../settings/settings-file.ts`'s `MAX_AGENTS_CEILING`); every
+    // crossing; every
     // other refusal (malformed value, non-allowlisted key, lock
     // contention) is a plain 400, never offering a confirm bypass that
     // can't fix it.

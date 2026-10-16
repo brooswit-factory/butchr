@@ -21,15 +21,19 @@
  *   `DashboardResponse` (`./dashboard.ts`) — the SAME poll-fed snapshot
  *   `/dashboard` already serves, decoded back to (resourceProvider, ruleId)
  *   via `decodeAnyAgentKey` (`../rules/agent-key.ts`). This module makes NO
- *   fresh call of its own to `herd.runningIssues()` or to any admission
- *   census: a rule's live agent(s) already appear as `AgentDashboardRow`s and
- *   a rule's admission-cap-withheld resource(s) already appear as
- *   `WithheldDashboardRow`s (BUTCHR-332's `updateWithheldRows` builds those
- *   for every admission source this daemon declares, not just "issue" —
- *   see that function's own doc comment), so cross-referencing rows already
- *   IN HAND against every enabled rule answers "staffed?" / "admission cap?"
- *   for every provider uniformly, with zero new I/O and zero new per-provider
- *   match-count plumbing.
+ *   fresh call of its own to `herd.runningIssues()`: a rule's live agent(s)
+ *   already appear as `AgentDashboardRow`s, so cross-referencing rows already
+ *   IN HAND against every enabled rule answers "staffed?" for every provider
+ *   uniformly, with zero new I/O and zero new per-provider match-count
+ *   plumbing.
+ *
+ * FACTORY-1013: "admission cap: matched resource(s) currently withheld" is
+ * GONE as a staffing reason, along with the capacity admission system that
+ * produced it and the per-source admission census this module used to
+ * cross-check. There is no matched-but-not-started state any more: every
+ * eligible match is reconciled into its agent, so a matched rule either has
+ * a live agent row or its agent is still being started and will appear on
+ * the next poll. Do not reintroduce a "held back" staffing reason.
  * - A provider's "missing token/config" reason is answered by
  *   `githubIssueStaffing`/`zendeskTicketStaffing` (`../rules/github-issue-
  *   type.ts` / `../rules/zendesk-ticket-type.ts`) — the exact functions
@@ -80,10 +84,10 @@
  * (path)`, byte-identical to the `resourceKey` a managed-session's own
  * `AgentDashboardRow` carries. Neither is a new format this ticket invented.
  */
-import type { AgentEffort, AgentHarness, AgentPreference, AgentRole, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
+import type { AgentEffort, AgentHarness, AgentPreference, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
 import { loadRules, rulesPath } from "../rules/rules.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
-import type { AdmissionCensusField, AdmissionView, DashboardResponse, DashboardRow } from "./dashboard.js";
+import type { DashboardResponse, DashboardRow } from "./dashboard.js";
 import {
   listSessionDefinitions,
   type SessionDefinitionListDeps,
@@ -108,7 +112,6 @@ export interface RuleInventoryEntry {
   enabled: boolean;
   execution: ExecutionMode;
   account: AccountPolicy;
-  role: AgentRole;
   /**
    * `rule.agentPreferences`, ranked-order preserved, each copied field-by-field
    * (`harness`/`model`/`effort` — none secret) rather than reused as-is.
@@ -195,8 +198,7 @@ const ruleCorrelationKey = (resourceProvider: ResourceProvider, ruleId: string):
  * a live agent" check: whether `rows` (the SAME poll-fed `DashboardResponse.
  * rows` every staffing check in this module already reads — see this
  * module's own top comment) carries at least one row for `ruleId`, decoded
- * via `decodeAnyAgentKey` (`../rules/agent-key.ts`), that is NOT a withheld
- * row. A rule id is validated unique across the whole rules document at load
+ * via `decodeAnyAgentKey` (`../rules/agent-key.ts`). A rule id is validated unique across the whole rules document at load
  * time (`rules.ts`'s own duplicate-id check), so matching on `ruleId` alone
  * (never pairing it with `resourceProvider`, unlike `ruleCorrelationKey`
  * above) is unambiguous here — this call site does not have a `Rule` object
@@ -223,7 +225,6 @@ const ruleCorrelationKey = (resourceProvider: ResourceProvider, ruleId: string):
  */
 export function ruleHasLiveAgent(ruleId: string, rows: readonly DashboardRow[]): boolean {
   for (const row of rows) {
-    if (row.kind === "withheld") continue;
     const decoded = decodeAnyAgentKey(row.resourceKey);
     if (decoded && decoded.ruleId === ruleId) return true;
   }
@@ -231,88 +232,28 @@ export function ruleHasLiveAgent(ruleId: string, rows: readonly DashboardRow[]):
 }
 
 /**
- * Every rule key (`resourceProvider:ruleId`) with at least one row in `rows`
- * — split into `live` (an ordinary `AgentDashboardRow`: a real running agent)
- * and `withheld` (a `WithheldDashboardRow`: matched but held back by the
- * fleet-wide admission cap this poll) — see this module's own top comment
- * for why reading `DashboardResponse.rows` answers this for every provider
- * uniformly, with no new I/O. A row whose `resourceKey` does not decode
- * (nothing in this daemon ever produces one, but `decodeAnyAgentKey` is
- * total) is silently skipped, same discipline `dashboard.ts` itself already
- * uses for a row with no resolvable resource key.
+ * Every rule key (`resourceProvider:ruleId`) with at least one live agent row
+ * in `rows` — see this module's own top comment for why reading
+ * `DashboardResponse.rows` answers this for every provider uniformly, with no
+ * new I/O. A row whose `resourceKey` does not decode (nothing in this daemon
+ * ever produces one, but `decodeAnyAgentKey` is total) is silently skipped,
+ * same discipline `dashboard.ts` itself already uses for a row with no
+ * resolvable resource key.
  */
-function liveAndWithheldRuleKeys(rows: readonly DashboardRow[]): { live: ReadonlySet<string>; withheld: ReadonlySet<string> } {
+function liveRuleKeys(rows: readonly DashboardRow[]): ReadonlySet<string> {
   const live = new Set<string>();
-  const withheld = new Set<string>();
   for (const row of rows) {
     const decoded = decodeAnyAgentKey(row.resourceKey);
     if (!decoded) continue;
-    const key = ruleCorrelationKey(decoded.resourceProvider, decoded.ruleId);
-    (row.kind === "withheld" ? withheld : live).add(key);
+    live.add(ruleCorrelationKey(decoded.resourceProvider, decoded.ruleId));
   }
-  return { live, withheld };
-}
-
-/**
- * FACTORY-136: every rule provider's own admission-source name, verified by
- * reading every `admissionController.admit(...)` call site in
- * `src/daemon/index.ts` — each rule-driving loop admits under its own
- * `ADMISSION_SOURCE_*` constant, and every one of those constants' STRING
- * VALUE equals the `ResourceProvider` it drives, with exactly one exception:
- * the `jira-work` loop (`runResourceLoop(ruleResourceType, ...)`, the plain
- * Jira issue/project-search rule engine) admits under the source name
- * `"issue"`, not `"jira-work"` — confirmed by `ownsRuleAgent`/the `enabled`
- * filter in `src/rules/resource-type.ts` both keying on `resourceProvider
- * === "jira-work"` while the SAME loop's own `admission:` callback in
- * `index.ts` passes `ADMISSION_SOURCE_ISSUE = "issue"`. No other provider has
- * this mismatch. The mapping is TOTAL and 1:1 over every `ResourceProvider` —
- * no two providers share a source, and no provider spans more than one.
- * `"managed-sessions"` (`ADMISSION_SOURCE_MANAGED_SESSIONS`) has no entry
- * here: it is never a `Rule.resourceProvider` value, only the built-in
- * managed-session-definitions loop's own admission bucket, which this module
- * already handles separately (`SessionDefinitionInventoryEntry`, no
- * `staffed`/`reason` of its own).
- */
-const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
-  "jira-work": "issue",
-  "github-issue": "github-issue",
-  "github-pr": "github-pr",
-  "jira-idea": "jira-idea",
-  "zendesk-ticket": "zendesk-ticket",
-  "jira-project": "jira-project",
-  filesystem: "filesystem",
-  "confluence-page": "confluence-page",
-};
-
-/**
- * A rule's own covering admission source's census entry, resolved from
- * `AdmissionView.sources` (`./dashboard.ts`) via `RULE_ADMISSION_SOURCE`.
- *
- * FACTORY-340: a source CAN be entirely absent from `admission.sources` in a
- * real daemon — `src/daemon/index.ts`'s conditional `sources:` list omits a
- * provider's entry whenever that provider's own client failed to construct
- * (e.g. `github-pr`'s `githubPrs = githubPrStaffingResult.run && config.github`
- * being falsy when an enabled `github-pr` rule exists but `config.github` is
- * unset — no `GITHUB_TOKEN_FILE`/`BUTCHR_GITHUB_ORGS`), independent of
- * whether `configReasonFor` (below) also happens to cover that provider. The
- * previous doc comment here claimed this was structurally impossible; it was
- * wrong (epic-reviewer finding on FACTORY-136). Returns `{ source, absent:
- * true }` in that case — resolved via `RULE_ADMISSION_SOURCE` all the same,
- * so the source name is still known and reportable even though its census
- * entry is not — rather than `undefined`, so `ruleStaffingReason` below can
- * never mistake "not present in the census" for "reported and fine".
- */
-function admissionSourceCensusFor(rule: Rule, admission: AdmissionView): { source: string; census: AdmissionCensusField } | { source: string; absent: true } {
-  const source = RULE_ADMISSION_SOURCE[rule.resourceProvider];
-  const entry = admission.sources.find((s) => s.source === source);
-  return entry ? { source: entry.source, census: entry.census } : { source, absent: true };
+  return live;
 }
 
 export interface RuleStaffingDeps {
   /** From `githubIssueStaffing`/`zendeskTicketStaffing` (or any future provider's own equivalent) — `null` when this rule's provider has no config/credential problem right now (may still be unstaffed for another reason below). Never consulted for a disabled rule. */
   configReason: string | null;
   live: ReadonlySet<string>;
-  withheld: ReadonlySet<string>;
   /**
    * `DashboardResponse.checked` verbatim — whether the MOST RECENT
    * `agent.list()` poll succeeded. NOT "whether at least one poll has ever
@@ -327,31 +268,6 @@ export interface RuleStaffingDeps {
    * from this flag being `false` must read as true under BOTH cases.
    */
   dashboardChecked: boolean;
-  /**
-   * FACTORY-136: this rule's own covering admission source's census entry
-   * (`admissionSourceCensusFor`, above) — INDEPENDENT of `dashboardChecked`:
-   * either can fail alone (see `AdmissionView`'s own doc comment on
-   * `./dashboard.ts`). This is what closes the remaining gap `dashboardChecked`
-   * does not cover — a rule whose admission source is declined or has never
-   * reported has no way to know whether a matched resource is currently being
-   * withheld by the fleet-wide cap (`withheld` above is built only from
-   * sources that HAVE reported), so asserting a genuine zero in that case
-   * would repeat exactly the defect FACTORY-132 fixed for the agent census.
-   *
-   * FACTORY-340: `{ source, absent: true }` — no `census` field at all — is
-   * a DISTINCT case from `{ source, census }` with `census.checked === false`:
-   * both mean "this rule's covering source cannot currently vouch for a
-   * zero", but `absent` means the source was never even DECLARED this poll
-   * (see `admissionSourceCensusFor`'s own doc comment for the real
-   * `github-pr`-without-`config.github` case that makes this reachable),
-   * while `census.checked === false` means it was declared and reported a
-   * decline. `ruleStaffingReason` below treats both as COULD NOT CHECK.
-   * `undefined` remains a third, allowed value for existing tests/fixtures
-   * that construct `RuleStaffingDeps` directly and want to skip this branch
-   * entirely — a real daemon path (via `admissionSourceCensusFor`) never
-   * produces it, only `{ source, absent: true }` or `{ source, census }`.
-   */
-  admissionSourceCensus: { source: string; census: AdmissionCensusField } | { source: string; absent: true } | undefined;
 }
 
 /**
@@ -366,32 +282,18 @@ export interface RuleStaffingDeps {
  *    `githubIssueStaffing`/`zendeskTicketStaffing` — also a config fact,
  *    also true regardless of census state.
  * 3. A live agent already observed for this rule → staffed, `reason: null`.
- * 4. A matched-but-withheld resource observed for this rule (the fleet-wide
- *    admission cap) → `"admission cap: ..."`.
- * 5. FACTORY-132: the agent census is unavailable (`!dashboardChecked` — see
+ * 4. FACTORY-132: the agent census is unavailable (`!dashboardChecked` — see
  *    that field's own doc comment: the MOST RECENT poll didn't succeed,
  *    whether or not an earlier one did) → `staffed: null` (neither true nor
  *    false — this daemon genuinely cannot say), `"census unavailable: ..."`.
  *    Must never collapse into `UNSTAFFED` — that was this exact defect.
- * 6. FACTORY-136/FACTORY-340: the admission source covering this rule's own
- *    provider (`admissionSourceCensus`, resolved via `RULE_ADMISSION_SOURCE`)
- *    has NOT reported this poll — declined, never-reported, OR (FACTORY-340)
- *    entirely ABSENT from this poll's admission census (`{ source, absent:
- *    true }` — see `admissionSourceCensusFor`'s own doc comment for the real
- *    `github-pr`-without-`config.github` case this covers) → `staffed: null`
- *    (the SAME tri-state FACTORY-132 introduced, not a distinct fourth
- *    state — see this function's own module-level discussion of that
- *    choice), naming the unavailable source in the reason. This is checked
- *    strictly AFTER the agent-census check (5) and AFTER the withheld check
- *    (4): a rule already known live or withheld (freshly observed OR carried
- *    forward from an earlier successful report of THIS SAME source) keeps
- *    that answer regardless of this poll's admission state, and a fully-down
- *    agent census is reported as that broader, more fundamental unknown
- *    rather than this narrower one. Only a rule whose provider's OWN source
- *    is unavailable (declined, never-reported, or absent) is affected — a
- *    rule whose source reported this poll keeps today's behaviour exactly,
- *    unchanged by this branch.
- * 7. Otherwise: a real, current zero — worded per `execution` mode, since
+ *
+ *    FACTORY-1013 removed the two further checks that used to sit here: a
+ *    matched-but-withheld resource (the deleted fleet-wide capacity cap), and
+ *    the per-provider admission census that had to be consulted before a zero
+ *    could be asserted. Neither has anything left to report — there is no
+ *    admission census, and no resource is ever matched-but-withheld.
+ * 5. Otherwise: a real, current zero — worded per `execution` mode, since
  *    "no matching resources" is not quite the right claim for a
  *    `singleton`/`persistent` rule's one query-level agent (see `Rule.execution`'s
  *    own doc comment, `../rules/rules.ts`).
@@ -401,20 +303,7 @@ export function ruleStaffingReason(rule: Rule, deps: RuleStaffingDeps): { staffe
   if (deps.configReason) return { staffed: false, reason: deps.configReason };
   const key = ruleCorrelationKey(rule.resourceProvider, rule.id);
   if (deps.live.has(key)) return { staffed: true, reason: null };
-  if (deps.withheld.has(key)) return { staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" };
   if (!deps.dashboardChecked) return { staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" };
-  if (deps.admissionSourceCensus && "absent" in deps.admissionSourceCensus) {
-    return {
-      staffed: null,
-      reason: `census unavailable: the "${deps.admissionSourceCensus.source}" admission source covering this rule is not present in this poll's admission census, so an admission-cap withholding for this rule cannot currently be ruled out`,
-    };
-  }
-  if (deps.admissionSourceCensus && !deps.admissionSourceCensus.census.checked) {
-    return {
-      staffed: null,
-      reason: `census unavailable: the "${deps.admissionSourceCensus.source}" admission source covering this rule has not reported this poll (${deps.admissionSourceCensus.census.reason}), so an admission-cap withholding for this rule cannot currently be ruled out`,
-    };
-  }
   return {
     staffed: false,
     reason: rule.execution === "swarm" ? "no matching resources this poll" : "no live agent observed for this rule this poll",
@@ -438,7 +327,6 @@ function buildRuleInventoryEntry(rule: Rule, deps: RuleStaffingDeps): RuleInvent
     enabled: rule.enabled,
     execution: rule.execution,
     account: rule.account,
-    role: rule.role,
     agentPreferences: (rule.agentPreferences ?? []).map(copyAgentPreference),
     linkedEventing: rule.linkedEventing === true,
     mcpServerNames: (rule.mcpServers ?? []).map((s) => s.name),
@@ -558,14 +446,12 @@ export interface BuildQueryAgentInventoryDeps {
 
 /** The whole inventory — see this module's own top comment for the shape and the reuse it is built from. */
 export async function buildQueryAgentInventory(deps: BuildQueryAgentInventoryDeps): Promise<QueryAgentInventory> {
-  const { live, withheld } = liveAndWithheldRuleKeys(deps.dashboard.rows);
+  const live = liveRuleKeys(deps.dashboard.rows);
   const rules = deps.rulesFile.rules.map((rule) =>
     buildRuleInventoryEntry(rule, {
       configReason: deps.configReasonFor(rule),
       live,
-      withheld,
       dashboardChecked: deps.dashboard.checked,
-      admissionSourceCensus: admissionSourceCensusFor(rule, deps.dashboard.admission),
     }),
   );
   const { entries: sessionDefinitions, errors: sessionErrors } = await buildSessionDefinitionInventory(deps.sessionDefinitions);

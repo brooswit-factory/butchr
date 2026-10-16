@@ -10,7 +10,7 @@
  *
  * SPEC CHANGE (a), agentsafety review 2026-10-05: no `title`/`maxAgents`
  * field — neither exists on `Rule`. The real fields are `execution`,
- * `account`, `role`, `agentPreferences`, `linkedEventing`, `mcpServerNames`
+ * `account`, `agentPreferences`, `linkedEventing`, `mcpServerNames`
  * — copied verbatim from `RuleInventoryEntry`, never invented.
  *
  * BRIEF HANDLING: the ticket's own instruction — never the full `brief`
@@ -60,7 +60,6 @@ export interface RulesApiRuleEntry {
   enabled: boolean;
   execution: RuleInventoryEntry["execution"];
   account: RuleInventoryEntry["account"];
-  role: RuleInventoryEntry["role"];
   agentPreferences: RuleInventoryEntry["agentPreferences"];
   linkedEventing: boolean;
   mcpServerNames: string[];
@@ -76,10 +75,6 @@ export interface RulesApiRuleEntry {
   permissionMode: RulePermissionMode | null;
   /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (today's "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts` — not necessarily `false`). */
   lizardMode: boolean | null;
-  /** FACTORY-907: read-only for now (see `Rule.maxNewPerTick`'s own doc comment, `../rules/rules.ts`) — same "read off the raw `Rule`, `null` when absent/unmatched" shape `permissionMode`/`lizardMode` already use; never added to the web write surface this Story. */
-  maxNewPerTick: number | null;
-  /** FACTORY-907: companion to `maxNewPerTick` immediately above — see `Rule.minSecondsBetweenAdmissions`'s own doc comment. */
-  minSecondsBetweenAdmissions: number | null;
   /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../rules/rules.ts`), never necessarily `false`. */
   resumeOnRespawn: boolean | null;
   /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see `Rule.resumeContextCutoff`'s own doc comment, `../rules/rules.ts`). */
@@ -168,14 +163,11 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       enabled: entry.enabled,
       execution: entry.execution,
       account: entry.account,
-      role: entry.role,
       agentPreferences: entry.agentPreferences,
       linkedEventing: entry.linkedEventing,
       mcpServerNames: entry.mcpServerNames,
       permissionMode: raw?.permissionMode ?? null,
       lizardMode: raw?.lizardMode ?? null,
-      maxNewPerTick: raw?.maxNewPerTick ?? null,
-      minSecondsBetweenAdmissions: raw?.minSecondsBetweenAdmissions ?? null,
       resumeOnRespawn: raw?.resumeOnRespawn ?? null,
       resumeContextCutoff: raw?.resumeContextCutoff ?? null,
       idlePokeMinutes: raw?.idlePokeMinutes ?? null,
