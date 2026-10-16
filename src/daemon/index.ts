@@ -1857,7 +1857,7 @@ const abandonedDetector = createAbandonedDetector({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
-  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
+  todoWorkers: createTodoWorkersFetch({ searchAll: (jql) => atlassian.searchAll(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts

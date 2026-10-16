@@ -477,15 +477,19 @@ export function createAbandonedDetector(deps: AbandonedDetectorDeps): AbandonedD
       // comment): one is "can't reach the query, so don't lose what already
       // works"; the other is "can't confirm Done, so don't claim it".
       let allIssues = issues;
+      let complete = true;
       if (deps.todoWorkers) {
         const todo = await deps.todoWorkers().catch((e) => {
           log(`WARNING: [abandoned] todoWorkers fetch failed: ${(e as Error)?.message ?? e}`);
           return null;
         });
         if (todo !== null) allIssues = [...issues, ...todo];
+        else complete = false;
       }
       const candidates = abandonedCandidates(allIssues);
-      tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.worker.key, c.boss))));
+      // Absence is meaningful only after a complete read. Keep observation
+      // clocks through query failures, while processing known active issues.
+      if (complete) tracker.forgetMissing(new Set(candidates.map((c) => pairKey(c.worker.key, c.boss))));
 
       for (const { worker, boss } of candidates) {
         const e = tracker.observe(worker.key, boss);

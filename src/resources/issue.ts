@@ -282,15 +282,15 @@ export interface IssueResourceDeps {
  */
 /**
  * BUTCHR-240: the `todoWorkers` fetch seam `createAbandonedDetector`
- * (src/agents/abandoned.ts) optionally takes — a single `deps.search(...)`
- * call, the same house pattern `createRelated` below uses for its own
- * batched extra query. Lives here, beside `TODO_WORKER_JQL`, rather than
+ * (src/agents/abandoned.ts) optionally takes. FACTORY-191 uses searchAll:
+ * all matching pages or a rejection, never a first-page-only snapshot.
+ * Lives here, beside `TODO_WORKER_JQL`, rather than
  * inside `abandoned.ts` itself, so that module's dependency surface never
  * has to import a JQL string or know how a search is actually issued — it
  * only takes a `() => Promise<JiraIssue[]>` function.
  */
-export function createTodoWorkersFetch(deps: Pick<IssueResourceDeps, "search">): () => Promise<JiraIssue[]> {
-  return () => deps.search(TODO_WORKER_JQL);
+export function createTodoWorkersFetch(deps: { searchAll(jql: string): Promise<JiraIssue[]> }): () => Promise<JiraIssue[]> {
+  return () => deps.searchAll(TODO_WORKER_JQL);
 }
 
 function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
