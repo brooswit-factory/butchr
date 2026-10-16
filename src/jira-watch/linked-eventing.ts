@@ -971,7 +971,24 @@ export function createLinkedEventingState(): LinkedEventingState {
     // kind this tick. FACTORY-137: resyncPending/TTL are correspondingly
     // left untouched too — a failed fetch never "settles" anything.
     if (searchFailed) return;
-    const byKey = new Map<string, JiraIssue>([...ctx.memberFetchedByKey, ...fetched.map((i) => [i.key, i] as const)]);
+    // Review round 3 (P2, continued): `ctx.memberFetchedByKey` must NOT seed
+    // `byKey` for an on-demand pass either, not just the fetch-exclusion
+    // above — same staleness, a different symptom. A dirty member that was
+    // deleted/became unreadable is correctly INCLUDED in `allTargets` now
+    // (the `!restrict` gate above), but Jira's batched search silently
+    // OMITS an unreadable/nonexistent key rather than returning an error
+    // for it (this module's own documented contract — see the `!issue`
+    // branch below). If `byKey` still fell back to the member's OLD cached
+    // object for that same key, the per-item loop would never see `!issue`
+    // at all: it would treat the stale object as still readable, settle
+    // its TTL, and clear the dirty mark with the unreadable transition
+    // never reported. So an on-demand pass's `byKey` is seeded ONLY from
+    // this pass's own fresh `fetched` results — a member target that drops
+    // out (no row returned) correctly resolves to `undefined` and hits the
+    // ordinary unreadable path below. A genuine regular tick (`!restrict`)
+    // keeps reusing `ctx.memberFetchedByKey` exactly as before (that data
+    // is fresh THIS tick, not stale).
+    const byKey = new Map<string, JiraIssue>([...(restrict ? [] : ctx.memberFetchedByKey), ...fetched.map((i) => [i.key, i] as const)]);
 
     // FACTORY-9: newest comment id per DISTINCT Jira-kind target actually
     // returned by the batched search above — one extra REST call per
