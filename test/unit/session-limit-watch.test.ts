@@ -475,6 +475,36 @@ describe("watchSessionLimits: capture (BUTCHR-12)", () => {
     expect(files.size).toBe(51); // 49 kept + 1 new + the foreign file
   });
 
+  // FACTORY-77: `jira-project` was missing from CAPTURE_NAME's provider
+  // alternation, so a jira-project rule-engine agent's own captures (e.g.
+  // `jira-project:sweep:BUTCHR-unrecognised-<ts>.txt`) were written but
+  // never recognised as "ours" — never evicted, never counted toward the
+  // cap, just accumulating in the capture directory forever. Mirrors (j)'s
+  // `jira-work` coverage for the `jira-project` provider specifically.
+  test("(k) jira-project rule-engine agent-key captures are recognised and evicted at the same cap, unrelated files untouched", async () => {
+    const agent = "jira-project:sweep:BUTCHR";
+    const ours = Array.from({ length: 50 }, (_, i) => `jira-project:sweep:BUTCHR-unrecognised-20260201T${String(i).padStart(2, "0")}0000Z.txt`);
+    const oldestName = ours[0]!;
+    const foreign = "jira-project:sweep:BUTCHR-escalation-20260101T000000Z.txt"; // escalation-loop shape: never ours
+    const unrelated = "operator-notes.txt"; // not capture-shaped at all: never ours
+    const { sink, files } = fakeSink([...ours, foreign, unrelated]);
+    const stop = watchSessionLimits({
+      list: async () => [row(agent, "idle", "p1")],
+      read: async () => fixture("pane-cap-session-limit-midscroll.txt"),
+      close: async () => {},
+      now: () => Date.now(),
+      log: () => {},
+      captures: sink,
+    }, 10);
+    await wait(30);
+    stop();
+    expect(files.has(oldestName)).toBe(false); // evicted
+    expect(files.has(foreign)).toBe(true); // not ours: never evicted
+    expect(files.has(unrelated)).toBe(true); // not ours: never evicted
+    expect([...files.keys()].some((n) => n.startsWith(`${agent}-unrecognised-`))).toBe(true);
+    expect(files.size).toBe(52); // 49 kept + 1 new + the foreign file + the unrelated file
+  });
+
   test("(g) no captures dep supplied => today's behaviour exactly (no throw, no capture-shaped log)", async () => {
     const logs: string[] = [];
     const stop = watchSessionLimits({
