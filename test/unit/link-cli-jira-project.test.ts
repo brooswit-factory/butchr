@@ -86,17 +86,32 @@ describe("malformed-config path (FACTORY-19): a bad ATLASSIAN_EMAIL", () => {
     try {
       const jiraJs: any = await import("jira.js");
       const jiraJsPkg = await import("jira.js/package.json", { with: { type: "json" } } as any).catch(() => undefined);
+      const zodMod: any = await import("zod");
+      const zodPkg = await import("zod/package.json", { with: { type: "json" } } as any).catch(() => undefined);
       let directThrow: unknown;
+      let directResultKeys: string[] = [];
       try {
-        jiraJs.createCloudClient({ host: "https://x.atlassian.net", auth: { type: "basic", email: "not-an-email", apiToken: "t" } });
+        const r = jiraJs.createCloudClient({ host: "https://x.atlassian.net", auth: { type: "basic", email: "not-an-email", apiToken: "t" } });
+        directResultKeys = r && typeof r === "object" ? Object.keys(r).slice(0, 10) : [];
       } catch (e) {
         directThrow = e;
       }
+      const rawRegex = /^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/;
+      let zodEmailResult: unknown = "n/a";
+      try {
+        zodEmailResult = zodMod.z.string().email().safeParse("not-an-email").success;
+      } catch (e) {
+        zodEmailResult = `threw: ${String(e)}`;
+      }
       console.error("FACTORY-77-DIAG2", JSON.stringify({
         jiraJsVersion: (jiraJsPkg as any)?.default?.version ?? (jiraJsPkg as any)?.version,
+        zodVersion: (zodPkg as any)?.default?.version ?? (zodPkg as any)?.version,
         hasCreateCloudClient: typeof jiraJs.createCloudClient,
         directThrowName: (directThrow as any)?.name,
         directThrowMessage: typeof (directThrow as any)?.message === "string" ? (directThrow as any).message.slice(0, 300) : String(directThrow),
+        directResultKeys,
+        rawRegexTest: rawRegex.test("not-an-email"),
+        zodEmailSafeParseSuccess: zodEmailResult,
       }));
     } catch (diagErr) {
       console.error("FACTORY-77-DIAG2-ERROR", String(diagErr));
