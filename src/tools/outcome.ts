@@ -52,8 +52,7 @@ export class Refusal extends Error {}
 /**
  * BUTCHR-341: the tag for the per-call OUTCOME record, deliberately DISTINCT
  * from the pre-existing `[tools]` tag (src/tools/defs.ts's own `audit`
- * helper) rather than a version marker appended to it — same reasoning
- * `ADMISSION2_TAG` (src/agents/admission.ts) already documents: journals
+ * helper) rather than a version marker appended to it, because journals
  * outlive deploys, so a reader (human or `scripts/audit-alias-calls.ts`)
  * must be able to tell which instrument produced a line from the line's own
  * shape, without knowing when this shipped. THIS IS NOT BACKWARD

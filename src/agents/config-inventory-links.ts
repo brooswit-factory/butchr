@@ -57,7 +57,7 @@ export interface SessionDefinitionCorrelationKey {
   agentKey?: string;
 }
 
-/** Every LIVE (`kind: "agent"`) row matching this rule's `(resourceProvider, id)` pair — see this module's own top comment for the match rule. Never a withheld row: item 3 of the ticket asks a config entry to link to its "running agent row(s)", and `staffed`/`reason` already carry the admission-cap case. */
+/** Every LIVE (`kind: "agent"`) row matching this rule's `(resourceProvider, id)` pair — see this module's own top comment for the match rule. The `kind` guard is kept for forward-compatibility with a future non-agent row kind (see `DashboardRow`'s own doc comment, `./dashboard.ts`); today every row is an agent row. */
 export function agentRowsForRule(rule: RuleCorrelationKey, rows: readonly DashboardRow[]): AgentDashboardRow[] {
   return rows.filter((row): row is AgentDashboardRow => {
     if (row.kind !== "agent") return false;

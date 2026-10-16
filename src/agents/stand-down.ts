@@ -5,8 +5,7 @@ import { unseenIds } from "../resources/project.js";
  * BUTCHR-307 — the issue tier's sleep/wake registry, the mechanism behind the
  * `stand_down` verb (src/tools/defs.ts). In-memory daemon state only, never
  * persisted — losing it on a restart is SAFE and self-healing: every active
- * issue is simply desired again and spawns, bounded by the admission cap
- * (BUTCHR-284). The only window where an edge can be lost this way is one
+ * issue is simply desired again and spawns. The only window where an edge can be lost this way is one
  * where the restart itself already wakes the agent anyway.
  *
  * WHY THIS IS NOT A PERSISTED WATERMARK, UNLIKE THE PROJECT TIER'S: the
@@ -236,7 +235,7 @@ export interface StandDownRegistry {
   /** Drop every sleep/crash-loop-exemption record for an id not in `stillPresent` this poll — bounds memory to currently-active issues (see this module's own top comment on the seen-set bound). */
   forgetMissing(stillPresent: ReadonlySet<string>): void;
   /**
-   * Returns `admitted` with any id whose most recent wake is still an
+   * Returns `spawning` with any id whose most recent wake is still an
    * unconsumed exemption removed, clearing that exemption for each id
    * removed. Wired at the daemon's crash-loop call site
    * (src/daemon/index.ts), wrapping `issueCrashLoopDetector.check` — see
@@ -246,12 +245,11 @@ export interface StandDownRegistry {
    * undeclared crash, so the detector's own definition ("unexplained
    * re-spawns") is correctly never shown this category of event at all —
    * the crash-loop detector's own source is untouched by this ticket.
-   * The exemption persists across polls until the id is ACTUALLY admitted
-   * (an admission-cap withhold does not consume it) — never expires on a
-   * timer, since a withheld candidate has not yet had the spawn this
-   * exemption is for.
+   * The exemption persists across polls until the id is ACTUALLY offered to
+   * the spawn loop — never expires on a timer, since an id the residency
+   * guard skipped has not yet had the spawn this exemption is for.
    */
-  consumeCrashLoopExemptions(admitted: readonly string[]): readonly string[];
+  consumeCrashLoopExemptions(spawning: readonly string[]): readonly string[];
 }
 
 export function createStandDownRegistry(deps: StandDownDeps): StandDownRegistry {
@@ -387,8 +385,8 @@ export function createStandDownRegistry(deps: StandDownDeps): StandDownRegistry 
       for (const id of [...yieldTimes.keys()]) if (!stillPresent.has(id)) { yieldTimes.delete(id); yieldSpoken.delete(id); }
     },
 
-    consumeCrashLoopExemptions(admitted) {
-      return admitted.filter((id) => {
+    consumeCrashLoopExemptions(spawning) {
+      return spawning.filter((id) => {
         if (crashLoopExempt.has(id)) {
           crashLoopExempt.delete(id);
           return false;

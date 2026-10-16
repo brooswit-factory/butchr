@@ -753,11 +753,9 @@ export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; er
  * computations `writeRuleEnabled`/`writeRuleFields` redo under the lock —
  * so `planHash` (`buildPlanHash`) is a real commitment an apply call can
  * verify, not a separate guess. `scope` (Jira dry-run ticket count) is
- * fleet-blind by design, same as before: the daemon's real reconcile loop
- * (`src/daemon/loop.ts`) considers the whole fleet's admission state, which
- * this report-only dry-run deliberately does not re-run. A caller wanting
- * the fleet-wide admission picture should read `/api/rules/:id/preview`'s
- * own `warning` field too.
+ * fleet-blind by design, same as before: it answers "how many tickets would
+ * this query match", not "what is the fleet doing right now", and this
+ * report-only dry-run deliberately does not re-run the reconcile loop.
  */
 export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
   const env = deps.env ?? process.env;

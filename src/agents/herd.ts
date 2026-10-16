@@ -729,7 +729,7 @@ export class HerdrHerd implements Herd {
      * itself holding any rule state (it is one flat instance shared by every
      * rule/provider — see src/daemon/index.ts). The caller resolves an
      * issue id to its rule's current `mcpServers` (or `undefined`); this
-     * mirrors `roleOfAgent` in src/daemon/index.ts, the same
+     * mirrors `ruleLizardModeOf` in src/daemon/index.ts, the same
      * decode-then-look-up-by-ruleId shape that field already uses for a
      * different rule-level property. Optional and defaulting to "no
      * bindings for anyone" is exactly what keeps a rule that never opts into

@@ -40,7 +40,7 @@ const UI = { id: "ui-first-rule", resourceProvider: "jira-work", query: "PLACEHO
 writeRulesFile(doc([MGR, UI]), env);
 const holder = createRulesHolder(loadRules(env).rules, sourceEtagOf(readFileSync(rulesFile, "utf8")));
 const issues = Array.from({ length: 3 }, (_, i) => ({ key: `P-${i + 1}`, fields: {} })) as any;
-const previewer = createRulesPreviewer({ rules: () => holder.getRules(), search: async () => issues, maxAgents: 24 } as any);
+const previewer = createRulesPreviewer({ rules: () => holder.getRules(), search: async () => issues } as any);
 const scopeOf = createScopeCache(async (id: string) => { const r: any = await previewer(id); return r.ok ? r.total : Number.POSITIVE_INFINITY; });
 const deps0: any = { env, reload: () => { const r = reloadRules(holder, env); return { applied: r.ok, problems: r.problems }; }, getSourceEtag: () => holder.getSourceEtag() };
 const alerts: string[] = [];
@@ -49,8 +49,8 @@ const csrf = createCsrfTokenIssuer(); const guard = { port: 0 };
 const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: "127.0.0.1", port: guard.port } });
 const fakeMcp = { connections: { list: () => [] } } as unknown as McpHandle;
 const unused = () => { throw new Error("unused"); };
-const deps = { state: async () => [], open: unused, openPane: unused, health: () => ({ ok: true }), dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
-  header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } }), resourceLink: unused, configInventory: async () => ({ rules: holder.getRules().map((r: any) => ({ kind: "rule", id: r.id, resourceProvider: r.resourceProvider, query: r.query, enabled: r.enabled, execution: r.execution, account: r.account, role: r.role, agentPreferences: r.agentPreferences ?? [], linkedEventing: !!r.linkedEventing, mcpServerNames: [], staffed: null, reason: "e2e harness: no agent fleet" })), sessionDefinitions: [], errors: [] }),
+const deps = { state: async () => [], open: unused, openPane: unused, health: () => ({ ok: true }), dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] }),
+  header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } }), resourceLink: unused, configInventory: async () => ({ rules: holder.getRules().map((r: any) => ({ kind: "rule", id: r.id, resourceProvider: r.resourceProvider, query: r.query, enabled: r.enabled, execution: r.execution, account: r.account, agentPreferences: r.agentPreferences ?? [], linkedEventing: !!r.linkedEventing, mcpServerNames: [], staffed: null, reason: "e2e harness: no agent fleet" })), sessionDefinitions: [], errors: [] }),
   dashboardAppRoot: join(import.meta.dir, "..", "dist", "web"), dashboardOriginGuard: guard, peerUidCheck, csrf, writeGuard: { dashboardOriginGuard: guard, peerUidCheck, csrf },
   rulesWrite: { enabled: (id: string, e: boolean, m: string, c: boolean, h: string) => writeRuleEnabled(id, e, m, c, h, scopeOf, deps0), fields: (id: string, p: any, m: string, c: boolean, h: string) => writeRuleFields(id, p, m, c, h, scopeOf, deps0), undo: (b: string) => writeUndo(b, deps0), plan: (id: string, p: any, c: boolean) => planRuleWrite(id, p, c, scopeOf, deps0) },
   auditWrite, rulesPreview: (id: string) => previewer(id), getRulesSourceEtag: () => holder.getSourceEtag(),

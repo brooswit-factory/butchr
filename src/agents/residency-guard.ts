@@ -57,7 +57,7 @@ export interface ResidencyGuard {
   filter: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
 }
 
-/** Builds the residency guard wired into `reconcileNow`'s `ReconcileOptions.checkResidency` (src/daemon/loop.ts), called immediately after `planReconcile` — BEFORE `opts.admission`, `checkCrashLoop`, `checkReap` and the spawn loop, all of which see its output rather than `plan.spawn`. (Read the call order off loop.ts itself, not off this line: an earlier version of this comment said "after `checkReap`", which loop.test.ts's own ordering assertion already contradicted.) */
+/** Builds the residency guard wired into `reconcileNow`'s `ReconcileOptions.checkResidency` (src/daemon/loop.ts), called immediately after `planReconcile` — BEFORE `checkCrashLoop`, `checkReap` and the spawn loop, all of which see its output rather than `plan.spawn`. (Read the call order off loop.ts itself, not off this line: an earlier version of this comment said "after `checkReap`", which loop.test.ts's own ordering assertion already contradicted.) */
 export function createResidencyGuard(deps: ResidencyGuardDeps): ResidencyGuard {
   const unknownStreak = new Map<string, number>();
   const log = (line: string) => deps.log?.(line);

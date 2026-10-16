@@ -46,7 +46,7 @@ const stub = Bun.serve({
 });
 const stubSite = `http://127.0.0.1:${stub.port}`;
 
-const env = { ATLASSIAN_SITE: stubSite, ATLASSIAN_EMAIL: "butchr@example.com", ATLASSIAN_TOKEN: SECRET_SENTINEL, BUTCHR_PORT: "0", BUTCHR_MAX_AGENTS: "8" };
+const env = { ATLASSIAN_SITE: stubSite, ATLASSIAN_EMAIL: "butchr@example.com", ATLASSIAN_TOKEN: SECRET_SENTINEL, BUTCHR_PORT: "0", BUTCHR_POLL_STALE_MS: "60000" };
 
 const auditLines: unknown[] = [];
 const auditWrite = createAuditLogger({ append: () => {}, host: "codey", log: () => {} });
@@ -59,7 +59,7 @@ const unused = () => { throw new Error("unused"); };
 
 const deps = {
   state: async () => [], open: unused, openPane: unused, health: () => ({ ok: true }),
-  dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
+  dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] }),
   header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } }),
   resourceLink: unused,
   configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),

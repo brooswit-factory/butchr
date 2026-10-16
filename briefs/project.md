@@ -32,8 +32,8 @@ the caller's issue type. Before creating work, search for an existing owner or
 active review and reuse it. File unrelated work only when authorized, naming
 its destination and purpose.
 
-Jira priority records planning intent; priority is not read by admission or reconcile, so it does not change which ticket is staffed first.
-Verify actual admission and owner activity instead of assuming a priority write
+Jira priority records planning intent; priority is not read by reconcile, so it does not change which ticket is staffed first.
+Verify actual owner activity instead of assuming a priority write
 changes execution order.
 
 Use `jira_transition` (key, status) only after checking the workflow's evidence,

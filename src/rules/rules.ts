@@ -78,7 +78,7 @@ export { AGENT_EFFORTS, type AgentEffort };
  * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
  * an INDEPENDENT copy of that constant (not imported FROM that module: it
- * already imports `ExecutionMode`/`AccountPolicy`/`AgentRole`/
+ * already imports `ExecutionMode`/`AccountPolicy`/
  * `McpServerBinding` FROM this file, so importing its
  * `SESSION_PERMISSION_MODES` back would cycle this file with it).
  * FACTORY-729: THIS copy's own value+type now live in `./agent-harness.ts`

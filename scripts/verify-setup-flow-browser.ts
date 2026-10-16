@@ -203,10 +203,10 @@ const rulesCsrf = createCsrfTokenIssuer();
 const rulesUnused = (): never => { throw new Error("unused in this normal-mode render"); };
 const normalModeDeps = {
   state: async () => [], open: rulesUnused, openPane: rulesUnused, health: () => ({ ok: true }),
-  dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
+  dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] }),
   header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag" as const, versionUnknownReason: null } }),
   resourceLink: rulesUnused,
-  configInventory: async () => ({ rules: rulesHolder.getRules().map((r) => ({ kind: "rule" as const, id: r.id, resourceProvider: r.resourceProvider, query: r.query, enabled: r.enabled, execution: r.execution, account: r.account, role: r.role, agentPreferences: r.agentPreferences ?? [], linkedEventing: !!r.linkedEventing, mcpServerNames: [], staffed: null, reason: "verify-setup-flow-browser: no agent fleet" })), sessionDefinitions: [], errors: [] }),
+  configInventory: async () => ({ rules: rulesHolder.getRules().map((r) => ({ kind: "rule" as const, id: r.id, resourceProvider: r.resourceProvider, query: r.query, enabled: r.enabled, execution: r.execution, account: r.account, agentPreferences: r.agentPreferences ?? [], linkedEventing: !!r.linkedEventing, mcpServerNames: [], staffed: null, reason: "verify-setup-flow-browser: no agent fleet" })), sessionDefinitions: [], errors: [] }),
   dashboardAppRoot,
   dashboardOriginGuard: rulesGuard, peerUidCheck: rulesPeerUidCheck,
   csrf: rulesCsrf, writeGuard: { dashboardOriginGuard: rulesGuard, peerUidCheck: rulesPeerUidCheck, csrf: rulesCsrf },

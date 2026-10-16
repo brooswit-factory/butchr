@@ -21,11 +21,14 @@
  * `resourceKey`, so a resource match here is by construction a resource this
  * daemon has ALREADY matched and (at least tried to) staff.
  *
- * `live` distinguishes a row this daemon is actually RUNNING right now
- * (`kind: "agent"`) from one it has matched but is currently withholding
- * (`kind: "withheld"`, the fleet-wide admission cap, BUTCHR-332) — both are
- * real agent keys in this daemon's registry, but only the former has a pane
- * to attach a terminal to.
+ * `live` was once the discriminator between a running row (`kind: "agent"`)
+ * and one this daemon had matched but was withholding under the fleet-wide
+ * capacity cap. FACTORY-1013 removed that cap and the withheld row kind with
+ * it, so every row in this registry is a running agent with a real pane:
+ * `live` is now always `true` and `pane` always non-null. The field is kept
+ * on the response shape (a consumer contract) and the `kind` guard below is
+ * kept for forward-compatibility with a future non-agent row kind — see
+ * `DashboardRow`'s own doc comment (../agents/dashboard.ts).
  */
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { DashboardRow } from "../agents/dashboard.js";

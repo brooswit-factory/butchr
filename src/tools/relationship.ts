@@ -698,7 +698,7 @@ export async function startWorker(ops: AtlassianOps, callerKey: string, workerKe
 
 /**
  * `check_worker` distinguishes a confirmed running or absent worker from an
- * unavailable observation. Admission capacity does not add a label verdict.
+ * unavailable observation.
  */
 export type StaffingVerdict = "staffed" | "not-staffed" | "could-not-look";
 
