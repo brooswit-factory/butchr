@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { rulesEtag, updateRulesFile } from "../../src/rules/write-rules.js";
 import { loadRules, type RulesEnv } from "../../src/rules/rules.js";
-import { capacityRoleFor } from "../../src/agents/capacity-role.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, planRuleCreate, createRule, buildPlanHash, createScopeCache, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { buildFieldsAllowedPaths } from "../../src/rules/rules-write-apply.js";
 import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, type RuleFieldPatch, type RuleCreateInput } from "../../src/rules/rules-write-registry.js";
@@ -309,22 +308,22 @@ describe("writeRuleFields (PUT)", () => {
   // impossible through this path"` test (`writeRuleEnabled`, above), just
   // against an operator's real rule instead of the seeded template, and
   // via `writeRuleFields` instead of `writeRuleEnabled`. `RuleFieldPatch`'s
-  // own TYPE (`rules-write-registry.ts`) names `execution`/`account`/`role`/
+  // own TYPE (`rules-write-registry.ts`) names `execution`/`account`/
   // `mcpServers`/`mcpConfigFile`/`brief` nowhere, and `applyRuleFieldPatch`
   // only ever copies an explicitly-named field onto the next document — so
   // a legitimate `query`-only edit through this path leaves every one of
   // them byte-for-byte untouched, for a non-`ui-` rule exactly as it always
   // did for `ui-first-rule`.
-  test("FACTORY-730: fixed template fields (execution/account/role/brief) stay untouched by a write to a non-ui- rule", async () => {
-    // `account`/`role` kept to their real schema's valid values (`rules.ts`'s
-    // own `AccountPolicy`/`AgentRole`) — `mcpServers`/`mcpConfigFile` are
+  test("FACTORY-730: fixed template fields (execution/account/brief) stay untouched by a write to a non-ui- rule", async () => {
+    // `account` kept to its real schema's valid values (`rules.ts`'s
+    // own `AccountPolicy`) — `mcpServers`/`mcpConfigFile` are
     // deliberately NOT exercised here (each carries its own much stricter
     // sub-schema — an absolute path, `jira-project`-only, a structured
     // server-binding shape — unrelated to what this test means to prove)
     // and are already covered as "never in `RuleFieldPatch`'s own type" by
     // this file's header comment and `rules-write-apply.ts`'s own explicit,
     // field-by-field copy.
-    const real = { ...MANAGERS_RULE, execution: "swarm", account: "none", role: "worker" };
+    const real = { ...MANAGERS_RULE, execution: "swarm", account: "none" };
     seed([real]);
     const deps = { env: env() };
     const patch = { query: "project = CHANGED" };
@@ -336,7 +335,6 @@ describe("writeRuleFields (PUT)", () => {
     expect(nextDoc.rules[0].query).toBe("project = CHANGED");
     expect(nextDoc.rules[0].execution).toBe("swarm");
     expect(nextDoc.rules[0].account).toBe("none");
-    expect(nextDoc.rules[0].role).toBe("worker");
     expect(nextDoc.rules[0].brief).toBe(real.brief);
   });
 
@@ -589,80 +587,10 @@ describe("FACTORY-729: permissionMode bypassPermissions/auto and lizardMode:true
     expect(outcome.ok).toBe(true);
   });
 
-  // FACTORY-817: `role: "sentinel"` joins this gate — see `isRiskyFieldPatch`'s own doc comment (`src/rules/rules-write.ts`).
-  test("setting role: sentinel without confirm is refused, writes nothing", async () => {
-    const text = seed([UI_RULE]);
-    const deps = { env: env() };
-    const patch: RuleFieldPatch = { role: "sentinel" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
-    const etag = rulesEtag(env());
-    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
-    expect(outcome.ok).toBe(false);
-    if (!outcome.ok) expect(outcome.status).toBe(409);
-    expect(readFileSync(rulesFilePath(), "utf8")).toBe(text);
-  });
 
-  test("setting role: sentinel WITH confirm succeeds", async () => {
-    seed([UI_RULE]);
-    const deps = { env: env() };
-    const patch: RuleFieldPatch = { role: "sentinel" };
-    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
-    const etag = rulesEtag(env());
-    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
-    expect(outcome.ok).toBe(true);
-    const nextDoc = JSON.parse(readFileSync(rulesFilePath(), "utf8"));
-    expect(nextDoc.rules[0].role).toBe("sentinel");
-  });
 
-  test("setting role: worker (the default, an explicit opt-in) needs no confirm", async () => {
-    seed([UI_RULE]);
-    const deps = { env: env() };
-    const patch: RuleFieldPatch = { role: "worker" };
-    const planHash = await planHashFor("ui-first-rule", patch, false, noScope, deps);
-    const etag = rulesEtag(env());
-    const outcome = await writeRuleFields("ui-first-rule", patch, etag, false, planHash, noScope, deps);
-    expect(outcome.ok).toBe(true);
-  });
 
-  test("planRuleWrite: requiresConfirm with confirmReason \"capacity-sentinel\" for role: sentinel alone", async () => {
-    seed([UI_RULE]);
-    const plan = await planRuleWrite("ui-first-rule", { role: "sentinel" }, false, noScope, { env: env() });
-    expect(plan.ok).toBe(true);
-    if (plan.ok) {
-      expect(plan.requiresConfirm).toBe(true);
-      expect(plan.confirmReason).toBe("capacity-sentinel");
-    }
-  });
 
-  // FACTORY-817 criterion 4: the write must be what the ENGINE reads, not
-  // just what the stored row says — `loadRules` is the same parse the
-  // daemon runs at startup/reload, and `capacityRoleFor` (fed a
-  // `ruleRoleOf` built off its `rules`, mirroring `src/daemon/index.ts`'s
-  // own `ruleRoleOfAgent`) is the exact function the admission controller
-  // calls. Asserting through both, not just `nextDoc.rules[0].role`, is
-  // what tells this apart from a write that merely LOOKS right in the file.
-  test("round-trip through loadRules + capacityRoleFor: writing role: sentinel is what the engine's own reader sees", async () => {
-    seed([UI_RULE]);
-    const deps = { env: env() };
-    const patch: RuleFieldPatch = { role: "sentinel" };
-    const planHash = await planHashFor("ui-first-rule", patch, true, noScope, deps);
-    const etag = rulesEtag(env());
-    const outcome = await writeRuleFields("ui-first-rule", patch, etag, true, planHash, noScope, deps);
-    expect(outcome.ok).toBe(true);
-
-    const loaded = loadRules(env());
-    const ruleRoleOf = (id: string) => loaded.rules.find((r) => r.id === "ui-first-rule")?.role;
-    expect(capacityRoleFor("jira-work:ui-first-rule:BUTCHR-1", ruleRoleOf)).toBe("sentinel");
-  });
-
-  test("round-trip through loadRules + capacityRoleFor: an UNSET role reads as the engine's own \"worker\" default", async () => {
-    seed([UI_RULE]);
-    const loaded = loadRules(env());
-    const rule = loaded.rules.find((r) => r.id === "ui-first-rule")!;
-    expect(rule.role).toBe("worker");
-    const ruleRoleOf = (id: string) => loaded.rules.find((r) => r.id === "ui-first-rule")?.role;
-    expect(capacityRoleFor("jira-work:ui-first-rule:BUTCHR-1", ruleRoleOf)).toBe("worker");
-  });
 
   test("planRuleWrite: requiresConfirm with confirmReason \"risky-permission\" for permissionMode: bypassPermissions alone", async () => {
     seed([UI_RULE]);
@@ -1351,14 +1279,13 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
       brief: "do the thing",
       execution: "swarm",
       account: "none",
-      role: "worker",
       ...overrides,
     } as Rule;
   }
 
   /** Wires `scopeOf` exactly as `src/daemon/index.ts` does: a real `createRulesPreviewer` (default `rateLimitMs`), wrapped in `createScopeCache` (also at its own real default TTL unless `cacheDeps` says otherwise). */
   function realScopeOf(rule: Rule, issues: JiraIssue[], cacheDeps?: Parameters<typeof createScopeCache>[1]) {
-    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => issues, maxAgents: 50 });
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => issues });
     return createScopeCache(async (id: string): Promise<number> => {
       const r = await previewer(id);
       return r.ok ? r.total : Number.POSITIVE_INFINITY;
@@ -1371,7 +1298,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     const deps = { env: env() };
     // The uncached shape `src/daemon/index.ts` had BEFORE this fix: a
     // fresh `scopeOf` closure with no cache in front of it at all.
-    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => [issue("F-1")], maxAgents: 50 });
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => [issue("F-1")] });
     const uncachedScopeOf = async (id: string): Promise<number> => {
       const r = await previewer(id);
       return r.ok ? r.total : Number.POSITIVE_INFINITY;
@@ -1469,7 +1396,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     const rule = previewRule();
     seed([rule]);
     const deps = { env: env() };
-    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); } });
     const scopeOf = createScopeCache(async (id: string): Promise<number> => {
       const r = await previewer(id);
       return r.ok ? r.total : Number.POSITIVE_INFINITY;
@@ -1496,7 +1423,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     const rule = previewRule();
     seed([rule]);
     const deps = { env: env() };
-    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); } });
     const scopeOf = createScopeCache(async (id: string): Promise<number> => {
       const r = await previewer(id);
       return r.ok ? r.total : Number.POSITIVE_INFINITY;
@@ -1525,7 +1452,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     const rule = previewRule();
     seed([rule]);
     const deps = { env: env() };
-    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); }, maxAgents: 50 });
+    const previewer = createRulesPreviewer({ rules: () => [rule], search: async () => { throw new Error("Jira is down"); } });
     const scopeOf = createScopeCache(async (id: string): Promise<number> => {
       const r = await previewer(id);
       return r.ok ? r.total : Number.POSITIVE_INFINITY;
@@ -1600,7 +1527,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     });
 
     test("end-to-end repro (the ticket's own acceptance test): plan on a 3-ticket query, widen to 40, plan again WITHIN the TTL — scope is 40, and ceiling/confirm logic applies to 40", async () => {
-      const rule = { id: "ui-first-rule", enabled: false, resourceProvider: "jira-work" as const, query: "project = A", brief: "do the thing", execution: "swarm" as const, account: "none" as const, role: "worker" as const };
+      const rule = { id: "ui-first-rule", enabled: false, resourceProvider: "jira-work" as const, query: "project = A", brief: "do the thing", execution: "swarm" as const, account: "none" as const };
       seed([rule]);
       const deps = { env: env() };
       let now = 0;
@@ -1814,7 +1741,7 @@ describe("createRule", () => {
   test("with an agentPreferences entry: writes harness/model through untouched", async () => {
     seed([MANAGERS_RULE]);
     const deps = { env: env() };
-    const input: RuleCreateInput = { ...NEW_RULE_INPUT, id: "new-rule-2", agentPreferences: [{ harness: "claude", model: "sonnet" }], permissionMode: "acceptEdits", lizardMode: true, role: "sentinel" };
+    const input: RuleCreateInput = { ...NEW_RULE_INPUT, id: "new-rule-2", agentPreferences: [{ harness: "claude", model: "sonnet" }], permissionMode: "acceptEdits", lizardMode: true };
     const planHash = await createPlanHashFor(input, true, noScope, deps);
     const outcome = await createRule(input, true, planHash, noScope, deps);
     expect(outcome.ok).toBe(true);
@@ -1823,6 +1750,5 @@ describe("createRule", () => {
     expect(created.agentPreferences).toEqual([{ harness: "claude", model: "sonnet" }]);
     expect(created.permissionMode).toBe("acceptEdits");
     expect(created.lizardMode).toBe(true);
-    expect(created.role).toBe("sentinel");
   });
 });

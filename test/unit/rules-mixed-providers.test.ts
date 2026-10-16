@@ -32,17 +32,17 @@ describe("a mixed, github-pr-free rules file loads and parses unchanged", () => 
       {
         id: "tasks", enabled: true, resourceProvider: "jira-work",
         query: 'assignee = currentUser() AND issuetype = Task AND status IN ("In Progress", "In Review")',
-        brief: "@builtin:task", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults,
+        brief: "@builtin:task", execution: "swarm", account: "none", ...idlePokeDefaults,
       },
       {
         id: "bugs", enabled: true, resourceProvider: "github-issue",
         query: "type:Bug is:open", brief: "Fix the bug, then comment what you did.",
-        execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults,
+        execution: "swarm", account: "none", ...idlePokeDefaults,
       },
       {
         id: "configs", enabled: true, resourceProvider: "filesystem",
         query: '{"root":"/srv/factory/config","kind":"file","namePattern":"*.json","maxDepth":2}',
-        brief: "Keep this config file correct and well-formed.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults,
+        brief: "Keep this config file correct and well-formed.", execution: "swarm", account: "none", ...idlePokeDefaults,
       },
     ]);
   });

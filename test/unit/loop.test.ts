@@ -350,17 +350,14 @@ describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
     expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchatAccount: "butchr_x", origin: undefined }]);
   });
 
-  test("ensure refusing (null) WITHHOLDS the spawn: herd.spawn is never called, and the id is excluded from onAdmitted's succeeded set", async () => {
+  test("ensure refusing (null) REFUSES the spawn: herd.spawn is never called, and the refusal is recorded as a spawn-stage failure", async () => {
     const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
-    const admitted: string[] = [];
     const failures: unknown[] = [];
     await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
       account: { ensure: async () => null, release: async () => {}, retryPendingReleases: async () => {}, publishBatch: async () => {} },
-      onAdmitted: (succeeded) => admitted.push(...succeeded),
       checkReconcileFailure: async (fs) => { failures.push(...fs); },
     });
     expect(spawnedSpecs).toEqual([]);
-    expect(admitted).toEqual([]);
     expect(failures).toEqual([{ id: "NEW", stage: "spawn", error: expect.any(Error) }]);
   });
 
@@ -794,21 +791,16 @@ describe("reconcileNow: BUTCHR-287 residency guard — cold start, independent o
     expect(crashLoopSaw).toEqual([["VACANT-1"]]);
   });
 
-  test("composes with BUTCHR-284's admission cap: a resident duplicate is filtered out BEFORE admission rations the list, so it never consumes a cap slot a genuinely-new ticket could have used", async () => {
+  test("checkResidency's output — not plan.spawn — is what the spawn loop attempts: an already-resident candidate is never re-spawned, and every other candidate starts THIS poll", async () => {
     const herd = fakeHerd([]);
     const desired = new Map([["RESIDENT-1", spec("RESIDENT-1")], ["NEW-1", spec("NEW-1")], ["NEW-2", spec("NEW-2")]]);
-    const admissionSaw: string[][] = [];
     await reconcileNow(herd, desired, {
       checkResidency: async (spawning) => spawning.filter((id) => id !== "RESIDENT-1"),
-      // A cap of 2, admitting from the front of whatever it's handed: if it
-      // were handed the unfiltered plan.spawn (3 candidates, RESIDENT-1
-      // included), it would admit RESIDENT-1 + one genuine candidate and
-      // strand the other genuine one — under-delivering real work by
-      // exactly the phantom it admitted. With RESIDENT-1 already filtered,
-      // it admits both genuine candidates.
-      admission: async (candidates) => { admissionSaw.push([...candidates]); return candidates.slice(0, 2); },
     });
-    expect(admissionSaw).toEqual([["NEW-1", "NEW-2"]]); // RESIDENT-1 never reached admission at all
+    // Idempotency, preserved after FACTORY-1013 removed capacity admission:
+    // RESIDENT-1 already has its own agent, so it is dropped — and EVERY
+    // other eligible candidate starts on this very poll, with no cap, queue
+    // or pacing between the filter and the spawn loop.
     expect(herd.spawned.sort()).toEqual(["NEW-1", "NEW-2"]);
   });
 });

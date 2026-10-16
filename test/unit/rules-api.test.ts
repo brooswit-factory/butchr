@@ -12,7 +12,6 @@ function rule(overrides: Partial<Rule> = {}): Rule {
     brief: "a".repeat(300),
     execution: "swarm",
     account: "none",
-    role: "worker",
     ...overrides,
   } as Rule;
 }
@@ -26,7 +25,6 @@ function entry(overrides: Partial<RuleInventoryEntry> = {}): RuleInventoryEntry 
     enabled: true,
     execution: "swarm",
     account: "none",
-    role: "worker",
     agentPreferences: [],
     linkedEventing: false,
     mcpServerNames: [],
@@ -79,7 +77,6 @@ describe("buildRulesApiResponse", () => {
     expect(out.resourceProvider).toBe("jira-work");
     expect(out.execution).toBe("swarm");
     expect(out.account).toBe("none");
-    expect(out.role).toBe("worker");
     expect(out.staffed).toBe(true);
     expect(out.whyUnstaffed).toBeNull();
     expect(out.briefExcerpt.length).toBe(BRIEF_EXCERPT_MAX);
@@ -167,28 +164,6 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.idlePokeMessage).toBeNull();
     // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null.
     expect(r.rules[0]!.idlePokeEnabled).toBe(true);
-  });
-  test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
-    const r = buildRulesApiResponse({
-      rulesFile: { path: "/rules.json", rules: [rule({ maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 })], error: null },
-      mtime: null,
-      sourceEtag: "deadbeef",
-      fileEtag: "deadbeef",
-      ruleInventory: [entry()],
-    });
-    expect(r.rules[0]!.maxNewPerTick).toBe(2);
-    expect(r.rules[0]!.minSecondsBetweenAdmissions).toBe(30);
-  });
-  test("FACTORY-907: absent maxNewPerTick/minSecondsBetweenAdmissions on the raw Rule read as null", () => {
-    const r = buildRulesApiResponse({
-      rulesFile: { path: "/rules.json", rules: [rule()], error: null },
-      mtime: null,
-      sourceEtag: "deadbeef",
-      fileEtag: "deadbeef",
-      ruleInventory: [entry()],
-    });
-    expect(r.rules[0]!.maxNewPerTick).toBeNull();
-    expect(r.rules[0]!.minSecondsBetweenAdmissions).toBeNull();
   });
   test("invalid file: valid:false, problems populated from the error message, zero rules", () => {
     const r = buildRulesApiResponse({

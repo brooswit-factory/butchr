@@ -60,7 +60,6 @@ describe("docs/codey-session-definitions.example/", () => {
       const def = load(name);
       expect(def.execution).toBe("persistent");
       expect(def.account).toBe("permanent");
-      expect(def.role).toBe("sentinel");
       expect(def.frozen).toBe(false);
       expect(def.vendor).toBe("claude");
       const names = (def.mcpServers ?? []).map((m) => m.name);
@@ -98,7 +97,6 @@ describe("docs/codey-session-definitions.example/", () => {
       const def = load(name);
       expect(def.execution).toBe("persistent");
       expect(def.account).toBe("none");
-      expect(def.role).toBe("sentinel");
       expect(def.frozen).toBe(true);
       expect(def.tier).toBe("tier1");
       expect(def.vendor).toBe("claude");

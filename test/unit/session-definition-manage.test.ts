@@ -40,14 +40,14 @@ const missingRootList = async (): Promise<FilesystemResource[]> => { throw Objec
 
 describe("listSessionDefinitions — everything, not just the eligible subset", () => {
   test("a valid definition reports vendor/tier/role/execution and both freeze gates", async () => {
-    const text = JSON.stringify(goodDef({ role: "sentinel", execution: "persistent" }));
+    const text = JSON.stringify(goodDef({ execution: "persistent" }));
     const { list, read } = fakeFiles({ [absPath("defs", "a.json")]: text });
     const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: absPath("defs", "a.json") });
     const store = fakeStore(new Set([`butchr:${agentKey}`]));
     const entries = await listSessionDefinitions({ dir: absPath("defs"), list, read, store });
     expect(entries).toEqual([{
       name: "a.json", path: absPath("defs", "a.json"), agentKey, valid: true, problems: [],
-      vendor: "claude", tier: "tier1", role: "sentinel", execution: "persistent",
+      vendor: "claude", tier: "tier1", execution: "persistent",
       account: "none", permissionMode: "default", workingDirectory: absPath("repo", "project"), mcpServerNames: [],
       manifestFrozen: false, storeFrozen: true,
       freezeControllers: [], unfreezeControllers: [],

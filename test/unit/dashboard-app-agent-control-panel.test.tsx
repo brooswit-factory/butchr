@@ -151,6 +151,5 @@ describe("AgentControlPanel — FACTORY-666", () => {
     expect(queryByTestId("agent-control-stop-button")).toBeNull();
     const note = await findByTestId("agent-control-start-note");
     expect(note.textContent).toContain("next reconcile poll");
-    expect(note.textContent).toContain("fleet-wide agent cap");
   });
 });

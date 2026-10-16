@@ -386,7 +386,7 @@ describe("listFilesystemResources caps (fake io)", () => {
 const rule = (over: Partial<Rule> = {}): Rule => ({
   id: "docs", enabled: true, resourceProvider: "filesystem",
   query: JSON.stringify({ root: "/repo", kind: "file", namePattern: "*.md" }),
-  brief: "Keep it current.", execution: "swarm", account: "none", role: "worker",
+  brief: "Keep it current.", execution: "swarm", account: "none",
   ...over,
 });
 
@@ -761,9 +761,9 @@ describe("filesystem in the shared agent-key / rules / identity surfaces", () =>
     expect(() => parseRules({ rules: [bad] })).toThrow("relationships are not supported for filesystem rules yet");
   });
   test("execution/account/role apply generically to filesystem rules too", () => {
-    const doc = { id: "docs", resourceProvider: "filesystem", query: JSON.stringify({ root: "/repo", kind: "file" }), brief: "go", execution: "persistent", role: "sentinel" };
+    const doc = { id: "docs", resourceProvider: "filesystem", query: JSON.stringify({ root: "/repo", kind: "file" }), brief: "go", execution: "persistent" };
     const [r] = parseRules({ rules: [doc] });
-    expect(r).toMatchObject({ execution: "persistent", role: "sentinel", account: "none" });
+    expect(r).toMatchObject({ execution: "persistent", account: "none" });
   });
 
   test("callerIdentity resolves a filesystem agent from its key alone, and refuses one that also carries x-issue", () => {

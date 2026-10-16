@@ -35,7 +35,7 @@ describe("legacyAgentPreflight", () => {
     if (r.ok) return;
     expect(r.message).toContain("1 agent(s) still running in legacy flat workspaces under /w. Refusing to start.");
     expect(r.message).toContain("BUTCHR-7: pane p3 in /w/butchr-7");
-    expect(r.message).toContain("BUTCHR_MAX_AGENTS");
+    expect(r.message).toContain("each keeps consuming host resources");
     expect(r.message).toContain("does not stop or adopt them");
     expect(r.message).toContain("kept on disk");
   });

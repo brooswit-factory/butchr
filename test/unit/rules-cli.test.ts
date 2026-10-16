@@ -118,7 +118,7 @@ describe("Jira dry run", () => {
 
   test("a failed search (Jira unreachable) is a clear message, exit 1, never a crash", async () => {
     const file = writeRules({ rules: [{ id: "r1", resourceProvider: "jira-work", query: "key = X-1", brief: "b" }] });
-    const loadJiraEnv = (): RulesCheckJiraEnv => ({ maxAgents: 8, search: async () => { throw new Error("ECONNREFUSED"); } });
+    const loadJiraEnv = (): RulesCheckJiraEnv => ({ search: async () => { throw new Error("ECONNREFUSED"); } });
     expect(await runRulesCli(["check", file], io({ loadJiraEnv }))).toBe(1);
     expect(err.join("\n")).toMatch(/dry-run query failed/);
     expect(err.join("\n")).toMatch(/ECONNREFUSED/);
@@ -126,7 +126,7 @@ describe("Jira dry run", () => {
 
   test("zero matches: printed plainly, exit 0", async () => {
     const file = writeRules({ rules: [{ id: "r1", resourceProvider: "jira-work", query: "key = X-1", brief: "b" }] });
-    const loadJiraEnv = (): RulesCheckJiraEnv => ({ maxAgents: 8, search: async () => [] });
+    const loadJiraEnv = (): RulesCheckJiraEnv => ({ search: async () => [] });
     expect(await runRulesCli(["check", file], io({ loadJiraEnv }))).toBe(0);
     expect(out.join("\n")).toMatch(/would staff 0 ticket\(s\)/);
     expect(out.join("\n")).toMatch(/0 tickets matched/);
@@ -135,7 +135,6 @@ describe("Jira dry run", () => {
   test("matches: key/status/summary printed, impossible-to-miss total, exit 0", async () => {
     const file = writeRules({ rules: [{ id: "r1", resourceProvider: "jira-work", query: "assignee = currentUser()", brief: "b" }] });
     const loadJiraEnv = (): RulesCheckJiraEnv => ({
-      maxAgents: 8,
       search: async () => [issue("FACTORY-1", "In Progress", "Fix the thing")],
     });
     expect(await runRulesCli(["check", file], io({ loadJiraEnv }))).toBe(0);
@@ -146,15 +145,6 @@ describe("Jira dry run", () => {
     expect(text).toMatch(/WOULD STAFF 1 REAL TICKET/);
   });
 
-  test("matches over maxAgents: a plain warning naming the cap", async () => {
-    const file = writeRules({ rules: [{ id: "r1", resourceProvider: "jira-work", query: "assignee = currentUser()", brief: "b" }] });
-    const loadJiraEnv = (): RulesCheckJiraEnv => ({
-      maxAgents: 2,
-      search: async () => [issue("A-1", "In Progress", "one"), issue("A-2", "In Progress", "two"), issue("A-3", "In Progress", "three")],
-    });
-    expect(await runRulesCli(["check", file], io({ loadJiraEnv }))).toBe(0);
-    expect(out.join("\n")).toMatch(/WARNING: 3 match\(es\) exceed maxAgents=2/);
-  });
 
   test("jira-work and jira-idea rules are both dry-run, each against its own query", async () => {
     const file = writeRules({
@@ -165,7 +155,6 @@ describe("Jira dry run", () => {
     });
     const calls: string[] = [];
     const loadJiraEnv = (): RulesCheckJiraEnv => ({
-      maxAgents: 8,
       search: async (jql) => {
         calls.push(jql);
         if (jql === "project = X") return [issue("X-1", "In Progress", "work item", { issuetype: "Task" })];
@@ -186,7 +175,6 @@ describe("Jira dry run", () => {
   test("a jira-work rule's query never staffs an unproven idea, and vice versa (same exclusion the daemon itself applies)", async () => {
     const file = writeRules({ rules: [{ id: "broad", resourceProvider: "jira-work", query: "project = X", brief: "b" }] });
     const loadJiraEnv = (): RulesCheckJiraEnv => ({
-      maxAgents: 8,
       search: async () => [issue("X-1", "In Progress", "an idea", { issuetype: "Idea", projectType: "product_discovery" })],
     });
     expect(await runRulesCli(["check", file], io({ loadJiraEnv }))).toBe(0);
@@ -230,10 +218,9 @@ describe("no-write guarantee (mutation check)", () => {
 });
 
 describe("createJiraEnv", () => {
-  test("wires maxAgents and search from the real config/client", async () => {
+  test("wires search from the real config/client", async () => {
     const fetchImpl = async (): Promise<Response> => new Response(JSON.stringify({ issues: [{ key: "K-1", fields: {} }] }), { status: 200 });
-    const jira = createJiraEnv({ ATLASSIAN_SITE: "https://x.atlassian.net", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "t", BUTCHR_MAX_AGENTS: "3" }, fetchImpl);
-    expect(jira.maxAgents).toBe(3);
+    const jira = createJiraEnv({ ATLASSIAN_SITE: "https://x.atlassian.net", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "t" }, fetchImpl);
     expect((await jira.search("x")).map((i) => i.key)).toEqual(["K-1"]);
   });
 

@@ -137,7 +137,7 @@ describe("the MCP auth gate", () => {
   const view = {
     state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }),
     health: () => ({ ok: true, components: [] }),
-    dashboard: async () => ({ checked: true as const, confirmedAt: "", rows: [], admission: { cap: 0, residency: null, sources: [] } }),
+    dashboard: async () => ({ checked: true as const, confirmedAt: "", rows: [] }),
     header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "t", version: "0", versionProvenance: "tag", versionUnknownReason: null } }),
     resourceLink: async () => ({ ok: true as const, url: "x" }),
   };

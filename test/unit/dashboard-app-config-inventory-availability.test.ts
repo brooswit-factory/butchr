@@ -10,7 +10,6 @@ const rule: RuleInventoryEntry = {
   enabled: true,
   execution: "swarm",
   account: "none",
-  role: "worker",
   agentPreferences: [],
   linkedEventing: false,
   mcpServerNames: [],

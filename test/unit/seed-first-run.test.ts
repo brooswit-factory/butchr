@@ -47,7 +47,6 @@ describe("seedFirstRunRules — true first run", () => {
     // deliberately rather than deleted, per this ticket's own instruction.
     expect(rule.execution).toBe("swarm");
     expect(rule.account).toBe("none");
-    expect(rule.role).toBe("worker");
     expect(rule.permissionMode).toBe("default");
     expect(rule.lizardMode).toBe(true);
     expect(rule.agentPreferences).toEqual([{ harness: "claude", model: "sonnet", effort: "low" }]);

@@ -7,13 +7,10 @@ import { sessionAgentKey } from "../../src/resources/session-freeze.js";
 import { absPath } from "../helpers/abs-path";
 import {
   buildDashboardRows,
-  buildAdmissionView,
-  updateWithheldRows,
   createDashboardFeed,
   type DashboardAgent,
   type DashboardResponse,
 } from "../../src/agents/dashboard.js";
-import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 
 /** FACTORY-407: the bare provider-native resource id these fixtures have always named their agents by — unchanged. */
@@ -32,7 +29,6 @@ function agent(name: string, status = "idle", pane = "p1"): DashboardAgent {
   return { name, resource_key: resourceIdFor(name), agent_key: agentKeyFor(name), agent_status: status, pane_id: pane };
 }
 
-const NO_ADMISSION = { cap: 0, residency: null, sentinels: null, sources: [] as const };
 
 /**
  * Extracts the inner text of the FIRST element whose opening tag contains
@@ -80,7 +76,7 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
       issueMeta: (k) => meta.get(k),
       tracker: new StatusFloorTracker(() => now),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(now).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(now).toISOString(), rows };
     const html = renderDashboard(response, opts({ now }));
     expect(html).toContain("BUTCHR-1");
     expect(html).toContain("Task");
@@ -91,7 +87,7 @@ describe("renderDashboard: agent rows, driven by the real buildDashboardRows (BU
 
   test("a project-tier row renders tier 'project' — no issuetype to know or decline", () => {
     const rows = buildDashboardRows([agent("butchr-butchr", "idle", "p2")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     expect(renderDashboard(response, opts())).toContain(">project<");
   });
 });
@@ -112,7 +108,7 @@ describe("renderDashboard: the visible .key label is the bare resource id, never
       issueMeta: () => ({ summary: "s", issuetype: "Task" }),
       tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(elementText(html, 'class="key"', "</span>")).toBe("BUTCHR-1");
     // the full key must still be present ELSEWHERE on the row (hrefs/anchors) — this ticket narrows only the visible label
@@ -121,7 +117,7 @@ describe("renderDashboard: the visible .key label is the bare resource id, never
 
   test("a project-tier row's .key label is the bare project id exactly — not the full jira-project:<rule>:<id> agent key", () => {
     const rows = buildDashboardRows([agent("butchr-butchr", "idle", "p2")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(elementText(html, 'class="key"', "</span>")).toBe("BUTCHR");
   });
@@ -132,7 +128,7 @@ describe("renderDashboard: the visible .key label is the bare resource id, never
       [{ name: "director", resource_key: "director", agent_key: key, agent_status: "idle", pane_id: "p1" }],
       { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) },
     );
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(elementText(html, 'class="key"', "</span>")).toBe("filesystem:director (query)");
   });
@@ -161,40 +157,25 @@ describe("renderDashboard: the pane is visible text on every agent row (BUTCHR-3
       issueMeta: () => undefined,
       tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(elementText(html, 'class="pane"', "</span>")).toBe("w1:p3");
   });
 
-  test("a withheld row (real updateWithheldRows, cap 0) renders no pane and no pane slot at all — a withheld row has no agent, so no pane to show", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-99"], [], "issue");
-    const census = controller.census();
-    const withheldRows = updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() });
-    const rows = [...withheldRows.values()].flat();
-    expect(rows).toHaveLength(1);
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).not.toContain('class="pane"');
-  });
 });
 
 // ---------------------------------------------------------------------------
 // Mutation 1: a could-not-check value rendered like a known value — all THREE
-// sub-cases the ticket names (whole response, a row's issuetype, a census
-// source). Each assertion below is a NAMED test that fails if the
+// sub-cases the ticket names (whole response, a row's issuetype). Each assertion below is a NAMED test that fails if the
 // corresponding could-not-check branch in dashboard-page.ts is deleted or
 // collapsed into the "known" one.
 // ---------------------------------------------------------------------------
-describe("renderDashboard: mutation 1 — could-not-check rendered like known (three sub-cases, BUTCHR-339)", () => {
+describe("renderDashboard: mutation 1 — could-not-check rendered like known (two sub-cases, BUTCHR-339)", () => {
   test("1a. whole response: a failed agent-list read (checked:false) renders the loud banner, never the calm confirmed styling, and carried-forward rows render STALE", async () => {
-    const admission = createAdmissionController({ cap: 10, residency: async () => [] });
     const feed = createDashboardFeed({
       now: () => 1000,
       issueMeta: () => undefined,
       tracker: new StatusFloorTracker(() => 1000),
-      withheldTracker: new StatusFloorTracker(() => 1000),
-      admission: () => admission.census(),
     });
     await feed.poll(async () => ({ agents: [agent("butchr-butchr-1", "working", "p1")] })); // succeeds
     await expect(feed.poll(async () => { throw new Error("boom"); })).rejects.toThrow(); // then fails
@@ -230,106 +211,17 @@ describe("renderDashboard: mutation 1 — could-not-check rendered like known (t
 
   test("1b. a row's issuetype: an unavailable issuetype renders the cnc tier marker, never the plain known styling", () => {
     const rows = buildDashboardRows([agent("butchr-butchr-1", "idle", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toContain('class="tier cnc"');
     expect(elementText(html, 'class="tier cnc"', "</span>").toLowerCase()).toContain("could not check");
     expect(html).not.toContain('class="tier known"');
   });
 
-  test("1c. a census source: a never-reported source renders could-not-check for itself, never as an ordinary checked source", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue", "project"] });
-    await controller.admit(["KAN-1"], [], "issue"); // "issue" reports; "project" never calls admit
-    const census = controller.census();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).toMatch(/data-source="project">project: COULD NOT CHECK — never-reported/);
-    expect(html).not.toMatch(/data-source="project">project: checked/);
-  });
 });
 
-// ---------------------------------------------------------------------------
-// Mutation 2: not-applicable rendered as could-not-check, AND the reverse —
-// including the "single row carries both at once" case the ticket calls out
-// by name.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: mutation 2 — not-applicable vs could-not-check, never conflated, even on the SAME row (BUTCHR-339)", () => {
-  test("a withheld row with an unresolved issuetype carries BOTH the cnc tier marker AND the na agent marker, styled distinctly", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-99"], [], "issue"); // withheld (cap 0), issueMeta below has no entry -> could-not-check issuetype
-    const census = controller.census();
-    const withheldRows = updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() });
-    const rows = [...withheldRows.values()].flat();
-    expect(rows).toHaveLength(1);
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
 
-    expect(html).toContain('class="tier cnc"'); // could-not-check issuetype
-    expect(html).toContain('class="na"'); // not-applicable agent marker
-    // NEVER SWAPPED — THE WORDING ITSELF, scoped to each element and
-    // CASE-INSENSITIVE (BUTCHR-266's review: a mutation that kept class="na"
-    // but changed its text to "could not check" — lowercase — survived a
-    // case-sensitive regex check here). The na marker must never carry
-    // could-not-check wording in ANY case, and the cnc tier marker must
-    // never carry the na wording, in either case.
-    const naText = elementText(html, 'class="na"', "</span>").toLowerCase();
-    expect(naText).not.toContain("could not check");
-    expect(naText).toContain("no agent"); // still says what it actually is
-    const tierText = elementText(html, 'class="tier cnc"', "</span>").toLowerCase();
-    expect(tierText).not.toContain("no agent");
-    expect(tierText).toContain("could not check");
-  });
 
-  test("reverse: an ordinary agent row (a real pane + agentStatus) never renders the not-applicable marker — nothing about it is inapplicable", () => {
-    const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
-    const rows = buildDashboardRows([agent("butchr-butchr-1", "idle", "p1")], { now: () => 0, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
-    expect(renderDashboard(response, opts())).not.toContain('class="na"');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Mutation 3: a failed/never-reported census source rendered as an ordinary
-// busy fleet, or smeared onto another source.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: mutation 3 — per-source census independence, never smeared (BUTCHR-339)", () => {
-  test("one checked source and one never-reported source render two INDEPENDENT lines — the checked one never carries the failed one's reason, and vice versa", async () => {
-    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue", "project"] });
-    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked, nothing withheld (cap is high)
-    const census = controller.census();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).toMatch(/data-source="issue">issue: checked/);
-    expect(html).toMatch(/data-source="project">project: COULD NOT CHECK — never-reported/);
-    // smear-detector: neither source's own line mentions the other's state
-    expect(html).not.toMatch(/data-source="issue">issue: COULD NOT CHECK/);
-    expect(html).not.toMatch(/data-source="project">project: checked/);
-    // never rendered as an ordinary, fully-healthy fleet: the failure text is present somewhere
-    expect(html).toContain("never-reported");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// FACTORY-219 (Z4): a CHECKED census source's own line must carry its
-// `(confirmed X ago)` age — dropping it leaves a source that reports
-// "checked" with no freshness, which never goes stale no matter how long ago
-// the last real check happened. Scoped to the source's own element, and with
-// render-time `now` moved past the source's own confirmedAt, so a mutation
-// that drops the whole "(confirmed ... ago)" clause fails here even though
-// "checked" alone would still read as superficially fine.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: Z4 — a checked census source's own entry carries its confirmed age (FACTORY-219)", () => {
-  test("a checked source's admission line reads 'checked (confirmed Xs ago)', never bare 'checked'", async () => {
-    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue"], now: () => 0 });
-    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked at now=0
-    const census = controller.census();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts({ now: 10_000 })); // rendered 10s after the source's own confirmedAt
-    const sourceText = elementText(html, 'data-source="issue"', "</div>");
-    expect(sourceText).toBe("issue: checked (confirmed 10s ago)");
-    expect(sourceText).not.toBe("issue: checked"); // what dropping the age clause would leave behind
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Mutation 4: the time-in-status floor rendered without its "since daemon
@@ -339,19 +231,19 @@ describe("renderDashboard: mutation 4 — time-in-status: exact marking + visual
   test("a fresh (exact:false) floor is marked 'since daemon start'; a real, witnessed transition (exact:true) is not", () => {
     const tracker = new StatusFloorTracker(() => 0);
     const first = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 0, issueMeta: () => undefined, tracker }); // first observation -> exact:false
-    const inexactResponse: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: first, admission: NO_ADMISSION };
+    const inexactResponse: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: first };
     expect(renderDashboard(inexactResponse, opts({ now: 0 }))).toContain("since daemon start");
 
     const trackerB = new StatusFloorTracker(() => 0);
     buildDashboardRows([agent("butchr-butchr-2", "working", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: trackerB });
     const second = buildDashboardRows([agent("butchr-butchr-2", "idle", "p1")], { now: () => 5000, issueMeta: () => undefined, tracker: trackerB }); // witnessed transition -> exact:true
-    const exactResponse: DashboardResponse = { checked: true, confirmedAt: new Date(5000).toISOString(), rows: second, admission: NO_ADMISSION };
+    const exactResponse: DashboardResponse = { checked: true, confirmedAt: new Date(5000).toISOString(), rows: second };
     expect(renderDashboard(exactResponse, opts({ now: 5000 }))).not.toContain("since daemon start");
   });
 
   test("the time-in-status value renders inside its own dedicated, large element — never buried as a generic row cell", () => {
     const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toMatch(/<div class="floor"[^>]*><span class="floorval">/);
     // the dedicated CSS class carries a deliberately large font — "buried as
@@ -360,17 +252,6 @@ describe("renderDashboard: mutation 4 — time-in-status: exact marking + visual
     expect(html).toMatch(/\.floorval\{font-size:(2\d|[3-9]\d)px/);
   });
 
-  test("a withheld row's `waiting` floor is marked on the SAME exact/prominence terms as an agent row's `timeInStatus`", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-1"], [], "issue");
-    const census = controller.census();
-    const withheldRows = updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() });
-    const rows = [...withheldRows.values()].flat();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).toMatch(/<div class="floor"[^>]*><span class="floorval">/);
-    expect(html).toContain("since daemon start"); // first observation of this withheld ticket -> exact:false
-  });
 
   // BUTCHR-266's review of the first draft: the PROMINENT number itself must
   // say "at least" when it is only a floor — a trailing note is not enough,
@@ -380,10 +261,10 @@ describe("renderDashboard: mutation 4 — time-in-status: exact marking + visual
     const inexact = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 0, issueMeta: () => undefined, tracker });
     const exact = buildDashboardRows([agent("butchr-butchr-1", "idle", "p1")], { now: () => 5000, issueMeta: () => undefined, tracker }); // witnessed transition
 
-    const inexactHtml = renderDashboard({ checked: true, confirmedAt: new Date(0).toISOString(), rows: inexact, admission: NO_ADMISSION }, opts({ now: 0 }));
+    const inexactHtml = renderDashboard({ checked: true, confirmedAt: new Date(0).toISOString(), rows: inexact }, opts({ now: 0 }));
     expect(inexactHtml).toMatch(/<span class="floorval">at least /);
 
-    const exactHtml = renderDashboard({ checked: true, confirmedAt: new Date(5000).toISOString(), rows: exact, admission: NO_ADMISSION }, opts({ now: 5000 }));
+    const exactHtml = renderDashboard({ checked: true, confirmedAt: new Date(5000).toISOString(), rows: exact }, opts({ now: 5000 }));
     expect(exactHtml).toMatch(/<span class="floorval">(?!at least )/);
   });
 
@@ -394,7 +275,7 @@ describe("renderDashboard: mutation 4 — time-in-status: exact marking + visual
   test("the floorval number is recomputed against render-time `now`, not frozen at whatever `humanDuration` was when the row was built", () => {
     const tracker = new StatusFloorTracker(() => 1000);
     const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 1000, issueMeta: () => undefined, tracker }); // floor anchored at sinceMs=1000, humanDuration frozen at "0s"
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows };
 
     const atPollTime = renderDashboard(response, opts({ now: 1000 }));
     const tenSecondsLater = renderDashboard(response, opts({ now: 1000 + 10_000 })); // same response object — only `now` moved
@@ -403,92 +284,7 @@ describe("renderDashboard: mutation 4 — time-in-status: exact marking + visual
   });
 });
 
-// ---------------------------------------------------------------------------
-// BUTCHR-266's review, question 2: a withheld row from a source whose census
-// has since DECLINED is carried forward byte-identical (src/agents/dashboard.ts's
-// updateWithheldRows) — its own confirmedAt stops advancing, but nothing
-// beyond the admission panel said so. A withheld row's freshness badge must
-// go stale in lockstep with ITS OWN source's panel entry, and ONLY that
-// source's rows — never a source that is still checking in fine.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: a withheld row from a currently-declined source renders STALE, scoped to that source only (BUTCHR-339, review gap #2)", () => {
-  test("two withheld rows from two different sources: only the one whose source currently reports checked:false renders the stale freshness badge", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue", "project"] });
-    await controller.admit(["BUTCHR-1"], [], "issue"); // "issue" checked, withholds BUTCHR-1
-    // "project" never calls admit -> never-reported (declined)
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
-    // Hand-add a second withheld row attributed to the declined "project"
-    // source, carried forward exactly as `updateWithheldRows` would leave a
-    // prior successful read untouched on a decline — the shape this test
-    // needs is "a withheld row whose OWN source is currently declined",
-    // which requires simulating a PRIOR successful poll for "project" (this
-    // controller's "project" source has never reported at all, so there is
-    // no prior row to carry forward from it in this call) — so this row is
-    // built the same way `updateWithheldRows` builds any withheld row,
-        // just attributed to the now-declined source directly.
-    const projectRow = { ...withheldRows[0]!, resourceKey: "KAN", source: "project" };
-    const rows = [...withheldRows, projectRow];
 
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-
-    // The "issue" row (checked source) reads calm/known.
-    expect(html).toContain('class="conf known" data-source="issue"');
-    // The "project" row (declined source) reads STALE, scoped to itself.
-    expect(html).toContain('class="conf cnc" data-source="project"');
-    expect(html).not.toContain('class="conf cnc" data-source="issue"');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// FACTORY-219 (Z1): the withheld-row version of mutation 5 — a withheld row's
-// freshness must come from its OWN `confirmedAt`, never be re-stamped at
-// render time (`new Date(opts.now).toISOString()`). The agent-row sibling of
-// this bug is already pinned by mutation 5's own test above, and the
-// page-level whole-response case is pinned by test 1a; this is the one site
-// (renderWithheldRow) BUTCHR-263 found nothing pinning. A render-time
-// re-stamp would always read "observed 0s ago" (both arguments to `ageText`
-// become the same `now`), and the declined-source STALE case would always
-// read "at least 0s old, as of <now>" instead of the row's real anchor — so
-// holding `confirmedAt` fixed and advancing render-time `now` is exactly
-// the check that catches it.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: Z1 — a withheld row's freshness is its OWN confirmedAt, never re-stamped at render time (FACTORY-219)", () => {
-  test("a non-declined withheld row's observed age grows with render-time `now`, never pinned at 0s", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"], now: () => 0 });
-    await controller.admit(["BUTCHR-1"], [], "issue"); // census confirmedAt observed at now=0
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
-    expect(withheldRows).toHaveLength(1);
-    const row = withheldRows[0]!;
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
-
-    const html = renderDashboard(response, opts({ now: 10_000 })); // rendered 10s after the row's own confirmedAt
-    const confText = elementText(html, 'class="conf known" data-source="issue"', "</span>");
-    expect(confText).toContain("observed 10s ago");
-    expect(confText).not.toContain("observed 0s ago"); // what a render-time re-stamp would always say
-    // the title attribute is the row's OWN confirmedAt anchor, not render-time `now`
-    expect(html).toContain(`class="conf known" data-source="issue" title="${row.confirmedAt}"`);
-  });
-
-  test("a withheld row whose source has declined reads STALE from its OWN confirmedAt anchor, not render-time `now`", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue", "project"], now: () => 0 });
-    await controller.admit(["BUTCHR-1"], [], "issue"); // "issue" checked; "project" never reports -> declined
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
-    // Attribute this row to a now-declined source, same construction the
-    // existing review-gap-#2 test above uses for the identical shape.
-    const row = { ...withheldRows[0]!, resourceKey: "KAN", source: "project" };
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [row], admission: buildAdmissionView(census) };
-
-    const html = renderDashboard(response, opts({ now: 10_000 }));
-    const staleText = elementText(html, 'class="conf cnc" data-source="project"', "</span>");
-    expect(staleText).toContain("at least 10s old"); // 10s is the real elapsed time since the row's own confirmedAt (0)
-    expect(staleText).not.toContain("at least 0s old"); // what a render-time re-stamp would always say
-    expect(staleText).toContain(`as of ${row.confirmedAt}`);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // Mutation 5: the page's age taken from the browser clock/request time
@@ -496,7 +292,7 @@ describe("renderDashboard: Z1 — a withheld row's freshness is its OWN confirme
 // ---------------------------------------------------------------------------
 describe("renderDashboard: mutation 5 — page age from the response's own confirmedAt/declinedAt, never a request-time clock (BUTCHR-339)", () => {
   test("holding confirmedAt fixed and varying `now` changes the rendered age proportionally — proving the age is DERIVED, not a fixed string", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(1_000_000).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(1_000_000).toISOString(), rows: [] };
     const soon = renderDashboard(response, opts({ now: 1_000_000 }));
     const sixDaysLater = renderDashboard(response, opts({ now: 1_000_000 + 6 * 86_400_000 }));
     expect(soon).toContain("0s ago");
@@ -508,14 +304,14 @@ describe("renderDashboard: mutation 5 — page age from the response's own confi
   });
 
   test("a could-not-check page's age comes from declinedAt (the ONLY time that arm carries), never confirmedAt", () => {
-    const response: DashboardResponse = { checked: false, declinedAt: new Date(2_000_000).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: false, declinedAt: new Date(2_000_000).toISOString(), rows: [] };
     const html = renderDashboard(response, opts({ now: 2_000_000 + 60_000 }));
     expect(html).toContain("1m");
     expect(html).toContain(new Date(2_000_000).toISOString());
   });
 
   test("the empty-fleet finding still carries the page's own age — freshness is visible even with zero rows to carry it", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(500_000).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(500_000).toISOString(), rows: [] };
     const html = renderDashboard(response, opts({ now: 500_000 + 3000 }));
     expect(html).toContain("this daemon runs no agents");
     expect(html).toContain("3s ago");
@@ -535,7 +331,7 @@ describe("renderDashboard: mutation 5 — page age from the response's own confi
 describe("renderDashboard: mutation 6 (page-level) — the terminal link is a plain href, never a success claim of its own (BUTCHR-339)", () => {
   test("the terminal link's own label never says 'launched'/'confirmed' — that reporting lives entirely on the route (see test/unit/app.test.ts)", () => {
     const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toMatch(/>open terminal</);
     expect(html).not.toMatch(/launched a terminal|confirmed a terminal/i);
@@ -552,23 +348,12 @@ describe("renderDashboard: mutation 6 (page-level) — the terminal link is a pl
 describe("renderDashboard: mutation 7 (page-level) — resource links always go through the injected resourceLinkHref, keyed on resourceKey (BUTCHR-339)", () => {
   test("an agent row's resource link is built from resourceLinkHref(resourceKey), not a URL the template invents", () => {
     const rows = buildDashboardRows([agent("butchr-butchr-1", "idle", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const calls: string[] = [];
     renderDashboard(response, opts({ resourceLinkHref: (key) => { calls.push(key); return `/marked/${key}`; } }));
     expect(calls).toEqual([agentKeyFor("butchr-butchr-1")]);
   });
 
-  test("a withheld row's resource link is ALSO built from resourceLinkHref(resourceKey) — withheld rows are not exempted from having a working resource link", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-42"], [], "issue");
-    const census = controller.census();
-    const withheldRows = updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() });
-    const rows = [...withheldRows.values()].flat();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: buildAdmissionView(census) };
-    const calls: string[] = [];
-    renderDashboard(response, opts({ resourceLinkHref: (key) => { calls.push(key); return `/marked/${key}`; } }));
-    expect(calls).toEqual(["BUTCHR-42"]);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -591,7 +376,7 @@ describe("renderDashboard: mutation 8 — never a Jira-label-derived status (BUT
 
   test("every status this page renders comes from the row's own agentStatus (herdr's domain), never a synthesized label value", () => {
     const rows = buildDashboardRows([agent("butchr-butchr-1", "blocked", "p1")], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     expect(renderDashboard(response, opts())).toContain('class="st blocked"');
   });
 });
@@ -604,7 +389,7 @@ describe("renderDashboard: mutation 8 — never a Jira-label-derived status (BUT
 // ---------------------------------------------------------------------------
 describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
   const build = { sha: "b".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag" as const, versionUnknownReason: null };
-  const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+  const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
 
   test("no currency sibling at all (older build): falls back to the build sha alone", () => {
     const html = renderDashboard(response, opts({ header: { build } }));
@@ -666,7 +451,7 @@ describe("renderDashboard: header build currency (BUTCHR-339 DoD 7)", () => {
 // one of the two.
 // ---------------------------------------------------------------------------
 describe("renderDashboard: Z13 — a dirty build sha is labelled '(dirty)', never '(clean)' (FACTORY-219)", () => {
-  const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+  const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
 
   test("shaDirty:true renders '(dirty)', never '(clean)'", () => {
     const build = { sha: "e".repeat(40), shaDirty: true, shaUnknownReason: null, version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
@@ -696,7 +481,7 @@ describe("renderDashboard: Z13 — a dirty build sha is labelled '(dirty)', neve
 describe("renderDashboard: Z14 — 'build sha unknown' carries its own reason (FACTORY-219)", () => {
   test("a null sha with a shaUnknownReason renders 'build sha unknown (<reason>)', not the bare phrase", () => {
     const build = { sha: null, shaDirty: null, shaUnknownReason: "git not available in this container", version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
     const html = renderDashboard(response, opts({ header: { build } }));
     const buildText = elementText(html, 'class="hdrline build"', "</div>");
     expect(buildText).toContain("build sha unknown (git not available in this container)");
@@ -705,105 +490,9 @@ describe("renderDashboard: Z14 — 'build sha unknown' carries its own reason (F
   });
 });
 
-// ---------------------------------------------------------------------------
-// Row-kind discrimination: never assume one kind (dashboard.ts's own rule).
-// ---------------------------------------------------------------------------
-describe("renderDashboard: a response mixing agent and withheld rows renders both, distinctly (BUTCHR-339)", () => {
-  test("an agent row and a withheld row in the same response render with different structural markers (.row.agent has a terminal link; .row.withheld does not)", async () => {
-    const meta = new Map([["BUTCHR-1", { summary: "s", issuetype: "Task" }]]);
-    const agentRows = buildDashboardRows([agent("butchr-butchr-1", "working", "p1")], { now: () => 0, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => 0) });
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-2"], [], "issue");
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => 0), agentKeys: new Set(agentRows.map((r) => r.resourceKey)) }).values()].flat();
 
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [...agentRows, ...withheldRows], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).toContain('class="row agent"');
-    expect(html).toContain('class="row withheld"');
-    expect(html).toContain("waiting for a slot");
-    // the withheld row has no pane -> no terminal link for BUTCHR-2 specifically
-    expect(html).not.toContain(`/agents/pane/${encodeURIComponent("BUTCHR-2")}/attach`);
-  });
-});
 
-// ---------------------------------------------------------------------------
-// BUTCHR-344 (K5): a could-not-check residency (no trusted census yet) must
-// never render as an ordinary known number in the admission cap line — the
-// shared NO_ADMISSION fixture used everywhere else in this file has
-// `residency: null` but nothing above ever asserts on that slot at all.
-// Driven by the REAL createAdmissionController (never a hand-typed
-// AdmissionView), whose `census()` reports `residency: null` before any
-// `admit()` call ever lands — a genuine "no trusted census yet" producer.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: residency's could-not-check case is never rendered as a known number (BUTCHR-344, review gap K5)", () => {
-  test("a fresh admission controller (no admit() call yet) renders could-not-check in the .admcap element, with no number in the residency slot", () => {
-    const controller = createAdmissionController({ cap: 5, residency: async () => [] });
-    const census = controller.census();
-    expect(census.residency).toBeNull(); // sanity: this producer really is in the could-not-check state
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    const admcapText = elementText(html, 'class="admcap"', "</div>");
-    expect(admcapText.toLowerCase()).toContain("could not check");
-    // never the known-value span, and never a bare digit standing in for the
-    // unresolved residency (the K5 mutation renders `admission.cap`, e.g.
-    // "5", in the residency slot instead)
-    expect(admcapText).not.toMatch(/residency: <span class="known">/);
-    expect(admcapText).not.toMatch(/residency:\s*\d/);
-  });
-});
 
-// ---------------------------------------------------------------------------
-// BUTCHR-344 [correction] (X6): the OPPOSITE gap from K5 — a KNOWN, non-null
-// residency must actually appear in the .admcap line at all. Dropping the
-// whole " · residency: ..." segment leaves the rest of the suite green,
-// because K5 only asserts on the could-not-check wording, never that a real,
-// trusted residency count is rendered anywhere. Driven by a REAL
-// createAdmissionController with an actual admit() call, so `census().residency`
-// is a genuine trusted number, never a hand-typed one.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: a known, non-null residency actually appears in .admcap — dropping the whole segment must fail (BUTCHR-344 [correction], review item X6)", () => {
-  test("a trusted residency count renders in the admission cap line", async () => {
-    const controller = createAdmissionController({ cap: 10, residency: async () => ["a", "b", "c"] });
-    await controller.admit([], [], "issue");
-    const census = controller.census();
-    expect(census.residency).toBe(3); // sanity: a real, known, non-null residency
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    const admcapText = elementText(html, 'class="admcap"', "</div>");
-    // BUTCHR-398: "residency:" is now "residency(workers):" — see
-    // renderAdmission's own doc comment (src/web/dashboard-page.ts).
-    expect(admcapText).toContain("residency(workers):");
-    expect(admcapText).toContain("3");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// BUTCHR-344 [correction] (X2): the not-applicable marker's own TITLE must
-// carry the row's REAL reason, never a generic string. Deliberately scoped
-// down from an earlier (wrong) characterization: `renderNotApplicable`'s
-// VISIBLE text ("no agent — n/a") is unconditional and is not itself part of
-// this assertion — only the tooltip (`title` attribute) is under test here.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: the not-applicable marker's own title carries its real reason (BUTCHR-344 [correction], review item X2)", () => {
-  test("a withheld row's .na title attribute is its own agentFields.reason, not a generic string", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-3"], [], "issue");
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
-    expect(withheldRows).toHaveLength(1);
-    const reason = withheldRows[0]!.agentFields.reason;
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    const titleMatch = html.match(/<span class="na" title="([^"]+)">/);
-    if (!titleMatch) throw new Error("expected a .na element with a title attribute");
-    expect(titleMatch[1]).toBe(reason);
-    expect(titleMatch[1]).not.toBe("could not check");
-    // deliberately NOT a conflation test (BUTCHR-344 [correction]): the
-    // visible text stays unconditional regardless of the title's content.
-    expect(elementText(html, 'class="na"', "</span>")).toBe("no agent — n/a");
-  });
-});
 
 // ---------------------------------------------------------------------------
 // BUTCHR-344 [correction] (F1): deleting the auto-refresh meta tag leaves the
@@ -816,7 +505,7 @@ describe("renderDashboard: the not-applicable marker's own title carries its rea
 // ---------------------------------------------------------------------------
 describe("renderDashboard: the auto-refresh meta tag is present and coupled to the hint's stated interval (BUTCHR-344 [correction], review item F1)", () => {
   test("the <meta http-equiv=refresh> tag exists and its interval equals the number the hint states", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
     const html = renderDashboard(response, opts({ refreshSeconds: 7 }));
     const metaMatch = html.match(/<meta http-equiv="refresh" content="(\d+)">/);
     if (!metaMatch) throw new Error("expected an auto-refresh meta tag");
@@ -836,7 +525,7 @@ describe("renderDashboard: the auto-refresh meta tag is present and coupled to t
 describe("renderDashboard: the currency line carries its own age, never a bare 'checked' (BUTCHR-344 [correction], review item H1)", () => {
   test("a known checkedAt/now renders 'checked <age> ago', not a bare 'checked'", () => {
     const build = { sha: "d".repeat(40), shaDirty: false, shaUnknownReason: null, version: "1.0.0", versionProvenance: "tag" as const, versionUnknownReason: null };
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
     const html = renderDashboard(
       response,
       opts({
@@ -855,30 +544,6 @@ describe("renderDashboard: the currency line carries its own age, never a bare '
   });
 });
 
-// ---------------------------------------------------------------------------
-// BUTCHR-344 [correction] (Y2): a DECLINED census source's own entry must
-// carry the could-not-check CLASS, never the known one — the page's own
-// stylesheet carries BOTH `.admsrc.cnc{color:#f0b429}` (amber) and
-// `.admsrc.known{color:#3fb950}` (GREEN), so swapping just the class (text
-// left untouched) paints a could-not-check source in the success colour.
-// This is the exact inverse of a mutation that keeps the class and changes
-// the text: here the words still say "COULD NOT CHECK" but the colour lies.
-// A sibling assertion that a CHECKED source still carries `known` guards
-// against the swap going the other way too.
-// ---------------------------------------------------------------------------
-describe("renderDashboard: a declined census source's own entry carries the could-not-check class, never the known class (BUTCHR-344 [correction], review item Y2)", () => {
-  test("a declined source renders admsrc cnc (never admsrc known); a checked source renders admsrc known (never admsrc cnc)", async () => {
-    const controller = createAdmissionController({ cap: 100, residency: async () => [], sources: ["issue", "project"] });
-    await controller.admit(["KAN-1"], [], "issue"); // "issue" checked; "project" never reports -> declined
-    const census = controller.census();
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    expect(html).toMatch(/class="admsrc cnc" data-source="project"/);
-    expect(html).not.toMatch(/class="admsrc known" data-source="project"/);
-    expect(html).toMatch(/class="admsrc known" data-source="issue"/);
-    expect(html).not.toMatch(/class="admsrc cnc" data-source="issue"/);
-  });
-});
 
 // ---------------------------------------------------------------------------
 // BUTCHR-344 (L5): the hint's own wording — nothing else on this page reads
@@ -888,7 +553,7 @@ describe("renderDashboard: a declined census source's own entry carries the coul
 // ---------------------------------------------------------------------------
 describe("renderDashboard: the hint's own wording, scoped to .hint (BUTCHR-344, review gap L5)", () => {
   test("the hint states the terminal link is fire-and-forget (attaches, not a confirmed 'opens' claim)", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
     const html = renderDashboard(response, opts());
     const hintText = elementText(html, 'class="hint"', "</div>");
     expect(hintText).toContain("attaches a terminal to that agent");
@@ -897,32 +562,6 @@ describe("renderDashboard: the hint's own wording, scoped to .hint (BUTCHR-344, 
   });
 });
 
-// ---------------------------------------------------------------------------
-// BUTCHR-344 (P3): a withheld row must never carry a terminal link at all —
-// scoped to the withheld row's OWN html, not merely "the one specific href
-// this fixture happens to produce" (the pre-existing structural test above
-// only rejects `/agents/pane/BUTCHR-2/attach`, which no plausible bug would
-// literally produce for a withheld row that has no pane in the first place).
-// ---------------------------------------------------------------------------
-describe("renderDashboard: a withheld row never gains a terminal link, scoped to its own HTML (BUTCHR-344, review gap P3)", () => {
-  test("a withheld row's own rendered HTML contains neither 'open terminal' nor '/attach' anywhere in it", async () => {
-    const controller = createAdmissionController({ cap: 0, residency: async () => [], sources: ["issue"] });
-    await controller.admit(["BUTCHR-2"], [], "issue");
-    const census = controller.census();
-    const withheldRows = [...updateWithheldRows(census, new Map(), { issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0), agentKeys: new Set() }).values()].flat();
-    expect(withheldRows).toHaveLength(1);
-    // The only row in this response, so the `#rows` container's own content
-    // IS this withheld row's own HTML, start to finish.
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: withheldRows, admission: buildAdmissionView(census) };
-    const html = renderDashboard(response, opts());
-    const rowsStart = html.indexOf('<div id="rows">') + '<div id="rows">'.length;
-    const hintStart = html.indexOf('<div class="hint">');
-    const rowHtml = html.slice(rowsStart, hintStart);
-    expect(rowHtml).toContain('class="row withheld"');
-    expect(rowHtml).not.toContain("open terminal");
-    expect(rowHtml).not.toContain("/attach");
-  });
-});
 
 // ---------------------------------------------------------------------------
 // BUTCHR-344 (E1): `esc()` is exercised elsewhere only with panes that need
@@ -935,7 +574,7 @@ describe("renderDashboard: esc() actually escapes, verified with a pane containi
   test("a pane containing '<', '&', and '\"' renders as escaped text inside the .pane element's raw HTML", () => {
     const pane = `<img src=x onerror=alert(1)>&"'`;
     const rows = buildDashboardRows([agent("butchr-butchr-1", "working", pane)], { now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0) });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     const paneHtml = elementText(html, 'class="pane"', "</span>");
     expect(paneHtml).toBe("&lt;img src=x onerror=alert(1)&gt;&amp;&quot;&#39;");
@@ -960,7 +599,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toContain(`id="${agentRowAnchorId(key)}"`);
     expect(html).toContain(`href="/configurations#${ruleAnchorId("jira-work", "task")}">config</a>`);
@@ -971,7 +610,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toContain(`href="/configurations#${ruleAnchorId("filesystem", "director")}">config</a>`);
   });
@@ -981,7 +620,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).toContain(`href="/configurations#${sessionAnchorId(key)}">config</a>`);
     expect(html).not.toContain(`href="/configurations#${ruleAnchorId("filesystem", "managed-sessions")}">config</a>`);
@@ -992,7 +631,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts({ configLinkHref: (anchor) => `/custom/${anchor}` }));
     expect(html).toContain(`href="/custom/${ruleAnchorId("jira-work", "task")}">config</a>`);
     expect(html).not.toContain("/configurations#");
@@ -1003,26 +642,11 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     const rows = buildDashboardRows([{ name: "x", agent_key: "not-a-real-key", agent_status: "working", pane_id: "p1" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const html = renderDashboard(response, opts());
     expect(html).not.toContain(">config</a>");
   });
 
-  test("a withheld row gets NO config back-link — requirement 3 speaks of the 'running agent row' only", () => {
-    const html = renderDashboard(
-      {
-        checked: true, confirmedAt: new Date(0).toISOString(), admission: NO_ADMISSION,
-        rows: [{
-          kind: "withheld", resourceKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" }),
-          tier: { kind: "project" }, source: "issue",
-          waiting: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true },
-          confirmedAt: new Date(0).toISOString(), agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" },
-        }],
-      },
-      opts(),
-    );
-    expect(html).not.toContain(">config</a>");
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1030,7 +654,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 // Configurations view — the per-row back-link only exists on a row with a
 // live agent, but the whole point of that view is to show configs with NO
 // running agent (disabled/unstaffed rules, archived/frozen sessions), so an
-// operator looking at an empty (or all-withheld) `/` still needs a way in
+// operator looking at an empty `/` still needs a way in
 // that isn't typing the URL by hand.
 // ---------------------------------------------------------------------------
 describe("renderDashboard: a stable link to /configurations is always present (FACTORY-81 review fix)", () => {
@@ -1038,17 +662,17 @@ describe("renderDashboard: a stable link to /configurations is always present (F
     const rows = buildDashboardRows([agent("butchr-butchr-1", "working", "w1:p3")], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
   });
 
   test("present on a genuinely empty fleet (checked:true, rows:[]) — exactly the case a config-with-no-agent needs it most", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows: [] };
     expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
   });
 
   test("present even on a declined poll (checked:false)", () => {
-    const response: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [], admission: NO_ADMISSION };
+    const response: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [] };
     expect(renderDashboard(response, opts())).toContain('href="/configurations">configurations</a>');
   });
 });

@@ -33,7 +33,7 @@ describe("Availability (pure) — FACTORY-614", () => {
       });
     expect(render(known(7))).toBe("known:7");
     expect(render(couldNotCheck("declined"))).toBe("cnc:declined");
-    expect(render(notApplicable("withheld"))).toBe("na:withheld");
+    expect(render(notApplicable("no agent"))).toBe("na:no agent");
   });
 
   test("availabilityText renders the fixed could-not-check/not-applicable wording and formats KNOWN via the caller", () => {

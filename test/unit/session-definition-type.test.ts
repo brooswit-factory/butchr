@@ -17,7 +17,6 @@ import {
 import { listFilesystemResources } from "../../src/resources/filesystem.js";
 import type { SessionDefinition } from "../../src/resources/session-definition.js";
 import { startManagedSessionsLoop } from "../../src/daemon/session-definitions-loop.js";
-import { createAdmissionController } from "../../src/agents/admission.js";
 import { absPath } from "../helpers/abs-path";
 
 const res = (path: string, over: Partial<FilesystemResource> = {}): FilesystemResource =>
@@ -382,7 +381,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", frozen: false },
     };
     const spec = specForSessionDefinition(match);
     expect(spec.key).toBe(match.agentKey);
@@ -405,7 +404,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", modelPower: 100, effort: 70, permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false },
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", modelPower: 100, effort: 70, permissionMode: "auto", execution: "swarm", account: "none", frozen: false },
     };
     expect(specForSessionDefinition(match).agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]);
   });
@@ -415,7 +414,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, strictMcpConfig: true },
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "auto", execution: "swarm", account: "none", frozen: false, strictMcpConfig: true },
     };
     expect(specForSessionDefinition(match).strictMcpConfig).toBe(true);
   });
@@ -425,7 +424,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false, lizardMode: true },
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier2", permissionMode: "default", execution: "swarm", account: "none", frozen: false, lizardMode: true },
     };
     const spec = specForSessionDefinition(match);
     expect(spec).not.toHaveProperty("lizardMode");
@@ -434,7 +433,7 @@ describe("specForSessionDefinition", () => {
 
   test("FACTORY-108: for vendor codex, lizardMode IS carried into the SpawnSpec — the opposite of the claude case above — so agentLaunchConfig's Codex branch (src/agents/argv.ts) can drop --dangerously-bypass-approvals-and-sandbox; absent/false forwards nothing, same as every other vendor's absent field", () => {
     const rule = builtinManagedSessionsRule(absPath("defs"));
-    const base = { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const base = { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "codex" as const, tier: "tier2" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, frozen: false };
     const match = (definition: typeof base & { lizardMode?: boolean }): SessionDefinitionMatch => ({
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")), definition,
@@ -450,7 +449,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto", execution: "swarm", account: "none", role: "worker", frozen: false, mcpServers },
+      definition: { workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto", execution: "swarm", account: "none", frozen: false, mcpServers },
     };
     expect(specForSessionDefinition(match).mcpServers).toEqual(mcpServers);
   });
@@ -460,7 +459,7 @@ describe("specForSessionDefinition", () => {
     const match: SessionDefinitionMatch = {
       agentKey: encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") }),
       rule, resource: res(absPath("defs", "a.json")),
-      definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false },
+      definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", frozen: false },
     };
     expect(specForSessionDefinitionUnit({ kind: "resource", match })).toEqual(specForSessionDefinition(match));
     const qkey = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: rule.id });
@@ -489,26 +488,6 @@ describe("createManagedSessionResourceType", () => {
     expect((await type.discovery.search()).length).toBe(0);
   });
 
-  test("PR #394 review fix 1: `roles` is cleared and rebuilt every search from each eligible match's OWN manifest role, keyed by agent key — a frozen/removed definition's role does not linger", async () => {
-    let files: Record<string, string> = {
-      [absPath("defs", "a.json")]: JSON.stringify(goodDef({ role: "sentinel" })),
-      [absPath("defs", "b.json")]: JSON.stringify(goodDef({ role: "worker" })),
-    };
-    const { list } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule(absPath("defs"));
-    const roles = new Map<string, "worker" | "sentinel">();
-    const type = createManagedSessionResourceType({ rule, list, read: async (p) => { if (!(p in files)) throw new Error("ENOENT"); return files[p]!; }, roles });
-    const keyA = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
-    const keyB = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "b.json") });
-    await type.discovery.search();
-    expect(roles.get(keyA)).toBe("sentinel");
-    expect(roles.get(keyB)).toBe("worker");
-    // b.json goes frozen (still valid, but ineligible) — its role entry must not linger.
-    files = { [absPath("defs", "a.json")]: files[absPath("defs", "a.json")]!, [absPath("defs", "b.json")]: JSON.stringify(goodDef({ role: "worker", frozen: true })) };
-    await type.discovery.search();
-    expect(roles.get(keyA)).toBe("sentinel");
-    expect(roles.has(keyB)).toBe(false);
-  });
 
   test("BUTCHR-460: `accountPolicies` is cleared and rebuilt every search from each eligible match's OWN manifest account policy, keyed by agent key — a frozen/removed definition's policy does not linger", async () => {
     let files: Record<string, string> = {
@@ -534,7 +513,7 @@ describe("createManagedSessionResourceType", () => {
     expect(accountPolicies.has(keyB)).toBe(false);
   });
 
-  // FACTORY-75 — same rebuilt-every-poll seam as `roles`/`accountPolicies`
+  // FACTORY-75 — same rebuilt-every-poll seam as `accountPolicies`
   // above, one field over: this poll's eligible definitions' resolved
   // (model, effort) pair, keyed by agent key. `HerdrHerd.staleIssues()`'s
   // own `resolvedAgentOf` seam (src/agents/herd.ts) reads this to learn
@@ -590,39 +569,11 @@ describe("createManagedSessionResourceType", () => {
     expect(lizardModes.has(keyB)).toBe(false);
   });
 
-  test("PR #394 review fix 1, end-to-end: a sentinel definition's agent is admitted and not counted against the cap, and a worker definition's agent is capped — through the REAL createAdmissionController, not a stub", async () => {
-    const files: Record<string, string> = {
-      [absPath("defs", "sentinel.json")]: JSON.stringify(goodDef({ role: "sentinel", workingDirectory: absPath("repo", "sentinel") })),
-      [absPath("defs", "worker-a.json")]: JSON.stringify(goodDef({ role: "worker", workingDirectory: absPath("repo", "worker-a") })),
-      [absPath("defs", "worker-b.json")]: JSON.stringify(goodDef({ role: "worker", workingDirectory: absPath("repo", "worker-b") })),
-    };
-    const { list, read } = fakeFiles(files);
-    const rule = builtinManagedSessionsRule(absPath("defs"));
-    const roles = new Map<string, "worker" | "sentinel">();
-    const type = createManagedSessionResourceType({ rule, list, read, roles });
-    const units = await type.discovery.search();
-    const candidates = units.map((u) => type.discovery.idOf(u));
-    expect(candidates.length).toBe(3);
-
-    const controller = createAdmissionController({
-      cap: 1, // only ONE worker slot — the sentinel must not consume it
-      residency: async () => [],
-      roleOf: (id) => roles.get(id) ?? "worker",
-      sources: ["managed-sessions"],
-    });
-    const admitted = await controller.admit(candidates, [], "managed-sessions");
-
-    const sentinelId = candidates.find((id) => id.includes("sentinel.json"))!;
-    const workerIds = candidates.filter((id) => id.includes("worker-"));
-    expect(admitted).toContain(sentinelId); // sentinel: always admitted, per role
-    expect(admitted.filter((id) => workerIds.includes(id)).length).toBe(1); // worker: capped at 1
-    expect(admitted.length).toBe(2); // sentinel + exactly one worker, not all three
-  });
 
   test("activation is always active for whatever reaches it (frozen/invalid never do)", () => {
     const rule = builtinManagedSessionsRule(absPath("defs"));
     const type = createManagedSessionResourceType({ rule, list: async () => [], read: async () => "" });
-    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res(absPath("defs", "a.json")), definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false } };
+    const match: SessionDefinitionMatch = { agentKey: "x", rule, resource: res(absPath("defs", "a.json")), definition: { workingDirectory: absPath("x"), brief: "b", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", frozen: false } };
     expect(type.activation.verdictFor({ kind: "resource", match })).toBe("active");
   });
 });
@@ -630,7 +581,7 @@ describe("createManagedSessionResourceType", () => {
 describe("createSessionDefinitionEventRules", () => {
   test("unchanged content never notifies; a size/mtime move notifies the resource's own agent only", async () => {
     const rule = builtinManagedSessionsRule(absPath("defs"));
-    const definition = { workingDirectory: absPath("x"), brief: "b", vendor: "claude" as const, tier: "tier3" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+    const definition = { workingDirectory: absPath("x"), brief: "b", vendor: "claude" as const, tier: "tier3" as const, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, frozen: false };
     const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") });
     const unit = (r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition } });
     const type = createSessionDefinitionEventRules();
@@ -653,7 +604,7 @@ describe("createSessionDefinitionEventRules", () => {
   // moved, never again once `prev` catches up to it) is inherited, not
   // reimplemented — this test only pins the NEW `reason`, not that property.
   const rule = builtinManagedSessionsRule(absPath("defs"));
-  const baseDefinition: SessionDefinition = { workingDirectory: absPath("repo", "old"), brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", role: "worker", frozen: false };
+  const baseDefinition: SessionDefinition = { workingDirectory: absPath("repo", "old"), brief: "Old brief.", vendor: "claude", tier: "tier3", permissionMode: "default", execution: "swarm", account: "none", frozen: false };
   const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: absPath("defs", "a.json") });
   const unitWith = (def: SessionDefinition, r: FilesystemResource): ExecutionUnit<SessionDefinitionMatch> => ({ kind: "resource", match: { agentKey: key, rule, resource: r, definition: def } });
 
@@ -694,7 +645,7 @@ describe("createSessionDefinitionEventRules", () => {
     const type = createSessionDefinitionEventRules();
     const poll = await type.poll(
       { primary: [unitWith(baseDefinition, res(absPath("defs", "a.json"), { mtimeMs: 1 }))], related: [] },
-      { primary: [unitWith({ ...baseDefinition, role: "sentinel" }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
+      { primary: [unitWith({ ...baseDefinition, vendor: "codex" as const }, res(absPath("defs", "a.json"), { mtimeMs: 2 }))], related: [] },
     );
     expect(await poll.decide(key, key, "primary")).toEqual({ deliver: true });
   });
@@ -801,17 +752,17 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
     expect(stopped).toEqual([]);
   });
 
-  test("BUTCHR-408 staged scenarios (a-d): Baker directory agent, Candlestix Claude session, Candlestix Codex session, and a non-Rocket.Chat-channel-bound sentinel (mud-bridge director, real S4 McpServerBinding type) all validate and produce the expected spawn shape; a frozen mud player stays frozen — no agent", async () => {
+  test("BUTCHR-408 staged scenarios (a-d): Baker directory agent, Candlestix Claude session, Candlestix Codex session, and a non-Rocket.Chat-channel-bound director (mud-bridge director, real S4 McpServerBinding type) all validate and produce the expected spawn shape; a frozen mud player stays frozen — no agent", async () => {
     const files: Record<string, string> = {
       [absPath("defs", "baker-repo.json")]: JSON.stringify(goodDef({
-        workingDirectory: absPath("repo", "some-project"), brief: "Keep this repo's docs current.", vendor: "claude", tier: "tier1", permissionMode: "default", role: "worker",
+        workingDirectory: absPath("repo", "some-project"), brief: "Keep this repo's docs current.", vendor: "claude", tier: "tier1", permissionMode: "default",
       })),
       [absPath("defs", "candlestix-factory-director.json")]: JSON.stringify(goodDef({
         workingDirectory: absPath("var", "candlestix", "factory"), brief: "Direct the factory channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
-        execution: "persistent", account: "permanent", role: "sentinel",
+        execution: "persistent", account: "permanent",
       })),
       [absPath("defs", "candlestix-codex-agent.json")]: JSON.stringify(goodDef({
-        workingDirectory: absPath("var", "candlestix", "codex-session"), brief: "Codex channel agent.", vendor: "codex", tier: "tier1", permissionMode: "default", role: "worker",
+        workingDirectory: absPath("var", "candlestix", "codex-session"), brief: "Codex channel agent.", vendor: "codex", tier: "tier1", permissionMode: "default",
       })),
       // (d) the mud DIRECTOR (distinct from the 10 frozen mud PLAYERS below): bound to the
       // real, non-Rocket.Chat mud-bridge MCP server, channel:true, using the real
@@ -820,13 +771,13 @@ describe("the managed-sessions built-in query loop — no-double-owner and add/m
       // channel binding needs no Rocket.Chat account at all.
       [absPath("defs", "candlestix-mud-director.json")]: JSON.stringify(goodDef({
         workingDirectory: absPath("var", "candlestix", "mud"), brief: "Direct the MUD channel.", vendor: "claude", tier: "tier2", permissionMode: "auto",
-        execution: "persistent", account: "none", role: "sentinel",
+        execution: "persistent", account: "none",
         mcpServers: [{ name: "mud-bridge", type: "http", url: "https://mud.internal/mcp", channel: true }],
       })),
       // mud PLAYER: frozen (per BUTCHR-393: "10 MUD players ... frozen ... once unfrozen").
       [absPath("defs", "candlestix-mud-player-1.json")]: JSON.stringify(goodDef({
         workingDirectory: absPath("var", "candlestix", "mud", "player-1"), brief: "Play the MUD.", vendor: "claude", tier: "tier1", permissionMode: "default",
-        execution: "persistent", account: "none", role: "sentinel", frozen: true,
+        execution: "persistent", account: "none", frozen: true,
       })),
     };
     const { herd, spawned } = fakeHerd([]);
@@ -900,7 +851,7 @@ describe("FACTORY-47: crash-loop detection wired into the managed-sessions loop"
     const stop = startManagedSessionsLoop({
       root: absPath("defs"), herd, deliver: async () => {},
       list: async () => [res(absPath("defs", "nexus.json"))],
-      read: async () => JSON.stringify(goodDef({ tier: "tier4", permissionMode: "auto", execution: "persistent", account: "none", role: "sentinel" })),
+      read: async () => JSON.stringify(goodDef({ tier: "tier4", permissionMode: "auto", execution: "persistent", account: "none" })),
       checkCrashLoop: async (spawning, desired) => { calls.push({ spawning, desired }); },
       log: () => {}, intervalMs: 5,
     });

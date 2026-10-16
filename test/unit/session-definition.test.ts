@@ -15,12 +15,11 @@ describe("sessionDefinitionProblems", () => {
   test("a minimal valid definition has no problems", () => {
     expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
   });
-  test("execution/account/role/frozen are optional and default sensibly when validated via parseSessionDefinition", () => {
+  test("execution/account/frozen are optional and default sensibly when validated via parseSessionDefinition", () => {
     expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
     const parsed = parseSessionDefinition(good(), "def", HOME);
     expect(parsed.execution).toBe("swarm");
     expect(parsed.account).toBe("none");
-    expect(parsed.role).toBe("worker");
     expect(parsed.frozen).toBe(false);
   });
   test("a non-object document is rejected", () => {
@@ -160,12 +159,6 @@ describe("sessionDefinitionProblems", () => {
   test("account: reuses Rule's AccountPolicy enum verbatim, invalid value rejected", () => {
     for (const account of ["none", "temporary", "permanent"]) expect(sessionDefinitionProblems({ ...good(), account }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), account: "bogus" }, "def")[0]).toContain("account must be one of");
-  });
-  test("role: reuses Rule's AgentRole enum verbatim (worker/sentinel), default worker, invalid value rejected", () => {
-    for (const role of ["worker", "sentinel"]) expect(sessionDefinitionProblems({ ...good(), role }, "def")).toEqual([]);
-    expect(sessionDefinitionProblems({ ...good(), role: "admin" }, "def")[0]).toContain("role must be one of worker, sentinel");
-    expect(parseSessionDefinition(good(), "def", HOME).role).toBe("worker");
-    expect(parseSessionDefinition({ ...good(), role: "sentinel" }, "def", HOME).role).toBe("sentinel");
   });
   test("frozen: boolean, defaults false — a frozen definition is still a VALID one (validity and frozen-ness are independent axes)", () => {
     expect(sessionDefinitionProblems({ ...good(), frozen: true }, "def")).toEqual([]);

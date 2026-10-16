@@ -179,7 +179,7 @@ describe("GET /api/rules", () => {
       configInventory: async () => ({
         rules: [{
           kind: "rule", id: "triage", resourceProvider: "jira-work", query: "project = X", enabled: true,
-          execution: "swarm", account: "none", role: "worker", agentPreferences: [], linkedEventing: false,
+          execution: "swarm", account: "none", agentPreferences: [], linkedEventing: false,
           mcpServerNames: [], staffed: true, reason: null,
         }],
         sessionDefinitions: [], errors: [],
@@ -187,7 +187,7 @@ describe("GET /api/rules", () => {
       getRulesSourceEtag: () => "deadbeef",
       rulesFileState: async () => ({
         path: "/rules.json",
-        rules: [{ id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = X", brief: "do the thing", execution: "swarm", account: "none", role: "worker" } as any],
+        rules: [{ id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = X", brief: "do the thing", execution: "swarm", account: "none" } as any],
         error: null,
         mtime: "2026-10-05T12:00:00.000Z",
         fileEtag: "deadbeef",
@@ -349,12 +349,10 @@ describe("GET /api/rules/catalog", () => {
       expect(res.status).toBe(200);
       expect(res.headers.get("cache-control")).toBe("no-store");
       const body = await res.json();
-      // FACTORY-817: `capacityRoles` is served alongside `harnesses` — not
-      // sourced from `deps.rulesCatalog()` (that dep is per-harness only),
-      // but computed straight from `AGENT_ROLES`/`CAPACITY_ROLE_DEFAULT`
-      // (`src/rules/rule-form-catalog.ts`), so it is present regardless of
-      // what `fakeCatalog` above contains.
-      expect(body).toEqual({ harnesses: fakeCatalog, capacityRoles: { values: ["worker", "sentinel"], default: "worker" } });
+      // FACTORY-1013: `capacityRoles` is gone from this catalog along with
+      // the capacity admission system it configured — `harnesses` (straight
+      // from `deps.rulesCatalog()`) is the whole response now.
+      expect(body).toEqual({ harnesses: fakeCatalog });
     } finally { await app.stop(true); }
   });
 });

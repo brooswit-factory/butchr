@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { buildResourcesForUrlResponse } from "../../src/resources/resource-lookup.js";
 import type { UrlToResourceDeps } from "../../src/resources/url-to-resource.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
-import type { AgentDashboardRow, DashboardRow, WithheldDashboardRow } from "../../src/agents/dashboard.js";
+import type { AgentDashboardRow, DashboardRow } from "../../src/agents/dashboard.js";
 
 const deps: UrlToResourceDeps = { jiraHost: "acme.atlassian.net", zendeskSubdomain: "acme" };
 const url = "https://acme.atlassian.net/browse/BUTCHR-12";
@@ -21,17 +21,6 @@ function agentRow(ruleId: string, resourceId: string, pane: string): AgentDashbo
   };
 }
 
-function withheldRow(ruleId: string, resourceId: string): WithheldDashboardRow {
-  return {
-    kind: "withheld",
-    resourceKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId, resourceId }),
-    tier: { kind: "issue", issuetype: { checked: true, value: "Task" } },
-    source: "issue",
-    waiting: floor,
-    confirmedAt: new Date(0).toISOString(),
-    agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" },
-  };
-}
 
 describe("buildResourcesForUrlResponse", () => {
   test("no resource: url and canonicalUrl are both present, resource and agents are null/[]", () => {
@@ -51,11 +40,6 @@ describe("buildResourcesForUrlResponse", () => {
     const rows: DashboardRow[] = [agentRow("triage", "BUTCHR-12", "pane-1")];
     const r = buildResourcesForUrlResponse(url, deps, rows);
     expect(r.agents).toEqual([{ agentKey: rows[0]!.resourceKey, ruleId: "triage", pane: "pane-1", live: true, label: "triage:BUTCHR-12" }]);
-  });
-  test("a withheld (not live) agent reports live:false and pane:null", () => {
-    const rows: DashboardRow[] = [withheldRow("triage", "BUTCHR-12")];
-    const r = buildResourcesForUrlResponse(url, deps, rows);
-    expect(r.agents).toEqual([{ agentKey: rows[0]!.resourceKey, ruleId: "triage", pane: null, live: false, label: "triage:BUTCHR-12" }]);
   });
   test("several agents (several rules matching the same resource) are sorted deterministically by rule id", () => {
     const rows: DashboardRow[] = [agentRow("zzz-rule", "BUTCHR-12", "pane-z"), agentRow("aaa-rule", "BUTCHR-12", "pane-a"), agentRow("mmm-rule", "BUTCHR-12", "pane-m")];

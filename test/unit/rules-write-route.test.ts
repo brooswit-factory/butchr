@@ -393,19 +393,6 @@ describe("PUT /api/rules/:id", () => {
   });
 
   // FACTORY-817: `role` ("Included in capacity") is now editable the same way.
-  test("valid role=sentinel edit with confirm: 200, write called with the parsed patch", async () => {
-    const csrf = createCsrfTokenIssuer();
-    let receivedArgs: unknown[] = [];
-    const { app, origin, host } = startApp(buildDeps(csrf, (...a) => { receivedArgs = a; return ACCEPTED; }));
-    try {
-      const res = await fetch(`${origin}/api/rules/ui-first-rule`, {
-        method: "PUT", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token },
-        body: JSON.stringify({ ifMatch: "etag-1", planHash: "hash-1", confirm: true, role: "sentinel" }),
-      });
-      expect(res.status).toBe(200);
-      expect(receivedArgs).toEqual(["ui-first-rule", { role: "sentinel" }, "etag-1", true, "hash-1"]);
-    } finally { await app.stop(true); }
-  });
 
   test("invalid role value: 400, write never called", async () => {
     const csrf = createCsrfTokenIssuer();

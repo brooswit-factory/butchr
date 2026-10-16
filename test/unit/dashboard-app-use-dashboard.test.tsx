@@ -12,8 +12,7 @@ function Probe() {
   return <div data-testid="state">{JSON.stringify(state)}</div>;
 }
 
-const admission: DashboardResponse["admission"] = { cap: 5, residency: 0, sentinels: 0, sources: [] };
-const okResponse: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:00:00.000Z", rows: [], admission };
+const okResponse: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:00:00.000Z", rows: [] };
 
 describe("useDashboard — FACTORY-614", () => {
   test("fetches GET /dashboard (same origin, no new API) and resolves to loaded with the real response shape", async () => {

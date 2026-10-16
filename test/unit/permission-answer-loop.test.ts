@@ -701,7 +701,7 @@ describe("startPermissionAnswerLoop", () => {
 // be exercised directly.
 describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
   const rule = (over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule =>
-    ({ enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over });
+    ({ enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", ...over });
 
   const noManagedSession = () => false;
   const emptyMap = new Map<string, boolean>();

@@ -22,7 +22,7 @@ describe("combineHealth FACTORY-922: commentChecksSkipped", () => {
   test("present and equal to whatever count the caller passes, never flipping `ok`", () => {
     const health = combineHealth(
       [poll],
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       7,
     );
     expect(health.commentChecksSkipped).toBe(7);
@@ -32,7 +32,7 @@ describe("combineHealth FACTORY-922: commentChecksSkipped", () => {
   test("0 is a real, present value — distinguishable from 'absent'", () => {
     const health = combineHealth(
       [poll],
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       0,
     );
     expect("commentChecksSkipped" in health).toBe(true);

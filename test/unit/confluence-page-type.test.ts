@@ -22,7 +22,7 @@ import type { NotifyReason } from "../../src/resources/types.js";
 const pageBody = (body: string) => async () => ({ body: { storage: { value: body } } });
 
 function rule(over: Partial<Rule> & { id: string; query: string }): Rule {
-  return { enabled: true, resourceProvider: "confluence-page", brief: "Work this child page.", execution: "swarm", account: "none", role: "worker", ...over };
+  return { enabled: true, resourceProvider: "confluence-page", brief: "Work this child page.", execution: "swarm", account: "none", ...over };
 }
 
 function page(over: Partial<ConfluencePageSnapshot> & { id: string }): ConfluencePageSnapshot {

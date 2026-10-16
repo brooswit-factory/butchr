@@ -25,9 +25,9 @@ describe("settingRowView", () => {
   });
 
   test("editable, non-secret: rawValue is the current value (empty string when unset)", () => {
-    const set: SettingEntry = { key: "BUTCHR_MAX_AGENTS", value: "12", source: "file", restartNeeded: true, secret: false, editable: true, description: "d" };
+    const set: SettingEntry = { key: "BUTCHR_POLL_STALE_MS", value: "12", source: "file", restartNeeded: true, secret: false, editable: true, description: "d" };
     expect(settingRowView(set).rawValue).toBe("12");
-    const unset: SettingEntry = { key: "BUTCHR_MAX_AGENTS", value: null, source: "default", restartNeeded: true, secret: false, editable: true, description: "d" };
+    const unset: SettingEntry = { key: "BUTCHR_POLL_STALE_MS", value: null, source: "default", restartNeeded: true, secret: false, editable: true, description: "d" };
     expect(settingRowView(unset).rawValue).toBe("");
   });
 
@@ -39,7 +39,7 @@ describe("settingRowView", () => {
   });
 
   test("source 'file' passes through verbatim", () => {
-    const entry: SettingEntry = { key: "BUTCHR_MAX_AGENTS", value: "12", source: "file", restartNeeded: true, secret: false, editable: true, description: "d" };
+    const entry: SettingEntry = { key: "BUTCHR_POLL_STALE_MS", value: "12", source: "file", restartNeeded: true, secret: false, editable: true, description: "d" };
     expect(settingRowView(entry).source).toBe("file");
   });
 });

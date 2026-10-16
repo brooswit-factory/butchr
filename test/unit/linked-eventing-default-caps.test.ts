@@ -300,7 +300,7 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
 describe("BUTCHR-471: default caps for a managed session, through createManagedSessionResourceType with discovery.search then discovery.related (the way FACTORY-53/71 actually wires it) — NOT a hand-built ProjectLinkedEventingMatch, NOT a fixture that hand-sets a cap", () => {
   const goodDef = (over: Record<string, unknown> = {}) => ({
     workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default",
-    frozen: false, execution: "swarm", account: "none", role: "worker", ...over,
+    frozen: false, execution: "swarm", account: "none", ...over,
   });
 
   function fakeFiles(files: Record<string, string>) {

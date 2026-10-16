@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   SETTINGS_ALLOWLIST,
-  MAX_AGENTS_CEILING,
   POLL_STALE_MS_FLOOR,
   effectiveSettingsEnv,
   isAllowlistedSettingsKey,
@@ -50,7 +49,7 @@ describe("SETTINGS_ALLOWLIST", () => {
   });
 
   test("isAllowlistedSettingsKey agrees with the list", () => {
-    expect(isAllowlistedSettingsKey("BUTCHR_MAX_AGENTS")).toBe(true);
+    expect(isAllowlistedSettingsKey("BUTCHR_POLL_STALE_MS")).toBe(true);
     expect(isAllowlistedSettingsKey("ATLASSIAN_TOKEN")).toBe(false);
     expect(isAllowlistedSettingsKey("BUTCHR_PORT")).toBe(false);
     expect(isAllowlistedSettingsKey("not-a-real-key")).toBe(false);
@@ -78,23 +77,7 @@ describe("validateSettingValue", () => {
     expect(validateSettingValue("BUTCHR_AGENT_MODEL", "   ").ok).toBe(false);
   });
 
-  test("BUTCHR_MAX_AGENTS: positive integer, non-integer/zero/negative refused", () => {
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", "12")).toEqual({ ok: true, normalized: "12" });
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", "0").ok).toBe(false);
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", "-3").ok).toBe(false);
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", "3.5").ok).toBe(false);
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", "abc").ok).toBe(false);
-  });
 
-  test("BUTCHR_MAX_AGENTS: above the ceiling needs confirm", () => {
-    const over = String(MAX_AGENTS_CEILING + 1);
-    const refused = validateSettingValue("BUTCHR_MAX_AGENTS", over);
-    expect(refused.ok).toBe(false);
-    if (!refused.ok) expect(refused.needsConfirm).toBe(true);
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", over, true)).toEqual({ ok: true, normalized: over });
-    // at the ceiling exactly: no confirm needed
-    expect(validateSettingValue("BUTCHR_MAX_AGENTS", String(MAX_AGENTS_CEILING))).toEqual({ ok: true, normalized: String(MAX_AGENTS_CEILING) });
-  });
 
   test("BUTCHR_POLL_STALE_MS: floor refused outright, confirm does not bypass it", () => {
     const under = String(POLL_STALE_MS_FLOOR - 1);
@@ -119,9 +102,9 @@ describe("loadSettingsFile", () => {
   });
 
   test("valid file: every allowlisted key present", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: "12", BUTCHR_AGENT_PROVIDER: "codex" }));
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: "60000", BUTCHR_AGENT_PROVIDER: "codex" }));
     const result = loadSettingsFile(env());
-    expect(result.values).toEqual({ BUTCHR_MAX_AGENTS: "12", BUTCHR_AGENT_PROVIDER: "codex" });
+    expect(result.values).toEqual({ BUTCHR_POLL_STALE_MS: "60000", BUTCHR_AGENT_PROVIDER: "codex" });
     expect(result.problems).toEqual([]);
   });
 
@@ -143,7 +126,7 @@ describe("loadSettingsFile", () => {
   test("a symlinked settings.json: refused, never followed", () => {
     mkdirSync(join(dir, "butchr"), { recursive: true, mode: 0o700 });
     const real = join(dir, "real-settings.json");
-    writeFileSync(real, JSON.stringify({ BUTCHR_MAX_AGENTS: "12" }), { mode: 0o600 });
+    writeFileSync(real, JSON.stringify({ BUTCHR_POLL_STALE_MS: "60000" }), { mode: 0o600 });
     symlinkSync(real, filePath());
     const result = loadSettingsFile(env());
     expect(result.values).toEqual({});
@@ -151,14 +134,14 @@ describe("loadSettingsFile", () => {
   });
 
   test("mode wider than 0600: refused", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: "12" }), 0o644);
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: "60000" }), 0o644);
     const result = loadSettingsFile(env());
     expect(result.values).toEqual({});
     expect(result.problems[0]).toMatch(/mode 644/);
   });
 
   test("wrong owner (uid mismatch): refused", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: "12" }));
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: "60000" }));
     const io = {
       readFile: (p: string) => readFileSync(p, "utf8"),
       lstat: (p: string) => lstatSync(p),
@@ -171,23 +154,23 @@ describe("loadSettingsFile", () => {
   });
 
   test("a non-allowlisted key in an otherwise valid file: ignored individually, other keys still apply", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: "12", BUTCHR_PORT: "9999" }));
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: "60000", BUTCHR_PORT: "9999" }));
     const result = loadSettingsFile(env());
-    expect(result.values).toEqual({ BUTCHR_MAX_AGENTS: "12" });
+    expect(result.values).toEqual({ BUTCHR_POLL_STALE_MS: "60000" });
     expect(result.problems.length).toBe(1);
     expect(result.problems[0]).toMatch(/BUTCHR_PORT.*not an allowlisted setting/);
   });
 
   test("an out-of-range value for one key: that key dropped, others still apply", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: "0", BUTCHR_AGENT_PROVIDER: "codex" }));
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: "0", BUTCHR_AGENT_PROVIDER: "codex" }));
     const result = loadSettingsFile(env());
     expect(result.values).toEqual({ BUTCHR_AGENT_PROVIDER: "codex" });
     expect(result.problems.length).toBe(1);
-    expect(result.problems[0]).toMatch(/BUTCHR_MAX_AGENTS/);
+    expect(result.problems[0]).toMatch(/BUTCHR_POLL_STALE_MS/);
   });
 
   test("a non-string value: ignored individually", () => {
-    writeFile(JSON.stringify({ BUTCHR_MAX_AGENTS: 12 }));
+    writeFile(JSON.stringify({ BUTCHR_POLL_STALE_MS: 60000 }));
     const result = loadSettingsFile(env());
     expect(result.values).toEqual({});
     expect(result.problems[0]).toMatch(/must be a string/);
@@ -196,24 +179,24 @@ describe("loadSettingsFile", () => {
 
 describe("effectiveSettingsEnv", () => {
   test("an unset env var falls through to the settings.json value", () => {
-    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ FOO: undefined }, { BUTCHR_MAX_AGENTS: "12" });
-    expect(merged.BUTCHR_MAX_AGENTS).toBe("12");
+    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ FOO: undefined }, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(merged.BUTCHR_POLL_STALE_MS).toBe("60000");
   });
 
   test("a SET env var always wins, even if settings.json also has the key", () => {
-    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ BUTCHR_MAX_AGENTS: "5" }, { BUTCHR_MAX_AGENTS: "12" });
-    expect(merged.BUTCHR_MAX_AGENTS).toBe("5");
+    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ BUTCHR_POLL_STALE_MS: "5000" }, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(merged.BUTCHR_POLL_STALE_MS).toBe("5000");
   });
 
   test("an empty-string env var is treated as unset", () => {
-    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ BUTCHR_MAX_AGENTS: "" }, { BUTCHR_MAX_AGENTS: "12" });
-    expect(merged.BUTCHR_MAX_AGENTS).toBe("12");
+    const merged = effectiveSettingsEnv<Record<string, string | undefined>>({ BUTCHR_POLL_STALE_MS: "" }, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(merged.BUTCHR_POLL_STALE_MS).toBe("60000");
   });
 
   test("never mutates the input env object", () => {
-    const input: Record<string, string | undefined> = { BUTCHR_MAX_AGENTS: undefined };
-    const merged = effectiveSettingsEnv(input, { BUTCHR_MAX_AGENTS: "12" });
-    expect(input.BUTCHR_MAX_AGENTS).toBeUndefined();
-    expect(merged.BUTCHR_MAX_AGENTS).toBe("12");
+    const input: Record<string, string | undefined> = { BUTCHR_POLL_STALE_MS: undefined };
+    const merged = effectiveSettingsEnv(input, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(input.BUTCHR_POLL_STALE_MS).toBeUndefined();
+    expect(merged.BUTCHR_POLL_STALE_MS).toBe("60000");
   });
 });

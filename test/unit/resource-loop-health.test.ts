@@ -27,7 +27,7 @@ describe("resource loop health", () => {
     const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
     const gh = createResourceLoopHealth({ name: "github-issue", enabled: true, thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
     t = 5_000; poll.recordSuccess(); gh.recordError(new Error("GitHub 401"));
-    const health = combineHealth([poll], undefined, undefined, undefined, undefined, [gh]);
+    const health = combineHealth([poll], undefined, undefined, undefined, [gh]);
     expect(health.ok).toBe(true);
     expect(health.components.map((c) => c.name)).toEqual(["pollLoop"]);
     expect(health.resourceLoops).toEqual([expect.objectContaining({ name: "github-issue", ok: false, state: "stale", consecutiveFailures: 1 })]);
@@ -41,8 +41,8 @@ describe("resource loop health", () => {
     t = 5_000; poll.recordSuccess();
     const unresolved = [{ ruleId: "task", field: "childRule" as const, missingTarget: "story" }];
 
-    expect(combineHealth([poll], undefined, undefined, undefined, undefined, undefined, unresolved).unresolvedRelationships).toEqual(unresolved);
-    expect("unresolvedRelationships" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
+    expect(combineHealth([poll], undefined, undefined, undefined, undefined, unresolved).unresolvedRelationships).toEqual(unresolved);
+    expect("unresolvedRelationships" in combineHealth([poll], undefined, undefined, undefined, undefined, [])).toBe(false);
     expect("unresolvedRelationships" in combineHealth([poll])).toBe(false);
     poll.stop();
   });
@@ -53,10 +53,10 @@ describe("resource loop health", () => {
     t = 5_000; poll.recordSuccess();
     const escalations = [{ agentKey: "filesystem:managed-sessions:%2Ffoo.json", definitionPath: "/foo.json", paneId: "p1", fingerprint: "abc12345", since: new Date(5_000).toISOString() }];
 
-    const withEscalations = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, escalations);
+    const withEscalations = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, escalations);
     expect(withEscalations.managedSessionEscalations).toEqual(escalations);
     expect(withEscalations.ok).toBe(true); // a stalled managed session is a real problem, never a liveness failure
-    expect("managedSessionEscalations" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
+    expect("managedSessionEscalations" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
     expect("managedSessionEscalations" in combineHealth([poll])).toBe(false);
     poll.stop();
   });
@@ -114,7 +114,7 @@ describe("resource loop health", () => {
     t = 5_000; poll.recordSuccess();
     const dashboardApp = { built: false, path: "/some/dist/web/index.html" };
 
-    const withDashboardApp = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardApp);
+    const withDashboardApp = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardApp);
     expect(withDashboardApp.dashboardApp).toEqual(dashboardApp);
     expect(withDashboardApp.ok).toBe(true); // a missing web build is a deploy gap, never a liveness failure
     expect("dashboardApp" in combineHealth([poll])).toBe(false);

@@ -17,8 +17,7 @@ import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 // build absent), no shell on hostile strings, matching the ticket's own
 // test shape.
 const unused = () => { throw new Error("unused in this test"); };
-const noAdmissionView = { cap: 0, residency: null, sentinels: null, sources: [] };
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
 const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } });
 
 const baseDeps = {
@@ -33,7 +32,7 @@ async function withApp(root: string, run: (base: string) => Promise<void>) {
   const deps: ViewDeps = {
     ...baseDeps,
     dashboardAppRoot: root,
-    health: () => combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardAppStatus(root)),
+    health: () => combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardAppStatus(root)),
   };
   const { app, mcp } = buildApp(deps);
   app.listen(0);

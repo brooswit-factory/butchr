@@ -39,19 +39,19 @@ describe("createFixturesSettingsApi", () => {
   // FACTORY-665
   test("writeSetting updates the in-memory fixture's own value/source, returned by a later listSettings", async () => {
     const api = createFixturesSettingsApi();
-    const written = await api.writeSetting("BUTCHR_MAX_AGENTS", "20", false);
-    const row = written.settings.find((e) => e.key === "BUTCHR_MAX_AGENTS")!;
+    const written = await api.writeSetting("BUTCHR_POLL_STALE_MS", "90000", false);
+    const row = written.settings.find((e) => e.key === "BUTCHR_POLL_STALE_MS")!;
     expect(row.secret).toBe(false);
-    if (!row.secret) { expect(row.value).toBe("20"); expect(row.source).toBe("file"); }
+    if (!row.secret) { expect(row.value).toBe("90000"); expect(row.source).toBe("file"); }
     expect(await api.listSettings()).toEqual(written);
   });
 
   test("writeSetting one-shot nextWriteError is thrown then cleared", async () => {
     const err = new SettingsWriteRefusedError("above the confirm ceiling", true);
     const api = createFixturesSettingsApi({ nextWriteError: err });
-    await expect(api.writeSetting("BUTCHR_MAX_AGENTS", "999", false)).rejects.toBe(err);
+    await expect(api.writeSetting("BUTCHR_POLL_STALE_MS", "1", false)).rejects.toBe(err);
     // cleared: a second call succeeds
-    await expect(api.writeSetting("BUTCHR_MAX_AGENTS", "20", false)).resolves.toBeDefined();
+    await expect(api.writeSetting("BUTCHR_POLL_STALE_MS", "90000", false)).resolves.toBeDefined();
   });
 
   test("restartDaemon resolves by default", async () => {

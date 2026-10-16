@@ -16,14 +16,13 @@ function rule(overrides: Partial<Rule> = {}): Rule {
     brief: "brief",
     execution: "swarm",
     account: "none",
-    role: "worker",
     ...overrides,
   } as Rule;
 }
 
 describe("createRulesPreviewer", () => {
   test("unknown rule id: 404", async () => {
-    const preview = createRulesPreviewer({ rules: () => [], search: async () => [], maxAgents: 5 });
+    const preview = createRulesPreviewer({ rules: () => [], search: async () => [] });
     const r = await preview("nope");
     expect(r).toEqual({ ok: false, status: 404, error: "rule not found" });
   });
@@ -33,7 +32,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule({ id: "fs", resourceProvider: "filesystem" })],
       search: async () => { called = true; return []; },
-      maxAgents: 5,
     });
     const r = await preview("fs");
     expect(r.ok).toBe(false);
@@ -43,14 +41,13 @@ describe("createRulesPreviewer", () => {
 
   test("keys and total, capped, no summary/status text anywhere (SPEC CHANGE b)", async () => {
     const issues = Array.from({ length: 5 }, (_, i) => issue(`F-${i}`));
-    const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues, maxAgents: 10, cap: 3 });
+    const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues, cap: 3 });
     const r = await preview("triage");
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.keys).toEqual(["F-0", "F-1", "F-2"]);
       expect(r.total).toBe(5);
       expect(r.cap).toBe(3);
-      expect(r.warning).toBeNull();
     }
     expect(JSON.stringify(r)).not.toContain("summary for");
     expect(JSON.stringify(r)).not.toContain("To Do");
@@ -58,23 +55,16 @@ describe("createRulesPreviewer", () => {
 
   test("total beyond cap is still reported in full via `total`, even though `keys` is capped", async () => {
     const issues = Array.from({ length: 120 }, (_, i) => issue(`F-${i}`));
-    const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues, maxAgents: 200 });
+    const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues });
     const r = await preview("triage");
     expect(r.ok).toBe(true);
     if (r.ok) { expect(r.keys).toHaveLength(50); expect(r.total).toBe(120); }
   });
 
-  test("total exceeding maxAgents: a plain warning", async () => {
-    const issues = Array.from({ length: 8 }, (_, i) => issue(`F-${i}`));
-    const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues, maxAgents: 3 });
-    const r = await preview("triage");
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.warning).toContain("maxAgents=3");
-  });
 
   test("jira-idea provider is previewable too, via the idea search path", async () => {
     const issues = [{ ...issue("IDEA-1"), issuetype: "Idea", projectType: "product_discovery" }];
-    const preview = createRulesPreviewer({ rules: () => [rule({ id: "idea-rule", resourceProvider: "jira-idea" })], search: async () => issues, maxAgents: 5 });
+    const preview = createRulesPreviewer({ rules: () => [rule({ id: "idea-rule", resourceProvider: "jira-idea" })], search: async () => issues });
     const r = await preview("idea-rule");
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.keys).toEqual(["IDEA-1"]);
@@ -92,7 +82,6 @@ describe("createRulesPreviewer", () => {
         seenJql = jql;
         return jql === "project = NEW" ? [issue("F-1"), issue("F-2")] : [issue("F-0")];
       },
-      maxAgents: 5,
     });
     const r = await preview("triage", "project = NEW");
     expect(r.ok).toBe(true);
@@ -104,7 +93,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule({ enabled: false, query: "project = OLD" })],
       search: async () => [issue("F-1")],
-      maxAgents: 5,
     });
     const r = await preview("triage", "project = NEW");
     expect(r.ok).toBe(true);
@@ -117,7 +105,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule()],
       search: async () => { calls++; return [issue("F-1")]; },
-      maxAgents: 5,
       now: () => now,
       rateLimitMs: 2000,
     });
@@ -135,7 +122,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule()],
       search: async () => { calls++; return [issue("F-1")]; },
-      maxAgents: 5,
       now: () => now,
       rateLimitMs: 2000,
     });
@@ -151,7 +137,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule({ id: "a" }), rule({ id: "b" })],
       search: async () => [],
-      maxAgents: 5,
       now: () => now,
       rateLimitMs: 2000,
     });
@@ -165,7 +150,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule()],
       search: async () => { throw new Error("Jira 500: internal server error, request id abc123, auth header leaked"); },
-      maxAgents: 5,
     });
     const r = await preview("triage");
     expect(r).toEqual({ ok: false, status: 502, error: "preview failed: could not query Jira" });
@@ -175,7 +159,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule()],
       search: () => new Promise(() => {}),
-      maxAgents: 5,
       timeoutMs: 20,
     });
     const r = await preview("triage");
@@ -194,7 +177,6 @@ describe("createRulesPreviewer", () => {
     const preview = createRulesPreviewer({
       rules: () => [rule({ id: "ui-first-rule", enabled: false })],
       search: async (jql) => { searchedJql = jql; return issues; },
-      maxAgents: 5,
       cap: 50,
     });
     const r = await preview("ui-first-rule");
@@ -205,7 +187,7 @@ describe("createRulesPreviewer", () => {
 
   test("B5c: the disabled rule's OWN object is never mutated by the dry run", async () => {
     const theRule = rule({ id: "ui-first-rule", enabled: false });
-    const preview = createRulesPreviewer({ rules: () => [theRule], search: async () => [], maxAgents: 5 });
+    const preview = createRulesPreviewer({ rules: () => [theRule], search: async () => [] });
     await preview("ui-first-rule");
     expect(theRule.enabled).toBe(false);
   });

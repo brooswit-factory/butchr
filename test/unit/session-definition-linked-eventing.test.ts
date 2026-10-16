@@ -82,7 +82,7 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
     agentKey: sessionAgentKey(path),
     rule: builtinManagedSessionsRule(absPath("defs")),
     resource: res(path),
-    definition: { ...goodDef(), frozen: false, execution: "swarm", account: "none", role: "worker", ...def } as SessionDefinitionMatch["definition"],
+    definition: { ...goodDef(), frozen: false, execution: "swarm", account: "none", ...def } as SessionDefinitionMatch["definition"],
   });
 
   test("a definition without linkedEventingProjects yields no matches", () => {
@@ -256,7 +256,7 @@ describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window 
     const realSessionAgent = sessionAgentKey(absPath("defs", "a.json"));
     const m: ProjectLinkedEventingMatch = {
       agentKey: `${realSessionAgent}\0linked:jira-project:BUTCHR`,
-      rule: { id: "x", enabled: true, resourceProvider: "filesystem", query: "{}", brief: "b", execution: "swarm", account: "none", role: "worker", linkedEventing: true, maxLinkedTurnsPerHour: 1 },
+      rule: { id: "x", enabled: true, resourceProvider: "filesystem", query: "{}", brief: "b", execution: "swarm", account: "none", linkedEventing: true, maxLinkedTurnsPerHour: 1 },
       projectKey: "BUTCHR",
       notifyAgentKey: realSessionAgent,
     };

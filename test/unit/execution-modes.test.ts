@@ -17,7 +17,6 @@ import type { ZendeskTicket } from "../../src/resources/zendesk-ticket.js";
 import { parseZendeskTicketRef } from "../../src/resources/zendesk-ticket-ref.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, scopeRelated, scopeRelatedResources, type ExecutionUnit } from "../../src/rules/execution.js";
-import { createAdmissionController, type AgentCapacityRole } from "../../src/agents/admission.js";
 import { resourceKeyOf } from "../../src/agents/workspace.js";
 
 /**
@@ -25,9 +24,8 @@ import { resourceKeyOf } from "../../src/agents/workspace.js";
  * "singleton" | "persistent"` rules (BUTCHR-397 shipped the schema field,
  * the codec, and the identity plumbing only; nothing here could have passed
  * before this ticket — `groupExecutionUnits`, `scopeRelated`/
- * `scopeRelatedResources`, `logExecutionModeSwitches` and
- * `AdmissionControllerDeps.roleOf`/`Rule.role` are all NEW exports this
- * ticket adds. Verified live: `git show origin/BUTCHR-392:src/rules/rules.ts`
+ * `scopeRelatedResources` and `logExecutionModeSwitches` are all NEW exports
+ * this ticket adds. Verified live: `git show origin/BUTCHR-392:src/rules/rules.ts`
  * has no `role` field and `git show origin/BUTCHR-392:src/rules/execution.ts`
  * does not exist at all — every test below imports from one or the other, so
  * the whole file fails to even load against pre-change `BUTCHR-392`, let
@@ -69,7 +67,7 @@ const queryKey2 = (resourceProvider: "jira-work" | "github-issue" | "jira-idea" 
 
 describe("groupExecutionUnits (BUTCHR-398) — the primary-item grouping every provider's discovery.search() shares", () => {
   const rule = (id: string, execution: Rule["execution"], enabled = true): Rule =>
-    ({ id, enabled, resourceProvider: "jira-work", query: "q", brief: "b", execution, account: "none", role: "worker" });
+    ({ id, enabled, resourceProvider: "jira-work", query: "q", brief: "b", execution, account: "none" });
   const match = (rule: Rule, key: string): RuleMatch => ({ agentKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId: rule.id, resourceId: key }), rule, issue: issue(key) });
 
   test("swarm: byte-for-byte today's behaviour — one resource-kind unit per match, none when nothing matches", () => {
@@ -112,9 +110,9 @@ describe("groupExecutionUnits (BUTCHR-398) — the primary-item grouping every p
 });
 
 describe("the query-level SpawnSpec, per provider (BUTCHR-398)", () => {
-  const jiraRule: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: 'status = "In Progress"', brief: "Triage the queue.", execution: "singleton", account: "none", role: "worker" };
-  const ghRule: Rule = { id: "bugs", enabled: true, resourceProvider: "github-issue", query: "is:open label:bug", brief: "Fix bugs.", execution: "persistent", account: "none", role: "worker" };
-  const zdRule: Rule = { id: "support", enabled: true, resourceProvider: "zendesk-ticket", query: "status:open", brief: "Triage tickets.", execution: "singleton", account: "none", role: "worker" };
+  const jiraRule: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: 'status = "In Progress"', brief: "Triage the queue.", execution: "singleton", account: "none" };
+  const ghRule: Rule = { id: "bugs", enabled: true, resourceProvider: "github-issue", query: "is:open label:bug", brief: "Fix bugs.", execution: "persistent", account: "none" };
+  const zdRule: Rule = { id: "support", enabled: true, resourceProvider: "zendesk-ticket", query: "status:open", brief: "Triage tickets.", execution: "singleton", account: "none" };
 
   test("no single resource: `resource` is never set, so mcpIdentityHeaders/buildWorkspace can never resolve one for it", () => {
     for (const spec of [specForRuleQuery(jiraRule, queryKey("triage")), specForGithubIssueQuery(ghRule, "github-issue:bugs:%40query"), specForZendeskTicketQuery(zdRule, "zendesk-ticket:support:%40query")]) {
@@ -150,8 +148,8 @@ describe("the query-level SpawnSpec, per provider (BUTCHR-398)", () => {
 });
 
 describe("scopeRelated / scopeRelatedResources (BUTCHR-398) — the event-delivery mechanism for a query-level agent's scope", () => {
-  const singletonRule: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none", role: "worker" };
-  const swarmRule: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
+  const singletonRule: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none" };
+  const swarmRule: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none" };
   const m = (rule: Rule, key: string): RuleMatch => ({ agentKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId: rule.id, resourceId: key }), rule, issue: issue(key) });
 
   test("a swarm rule's matches contribute NOTHING to scope-related — its own agents hear their own changes directly, no watcher relationship needed", () => {
@@ -182,7 +180,7 @@ describe("scopeRelated / scopeRelatedResources (BUTCHR-398) — the event-delive
 
 describe("logExecutionModeSwitches (BUTCHR-398) — BUTCHR-370-class rename-safety, loud not silent", () => {
   test("a running per-resource agent whose rule switched away from swarm is logged, once per id", () => {
-    const r: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none", role: "worker" };
+    const r: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none" };
     const lines: string[] = [];
     logExecutionModeSwitches("jira-work", [r], ["jira-work:task:BUTCHR-1", "jira-work:task:BUTCHR-2"], decodeAnyAgentKey, (l) => lines.push(l));
     expect(lines).toHaveLength(2);
@@ -193,15 +191,15 @@ describe("logExecutionModeSwitches (BUTCHR-398) — BUTCHR-370-class rename-safe
   });
 
   test("a running query-level agent whose rule switched TO swarm is logged", () => {
-    const r: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
+    const r: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none" };
     const lines: string[] = [];
     logExecutionModeSwitches("jira-work", [r], [queryKey("task")], decodeAnyAgentKey, (l) => lines.push(l));
     expect(lines).toEqual([expect.stringContaining('rule "task" switched to swarm')]);
   });
 
   test("no switch: a per-resource id under a swarm rule, or a query-level id under a singleton/persistent rule, is silent", () => {
-    const swarmR: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
-    const singletonR: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none", role: "worker" };
+    const swarmR: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none" };
+    const singletonR: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "singleton", account: "none" };
     const lines: string[] = [];
     logExecutionModeSwitches("jira-work", [swarmR, singletonR], ["jira-work:task:BUTCHR-1", queryKey("triage")], decodeAnyAgentKey, (l) => lines.push(l));
     expect(lines).toEqual([]);
@@ -430,7 +428,7 @@ describe("the resourceKeyOf hazard: a running query-level agent never causes a J
   });
 
   test("uniqueIssues never surfaces a query-level unit's bogus key as a ticket — only resource-kind matches are represented", () => {
-    const r: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none", role: "worker" };
+    const r: Rule = { id: "triage", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none" };
     const units: ExecutionUnit<RuleMatch>[] = [
       { kind: "resource", match: { agentKey: "jira-work:triage:BUTCHR-1", rule: r, issue: issue("BUTCHR-1") } },
       { kind: "query", agentKey: queryKey("triage"), rule: r },
@@ -439,65 +437,6 @@ describe("the resourceKeyOf hazard: a running query-level agent never causes a J
   });
 });
 
-describe("fleet capacity role: worker (default) | sentinel (BUTCHR-398)", () => {
-  const roleOfFor = (rules: readonly Rule[]) => (id: string): AgentCapacityRole => {
-    const decoded = decodeAnyAgentKey(id);
-    if (!decoded) return "worker";
-    const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
-    return rule?.role ?? "worker";
-  };
-
-  test("an unflagged rule's agents behave identically to today: counted, withheld exactly as before", async () => {
-    const worker: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
-    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:task:A"], roleOf: roleOfFor([worker]) });
-    expect(await ctrl.admit(["jira-work:task:B", "jira-work:task:C"], [])).toEqual([]); // both withheld, cap already full
-    expect(ctrl.snapshot()).toMatchObject({ residency: 1, sentinels: 0 });
-  });
-
-  test("a sentinel is never withheld — admitted even at/over the cap, while workers around it are still rationed", async () => {
-    const sentinel: Rule = { id: "director", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none", role: "sentinel" };
-    const worker: Rule = { id: "task", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
-    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:task:A"], roleOf: roleOfFor([sentinel, worker]) });
-    const admitted = await ctrl.admit([queryKey("director"), "jira-work:task:B"], []);
-    expect(admitted).toEqual([queryKey("director")]); // sentinel admitted; the worker candidate is withheld (cap already at 1 worker)
-  });
-
-  test("a sentinel never counts toward residency — adding sentinels changes nothing for workers' own budget", async () => {
-    const sentinel: Rule = { id: "director", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none", role: "sentinel" };
-    const ctrl = createAdmissionController({ cap: 2, residency: async () => [queryKey("director"), "jira-work:task:A"], roleOf: roleOfFor([sentinel]) });
-    // cap=2, but only ONE resident WORKER (task:A) — the sentinel (director) must not consume the second slot.
-    expect(await ctrl.admit(["jira-work:task:B"], [])).toEqual(["jira-work:task:B"]);
-    expect(ctrl.snapshot()).toMatchObject({ residency: 1, sentinels: 1 });
-  });
-
-  test("sentinels start even when workers are withheld at the cap", async () => {
-    const sentinel: Rule = { id: "director", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none", role: "sentinel" };
-    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:task:A"], roleOf: roleOfFor([sentinel]) });
-    expect(await ctrl.admit(["jira-work:task:B", queryKey("director")], [])).toEqual([queryKey("director")]);
-  });
-
-  test("an id whose rule cannot be resolved (removed rule, legacy bare-issue agent) counts as a WORKER — fail-safe", async () => {
-    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["BUTCHR-1", "jira-work:gone:BUTCHR-2"], roleOf: roleOfFor([]) });
-    expect(ctrl.snapshot()).toMatchObject({ residency: null, sentinels: null }); // no admit() yet
-    await ctrl.admit([], []);
-    expect(ctrl.snapshot()).toMatchObject({ residency: 2, sentinels: 0 }); // both unresolved ids counted as workers
-  });
-
-  test("omitted roleOf: every id is a worker — today's exact behaviour, unchanged", async () => {
-    const ctrl = createAdmissionController({ cap: 5, residency: async () => ["jira-work:task:A", queryKey("director")] });
-    await ctrl.admit([], []);
-    expect(ctrl.snapshot()).toMatchObject({ residency: 2, sentinels: 0 });
-  });
-
-  test("the [admission2] log line reports workers and sentinels separately", async () => {
-    const sentinel: Rule = { id: "director", enabled: true, resourceProvider: "jira-work", query: "q", brief: "b", execution: "persistent", account: "none", role: "sentinel" };
-    const lines: string[] = [];
-    const ctrl = createAdmissionController({ cap: 5, residency: async () => [queryKey("director"), "jira-work:task:A"], roleOf: roleOfFor([sentinel]), log: (l) => lines.push(l) });
-    await ctrl.admit(["jira-work:task:B"], []);
-    const line = lines.find((l) => l.startsWith("[admission2]"))!;
-    expect(line).toContain("residency(workers)=1 sentinels=1");
-  });
-});
 
 describe("per-provider convergence and event delivery (BUTCHR-398 review finding 3): github-issue, zendesk-ticket, jira-idea", () => {
   const gi = (ref: string, over: Partial<GithubIssue> = {}): GithubIssue => {

@@ -139,7 +139,7 @@ describe("archiveSessionDefinition / unarchiveSessionDefinition — real disk", 
   test("round-trip: archive then unarchive preserves the exact name and byte-for-byte content", async () => {
     const activeDir = await tmp("butchr-archive-active-");
     const archiveDir = await tmp("butchr-archive-dst-");
-    const content = JSON.stringify(goodDef({ role: "sentinel", execution: "persistent" }), null, 2) + "\n";
+    const content = JSON.stringify(goodDef({ execution: "persistent" }), null, 2) + "\n";
     await writeFile(join(activeDir, "a.json"), content);
 
     const io: SessionArchiveIo = { activeDir, archiveDir, ...defaultSessionArchiveIo() };
@@ -308,7 +308,7 @@ describe("frozen state survives archive then unarchive — real InstanceFreezeSt
     const storeRoot = await tmp("butchr-archive-frz-store-");
     const store = new InstanceFreezeStore(storeRoot);
     const path = join(activeDir, "mud-player-1.json");
-    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent", role: "sentinel" })));
+    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent" })));
 
     const freezeIo = { store, readFile: (p: string) => readFile(p, "utf8"), writeFile: (p: string, c: string) => writeFile(p, c) };
     await freezeSessionDefinition(freezeIo, path);
@@ -393,12 +393,12 @@ function fakeHerdWithFreeze(store: { read(id: string): Promise<{ frozen: boolean
   };
 }
 
-describe("reconcile-level: archiving a RUNNING persistent/sentinel definition stops it; unarchiving re-staffs it; a frozen one stays unstaffed after unarchive", () => {
+describe("reconcile-level: archiving a RUNNING persistent definition stops it; unarchiving re-staffs it; a frozen one stays unstaffed after unarchive", () => {
   test("archive removes it from `desired` (directory listing drives eligibility) and reconcileNow stops the running agent; unarchive makes it desired again and reconcileNow spawns it", async () => {
     const activeDir = await tmp("butchr-archive-reconcile-active-");
     const archiveDir = await tmp("butchr-archive-reconcile-dst-");
     const path = join(activeDir, "mud-player-1.json");
-    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent", role: "sentinel" })));
+    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent" })));
 
     const rule = builtinManagedSessionsRule(activeDir);
     const resourceType = createManagedSessionResourceType({ rule, list: listFilesystemResources, read: (p: string) => readFile(p, "utf8") });
@@ -443,7 +443,7 @@ describe("reconcile-level: archiving a RUNNING persistent/sentinel definition st
     const storeRoot = await tmp("butchr-archive-reconcile-frz-store-");
     const store = new InstanceFreezeStore(storeRoot);
     const path = join(activeDir, "mud-player-2.json");
-    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent", role: "sentinel" })));
+    await writeFile(path, JSON.stringify(goodDef({ execution: "persistent" })));
 
     const freezeIo = { store, readFile: (p: string) => readFile(p, "utf8"), writeFile: (p: string, c: string) => writeFile(p, c) };
     await freezeSessionDefinition(freezeIo, path); // both gates frozen

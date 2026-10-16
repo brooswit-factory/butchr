@@ -13,7 +13,6 @@ import { spawnArgs, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT } from "../../src/ag
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
 import { effectiveAgent } from "../../src/resources/session-definition.js";
-import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
 import { absPath } from "../helpers/abs-path";
 
@@ -386,7 +385,7 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
   // THE TRAP: an issue that already has a live agent attempts nothing — not
   // a success, not a failure. It gets its own third outcome under the same
   // tag rather than silence, so (A)'s total can still be reconciled against
-  // (B)'s admitted count (see admission.test.ts's cross-instrument check).
+  // the poll's own spawn-candidate count.
   test("the no-op early return (already running) logs a THIRD outcome, never 'succeeded'", async () => {
     const lines: string[] = [];
     const f2 = fakeHerdr([{ name: "butchr-kan-7", pane_id: "w1:p1" }]);
@@ -442,18 +441,19 @@ describe("spawn: outcome logging under SPAWN_TAG (BUTCHR-320)", () => {
   });
 });
 
-// BUTCHR-320 falsifier 2 — CROSS-INSTRUMENT CONSISTENCY: for the same poll,
-// the number of attempts derivable from (A)'s SPAWN_TAG must equal the
-// admitted count from (B)'s ADMISSION2_TAG line — independent emissions of
-// the same fact, run here through the REAL reconcileNow + a REAL
-// createAdmissionController + a REAL HerdrHerd (never the plain `Herd` test
-// fakes elsewhere in this codebase, which never emit either line at all).
-describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same poll", () => {
+// BUTCHR-320 falsifier 2, as it survives FACTORY-1013: the (B) side of this
+// pair was the `[admission2]` line's own `admitted=` count, and the capacity
+// admission system that emitted it is gone. What remains — and is still
+// worth pinning — is (A): the SPAWN_TAG attempt count for a poll, driven
+// through the REAL reconcileNow + a REAL HerdrHerd (never the plain `Herd`
+// test fakes elsewhere in this codebase, which never emit the line at all).
+// Every candidate is now attempted, so the attempt count IS the candidate
+// count, with no second instrument to reconcile it against.
+describe("BUTCHR-320 falsifier 2: (A) attempts for the same poll", () => {
   const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
 
-  test("ordinary case (no race): one success + one failure — attempts(2) == admitted(2)", async () => {
+  test("ordinary case (no race): one success + one failure — attempts(2) == candidates(2)", async () => {
     const spawnLines: string[] = [];
-    const admissionLines: string[] = [];
     const client = {
       agent: {
         list: async () => ({ agents: [] }), // never running — no residency race in this test
@@ -463,25 +463,21 @@ describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same pol
       workspace: { create: async (p: any) => ({ root_pane: { pane_id: `pane-${p.label}` } }) },
     };
     const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => spawnLines.push(l));
-    const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
     const desired = new Map([["KAN-2", spec("KAN-2")], ["KAN-3", spec("KAN-3")]]);
-    await reconcileNow(herd, desired, { admission: admission.admit, onAdmitted: admission.recordSpawned });
+    await reconcileNow(herd, desired, {});
 
     expect(spawnLines.filter((l) => l.startsWith(SPAWN_TAG)).length).toBe(2); // 1 success + 1 failure, 0 noop
-    const admissionLine = admissionLines.find((l) => l.startsWith(ADMISSION2_TAG))!;
-    expect(admissionLine).toContain("admitted=2");
   });
 
   // THE TRAP, exercised end to end: `reconcileNow`'s own `running` snapshot
-  // and `admission`'s own `residency()` read both see KAN-1 as NOT running
-  // (agent.list() calls 1-2), but by the time `herd.spawn()` makes its own
-  // fresh `byIssue()` read (agent.list() call 3), a concurrent respawn
-  // elsewhere has registered it — the exact TOCTOU gap `spawn()`'s own doc
-  // comment names. (A)'s total must include the noop as an ATTEMPT for the
-  // arithmetic to close: attempts(1 noop) == admitted(1).
-  test("the no-op race: attempts(1 noop) == admitted(1) — the reconciliation rule for THE TRAP", async () => {
+  // sees KAN-1 as NOT running (agent.list() calls 1-2), but by the time
+  // `herd.spawn()` makes its own fresh `byIssue()` read (agent.list() call
+  // 3), a concurrent respawn elsewhere has registered it — the exact TOCTOU
+  // gap `spawn()`'s own doc comment names. (A)'s total must include the noop
+  // as an ATTEMPT for the arithmetic to close: attempts(1 noop) ==
+  // candidates(1).
+  test("the no-op race: attempts(1 noop) == candidates(1) — the reconciliation rule for THE TRAP", async () => {
     const spawnLines: string[] = [];
-    const admissionLines: string[] = [];
     let calls = 0;
     const client = {
       agent: {
@@ -495,34 +491,28 @@ describe("BUTCHR-320 falsifier 2: (A) attempts == (B) admitted, for the same pol
       workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
     };
     const herd = new HerdrHerd(client as any, "http://x/mcp", instant, (l) => spawnLines.push(l));
-    const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
     const desired = new Map([["KAN-1", spec("KAN-1")]]);
-    await reconcileNow(herd, desired, { admission: admission.admit, onAdmitted: admission.recordSpawned });
+    await reconcileNow(herd, desired, {});
 
     const attempts = spawnLines.filter((l) => l.startsWith(SPAWN_TAG));
     expect(attempts).toEqual([`${SPAWN_TAG} KAN-1 noop — already has a live agent origin=spawn`]);
-    const admissionLine = admissionLines.find((l) => l.startsWith(ADMISSION2_TAG))!;
-    expect(admissionLine).toContain("admitted=1");
-    expect(attempts.length).toBe(1); // reconciliation rule: attempts (success+failure+noop) == admitted, here 1 == 1
+    expect(attempts.length).toBe(1); // reconciliation rule: attempts (success+failure+noop) == candidates, here 1 == 1
   });
 });
 
-// BUTCHR-334 falsifier 3 — THE RESPAWN TERM: the bare "attempts == admitted"
-// rule above is false on any poll containing a respawn, because respawns
-// bypass admission entirely (ReconcileOptions.admission's own doc comment:
-// "plan.stop`/`plan.respawn` are never touched"). This is the falsifier that
-// was missing — it drives a poll with an admitted plan-spawn AND a respawn
-// (one succeeding, one FAILING) through a REAL reconcileNow + REAL
-// createAdmissionController + REAL HerdrHerd (spawn/stop delegate to it, so
-// the actual `origin=` tagging in HerdrHerd.spawn() is what's under test,
-// not a re-implementation of it), and shows the TRUE rule — attempts ==
-// admitted + respawn attempts — closing arithmetically.
-describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempts, for a poll containing both", () => {
+// BUTCHR-334 falsifier 3 — THE RESPAWN TERM: the bare "attempts == spawn
+// candidates" rule above is false on any poll containing a respawn, because
+// a respawn is its own code path (`plan.respawn`, never `plan.spawn`). This
+// drives a poll with a plan-spawn AND a respawn (one succeeding, one
+// FAILING) through a REAL reconcileNow + REAL HerdrHerd (spawn/stop delegate
+// to it, so the actual `origin=` tagging in HerdrHerd.spawn() is what's
+// under test, not a re-implementation of it), and shows the TRUE rule —
+// attempts == spawn candidates + respawn attempts — closing arithmetically.
+describe("BUTCHR-334 falsifier 3: (A) attempts == spawn candidates + respawn attempts, for a poll containing both", () => {
   const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
 
-  test("mixed poll: one admitted plan-spawn, one successful respawn, one FAILED respawn — the true rule closes, and the failed respawn is distinguishable from a failed plan spawn by origin alone", async () => {
+  test("mixed poll: one plan-spawn, one successful respawn, one FAILED respawn — the true rule closes, and the failed respawn is distinguishable from a failed plan spawn by origin alone", async () => {
     const spawnLines: string[] = [];
-    const admissionLines: string[] = [];
     const live: any[] = [];
     const client = {
       agent: {
@@ -561,29 +551,25 @@ describe("BUTCHR-334 falsifier 3: (A) attempts == (B) admitted + respawn attempt
       nudge: async () => ({ delivered: false }),
       resumeInPlace: async () => "unresumable",
     };
-    const admission = createAdmissionController({ cap: 10, residency: () => herd.runningIssues(), log: (l) => admissionLines.push(l) });
     const desired = new Map([
       ["KAN-NEW", spec("KAN-NEW")],
       ["KAN-RESPAWN-OK", spec("KAN-RESPAWN-OK")],
       ["KAN-RESPAWN-FAIL", spec("KAN-RESPAWN-FAIL")],
     ]);
-    await reconcileNow(herd, desired, { admission: admission.admit, onAdmitted: admission.recordSpawned });
+    await reconcileNow(herd, desired, {});
 
     const attempts = spawnLines.filter((l) => l.startsWith(SPAWN_TAG));
     expect(attempts.length).toBe(3); // KAN-NEW succeeded, KAN-RESPAWN-OK succeeded, KAN-RESPAWN-FAIL failed
-
-    const admissionLine = admissionLines.find((l) => l.startsWith(ADMISSION2_TAG))!;
-    expect(admissionLine).toContain("admitted=1"); // ONLY the ordinary plan-spawn candidate ever reached admission
 
     const planSpawnAttempts = attempts.filter((l) => l.includes("origin=spawn"));
     const respawnAttempts = attempts.filter((l) => l.includes("origin=respawn"));
     expect(planSpawnAttempts).toEqual([`${SPAWN_TAG} KAN-NEW succeeded — pane pane-KAN-NEW origin=spawn`]);
     expect(respawnAttempts.length).toBe(2); // BOTH the successful AND the failed respawn carry origin=respawn
 
-    // THE TRUE RULE (SPAWN_TAG's own doc comment): attempts == admitted (1)
-    // + respawn attempts this same poll (2). The BARE rule from BUTCHR-320
-    // ("attempts == admitted") would wrongly demand 1 == 3 here and fail.
-    expect(attempts.length).toBe(1 /* admitted */ + respawnAttempts.length);
+    // THE TRUE RULE (SPAWN_TAG's own doc comment): attempts == spawn
+    // candidates (1) + respawn attempts this same poll (2). The BARE rule
+    // from BUTCHR-320 would wrongly demand 1 == 3 here and fail.
+    expect(attempts.length).toBe(1 /* plan.spawn */ + respawnAttempts.length);
 
     // The second gap named on the ticket: a failed respawn must be
     // distinguishable, BY TAG ALONE, from a failed plan spawn — it is, via
@@ -1305,7 +1291,7 @@ describe("staleIssues", () => {
       const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: resourcePath });
       // The REAL resolver (effectiveAgent) and REAL spec builder (specForSessionDefinition) —
       // exactly what searchSessionDefinitions/specForSessionDefinitionUnit run in production.
-      const definitionAt100_70 = { workingDirectory: absPath("repo", "admin-agentcost"), brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+      const definitionAt100_70 = { workingDirectory: absPath("repo", "admin-agentcost"), brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, frozen: false };
       const spec = specForSessionDefinition({ agentKey, rule, resource: { path: resourcePath, kind: "file", name: "admin-agentcost.json", size: 10, mtimeMs: 1 }, definition: definitionAt100_70 });
       expect(spec.agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]); // DoD item 1: modelPower=100/effort=70 -> Fable at xhigh.
       // The REAL buildWorkspace — persists .butchr-model.json/.butchr-effort.json exactly as a real spawn would.
@@ -3251,7 +3237,7 @@ describe("resumeInPlace", () => {
         // 4) reconcileNow's ACTUAL contract for a "failed" outcome —
         // `herd.stop(issue)` THEN `herd.spawn(issue)` — mirrored directly so
         // this test isolates exactly what the floor fix changed, without
-        // routing through reconcileNow's own unrelated admission/guard logic.
+        // routing through reconcileNow's own unrelated guard logic.
         await herd.stop(spec.key);
         await herd.spawn(spec);
 

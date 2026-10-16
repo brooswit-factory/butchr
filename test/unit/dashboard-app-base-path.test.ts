@@ -16,8 +16,7 @@ import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 // wiring fails this test. Proved to fail against the pre-fix config (no
 // `base`): every extracted URL 404s instead of 200.
 const unused = () => { throw new Error("unused in this test"); };
-const noAdmissionView = { cap: 0, residency: null, sentinels: null, sources: [] };
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
 const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } });
 const deps = {
   state: unused, open: unused, openPane: unused,

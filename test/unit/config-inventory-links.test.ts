@@ -5,15 +5,12 @@ import {
 } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { sessionAgentKey } from "../../src/resources/session-freeze.js";
-import type { AgentDashboardRow, DashboardRow, WithheldDashboardRow } from "../../src/agents/dashboard.js";
+import type { AgentDashboardRow, DashboardRow } from "../../src/agents/dashboard.js";
 import { absPath } from "../helpers/abs-path";
 
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true };
 function agentRow(resourceKey: string): AgentDashboardRow {
   return { kind: "agent", resourceKey, tier: { kind: "project" }, agentStatus: "working", pane: "p1", timeInStatus: floor, confirmedAt: new Date(0).toISOString() };
-}
-function withheldRow(resourceKey: string, source = "issue"): WithheldDashboardRow {
-  return { kind: "withheld", resourceKey, tier: { kind: "project" }, source, waiting: floor, confirmedAt: new Date(0).toISOString(), agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" } };
 }
 
 describe("agentRowsForRule (FACTORY-81) — a rule matches a LIVE row iff decodeAnyAgentKey gives the same (resourceProvider, ruleId)", () => {
@@ -39,10 +36,6 @@ describe("agentRowsForRule (FACTORY-81) — a rule matches a LIVE row iff decode
     expect(agentRowsForRule({ id: "task", resourceProvider: "github-issue" }, [agentRow(key)])).toEqual([]);
   });
 
-  test("a withheld row never matches — only LIVE rows are 'running agent rows'", () => {
-    const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
-    expect(agentRowsForRule({ id: "task", resourceProvider: "jira-work" }, [withheldRow(key)])).toEqual([]);
-  });
 
   test("a resourceKey that fails to decode entirely is silently skipped, never thrown", () => {
     expect(agentRowsForRule({ id: "task", resourceProvider: "jira-work" }, [agentRow("not-a-real-key")])).toEqual([]);

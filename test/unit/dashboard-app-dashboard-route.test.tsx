@@ -10,8 +10,6 @@ import type { HealthStatus } from "../../src/daemon/health.js";
 withDom();
 afterEach(cleanup);
 
-const ADMISSION: DashboardResponse["admission"] = { cap: 5, residency: 2, sentinels: 0, sources: [] };
-
 const BASE_OPTS: DashboardViewOpts = {
   now: Date.parse("2026-01-01T00:10:00.000Z"),
   header: { build: null },
@@ -49,7 +47,6 @@ describe("DashboardView — row identity and the daemon-level banner (FACTORY-61
           confirmedAt,
         },
       ],
-      admission: ADMISSION,
     });
 
     const { container, rerender } = render(<DashboardView vm={buildDashboardViewModel(response("2026-01-01T00:09:00.000Z"), BASE_OPTS)} />);
@@ -62,19 +59,19 @@ describe("DashboardView — row identity and the daemon-level banner (FACTORY-61
   });
 
   test("a checked response renders the calm confirmed banner, never the loud could-not-check one", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:09:55.000Z", rows: [], admission: ADMISSION };
+    const response: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:09:55.000Z", rows: [] };
     const { getByTestId, queryByText } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
     expect(getByTestId("dashboard-banner").textContent).toContain("confirmed");
     expect(queryByText(/COULD NOT CHECK/)).toBeNull();
   });
 
   test("a declined response renders the loud could-not-check banner, as an Alert", () => {
-    const response: DashboardResponse = { checked: false, declinedAt: "2026-01-01T00:09:00.000Z", rows: [], admission: ADMISSION };
+    const response: DashboardResponse = { checked: false, declinedAt: "2026-01-01T00:09:00.000Z", rows: [] };
     const { getByTestId } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
     expect(getByTestId("dashboard-banner").textContent).toContain("COULD NOT CHECK");
   });
 
-  test("a mixed response renders both an agent row and a withheld row, each with their own test id", () => {
+  test("every row renders as an agent row — FACTORY-1013 left no other row kind", () => {
     const response: DashboardResponse = {
       checked: true,
       confirmedAt: "2026-01-01T00:09:55.000Z",
@@ -89,55 +86,27 @@ describe("DashboardView — row identity and the daemon-level banner (FACTORY-61
           confirmedAt: "2026-01-01T00:09:55.000Z",
         },
         {
-          kind: "withheld",
+          kind: "agent",
           resourceKey: "jira-work:rule1:FACTORY-99",
           tier: { kind: "issue", issuetype: { checked: true, value: "Story" } },
-          source: "issue-tier",
-          waiting: { since: "2026-01-01T00:00:00.000Z", sinceMs: BASE_OPTS.now - 60_000, humanDuration: "1m", exact: true },
+          agentStatus: "idle",
+          pane: "pane-2",
+          timeInStatus: { since: "2026-01-01T00:00:00.000Z", sinceMs: BASE_OPTS.now - 60_000, humanDuration: "1m", exact: true },
           confirmedAt: "2026-01-01T00:09:55.000Z",
-          agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" },
         },
       ],
-      admission: ADMISSION,
     };
-    const { getAllByTestId } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
-    expect(getAllByTestId("agent-row")).toHaveLength(1);
-    expect(getAllByTestId("withheld-row")).toHaveLength(1);
+    const { getAllByTestId, queryAllByTestId } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
+    expect(getAllByTestId("agent-row")).toHaveLength(2);
+    expect(queryAllByTestId("withheld-row")).toHaveLength(0);
   });
 
   test("a stable link to /configurations is always present, even on an empty, declined response", () => {
-    const response: DashboardResponse = { checked: false, declinedAt: "2026-01-01T00:09:00.000Z", rows: [], admission: ADMISSION };
+    const response: DashboardResponse = { checked: false, declinedAt: "2026-01-01T00:09:00.000Z", rows: [] };
     const { getByRole } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
     expect(getByRole("link", { name: "configurations" }).getAttribute("href")).toBe("/configurations");
   });
 
-  test("per-source admission rows render independently: a checked source and a declined source each carry only their own state (mutation 3)", () => {
-    const response: DashboardResponse = {
-      checked: true,
-      confirmedAt: "2026-01-01T00:09:55.000Z",
-      rows: [],
-      admission: {
-        ...ADMISSION,
-        sources: [
-          { source: "issue-tier", census: { checked: true, confirmedAt: "2026-01-01T00:09:50.000Z" } },
-          { source: "project-tier", census: { checked: false, declinedAt: "2026-01-01T00:09:50.000Z", reason: "untrusted" } },
-        ],
-      },
-    };
-    const { getByText } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
-    const checkedLine = getByText(/issue-tier: checked/);
-    const declinedLine = getByText(/project-tier: COULD NOT CHECK/);
-    expect(checkedLine.getAttribute("data-source")).toBe("issue-tier");
-    expect(checkedLine.textContent).not.toContain("untrusted");
-    expect(declinedLine.getAttribute("data-source")).toBe("project-tier");
-    expect(declinedLine.textContent).toContain("untrusted");
-  });
-
-  test("admission residency's could-not-check case never renders as a known number", () => {
-    const response: DashboardResponse = { checked: true, confirmedAt: "2026-01-01T00:09:55.000Z", rows: [], admission: { ...ADMISSION, residency: null } };
-    const { getByText } = render(<DashboardView vm={buildDashboardViewModel(response, BASE_OPTS)} />);
-    expect(getByText(/could not check \(no trusted census yet\)/)).toBeTruthy();
-  });
 });
 
 describe("DashboardRoute — FACTORY-615: the real main dashboard at /dashboard-app/", () => {
@@ -168,7 +137,6 @@ describe("DashboardRoute — FACTORY-615: the real main dashboard at /dashboard-
           confirmedAt: "2026-01-01T00:09:55.000Z",
         },
       ],
-      admission: ADMISSION,
     };
     const health: HealthStatus = { ok: true, components: [], build: { sha: "abc123def456", shaProvenance: "baked", shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag", versionUnknownReason: null, startedAt: "2026-01-01T00:00:00.000Z", pid: 1, unit: "butchr.service", journalctl: "journalctl --user -u butchr.service" } };
     globalThis.fetch = routed({ "/dashboard": { body: response }, "/health": { body: health } });
@@ -192,7 +160,6 @@ describe("DashboardRoute — FACTORY-615: the real main dashboard at /dashboard-
           confirmedAt: "2026-01-01T00:09:55.000Z",
         },
       ],
-      admission: ADMISSION,
     };
     globalThis.fetch = routed({ "/dashboard": { body: response }, "/health": { reject: true } });
     const { getByText } = render(<DashboardRoute />);

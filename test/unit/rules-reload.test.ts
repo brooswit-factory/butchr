@@ -10,7 +10,7 @@ import type { JiraIssue } from "../../src/atlassian/types.js";
 
 // Built through `parseRules` itself, never by hand — a hand-built `Rule`
 // literal omits the defaults `parseRules` fills in (`account: "none"`,
-// `role: "worker"`, `execution: "swarm"`), which would make every
+// `execution: "swarm"`), which would make every
 // "unchanged" comparison in this file a false "changed".
 const [ruleA, ruleB]: Rule[] = parseRules({
   rules: [

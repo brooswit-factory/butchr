@@ -78,9 +78,4 @@ describe("AgentRowCard — FACTORY-615", () => {
     const fresh = render(<AgentRowCard row={row()} />);
     expect(fresh.container.querySelector(".dashboard-row__freshness--stale")).toBeFalsy();
   });
-
-  test("never renders a not-applicable marker — nothing about an agent row is inapplicable", () => {
-    const { container } = render(<AgentRowCard row={row()} />);
-    expect(container.querySelector(".dashboard-row__na")).toBeFalsy();
-  });
 });

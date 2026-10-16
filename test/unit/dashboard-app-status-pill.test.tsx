@@ -19,9 +19,4 @@ describe("StatusPill — FACTORY-615", () => {
     expect(blocked.querySelector(".status-pill--blocked")).toBeTruthy();
     expect(working.querySelector(".status-pill--blocked")).toBeFalsy();
   });
-
-  test("the withheld row's own 'waiting' status renders its own distinct class", () => {
-    const { container } = render(<StatusPill statusClass="waiting" label="waiting for a slot" />);
-    expect(container.querySelector(".status-pill--waiting")).toBeTruthy();
-  });
 });

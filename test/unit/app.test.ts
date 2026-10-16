@@ -3,14 +3,13 @@ import { buildApp, notifyAgent, notifyIssue } from "../../src/daemon/app.js";
 import { startLoop } from "../../src/daemon/loop.js";
 import { combineHealth, createLoopHealth, type HealthStatus } from "../../src/daemon/health.js";
 import { createCoverageTracker } from "../../src/daemon/coverage.js";
-import { createAdmissionController } from "../../src/agents/admission.js";
 import { buildIdentity, toBuildReport } from "../../src/agents/build-identity.js";
 import { createCurrencyTracker } from "../../src/daemon/currency.js";
 import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
 import { FakeConnection } from "@brooswit/thatch/testing";
 import type { Herd } from "../../src/agents/herd.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
-import { buildDashboardRows, createDashboardFeed, type AdmissionView, type DashboardResponse } from "../../src/agents/dashboard.js";
+import { buildDashboardRows, createDashboardFeed, type DashboardResponse } from "../../src/agents/dashboard.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
 import type { DashboardHeaderInfo } from "../../src/web/dashboard-page.js";
 import { OUTCOME_TAG, UNKNOWN_CALLER, preIdentityRefusalLine } from "../../src/tools/outcome.js";
@@ -19,16 +18,12 @@ import { buildQueryAgentInventory } from "../../src/agents/query-agent-inventory
 import type { Rule } from "../../src/rules/rules.js";
 import { githubPrStaffing } from "../../src/rules/github-pr-type.js";
 
-// BUTCHR-332: a trivial, empty-sources fixture for every existing
-// DashboardResponse literal below that predates the admission view and isn't
-// exercising it.
-const noAdmissionView: AdmissionView = { cap: 0, residency: null, sentinels: null, sources: [] };
 
 // BUTCHR-269: a trivial, always-checked-empty fixture for every existing
 // ViewDeps literal below that predates /dashboard and isn't exercising it —
 // the real row-shape/could-not-check contract gets its own dedicated
 // describe block (and its own dedicated fixtures) further down this file.
-const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
 
 // BUTCHR-339: a trivial header fixture for every existing ViewDeps literal
 // below that predates the dashboard PAGE and isn't exercising it — the page's
@@ -247,7 +242,7 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
       ],
       { now: () => pollTime, issueMeta: (k) => meta.get(k), tracker: new StatusFloorTracker(() => pollTime) },
     );
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(pollTime).toISOString(), rows, admission: noAdmissionView };
+    const response: DashboardResponse = { checked: true, confirmedAt: new Date(pollTime).toISOString(), rows };
     // Distinct, clearly-shaped targets so a mismatch (e.g. the project row
     // 302ing to the issue row's Jira url) is unambiguous.
     const resourceLink = async (key: string) => {
@@ -314,7 +309,7 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
 // not an artifact of a fixture that fakes freshness some other way.
 describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request path", () => {
   test("smoke: the shared fixture app's /dashboard reflects its dashboard() fixture verbatim", async () => {
-    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView });
+    expect(await (await fetch(`${base}/dashboard`)).json()).toEqual({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [] });
   });
 
   test("a bare re-request does NOT advance confirmedAt (row-level or response-level) — only a new poll does", async () => {
@@ -322,7 +317,6 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       checked: true,
       confirmedAt: new Date(1000).toISOString(),
       rows: [{ kind: "agent", resourceKey: "BUTCHR-1", tier: { kind: "issue", issuetype: { checked: true, value: "Task" } }, agentStatus: "working", pane: "p1", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true }, confirmedAt: new Date(1000).toISOString() }],
-      admission: noAdmissionView,
     };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
     app.listen(0);
@@ -336,7 +330,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       expect(second.confirmedAt).toBe(first.confirmedAt);
 
       // Now simulate a poll: the daemon's own tee reassigns `snapshot`, never the route.
-      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }], admission: noAdmissionView };
+      snapshot = { checked: true, confirmedAt: new Date(2000).toISOString(), rows: [{ ...snapshot.rows[0]!, confirmedAt: new Date(2000).toISOString() }] };
       const third = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       if (!third.checked) throw new Error("expected checked:true");
       expect(third.rows[0]!.confirmedAt).not.toBe(first.rows[0]!.confirmedAt);
@@ -350,13 +344,13 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("could-not-check (case 1: the agent.list() read itself fails) is distinguishable from a genuinely empty fleet — never {checked:true, rows:[]}", async () => {
     // A genuine finding: the poll succeeded and there really are no agents.
-    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [], admission: noAdmissionView };
+    const genuinelyEmpty: DashboardResponse = { checked: true, confirmedAt: new Date(4000).toISOString(), rows: [] };
     // A declined poll: the whole-response shape carries checked:false and a
     // declinedAt, distinct at the type level from the empty-but-checked case
     // above — this is the assertion that fails if the two were ever
     // collapsed (e.g. both serializing to `{rows: []}` with `checked`
     // dropped, or a declined poll silently reusing `checked:true`).
-    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [], admission: noAdmissionView };
+    const declined: DashboardResponse = { checked: false, declinedAt: new Date(5000).toISOString(), rows: [] };
 
     let snapshot: DashboardResponse = genuinelyEmpty;
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
@@ -383,7 +377,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 
   test("a declined poll preserves the PRIOR successful snapshot's rows (stale, honestly labeled) rather than discarding them or re-serving them as fresh", async () => {
     const staleRow = { kind: "agent" as const, resourceKey: "BUTCHR-2", tier: { kind: "project" as const }, agentStatus: "idle", pane: "p2", timeInStatus: { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: false }, confirmedAt: new Date(1000).toISOString() };
-    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow], admission: noAdmissionView };
+    let snapshot: DashboardResponse = { checked: true, confirmedAt: new Date(1000).toISOString(), rows: [staleRow] };
     const { app } = buildApp({ state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }), health: () => healthy, dashboard: async () => snapshot, header: noHeader, resourceLink: noResourceLink, configInventory: noConfigInventory });
     app.listen(0);
     try {
@@ -392,7 +386,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
       // own tee) carries `rows` forward unchanged, only flipping the
       // top-level checked/declinedAt — this test pins that CHOICE, not just
       // that a value exists.
-      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows, admission: noAdmissionView };
+      snapshot = { checked: false, declinedAt: new Date(9000).toISOString(), rows: snapshot.rows };
       const body = (await (await fetch(`${b}/dashboard`)).json()) as DashboardResponse;
       expect(body.checked).toBe(false);
       expect(body.rows).toEqual([staleRow]);
@@ -408,7 +402,7 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 // query-agent-inventory.test.ts; this just proves the route is wired.
 describe("GET /config-inventory (FACTORY-72): every configured rule and managed-session definition", () => {
   test("smoke: the route serves deps.configInventory() verbatim", async () => {
-    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
     const { app } = buildApp({ ...view, configInventory: async () => inventory });
     app.listen(0);
     try {
@@ -422,7 +416,7 @@ describe("GET /config-inventory (FACTORY-72): every configured rule and managed-
   // FACTORY-132: `staffed: null` (the census-unavailable tri-state) must
   // round-trip through JSON as a real `null`, not dropped or coerced.
   test("staffed: null (census unavailable) round-trips through the JSON route as a real null, with a non-null reason", async () => {
-    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }], sessionDefinitions: [], errors: [] };
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }], sessionDefinitions: [], errors: [] };
     const { app } = buildApp({ ...view, configInventory: async () => inventory });
     app.listen(0);
     try {
@@ -446,9 +440,9 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
     const rows = buildDashboardRows([{ name: "x", agent_key: liveKey, agent_status: "working", pane_id: "w1:p3" }], {
       now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
     });
-    const dashboard: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
+    const dashboard: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows };
     const inventory = {
-      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }],
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }],
       sessionDefinitions: [], errors: [],
     };
     const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
@@ -498,9 +492,9 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
   // way src/daemon/index.ts wires them, never a hand-picked "checked" flag
   // independent of the rows the inventory itself was built from.
   test("when deps.dashboard() reports checked:false, the served page renders COULD NOT CHECK for staffing and cross-links — never UNSTAFFED or 'no running agent'", async () => {
-    const dashboard: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView };
+    const dashboard: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [] };
     const inventory = {
-      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }],
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }],
       sessionDefinitions: [], errors: [],
     };
     const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
@@ -519,77 +513,30 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
   });
 });
 
-// FACTORY-136: end-to-end through the REAL app/route AND a REAL
-// createDashboardFeed + createAdmissionController + buildQueryAgentInventory
-// — never a hand-built inventory literal like the block above (which only
-// pins the route's own pass-through wiring). This is the "real routes"
-// half of DoD requirement 6.
-describe("GET /configurations (FACTORY-136): the admission-source-unavailable tri-state, wired end-to-end through a real feed + admission controller", () => {
+// FACTORY-340: end-to-end through the REAL app/route AND a REAL
+// createDashboardFeed + buildQueryAgentInventory — never a hand-built
+// inventory literal like the block above (which only pins the route's own
+// pass-through wiring).
+describe("GET /configurations (FACTORY-340): a provider config reason, wired end-to-end through a real feed", () => {
   function ruleFixture(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
-    return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+    return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", ...over };
   }
 
-  test("a never-reported admission source covering a jira-work rule serves COULD NOT CHECK (naming the source) through /configurations and /config-inventory alike, never UNSTAFFED", async () => {
+
+  // FACTORY-340: the exact real-daemon failure the epic reviewer found —
+  // an enabled github-pr rule when `config.github` is unset. `configReasonFor`
+  // below mirrors `src/daemon/index.ts`'s own real callback
+  // (github-issue/github-pr/zendesk-ticket branches) exactly. Revert that
+  // callback's `github-pr` branch and this rule falls through to the
+  // observed-zero wording, reproducing the original bug: `staffed: false,
+  // reason: "no matching resources this poll"`, i.e. a silent, wrong
+  // UNSTAFFED for a rule that could never have been staffed at all.
+  test("FACTORY-340: an enabled github-pr rule with no GitHub config never reads UNSTAFFED/'no matching resources' — it gets the real config reason, through /configurations and /config-inventory alike", async () => {
     const now = () => 0;
-    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [], sources: ["issue"], now });
-    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
-    await feed.poll(async () => ({ agents: [] })); // agent.list() succeeds; the "issue" admission source never reports
-
-    const r = ruleFixture({ id: "task", resourceProvider: "jira-work" });
-    const configInventory = () =>
-      buildQueryAgentInventory({
-        rulesFile: { path: "/rules.json", rules: [r], error: null },
-        dashboard: feed.snapshot(),
-        configReasonFor: () => null,
-        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
-      });
-    const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
-    app.listen(0);
-    try {
-      const b = `http://localhost:${app.server!.port}`;
-
-      const jsonInventory = await (await fetch(`${b}/config-inventory`)).json() as { rules: { staffed: boolean | null; reason: string | null }[] };
-      expect(jsonInventory.rules[0]!.staffed).toBeNull();
-      expect(jsonInventory.rules[0]!.reason).toContain("never-reported");
-
-      const html = await (await fetch(`${b}/configurations`)).text();
-      expect(html).toContain("task");
-      expect(html.toUpperCase()).not.toContain("UNSTAFFED");
-      expect(html).toContain("COULD NOT CHECK");
-      expect(html).toContain("never-reported");
-    } finally {
-      app.stop();
-    }
-  });
-
-  // FACTORY-340: the exact real-daemon failure the epic reviewer found on
-  // FACTORY-136 — an enabled github-pr rule when `config.github` is unset.
-  // `src/daemon/index.ts`'s own conditional `sources:` list (`githubPrs =
-  // githubPrStaffingResult.run && config.github`) then OMITS
-  // ADMISSION_SOURCE_GITHUB_PR from `sources:` entirely — the source is not
-  // merely unchecked this poll, it was never DECLARED — while an enabled
-  // github-pr rule exists. `configReasonFor` below mirrors `index.ts`'s own
-  // real callback (github-issue/github-pr/zendesk-ticket branches) exactly,
-  // including this ticket's own fix (B) to it. Revert fix (B) (the
-  // `github-pr` branch added to `configReasonFor` in `src/daemon/index.ts`)
-  // and this rule falls through to fix (A)'s admission-source-absent branch
-  // instead, which still correctly reads COULD NOT CHECK (A alone already
-  // makes the safety argument true) — so this test only catches a FULL
-  // revert of both (A) and (B), which reproduces the original bug exactly:
-  // `staffed: false, reason: "no matching resources this poll"`, i.e. a
-  // silent, wrong UNSTAFFED for a rule whose withholding cannot be ruled
-  // out. See `admissionSourceCensusFor`'s own doc comment (src/agents/
-  // query-agent-inventory.ts) and `ruleStaffingReason`'s own unit tests for
-  // fix (A) isolated from fix (B).
-  test("FACTORY-340: an enabled github-pr rule whose admission source is entirely ABSENT (config.github unset) never reads UNSTAFFED/'no matching resources' — it gets the real config reason, through /configurations and /config-inventory alike", async () => {
-    const now = () => 0;
-    // No "github-pr" in `sources` — mirrors index.ts declaring it only when
-    // `githubPrs` (itself gated on `config.github`) is truthy.
-    const admission = createAdmissionController({ cap: 1_000_000, residency: async () => [], sources: ["issue"], now });
-    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
+    const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now) });
     await feed.poll(async () => ({ agents: [] }));
 
-    const r: Rule = { id: "review-prs", resourceProvider: "github-pr", enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
+    const r: Rule = { id: "review-prs", resourceProvider: "github-pr", enabled: true, query: "q", brief: "b", execution: "swarm", account: "none" };
     const staffing = githubPrStaffing([r], undefined); // config.github === undefined, same as a daemon with no GITHUB_TOKEN_FILE/BUTCHR_GITHUB_ORGS
     if (staffing.run) throw new Error("expected githubPrStaffing to read run:false with no config.github"); // sanity + narrows `staffing.reason` below
     const githubPrStaffingResult = staffing;
@@ -1109,97 +1056,6 @@ describe("/health carries detector coverage as a sibling of components, and neve
   });
 });
 
-// BUTCHR-284: /health carries the admission cap and current residency as a
-// THIRD sibling — never inside components[], and never able to flip `ok`:
-// sitting AT the cap is a normal, healthy state. Driven through the real
-// production composition (combineHealth + buildApp + a real listening
-// server), same as the build-identity/coverage tests above.
-describe("/health carries the admission cap + residency as a sibling of components, and never flips ok (BUTCHR-284)", () => {
-  test("combineHealth's optional admission param round-trips through the real /health endpoint", async () => {
-    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
-    health.recordSuccess();
-    const admission = createAdmissionController({ cap: 8, residency: async () => ["A", "B", "C"] });
-    await admission.admit([], []); // establishes a trusted residency reading
-    const { app, mcp } = buildApp({
-      state: async () => [],
-      open: async () => ({ ok: true }),
-      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
-      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
-      openPane: async () => ({ ok: true }),
-      header: noHeader,
-      resourceLink: noResourceLink, configInventory: noConfigInventory,
-      dashboard: noDashboard,
-      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
-    });
-    app.listen(0);
-    try {
-      const res = await fetch(`http://localhost:${app.server!.port}/health`);
-      const body = (await res.json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: 3, sentinels: 0, longestWait: null });
-      // Never folded into components[] — components stays exactly the liveness list.
-      expect(body.components).toEqual([expect.objectContaining({ name: "pollLoop" })]);
-      expect(body.components.some((c) => "cap" in c || "residency" in c)).toBe(false);
-      // Being at the cap is healthy: `ok` reflects pollLoop's own state only.
-      expect(body.ok).toBe(true);
-    } finally {
-      health.stop();
-      await mcp.closeAll();
-      app.stop();
-    }
-  });
-
-  test("residency is null before any trusted census has ever run", async () => {
-    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
-    health.recordSuccess();
-    const admission = createAdmissionController({ cap: 8, residency: async () => { throw new Error("never called yet"); } });
-    const { app, mcp } = buildApp({
-      state: async () => [],
-      open: async () => ({ ok: true }),
-      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
-      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
-      openPane: async () => ({ ok: true }),
-      header: noHeader,
-      resourceLink: noResourceLink, configInventory: noConfigInventory,
-      dashboard: noDashboard,
-      health: () => combineHealth([health], undefined, undefined, admission.snapshot()),
-    });
-    app.listen(0);
-    try {
-      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
-      expect(body.admission).toEqual({ cap: 8, residency: null, sentinels: null, longestWait: null });
-    } finally {
-      health.stop();
-      await mcp.closeAll();
-      app.stop();
-    }
-  });
-
-  test("omitting admission (existing callers, e.g. every fixture above) leaves it absent from the response — fully backward compatible", async () => {
-    const health = createLoopHealth({ name: "pollLoop", thresholdMs: 60_000 });
-    health.recordSuccess();
-    const { app, mcp } = buildApp({
-      state: async () => [],
-      open: async () => ({ ok: true }),
-      // BUTCHR-265: `openPane` is required on ViewDeps since BUTCHR-267; these
-      // BUTCHR-284 fixtures arrived on main after that change and never exercise it.
-      openPane: async () => ({ ok: true }),
-      header: noHeader,
-      resourceLink: noResourceLink, configInventory: noConfigInventory,
-      dashboard: noDashboard,
-      health: () => combineHealth([health]),
-    });
-    app.listen(0);
-    try {
-      const body = (await (await fetch(`http://localhost:${app.server!.port}/health`)).json()) as HealthStatus;
-      expect(body.admission).toBeUndefined();
-      expect(body.ok).toBe(true);
-    } finally {
-      health.stop();
-      await mcp.closeAll();
-      app.stop();
-    }
-  });
-});
 
 const STALE_VERDICT: CurrencyVerdict = {
   status: "stale",
@@ -1220,7 +1076,7 @@ const UNKNOWN_VERDICT: CurrencyVerdict = { status: "unknown", reason: "no local 
 // never inside components[], and never able to flip `ok`: a daemon running
 // stale code is not thereby unhealthy in the liveness sense. Driven through
 // the real production composition (combineHealth + buildApp + a real
-// listening server), same as the build-identity/coverage/admission tests
+// listening server), same as the build-identity/coverage tests
 // above. The tracker is fed a FAKE `compute` (never real git) so these stay
 // unit tests of the wiring, not of build-currency.ts itself (see
 // test/unit/build-currency.test.ts and test/unit/currency.test.ts for that).
@@ -1235,7 +1091,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       openPane: async () => ({ ok: true }),
       header: noHeader,
       resourceLink: noResourceLink, configInventory: noConfigInventory,
-      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      health: () => combineHealth([health], undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
     app.listen(0);
@@ -1267,7 +1123,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       openPane: async () => ({ ok: true }),
       header: noHeader,
       resourceLink: noResourceLink, configInventory: noConfigInventory,
-      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      health: () => combineHealth([health], undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
     app.listen(0);
@@ -1292,7 +1148,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       openPane: async () => ({ ok: true }),
       header: noHeader,
       resourceLink: noResourceLink, configInventory: noConfigInventory,
-      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      health: () => combineHealth([health], undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
     app.listen(0);
@@ -1317,7 +1173,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       openPane: async () => ({ ok: true }),
       header: noHeader,
       resourceLink: noResourceLink, configInventory: noConfigInventory,
-      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      health: () => combineHealth([health], undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
     app.listen(0);
@@ -1347,7 +1203,7 @@ describe("/health carries the build-currency verdict as a sibling of components,
       openPane: async () => ({ ok: true }),
       header: noHeader,
       resourceLink: noResourceLink, configInventory: noConfigInventory,
-      health: () => combineHealth([health], undefined, undefined, undefined, currency.snapshot()),
+      health: () => combineHealth([health], undefined, undefined, currency.snapshot()),
       dashboard: noDashboard,
     });
     app.listen(0);

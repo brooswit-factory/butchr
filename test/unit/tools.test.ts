@@ -2655,8 +2655,8 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
 // in test/unit/admission.test.ts's "priority is not an admission-order
 // input" describe block; this only proves the boss-facing prose is present,
 // not that the mechanism it describes is true.
-describe("BUTCHR-336: every boss-facing priority surface states the admission mechanism", () => {
-  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+describe("BUTCHR-336: every boss-facing priority surface states the staffing-order mechanism", () => {
+  const MECHANISM_CLAUSE = "priority is not read by reconcile, so it does not change which ticket is staffed first";
 
   test("prioritize_worker, new_worker, file_where_it_belongs, jira_create_issue and jira_set_priority all carry the mechanism sentence", () => {
     const { tools } = rig();
@@ -2672,7 +2672,7 @@ describe("BUTCHR-336: every boss-facing priority surface states the admission me
 describe("BUTCHR-299: every brief teaching explicit priority changes states the admission mechanism", () => {
   const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
   const GUIDANCE = "`jira_set_priority`";
-  const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
+  const MECHANISM_CLAUSE = "priority is not read by reconcile, so it does not change which ticket is staffed first";
   const unwrapped = (file: string) => readFileSync(join(BRIEFS_DIR, file), "utf8").replace(/\s+/g, " ");
 
   const briefs = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md"));

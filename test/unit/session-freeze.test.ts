@@ -96,7 +96,7 @@ describe("freezeSessionDefinition / unfreezeSessionDefinition — the two gates 
 
   test("freeze preserves every OTHER manifest field, only touching frozen", async () => {
     const store = fakeStore();
-    const def = goodDef({ role: "sentinel", execution: "persistent", mcpServers: [{ name: "x", type: "http", url: "https://x", channel: true }] });
+    const def = goodDef({ execution: "persistent", mcpServers: [{ name: "x", type: "http", url: "https://x", channel: true }] });
     const { files, readFile, writeFile } = fakeManifests({ [absPath("defs", "a.json")]: JSON.stringify(def) });
     await freezeSessionDefinition({ store, readFile, writeFile }, absPath("defs", "a.json"));
     const rewritten = JSON.parse(files[absPath("defs", "a.json")]!);
@@ -164,7 +164,7 @@ describe("freeze holds through a file rename ONLY via the manifest flag — the 
     const oldPath = absPath("defs", "mud-player-1.json");
     const newPath = absPath("defs", "archive", "mud-player-1.json");
     const store = fakeStore();
-    const manifests = fakeManifests({ [oldPath]: JSON.stringify(goodDef({ execution: "persistent", role: "sentinel" })) });
+    const manifests = fakeManifests({ [oldPath]: JSON.stringify(goodDef({ execution: "persistent" })) });
     await freezeSessionDefinition({ store, readFile: manifests.readFile, writeFile: manifests.writeFile }, oldPath);
     expect(sessionFreezeStoreKey(oldPath)).not.toBe(sessionFreezeStoreKey(newPath));
 
@@ -199,12 +199,12 @@ function fakeHerdWithFreeze(store: SessionFreezeStore, initiallyRunning: string[
   };
 }
 
-describe("reconcile-level: an explicit STORE freeze wins over persistence/sentinel status (BUTCHR-454 DoD)", () => {
+describe("reconcile-level: an explicit STORE freeze wins over persistence status (BUTCHR-454 DoD)", () => {
   const rule = () => builtinManagedSessionsRule(absPath("defs"));
 
-  test("a running persistent/sentinel definition, frozen ONLY via the store (manifest frozen: false), is removed from `desired` and stopped by reconcileNow", async () => {
+  test("a running persistent definition, frozen ONLY via the store (manifest frozen: false), is removed from `desired` and stopped by reconcileNow", async () => {
     const path = absPath("defs", "mud-player-1.json");
-    const files: Record<string, string> = { [path]: JSON.stringify(goodDef({ execution: "persistent", role: "sentinel", frozen: false })) };
+    const files: Record<string, string> = { [path]: JSON.stringify(goodDef({ execution: "persistent", frozen: false })) };
     const list = async () => [{ path, kind: "file" as const, name: "mud-player-1.json", size: 10, mtimeMs: 1 }];
     const read = async (p: string) => files[p]!;
     const resourceType = createManagedSessionResourceType({ rule: rule(), list, read });
@@ -231,9 +231,9 @@ describe("reconcile-level: an explicit STORE freeze wins over persistence/sentin
     expect(herd.stopped).toEqual([agentKey]);
   });
 
-  test("unfreezing (via unfreezeSessionDefinition) makes the SAME persistent/sentinel definition eligible again next poll", async () => {
+  test("unfreezing (via unfreezeSessionDefinition) makes the SAME persistent definition eligible again next poll", async () => {
     const path = absPath("defs", "mud-player-1.json");
-    const files: Record<string, string> = { [path]: JSON.stringify(goodDef({ execution: "persistent", role: "sentinel", frozen: true })) };
+    const files: Record<string, string> = { [path]: JSON.stringify(goodDef({ execution: "persistent", frozen: true })) };
     const store = fakeStore({ [sessionFreezeStoreKey(path)]: true });
     const list = async () => [{ path, kind: "file" as const, name: "mud-player-1.json", size: 10, mtimeMs: 1 }];
     const read = async (p: string) => files[p]!;

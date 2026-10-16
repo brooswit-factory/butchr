@@ -139,26 +139,25 @@ describe("buildSettingEntries", () => {
       "BUTCHR_AGENT_PROVIDERS_PROJECT",
       "BUTCHR_AGENT_PROVIDERS_STORY",
       "BUTCHR_AGENT_PROVIDERS_TASK",
-      "BUTCHR_MAX_AGENTS",
       "BUTCHR_POLL_STALE_MS",
     ].sort());
   });
 
   test("no settings.json layer (rawEnv === effectiveEnv, default): env-set key is 'environment', unset is 'default'", () => {
-    const entries = buildSettingEntries({ BUTCHR_MAX_AGENTS: "12" });
-    expect(entries.find((e) => e.key === "BUTCHR_MAX_AGENTS")!.source).toBe("environment");
+    const entries = buildSettingEntries({ BUTCHR_POLL_STALE_MS: "60000" });
+    expect(entries.find((e) => e.key === "BUTCHR_POLL_STALE_MS")!.source).toBe("environment");
     expect(entries.find((e) => e.key === "BUTCHR_AGENT_MODEL")!.source).toBe("default");
   });
 
   test("settings.json supplies a value the raw env does NOT set: source is 'file'", () => {
     // effectiveEnv already has the settings.json value merged in (as a real caller's effectiveSettingsEnv would produce); rawEnv is the UNMERGED process.env, which never set it.
-    const entries = buildSettingEntries({ BUTCHR_MAX_AGENTS: "12" }, {}, { BUTCHR_MAX_AGENTS: "12" });
-    expect(entries.find((e) => e.key === "BUTCHR_MAX_AGENTS")!.source).toBe("file");
+    const entries = buildSettingEntries({ BUTCHR_POLL_STALE_MS: "60000" }, {}, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(entries.find((e) => e.key === "BUTCHR_POLL_STALE_MS")!.source).toBe("file");
   });
 
   test("a real env var wins over settings.json: source is 'environment', never 'file'", () => {
-    const entries = buildSettingEntries({ BUTCHR_MAX_AGENTS: "5" }, { BUTCHR_MAX_AGENTS: "5" }, { BUTCHR_MAX_AGENTS: "12" });
-    expect(entries.find((e) => e.key === "BUTCHR_MAX_AGENTS")!.source).toBe("environment");
+    const entries = buildSettingEntries({ BUTCHR_POLL_STALE_MS: "5000" }, { BUTCHR_POLL_STALE_MS: "5000" }, { BUTCHR_POLL_STALE_MS: "60000" });
+    expect(entries.find((e) => e.key === "BUTCHR_POLL_STALE_MS")!.source).toBe("environment");
   });
 });
 

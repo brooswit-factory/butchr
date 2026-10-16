@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { resolvePtyPane, isPaneStillLive, ptyAttachRefusalMessage } from "../../src/terminal/pty-attach.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
-import type { AgentDashboardRow, WithheldDashboardRow } from "../../src/agents/dashboard.js";
+import type { AgentDashboardRow } from "../../src/agents/dashboard.js";
 
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0m", exact: true };
 
@@ -17,17 +17,6 @@ function agentRow(ruleId: string, resourceId: string, pane: string): AgentDashbo
   };
 }
 
-function withheldRow(ruleId: string, resourceId: string): WithheldDashboardRow {
-  return {
-    kind: "withheld",
-    resourceKey: encodeAgentKey({ resourceProvider: "jira-work", ruleId, resourceId }),
-    tier: { kind: "issue", issuetype: { checked: true, value: "Task" } },
-    source: "issue",
-    waiting: floor,
-    confirmedAt: new Date(0).toISOString(),
-    agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" },
-  };
-}
 
 describe("resolvePtyPane", () => {
   test("malformed key is refused before anything else is asked", () => {
@@ -41,11 +30,6 @@ describe("resolvePtyPane", () => {
     expect(r).toEqual({ ok: false, refusal: { reason: "unknown-pane", agentKey: key } });
   });
 
-  test("a well-formed key naming a WITHHELD (not-live) row is refused as unknown-pane, not resolved to a pane", () => {
-    const row = withheldRow("triage", "BUTCHR-1");
-    const r = resolvePtyPane(row.resourceKey, [row]);
-    expect(r).toEqual({ ok: false, refusal: { reason: "unknown-pane", agentKey: row.resourceKey } });
-  });
 
   test("a live agent row resolves to its pane", () => {
     const row = agentRow("triage", "BUTCHR-1", "pane-42");
@@ -80,10 +64,6 @@ describe("isPaneStillLive", () => {
   test("false once the row is gone", () => {
     const row = agentRow("triage", "BUTCHR-1", "pane-42");
     expect(isPaneStillLive(row.resourceKey, "pane-42", [])).toBe(false);
-  });
-  test("false once the row is withheld (no longer an agent row)", () => {
-    const row = withheldRow("triage", "BUTCHR-1");
-    expect(isPaneStillLive(row.resourceKey, "pane-42", [row])).toBe(false);
   });
   test("false when the pane was replaced (a respawned agent under the same key, different pane)", () => {
     const row = agentRow("triage", "BUTCHR-1", "pane-99");

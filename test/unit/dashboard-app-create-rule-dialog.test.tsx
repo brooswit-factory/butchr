@@ -19,7 +19,7 @@ import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { withDom } from "../setup/happy-dom.js";
 import { CreateRuleDialog } from "../../dashboard-app/src/components/CreateRuleDialog.js";
 import type { RuleCreateOutcome, RulesApi } from "../../dashboard-app/src/api/rules.js";
-import { RULE_FORM_CATALOG, AGENT_ROLES, CAPACITY_ROLE_DEFAULT } from "../../src/rules/rule-form-catalog.js";
+import { RULE_FORM_CATALOG } from "../../src/rules/rule-form-catalog.js";
 
 withDom();
 afterEach(cleanup);
@@ -29,7 +29,6 @@ function stubApi(createRule: (...a: unknown[]) => Promise<RuleCreateOutcome>): R
     capabilities: { write: true },
     listRules: () => Promise.reject(new Error("unused")),
     getCatalog: () => Promise.resolve(RULE_FORM_CATALOG),
-    getCapacityRoles: () => Promise.resolve({ values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT }),
     previewRule: () => Promise.reject(new Error("unused")),
     planRule: () => Promise.reject(new Error("unused")),
     setEnabled: () => Promise.reject(new Error("unused")),

@@ -103,7 +103,7 @@ import { handleJiraTokenWrite } from "../../src/web/setup-api.js";
 import { createSetupCodeManager } from "../../src/setup/setup-code.js";
 import { buildSetupModeViewDeps } from "../../src/daemon/setup-mode.js";
 import { writeSetting, SettingProvidedByEnvironmentError } from "../../src/settings/write-settings.js";
-import { MAX_AGENTS_HARD_MAX, loadSettingsFile } from "../../src/settings/settings-file.js";
+import { loadSettingsFile } from "../../src/settings/settings-file.js";
 import { buildSettingEntries } from "../../src/web/settings-api.js";
 import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
 
@@ -152,26 +152,25 @@ describe("setup mode restarts itself after a successful setup (item 6)", () => {
   });
 });
 
-describe("settings: env wins (409), hard maximum, loader agrees (item 4)", () => {
+describe("settings: env wins (409), loader agrees (item 4)", () => {
   test("PUT of an env-set key is refused with SettingProvidedByEnvironmentError; blank env counts as unset; editable is false for env rows", () => {
     const home = mkdtempSync(join(tmpdir(), "butchr-set-"));
     try {
-      const env = { XDG_CONFIG_HOME: home, HOME: home, BUTCHR_MAX_AGENTS: "24" } as Record<string, string | undefined>;
-      expect(() => writeSetting("BUTCHR_MAX_AGENTS", "10", false, env as never)).toThrow(SettingProvidedByEnvironmentError);
-      expect(() => writeSetting("BUTCHR_MAX_AGENTS", "10", false, { ...env, BUTCHR_MAX_AGENTS: "  " } as never)).not.toThrow();
+      const env = { XDG_CONFIG_HOME: home, HOME: home, BUTCHR_POLL_STALE_MS: "24000" } as Record<string, string | undefined>;
+      expect(() => writeSetting("BUTCHR_POLL_STALE_MS", "10000", false, env as never)).toThrow(SettingProvidedByEnvironmentError);
+      expect(() => writeSetting("BUTCHR_POLL_STALE_MS", "10000", false, { ...env, BUTCHR_POLL_STALE_MS: "  " } as never)).not.toThrow();
       const rows = buildSettingEntries(env, env, {});
-      expect(rows.find((r) => r.key === "BUTCHR_MAX_AGENTS")!.editable).toBe(false);
+      expect(rows.find((r) => r.key === "BUTCHR_POLL_STALE_MS")!.editable).toBe(false);
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
-  test("the hard maximum refuses even with confirm; a confirmed value up to it survives the loader", () => {
-    expect(() => writeSetting("BUTCHR_MAX_AGENTS", String(MAX_AGENTS_HARD_MAX + 1), true, { XDG_CONFIG_HOME: "/nonexistent-x", HOME: "/nonexistent-x" } as never)).toThrow();
+  test("a written value survives the loader", () => {
     const home = mkdtempSync(join(tmpdir(), "butchr-load-"));
     try {
       const env = { XDG_CONFIG_HOME: home, HOME: home } as Record<string, string | undefined>;
       mkdirSync(join(home, "butchr"), { recursive: true });
-      writeSetting("BUTCHR_MAX_AGENTS", "80", true, env as never);
+      writeSetting("BUTCHR_POLL_STALE_MS", "80000", false, env as never);
       const loaded = loadSettingsFile(env as never);
-      expect(loaded.values.BUTCHR_MAX_AGENTS).toBe("80");
+      expect(loaded.values.BUTCHR_POLL_STALE_MS).toBe("80000");
       expect(loaded.problems).toEqual([]);
       void writeFileSync; void chmodSync;
     } finally { rmSync(home, { recursive: true, force: true }); }
