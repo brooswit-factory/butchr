@@ -103,7 +103,7 @@ other and of every other field):
 
 | field | values | default | reaches argv? |
 |---|---|---|---|
-| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → butchr's own default applies (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, src/agents/argv.ts), for every provider including `jira-project` since FACTORY-129 | yes — `SpawnSpec.permissionMode` |
+| `permissionMode` | `default` \| `manual` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → butchr's own default applies (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, src/agents/argv.ts), for every provider including `jira-project` since FACTORY-129 | yes — `SpawnSpec.permissionMode` |
 | `lizardMode` | boolean | absent → eligible (`ruleLizardModeOf`: `rule.lizardMode !== false`); explicit `false` → never scanned | no — daemon-side only |
 
 **Rollout, and there is no global override.** `permissionMode` reaches
@@ -121,6 +121,20 @@ that turns this default off fleet-wide; rolling one rule back means setting
 `permissionMode: "bypassPermissions"` explicitly on it (which respawns that
 rule's agents once) — "leave it unset" now means `acceptEdits`, not the
 pre-FACTORY-138 behaviour.
+
+**Vocabulary (FACTORY-275).** `default` and `manual` are the SAME value at
+the launcher — Claude's own `--permission-mode` treats `manual` as an
+accepted alias for its real canonical `default` (verified against a real
+`claude` invocation, not just `--help`/`--version`; see
+`SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts,
+for the full reproduction). Both are forwarded verbatim, unchanged, so use
+whichever reads better; nothing distinguishes them at runtime. `auto` keeps
+its one existing meaning (Claude's own per-prompt model-classifier judgment)
+and is never treated as a synonym for `bypassPermissions` here, which skips
+every permission check unconditionally with no judgment involved — the
+operator-facing friendly name for `bypassPermissions` is **"unattended
+mode"** (prose/docs only; the wire value is unchanged for back-compat, and
+there is no permission-mode UI to relabel — see docs/managed-sessions.md).
 
 **What they do.** `lizardMode: true` is the operator's own name (FACTORY-67)
 for turning on the daemon's standalone permission-answer timer
@@ -568,8 +582,7 @@ single poll. These two fields are that per-rule throttle:
   (`LEDGER_UNSEEN_EVICTION_CALLS`) cap-withholding already relies on. But a
   rate-deferred id is explicitly EXCLUDED (PR #734 review) from every one of
   the cap's own reporting surfaces — `/health`'s `longestWait`, the
-  per-source admission census bucket (and so the `admission:withheld` Jira
-  label it feeds), and the `[admission2] cap=... withheld N/M wanted: ...`
+  per-source admission census bucket, and the `[admission2] cap=... withheld N/M wanted: ...`
   line's own count and id list — because it was never withheld BY THE CAP
   (it may have had cap headroom to spare). Those three only ever report a
   candidate the SHARED CAP actually ran out on; a rate limiter's own

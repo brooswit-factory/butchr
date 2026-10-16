@@ -30,6 +30,9 @@ export function computeRelease(baseVersion: Semver, fragments: Fragment[]): Rele
   const invalid = fragments.filter((fr) => fr.bump === null);
   if (invalid.length) throw new Error(`fragment(s) with no valid "bump: major|minor|patch" line: ${invalid.map((fr) => fr.path).join(", ")} — refusing to compute a release rather than silently skip them`);
 
+  const unrecognised = fragments.filter((fr) => fr.unknownHeadings.length > 0);
+  if (unrecognised.length) throw new Error(`fragment(s) with unrecognised heading(s): ${unrecognised.map((fr) => `${fr.path} (${fr.unknownHeadings.join(", ")})`).join("; ")} — refusing to compute a release rather than silently drop their bullets`);
+
   const mismatched = fragments.filter((fr) => hasBreaking(fr) !== (fr.bump === "major"));
   if (mismatched.length) throw new Error(`fragment(s) where ### BREAKING content and the declared bump disagree: ${mismatched.map((fr) => `${fr.path} (bump: ${fr.bump}, BREAKING: ${hasBreaking(fr)})`).join(", ")} — refusing to compute a release`);
 

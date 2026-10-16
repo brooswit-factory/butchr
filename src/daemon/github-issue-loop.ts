@@ -4,7 +4,7 @@
  * wiring itself is testable.
  *
  * What it deliberately does NOT get from the Jira loop: label sync, the
- * parked/abandoned/stall detectors, respawn and crash-loop comments. Every
+ * abandoned/stall detectors, respawn and crash-loop comments. Every
  * one of those writes to Jira, and a GitHub issue is not a Jira ticket.
  * `ownsId` scopes reconciliation to `github-issue` agents, and the Jira loop
  * scopes itself to `jira-work` agents, so neither loop can stop the other's.

@@ -319,11 +319,8 @@ export interface WorkerRef {
  * even against a worker that genuinely carries labels (BUTCHR-127 itself
  * carries `butchr:orphan`/`pr:merged`, and neither appears on BUTCHR-156's
  * outward link to it). So this can answer "is this worker Done" for free,
- * but it can NEVER answer "does this worker carry `butchr:shelved`"
- * (`EXEMPT_LABEL`, src/agents/parked.ts) from this payload alone — a caller
- * that needs the shelved-exemption has to pay for a SEPARATE `getIssue` per
- * non-Done worker to find out. That cost, and where it's paid, lives in
- * relationship.ts's own open-worker guard, not here — this function's only
+ * but it cannot answer label questions from this payload alone. A caller
+ * that needs labels must fetch the issue separately. This function's only
  * job is the total, I/O-free read of what the payload already contains.
  */
 export function findWorkers(issue: unknown): WorkerRef[] {

@@ -60,8 +60,8 @@ export const ISSUE_JQL = 'assignee = currentUser() AND status IN ("In Progress",
  * Do"` there would staff an agent for every To Do ticket in the backlog, a
  * blast radius far past this one detector. This query exists so a To Do
  * worker whose `Implements` boss has already reached Done — invisible to
- * `ISSUE_JQL` and therefore to `parked.ts` and `abandoned.ts` alike, since
- * the orphan machinery also can't see it (its boss link is intact) — is
+ * `ISSUE_JQL` and therefore to `abandoned.ts`'s default candidate walk,
+ * since the orphan machinery also can't see it (its boss link is intact) — is
  * still audible. See `abandonedCandidates`'s own doc comment for why the
  * PREDICATE needed no change once this feeds it: it was already total over
  * a To Do worker with a Done inward Implements stub.

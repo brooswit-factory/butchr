@@ -45,35 +45,30 @@ describe("LABEL_REGISTRY contents (verified against the code that writes each la
       expect(LABEL_REGISTRY[l as keyof typeof LABEL_REGISTRY]).toBeDefined();
     }
   });
-  // BUTCHR-352: the admission:* family — a SEPARATE namespace from agent:*,
-  // deliberately (see src/labels/plan.ts's ADMISSION_PREFIX doc comment for
-  // the mixed-build hazard this avoids).
-  test("the admission:* family — the one AdmissionLabel value (BUTCHR-352)", () => {
-    expect(LABEL_REGISTRY["admission:withheld"]).toBeDefined();
+  test("historical admission labels have no registry entry", () => {
+    expect(REGISTERED_LABELS.has("admission:withheld")).toBe(false);
   });
-  test("the three verb-owned labels", () => {
-    expect(LABEL_REGISTRY["butchr:shelved"]).toBeDefined();
+  test("the two verb-owned labels", () => {
+    expect(REGISTERED_LABELS.has("butchr:shelved")).toBe(false);
     expect(LABEL_REGISTRY["butchr:orphan"]).toBeDefined();
     expect(LABEL_REGISTRY["butchr:missing-implements"]).toBeDefined();
   });
-  test("exactly 13 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
-    expect(REGISTERED_LABELS.size).toBe(13);
+  test("exactly 11 registered labels — no more, no fewer (a change here means a label was added or removed; update this count deliberately, not by reflex)", () => {
+    expect(REGISTERED_LABELS.size).toBe(11);
   });
   // AC-6: this registry describes labels butchr writes; it must never become
   // a list of labels butchr enforces onto tickets it doesn't own.
   test("AC-6: every registered label is under butchr's own namespaces — never a human label", () => {
     for (const label of REGISTERED_LABELS) {
-      expect(/^(agent|pr|admission|butchr):/.test(label)).toBe(true);
+      expect(/^(agent|pr|butchr):/.test(label)).toBe(true);
     }
   });
   // AC-5: butchr:shelved's documented treatment (verb-owned, NOT daemon-owned)
   // must not be re-described here as daemon-owned — that's a different bug
   // from "unregistered" but just as real, so pin it directly against the
   // registry's own prose rather than trusting a human to keep it in sync.
-  test("AC-5: butchr:shelved's registry entry does not claim daemon ownership", () => {
-    const entry = LABEL_REGISTRY["butchr:shelved"];
-    expect(entry.appliedBy.toLowerCase()).not.toContain("daemon");
-    expect(entry.notes).toContain("NOT daemon-owned");
+  test("FACTORY-498: historical shelving labels have no registry entry", () => {
+    expect(REGISTERED_LABELS.has("butchr:shelved")).toBe(false);
   });
 });
 

@@ -45,6 +45,17 @@ export function evaluate(f: Facts): GateResult {
   const v = (ok: boolean, reason: string) => verdicts.push({ ok, reason });
   const versionChanged = f.version !== f.baseVersion;
 
+  // Unrecognised headings are checked unconditionally, before the `!required` early return:
+  // a fragment can be ADDED by a PR that doesn't itself touch a gated path (e.g. a scripts/
+  // change, or a fragment-only diff) and still be picked up by `computeRelease` at a later
+  // tag — fragments aren't required outside a gated PR, but one that IS present must not be
+  // allowed to carry a heading whose bullets would be silently dropped or misattributed.
+  for (const frag of f.newFragments) {
+    v(frag.unknownHeadings.length === 0, frag.unknownHeadings.length === 0
+      ? `${frag.path} has no unrecognised headings`
+      : `${frag.path} has unrecognised heading(s) ${frag.unknownHeadings.map((h) => `"### ${h}"`).join(", ")} — bullets under these are silently dropped; use one of ${SECTIONS.join("/")}`);
+  }
+
   if (!required) {
     const to = parse(f.version);
     const baseTip = f.baseTipVersion ? parse(f.baseTipVersion) : null;
@@ -74,6 +85,7 @@ export function evaluate(f: Facts): GateResult {
     : `gated files changed but no changelog.d/ fragment was added — create changelog.d/<TICKET>.md starting with "bump: major|minor|patch" on its own line, followed by "### Added"/"### Fixed"/etc. bullets (see changelog.d/README.md)`);
 
   // 5. per-fragment: a valid declared level, at least one bullet, and BREAKING <=> major.
+  // (unrecognised-heading check already ran above, unconditionally, before the `!required` return.)
   for (const frag of f.newFragments) {
     v(frag.bump !== null, frag.bump !== null
       ? `${frag.path} declares bump: ${frag.bump}`

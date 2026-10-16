@@ -15,10 +15,10 @@ import type { NotifyReason } from "../resources/types.js";
 /**
  * A ticket watched on behalf of active issues via the Implements chain (see
  * src/jira-watch/routes.ts). This is `RelatedResource<T>`
- * (src/resources/types.ts) defaulted to `T = JiraIssue` — the shape every
- * existing caller (src/agents/parked.ts, and this file's own issue-tier
- * wiring below) already depends on; a second resource type would use
- * `RelatedResource<ItsShape>` directly instead of this alias.
+ * (src/resources/types.ts) defaulted to `T = JiraIssue` — the shape this
+ * file's own issue-tier wiring below already depends on; a second resource
+ * type would use `RelatedResource<ItsShape>` directly instead of this
+ * alias.
  */
 export type RelatedIssue<T = JiraIssue> = RelatedResource<T>;
 
@@ -104,48 +104,19 @@ export interface LoopDeps {
    */
   onPollSuccess?: () => void;
   /**
-   * BUTCHR-24: run the parked-ticket detector (src/agents/parked.ts) over
-   * this poll's already-fetched (issues, related) snapshot. Called from
-   * inside the observe function below, NOT from `watch()`'s `onChange`
-   * callback, because this is fetch-stage work operating on the snapshot
-   * `observe()` just produced — it belongs alongside `syncLabels` above, not
-   * downstream in the diff/notify stage.
-   *
-   * BUTCHR-57 UPDATE: the reason this placement used to be load-bearing no
-   * longer applies IN THIS LOOP. `@brooswit/sundry`'s `watch()` by DEFAULT
-   * only invokes `onChange` when the polled snapshot's hash differs from the
-   * previous one — documented in the published package's
-   * `dist/watch/watcher.d.ts` ("call `onChange(next, prev)` whenever the
-   * hash of its return value changes") and confirmed against the compiled
-   * implementation in `dist/index.js`, whose internal `observe()` returns
-   * early via `if (h !== prevHash)` before ever calling `onChange`. THIS loop
-   * no longer relies on that default: the `hash` option passed to `watch()`
-   * below (see `notifyTick`) forces `observe()`'s `h !== prevHash` branch to
-   * always be taken, so `onChange` now runs on every poll tick regardless of
-   * whether anything changed. A detector wired into `onChange` here would no
-   * longer silently stop firing on a quiet poll. That does not make
-   * `checkParked` a candidate to move, though: it still belongs in the fetch
-   * stage on its own merits (it consumes the same freshly-fetched snapshot
-   * as `syncLabels`, before any diffing happens), so it stays here. Optional;
-   * omitted, parked-ticket detection simply never runs. The detector itself
-   * never throws (see parked.ts), but this call is awaited inside the same
-   * try-implicit observe function as `syncLabels` above, so a change to that
-   * guarantee can never silently take the success heartbeat below down with
-   * it.
-   */
-  checkParked?: (issues: readonly JiraIssue[], related: readonly RelatedIssue[]) => Promise<void>;
-  /**
    * BUTCHR-200: run the abandoned-worker detector (src/agents/abandoned.ts)
-   * over this poll's already-fetched `issues` snapshot — same placement
-   * rule as `checkParked` above, and for the same reason: fetch-stage work
-   * over the snapshot `observe()` just produced, not downstream diff/notify
-   * work. Takes no `related` (unlike `checkParked`): this detector's
-   * candidates ARE `issues` themselves (each already-staffed worker's own
-   * boss status arrives pre-hydrated on its `issuelinks`), so there is
-   * nothing here for a `related` walk to add. Optional; omitted, abandoned-
-   * worker detection simply never runs. Never throws (see abandoned.ts),
-   * awaited inside the same observe function as `checkParked`, same
-   * heartbeat-safety guarantee.
+   * over this poll's already-fetched `issues` snapshot. Called from inside
+   * the observe function below, NOT from `watch()`'s `onChange` callback,
+   * because this is fetch-stage work operating on the snapshot `observe()`
+   * just produced — it belongs alongside `syncLabels` above, not downstream
+   * in the diff/notify stage. Takes no `related`: this detector's candidates
+   * ARE `issues` themselves (each already-staffed worker's own boss status
+   * arrives pre-hydrated on its `issuelinks`), so there is nothing here for
+   * a `related` walk to add. Optional; omitted, abandoned-worker detection
+   * simply never runs. Never throws (see abandoned.ts), but this call is
+   * awaited inside the same try-implicit observe function as `syncLabels`
+   * above, so a change to that guarantee can never silently take the
+   * success heartbeat below down with it.
    */
   checkAbandoned?: (issues: readonly JiraIssue[]) => Promise<void>;
   /**
@@ -972,7 +943,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   //
   // NOT double-wrapped in a try/catch here (PR #204 review, non-blocking):
   // deliberately consistent with `checkCrashLoop` immediately above, not
-  // with `checkParked`'s belt-and-suspenders wrap in `runResourceLoop`
+  // with `checkAbandoned`'s belt-and-suspenders wrap in `runResourceLoop`
   // below — a real disagreement between two call sites in this same file,
   // called out explicitly by the reviewer. The choice made here: this
   // detector's OWN "never throws" contract (`check`'s internal try/catch,
@@ -980,12 +951,12 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // `checkCrashLoop`'s equivalent guarantee at the call site directly
   // above, which has never been double-wrapped either — a second wrapper
   // HERE would add no guarantee beyond what `check`'s own try/catch already
-  // gives, only a duplicate of it. `checkParked`'s extra wrap is not doing
-  // the same job: it exists because that hook runs several calls further
-  // into the SAME fetch-stage function, so a regression to ITS "never
-  // throws" contract would otherwise take `onPollSuccess` down with it in a
-  // way harder to trace back to the actual offender. If `check`'s own
-  // try/catch here is ever removed or narrowed, this call site becomes
+  // gives, only a duplicate of it. `checkAbandoned`'s extra wrap is not
+  // doing the same job: it exists because that hook runs several calls
+  // further into the SAME fetch-stage function, so a regression to ITS
+  // "never throws" contract would otherwise take `onPollSuccess` down with
+  // it in a way harder to trace back to the actual offender. If `check`'s
+  // own try/catch here is ever removed or narrowed, this call site becomes
   // exactly that same hazard and should be wrapped too.
   if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
   // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): called ONCE,
@@ -1152,8 +1123,7 @@ export interface GenericLoopDeps<T> {
   /** FACTORY-501 — see `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment; threaded straight through. */
   checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
-  checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
-  /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above — same placement rule as `checkParked`, no `related` needed. Optional; omitted, abandoned-worker detection simply never runs. */
+  /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above. Optional; omitted, abandoned-worker detection simply never runs. */
   checkAbandoned?: (issues: readonly T[]) => Promise<void>;
   /** BUTCHR-95/123: see `ReconcileOptions.checkFrozenAsleep`'s doc comment — threaded straight through to `reconcileNow` below. Optional; omitted, `atRest` protects indefinitely (every resource type before this ticket). */
   checkFrozenAsleep?: (restingRunning: readonly string[]) => Promise<ReadonlySet<string>>;
@@ -1211,7 +1181,7 @@ export interface GenericLoopDeps<T> {
  *
  * What stays HERE, and only here, is the type-agnostic mechanism: per-poll
  * memoization of `eventRules.poll` itself, the `sent` dedupe, delivery, and
- * fail-open discipline around `syncLabels`/`checkParked`. Adding a second
+ * fail-open discipline around `syncLabels`/`checkAbandoned`. Adding a second
  * resource type means writing its own `ResourceType<T>` and calling this
  * function with it — nothing below changes.
  *
@@ -1232,9 +1202,9 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   // Without this, a quiet fleet (nothing changed in Jira for hours) would
   // never invoke `onChange` at all, and the notify component of `/health`
   // (see `onNotifySuccess` on `LoopDeps`) would have no way to distinguish
-  // "healthy and idle" from "stuck" — this is why `checkParked`'s own doc
+  // "healthy and idle" from "stuck" — this is why `checkAbandoned`'s own doc
   // comment above now flags that `onChange` is no longer change-gated in
-  // THIS loop. `checkParked` itself is unaffected and stays in the fetch
+  // THIS loop. `checkAbandoned` itself is unaffected and stays in the fetch
   // stage regardless (see that comment) — the notify stage's own job
   // (diffing `prev`/`next` and sending nudges) is what genuinely belongs in
   // `onChange`, so the fix here is to make `onChange` unconditional rather
@@ -1306,18 +1276,11 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       const related = resourceType.discovery.related ? await resourceType.discovery.related([...new Set([...desired.keys(), ...atRest])]) : [];
       if (deps.syncLabels) await deps.syncLabels(issues);
       // A detector failure must never take down the poll — caught HERE too
-      // (belt and suspenders on top of parked.ts's own internal try/catch):
-      // a rejection reaching this point would otherwise fail the whole `fn`
-      // this poll, skipping `onPollSuccess` below and reporting the poll
-      // loop unhealthy over what is, at worst, one failed Jira comment call.
-      if (deps.checkParked) {
-        try {
-          await deps.checkParked(issues, related);
-        } catch (e) {
-          deps.log?.(`WARNING: [parked] checkParked threw: ${(e as Error)?.message ?? e}`);
-        }
-      }
-      // Same belt-and-suspenders wrap as checkParked above (BUTCHR-200).
+      // (belt and suspenders on top of abandoned.ts's own internal
+      // try/catch): a rejection reaching this point would otherwise fail
+      // the whole `fn` this poll, skipping `onPollSuccess` below and
+      // reporting the poll loop unhealthy over what is, at worst, one
+      // failed Jira comment call (BUTCHR-200).
       if (deps.checkAbandoned) {
         try {
           await deps.checkAbandoned(issues);
@@ -1445,7 +1408,6 @@ export function startLoop(deps: LoopDeps): Stop {
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
     ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
-    ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
     ...(deps.checkAbandoned ? { checkAbandoned: deps.checkAbandoned } : {}),
     ...(deps.log ? { log: deps.log } : {}),
     intervalMs: deps.intervalMs,

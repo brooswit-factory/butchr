@@ -204,20 +204,48 @@ points in history.** To check whether a diff removed an assertion, read
 the diff itself:
 
 ```bash
-git diff <base>...<head> -- test/ | grep '^-.*expect(' || true
+git diff <base>...<head> | grep -E '^-[^-]' || true
 ```
 
-**Two defects, both handled or stated:**
+**Four defects, each handled or stated — FACTORY-901 added the last three
+after the first alone was found to make this check always-pass on a repo
+this exact wording does not describe:**
 
 - **The trailing `|| true` is required, not optional prose.** Plain `grep`
-  exits 1 when nothing matches — and "nothing matches" (no assertion-shaped
-  line removed) is the PASSING result. Verified directly in this repo:
-  `git diff 7dd88fe~1...7dd88fe -- test/ | grep '^-.*expect('` exits 1 on a
-  commit that removed no assertions; under `set -e` a script built from the
-  bare command dies silently at exactly the moment the news is good.
-  Appending `|| true` (confirmed: exits 0 in both the match and no-match
-  case above) makes the command safe to run inside any script, including
-  one under `set -e`.
+  exits 1 when nothing matches — and "nothing matches" (no removed line in
+  the matched paths) is the PASSING result. Verified directly in this repo:
+  the bare command without `|| true` exits 1 on a commit that removed no
+  assertions; under `set -e` a script built from the bare command dies
+  silently at exactly the moment the news is good. Appending `|| true`
+  (confirmed: exits 0 in both the match and no-match case) makes the
+  command safe to run inside any script, including one under `set -e`.
+- **Do not hardcode `expect(` as the assertion syntax.** The original form
+  of this command (`grep '^-.*expect('`) matches nothing, and therefore
+  reports "clean", on any suite that does not use an `expect(...)`-shaped
+  assertion library — `node:assert`'s `assert.equal(...)`/`assert.ok(...)`
+  is one real example (FACTORY-901, found reviewing agentcost-capture's
+  collector tests). It cannot distinguish "nothing was removed" from "the
+  pattern does not apply here", and silently reports the reassuring one —
+  worse than no check, because it produces positive-sounding evidence. The
+  fix is to not filter by assertion-library syntax at all: list every
+  removed line in the diff (`grep -E '^-[^-]'`, excluding only the
+  `---`/diff-header lines `^-{2,}` would also start with) and read it —
+  diffs under review are small enough that this is cheap, and it cannot
+  silently fail to apply.
+- **Do not restrict to a pathspec at all — no test-file naming convention
+  is safe to assume.** The first attempt at fixing this scoped the diff to
+  `-- test/ tests/ '*.test.*' '**/__tests__/**'`, which is itself still a
+  guess: a repo that mixes `.test.ts` and `.spec.ts` files in the same
+  suite reproduces the identical false-clean failure, one level down —
+  reviewed on PR #792 (FACTORY-901), reproduced with a two-file fixture
+  (`src/covered.test.ts`, touched only by an added comment, alongside
+  `src/omitted.spec.ts`, whose diff removes a real `assert.equal(...)`
+  line): the pathspec matches `covered.test.ts`, the scoped grep finds
+  nothing to flag, and the real removal in the unmatched `.spec.ts` file
+  is invisible — a test-file naming enumeration can always be a guess shy
+  of whatever a given repo actually uses. The fix is to drop the pathspec
+  and run the command over the whole diff: a pathspec can miss a file:
+  nothing can.
 - **Every line this prints is a candidate to read, not a verdict.**
   Verified directly in this repo against a real historical diff
   (`88883e2...`): the command printed one line —
@@ -232,8 +260,8 @@ git diff <base>...<head> -- test/ | grep '^-.*expect(' || true
   never grounds by itself to request changes or to approve.**
 
 Guidance pointing at this document and carrying the command above is in
-`briefs/story.md` (task-PR review) and `briefs/epic.md` (story-PR review) —
-the channels a reviewing agent actually reads at the moment it would
+every brief template's own "Evidence and review" section (`briefs/*.md`) —
+the channel a reviewing agent actually reads at the moment it would
 otherwise reach for the tally.
 
 ## Addendum (FACTORY-179): a non-tally failure left no identity

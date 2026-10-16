@@ -74,7 +74,7 @@ import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMe
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
 import { providerAtlassianTools } from "../tools/provider-atlassian.js";
-import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
 import { isAgentLabel } from "../labels/plan.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
@@ -89,7 +89,6 @@ import { createStallRemediator } from "../agents/stall-remediation.js";
 import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
 import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
-import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
@@ -1185,7 +1184,7 @@ const { app, mcp } = buildApp({
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop,
   // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
   // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
   // (process control) — no second Jira client, no second herdr client.
@@ -1194,8 +1193,6 @@ const { app, mcp } = buildApp({
     start: (issue) => doAgentStart(agentWriteDeps, issue),
     planStop: (issue) => planAgentStop(agentWriteDeps, issue),
     stop: (issue) => doAgentStop(agentWriteDeps, issue),
-    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
-    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
     adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
     prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
   },
@@ -1717,24 +1714,13 @@ const quotaGate = createQuotaGate(
 // rationale and the own-write ledger hazard it avoids by construction).
 // Always an issue key (syncLabels below is never wired into the project
 // loop further down this file), so `ops.addComment` is the right seam —
-// same one parked.ts uses, no second Atlassian writer.
+// same one every other daemon-side comment write uses, no second Atlassian
+// writer.
 const stallRemediation = createStallRemediator({
   now: () => Date.now(),
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: (issue) => atlassian.comments(issue),
   quotaBlocked: (issue) => herd.resourceQuotaBlocked(issue) || quotaGate.blockedIds().some((id) => resourceKeyOf(id) === issue),
-  // BUTCHR-353: a worker's own labels, for the "withheld at the admission
-  // cap" branch — DELIBERATELY `ops.getIssue` (the raw single-issue read),
-  // never a herd/live probe: a boss's worker is staffed under a different
-  // Atlassian account than the boss (this fleet's own tier->account split),
-  // so a probe wired here would be structurally blind to every worker it
-  // could ever be asked about (three independent live confirmations, all
-  // probeOutOfScope:true — see this ticket's own PR body) — the label path
-  // is the only honest source, exactly as `staffingFromAgentLabel`'s own
-  // doc comment argues (src/tools/relationship.ts). Paid at most once per
-  // non-Done worker, only on the one poll that is actually about to post a
-  // wake comment — see stall-remediation.ts's own cost-bound doc comment.
-  labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
 
@@ -1831,17 +1817,6 @@ const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngin
   deliver: deliverIdlePoke,
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
-// see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
-// every other daemon-side comment write; no second Atlassian writer.
-const parkedDetector = createParkedDetector({
-  now: () => Date.now(),
-  minutes: config.parkedMinutes,
-  addComment: async (issue, text) => { await ops.addComment(issue, text); },
-  comments: (issue) => atlassian.comments(issue),
-  links: (issue) => atlassian.links(issue),
-  log: (line) => console.error(`  ${line}`),
-});
 // BUTCHR-95/123/124/141: reads a resource's own channel — shared by the
 // frozen-asleep detector below, BOTH crash-loop detector instances further
 // down, and the blocked-dialog escalator (`escalator`'s `ownChannelComments`
@@ -1851,14 +1826,12 @@ const parkedDetector = createParkedDetector({
 // hand there — see that function's own doc comment for the full mechanism
 // (routing, the single-id call shape, and the BUTCHR-129 unwrap history).
 // `issueComments` is injected as `atlassian.comments`, the same client
-// `stalled`/`parkedDetector` above already use.
+// `stalled` above already uses.
 const ownChannelComments = createOwnChannelComments(ops, (key) => atlassian.comments(key));
 // BUTCHR-200: escalates a worker whose Implements boss reached Done while it
-// is still open — see src/agents/abandoned.ts. Unlike parkedDetector above
-// (which predates the BUTCHR-95/123/141 comment-read-path fix and still
-// uses the raw `atlassian.comments` call, deliberately not corrected here —
-// out of scope), this reads through `ownChannelComments`, the tier-aware
-// reader, per this ticket's own requirement. Posts through the same
+// is still open — see src/agents/abandoned.ts. This reads through
+// `ownChannelComments`, the tier-aware reader, per this ticket's own
+// requirement. Posts through the same
 // `ops.addComment` seam as every other daemon-side comment write; no second
 // Atlassian writer. ON by default (see the wiring below): this detector's
 // measured day-one population is ZERO (BUTCHR-192/BUTCHR-200), so an ON
@@ -2152,29 +2125,6 @@ const issueResidencyGuard = createResidencyGuard({
   census: (candidates) => herd.residency(candidates),
   log: (line) => console.error(`  ${line}`),
 });
-// BUTCHR-352: the issue tier's own admission census bucket — the SAME
-// `admissionController` instance the issue/project `runResourceLoop` calls
-// below already share (see that construction's own comment for why one
-// instance, not one per tier). Only the ISSUE tier's bucket is relevant here:
-// syncLabels only ever processes Jira issues (only the issue `runResourceLoop`
-// call wires `syncLabels` in at all — see that call site's own comment), so
-// a project-tier candidate is never a `syncLabels` input in the first place.
-// Returns the TRUSTED withheld set from a `checked: true` bucket, or the
-// literal `"unknown"` from a `checked: false` one (residency threw, an
-// untrusted implausible zero, or this source has never reported) — never a
-// guess either way. `desiredLabels` (src/labels/plan.ts) re-emits whatever
-// admission:withheld marker a ticket already carries on `"unknown"` rather
-// than flipping it off from an observation never made (KAN-832/837's own
-// pattern) — so a bad poll holds the last TRUSTED state rather than
-// asserting a confident wrong one in either direction. Synchronous:
-// `census()` reads state `admit()` already computed EARLIER in this SAME
-// poll (`reconcileNow` runs before `syncLabels` — see src/daemon/loop.ts's
-// own call order), never a second/stale read.
-const issueAdmissionWithheld = (): ReadonlySet<string> | "unknown" => {
-  const bucket = admissionController.census().buckets.find((b) => b.source === ADMISSION_SOURCE_ISSUE);
-  return bucket?.checked ? new Set(bucket.withheld.map(resourceKeyOf)) : "unknown";
-};
-
 const syncLabels = createLabelSync({
   jira: labelWriter,
   agentStatuses: agentStatusesFeedingDashboard,
@@ -2183,7 +2133,6 @@ const syncLabels = createLabelSync({
   stallRemediation,
   ...(silentStop ? { silentStop } : {}),
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
-  withheld: issueAdmissionWithheld,
   coverage,
   reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => sweepAbsentLiveAgentLabels({
     search: (jql) => atlassian.search(jql),
@@ -2421,7 +2370,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   // for a model/effort-only deferral (src/daemon/loop.ts's own split at the
   // `RESTORED_PANE_STALE_REASON_PREFIX` check).
   checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
-  // Label sync and the parked/abandoned detectors work per TICKET, so they
+  // Label sync and the abandoned detector work per TICKET, so they
   // see each matched issue once however many rules matched it.
   syncLabels: (matches) => {
     // FACTORY-845: refresh this poll's per-issue idle-poke rule config
@@ -2433,7 +2382,6 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     stalledMinutesByIssue = stalledMinutesForIssues(matches);
     return syncLabels(uniqueIssues(matches));
   },
-  checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
   checkReconcileFailure: issueReconcileFailureDetector.check,

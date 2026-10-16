@@ -62,7 +62,7 @@ describe("atlassianTools", () => {
       "jira_set_priority", "jira_transition",
       "list_peers",
       "new_worker", "prioritize_worker", "report_to_boss",
-      "set_doc", "shelve_worker", "stand_down", "start_worker", "submit_to_boss",
+      "set_doc", "stand_down", "start_worker", "submit_to_boss",
       "tell_peer", "tell_worker",
     ]);
   });
@@ -131,7 +131,7 @@ describe("jira_transition: pinning test — still works exactly as it does today
     await tools.jira_transition!.handler({ key: "SOMEONE-ELSE-1", status: "Done" }, conn);
     expect(calls).toEqual([["transition", ["SOMEONE-ELSE-1", "Done"]]]);
     expect(audits[0]).toContain("transition SOMEONE-ELSE-1 → Done");
-    expect(audits[0]).toContain("[deprecated alias; use start_worker/shelve_worker/finish_worker/submit_to_boss]");
+    expect(audits[0]).toContain("[deprecated alias; use start_worker/finish_worker/submit_to_boss]");
   });
 
   test("still names finish_without_a_boss in its deprecation note, alongside the other successors", () => {
@@ -827,13 +827,12 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
 });
 
 describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema shape, audit, onWrite", () => {
-  const TEN = ["new_worker", "start_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker", "report_to_boss", "ask_boss", "submit_to_boss"] as const;
+  const TEN = ["new_worker", "start_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker", "report_to_boss", "ask_boss", "submit_to_boss"] as const;
 
   /** Minimal args satisfying each verb's required schema, so every one below can be called uniformly for the no-x-issue sweep. */
   const MIN_ARGS: Record<(typeof TEN)[number], Record<string, unknown>> = {
     new_worker: { summary: "s", disposition: "start" },
     start_worker: { key: "KAN-9" },
-    shelve_worker: { key: "KAN-9", reason: "r" },
     adopt_worker: { key: "KAN-9", disposition: "start" },
     finish_worker: { key: "KAN-9" },
     prioritize_worker: { key: "KAN-9", priority: "High" },
@@ -914,9 +913,9 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     expect(Object.keys(tools.submit_to_boss!.input)).toEqual([]);
   });
 
-  test("new_worker's schema requires `disposition`; `reason` stays optional at the schema level (validated by relationship.ts instead)", () => {
+  test("new_worker's schema requires `disposition`; only start is supported", () => {
     const tools = rigNoOp();
-    expect(Object.keys(tools.new_worker!.input).sort()).toEqual(["description", "disposition", "priority", "reason", "summary"]);
+    expect(Object.keys(tools.new_worker!.input).sort()).toEqual(["description", "disposition", "priority", "summary"]);
   });
 
   test("start_worker / shelve_worker / finish_worker / prioritize_worker / tell_worker audit lines name the verb and the target key", async () => {
@@ -941,12 +940,10 @@ describe("the ten relationship verbs (BUTCHR-35): wiring — x-issue, schema sha
     const tools = atlassianTools(ops, (l) => audits.push(l));
     const conn = { headers: { "x-issue": "KAN-7" } } as any;
     await tools.start_worker!.handler({ key: "KAN-9" }, conn);
-    await tools.shelve_worker!.handler({ key: "KAN-9", reason: "later" }, conn);
     await tools.finish_worker!.handler({ key: "KAN-9" }, conn);
     await tools.prioritize_worker!.handler({ key: "KAN-9", priority: "High" }, conn);
     await tools.tell_worker!.handler({ key: "KAN-9", text: "hi" }, conn);
     expect(audits.some((a) => a.includes("start_worker KAN-9"))).toBe(true);
-    expect(audits.some((a) => a.includes("shelve_worker KAN-9"))).toBe(true);
     expect(audits.some((a) => a.includes("finish_worker KAN-9"))).toBe(true);
     expect(audits.some((a) => a.includes("prioritize_worker KAN-9 → High"))).toBe(true);
     expect(audits.some((a) => a.includes("tell_worker KAN-9"))).toBe(true);
@@ -2711,4 +2708,22 @@ describe("BUTCHR-299: every brief teaching explicit priority changes states the 
   test("task agents receive the same priority mechanism guidance as other callers", () => {
     expect(withGuidance).toContain("task.md");
   });
+});
+
+describe("FACTORY-498: removed shelving MCP surface", () => {
+  test("shelve_worker is not advertised or dispatchable", () => {
+    const { tools } = rig();
+    expect(tools.shelve_worker).toBeUndefined();
+    expect(Object.values(tools).some(tool => /shelve_worker|butchr:shelved/.test(tool.description))).toBe(false);
+  });
+  for (const verb of ["new_worker", "adopt_worker"] as const) {
+    test(`${verb} rejects legacy/missing dispositions at schema and handler boundaries without writes`, async () => {
+      const { tools, calls, conn } = rig();
+      for (const disposition of ["shelve", "unknown", undefined]) {
+        expect(tools[verb]!.input.disposition!.safeParse(disposition).success).toBe(false);
+        await expect(tools[verb]!.handler({ summary: "s", key: "KAN-9", disposition, reason: "later" }, conn)).rejects.toThrow(/disposition must be "start"/);
+      }
+      expect(calls).toEqual([]);
+    });
+  }
 });

@@ -136,7 +136,7 @@ an admin.
   a response that cannot prove it is complete, fails the whole poll instead
   of stopping agents whose tickets were not listed.
 - The loop polls once a minute and shares the host admission cap. It gets no
-  label sync, stall/parked/abandoned detection, or respawn and crash-loop
+  label sync, stall/abandoned detection, or respawn and crash-loop
   comments: nothing except an agent's own note is written to a ticket.
 - Zendesk's search index lags ticket changes, so a new or changed ticket can
   take a few minutes to match.

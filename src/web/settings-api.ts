@@ -72,7 +72,6 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_OPS_ALERT_MENTION", description: "Mention prepended to an ops-alert post. Literal 'none' posts with no mention.", secret: false },
   { key: "BUTCHR_OPS_ALERT_DEDUP_MINUTES", description: "Dedup window, in minutes: at most one ops-alert post per condition in this window.", secret: false },
   { key: "BUTCHR_STALLED_MINUTES", description: "Minutes an active ticket's agent must sit idle before it's surfaced as agent:stalled.", secret: false },
-  { key: "BUTCHR_PARKED_MINUTES", description: "Minutes a staffed child sits in To Do under a live boss before the parked-ticket escalation fires.", secret: false },
   { key: "BUTCHR_ABANDONED_MINUTES", description: "Minutes a worker sits ABANDONED before the abandoned-worker escalation fires.", secret: false },
   { key: "BUTCHR_ATREST_MINUTES", description: "Minutes a resource may read asleep-with-agent-running before the frozen-asleep detector fires.", secret: false },
   { key: "BUTCHR_CRASHLOOP_COUNT", description: "Spawns of the same resource within the crash-loop window before the crash-loop detector posts.", secret: false },

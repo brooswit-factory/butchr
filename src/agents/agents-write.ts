@@ -1,17 +1,17 @@
 /**
- * FACTORY-666 — dashboard agent control: start, stop, shelve, adopt and
+ * FACTORY-666 — dashboard agent control: start, stop, adopt and
  * prioritize a fleet worker ticket from the web UI instead of the CLI/MCP.
  * `src/web/view.ts` wires these to HTTP (guards, confirm/audit plumbing,
  * rate limiting); nothing in this file knows about Elysia, Origin headers
  * or CSRF.
  *
  * REUSE, NOT RE-DERIVATION: every Jira-side effect reuses the EXACT same
- * functions the MCP tools (`start_worker`/`shelve_worker`/`adopt_worker`/
+ * functions the MCP tools (`start_worker`/`adopt_worker`/
  * `prioritize_worker`, `src/tools/relationship.ts`) already call — this
  * module adds NO second implementation of ownership checks, label
  * bookkeeping, or Jira writes. The one thing an MCP call has that an
  * operator's dashboard click does not is a `callerKey` (the calling agent's
- * OWN ticket, verified as the worker's boss) — for start/shelve/prioritize
+ * OWN ticket, verified as the worker's boss) — for start/prioritize
  * this module derives that caller key automatically from the worker's own
  * CURRENT boss (`resolveBoss`, `../tools/docs.js`, the same Implements-link-
  * then-parent-fallback resolution `assertOwnWorker` itself uses), so the
@@ -32,7 +32,7 @@
  */
 import type { AtlassianOps } from "../tools/atlassian.js";
 import { resolveBoss } from "../tools/docs.js";
-import { startWorker, shelveWorker, adoptWorker, prioritizeWorker, type Disposition, type Roles } from "../tools/relationship.js";
+import { startWorker, adoptWorker, prioritizeWorker, type Disposition, type Roles } from "../tools/relationship.js";
 import { Refusal } from "../tools/outcome.js";
 import type { Herd } from "./herd.js";
 
@@ -78,7 +78,7 @@ async function resolveCallerBoss(deps: AgentWriteDeps, workerKey: string): Promi
   }
   const resolution = resolveBoss(issue, issueTypeNameOf(issue));
   if (!resolution.boss) {
-    return { ok: false, status: 409, error: `${workerKey} has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting, shelving or prioritizing it` };
+    return { ok: false, status: 409, error: `${workerKey} has no boss (no Implements link and no eligible Jira parent) — adopt it first with a boss key before starting or prioritizing it` };
   }
   return { ok: true, boss: resolution.boss, issue };
 }
@@ -110,7 +110,7 @@ export async function agentSnapshot(deps: AgentWriteDeps, issue: string): Promis
   };
 }
 
-/** `start_worker`'s own effect (status -> In Progress, clears a stale shelved-exemption label), called under the worker's OWN current boss — never destructive (nothing stops or changes irreversibly), so no confirm step. Where the operator sees this take effect: the Jira transition is immediate, but admission into a RUNNING agent still goes through the daemon's own capacity-capped reconcile poll — see this route's own "takes effect after the next poll" UI note (`src/web/view.ts`). */
+/** `start_worker`'s own effect (status -> In Progress), called under the worker's OWN current boss — never destructive (nothing stops or changes irreversibly), so no confirm step. Where the operator sees this take effect: the Jira transition is immediate, but admission into a RUNNING agent still goes through the daemon's own capacity-capped reconcile poll — see this route's own "takes effect after the next poll" UI note (`src/web/view.ts`). */
 export async function doAgentStart(deps: AgentWriteDeps, issue: string): Promise<AgentWriteOutcome> {
   const boss = await resolveCallerBoss(deps, issue);
   if (!boss.ok) return boss;
@@ -135,7 +135,7 @@ export async function doAgentStart(deps: AgentWriteDeps, issue: string): Promise
  * the dry-run preview and the final outcome so the operator sees it before
  * and after confirming, rather than discovering it when the agent reappears.
  */
-const WILL_RESPAWN_NOTE = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll — shelve the ticket instead to keep it stopped";
+const WILL_RESPAWN_NOTE = "this only closes the running pane; the ticket's own Jira status is untouched, so if it still matches an active rule the daemon's reconcile loop can spawn a fresh agent for it on a later poll";
 
 /** Report-only — never kills anything. `requiresConfirm: true` whenever there IS a running agent to stop (the ordinary first step); a genuine refusal (nothing running) is reported the same way a rejected write is, since there is nothing here for a client to usefully confirm into. */
 export async function planAgentStop(deps: AgentWriteDeps, issue: string): Promise<AgentWriteOutcome> {
@@ -152,32 +152,9 @@ export async function doAgentStop(deps: AgentWriteDeps, issue: string): Promise<
   return { ok: true, key: issue, stoppedPane: pane, note: WILL_RESPAWN_NOTE };
 }
 
-/** Report-only — never writes. Refuses up front (same refusal `shelve_worker` itself throws) on an empty `reason`, and on a worker with no derivable boss, before ever naming a `confirmReason` a client could mistake for "go ahead". */
-export async function planAgentShelve(deps: AgentWriteDeps, issue: string, reason: string): Promise<AgentWriteOutcome> {
-  if (!reason.trim()) return { ok: false, status: 400, error: `shelve: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot` };
-  const boss = await resolveCallerBoss(deps, issue);
-  if (!boss.ok) return boss;
-  return { ok: true, requiresConfirm: true, confirmReason: "agent-shelve", preview: { key: issue, boss: boss.boss, reason } };
-}
-
-/** `shelve_worker`'s own effect (label, then transition to To Do, then the reason as a comment), under the worker's own current boss. */
-export async function doAgentShelve(deps: AgentWriteDeps, issue: string, reason: string): Promise<AgentWriteOutcome> {
-  if (!reason.trim()) return { ok: false, status: 400, error: `shelve: a reason is required — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot` };
-  const boss = await resolveCallerBoss(deps, issue);
-  if (!boss.ok) return boss;
-  try {
-    await shelveWorker(deps.ops, boss.boss, issue, reason);
-    return { ok: true, key: issue, shelvedUnderBoss: boss.boss, reason };
-  } catch (e) {
-    return { ok: false, ...fromThrown(e) };
-  }
-}
-
 export interface AdoptInput {
   bossKey: string;
-  disposition: "start" | "shelve";
-  /** Required (and must be non-empty) when `disposition === "shelve"` — see `shelveWorker`'s own refusal for why. Ignored for `"start"`. */
-  reason?: string;
+  disposition: "start";
 }
 
 /**
@@ -189,7 +166,7 @@ export interface AdoptInput {
  * registry.ts`) already set the precedent for, after a client/route body-
  * shape mismatch once shipped a route unreachable from the real UI. Each
  * one is a pure, no-I/O shape check; the business logic above (reason
- * required, confirm required for stop/shelve, …) stays in this module's
+ * required, confirm required for stop, …) stays in this module's
  * own `plan*`/`do*` functions, never duplicated here.
  */
 export function validateStopRequestBody(body: unknown): { ok: true; confirm: boolean } | { ok: false; error: string } {
@@ -200,24 +177,14 @@ export function validateStopRequestBody(body: unknown): { ok: true; confirm: boo
   return { ok: true, confirm: b.confirm === true };
 }
 
-export function validateShelveRequestBody(body: unknown): { ok: true; reason: string; confirm: boolean } | { ok: false; error: string } {
-  const error = "body must include reason: string (and optional confirm: boolean)";
-  if (!body || typeof body !== "object") return { ok: false, error };
-  const b = body as Record<string, unknown>;
-  if (typeof b.reason !== "string") return { ok: false, error };
-  if ("confirm" in b && typeof b.confirm !== "boolean") return { ok: false, error };
-  return { ok: true, reason: b.reason, confirm: b.confirm === true };
-}
-
 export function validateAdoptRequestBody(body: unknown): { ok: true; input: AdoptInput } | { ok: false; error: string } {
-  const error = `body must include bossKey: string and disposition: "start" | "shelve" (plus reason: string for "shelve")`;
+  const error = `body must include bossKey: string and disposition: "start"`;
   if (!body || typeof body !== "object") return { ok: false, error };
   const b = body as Record<string, unknown>;
   if (typeof b.bossKey !== "string" || b.bossKey.length === 0) return { ok: false, error };
-  if (b.disposition !== "start" && b.disposition !== "shelve") return { ok: false, error };
+  if (b.disposition !== "start") return { ok: false, error };
   if ("reason" in b && b.reason !== undefined && typeof b.reason !== "string") return { ok: false, error };
   const input: AdoptInput = { bossKey: b.bossKey, disposition: b.disposition };
-  if (typeof b.reason === "string") input.reason = b.reason;
   return { ok: true, input };
 }
 
@@ -231,10 +198,12 @@ export function validatePrioritizeRequestBody(body: unknown): { ok: true; priori
 
 /** `adopt_worker`'s own effect, called with the OPERATOR-SUPPLIED `bossKey` — the one action in this module with no current boss to derive (that is the entire point of adopting). Not flagged destructive in this ticket's scope (it only ever gains a ticket a boss/disposition it did not have, or confirms one it already has — see `adoptWorker`'s own idempotence contract), so no confirm step. */
 export async function doAgentAdopt(deps: AgentWriteDeps, issue: string, input: AdoptInput): Promise<AgentWriteOutcome> {
-  if (input.disposition === "shelve" && !(input.reason ?? "").trim()) {
-    return { ok: false, status: 400, error: `adopt: a reason is required for disposition "shelve" — an activation condition nobody wrote down is indistinguishable six weeks later from a ticket somebody forgot` };
+  // Validate runtime callers too: a stale client must never turn an unsupported
+  // disposition into a start or create an ownership link before refusing.
+  if (input.disposition !== "start") {
+    return { ok: false, status: 400, error: 'adopt: disposition must be "start"' };
   }
-  const disposition: Disposition = input.disposition === "shelve" ? { kind: "shelve", reason: input.reason!.trim() } : { kind: "start" };
+  const disposition: Disposition = { kind: "start" };
   try {
     const result = await adoptWorker(deps.ops, deps.roles, input.bossKey, issue, disposition);
     return { ok: true, ...result };
