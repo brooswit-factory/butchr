@@ -40,6 +40,16 @@ Content-Type: application/json
 {"url": "<browser URL, plain, not percent-encoded>"}
 ```
 
+`POST` REQUIRES `Content-Type: application/json`, exactly (a `;charset=...`
+suffix is fine; the media type itself is matched case-SENSITIVELY, on
+purpose — Elysia's own body parser only recognizes that exact-case media
+type as JSON, so matching it any more loosely here would report success on
+a request Elysia never actually parsed as JSON). A missing or different
+`Content-Type` is refused with `415`, checked after the Origin guard above
+but before the body is parsed for a `url` field. This is distinct from a
+JSON body missing its `url` field, or `url` not being a string, which is
+not an error (see the "absent entirely" note below).
+
 ```
 GET /resources/for-url?url=<percent-encoded browser URL>
 Origin: chrome-extension://<id>   (REQUIRED — see Security tradeoff below;
