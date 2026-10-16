@@ -70,6 +70,12 @@ export interface LinkCliIo {
  */
 export function jiraProjectStoreFromEnv(): LinkStore {
   const config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  // FACTORY-66: `config.atlassian` can now be `undefined` — a `jira-project`
+  // link owner is meaningless without it, so this throws the SAME clear,
+  // isolated way this function already throws on any other bad/missing
+  // credential (see this file's own header: never caught here, surfaced by
+  // `tryStoreOp` as a clean stderr line).
+  if (!config.atlassian) throw new Error(`cannot resolve a jira-project link owner: ${config.atlassianDisabledReason ?? "Atlassian is not configured"}`);
   return createJiraProjectLinkStore(realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }));
 }
 

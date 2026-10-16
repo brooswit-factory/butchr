@@ -1,4 +1,5 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
+import { atlassianProviderStaffing } from '../rules/atlassian-staffing.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
@@ -6,7 +7,7 @@ import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { createOutstandingGuard } from "./herdr-subscribe-deadline.js";
-import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, type Config } from "../config/config.js";
 import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
 import { runSetupModeDaemon } from "./setup-mode.js";
 import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
@@ -45,7 +46,7 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole, type Rule } from "../rules/rules.js";
 import { resourceMatches, type ExecutionUnit } from "../rules/execution.js";
 import { createIdlePokeEngine, type IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
@@ -73,6 +74,7 @@ import { withIdleDialogDetection } from "../agents/idle-dialog.js";
 import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMessage, terminalCommand } from "../terminal/open.js";
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
+import type { AtlassianOps } from "../tools/atlassian.js";
 import { providerAtlassianTools } from "../tools/provider-atlassian.js";
 import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
@@ -233,20 +235,38 @@ const cachedUnitHint = createCachedUnitHint();
 // exactly as before — this is not a general "never crash" change, only the
 // one case setup mode exists for.
 const effectiveJiraEnv = resolveEffectiveJiraEnv(effectiveEnv, { onWarn: (line) => console.error(`butchr: ${line}`) });
-if (!isAtlassianConfigured(effectiveJiraEnv)) {
+// FACTORY-66: an explicit `BUTCHR_ATLASSIAN_ENABLED=false` (etc.) always
+// bypasses setup mode, even on an otherwise-fresh install with nothing else
+// set — the operator has said what they want, there is nothing to walk
+// them through. Checked with the SAME case-insensitive truthiness
+// `loadAtlassianConfig` (src/config/config.ts) uses, so the two can never
+// disagree about whether Atlassian is "explicitly off".
+const atlassianExplicitlyDisabled = (() => {
+  const v = effectiveEnv.BUTCHR_ATLASSIAN_ENABLED?.trim().toLowerCase();
+  return v === "false" || v === "0" || v === "no" || v === "off";
+})();
+if (!atlassianExplicitlyDisabled && !isAtlassianConfigured(effectiveJiraEnv)) {
   // Setup mode ONLY for a truly fresh install (no site, email, token, identity file or managed token file at all).
-  // Any PARTIAL state is a misconfiguration: exit 1 loudly, exactly as before, instead of serving a quiet setup page with nothing polling (agentsafety A2 review item 3).
+  // FACTORY-66: a PARTIAL state used to exit(1) loudly here (PR463/FACTORY-65's
+  // own boot-refusal path) — that made one misconfigured credential a
+  // process-wide outage for every OTHER provider too (github-issue,
+  // zendesk-ticket, filesystem), which is exactly the failure mode this
+  // ticket's acceptance criteria rules out ("enabled but misconfigured"
+  // must produce an isolated, provider-specific error, never a
+  // process-wide startup failure). A partial Atlassian credential now
+  // falls through to the real daemon instead of setup mode or exit(1):
+  // `loadConfig` below reports it via `atlassianDisabledReason` and the
+  // four Atlassian-backed providers are not staffed, exactly like any
+  // other misconfigured-but-isolated provider.
   const partial = [effectiveJiraEnv.ATLASSIAN_SITE, effectiveJiraEnv.ATLASSIAN_EMAIL, effectiveJiraEnv.ATLASSIAN_TOKEN, effectiveJiraEnv.ATLASSIAN_TOKEN_FILE].some((v) => !!v?.trim());
-  if (partial) {
-    console.error("butchr: Missing required config: ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE) must all be set (partial Atlassian configuration is not setup mode). Inputs counted: ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN/ATLASSIAN_TOKEN_FILE, the identity file written by UI setup (jira-identity.json in the butchr config directory) and the managed token file (secrets/atlassian-token). To start setup over, delete BOTH files.");
-    process.exit(1);
+  if (!partial) {
+    await runSetupModeDaemon();
+    // runSetupModeDaemon returns once app.listen() is called; the listening server keeps the process alive, so park here instead of falling through to the real daemon (or exiting).
+    await new Promise<never>(() => {});
   }
-  await runSetupModeDaemon();
-  // runSetupModeDaemon returns once app.listen() is called; the listening server keeps the process alive, so park here instead of falling through to the real daemon (or exiting).
-  await new Promise<never>(() => {});
 }
 
-let config;
+let config: Config;
 try {
   config = loadConfig(effectiveJiraEnv, (p) => readFileSync(p, "utf8"));
 } catch (e) {
@@ -256,6 +276,14 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-66: loud, once, at startup — never thrown, never process-exiting
+// (see `Config.atlassianDisabledReason`/`loadAtlassianConfig`'s own doc
+// comments) — so an operator sees exactly why jira-work/jira-idea/
+// jira-project/confluence-page are unstaffed on THIS boot, same discipline
+// as every other provider's startup announcement below.
+if (config.atlassianDisabledReason) console.error(`butchr: ${config.atlassianDisabledReason}`);
+if (config.githubTokenReadError) console.error(`butchr: ${config.githubTokenReadError}`);
 
 // FACTORY-497: an existing systemd drop-in from before this ticket may still
 // set BUTCHR_EXTENSION_ORIGINS — say so once rather than silently ignoring it.
@@ -270,7 +298,7 @@ if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console
 // `ZENDESK_SUBDOMAIN`, the SAME env var `zendesk-ticket.ts` itself reads
 // (never routed through `Config`, matching that module's own convention —
 // see this ticket's own doc for why Zendesk config isn't centralized there).
-const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.toLowerCase(), zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
+const resourceLookupDeps = { jiraHost: config.atlassian ? new URL(config.atlassian.site).hostname.toLowerCase() : undefined, zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
 
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
@@ -616,24 +644,74 @@ const zendeskTickets = zendeskStaffing.run
 // runs, reading the local disk directly (src/resources/filesystem.ts).
 const fsRules = filesystemRules(getRules());
 
-// FACTORY-998: confluence-page rules need no SEPARATE credential either —
-// this daemon never reaches here without a fully-configured Atlassian site
-// (the setup-mode gate above), so the real `ops` client built below already
-// covers it; every enabled confluence-page rule always runs.
+// FACTORY-998 (FACTORY-66 update): confluence-page rules need no SEPARATE
+// credential — they share Atlassian's `ops` client — but FACTORY-66 means
+// this daemon CAN now reach here with Atlassian disabled; the old "always
+// runs" assumption is no longer true. See `confluencePageStaffing` below,
+// which `startConfluencePageLoop`'s own call site gates on.
 const confluencePageEnabledRules = confluencePageRules(getRules());
 
-const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
+// FACTORY-66: see `atlassianProviderStaffing`'s own doc comment
+// (src/rules/atlassian-staffing.ts) for the shape and the "why one function
+// for four providers" rationale — pulled out into its own module so it has
+// a direct unit test, same discipline as `githubIssueStaffing`/
+// `zendeskTicketStaffing`.
+const jiraWorkStaffing = atlassianProviderStaffing("jira-work", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
+const jiraIdeaStaffing = atlassianProviderStaffing("jira-idea", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
+const jiraProjectStaffing = atlassianProviderStaffing("jira-project", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
+const confluencePageStaffing = atlassianProviderStaffing("confluence-page", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason);
+
+/**
+ * FACTORY-66 — disabled stand-ins for the real Atlassian client/ops, used
+ * ONLY when `config.atlassian` is `undefined`. Every member rejects with a
+ * clear, named reason rather than making a network call (there IS no
+ * credential to call with) or returning a fake success. This satisfies the
+ * same contract `githubToolIssues`/`zendeskToolTickets` already have
+ * (`undefined` when off) WITHOUT threading `AtlassianClient | undefined`
+ * through the ~40 call sites this file already has for `atlassian`/`ops` —
+ * every one of those sites is reached ONLY from a path this file itself
+ * gates on `*Staffing.run`/`config.atlassian` (the four resource loops
+ * below, each tool registration's own `config.atlassian ?` guard), so the
+ * stub's rejection is never actually hit in practice; it exists as a
+ * last-resort, loud failure for any path a future change might miss,
+ * never a silent no-op.
+ */
+function disabledAtlassianReason(): string {
+  return config.atlassianDisabledReason ?? "Atlassian is not configured on this daemon";
+}
+function createDisabledAtlassianClientStub(): AtlassianClient {
+  const fail = () => Promise.reject(new Error(`Atlassian is disabled: ${disabledAtlassianReason()}`));
+  return new Proxy({} as unknown as AtlassianClient, { get: () => fail });
+}
+function createDisabledAtlassianOpsStub(): AtlassianOps {
+  const fail = () => Promise.reject(new Error(`Atlassian is disabled: ${disabledAtlassianReason()}`));
+  return new Proxy({} as unknown as AtlassianOps, { get: () => fail });
+}
+
+const atlassian = config.atlassian
+  ? new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`))
+  : createDisabledAtlassianClientStub();
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
+// FACTORY-66: gated on `jiraIdeaStaffing.run` (enabled rules AND Atlassian
+// configured), not merely `ideaRules.length` — a rules file with jira-idea
+// rules but Atlassian disabled must not construct a client that would only
+// ever reject.
 const ideaRules = jiraIdeaRules(getRules());
-const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
+const jiraIdeas = jiraIdeaStaffing.run ? createJiraIdeaClient(atlassian) : undefined;
 // Tool connections are independent of agent staffing. Reuse clients where possible;
 // keep the same credentials, organization/account boundaries and Zendesk opt-in.
 const githubToolIssues = githubIssues ?? (config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
 const githubToolPrs = githubPrs ?? (config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
-const jiraToolIdeas = jiraIdeas ?? createJiraIdeaClient(atlassian);
+// FACTORY-66: tool registration (unlike the poll loop above) is fine to
+// construct even with zero jira-idea RULES — an agent may still want
+// `jira_idea_*` tools available — but it must still require Atlassian
+// itself to be configured; without that this constructed a client against
+// the stub (or, before this ticket, unconditionally real) that could only
+// ever reject every call.
+const jiraToolIdeas = config.atlassian ? (jiraIdeas ?? createJiraIdeaClient(atlassian)) : undefined;
 const zendeskToolAuth = !zendeskTickets && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
   ? loadZendeskAuth(process.env) : undefined;
 const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
@@ -645,7 +723,7 @@ const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
 // and falls back to notifying writes — loudly, once — when it's absent.
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
-const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
+const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian?.email ?? "(atlassian disabled)", log: (line) => console.error(`  ${line}`) });
 // FACTORY-722: `timeoutMs` bounds EVERY call this shared client makes
 // (`@brooswit/herdr-sdk`'s `rpc()` arms its timer around the whole
 // connect-write-respond sequence, not merely the read) — see
@@ -749,7 +827,10 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // it exists only so the admission census can report on this tier by name,
 // the same reason every other provider gets its own named source.
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
-const jiraProjectEnabled = getRules().some((r) => r.enabled && r.resourceProvider === "jira-project");
+// FACTORY-66: `jiraProjectStaffing.run` (enabled jira-project rules AND
+// Atlassian configured), not merely "enabled rules exist" — see
+// `atlassianProviderStaffing`'s own doc comment above.
+const jiraProjectEnabled = jiraProjectStaffing.run;
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
 const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
 // BUTCHR-408: unlike every rule above, the managed-sessions query is built
@@ -835,7 +916,7 @@ const dashboardFeed = createDashboardFeed({
   admission: () => admissionController.census(),
 });
 
-const ops = realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token });
+const ops: AtlassianOps = config.atlassian ? realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }) : createDisabledAtlassianOpsStub();
 
 // FACTORY-7/FACTORY-5: the local file store needs no credentials and works
 // for every ResourceRef kind; a `jira-project:` owner routes to the
@@ -915,14 +996,24 @@ const githubPrHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * GITHUB_PR_POLL_MS),
   log: (line) => console.error(line),
 });
+// FACTORY-66: jira-work had no dedicated health entry before this ticket —
+// Atlassian being mandatory meant it always ran, so "enabled" was never in
+// question. Now it can be off, same as every other provider.
+const jiraWorkHealth = createResourceLoopHealth({
+  name: "jira-work",
+  enabled: jiraWorkStaffing.run,
+  ...(jiraWorkStaffing.run ? {} : { disabledReason: jiraWorkStaffing.reason ?? "no enabled jira-work rules" }),
+  thresholdMs: config.pollStaleMs,
+  log: (line) => console.error(line),
+});
 const jiraIdeaHealth = createResourceLoopHealth({
   name: "jira-idea",
   enabled: Boolean(jiraIdeas),
-  ...(jiraIdeas ? {} : { disabledReason: "no enabled jira-idea rules" }),
+  ...(jiraIdeaStaffing.run ? {} : { disabledReason: jiraIdeaStaffing.reason ?? "no enabled jira-idea rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * JIRA_IDEA_POLL_MS),
   log: (line) => console.error(line),
 });
-const jiraProjectHealth = createResourceLoopHealth({ name: "jira-project", enabled: jiraProjectEnabled, ...(jiraProjectEnabled ? {} : { disabledReason: "no enabled jira-project rules" }), thresholdMs: 300_000, log: (line) => console.error(line) });
+const jiraProjectHealth = createResourceLoopHealth({ name: "jira-project", enabled: jiraProjectEnabled, ...(jiraProjectEnabled ? {} : { disabledReason: jiraProjectStaffing.reason ?? "no enabled jira-project rules" }), thresholdMs: 300_000, log: (line) => console.error(line) });
 const zendeskTicketHealth = createResourceLoopHealth({
   name: "zendesk-ticket",
   enabled: Boolean(zendeskTickets),
@@ -939,8 +1030,8 @@ const filesystemHealth = createResourceLoopHealth({
 });
 const confluencePageHealth = createResourceLoopHealth({
   name: "confluence-page",
-  enabled: confluencePageEnabledRules.length > 0,
-  ...(confluencePageEnabledRules.length ? {} : { disabledReason: "no enabled confluence-page rules" }),
+  enabled: confluencePageStaffing.run,
+  ...(confluencePageStaffing.run ? {} : { disabledReason: confluencePageStaffing.reason ?? "no enabled confluence-page rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * CONFLUENCE_PAGE_POLL_MS),
   log: (line) => console.error(line),
 });
@@ -1208,7 +1299,7 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [jiraWorkHealth, githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -1247,9 +1338,14 @@ const { app, mcp } = buildApp({
   // jira-project agents work a bare Jira project key, not a ticket
   // `resolveResourceLink` knows how to route — link straight to the
   // project's Jira browse page instead.
+  // FACTORY-66: `config.atlassian` can now be `undefined` — a jira-project
+  // key with Atlassian disabled is refused with a readable reason instead
+  // of building a URL with "undefined" in it.
   resourceLink: (key) => decodeAgentKey(key)?.resourceProvider === "jira-project"
-    ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
-    : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
+    ? (config.atlassian
+        ? Promise.resolve({ ok: true as const, url: `${config.atlassian.site}/browse/${resourceKeyOf(key)}` })
+        : Promise.resolve({ ok: false as const, error: "Atlassian is disabled on this daemon — no Jira site configured to resolve a link against" }))
+    : resolveResourceLink(resourceKeyOf(key), { jiraSite: config.atlassian?.site, projectRootDocUrl: async (projectKey) => (await projectRootDoc(ops, projectKey)).url }),
   // FACTORY-339: NO I/O here, same discipline as `dashboard` above —
   // `dashboardFeed.snapshot()` is the SAME already-polled staffed-agent
   // registry `/dashboard` itself serves, never a second poll or a live
@@ -1381,7 +1477,12 @@ const { app, mcp } = buildApp({
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
   // daemon's own already-loaded credentials, never anything from the
   // request itself.
-  jiraTest: () => testJiraConnection(config.atlassian),
+  // FACTORY-66: `config.atlassian` can now be `undefined` — reported as a
+  // normal (non-throwing) failed test, same shape `testJiraConnection`
+  // already uses for every other failure, rather than crashing the route.
+  jiraTest: () => config.atlassian
+    ? testJiraConnection(config.atlassian)
+    : Promise.resolve({ ok: false as const, site: "", httpStatusClass: "other" as const, error: disabledAtlassianReason() }),
   jiraTestRateLimit,
   // FACTORY-665: `PUT /api/settings/:key` — writes through
   // `writeSetting` (`../settings/write-settings.ts`), then re-reads the
@@ -1418,11 +1519,16 @@ const { app, mcp } = buildApp({
   // comment), and `requireEnvCheck: true` means an env-provided token
   // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 before
   // the setup code is even checked.
-  jiraTokenRotate: (input, rateGate) => handleJiraTokenWrite(
-    { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
-    { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
-    { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
-  ),
+  // FACTORY-66: `config.atlassian` can now be `undefined` — rotation makes
+  // no sense with no Atlassian credential to rotate, refused the same way
+  // any other bad input to this route already is (400), never a crash.
+  jiraTokenRotate: (input, rateGate) => config.atlassian
+    ? handleJiraTokenWrite(
+        { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
+        { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
+        { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
+      )
+    : Promise.resolve({ ok: false as const, status: 400 as const, body: { error: disabledAtlassianReason() } }),
   jiraTokenTestRateLimit,
   jiraTokenWriteRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
@@ -1431,14 +1537,18 @@ const { app, mcp } = buildApp({
 // loop reads.
 }, {
   // Provider operations use the daemon's connections, independent of caller role.
-  ...providerAtlassianTools(ops, undefined, recordOwnWrite),
+  // FACTORY-66: `providerAtlassianTools`/`jiraIdeaTools`/`ideaGithubLinkTools`
+  // are now gated on `config.atlassian` — a disabled provider is not
+  // initialized, which here means its MCP tools are not even registered,
+  // not merely registered-but-guaranteed-to-fail.
+  ...(config.atlassian ? providerAtlassianTools(ops, undefined, recordOwnWrite) : {}),
   ...resourceLinkTools(routingLinkStore, (line) => console.error(line)),
   ...(githubToolIssues ? githubIssueTools({ client: githubToolIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(githubToolPrs ? githubPrTools({ client: githubToolPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskToolTickets ? zendeskTicketTools({ client: zendeskToolTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(config.atlassian && jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking requires both configured provider clients; their account checks remain authoritative.
-  ...(githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  ...(config.atlassian && githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
   // Session control retains its explicit controller authorization and containment.
   ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
@@ -2185,14 +2295,19 @@ const syncLabels = createLabelSync({
   ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
-  reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => sweepAbsentLiveAgentLabels({
+  // FACTORY-66: `sweepAbsentLiveAgentLabels` (src/labels/sweep.ts) calls
+  // `search` unconditionally EVERY poll — unlike `discovery.search()`
+  // above, it is not naturally skipped by "zero matches", so it needs its
+  // OWN `jiraWorkStaffing.run` guard or a disabled Atlassian would retry
+  // (and fail against the stub) on every single tick of this loop.
+  reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => (jiraWorkStaffing.run ? sweepAbsentLiveAgentLabels({
     search: (jql) => atlassian.search(jql),
     jira: labelWriter,
     liveKeys,
     ownedKeys,
     onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
     log: (line) => console.error(`  ${line}`),
-  }),
+  }) : Promise.resolve()),
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
@@ -2221,7 +2336,7 @@ watchSessionLimits({
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
 // the 15s poll only ever sees active tickets, so nothing else ever revisits
 // this. Not a new polling timer — runs once, here, and never again.
-if (getRules().some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
+if (jiraWorkStaffing.run) void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
   jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
@@ -2296,7 +2411,19 @@ const ruleResourceType = createRuleResourceType({
   rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
   // leaving the query and stop their agents.
+  // FACTORY-66: `jiraWorkStaffing.run` gates the ONE call that would
+  // otherwise reach the (possibly disabled-stub) `atlassian` client — same
+  // "decide before any network call, never inside a retry" discipline
+  // `githubIssueStaffing`/`zendeskTicketStaffing` already use. Short-
+  // circuiting here (rather than only at `atlassian`'s own stub) means a
+  // misconfigured Atlassian credential with enabled jira-work rules never
+  // repeatedly throws out of this loop's own poll — it reports via
+  // `jiraWorkHealth`'s `disabledReason` instead, and the loop's generic
+  // `pollLoop`/`notify` heartbeat (shared by this whole daemon process,
+  // not jira-work-specific) stays healthy exactly as it would with zero
+  // enabled jira-work rules.
   search: async (jql) => {
+    if (!jiraWorkStaffing.run) return [];
     const issues = await atlassian.searchAll(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
     return issues;
@@ -2451,6 +2578,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
 
+if (!jiraWorkStaffing.run && jiraWorkStaffing.reason) console.error(`  WARNING: ${jiraWorkStaffing.reason}`);
 let stopIssueLoop = startIssueLoop();
 
 // FACTORY-772: the backstop for any never-settling await that
@@ -2540,16 +2668,25 @@ startGithubPrLoop({
 
 // The jira-idea rule loop: proven Product Discovery ideas only, its own
 // agents and admission bucket, and none of the work-item detectors above.
-if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
+if (jiraIdeaStaffing.run) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
+else if (jiraIdeaStaffing.reason) console.error(`  WARNING: ${jiraIdeaStaffing.reason}`);
 if (!githubIssues && ideaRules.some((r) => r.relationships?.inwardConnectionRules?.length)) console.error("  WARNING: jira-idea rules list github-issue rules, but github-issue rules are not staffed; ideas hear no GitHub issues");
+// FACTORY-66: pulled out of the `startJiraIdeaLoop` call below (kept short
+// there on purpose — see test/unit/notify-deliver-seams.test.ts's own
+// fixed-length source slices) — gates on `jiraIdeaStaffing.run`, same
+// "never call the (possibly disabled-stub) Atlassian client when not
+// staffed" discipline as the jira-work loop's own `search` above.
+const jiraIdeaSearch = async (jql: string) => {
+  if (!jiraIdeaStaffing.run) return [];
+  const issues = await atlassian.searchAll(jql);
+  for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
+  return issues;
+};
+const jiraIdeaComments = (key: string) => (jiraIdeaStaffing.run ? atlassian.comments(key) : Promise.resolve([]));
 startJiraIdeaLoop({
   rules: getRules(),
-  search: async (jql) => {
-    const issues = await atlassian.searchAll(jql);
-    for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
-    return issues;
-  },
-  comments: (key) => atlassian.comments(key),
+  search: jiraIdeaSearch,
+  comments: jiraIdeaComments,
   onMatches: (matches) => { ideaMatches = matches; },
   ...(githubIssues && jiraIdeas ? {
     githubMatches: () => githubMatches,
@@ -2631,13 +2768,27 @@ startFilesystemLoop({
 // Confluence/Jira read path in this daemon already uses: no new credential,
 // no new staffing gate (see `confluencePageEnabledRules`'s own comment,
 // above `fsRules`).
-if (confluencePageEnabledRules.length) console.error(`  confluence-page rules: ${confluencePageEnabledRules.map((r) => r.id).join(", ")}`);
+if (confluencePageStaffing.run) console.error(`  confluence-page rules: ${confluencePageEnabledRules.map((r) => r.id).join(", ")}`);
+else if (confluencePageStaffing.reason) console.error(`  WARNING: ${confluencePageStaffing.reason}`);
+// FACTORY-66: pulled out of the `startConfluencePageLoop` call below (kept
+// short there on purpose — see test/unit/notify-deliver-seams.test.ts's own
+// fixed-length source slices) — each gates on `confluencePageStaffing.run`,
+// same "never call the (possibly disabled-stub) Atlassian ops client when
+// not staffed" discipline as the jira-work/jira-idea loops' own closures
+// above. `getChildPages` returning no children means `getPage`/
+// `getPageComments`/`getPageVersions` are never reached for this poll in
+// the first place (see confluence-page-type.ts's own discovery, which
+// walks children breadth-first from each root).
+const confluenceGetChildPages = (parentId: string, cursor?: string) => (confluencePageStaffing.run ? ops.getChildPages(parentId, cursor) : Promise.resolve({ results: [] }));
+const confluenceGetPageVersions = (pageIds: readonly string[]) => (confluencePageStaffing.run ? ops.getPageVersions(pageIds) : Promise.resolve({}));
+const confluenceGetPageComments = (pageId: string) => (confluencePageStaffing.run ? ops.getPageComments(pageId) : Promise.resolve({ results: [] }));
+const confluenceGetPage = (pageId: string) => (confluencePageStaffing.run ? ops.getPage(pageId) : Promise.reject(new Error(disabledAtlassianReason())));
 startConfluencePageLoop({
   rules: getRules(),
-  getChildPages: (parentId, cursor) => ops.getChildPages(parentId, cursor),
-  getPageVersions: (pageIds) => ops.getPageVersions(pageIds),
-  getPageComments: (pageId) => ops.getPageComments(pageId),
-  getPage: (pageId) => ops.getPage(pageId),
+  getChildPages: confluenceGetChildPages,
+  getPageVersions: confluenceGetPageVersions,
+  getPageComments: confluenceGetPageComments,
+  getPage: confluenceGetPage,
   herd,
   deliver: async (agent, resource, msg) => {
     const result = await deliverNotice({
@@ -3327,7 +3478,10 @@ const pinnedActiveDetector = createPinnedActiveDetector({
 // so admission never withholds one regardless of `config.maxAgents`.
 const projectType = createJiraProjectResourceType({
   rules: getRules(),
-  search: (q) => atlassian.searchProjects(q),
+  // FACTORY-66: same "never call the (possibly disabled-stub) Atlassian
+  // client when not staffed" discipline as the jira-work/jira-idea/
+  // confluence-page loops' own closures above.
+  search: (q) => (jiraProjectStaffing.run ? atlassian.searchProjects(q) : Promise.resolve([])),
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
   prepare: (spec) => resourceConnections.prepare(spec),
   // BUTCHR-469: linked-change eventing (member discovery + managed links) —
@@ -3336,8 +3490,8 @@ const projectType = createJiraProjectResourceType({
   // SAME routed link store `resourceLinkTools` is wired with (a
   // `jira-project:` owner key routes to the `brooswit.butchr.links`
   // project-property store — see `routingLinkStore`'s own doc comment).
-  searchIssues: (jql) => atlassian.searchAll(jql),
-  comments: (key) => atlassian.comments(key),
+  searchIssues: (jql) => (jiraProjectStaffing.run ? atlassian.searchAll(jql) : Promise.resolve([])),
+  comments: (key) => (jiraProjectStaffing.run ? atlassian.comments(key) : Promise.resolve([])),
   linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
@@ -3360,6 +3514,7 @@ projectType.discovery.search = async () => {
   pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
   return matches;
 };
+if (!jiraProjectStaffing.run && jiraProjectStaffing.reason) console.error(`  WARNING: ${jiraProjectStaffing.reason}`);
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,

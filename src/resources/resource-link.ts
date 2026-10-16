@@ -19,8 +19,16 @@
 import { isIssueKey, isProjectId } from "./id.js";
 
 export interface ResourceLinkDeps {
-  /** The configured Atlassian site (e.g. `https://foo.atlassian.net`, no trailing slash) — reused verbatim, never a second spelling (see `src/tools/docs.ts`'s own `ticketUrl` construction, which this mirrors). */
-  jiraSite: string;
+  /**
+   * The configured Atlassian site (e.g. `https://foo.atlassian.net`, no
+   * trailing slash) — reused verbatim, never a second spelling (see
+   * `src/tools/docs.ts`'s own `ticketUrl` construction, which this
+   * mirrors). `undefined` when this daemon has Atlassian disabled
+   * (FACTORY-66, `Config.atlassian`) — an issue/project key is then
+   * refused with a readable reason instead of building a URL with no site
+   * in it.
+   */
+  jiraSite?: string | undefined;
   /**
    * Resolves a PROJECT key's root-doc URL. Never called for an issue key.
    * A rejection (the project's `butchr` entity property unreadable or
@@ -41,6 +49,9 @@ export type ResourceLinkResult = { ok: true; url: string } | { ok: false; error:
  * a human actually clicks, never while building the dashboard page itself.
  */
 export async function resolveResourceLink(key: string, deps: ResourceLinkDeps): Promise<ResourceLinkResult> {
+  if ((isIssueKey(key) || isProjectId(key)) && !deps.jiraSite) {
+    return { ok: false, error: "Atlassian is disabled on this daemon — no Jira site configured to resolve a link against" };
+  }
   if (isIssueKey(key)) return { ok: true, url: `${deps.jiraSite}/browse/${key}` };
   if (isProjectId(key)) {
     try {

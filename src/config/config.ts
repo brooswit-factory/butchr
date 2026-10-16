@@ -85,7 +85,21 @@ export const DEFAULT_STALLED_WAKE_MAX_PER_HOUR = 6;
  */
 export interface Config {
   agent?: import("../agents/argv.js").AgentConfig;
-  atlassian: { site: string; email: string; token: string };
+  /**
+   * FACTORY-66: OPTIONAL, same all-or-nothing-plus-explicit-opt-out shape as
+   * `github`/`rocketchat` below — `undefined` whenever Atlassian is off,
+   * whether that's an explicit `BUTCHR_ATLASSIAN_ENABLED=false`, a genuinely
+   * unconfigured host, or a PARTIAL/invalid credential (site/email/token not
+   * all present and valid). In every one of those cases `atlassianDisabledReason`
+   * is set instead of `loadConfig` throwing — see `loadAtlassianConfig`'s own
+   * doc comment. `jira-work`, `jira-idea`, `jira-project` and `confluence-page`
+   * (the four Atlassian-backed `RESOURCE_PROVIDERS`, src/rules/agent-key.ts)
+   * are the providers this gates; `github-issue`/`github-pr`/`zendesk-ticket`
+   * are unaffected (their own credentials are independent of this one).
+   */
+  atlassian?: { site: string; email: string; token: string };
+  /** Set only when `atlassian` above is `undefined` — names exactly why (disabled, unconfigured, or misconfigured) and which rule providers are not staffed as a result. Never thrown as an exception: see `loadAtlassianConfig`. */
+  atlassianDisabledReason?: string;
   /** Port the daemon serves the MCP endpoint and the live-view webapp on. */
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
@@ -142,6 +156,8 @@ export interface Config {
    * entirely.
    */
   github?: { token: string; orgs: string[] };
+  /** FACTORY-66: set only when `GITHUB_TOKEN_FILE` was set but unreadable — isolates that failure to `github` staying `undefined` (same as merely unset) rather than failing `loadConfig`/the whole daemon over a provider that is, by its own contract above, optional. */
+  githubTokenReadError?: string;
   /**
    * BUTCHR-395/S4: Rocket.Chat account lifecycle config. OPTIONAL, same
    * all-or-nothing shape as `github` above: present only when
@@ -727,6 +743,8 @@ export interface ConfigEnv {
   ATLASSIAN_EMAIL?: string | undefined;
   ATLASSIAN_TOKEN?: string | undefined;
   ATLASSIAN_TOKEN_FILE?: string | undefined;
+  /** FACTORY-66: explicit opt-out — "false"/"0"/"no"/"off" (case-insensitive) disables Atlassian regardless of what ATLASSIAN_* is set, bypassing setup mode too. Unset/anything else leaves today's presence-based behavior unchanged. */
+  BUTCHR_ATLASSIAN_ENABLED?: string | undefined;
   BUTCHR_PORT?: string | undefined;
   HERDR_SOCKET?: string | undefined;
   BUTCHR_TERMINAL?: string | undefined;
@@ -822,17 +840,28 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     : restoredResumeRaw === "off" || restoredResumeRaw === "all"
     ? restoredResumeRaw
     : new Set(restoredResumeRaw.split(",").map((name) => name.trim()).filter(Boolean));
-  const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
-  validateAtlassianSiteShape(site);
-  const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
-  const token = env.ATLASSIAN_TOKEN_FILE
-    ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
-    : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
-  if (!token) throw new Error("Atlassian token is empty");
+  const atlassianResult = loadAtlassianConfig(env, readFile);
+  const atlassian = atlassianResult.config;
+  const atlassianDisabledReason = atlassianResult.disabledReason;
 
   const port = parsePort(env);
 
-  const githubToken = env.GITHUB_TOKEN_FILE ? readFile(env.GITHUB_TOKEN_FILE).trim() : undefined;
+  // FACTORY-66: isolate a bad GITHUB_TOKEN_FILE to `github` staying
+  // `undefined` (indistinguishable from simply unset, except for the
+  // diagnostic `githubTokenReadError` below) — github is documented as
+  // OPTIONAL (see `Config.github`'s own doc comment), so an unreadable
+  // token file for it must never fail `loadConfig`/take down the whole
+  // daemon, same contract `loadAtlassianConfig` above now also honours for
+  // Atlassian's own (mandatory-shaped, but no-longer-fatal) token read.
+  let githubToken: string | undefined;
+  let githubTokenReadError: string | undefined;
+  if (env.GITHUB_TOKEN_FILE) {
+    try {
+      githubToken = readFile(env.GITHUB_TOKEN_FILE).trim();
+    } catch (e) {
+      githubTokenReadError = `could not read GITHUB_TOKEN_FILE (${env.GITHUB_TOKEN_FILE}): ${(e as Error).message} — github-issue/github-pr rules and pr:* discovery are not staffed until it is fixed`;
+    }
+  }
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
 
@@ -1032,7 +1061,9 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const extensionOrigins = [CLEAVR_EXTENSION_ORIGIN];
 
   return {
-    atlassian: { site, email, token },
+    ...(atlassian ? { atlassian } : {}),
+    ...(atlassianDisabledReason ? { atlassianDisabledReason } : {}),
+    ...(githubTokenReadError ? { githubTokenReadError } : {}),
     agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
@@ -1148,6 +1179,74 @@ export function isAtlassianConfigured(env: ConfigEnv): boolean {
   return hasSite && hasEmail && hasToken;
 }
 
+/** The four `RESOURCE_PROVIDERS` (src/rules/agent-key.ts) backed by this one Atlassian credential — named consistently in every `loadAtlassianConfig` disabled reason so a reader sees exactly what is not staffed as a result. */
+const ATLASSIAN_BACKED_PROVIDERS = "jira-work, jira-idea, jira-project and confluence-page rules are not staffed";
+
+/**
+ * FACTORY-66 — Atlassian's own optional/isolated-error load, matching the
+ * `github?`/`rocketchat?` precedent's contract ("optional, never a startup
+ * crash for unrelated config") that Atlassian itself was the one credential
+ * NOT following before this ticket: `loadConfig` used to call `required()`
+ * directly for site/email/token and let any failure (missing field, a
+ * malformed site, an unreadable `ATLASSIAN_TOKEN_FILE`) propagate as a
+ * thrown exception all the way out of `loadConfig` — fatal to the entire
+ * daemon (`src/daemon/index.ts` catches it and calls `process.exit(1)`),
+ * even though the four Atlassian-backed providers above are only PART of
+ * what this daemon might be staffing (an operator running only
+ * `github-issue`/`zendesk-ticket` rules got no benefit from that crash).
+ *
+ * Three distinct outcomes, all non-throwing:
+ *  - `BUTCHR_ATLASSIAN_ENABLED` explicitly falsy ("false"/"0"/"no"/"off") —
+ *    disabled regardless of what ATLASSIAN_* otherwise holds. The one new
+ *    lever this ticket adds: previously there was no way to say "Atlassian
+ *    is off" other than leaving every ATLASSIAN_* var unset, which instead
+ *    routes a FRESH install into setup mode (`src/daemon/setup-mode.ts`) —
+ *    a deliberately different UX this flag bypasses entirely.
+ *  - Nothing at all set (no explicit flag, no ATLASSIAN_* var) — reported
+ *    as "not configured", the same presence condition
+ *    `isAtlassianConfigured` already uses to route a truly fresh install
+ *    into setup mode; this function does not decide that routing itself
+ *    (`src/daemon/index.ts` still does, via `isAtlassianConfigured`), it
+ *    only gives that same absent state a non-throwing shape for the case
+ *    setup mode does NOT apply (explicitly disabled, or any later restart
+ *    once env still leaves it absent outside setup mode's own identity-file
+ *    fallback).
+ *  - Partial or invalid (any of site/email/token missing, a malformed
+ *    site, an unreadable token file, an empty token) — this is the
+ *    historical boot-refusal path (PR463/FACTORY-65, `process.exit(1)`
+ *    in `src/daemon/index.ts`): now isolated to a `disabledReason`
+ *    instead, naming exactly what's wrong, with the SAME four providers
+ *    simply not staffed rather than the whole daemon refusing to start.
+ */
+export type AtlassianConfigResult =
+  | { config: Config["atlassian"]; disabledReason?: undefined }
+  | { config: undefined; disabledReason: string };
+
+export function loadAtlassianConfig(env: ConfigEnv, readFile: (path: string) => string): AtlassianConfigResult {
+  const disabledFlag = env.BUTCHR_ATLASSIAN_ENABLED?.trim().toLowerCase();
+  if (disabledFlag === "false" || disabledFlag === "0" || disabledFlag === "no" || disabledFlag === "off") {
+    return { config: undefined, disabledReason: `Atlassian is disabled (BUTCHR_ATLASSIAN_ENABLED=${env.BUTCHR_ATLASSIAN_ENABLED}) — ${ATLASSIAN_BACKED_PROVIDERS}` };
+  }
+  const hasSite = !!env.ATLASSIAN_SITE?.trim();
+  const hasEmail = !!env.ATLASSIAN_EMAIL?.trim();
+  const hasTokenInput = !!env.ATLASSIAN_TOKEN?.trim() || !!env.ATLASSIAN_TOKEN_FILE?.trim();
+  if (!hasSite && !hasEmail && !hasTokenInput) {
+    return { config: undefined, disabledReason: `Atlassian is not configured (ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN/ATLASSIAN_TOKEN_FILE are all unset) — ${ATLASSIAN_BACKED_PROVIDERS}` };
+  }
+  try {
+    const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
+    validateAtlassianSiteShape(site);
+    const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
+    const token = env.ATLASSIAN_TOKEN_FILE
+      ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
+      : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
+    if (!token) throw new Error("Atlassian token is empty");
+    return { config: { site, email, token } };
+  } catch (e) {
+    return { config: undefined, disabledReason: `Atlassian is misconfigured: ${(e as Error).message} — ${ATLASSIAN_BACKED_PROVIDERS}` };
+  }
+}
+
 /** AccountIds are not secrets; truncate them only for readability, never redact. */
 const truncAccountId = (id: string): string => (id.length > 11 ? `${id.slice(0, 11)}…` : id);
 
@@ -1241,8 +1340,8 @@ function describeCollisions(assignees: Config["assignees"]): string {
 export const describeConfig = (c: Config): string =>
   `provider=${c.agent?.provider ?? "claude"} model=${c.agent?.model ?? "provider-default"} ` +
   `providerOrder=${(c.agent?.providers ?? [c.agent?.provider ?? "claude"]).join(",")} roleProviderOrders=${JSON.stringify(c.agent?.roleProviders ?? {})} ` +
-  `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars) port=${c.port} ` +
-  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
+  `${c.atlassian ? `site=${c.atlassian.site} email=${c.atlassian.email} token=***(${c.atlassian.token.length} chars)` : `atlassian=disabled (${c.atlassianDisabledReason ?? "not configured"})`} port=${c.port} ` +
+  `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : `disabled${c.githubTokenReadError ? ` (${c.githubTokenReadError})` : ""}`} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
   `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +

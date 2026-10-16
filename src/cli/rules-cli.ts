@@ -86,6 +86,10 @@ export function createJiraEnv(
   readFile: (path: string) => string = (p) => readFileSync(p, "utf8"),
 ): RulesCheckJiraEnv {
   const config: Config = loadConfig(env, readFile);
+  // FACTORY-66: `config.atlassian` can now be `undefined` — `rules check`'s
+  // one Jira search capability is meaningless without it, so this throws a
+  // clear, specific reason rather than crashing on an undefined read.
+  if (!config.atlassian) throw new Error(`cannot check jira-work/jira-idea/jira-project rules: ${config.atlassianDisabledReason ?? "Atlassian is not configured"}`);
   const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, fetchImpl);
   return { maxAgents: config.maxAgents, search: (jql) => atlassian.searchAll(jql) };
 }

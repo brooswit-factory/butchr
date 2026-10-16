@@ -2,6 +2,9 @@ import { readFileSync } from "node:fs";
 import { loadConfig, type Config, type ConfigEnv } from "../src/config/config.js";
 import type { FetchLike } from "../src/atlassian/client.js";
 
+/** FACTORY-66: `Config.atlassian` is now optional daemon-wide; this script is a one-time, human-run Jira links migration that is meaningless without it, so every function here requires it present — `main` below is the one place that checks and reports clearly before anything else runs. */
+export type ConfigWithAtlassian = Config & { atlassian: NonNullable<Config["atlassian"]> };
+
 /** A single issue link as seen from the OWNING issue's own fields.issuelinks row. */
 export interface MigrateLink {
   id: string;
@@ -202,7 +205,7 @@ export function formatTable(plan: Plan): string {
   return rows.map((r) => r.map((c, i) => c.padEnd(widths[i]!)).join("  ")).join("\n");
 }
 
-const basicAuth = (cfg: Config) => "Basic " + Buffer.from(`${cfg.atlassian.email}:${cfg.atlassian.token}`).toString("base64");
+const basicAuth = (cfg: ConfigWithAtlassian) => "Basic " + Buffer.from(`${cfg.atlassian.email}:${cfg.atlassian.token}`).toString("base64");
 
 function mapIssue(raw: any): MigrateIssue {
   const f = raw.fields ?? {};
@@ -232,7 +235,7 @@ function mapIssue(raw: any): MigrateIssue {
  * (needed to delete), so this is its own small typed helper rather than a
  * bent reuse of the client.
  */
-export async function fetchAllIssues(cfg: Config, fetchImpl: FetchLike): Promise<MigrateIssue[]> {
+export async function fetchAllIssues(cfg: ConfigWithAtlassian, fetchImpl: FetchLike): Promise<MigrateIssue[]> {
   const auth = basicAuth(cfg);
   const issues: MigrateIssue[] = [];
   let nextPageToken: string | undefined;
@@ -277,7 +280,7 @@ async function deleteLink(site: string, auth: string, fetchImpl: FetchLike, link
  * than stranding the ticket with neither link. A delete-backwards-implements
  * never depends on an add, so failedAdds never suppresses it.
  */
-export async function applyPlan(plan: Plan, cfg: Config, fetchImpl: FetchLike): Promise<ApplyOutcome[]> {
+export async function applyPlan(plan: Plan, cfg: ConfigWithAtlassian, fetchImpl: FetchLike): Promise<ApplyOutcome[]> {
   const auth = basicAuth(cfg);
   const outcomes: ApplyOutcome[] = [];
   const failedAdds = new Set<string>();
@@ -315,14 +318,23 @@ async function main(): Promise<void> {
   console.log(apply ? "=== APPLY MODE — this WILL modify Jira ===" : "=== DRY RUN (default) — no changes will be made; pass --apply to execute ===");
 
   const cfg = loadConfig(process.env as ConfigEnv, (p) => readFileSync(p, "utf8"));
-  const issues = await fetchAllIssues(cfg, globalThis.fetch as FetchLike);
+  // FACTORY-66: `cfg.atlassian` can now be `undefined` — this migration is
+  // meaningless without it, so fail clearly here rather than reaching an
+  // undefined read deeper in.
+  if (!cfg.atlassian) {
+    console.error(`cannot migrate links: ${cfg.atlassianDisabledReason ?? "Atlassian is not configured"}`);
+    process.exitCode = 1;
+    return;
+  }
+  const cfgWithAtlassian: ConfigWithAtlassian = { ...cfg, atlassian: cfg.atlassian };
+  const issues = await fetchAllIssues(cfgWithAtlassian, globalThis.fetch as FetchLike);
   const plan = computePlan(issues);
 
   console.log(formatTable(plan));
   console.log(summarize(plan));
 
   if (!apply) return;
-  const outcomes = await applyPlan(plan, cfg, globalThis.fetch as FetchLike);
+  const outcomes = await applyPlan(plan, cfgWithAtlassian, globalThis.fetch as FetchLike);
   for (const o of outcomes) console.log(`  ${o.ok ? "✓" : "✗"} ${o.action} ${o.ticket} -> ${o.otherEnd}${o.error ? `: ${o.error}` : ""}`);
   if (outcomes.some((o) => !o.ok)) process.exitCode = 1;
 }
