@@ -1,6 +1,23 @@
-import { describe, expect, test, mock } from "bun:test";
+import { afterAll, describe, expect, test, mock } from "bun:test";
 import { createProjectResourceType, projectVerdict } from "../../src/resources/project.js";
 import type { ProjectResourceDeps } from "../../src/resources/project.js";
+
+// FACTORY-137 (incidental fix, found while rebasing onto main): `mock.module`
+// is a PROCESS-WIDE patch, not scoped to this file — bun does not undo it
+// when the file finishes. Every test above replaces "jira.js"/"confluence.js"
+// with a stub lacking most of the real client's surface (e.g. no
+// `projectProperties`), so without restoring it here, any OTHER test file
+// that happens to run later in the SAME bun test process and imports the
+// real client (e.g. test/unit/link-cli-jira-project.test.ts) silently gets
+// this file's last stub instead — order-dependent, so it can pass for a long
+// time and then fail the moment file-execution order shifts (exactly what
+// happened here: this PR's own new test files changed CI's worker
+// distribution enough to expose it). Restoring once, after every test in
+// this file has run, is enough — each test already calls `mock.module`
+// fresh before using the client, so nothing above needs its own cleanup.
+afterAll(() => {
+  mock.restore();
+});
 
 describe("realAtlassian confluence page ops", () => {
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {
