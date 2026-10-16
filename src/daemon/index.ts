@@ -116,7 +116,7 @@ import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
 import { loadZendeskAuth, createZendeskTicketClient } from "../resources/zendesk-ticket.js";
-import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffingIfEnabled } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
@@ -650,8 +650,18 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // zendesk-ticket rules run only with ZENDESK_SUBDOMAIN and an owner-only
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
-// when an enabled zendesk-ticket rule exists.
-const zendeskStaffing = applyProviderSwitch("zendesk-ticket", zendeskTicketStaffing(getRules(), process.env as Record<string, string | undefined>), config.providerEnabled["zendesk-ticket"]);
+// when an enabled zendesk-ticket rule exists AND this provider's own switch
+// is on. FACTORY-66 review round 4 (brooswit, PR #797, @ cf9645e5): the old
+// `zendeskTicketStaffing(...)` call here ran (and could read the token
+// file) BEFORE `applyProviderSwitch` consulted the switch at all —
+// `zendeskTicketStaffingIfEnabled` (src/rules/zendesk-ticket-type.ts)
+// checks the switch FIRST and never calls the real staffing function (or
+// its credential read) when it's off.
+const zendeskStaffing = applyProviderSwitch(
+  "zendesk-ticket",
+  zendeskTicketStaffingIfEnabled(getRules(), process.env as Record<string, string | undefined>, config.providerEnabled["zendesk-ticket"]),
+  config.providerEnabled["zendesk-ticket"],
+);
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
