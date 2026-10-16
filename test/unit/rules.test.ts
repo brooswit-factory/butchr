@@ -15,6 +15,7 @@ import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
 import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
 import { ownsFilesystemAgent } from "../../src/rules/filesystem-type.js";
 import { ownsConfluencePageAgent } from "../../src/rules/confluence-page-type.js";
+import { ownsJiraComponentAgent } from "../../src/rules/jira-component-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
 
@@ -899,7 +900,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent, "confluence-page": ownsConfluencePageAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent, "confluence-page": ownsConfluencePageAgent, "jira-component": ownsJiraComponentAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -927,5 +928,6 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "jira-project": return "BUTCHR";
     case "filesystem": return "/tmp/example.txt";
     case "confluence-page": return "123456";
+    case "jira-component": return "BUTCHR:10000";
   }
 }

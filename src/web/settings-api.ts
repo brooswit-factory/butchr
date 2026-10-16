@@ -108,6 +108,11 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: PROVIDER_ENABLED_ENV_VAR["github-pr"], description: "Independent on/off switch for the github-pr rule provider. Default enabled.", secret: false },
   { key: PROVIDER_ENABLED_ENV_VAR["zendesk-ticket"], description: "Independent on/off switch for the zendesk-ticket rule provider. Default enabled.", secret: false },
   { key: PROVIDER_ENABLED_ENV_VAR.filesystem, description: "Independent on/off switch for the filesystem rule provider. Default enabled.", secret: false },
+  // FACTORY-990: jira-component is inert scaffolding with no caller yet
+  // (see `../rules/jira-component-type.ts`'s own header) — this entry
+  // exists only to keep `SETTINGS_ALLOWLIST` in sync with
+  // `PROVIDER_ENABLED_ENV_VAR`, which is total over `ResourceProvider`.
+  { key: PROVIDER_ENABLED_ENV_VAR["jira-component"], description: "Independent on/off switch for the jira-component rule provider. Default enabled. Currently inert: no agent can be staffed by this provider yet.", secret: false },
 ];
 
 /**

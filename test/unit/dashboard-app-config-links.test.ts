@@ -13,6 +13,7 @@ const SAMPLE_RESOURCE_IDS: Record<(typeof RESOURCE_PROVIDERS)[number], string> =
   "jira-project": "FACTORY",
   filesystem: "/abs/path",
   "confluence-page": "123456",
+  "jira-component": "FACTORY:10000",
 };
 
 describe("dashboard-app/view-model/config-links: parity with the real src/agents/config-inventory-links.ts (drift guard)", () => {

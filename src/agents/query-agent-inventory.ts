@@ -272,6 +272,19 @@ function liveAndWithheldRuleKeys(rows: readonly DashboardRow[]): { live: Readonl
  * managed-session-definitions loop's own admission bucket, which this module
  * already handles separately (`SessionDefinitionInventoryEntry`, no
  * `staffed`/`reason` of its own).
+ *
+ * FACTORY-990: `jira-component` is the one entry here with NO matching
+ * `admissionController.admit(...)` call site (yet) — it is inert scaffolding
+ * (see `../rules/jira-component-type.ts`'s own header): no rule using it can
+ * ever be staffed, since no `runResourceLoop` in `src/daemon/index.ts` filters
+ * for it. The entry still has to exist (this map is a TOTAL
+ * `Record<ResourceProvider, string>`, and `jira-component` is now one), so it
+ * follows the SAME provider-name-as-source convention every other entry but
+ * `jira-work` already does — `resolveRuleAdmission` below degrades exactly
+ * like any other provider whose `admission.sources` bucket is absent
+ * (FACTORY-340's own documented case), reporting `{ absent: true }` rather
+ * than crashing. A later story that wires a real `jira-component` loop would
+ * make this entry genuinely live without needing to change its value.
  */
 const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
   "jira-work": "issue",
@@ -282,6 +295,7 @@ const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
   "jira-project": "jira-project",
   filesystem: "filesystem",
   "confluence-page": "confluence-page",
+  "jira-component": "jira-component",
 };
 
 /**

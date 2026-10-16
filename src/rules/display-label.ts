@@ -59,6 +59,7 @@ import { githubIssueShortDisplayId } from "./github-issue-type.js";
 import { githubPrShortDisplayId } from "./github-pr-type.js";
 import { zendeskTicketShortDisplayId } from "./zendesk-ticket-type.js";
 import { confluencePageShortDisplayId } from "./confluence-page-type.js";
+import { jiraComponentShortDisplayId } from "./jira-component-type.js";
 
 /**
  * The one dispatch spot — see this module's own top comment for why this is
@@ -81,6 +82,7 @@ export function shortDisplayId(provider: ResourceProvider, ruleId: string, resou
     case "github-pr": return githubPrShortDisplayId(resourceId);
     case "zendesk-ticket": return zendeskTicketShortDisplayId(resourceId);
     case "confluence-page": return confluencePageShortDisplayId(resourceId);
+    case "jira-component": return jiraComponentShortDisplayId(resourceId);
   }
 }
 

@@ -73,6 +73,11 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
   // `forJiraCallers` below (`CONFLUENCE_PAGE_OWN_TOOL_NAMES`) — every OTHER
   // Jira/Confluence tool still refuses it, citing this same message.
   "confluence-page": "get_my_confluence_page and get_my_confluence_page_comments",
+  // FACTORY-990: `jira-component` is inert scaffolding (no ResourceType, no
+  // spawn wiring — see ../rules/jira-component-type.ts's own header), so no
+  // agent can ever be this caller in practice; this entry exists only to
+  // keep `OWN_TOOLS` total over `CallerIdentity["provider"]`.
+  "jira-component": "no tools — the jira-component provider is inert scaffolding with no agent that can call this",
 };
 
 /**
