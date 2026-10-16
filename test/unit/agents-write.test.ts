@@ -23,15 +23,15 @@ import type { Herd } from "../../src/agents/herd.js";
  * reading a return value.
  */
 function makeOps() {
-  const issues = new Map<string, { issuetype: string; status: string; labels: string[]; bossKey?: string; summary?: string; priority?: string }>();
+  const issues = new Map<string, { issuetype: string; status: string; labels: string[]; bossKey?: string; summary?: string; priority?: string; assignee?: string }>();
   const calls: string[] = [];
   function requireIssue(key: string) {
     const i = issues.get(key);
     if (!i) throw new Error(`fake world: no such issue ${key}`);
     return i;
   }
-  function addIssue(key: string, p: { issuetype: string; status?: string; labels?: string[]; bossKey?: string; summary?: string }) {
-    issues.set(key, { issuetype: p.issuetype, status: p.status ?? "To Do", labels: p.labels ?? [], summary: p.summary ?? `${key} summary`, ...(p.bossKey !== undefined ? { bossKey: p.bossKey } : {}) });
+  function addIssue(key: string, p: { issuetype: string; status?: string; labels?: string[]; bossKey?: string; summary?: string; assignee?: string }) {
+    issues.set(key, { issuetype: p.issuetype, status: p.status ?? "To Do", labels: p.labels ?? [], summary: p.summary ?? `${key} summary`, ...(p.bossKey !== undefined ? { bossKey: p.bossKey } : {}), ...(p.assignee !== undefined ? { assignee: p.assignee } : {}) });
   }
   const notImplemented = (name: string) => async () => { throw new Error(`fake ops: ${name} not implemented (unused by agents-write tests)`); };
   const ops: AtlassianOps = {
@@ -43,6 +43,7 @@ function makeOps() {
           issuetype: { name: i.issuetype },
           status: { name: i.status },
           labels: i.labels,
+          assignee: i.assignee ? { accountId: i.assignee } : null,
           issuelinks: i.bossKey ? [{ type: { name: "Implements" }, inwardIssue: { key: i.bossKey } }] : [],
         },
       };
@@ -53,7 +54,7 @@ function makeOps() {
     transition: async (key: string, status: string) => { calls.push(`transition:${key}:${status}`); requireIssue(key).status = status; return { ok: true }; },
     createIssue: notImplemented("createIssue"),
     setPriority: async (key: string, priority: string) => { calls.push(`setPriority:${key}:${priority}`); requireIssue(key).priority = priority; return { ok: true }; },
-    assign: async (key: string, accountId: string) => { calls.push(`assign:${key}:${accountId}`); requireIssue(key); return { ok: true }; },
+    assign: async (key: string, accountId: string) => { calls.push(`assign:${key}:${accountId}`); requireIssue(key).assignee = accountId; return { ok: true }; },
     correctText: notImplemented("correctText"),
     createPage: notImplemented("createPage"),
     getPage: notImplemented("getPage"),
@@ -115,6 +116,52 @@ describe("agents-write — FACTORY-666", () => {
         expect(outcome.error).toContain("has no boss");
         expect(outcome.status).toBe(409);
       }
+      expect(world.calls).toEqual([]);
+    });
+
+    // FACTORY-829: this dashboard route is the LIVE caller of startWorker —
+    // `defs.ts`'s own legacy `atlassianTools` wiring to the same function is
+    // dead on the daemon's current path, but a click on this route is not.
+    // Before the fix, a ticket started here with no prior adopt_worker call
+    // transitioned to In Progress while staying unassigned forever —
+    // invisible to the fleet's own assignee-scoped admission search, so it
+    // never got a running agent and nothing ever detected the gap.
+    test("FACTORY-829: an unassigned worker started from the dashboard is assigned by role, not left undiscoverable", async () => {
+      const world = makeOps();
+      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" }); // no assignee
+      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
+      const { herd } = makeHerd();
+      const outcome = await doAgentStart(deps(world, herd), "FACTORY-1");
+      expect(outcome.ok).toBe(true);
+      expect(world.issues.get("FACTORY-1")?.assignee).toBe("acct-task");
+      expect(world.issues.get("FACTORY-1")?.status).toBe("In Progress");
+      expect(world.calls).toContain("assign:FACTORY-1:acct-task");
+      expect(world.calls).toContain("transition:FACTORY-1:In Progress");
+    });
+
+    test("FACTORY-829: a worker that already has a legitimate assignee is started without being reassigned", async () => {
+      const world = makeOps();
+      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS", assignee: "some-other-legitimate-owner" });
+      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
+      const { herd } = makeHerd();
+      const outcome = await doAgentStart(deps(world, herd), "FACTORY-1");
+      expect(outcome.ok).toBe(true);
+      expect(world.issues.get("FACTORY-1")?.assignee).toBe("some-other-legitimate-owner");
+      expect(world.calls.some((c) => c.startsWith("assign:"))).toBe(false);
+    });
+
+    test("FACTORY-829: with no role configured for the worker's type, this refuses clearly and writes nothing — no misleading active-but-undiscoverable success", async () => {
+      const world = makeOps();
+      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" }); // no assignee
+      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
+      const { herd } = makeHerd();
+      const noTaskRole: AgentWriteDeps = { ops: world.ops, herd, roles: { story: "acct-story", epic: "acct-epic" } }; // roles.task deliberately unset
+      const outcome = await doAgentStart(noTaskRole, "FACTORY-1");
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.error).toMatch(/no assignee for a Task.*BUTCHR_ASSIGNEE_TASK/);
+      }
+      expect(world.issues.get("FACTORY-1")?.status).toBe("To Do"); // never transitioned while still unassigned
       expect(world.calls).toEqual([]);
     });
   });
