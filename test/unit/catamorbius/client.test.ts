@@ -165,6 +165,10 @@ function createFakeGateway() {
     queueNetworkError(message = "network down"): void {
       eventsScripts.push(() => Promise.reject(new Error(message)));
     },
+    /** Queue an arbitrary script for the next `/events` call — full control over timing (e.g. a fetch that only resolves/rejects on the caller's own signal, to simulate a hung connect or an abort race). */
+    queueCustom(fn: (signal: AbortSignal) => FakeResponse | Promise<FakeResponse>): void {
+      eventsScripts.push(fn);
+    },
     setProbe(fn: (signal: AbortSignal) => Promise<FakeResponse>): void {
       onProbe = fn;
     },
@@ -651,6 +655,133 @@ describe("stop(): aborts in-flight request, cancels the reader, clears every tim
     client.stop();
     client.stop();
     expect(client.state).toBe("idle");
+  });
+
+  test("stop() then a fresh start() WHILE a connect attempt is still awaiting fetch: the stale attempt never spawns its own reconnect chain (review-caught bug)", async () => {
+    // Reproduces the exact race: start() kicks off connectOnce() #1, whose fetch never resolves
+    // until we explicitly release it below. stop() aborts #1's request and immediately start()
+    // clears `stopped` again — before this fix, #1's own `catch { if (stopped) return; ...}`
+    // would see `stopped === false` (because start() already ran) and schedule ITS OWN
+    // reconnect, running independently alongside the new attempt #2.
+    const clock = createFakeClock();
+    const gateway = createFakeGateway();
+    let releaseFirstFetch: ((res: FakeResponse) => void) | undefined;
+    const firstFetchPromise = new Promise<FakeResponse>((resolve) => {
+      releaseFirstFetch = resolve;
+    });
+    gateway.queueCustom((signal) => {
+      // #1's fetch: resolves only when we call releaseFirstFetch, or rejects on abort.
+      return new Promise<FakeResponse>((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+        void firstFetchPromise.then(resolve);
+      });
+    });
+    gateway.queueLive(); // #2's fetch, once the new attempt starts
+
+    const client = makeClient({ clock, fetch: gateway.fetch, backoffBaseMs: 100, randomValues: [0.5] });
+    const states = recordStates(client);
+    client.start(); // attempt #1: fetch is now pending, never resolving until released
+    await clock.advance(0);
+    expect(gateway.calls).toHaveLength(1);
+
+    client.stop(); // aborts #1's request (rejects its fetch promise via the abort listener)
+    client.start(); // attempt #2: a NEW generation
+    await clock.advance(0);
+    expect(gateway.calls).toHaveLength(2); // #2 connected immediately
+    expect(client.state).toBe("live");
+
+    // Now let #1's ABORTED fetch promise actually settle (its abort-triggered rejection was
+    // already queued; this just lets that microtask run to completion) and give its stale
+    // `catch` block every chance to misbehave.
+    await clock.advance(0);
+    await clock.advance(10_000); // long past any backoff #1 might have scheduled if the bug were present
+
+    expect(gateway.calls).toHaveLength(2); // still exactly 2 — #1 spawned NO reconnect chain of its own
+    expect(client.state).toBe("live"); // #2's connection is untouched by #1's demise
+    client.stop();
+  });
+
+  test("a throwing onEvent listener does not lose the event's delivery or force a reconnect (review-caught bug)", async () => {
+    const clock = createFakeClock();
+    const gateway = createFakeGateway();
+    gateway.queueLive();
+    const client = makeClient({ clock, fetch: gateway.fetch });
+    const states = recordStates(client);
+    const delivered: number[] = [];
+    client.onEvent(() => {
+      throw new Error("consumer bug");
+    });
+    client.onEvent((e) => delivered.push(e.seq));
+    client.start();
+    await clock.advance(0);
+
+    gateway.liveConns[0]!.push(sseFrame({ event: "a", id: "1", data: {} }));
+    await clock.advance(0);
+    gateway.liveConns[0]!.push(sseFrame({ event: "a", id: "2", data: {} }));
+    await clock.advance(0);
+
+    expect(delivered).toEqual([1, 2]); // the throwing listener never stopped the well-behaved one
+    expect(client.lastSeq).toBe(2);
+    expect(states).toEqual(["connecting", "live"]); // no reconnect churn from the listener's own throw
+    expect(gateway.calls).toHaveLength(1);
+    client.stop();
+  });
+
+  test("a throwing onStateChange/onResyncRequired listener is isolated the same way", async () => {
+    const clock = createFakeClock();
+    const gateway = createFakeGateway();
+    gateway.queueLive();
+    gateway.queueStatus(400);
+    const client = makeClient({ clock, fetch: gateway.fetch, backoffBaseMs: 50, randomValues: [0.5] });
+    client.onStateChange(() => {
+      throw new Error("consumer bug");
+    });
+    const resyncs: ResyncReason[] = [];
+    client.onResyncRequired(() => {
+      throw new Error("consumer bug");
+    });
+    client.onResyncRequired((r) => resyncs.push(r));
+    client.start();
+    await clock.advance(0);
+    expect(client.state).toBe("live"); // setState itself never threw despite the listener
+
+    gateway.liveConns[0]!.push(sseFrame({ event: "a", id: "9", data: {} }));
+    await clock.advance(0);
+    gateway.liveConns[0]!.close();
+    await clock.advance(100); // reconnect hits the queued 400
+
+    expect(resyncs).toEqual(["cursor-dropped"]); // the well-behaved resync listener still fired
+    client.stop();
+  });
+});
+
+describe("watchdog covers the connect phase, not just an already-live stream (review-caught bug)", () => {
+  test("a gateway that accepts the request but never responds is treated as dead and reconnected", async () => {
+    const clock = createFakeClock();
+    const gateway = createFakeGateway();
+    gateway.queueCustom(
+      (signal) =>
+        new Promise<FakeResponse>((_, reject) => {
+          // Never resolves on its own — a real `fetch` only settles this hung request when its
+          // AbortSignal fires, which is exactly what the watchdog is relied on to trigger.
+          signal.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    gateway.queueLive();
+    const client = makeClient({ clock, fetch: gateway.fetch, watchdogMs: 1000, backoffBaseMs: 50 });
+    const states = recordStates(client);
+    client.start();
+    await clock.advance(0);
+    expect(states).toEqual(["connecting"]); // still awaiting a response
+
+    await clock.advance(999);
+    expect(gateway.calls).toHaveLength(1); // watchdog not yet due
+    await clock.advance(1); // watchdog fires: aborts the hung connect attempt
+    await clock.advance(100); // scheduled reconnect fires, hitting the second queued script
+
+    expect(gateway.calls).toHaveLength(2);
+    expect(client.state).toBe("live");
+    client.stop();
   });
 });
 

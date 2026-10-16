@@ -167,19 +167,43 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
   let reconnectHandle: unknown;
   let abortController: AbortController | undefined;
   let everLive = false;
+  // Bumped by every start()/stop(): the review-caught bug this closes is stop() aborting an
+  // in-flight connectOnce() while start() immediately clears `stopped` again, letting the OLD
+  // attempt's own `if (stopped) return` checks pass and spawn a SECOND, independent connect
+  // chain. Every async continuation below checks its own captured `myGen` against this instead
+  // of the shared `stopped` flag, so a stop()-then-start() during any in-flight step (the fetch
+  // itself, a pending read, a scheduled reconnect) always bails out the stale chain.
+  let generation = 0;
 
   const stateListeners = new Set<(state: CatamorbiusClientState) => void>();
   const eventListeners = new Set<(delivered: DeliveredCatamorbiusEvent) => void>();
   const resyncListeners = new Set<(reason: ResyncReason) => void>();
 
+  // Every listener call is isolated: a throwing consumer must never unwind into this module's
+  // OWN control flow (the SSE read loop, in particular) — that would abort a perfectly healthy
+  // connection and force a reconnect after `lastSeq` has already advanced past the very event
+  // the listener failed to handle, silently losing it. Swallowed deliberately, the same way a
+  // DOM EventTarget isolates one listener's throw from its other listeners and from the
+  // dispatching code — there is no injected error sink in this ticket's own config surface, and
+  // adding one is a caller-facing API decision left to task 2, which owns the actual listeners.
+  function notify<T>(listeners: Set<(arg: T) => void>, arg: T): void {
+    for (const l of listeners) {
+      try {
+        l(arg);
+      } catch {
+        // isolated — see this function's own header
+      }
+    }
+  }
+
   function setState(next: CatamorbiusClientState): void {
     if (state === next) return;
     state = next;
-    for (const l of stateListeners) l(state);
+    notify(stateListeners, state);
   }
 
   function emitResync(reason: ResyncReason): void {
-    for (const l of resyncListeners) l(reason);
+    notify(resyncListeners, reason);
   }
 
   function clearWatchdog(): void {
@@ -214,18 +238,18 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     return serverRetryHintMs !== undefined ? Math.max(jittered, serverRetryHintMs) : jittered;
   }
 
-  function scheduleReconnect(): void {
-    if (stopped) return;
+  function scheduleReconnect(myGen: number): void {
+    if (myGen !== generation) return;
     const delay = nextBackoffDelay();
     setState("reconnecting");
     reconnectHandle = deps.setTimeout(() => {
       reconnectHandle = undefined;
-      void connectOnce();
+      void connectOnce(myGen);
     }, delay);
   }
 
-  async function connectOnce(): Promise<void> {
-    if (stopped) return;
+  async function connectOnce(myGen: number): Promise<void> {
+    if (myGen !== generation) return;
     setState(everLive ? "reconnecting" : "connecting");
     const controller = new AbortController();
     abortController = controller;
@@ -235,39 +259,53 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     const resumeFrom = lastSeq;
     if (resumeFrom !== null) headers["Last-Event-ID"] = String(resumeFrom);
 
+    // Armed for the connect phase itself, not just once live: a gateway that accepts the TCP
+    // connection but never sends response headers (or hangs before a body arrives) is just as
+    // "dead" per this ticket's own "no bytes for a window" rule as a silent already-live stream —
+    // nothing before this point exempted the connecting/reconnecting phase from that rule.
+    armWatchdog();
+
     let res: Awaited<ReturnType<FetchLike>>;
     try {
       res = await deps.fetch(buildEventsUrl(baseUrl, filters), { headers, signal: controller.signal });
     } catch {
-      if (stopped) return;
-      scheduleReconnect();
+      clearWatchdog();
+      if (myGen !== generation) return;
+      scheduleReconnect(myGen);
       return;
     }
-    if (stopped) return;
+    if (myGen !== generation) {
+      clearWatchdog();
+      return;
+    }
 
     if (res.status === 401) {
+      clearWatchdog();
       setState("unauthorized");
       return;
     }
     if (res.status === 503) {
+      clearWatchdog();
       setState("unavailable");
       return;
     }
     if (res.status === 400) {
+      clearWatchdog();
       lastSeq = null; // drop the cursor — next attempt is live-only
       emitResync("cursor-dropped");
-      scheduleReconnect();
+      scheduleReconnect(myGen);
       return;
     }
     if (!res.ok || !res.body) {
-      scheduleReconnect();
+      clearWatchdog();
+      scheduleReconnect(myGen);
       return;
     }
 
     everLive = true;
     setState("live");
     liveSince = deps.now();
-    armWatchdog();
+    armWatchdog(); // fresh window for the live phase, independent of whatever remained from connecting
 
     let resyncCheckedThisConnection = false;
     const parser = createSseParser({
@@ -287,7 +325,7 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
         } catch {
           return; // malformed data JSON: dropped, never delivered
         }
-        for (const l of eventListeners) l({ seq, event: parsedEvent });
+        notify(eventListeners, { seq, event: parsedEvent });
       },
       onRetry(ms) {
         serverRetryHintMs = ms;
@@ -304,7 +342,7 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (stopped) {
+        if (myGen !== generation) {
           try {
             await reader.cancel();
           } catch {
@@ -322,20 +360,23 @@ export function createCatamorbiusClient(opts: CatamorbiusClientOptions): Catamor
     } finally {
       clearWatchdog();
     }
-    if (stopped) return;
-    scheduleReconnect();
+    if (myGen !== generation) return;
+    scheduleReconnect(myGen);
   }
 
   return {
     start(): void {
       if (!stopped) return; // already running
       stopped = false;
+      generation += 1;
+      const myGen = generation;
       attempt = 0;
       everLive = false;
-      void connectOnce();
+      void connectOnce(myGen);
     },
     stop(): void {
       stopped = true;
+      generation += 1; // invalidates any in-flight connectOnce/scheduleReconnect chain, however far along
       clearWatchdog();
       clearReconnectTimer();
       abortController?.abort();
