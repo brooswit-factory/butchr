@@ -1,6 +1,6 @@
 [test]
 preload = ["./test/setup/isolated-workspaces.ts"]
-coverage = false
+coverage = true
 coverageSkipTestFiles = true
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"

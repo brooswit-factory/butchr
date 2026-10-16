@@ -31,12 +31,22 @@ import type { ProjectResourceDeps } from "../../src/resources/project.js";
  * link-cli-jira-project.test.ts, a completely different file, later in the
  * same process. The only way to actually undo a `mock.module` call is to
  * `mock.module` the same specifier again with a factory that returns the
- * REAL module — captured here via a real dynamic import before any test in
- * this file ever mocks "jira.js"/"confluence.js", so every mocked test
- * ends by handing the registry back its own real implementation.
+ * REAL module.
+ *
+ * That capture must be a SPREAD COPY, not the bare namespace object:
+ * `await import("jira.js")` returns a live module-namespace binding, and
+ * `mock.module` was confirmed (live, by instrumenting both sides of this
+ * exact restore) to mutate that SAME live binding in place rather than
+ * swap in an unrelated object — so holding onto the raw namespace still
+ * observes every later mock.module call too, and re-registering it as the
+ * "real" module just re-installs whatever the most recent fake was. A
+ * `{ ...(await import(...)) }` spread reads every export's CURRENT value
+ * once, upfront, into a brand new plain object immune to any later mutation
+ * of the original binding — confirmed fixed under the same harness that
+ * reproduced the leak.
  */
-const realJiraJs = await import("jira.js");
-const realConfluenceJs = await import("confluence.js");
+const realJiraJs = { ...(await import("jira.js")) };
+const realConfluenceJs = { ...(await import("confluence.js")) };
 afterEach(() => {
   mock.restore();
   mock.module("jira.js", () => realJiraJs);
