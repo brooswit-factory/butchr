@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createCrashLoopDetector, CrashLoopTracker, MARKER } from "../../src/agents/crash-loop.js";
+import { createOpsAlertRouter } from "../../src/agents/ops-alert.js";
 import { findMarked } from "../../src/agents/escalation-helper.js";
 import { parseDirective } from "../../src/agents/escalate.js";
 import { reconcileNow } from "../../src/daemon/loop.js";
@@ -547,5 +548,185 @@ describe("reconcileNow: checkCrashLoop is called before the spawn loop, with (pl
     }
     expect(spawned.length).toBe(10); // identical to running with no checkCrashLoop at all — see loop.test.ts's own F2/F3 falsifier measurement
     expect(chan.posted.length).toBe(1); // and still alarmed
+  });
+});
+
+/**
+ * FACTORY-622 — the ops-alert route on this detector, and the exact defect it
+ * closes. A managed session (director, genius, an admin agent) has NO Jira
+ * ticket, so `src/daemon/index.ts` wires its detector instance's `addComment`
+ * to a `console.error` and its `comments` to a constant `[]`. The complaint
+ * was therefore correct and completely invisible, twice: 2026-10-02 (director
+ * and genius, 5+ spawns/hour each, "nowhere to post") and 2026-10-03
+ * (admin-brooswit-nexus, 26 refusals, "a crash-loop complaint that reached
+ * only the journal").
+ *
+ * These tests use the REAL `createOpsAlertRouter`, not a stub of it: the
+ * properties that matter here — one post per session per hour, the refusal
+ * reason named in the post, and secrets redacted — all live in that module's
+ * composition and dedup, so a stubbed `raise` would assert nothing about what
+ * a human actually receives.
+ */
+describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash loop reaches chat, not only the journal", () => {
+  /** The ticketless wiring, reproduced exactly: nowhere to post, nothing to read back. */
+  function ticketlessChannel() {
+    const logged: string[] = [];
+    return { logged, addComment: async (_id: string, text: string) => { logged.push(text); }, comments: async () => [] as never[] };
+  }
+
+  function routerWithPostSpy(now: () => number, dedupWindowMs = 60 * MIN) {
+    const posts: { room: string; text: string }[] = [];
+    const router = createOpsAlertRouter({
+      post: async (room, text) => { posts.push({ room, text }); },
+      room: "team-admin", mention: "@here", host: "testhost", now, log: () => {}, dedupWindowMs,
+    });
+    return { posts, router };
+  }
+
+  test("THE DEFECT: a ticketless session crossing the threshold posts to chat, naming the session and the refusal reason", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router,
+      refusalReason: () => "Current worker disappeared; refusing implicit replacement",
+    });
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["admin-brooswit-nexus"], ["admin-brooswit-nexus"]); }
+    // `raise` dispatches fire-and-forget by contract, so the post lands on a
+    // later microtask — awaited rather than assumed.
+    await Promise.resolve(); await Promise.resolve();
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.room).toBe("team-admin");
+    expect(posts[0]!.text).toContain("admin-brooswit-nexus"); // the session
+    expect(posts[0]!.text).toContain("Current worker disappeared; refusing implicit replacement"); // the refusal reason
+    expect(posts[0]!.text).toContain("crashloop");
+    expect(posts[0]!.text).toContain("testhost"); // which daemon — the room collects more than one
+  });
+
+  test("the SAME ongoing loop posts once per hour, however many polls it spans", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router, refusalReason: () => "refused",
+    });
+    // 240 polls at 15s — a full hour of the issue tier's own cadence, with
+    // the loop never stopping.
+    for (let i = 0; i < 240; i++) { now = i * 15_000; await det.check(["genius"], ["genius"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toHaveLength(1);
+
+    // Past the window, still looping: it speaks again rather than latching
+    // silent forever. Note this is the ROOM's clock, not the comment latch —
+    // the comment was posted exactly once (below) across both hours.
+    now = 61 * MIN;
+    await det.check(["genius"], ["genius"]);
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toHaveLength(2);
+    expect(chan.logged).toHaveLength(1);
+  });
+
+  test("the alert does not depend on the comment path succeeding — which is the whole point, since for a ticketless session it cannot", async () => {
+    let now = 0;
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      // Both halves of the comment path fail outright, the worst case: a
+      // `comments` fetch that rejects makes `postComplaint` return null
+      // before it ever reaches `addComment`.
+      addComment: async () => { throw new Error("no ticket"); },
+      comments: async () => { throw new Error("no ticket"); },
+      opsAlert: () => router, refusalReason: () => "Current worker disappeared; refusing implicit replacement",
+    });
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["director"], ["director"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toHaveLength(1);
+  });
+
+  test("no router wired (the issue tier, which already posts on the resource's own ticket) changes nothing about this detector", async () => {
+    let now = 0;
+    const chan = fakeChannel();
+    const det = createCrashLoopDetector({ now: () => now, count: 5, windowMinutes: 60, addComment: chan.addComment, comments: chan.comments });
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["BUTCHR-1"], ["BUTCHR-1"]); }
+    expect(chan.posted).toHaveLength(1); // exactly as before this ticket
+  });
+
+  test("a router that throws synchronously never reaches the detector — the journal channel that was already working must not be lost to the new one", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => { throw new Error("router construction blew up"); },
+      refusalReason: () => "refused",
+    });
+    // `check` never rejects (its own contract), and the complaint still lands.
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["genius"], ["genius"]); }
+    expect(chan.logged).toHaveLength(1);
+  });
+
+  test("below the threshold nothing is posted to chat, however many polls — the alert inherits the threshold, it does not bypass it", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router, refusalReason: () => "refused",
+    });
+    for (let i = 0; i < 4; i++) { now = i * MIN; await det.check(["genius"], ["genius"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toEqual([]);
+  });
+
+  test("a fleet-wide 'nothing running' poll posts nothing to chat either — the inverted confident-zero guard runs before any raise", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router, refusalReason: () => "refused",
+    });
+    for (let i = 0; i < 20; i++) { now = i * MIN; await det.check(["genius", "director"], ["genius", "director"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toEqual([]); // a fleet-wide alarm in a shared room is the spam outcome this guard exists to prevent
+  });
+
+  test("no refusal reason to quote (the agent dies AFTER a successful launch) says so, rather than inventing one", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router, refusalReason: () => undefined,
+    });
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["genius"], ["genius"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.text).toContain("dying after a successful launch");
+  });
+
+  test("the ticket's 'keep the alert text free of secrets' requirement: a refusal reason carrying a token is redacted in the posted text", async () => {
+    let now = 0;
+    const chan = ticketlessChannel();
+    const { posts, router } = routerWithPostSpy(() => now);
+    const leaked = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij";
+    const det = createCrashLoopDetector({
+      now: () => now, count: 5, windowMinutes: 60,
+      addComment: chan.addComment, comments: chan.comments,
+      opsAlert: () => router,
+      refusalReason: () => `herdr error: launch failed with ${leaked}`,
+    });
+    for (let i = 0; i < 5; i++) { now = i * MIN; await det.check(["genius"], ["genius"]); }
+    await Promise.resolve(); await Promise.resolve();
+    expect(posts).toHaveLength(1);
+    expect(posts[0]!.text).not.toContain(leaked);
   });
 });

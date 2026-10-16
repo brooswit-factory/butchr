@@ -54,4 +54,29 @@ describe("docs/rules.example.json", () => {
     const { rules } = loadRules({ BUTCHR_RULES_FILE: EXAMPLE_PATH });
     for (const rule of rules) expect(rule.query).toContain("assignee = currentUser()");
   });
+
+  /**
+   * FACTORY-842 — the epic's per-role idle-poke defaults (FACTORY-836),
+   * shipped as explicit `idlePokeMinutes` on each role's own rule rather
+   * than left absent. Per FACTORY-844/846, an ABSENT `idlePokeMinutes`
+   * does NOT resolve to the epic's 30-minute figure — it falls back to
+   * the global `stalledMinutes` (default 10) unchanged — so the epic's
+   * declared defaults are only real where this shipped file explicitly
+   * carries them. `bugs`/`subtasks` are not named by the epic's role list;
+   * per the epic's own resolution of that gap, they carry the epic-wide
+   * default (30 min, same as `DEFAULT_IDLE_POKE_MINUTES`) explicitly
+   * rather than being left absent.
+   */
+  test("every rule carries an explicit idlePokeMinutes matching the epic's per-role defaults — none left absent", () => {
+    const { rules } = loadRules({ BUTCHR_RULES_FILE: EXAMPLE_PATH });
+    const byId = new Map(rules.map((r) => [r.id, r]));
+    expect(byId.get("epics")!.idlePokeMinutes).toBe(240);
+    expect(byId.get("stories")!.idlePokeMinutes).toBe(60);
+    expect(byId.get("tasks")!.idlePokeMinutes).toBe(10);
+    // Not named by the epic's role list — carries the epic-wide default explicitly (see doc comment above).
+    expect(byId.get("bugs")!.idlePokeMinutes).toBe(30);
+    expect(byId.get("subtasks")!.idlePokeMinutes).toBe(30);
+    // idlePokeEnabled always resolves (parseRules `?? true`); every shipped role rule stays on.
+    for (const rule of rules) expect(rule.idlePokeEnabled).toBe(true);
+  });
 });

@@ -149,7 +149,7 @@ export function onceOversized(log: ((line: string) => void) | undefined): Oversi
     const id = `${rule.id}:${path}`;
     if (logged.has(id)) return;
     logged.add(id);
-    log?.(`WARNING: [filesystem] rule ${rule.id} skips ${path}: its percent-encoded id would exceed the workspace directory-name limit (${MAX_ENCODED_SEGMENT_BYTES} bytes); narrow the rule's root or namePattern`);
+    log?.(`WARNING: [filesystem] rule ${rule.id} skips ${path}: its percent-encoded id would exceed the workspace directory-name limit (${MAX_ENCODED_SEGMENT_BYTES} characters); narrow the rule's root or namePattern`);
   };
 }
 

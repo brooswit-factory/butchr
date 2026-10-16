@@ -165,6 +165,21 @@ export interface Activation<T> {
  * race). Every OTHER definition-field change (`vendor`, `tier`, `modelPower`,
  * `permissionMode`, …) still delivers with no `reason` at all, exactly as
  * before this ticket — this member is additive, not a replacement.
+ *
+ * FACTORY-922 (implementing story FACTORY-921, resolved decision point):
+ * `assignee`/`description`/`issuelinks` are the three further fields
+ * `decide()` (src/resources/issue.ts) now names explicitly, per the
+ * director's resolved decision on FACTORY-921: a reassignment, a
+ * description/brief edit, or a link added/removed must still wake the
+ * worker, same as status/label/summary always have — only a PRIORITY-only
+ * or (non-daemon) LABEL-only change is deliberately excluded (and neither
+ * ever reaches `decide()` as a distinguishable fact: `JiraIssue` carries no
+ * `priority` field at all, and a non-`agent:*`/`pr:*` label is invisible to
+ * `daemonLabelTransition`, so both already fall through to "nothing this
+ * classifier tracks moved" with no code path needed to special-case them).
+ * `issuelinks` only fires when BOTH sides of the diff carried the field
+ * (`undefined` means "unknown", never "confirmed empty" — see `JiraIssue`'s
+ * own doc comment); an unknown side is silently not diffed, never guessed.
  */
 export type NotifyReason =
   | { pr: { from: string | null; to: string } }
@@ -173,10 +188,65 @@ export type NotifyReason =
   | { status: { from: string; to: string } }
   | { label: { prefix: "agent" | "pr"; from: string | null; to: string | null } }
   | { summary: true }
+  | { assignee: { from: string | null; to: string | null } }
+  | { description: true }
+  | { issuelinks: { added: readonly string[]; removed: readonly string[] } }
   | { comment: string | null }
   | { undetermined: "unchecked" | "check-failed" | "checked-unchanged" }
   | { linked: { events: readonly LinkedChangeEvent[] } }
-  | { definitionField: { brief?: string; workingDirectory?: string } };
+  | { definitionField: { brief?: string; workingDirectory?: string } }
+  | { blocked: { key: string } }
+  | { stalled: { key: string } }
+  | { confluencePageEdit: { from: number; to: number } }
+  | { confluencePageComment: { ids: readonly string[] } };
+
+/**
+ * FACTORY-949 (implementing story FACTORY-948): `blocked` names the
+ * SPECIFIC ticket (`key`) whose `agent:*` label just transitioned to
+ * `agent:blocked` — produced by TWO different callers, for two different
+ * audiences, which is why `key` is always named explicitly rather than
+ * relying on the `about` argument `deps.notify` already carries:
+ * - `src/resources/issue.ts`'s `decide()`, on the RELATED space only (never
+ *   primary/self — see that function's own comment for why), where `key`
+ *   happens to equal the `about` argument already (the blocked ticket IS
+ *   the related resource); redundant there, but naming it explicitly keeps
+ *   this one shape correct for the second producer below without the
+ *   reader having to know which caller produced a given verdict.
+ * - `src/resources/project.ts`'s `createProjectEventRules`, on the PRIMARY
+ *   space (the project's own key, i.e. `about === key` there is the
+ *   PROJECT, never the blocked ticket) — `key` is the only way this
+ *   delivery can name WHICH of the project's tickets just went
+ *   `agent:blocked`.
+ */
+
+/**
+ * FACTORY-972 (story FACTORY-971, extending `blocked` above): `stalled`
+ * names the SPECIFIC ticket (`key`) whose `agent:*` label just transitioned
+ * to `agent:stalled` — same two producers, same two audiences, same reason
+ * `key` is always named explicitly (never relied on the `about` argument)
+ * as `blocked` above: `src/resources/issue.ts`'s `decide()` on the related
+ * space (the boss), and `src/resources/project.ts`'s
+ * `createProjectEventRules` on the primary space (the project manager).
+ */
+
+/**
+ * FACTORY-997 (story FACTORY-994, epic FACTORY-348): the ONLY two members
+ * `src/resources/confluence-page.ts`'s `createConfluencePageEventRules`
+ * ever produces — a standalone Confluence page (no owning Jira ticket) has
+ * nothing status/label/assignee-shaped to report, so it defines its own
+ * pair rather than reusing any issue-tier member above (per this union's
+ * own top doc comment: "a future type's event rules are free to ... define
+ * their own union"). `confluencePageEdit` fires when
+ * `confluencePageVersion`'s fingerprint (the page's own `version.number`)
+ * moved between two polls; `confluencePageComment` fires when the page's
+ * footer-comment id SET gained one or more members (never fewer — a
+ * shrinking set is a deletion, which this module does not classify as an
+ * event; see that module's own `diffConfluencePage` doc comment). The two
+ * are mutually exclusive within one `decide()` call — `diffConfluencePage`
+ * checks the version first and only falls through to comments when the
+ * version did not move, documented there as a deliberate simplification
+ * when both happen in the same poll.
+ */
 
 /**
  * BUTCHR-436 (epic BUTCHR-421, story 2/4): one line of a coalesced

@@ -17,7 +17,7 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { expandHome } from "./filesystem-query.js";
+import { expandHome, pathModuleFor } from "./filesystem-query.js";
 import { ACCOUNT_POLICIES, AGENT_ROLES, EXECUTION_MODES, parseMcpServers, type AccountPolicy, type AgentRole, type ExecutionMode, type McpServerBinding } from "../rules/rules.js";
 import { formatResourceRef, parseResourceRef } from "./resource-ref.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, type AgentEffort } from "./power-scale.js";
@@ -29,15 +29,60 @@ export type SessionDefinitionVendor = (typeof SESSION_DEFINITION_VENDORS)[number
 /**
  * Permission modes a managed session may launch under. `"auto"` is the
  * ticket's own named case — "permission mode, including `auto` with a
- * strict MCP config" (BUTCHR-393/BUTCHR-408) — carried through verbatim to
- * `SpawnSpec.permissionMode` -> Drovr's `ClaudeAgentLaunch.permissionMode`
- * (untyped string there; validated here so a typo fails at load time, not
- * at launch). Codex has no `permissionMode` concept in
- * `CodexAgentLaunch` (its own `trustWorkspace`/`bypassApprovalsAndSandbox`
- * fields instead) — see docs/managed-sessions.md's "Per-vendor launch
- * differences" for what that means for a `vendor: "codex"` definition.
+ * strict MCP config" (BUTCHR-393/BUTCHR-408) — carried through to
+ * `SpawnSpec.permissionMode` (validated here so a typo fails at load time,
+ * not at launch), and from there to EITHER vendor's launch, per
+ * `agentLaunchConfig` (src/agents/argv.ts): verbatim to Drovr's
+ * `ClaudeAgentLaunch.permissionMode` for Claude, or (FACTORY-577) mapped
+ * onto `CodexAgentLaunch.bypassApprovalsAndSandbox` for Codex — Codex still
+ * has no `permissionMode` field of its own (its own
+ * `trustWorkspace`/`bypassApprovalsAndSandbox` fields instead), so
+ * `"bypassPermissions"` maps to `bypassApprovalsAndSandbox: true` and every
+ * other value here maps to `false` — see docs/managed-sessions.md's
+ * "Per-vendor launch differences" for the full mapping and what it means
+ * for a `vendor: "codex"` definition.
+ *
+ * FACTORY-275 (permission-mode vocabulary alignment, operator's "option 3"
+ * on FACTORY-131): `"manual"` was ADDED here, `"default"` was NOT removed.
+ * Reproduced live at `claude` 2.1.251/2.1.283: `claude --help`'s own
+ * `--permission-mode` choice list is `acceptEdits, auto, bypassPermissions,
+ * manual, dontAsk, plan` — it shows `manual`, not `default`. That looked
+ * like butchr sending a value the launcher rejects (this ticket's AC2), but
+ * a real invocation settles it the other way: `claude --permission-mode
+ * default -p "hi" </dev/null` reaches the SAME argument-choice validation
+ * that rejects a genuinely bogus value immediately (with the six-value
+ * list above in its error) and is NOT rejected — it proceeds exactly like
+ * a known-good value. Strings in the installed binary explain why:
+ * `"'manual' is accepted as an alias for 'default'"` — `default` IS the
+ * launcher's real canonical value; `manual` is merely the friendlier name
+ * its own `--help` advertises for the identical thing. So both are kept:
+ * `default` because every existing definition/rule that already says it
+ * must keep loading and launching byte-for-byte identically (back-compat,
+ * not optional), `manual` so a NEW definition/rule can spell it the way
+ * the launcher's own public vocabulary does. Both are forwarded verbatim,
+ * with no normalization between them — either string alone is already
+ * accepted by the launcher, so a translation layer would only add a place
+ * to get it wrong.
+ *
+ * `"auto"` keeps its ONE existing meaning here (whatever Claude's own
+ * `--permission-mode auto` does — the installed binary's own option help
+ * describes it as "Use a model classifier to approve/deny permission
+ * prompts", a real per-prompt judgment, NOT a synonym for `bypassPermissions`
+ * skipping every check unconditionally) — this union does not alias it to
+ * anything else. `agentLaunchConfig`'s own unconditional `permissionMode:
+ * "auto"` override for `jira-project` agents (src/agents/argv.ts) is
+ * already gone as of FACTORY-129 — jira-project agents now inherit
+ * `DEFAULT_PERMISSION_MODE` (`acceptEdits`) like every other agent, unless
+ * an explicit `spec.permissionMode` overrides it — this ticket does not
+ * touch that removal at all; it was FACTORY-129's own ticket.
+ * `"bypassPermissions"` is the mode with no
+ * human-facing rename here either — its wire value is unchanged for
+ * back-compat — but see docs/managed-sessions.md for the friendlier
+ * operator-facing name ("unattended mode") this ticket gives it in prose,
+ * since butchr's web config page has no permission-mode UI to relabel
+ * (verified still true at this commit — read-only text, no form control).
  */
-export const SESSION_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
+export const SESSION_PERMISSION_MODES = ["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
 export type SessionPermissionMode = (typeof SESSION_PERMISSION_MODES)[number];
 
 /**
@@ -247,9 +292,16 @@ export interface SessionDefinition {
    * `definition.lizardMode` is truthy, and `agentLaunchConfig`'s Codex branch
    * (src/agents/argv.ts) reads it to decide whether to omit
    * `--dangerously-bypass-approvals-and-sandbox` — Codex's own "manual
-   * approval mode" pairing, replacing the `permissionMode: "default"`
-   * pairing Claude uses (Codex has no `permissionMode` concept). This DOES
-   * need FACTORY-43's persist-at-spawn/read-back stale-argv pair, same shape
+   * approval mode" signal, the same shape `permissionMode: "default"`
+   * pairs with for Claude. **FACTORY-577: this is no longer the only signal
+   * a Codex launch reads** — a `codex` definition's own (required)
+   * `permissionMode` field now ALSO reaches the launch (mapped onto
+   * `bypassApprovalsAndSandbox` the same way it is for Claude's
+   * `--permission-mode`; see `SESSION_PERMISSION_MODES`'s own doc comment
+   * above), and an explicit `permissionMode` wins over this field, in both
+   * directions, exactly like it already won over the pre-existing
+   * `jira-project` rule default. This DOES still need FACTORY-43's
+   * persist-at-spawn/read-back stale-argv pair, same shape
    * as `permissionMode`/`strictMcpConfig` (`.butchr-lizard-mode.json`,
    * `workspaceLizardMode`, src/agents/workspace.ts) — see
    * `docs/permission-answer-loop.md`'s "Codex lizard mode" section for the
@@ -329,11 +381,64 @@ export interface SessionDefinition {
    * docs/managed-sessions.md).
    */
   linkedEventingProjects?: string[];
+  /**
+   * FACTORY-926 (epic FACTORY-836) — REUSED VERBATIM from `Rule.idlePokeMinutes`
+   * (src/rules/rules.ts): same optional number, same "positive number"
+   * validation, same NO-resolved-default-when-absent semantics. A
+   * SessionDefinition agent (director/advisors/admins/dialog-monitor/
+   * genius/buddy) is deliberately NOT a `Rule` resource (see
+   * `Rule.idlePokeMinutes`'s own doc comment for why a resolved default
+   * here would be a behaviour change dressed as config) — it has no
+   * Jira-issue-keyed global
+   * `stalledMinutes` fallback to inherit at all, because no path from the
+   * idle-poke engine (`src/agents/idle-poke.ts`, wired only into the
+   * ISSUE-tier loop via `syncLabels`, src/labels/sync.ts) ever reaches a
+   * managed-session agent today — verified at FACTORY-942's own ticket
+   * comment with code evidence, and see `docs/idle-poke-role-defaults.md`'s
+   * "director, advisors, admins, utility sessions (epic group 3)" section
+   * for the same finding independently reached by FACTORY-842. This field
+   * is therefore CONFIG-ONLY / INERT exactly like the `jira-project`
+   * (group 2) case that same doc describes: present so an operator's
+   * manifest can CARRY the value and so a future engine change has a field
+   * to read with the right name already chosen, but nothing in this
+   * daemon reads it yet. See `docs/idle-poke-session-definitions.md` for
+   * the shipped per-role values and what applying them to a live fleet
+   * requires.
+   */
+  idlePokeMinutes?: number;
+  /**
+   * REUSED VERBATIM from `Rule.idlePokeMessage` — same optional non-empty
+   * string, same rejection of an empty string (use `idlePokeEnabled: false`
+   * instead), same no-resolved-default-when-absent semantics. Same
+   * CONFIG-ONLY / INERT status as `idlePokeMinutes` above — see that
+   * field's own doc comment.
+   */
+  idlePokeMessage?: string;
+  /**
+   * REUSED VERBATIM from `Rule.idlePokeEnabled` — same optional boolean,
+   * ALWAYS resolved by `parseSessionDefinition` (default `true`, mirroring
+   * `parseRules`'s own always-resolved convention for this field — see
+   * `Rule.idlePokeEnabled`'s own doc comment for why: "on" is already
+   * today's behaviour for the engine's only reachable resource type, a
+   * `Rule`, so resolving absent to `true` here changes nothing for an
+   * install that sets nothing). THE UN-POKEABLE GUARANTEE for group 3 is
+   * expressed through THIS field, set to an explicit `false` on every
+   * shipped utility-session definition (dialog-monitor/genius/buddy and
+   * equivalents) — never through a code special case, and never by
+   * relying on today's structural unreachability persisting by accident.
+   * Still CONFIG-ONLY today for the same reason as `idlePokeMinutes` above:
+   * no engine path reads this field yet, so setting it `true` grants no
+   * new reachability either — see
+   * `test/unit/session-definition-idle-poke.test.ts`'s "un-pokeable"
+   * describe block, which asserts this directly against the daemon's own
+   * wiring rather than trusting the field's mere presence.
+   */
+  idlePokeEnabled?: boolean;
 }
 
 const DEFINITION_FIELDS = new Set([
   "workingDirectory", "brief", "vendor", "tier", "modelPower", "effort", "permissionMode", "strictMcpConfig", "lizardMode", "execution", "account", "role", "frozen",
-  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects",
+  "mcpServers", "freezeControllers", "unfreezeControllers", "linkedEventingProjects", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled",
 ]);
 
 const MAX_CONTROLLERS_PER_FIELD = 100;
@@ -413,22 +518,32 @@ const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "obj
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 const oneOf = <T extends string>(options: readonly T[], v: unknown): v is T => typeof v === "string" && (options as readonly string[]).includes(v);
 
-function workingDirectoryProblems(raw: unknown, home: string): string[] {
+/**
+ * Deliberately does NOT reuse `absolutePathProblems`'s "." / ".." segment
+ * check — unlike `filesystemQueryProblems.root`, `workingDirectory` never
+ * has, and this ticket (FACTORY-558) leaves that unchanged: only the
+ * platform-aware absolute-ness and trailing-separator checks are shared.
+ */
+function workingDirectoryProblems(raw: unknown, home: string, platform: NodeJS.Platform): string[] {
   if (typeof raw !== "string" || !raw.trim()) return ["workingDirectory must be a non-empty string"];
-  const expanded = expandHome(raw.trim(), home);
+  const expanded = expandHome(raw.trim(), home, platform);
   if (expanded === null) return [`workingDirectory "${raw}": ~user is not supported; use an absolute path`];
   if (expanded.includes("\0")) return [`workingDirectory "${raw}" contains a NUL byte`];
-  if (expanded[0] !== "/") return [`workingDirectory "${raw}" must be absolute (or start with ~)`];
-  if (expanded !== "/" && expanded.endsWith("/")) return [`workingDirectory "${raw}" must not have a trailing slash`];
+  const p = pathModuleFor(platform);
+  if (!p.isAbsolute(expanded)) return [`workingDirectory "${raw}" must be absolute (or start with ~)`];
+  const root = p.parse(expanded).root;
+  if (expanded === root) return [];
+  const trailingSepRe = platform === "win32" ? /[\\/]$/ : /\/$/;
+  if (trailingSepRe.test(expanded)) return [`workingDirectory "${raw}" must not have a trailing slash`];
   return [];
 }
 
 /** Why a session-definition document is unusable, or `[]`. Same "collect every problem, never touch disk" discipline as `filesystemQueryProblems`. */
-export function sessionDefinitionProblems(doc: unknown, at: string, home: string = homedir()): string[] {
+export function sessionDefinitionProblems(doc: unknown, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): string[] {
   if (!isObject(doc)) return [`${at} must be a JSON object`];
   const problems: string[] = [];
   for (const k of Object.keys(doc)) if (!DEFINITION_FIELDS.has(k)) problems.push(`${at} has unknown field "${k}"`);
-  problems.push(...workingDirectoryProblems(doc.workingDirectory, home).map((p) => `${at}.${p}`));
+  problems.push(...workingDirectoryProblems(doc.workingDirectory, home, platform).map((p) => `${at}.${p}`));
   if (!nonEmpty(doc.brief)) problems.push(`${at}.brief must be a non-empty string`);
   if (!oneOf(SESSION_DEFINITION_VENDORS, doc.vendor)) problems.push(`${at}.vendor must be one of ${SESSION_DEFINITION_VENDORS.join(", ")}`);
   // FACTORY-75: `tier` (deprecated) and `modelPower`+`effort` (the new
@@ -468,16 +583,22 @@ export function sessionDefinitionProblems(doc: unknown, at: string, home: string
   if (doc.freezeControllers !== undefined) problems.push(...controllerListProblems(doc.freezeControllers, `${at}.freezeControllers`));
   if (doc.unfreezeControllers !== undefined) problems.push(...controllerListProblems(doc.unfreezeControllers, `${at}.unfreezeControllers`));
   if (doc.linkedEventingProjects !== undefined) problems.push(...linkedEventingProjectsProblems(doc.linkedEventingProjects, `${at}.linkedEventingProjects`));
+  // FACTORY-926: same field names, same validation idiom as `Rule`'s own
+  // `idlePokeMinutes`/`idlePokeMessage`/`idlePokeEnabled` (src/rules/rules.ts)
+  // — see this interface's own doc comments on these three fields for why.
+  if (doc.idlePokeMinutes !== undefined && (!Number.isFinite(doc.idlePokeMinutes) || (doc.idlePokeMinutes as number) <= 0)) problems.push(`${at}.idlePokeMinutes must be a positive number`);
+  if (doc.idlePokeMessage !== undefined && !nonEmpty(doc.idlePokeMessage)) problems.push(`${at}.idlePokeMessage must be a non-empty string`);
+  if (doc.idlePokeEnabled !== undefined && typeof doc.idlePokeEnabled !== "boolean") problems.push(`${at}.idlePokeEnabled must be a boolean`);
   return problems;
 }
 
 /** Throws with every collected problem (see `sessionDefinitionProblems`) when the document is invalid. Callers pass the raw parsed JSON — `parseSessionDefinitionFile` below is the read+JSON.parse+validate convenience most callers actually want. */
-export function parseSessionDefinition(doc: unknown, at: string, home: string = homedir()): SessionDefinition {
-  const problems = sessionDefinitionProblems(doc, at, home);
+export function parseSessionDefinition(doc: unknown, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): SessionDefinition {
+  const problems = sessionDefinitionProblems(doc, at, home, platform);
   if (problems.length) throw new Error(problems.join("\n"));
   const d = doc as Record<string, unknown>;
   return {
-    workingDirectory: expandHome((d.workingDirectory as string).trim(), home)!,
+    workingDirectory: expandHome((d.workingDirectory as string).trim(), home, platform)!,
     brief: (d.brief as string).trim(),
     vendor: d.vendor as SessionDefinitionVendor,
     ...(d.tier !== undefined ? { tier: d.tier as SessionTier } : {}),
@@ -496,15 +617,18 @@ export function parseSessionDefinition(doc: unknown, at: string, home: string = 
     ...(d.linkedEventingProjects !== undefined
       ? { linkedEventingProjects: (d.linkedEventingProjects as string[]).map((s) => formatResourceRef(parseResourceRef(s.trim()))) }
       : {}),
+    ...(d.idlePokeMinutes !== undefined ? { idlePokeMinutes: d.idlePokeMinutes as number } : {}),
+    ...(typeof d.idlePokeMessage === "string" ? { idlePokeMessage: d.idlePokeMessage.trim() } : {}),
+    idlePokeEnabled: (d.idlePokeEnabled as boolean | undefined) ?? true,
   };
 }
 
 /** Parses a definition file's raw text: JSON syntax errors are reported the same way `loadRules` reports a bad rules.json — one clear message, never a stack trace. */
-export function parseSessionDefinitionFile(text: string, at: string, home: string = homedir()): SessionDefinition {
+export function parseSessionDefinitionFile(text: string, at: string, home: string = homedir(), platform: NodeJS.Platform = process.platform): SessionDefinition {
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${at}: invalid JSON: ${(e as Error).message}`); }
-  return parseSessionDefinition(doc, at, home);
+  return parseSessionDefinition(doc, at, home, platform);
 }
 
 export interface SessionDefinitionsEnv { [name: string]: string | undefined; BUTCHR_SESSION_DEFINITIONS_DIR?: string | undefined; XDG_CONFIG_HOME?: string | undefined; HOME?: string | undefined }
@@ -546,4 +670,35 @@ export function sessionDefinitionsPath(env: SessionDefinitionsEnv = process.env)
  */
 export function isHiddenDefinitionFile(basename: string): boolean {
   return basename.startsWith(".");
+}
+
+/**
+ * FACTORY-755 — positive allowlist: a candidate is a definition file only
+ * when its basename ends in exactly `.json`. Before this, eligibility was
+ * decided purely by CONTENT (`parseSessionDefinitionFile` either parses or
+ * it doesn't), so a byte-identical `*.json.bak-*` copy of a real manifest
+ * parsed as valid and got its OWN agent key (derived from its own path),
+ * staffing a duplicate agent unrelated to the real definition's identity or
+ * freeze state — seen live as `admin-agentsafety.json.bak-1008` spawning a
+ * duplicate pane. A denylist of known backup suffixes (`.bak`, `~`, `.orig`,
+ * ...) would only ever cover suffixes someone thought to list; the allowlist
+ * instead makes `.json` the one shape that is ever a candidate at all.
+ *
+ * Case-sensitive, deliberately: `.JSON` does NOT match. The alternative
+ * (case-insensitive matching, e.g. to mirror a case-insensitive filesystem)
+ * would make eligibility depend on which OS/filesystem the daemon happens to
+ * run on for the exact same file content — this keeps it deterministic
+ * everywhere, at the cost of never staffing a real `.JSON`-suffixed
+ * manifest (which — being equally skipped and logged, never silently
+ * dropped, via `onceSkippedNonDefinitionFile` — is at worst a visible
+ * surprise, not a silent one).
+ *
+ * Checked SEPARATELY from, and always AFTER, `isHiddenDefinitionFile` at
+ * every call site — never folded into it, never replacing it. A dot-prefixed
+ * basename (even one literally named `.json`) is caught by the hidden-file
+ * gate FIRST and takes that silent, never-logged path; this function is only
+ * ever reached for a basename that already cleared the hidden-file check.
+ */
+export function isDefinitionJsonFile(basename: string): boolean {
+  return basename.endsWith(".json");
 }

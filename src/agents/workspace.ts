@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync, readFileSync, chmodSync, existsSync, readdirS
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import type { AgentConfig, AgentProvider } from "./argv.js";
+import { installFileExecutionVeto, usablePython3, VETO_MODE_BASENAME, VETO_FAIL_OPEN_STATE_BASENAME, type PythonCheck } from "./claude-hooks.js";
 // Bun embeds these at build time, so the built binary carries its briefs.
 import CLAUDE_MD from "../../briefs/CLAUDE.md" with { type: "text" };
 import AGENTS_MD from "../../briefs/AGENTS.md" with { type: "text" };
@@ -11,6 +12,7 @@ import TASK from "../../briefs/task.md" with { type: "text" };
 import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
+import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
@@ -125,9 +127,9 @@ export interface SpawnSpec {
    * ordinary `"follow your CLAUDE.md"`/`"follow your AGENTS.md"` string.
    */
   cwd?: string;
-  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). Claude only: `CodexAgentLaunch` has no such field (see `agentLaunchConfig`, src/agents/argv.ts). Absent means `agentLaunchConfig` applies ITS OWN default (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, or `"auto"` for a `jira-project` agent) rather than sending nothing — see that function's own doc comment; FACTORY-138 changed this from "no flag sent, Drovr's own bypassPermissions fallback applies" to an explicit butchr-owned default. */
+  /** BUTCHR-408: `ClaudeAgentLaunch.permissionMode` passthrough (Drovr; untyped string there, validated at OUR layer before it ever reaches launch — see src/resources/session-definition.ts's `SESSION_PERMISSION_MODES`). For Claude, absent means `agentLaunchConfig` applies ITS OWN default (`DEFAULT_PERMISSION_MODE`, `acceptEdits`) rather than sending nothing — see that function's own doc comment; FACTORY-138 changed this from "no flag sent, Drovr's own bypassPermissions fallback applies" to an explicit butchr-owned default. FACTORY-577: for Codex, `CodexAgentLaunch` still has no `permissionMode` field of its own, but `agentLaunchConfig`'s Codex branch now reads this field too, mapping it onto `bypassApprovalsAndSandbox` (`"bypassPermissions"` => `true`, any other explicit value => `false`) — no longer Claude only. Absent means unchanged pre-FACTORY-577 behaviour: the `jira-project`/`lizardMode` default (see that function's own doc comment). */
   permissionMode?: string;
-  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only, same as `permissionMode` above — a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts), a deliberate departure from `permissionMode`'s own silent-ignore precedent (see that field's own doc comment there for why). Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
+  /** BUTCHR-453/BUTCHR-463: `ClaudeAgentLaunch.strictMcpConfig` passthrough (`@brooswit/drovr` — emits `--strict-mcp-config` alongside `--mcp-config`, so Claude Code loads ONLY this agent's own `mcp.json`). Claude only — Codex has no strict-MCP-config concept, so a `vendor: "codex"` definition is REJECTED at manifest load rather than silently ignored (src/resources/session-definition.ts). FACTORY-577: `permissionMode` is no longer this field's silent-ignore precedent — it is now forwarded to a Codex launch too (see that field's own doc comment above) — so this field's REJECT-at-load behaviour stands on its own: a silently-ignored `strictMcpConfig` would leave an operator believing they have an MCP-isolation property they don't, which is worse than a silently-ignored knob and is why this one rejects instead of ignoring. Absent means today's behaviour exactly — no flag, ordinary MCP discovery. */
   strictMcpConfig?: boolean;
   /**
    * FACTORY-108: Codex's own "lizard mode" launch signal — the Codex twin of
@@ -135,9 +137,11 @@ export interface SpawnSpec {
    * (which stay daemon-side-only for CLAUDE, per those fields' own doc
    * comments). `agentLaunchConfig`'s Codex branch (src/agents/argv.ts) reads
    * this to omit `--dangerously-bypass-approvals-and-sandbox` (Codex's manual
-   * approval mode) when true — Codex has no `permissionMode` concept, so
-   * there is nothing else on `SpawnSpec` a Codex launch could pair its own
-   * lizard mode with. Ignored entirely by the Claude and Agy branches of
+   * approval mode) when true, but ONLY when `spec.permissionMode` is absent
+   * — FACTORY-577: an explicit `spec.permissionMode` now wins over this
+   * field entirely, in both directions (see `permissionMode`'s own doc
+   * comment above), the same way it already won over the pre-existing
+   * `jira-project` default. Ignored entirely by the Claude and Agy branches of
    * `agentLaunchConfig` — present or absent, neither launch's argv changes,
    * so a `specForSessionDefinition`/rule-engine caller may set this
    * unconditionally without knowing which vendor a launch will ultimately
@@ -173,13 +177,69 @@ export interface SpawnSpec {
    * behaviour exactly.
    */
   mcpServers?: readonly McpServerBinding[];
+  /**
+   * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — `Rule.resumeOnRespawn`
+   * passthrough (FACTORY-851, src/rules/rules.ts), read at the spawn
+   * decision in `HerdrHerd.startProviders` (src/agents/herd.ts) to decide
+   * whether an UNINTENDED-stop respawn may `--resume` this workspace's
+   * prior Claude session instead of starting fresh. Absent means ON, same
+   * no-tri-state contract as the rule field itself — only an explicit
+   * `false` here suppresses resume. Claude-only in effect (the Claude
+   * branch of `startProviders` is the only reader), same as
+   * `resumeSessionId` (src/agents/argv.ts) it ultimately feeds.
+   */
+  resumeOnRespawn?: boolean;
+  /**
+   * FACTORY-916 — `Rule.resumeContextCutoff` passthrough (FACTORY-851).
+   * Absent means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (src/rules/rules.ts).
+   */
+  resumeContextCutoff?: number;
+  /**
+   * FACTORY-916 — this ticket's own current Jira `status`/`labels`
+   * (`issue.status`/`issue.labels`, src/atlassian/types.ts), carried onto
+   * the spec SOLELY so `classifyStop` (src/agents/stop-cause.ts) can be
+   * called at the spawn decision without a second Jira fetch of its own —
+   * the same already-polled snapshot `specForMatch` (src/rules/resource-type.ts)
+   * builds the rest of this spec from. Absent (every non-Jira-rule-engine
+   * caller) means `classifyStop` sees `ticketStatus: ""`/`ticketLabels: []`,
+   * which cannot match `"Done"` or `EXEMPT_LABEL` — i.e. "status/labels
+   * unknown" never reads as "intentional", the same safe-direction default
+   * `classifyStop`'s own doc comment argues for an undeterminable cause.
+   */
+  ticketStatus?: string;
+  ticketLabels?: readonly string[];
 }
 
 
 /** The resource an agent works: `spec.resource` for a rule-engine agent, else the key itself. */
 export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec.key;
 
-const BRIEF_BY_TYPE: Readonly<Record<string, string>> = { epic: EPIC, story: STORY, task: TASK, bug: BUG, project: PROJECT };
+/**
+ * FACTORY-735/FACTORY-739: the marker every `briefs/*.md` template carries
+ * (once, verbatim) to pull in the shared "before you stop" section —
+ * `briefs/_before-you-stop.md` itself is NOT a template and carries no
+ * marker of its own; `test/unit/before-you-stop-coverage.test.ts`'s coverage
+ * check fails loud if any OTHER template under `briefs/` lacks it, so a new
+ * brief type cannot ship without the include. Deliberately NOT `{{UPPER_CASE}}`-
+ * shaped: that family is `WORKSPACE_PLACEHOLDERS`'s own closed-union,
+ * per-spec substitution syntax (`interpolate()`, below) — this is a
+ * separate, minimal, build-time text include with no `SpawnSpec` to read,
+ * so reusing that syntax would make `src/workspace/workspace-scan.ts`'s
+ * scanner demand a (meaningless) `WORKSPACE_PLACEHOLDERS`/registry entry for
+ * a name that is never actually interpolated per-spec.
+ */
+export const BEFORE_YOU_STOP_INCLUDE_MARKER = "<!-- include: briefs/_before-you-stop.md -->";
+
+/** Resolves `BEFORE_YOU_STOP_INCLUDE_MARKER` in a shipped brief template to the shared section's real text. */
+const resolveIncludes = (template: string): string => template.replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim());
+
+const BRIEF_BY_TYPE: Readonly<Record<string, string>> = {
+  epic: resolveIncludes(EPIC),
+  story: resolveIncludes(STORY),
+  task: resolveIncludes(TASK),
+  bug: resolveIncludes(BUG),
+  project: resolveIncludes(PROJECT),
+};
 
 /**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
@@ -210,7 +270,7 @@ export type WorkspacePlaceholder = (typeof WORKSPACE_PLACEHOLDERS)[number];
  * spawn-config work before assuming the caller shape reaching this function
  * hasn't moved — this file only adds the `project` entry additively.
  */
-export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.toLowerCase()] ?? DEFAULT;
+export const briefFor = (issuetype: string): string => BRIEF_BY_TYPE[issuetype.toLowerCase()] ?? resolveIncludes(DEFAULT);
 
 /**
  * The issue-type keys `briefFor` maps explicitly (lowercase). Every other
@@ -255,13 +315,25 @@ export const interpolate = (template: string, spec: SpawnSpec, groundTruth?: str
   return WORKSPACE_PLACEHOLDERS.reduce((acc, name) => acc.replaceAll(`{{${name}}}`, values[name]), template);
 };
 
-/** Model per issue type: epics think hardest, tasks run fast. A project resource (BUTCHR-71) gets the SAME tier an epic gets, not the task default — it makes epic-level product judgment, not fast mechanical work. */
+/**
+ * Model per issue type: epics/stories think hardest, tasks run fast.
+ *
+ * FACTORY-526: `project` (BUTCHR-71) used to get the SAME tier an epic
+ * gets — "epic-level product judgment, not fast mechanical work" — but that
+ * made an operator-authored `jira-project` rule with no explicit
+ * `agentPreferences` model spawn Opus by default, with no rule-file signal
+ * that it would. A brand-new `jira-project` rule is exactly the case with no
+ * per-rule judgment behind the tier yet, so it now falls to the same
+ * `sonnet` every other unrecognised issue type gets; a rule that genuinely
+ * wants epic-tier judgment sets `agentPreferences[].model: "opus"` itself
+ * (see docs/agent-providers.md, docs/rules.example.json).
+ */
 export const modelFor = (issuetype: string): string =>
-  ({ epic: "opus", story: "opus", task: "sonnet", project: "opus" } as Record<string, string>)[issuetype.toLowerCase()] ?? "sonnet";
+  ({ epic: "opus", story: "opus", task: "sonnet" } as Record<string, string>)[issuetype.toLowerCase()] ?? "sonnet";
 
-/** Effort per issue type: all types run high for now, project (BUTCHR-71) included. */
+/** Effort per issue type. FACTORY-526: `project` moved off the `high` default for the same reason `modelFor` moved it off `opus` — see that function's own doc comment. */
 export const effortFor = (issuetype: string): string =>
-  ({ epic: "high", story: "high", task: "high", project: "high" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
+  ({ epic: "high", story: "high", task: "high", project: "low" } as Record<string, string>)[issuetype.toLowerCase()] ?? "high";
 
 export const workspaceRoot = (): string => process.env.BUTCHR_WORKSPACES ?? join(homedir(), "butchr-workspaces");
 
@@ -332,10 +404,25 @@ const legacyLeaf = (resourceId: string): string => encodeURIComponent(resourceId
  * pre-Addendum herdr-LABEL sanitization this ticket's own leaf naming does
  * NOT reuse — none of those are rewritten; the leaf is either the provider's
  * real short id, verbatim, or (on failure here) `legacyLeaf` above.
+ *
+ * FACTORY-570: `:` and `\` are additionally rejected on `platform: "win32"`
+ * — both are valid single-path-segment bytes on POSIX (kept permissive
+ * there, unchanged), but `\` is Windows's own separator and `:` is reserved
+ * for a drive letter, so a short id built from a Windows path that leaks
+ * either (e.g. `managedSessionShortDisplayId` misreading a backslash-joined
+ * path as if it had no separator at all) must fall back to `legacyLeaf`'s
+ * flat, fully percent-encoded slug rather than being joined verbatim — that
+ * literal join is exactly what produced this ticket's own `ENOENT: mkdir
+ * 'C:\...\filesystem\managed-sessions\C:\Users\...'` failure: Windows read
+ * the embedded drive letter and separators as real path structure. `platform`
+ * defaults to `process.platform`, injectable so this and every caller below
+ * can be exercised for both platforms from any host, same discipline as
+ * FACTORY-558's `isFilesystemResourceId`.
  */
-export function isValidLeaf(leaf: string): boolean {
+export function isValidLeaf(leaf: string, platform: NodeJS.Platform = process.platform): boolean {
   if (leaf.length === 0 || leaf === "." || leaf === "..") return false;
   if (leaf.includes("/") || leaf.includes("\0")) return false;
+  if (platform === "win32" && (leaf.includes(":") || leaf.includes("\\"))) return false;
   return Buffer.byteLength(leaf, "utf8") <= MAX_ENCODED_SEGMENT_BYTES;
 }
 
@@ -350,10 +437,10 @@ export function isValidLeaf(leaf: string): boolean {
  * nothing to disambiguate and nothing to stamp — the pre-existing
  * segment-decode path in `agentIdOfWorkspacePath` already recognises it.
  */
-function candidateLeaf(decoded: AgentKeyParts): { leaf: string; changed: boolean } {
+function candidateLeaf(decoded: AgentKeyParts, platform: NodeJS.Platform = process.platform): { leaf: string; changed: boolean } {
   const legacy = legacyLeaf(decoded.resourceId);
   const short = shortDisplayId(decoded.resourceProvider, decoded.ruleId, decoded.resourceId);
-  const leaf = isValidLeaf(short) ? short : legacy;
+  const leaf = isValidLeaf(short, platform) ? short : legacy;
   return { leaf, changed: leaf !== legacy };
 }
 
@@ -422,13 +509,13 @@ function slugCollides(candidateDir: string, root: string): boolean {
  *      loud log line.
  * Never mutates anything — a handful of reads, never a write.
  */
-export function newLayoutDirFor(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function newLayoutDirFor(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   // Not a rule-engine key at all, or a query-level key (Addendum A1: query agents keep their pre-FACTORY-118 leaf unchanged) — same fixed shape either way.
   if (!decoded || decoded.kind === "query") return join(root, ...id.split(SEGMENT_SEP));
 
   const ruleDir = join(root, decoded.resourceProvider, decoded.ruleId);
-  const { leaf, changed } = candidateLeaf(decoded);
+  const { leaf, changed } = candidateLeaf(decoded, platform);
   if (!changed) return join(ruleDir, leaf); // identity short id — always equals the legacy path; see candidateLeaf's own doc comment
 
   const bareDir = join(ruleDir, leaf);
@@ -473,11 +560,11 @@ const SEGMENT_SEP = ":";
  *      `ensureWorkspaceDir` below ever turns this into a real, stamped
  *      directory — this function itself never creates or writes anything.
  */
-export function workspaceDirFor(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function workspaceDirFor(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   if (!decoded) return join(root, id); // legacy/bare id — unchanged
 
-  const target = newLayoutDirFor(id, root);
+  const target = newLayoutDirFor(id, root, platform);
   if (readBookkeptAgentKey(target) === id) return target;
 
   const oldDir = join(root, ...id.split(SEGMENT_SEP));
@@ -514,8 +601,8 @@ export function workspaceDirFor(id: string, root: string = workspaceRoot()): str
  * write with nothing to show for it (the pre-existing segment-decode path in
  * `agentIdOfWorkspacePath` already recognises this exact directory).
  */
-export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): string {
-  const decoded = decodeAnyAgentKey(id);
+export function ensureWorkspaceDir(id: string, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string {
+  const decoded = decodeAnyAgentKey(id, platform);
   // Computed BEFORE `mkdirSync` below creates anything: `newLayoutDirFor`'s
   // own A4 slug-collision/A3 occupied-bare-name checks read what currently
   // EXISTS on disk, so evaluating it after this call's own `mkdirSync` would
@@ -523,8 +610,8 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // "occupied by someone else" and wrongly suffix itself — caught by
   // `workspace.test.ts`'s own "spec.cwd does NOT redirect buildWorkspace"
   // case before this ever shipped.
-  const target = decoded ? newLayoutDirFor(id, root) : null;
-  const dir = workspaceDirFor(id, root);
+  const target = decoded ? newLayoutDirFor(id, root, platform) : null;
+  const dir = workspaceDirFor(id, root, platform);
   mkdirSync(dir, { recursive: true });
   // FACTORY-118: stamp ONLY when `dir` is actually the NEW-layout location —
   // never the pre-migration three-deep one `workspaceDirFor` can also
@@ -542,7 +629,7 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
   // moved (`candidateLeaf`'s own `changed` flag) — see this function's own
   // doc comment for why an identity-short-id provider or a query-level key
   // must see no write at all.
-  const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded).changed;
+  const leafActuallyMoved = decoded?.kind === "resource" && candidateLeaf(decoded, platform).changed;
   // Compares against `target` (computed BEFORE `mkdirSync` above) — never a
   // fresh `newLayoutDirFor(id, root)` call here, which would see this call's
   // own just-created, not-yet-stamped directory as "occupied by someone
@@ -575,7 +662,7 @@ export function ensureWorkspaceDir(id: string, root: string = workspaceRoot()): 
  * rule loop's `ownsId` is what keeps it from ever stopping or adopting
  * them.
  */
-export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
+export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string | null {
   if (!cwd) return null;
   const rel = relative(root, cwd);
   if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
@@ -596,17 +683,17 @@ export function agentIdOfWorkspacePath(cwd: string | null | undefined, root: str
   // "belongs to another key", and never a duplicate spawn.
   const stamped = readBookkeptAgentKey(join(root, provider, ruleId, leaf));
   if (stamped) {
-    const decoded = decodeAgentKey(stamped);
-    if (decoded && decoded.resourceProvider === provider && decoded.ruleId === ruleId && legitimateLeafFor(decoded, leaf)) return stamped;
+    const decoded = decodeAgentKey(stamped, platform);
+    if (decoded && decoded.resourceProvider === provider && decoded.ruleId === ruleId && legitimateLeafFor(decoded, leaf, platform)) return stamped;
   }
   const key = segments.join(SEGMENT_SEP);
-  return decodeAnyAgentKey(key) ? key : null;
+  return decodeAnyAgentKey(key, platform) ? key : null;
 }
 
 /** Addendum A6's own validity check — see `agentIdOfWorkspacePath`'s doc comment for why this exists. */
-function legitimateLeafFor(decoded: AgentKeyParts, leaf: string): boolean {
+function legitimateLeafFor(decoded: AgentKeyParts, leaf: string, platform: NodeJS.Platform = process.platform): boolean {
   const key = encodeAgentKey(decoded);
-  const { leaf: shortLeaf, changed } = candidateLeaf(decoded);
+  const { leaf: shortLeaf, changed } = candidateLeaf(decoded, platform);
   if (!changed) return leaf === shortLeaf; // identity short id — the only legitimate leaf equals the (unchanged) legacy one too
   return leaf === shortLeaf || leaf === `${shortLeaf}-${collisionSuffix(key)}` || leaf === legacyLeaf(decoded.resourceId);
 }
@@ -645,9 +732,9 @@ export function workspaceDirsForResource(resourceProvider: ResourceProvider, res
  * query-level agent's workspace too (BUTCHR-397): it needs the same pane
  * care as any other rule-engine agent.
  */
-export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot()): string | null {
-  const id = agentIdOfWorkspacePath(cwd, root);
-  return id && decodeAnyAgentKey(id) ? id : null;
+export function ruleAgentIdOfWorkspacePath(cwd: string | null | undefined, root: string = workspaceRoot(), platform: NodeJS.Platform = process.platform): string | null {
+  const id = agentIdOfWorkspacePath(cwd, root, platform);
+  return id && decodeAnyAgentKey(id, platform) ? id : null;
 }
 
 /** The resource (Jira key) a herd id works: the decoded resource of an agent key, else the id itself. */
@@ -769,6 +856,62 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
   if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
 }
 
+/**
+ * FACTORY-625: the ONE pre-launch step for a Claude workspace — everything
+ * Claude reads as real file content on its first post-launch turn.
+ *
+ * This exists because there are TWO launch paths and they had drifted. A fresh
+ * spawn runs the whole of `buildWorkspace`; a RESUME (herd.ts) relaunches
+ * `--resume` into an existing workspace, writes only `mcp.json` before the
+ * relaunch, and calls `buildWorkspace` only AFTER the relaunch is verified. So
+ * anything written solely by `buildWorkspace` is absent for the entire first
+ * turn of every resumed session — which for a safety hook means a resumed
+ * agent runs UNHOOKED, silently, exactly the direction that must never fail.
+ * Both paths call this one function instead, so a file added here cannot be
+ * added to one path and forgotten in the other.
+ *
+ * `vetoEnabled: false` still runs the installer: it is what REMOVES a
+ * previously installed hook (see `installFileExecutionVeto`), so turning the
+ * veto off propagates on the next spawn rather than needing a hand-edit.
+ *
+ * A host with no working `python3` takes the same path as `vetoEnabled: false`
+ * (the hook cannot run there, and a hook that cannot run is a silent no-op that
+ * also fires Apple's installer stub on every Bash call), plus a loud warning,
+ * once per distinct reason: the agent still launches, as `installFileExecutionVeto`
+ * already requires, but nobody is left believing it is protected.
+ */
+let lastVetoUnavailableReason: string | undefined;
+export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: string, opts: { auditPath?: string; root?: string; vetoEnabled?: boolean; python?: PythonCheck } = {}): void {
+  writeClaudeMcpJson(dir, spec, mcpUrl);
+  const root = opts.root ?? workspaceRoot();
+  let vetoEnabled = opts.vetoEnabled ?? true;
+  if (vetoEnabled) {
+    const python = opts.python ?? usablePython3();
+    if (!python.ok) {
+      vetoEnabled = false;
+      if (lastVetoUnavailableReason !== python.reason) {
+        lastVetoUnavailableReason = python.reason;
+        console.error(`butchr: [veto-hook] NOT installed, agents on this host run without the file-execution veto: ${python.reason}`);
+      }
+    }
+  }
+  installFileExecutionVeto(dir, {
+    // Same env var and same default as `Config.permissionAuditPath`
+    // (src/config/config.ts) — one audit file for every approval decision on
+    // this host, so there is a single place to look rather than two. Read from
+    // the environment here rather than imported, to keep this module free of a
+    // dependency on config loading, which runs long before a workspace build.
+    auditPath: opts.auditPath ?? (process.env.BUTCHR_PERMISSION_AUDIT_PATH?.trim() || join(root, ".permission-audit.jsonl")),
+    modeFilePath: join(root, VETO_MODE_BASENAME),
+    failOpenStatePath: join(root, VETO_FAIL_OPEN_STATE_BASENAME),
+  }, vetoEnabled);
+}
+
+/** Test seam: forget which unavailable-veto reason was already warned about. */
+export function resetVetoUnavailableWarning(): void {
+  lastVetoUnavailableReason = undefined;
+}
+
 export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentProvider = "claude", disabledMcpServers: AgentConfig["disabledMcpServers"] = []): string {
   // BUTCHR-408 review fix: NEVER `spec.cwd` — see `SpawnSpec.cwd`'s own doc
   // comment for why butchr's bookkeeping files must never land in an
@@ -869,7 +1012,7 @@ No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by
 Await direction if your brief does not assign work. Preserve sandbox and approval review.
 ` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
   writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writeClaudeMcpJson(dir, spec, mcpUrl);
+  if (provider === "claude") writePreLaunchClaudeFiles(dir, spec, mcpUrl);
   writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
   return dir;
 }
@@ -894,37 +1037,27 @@ const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "github-pr", "j
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
-  "Your resource is a GitHub issue, not a Jira ticket. Read it (title, body, type, comments) with the butchr `github_get_issue` tool and comment on it with `github_add_comment`; both act only on your own issue. When your rule is allowed to, `github_link_jira_idea` links your issue to an existing Jira Product Discovery idea. Jira and Confluence tools refuse you. You are told when the issue changes — re-read it then.";
+  "Your resource is a GitHub issue. Use `github_get_issue` and `github_add_comment` with an explicit target (owner/repo#number), or omit it for your own issue. `github_link_jira_idea` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** FACTORY-57: what a `github-pr` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_PR_TOOLS_NOTE =
-  "Your resource is a GitHub pull request, not a Jira ticket. Read it (title, body, state, merged/draft, labels, comments) with the butchr `github_get_pr` tool and comment on it with `github_pr_add_comment`; both act only on your own pull request. Jira and Confluence tools refuse you. Your agent is stopped when this PR is merged or closed and your rule's own query no longer matches it. You are told when the PR changes — re-read it then.";
+  "Your resource is a GitHub pull request. Use `github_get_pr` and `github_pr_add_comment` with an explicit target (owner/repo#number), or omit it for your own PR. Your rule query determines when this agent is stopped; re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
 export const JIRA_IDEA_TOOLS_NOTE =
-  "Your resource is a Jira Product Discovery idea, not a work item. Read it (summary, description, status, labels, comments) with the butchr `jira_idea_get` tool, list the GitHub issues its Jira remote links point at with `jira_idea_github_issues`, and comment on it with `jira_idea_add_comment`; all three act only on your own idea. When your rule is allowed to, `jira_idea_link_github_issue` links your idea to an existing GitHub issue. Jira work and Confluence tools refuse you. You are told when the idea changes — re-read it then.";
+  "Your resource is a Jira Product Discovery idea. Use `jira_idea_get`, `jira_idea_github_issues`, and `jira_idea_add_comment` with an explicit target (issue key), or omit it for your own idea. `jira_idea_link_github_issue` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 /** What a `zendesk-ticket` agent is told about its tools; a Jira work brief carries no such section. */
 export const ZENDESK_TICKET_TOOLS_NOTE =
-  "Your resource is a Zendesk support ticket, not a Jira ticket. Read it (subject, description, status, tags, public comments and internal notes) with the butchr `zendesk_get_ticket` tool and add a private internal note with `zendesk_add_internal_note`; both act only on your own ticket. You cannot reply to the customer: every note is internal, visible to Zendesk agents only. Jira, Confluence and GitHub tools refuse you. You are told when the ticket changes — re-read it then.";
+  "Your resource is a Zendesk ticket. Use `zendesk_get_ticket` and `zendesk_add_internal_note` with an explicit target (subdomain#number), or omit it for your own ticket. You cannot reply to the customer with the internal-note operation: every note is internal. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
-/** What a `filesystem` agent is told about its tools; a Jira brief carries no such section. There are none: it reads/edits its resource directly with its own file tools (Read/Write/Edit/Bash), never a butchr MCP tool. NOT shown to a managed-session (`managed-sessions` rule) agent — see `MANAGED_SESSION_TOOLS_NOTE` below, which is the accurate note for that narrower case (BUTCHR-456 gives it exactly two conditional tools, not none). */
+/** File editing remains a native filesystem operation; provider tools use explicit targets. */
 export const FILESYSTEM_TOOLS_NOTE =
-  "Your resource is a file or directory on disk, not a Jira ticket. Read and edit it directly with your own file tools — there is no butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. You are told when it changes (created, modified, or removed) — re-read it from disk then.";
+  "Your resource is a file or directory. Read and edit it directly with your own file tools within authorized filesystem boundaries; there is no butchr MCP tool for general file editing. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
-/**
- * BUTCHR-456: what a MANAGED-SESSION agent specifically is told — narrower
- * than `FILESYSTEM_TOOLS_NOTE` above, which would otherwise tell a
- * `director-brooswit-mud`-shaped agent "there is no butchr MCP tool for it"
- * even once its own definition IS granted freeze/unfreeze control over
- * another one, undermining the very capability this delegation exists to
- * give it. Shown to every managed-session agent regardless of whether it
- * currently holds any grant (a definition's OWN manifest is what actually
- * decides that at call time — this brief text is static per rule, like
- * every other `TOOLS_NOTE` entry, not re-derived per grant).
- */
+/** Session control retains its explicit authorization independently of provider access. */
 export const MANAGED_SESSION_TOOLS_NOTE =
-  "Your resource is a managed-session definition file, not a Jira ticket. Read and edit YOUR OWN definition directly with your own file tools — there is no general-purpose butchr MCP tool for it, and Jira, Confluence, GitHub and Zendesk tools all refuse you. The ONE exception: if ANOTHER definition's own `freezeControllers`/`unfreezeControllers` grant names your definition's file, you may call the butchr `freeze_session`/`unfreeze_session` tool (argument: that OTHER definition's name) to flip its freeze state. You have no other butchr MCP tool, and you can never edit any grant, or create, archive, or delete a definition — see docs/managed-sessions.md's \"Delegated freeze/unfreeze\" section. You are told when your own file changes (created, modified, or removed) — re-read it from disk then.";
+  "Your resource is a managed-session definition. Preserve session-control authorization and freezes. `freeze_session` and `unfreeze_session` require the target definition's explicit freezeControllers/unfreezeControllers authorization; do not edit grants or create, archive or delete definitions without authorization. Read docs/managed-sessions.md for this operational contract. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
 
 const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "github-pr": GITHUB_PR_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
 
@@ -1144,7 +1277,9 @@ function claudeProjectDir(dir: string, home: string = homedir()): string {
  * FACTORY-314 (PR #513 review fix; epic review on PR #513, "trap 2") — the id
  * of a `.jsonl` transcript under this workspace's own Claude project folder
  * that is POSITIVELY TIED to a launch started at or after `after` (epoch
- * ms, `Date.now()`-comparable) — never merely "the newest file present".
+ * ms, `Date.now()`-comparable, ideally sub-millisecond precision — see
+ * "MILLISECOND-GRANULARITY HAZARD" below) — never merely "the newest file
+ * present".
  * That distinction is load-bearing, not cosmetic: a workspace directory is
  * unique per issue (`workspaceDirFor`), but is NOT guaranteed to hold only
  * ONE transcript ever — a prior respawn of the SAME issue leaves its OLDER
@@ -1162,12 +1297,63 @@ function claudeProjectDir(dir: string, home: string = homedir()): string {
  * the same fail-safe "cannot establish it — don't guess" contract
  * `HerdrHerd.startProviders`'s own caller already treats as "session lost:
  * id unknown" rather than resuming a best guess.
+ *
+ * FACTORY-631/FACTORY-623/FACTORY-568 — MILLISECOND-GRANULARITY HAZARD:
+ * `created` carries sub-millisecond precision wherever the filesystem
+ * reports birth time (ns-resolution birthtime on ext4 and most Linux
+ * filesystems), but `after` is always a whole-millisecond INTEGER in this
+ * codebase — `HerdrHerd.startProviders` passes `Date.now()`, a FLOOR of
+ * the real instant it names. (A sub-millisecond wall clock via
+ * `performance.timeOrigin + performance.now()` was tried here and
+ * discarded — measured on this worker's own checkout, that clock drifts
+ * AHEAD of both `Date.now()` and the filesystem's own `birthtimeMs`, and
+ * the gap GROWS over the process lifetime; using it made every
+ * newly-written, genuinely-this-launch's-own transcript compare as
+ * `created < after` — REJECTED on EVERY call, strictly worse than the bug
+ * this fixes. `Date.now()` stays the source of truth.) Because `after` is
+ * a floor, the real instant it names can be up to just under 1ms LATER
+ * than the integer itself, so a plain `created < after` does NOT reliably
+ * reject a transcript that predates the launch but happens to land in the
+ * SAME whole millisecond as `after` — `created` (e.g. `X.78`) compares
+ * `>= after` (`X`) even though it was written, in real time, before the
+ * call that produced `after`. That gap is exactly what let a stale
+ * transcript from a PRIOR launch get silently re-accepted.
+ *
+ * The fix: require `created >= after + AFTER_MARGIN_MS` (one whole extra
+ * millisecond) instead of `created >= after`, whenever `after` is an
+ * integer (`Number.isInteger` — true for every caller today; a future
+ * caller passing an already sub-millisecond `after` would need no margin
+ * at all, so this stays conditional rather than blanket). This is SAFE in
+ * the direction this filter exists to protect: for any write that happens
+ * strictly before the call producing an integer `after`, `created < after
+ * + AFTER_MARGIN_MS` always holds (the real call instant is itself `<
+ * after + 1`), so that transcript is still, unconditionally, never a
+ * candidate. The cost lands on the opposite, rare case: a transcript
+ * genuinely tied to THIS launch but written within under 1ms of `after`
+ * would also be wrongly rejected. In PRODUCTION this is a non-risk — a
+ * real Claude launch takes tens of milliseconds to seconds to write its
+ * first transcript line, nowhere close to sub-millisecond — but it is a
+ * REAL risk for a test fixture that writes a fake transcript synchronously
+ * right after capturing `after`: several in this codebase do exactly that
+ * and each needs a small, real, awaited delay before writing (see
+ * `withResumableSession`, `test/unit/herd.test.ts`, and the FACTORY-418
+ * test in `test/unit/herd-session-id-invalidation-ordering.test.ts`, for
+ * where this was measured and fixed). Do not widen `AFTER_MARGIN_MS`
+ * beyond what the floor requires: a bigger margin buys nothing more here
+ * and only widens that cost for whatever caller it falls on.
  */
+const AFTER_MARGIN_MS = 1;
 export function discoverClaudeSessionId(dir: string, home?: string, after?: number): string | undefined {
   const projectDir = claudeProjectDir(dir, home);
   let entries: string[];
   try { entries = readdirSync(projectDir); }
   catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  // See "MILLISECOND-GRANULARITY HAZARD" above: only a whole-millisecond
+  // INTEGER `after` is a potentially lossy floor — every caller today
+  // passes one (`Date.now()`), so the margin always applies in practice; a
+  // future caller passing an already sub-millisecond `after` would get the
+  // exact, margin-free bound instead.
+  const bound = after !== undefined && Number.isInteger(after) ? after + AFTER_MARGIN_MS : after;
   let newest: { id: string; created: number } | undefined;
   for (const entry of entries) {
     if (!entry.endsWith(".jsonl")) continue;
@@ -1179,7 +1365,7 @@ export function discoverClaudeSessionId(dir: string, home?: string, after?: numb
     // every entry as "created at epoch 0" (which `after` would then reject
     // outright on every filesystem that lacks birth time).
     const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
-    if (after !== undefined && created < after) continue; // exists, but predates this launch — not a candidate, ever
+    if (bound !== undefined && created < bound) continue; // exists, but predates this launch — not a candidate, ever
     if (!newest || created > newest.created) newest = { id: entry.slice(0, -".jsonl".length), created };
   }
   return newest?.id;
@@ -1223,5 +1409,54 @@ export function invalidatePersistedSessionId(dir: string): void {
  * restart) rather than resuming a nonexistent conversation.
  */
 export function claudeTranscriptExists(dir: string, sessionId: string, home?: string): boolean {
-  return existsSync(join(claudeProjectDir(dir, home), `${sessionId}.jsonl`));
+  return existsSync(claudeTranscriptPath(dir, sessionId, home));
+}
+
+/**
+ * FACTORY-916 — the path `claudeTranscriptExists` above checks, exported so
+ * `src/agents/respawn.ts` can `statSync` it directly (to ESTIMATE a
+ * token count from its byte size, for the respawn-resume context cutoff)
+ * without duplicating `claudeProjectDir`'s own encoding.
+ */
+export function claudeTranscriptPath(dir: string, sessionId: string, home?: string): string {
+  return join(claudeProjectDir(dir, home), `${sessionId}.jsonl`);
+}
+
+/**
+ * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — an ESTIMATE of
+ * `sessionId`'s transcript size in tokens, cheap enough to call on every
+ * respawn of a large (potentially many-MB) transcript: `statSync` for the
+ * byte count, never `readFileSync`/parsed JSON. The whole reason this
+ * cutoff exists is to bound the cost of resuming a LARGE transcript, so the
+ * check that enforces it must not itself pay a cost proportional to that
+ * size — see `Rule.resumeContextCutoff`'s own doc comment (src/rules/rules.ts).
+ *
+ * `BYTES_PER_TOKEN_ESTIMATE = 4`: a Claude Code `.jsonl` transcript line is
+ * mostly English prose and tool JSON, both of which sit close to OpenAI/
+ * Anthropic's own commonly-cited "~4 bytes per token" rule of thumb for
+ * English text; the surrounding JSON punctuation (quotes, braces, escaped
+ * newlines) skews slightly denser than prose alone, which makes this
+ * estimate a mild OVER-count of true tokens for a typical transcript — the
+ * safe direction for a cutoff whose entire job is to bound cost, since
+ * erring toward "estimated over cutoff, start fresh" costs nothing more
+ * than the resume this mechanism is already allowed to skip, while erring
+ * the other way (resume a transcript actually over budget) is the one
+ * outcome this field exists to prevent. Not a measured calibration against
+ * this codebase's own real transcripts — a documented rule-of-thumb
+ * constant, not a promise of accuracy; callers needing an exact count
+ * would have to parse and tokenize the file, exactly what this function is
+ * built to avoid.
+ *
+ * Returns `undefined` when the transcript cannot be stat'd at all (ENOENT —
+ * the caller's own `claudeTranscriptExists` check is expected to run
+ * first, so this is a defensive fallback, not the primary missing-
+ * transcript path) — never a thrown error for the common "file not there"
+ * case, same fail-safe shape as `workspaceSessionId`/`workspaceStopCause`.
+ */
+const BYTES_PER_TOKEN_ESTIMATE = 4;
+export function estimateTranscriptTokens(dir: string, sessionId: string, home?: string): number | undefined {
+  let size: number;
+  try { size = statSync(claudeTranscriptPath(dir, sessionId, home)).size; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  return Math.ceil(size / BYTES_PER_TOKEN_ESTIMATE);
 }

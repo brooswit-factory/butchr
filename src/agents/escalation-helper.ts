@@ -69,3 +69,68 @@ export class RateCap {
 
 /** One hour, in milliseconds — the window escalation-loop.ts's rate cap uses. */
 export const HOUR_MS = 60 * 60_000;
+
+/**
+ * FACTORY-607 comment 28781 (Part A) / FACTORY-609 (Part B): the director's
+ * own routing defaults for a managed-session escalation, factored out here
+ * (dependency-free, like the rest of this module) so BOTH `src/config/
+ * config.ts` (the env-var parser, which must apply these exact values as
+ * defaults) and `src/agents/escalation-loop.ts` (which falls back to these
+ * when `EscalatorDeps.managedEscalationRouting` is omitted — e.g. by an
+ * existing test that predates this ticket) read a SINGLE literal, never two
+ * copies that could drift apart. FACTORY-607 comment 28784 item 3: this is a
+ * DELIBERATE BEHAVIOUR CHANGE from what FACTORY-369 shipped — assembly's own
+ * pane used to route to `@director` in `#team-admin`; it now routes to
+ * `@manager-factory` in `#team-engineering` for tiers 1-2, matching the
+ * director's comment 28688.
+ */
+export const MANAGED_ESCALATION_DEFAULTS = {
+  /** Tiers 1-2 for an ordinary managed session. */
+  normalMention: "@admin-assembly",
+  normalRoom: "team-admin",
+  /** Tiers 1-2 for the admin-assembly session's OWN pane (the self-reference case). */
+  assemblyMention: "@manager-factory",
+  assemblyRoom: "team-engineering",
+  /** Tier 3, for every managed session (including admin-assembly's own pane). */
+  directorMention: "@director",
+  directorRoom: "team-engineering",
+  /** Minutes after an episode's first mark before the tier-2 re-escalation. */
+  tier2Minutes: 10,
+  /** Minutes after an episode's first mark before the tier-3 director escalation. */
+  tier3Minutes: 20,
+} as const;
+
+/**
+ * FACTORY-630: the ops-alert route's own routing defaults, kept HERE
+ * alongside `MANAGED_ESCALATION_DEFAULTS` and for the same reason — this
+ * module is dependency-free, so both `src/config/config.ts` (the env parser,
+ * which must apply these exact values as defaults) and any caller that falls
+ * back without a parsed config read ONE literal rather than two copies that
+ * could drift. Deliberately a SEPARATE constant from
+ * `MANAGED_ESCALATION_DEFAULTS` rather than more fields on it: an ops alert
+ * is a different condition class with a different audience, and collapsing
+ * them would make a future change to either one silently change the other.
+ *
+ * `room` is `#team-admin`, the director's own choice on FACTORY-630. The
+ * manager account can POST to that room but cannot READ it, which is why the
+ * composed post has to be useful entirely on its own — see
+ * `src/agents/ops-alert.ts`'s `OpsAlert`. `mention` is `@director` because
+ * every condition on this route is, by construction, one that no agent can
+ * fix or even acknowledge. `dedupMinutes` is the director's own 60.
+ */
+export const OPS_ALERT_DEFAULTS = {
+  room: "team-admin",
+  mention: "@director",
+  dedupMinutes: 60,
+} as const;
+
+export type ManagedEscalationRouting = {
+  normalMention: string;
+  normalRoom: string;
+  assemblyMention: string;
+  assemblyRoom: string;
+  directorMention: string;
+  directorRoom: string;
+  tier2Minutes: number;
+  tier3Minutes: number;
+};

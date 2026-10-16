@@ -21,6 +21,31 @@ const base: Facts = {
 };
 const failing = (f: Partial<Facts>) => evaluate({ ...base, ...f }).verdicts.filter((v) => !v.ok).map((v) => v.reason);
 
+describe("release gate: a minimum bump derived from the public surface (FACTORY-624)", () => {
+  const withFrag = (bump: string, extra = "") => [frag("changelog.d/X.md", `bump: ${bump}\n${extra}### Fixed\n- a change\n`)];
+  test("an added route or env var needs at least minor; patch fails and says why", () => {
+    const surface = { added: ["route /new", "env BUTCHR_NEW"], removed: [] };
+    expect(failing({ surface, newFragments: withFrag("patch") })[0]).toMatch(/public surface added \(route \/new, env BUTCHR_NEW\).*at least "bump: minor"/);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("minor") }).ok).toBe(true);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("major", "### BREAKING\n- b\n") }).ok).toBe(true);
+  });
+  test("a removed route or env var needs major (and so a BREAKING section)", () => {
+    const surface = { added: [], removed: ["env BUTCHR_OLD"] };
+    expect(failing({ surface, newFragments: withFrag("minor") })[0]).toMatch(/public surface removed \(env BUTCHR_OLD\).*requires "bump: major"/);
+    expect(evaluate({ ...base, surface, newFragments: withFrag("major", "### BREAKING\n- b\n") }).ok).toBe(true);
+  });
+  test("a rename (one removed, one added) is judged as a removal", () => {
+    expect(failing({ surface: { added: ["route /b"], removed: ["route /a"] }, newFragments: withFrag("minor") })[0]).toMatch(/removed/);
+  });
+  test("no surface change, or surface not measured, adds no verdict", () => {
+    expect(evaluate({ ...base, surface: { added: [], removed: [] } }).verdicts).toHaveLength(evaluate(base).verdicts.length);
+    expect(evaluate({ ...base }).ok).toBe(true);
+  });
+  test("a docs-only PR is exempt even if surface were reported", () => {
+    expect(evaluate({ ...base, changedFiles: ["README.md"], newFragments: [], surface: { added: ["env BUTCHR_X"], removed: [] } }).ok).toBe(true);
+  });
+});
+
 describe("release gate (version at merge, changelog.d fragments)", () => {
   test("happy path: gated change, unchanged version, one fragment, no new heading — passes", () => {
     const r = evaluate(base);
@@ -69,6 +94,54 @@ describe("release gate (version at merge, changelog.d fragments)", () => {
   test("a fragment with a valid bump but a bullet under an UNRECOGNIZED section still fails (not a known section)", () => {
     const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Notes\n- unrelated\n")] });
     expect(reasons.some((r) => /x\.md has no bullets under a known section/.test(r))).toBe(true);
+  });
+
+  describe("unrecognised headings fail loud instead of silently dropping the bullets under them (FACTORY-192)", () => {
+    test("an unknown-only heading fails, naming the file, the heading, and the valid sections", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Notes\n- unrelated\n")] });
+      expect(reasons.some((r) => /x\.md has unrecognised heading\(s\) "### Notes"/.test(r) && /BREAKING\/Added\/Changed\/Fixed\/Removed/.test(r))).toBe(true);
+    });
+    test("a mixed fragment (one recognised, one unrecognised heading) still fails, even though it has at least one bullet under a known section", () => {
+      const r = evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- kept\n### Notes\n- lost otherwise\n")] });
+      expect(r.ok).toBe(false);
+      expect(r.verdicts.some((v) => !v.ok && /unrecognised heading\(s\) "### Notes"/.test(v.reason))).toBe(true);
+    });
+    test("a multi-word heading fails", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Known Issues\n- a\n")] });
+      expect(reasons.some((r) => /"### Known Issues"/.test(r))).toBe(true);
+    });
+    test("a punctuated heading fails", () => {
+      const reasons = failing({ newFragments: [frag("x.md", "bump: patch\n### Fixed!\n- a\n")] });
+      expect(reasons.some((r) => /"### Fixed!"/.test(r))).toBe(true);
+    });
+    test("a fragment with only recognised headings passes this check", () => {
+      expect(evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a\n")] }).ok).toBe(true);
+    });
+
+    describe("checked unconditionally — not just when a gated file requires a release", () => {
+      test("a non-gated diff (e.g. a scripts/ change) with a supplied bad-heading fragment still fails: release isn't required, but the heading check isn't skipped", () => {
+        const r = evaluate({ ...base, changedFiles: ["scripts/release/foo.ts"], newFragments: [frag("x.md", "bump: patch\n### Fixed\n- kept\n### Notes\n- lost otherwise\n")] });
+        expect(r.required).toBe(false);
+        expect(r.ok).toBe(false);
+        expect(r.verdicts.some((v) => !v.ok && /unrecognised heading\(s\) "### Notes"/.test(v.reason))).toBe(true);
+      });
+      test("a fragment-only diff (only the fragment file itself changed) with a bad heading still fails", () => {
+        const r = evaluate({ ...base, changedFiles: ["changelog.d/X.md"], newFragments: [frag("changelog.d/X.md", "bump: patch\n### Notes\n- unrelated\n")] });
+        expect(r.required).toBe(false);
+        expect(r.ok).toBe(false);
+        expect(r.verdicts.some((v) => !v.ok && /unrecognised heading/.test(v.reason))).toBe(true);
+      });
+      test("control: a non-gated diff with a VALID fragment passes (the heading check doesn't reject good fragments)", () => {
+        const r = evaluate({ ...base, changedFiles: ["scripts/release/foo.ts"], newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a fix\n")] });
+        expect(r.required).toBe(false);
+        expect(r.ok).toBe(true);
+      });
+      test("control: a non-gated diff with NO fragment at all still passes (fragments stay optional outside a gated PR)", () => {
+        const r = evaluate({ ...base, changedFiles: ["scripts/release/foo.ts"], newFragments: [] });
+        expect(r.required).toBe(false);
+        expect(r.ok).toBe(true);
+      });
+    });
   });
   test("a fragment with a valid bump and at least one bullet passes the content check", () => {
     expect(evaluate({ ...base, newFragments: [frag("x.md", "bump: patch\n### Fixed\n- a fix\n")] }).ok).toBe(true);

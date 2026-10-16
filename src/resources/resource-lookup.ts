@@ -15,7 +15,7 @@
  * would report matches this daemon isn't actually staffing (a rule that
  * matches the resource but hasn't been enabled, or a resource excluded by a
  * project allowlist) — exactly the false positive this endpoint's whole
- * consumer (Clevr's terminal-open dropdown) must never show. `dashboard.rows`
+ * consumer (Cleavr's terminal-open dropdown) must never show. `dashboard.rows`
  * is that live registry already: `../rules/agent-key.ts`'s `decodeAnyAgentKey`
  * recovers `(resourceProvider, ruleId, resourceId)` from every row's own
  * `resourceKey`, so a resource match here is by construction a resource this
@@ -47,7 +47,7 @@ export interface ResourcesForUrlResponse {
   agents: ResourceForUrlAgent[];
 }
 
-/** Rule id + resource id, joined the same way an agent key's own components are (`:`) — deliberately NOT `display-label.ts`'s `baseDisplayLabel` (which fetches nothing itself either, but combines short-id and rule id in the OTHER order, and special-cases managed sessions) — this is its own, narrower "no title fetch" format, not a second implementation of that one. */
+/** Rule id + resource id, joined the same way an agent key's own components are (`:`) — deliberately NOT `display-label.ts`'s `baseDisplayLabel` (which fetches nothing itself either, but combines rule id and short-id with a middle-dot separator rather than `:`, and special-cases managed sessions) — this is its own, narrower "no title fetch" format, not a second implementation of that one. */
 const agentLabel = (ruleId: string, resourceId: string): string => `${ruleId}:${resourceId}`;
 
 /**
@@ -77,7 +77,7 @@ function agentsForResource(rows: readonly DashboardRow[], resource: ResourceIden
 /**
  * The whole response. `agents` is `[]` both when `resource` is `null` and
  * when a resource resolved but nothing in `rows` matches it — the ticket's
- * own requirement that a caller (Clevr) can tell "not a Butchr resource"
+ * own requirement that a caller (Cleavr) can tell "not a Butchr resource"
  * apart from "a Butchr resource with nothing running" ONLY by reading
  * `resource` itself, never by `agents.length` alone.
  */

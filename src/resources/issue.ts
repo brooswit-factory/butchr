@@ -22,16 +22,21 @@
  *   off `SpawnSpec.issuetype` exactly as today.
  */
 import type { JiraIssue, JiraComment, IssueLink } from "../atlassian/types.js";
+import { AtlassianHttpError } from "../atlassian/client.js";
 import { isActive } from "../reconcile/plan.js";
-import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, prTransition } from "../jira-watch/diff.js";
+import { changedKeys, isDaemonLabelOnlyDiff, daemonLabelsChanged, daemonLabelTransition, blockedTransition, prTransition, excludeBookkeepingComments, WAKE_MARKERS } from "../jira-watch/diff.js";
 import { watchedKeys } from "../jira-watch/routes.js";
 import { agentFoldSuppressedLine, standDownSuppressedLine } from "../jira-watch/suppressed-log.js";
+import { skippedCommentCheckLine, type SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { StandDownRegistry } from "../agents/stand-down.js";
+import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
   EventRules,
   EventVerdict,
+  NotifyReason,
   PollSnapshot,
   RelatedResource,
   ResourceType,
@@ -154,6 +159,26 @@ export function bossKeyFrom(issue: JiraIssue): string | null {
   return issue.issuelinks?.find((l) => l.type === "Implements" && l.otherEnd === "inward")?.key ?? null;
 }
 
+/**
+ * FACTORY-922 (implementing FACTORY-921's resolved decision point): which
+ * issue keys were added/removed between `before.issuelinks` and
+ * `after.issuelinks` — `null` when there is nothing to report, either
+ * because neither key set changed or because EITHER side is `undefined`
+ * ("unknown", per `JiraIssue.issuelinks`'s own doc comment — never silently
+ * treated as "confirmed empty", which would manufacture a diff out of
+ * missing information rather than a real one). Pure, no I/O — the same
+ * (before, after) pair `decide()` already has in hand.
+ */
+function issuelinksDiff(before: JiraIssue, after: JiraIssue): { added: readonly string[]; removed: readonly string[] } | null {
+  if (!before.issuelinks || !after.issuelinks) return null;
+  const beforeKeys = new Set(before.issuelinks.map((l) => l.key));
+  const afterKeys = new Set(after.issuelinks.map((l) => l.key));
+  const added = [...afterKeys].filter((k) => !beforeKeys.has(k));
+  const removed = [...beforeKeys].filter((k) => !afterKeys.has(k));
+  if (!added.length && !removed.length) return null;
+  return { added, removed };
+}
+
 /** SPAWN CONFIG: the SpawnSpec fields the existing shared spawn machinery reads — see this module's top comment. */
 export const ISSUE_SPAWN_CONFIG: SpawnConfig<JiraIssue> = {
   specFor: (issue) => ({ key: issue.key, issuetype: issue.issuetype, summary: issue.summary, parent: bossKeyFrom(issue) }),
@@ -199,6 +224,49 @@ export interface IssueResourceDeps {
    * src/daemon/log-sink.ts's own doc comment for why that matters — AC1).
    */
   log?: (line: string) => void;
+  /**
+   * FACTORY-922 (implementing story FACTORY-921): called once per key whose
+   * comment fetch could not confirm a diff this poll (§3D fallback in
+   * `decide()` below) — the counter a `/health` consumer surfaces as
+   * `commentChecksSkipped` (src/daemon/health.ts). Optional; omitted, the
+   * skip still happens and is still logged (`deps.log`), only the counter
+   * is not incremented anywhere.
+   */
+  onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
+  /**
+   * FACTORY-949 (story FACTORY-948): the boss-wake debounce window, in
+   * minutes — `Config.blockedWakeDebounceMinutes`, threaded straight
+   * through. Optional; omitted, `DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES`
+   * (src/config/config.ts) is used, same value `loadConfig`'s own default
+   * already resolves to, so an existing caller/test with no config wiring
+   * at all keeps the same effective behaviour.
+   */
+  blockedWakeDebounceMinutes?: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * blockedWakeDebounceMinutes above): the SAME debounce shape, threaded
+   * through for the `agent:stalled` boss wake instead. Optional; omitted,
+   * `DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES` (src/config/config.ts) is used.
+   */
+  stalledWakeDebounceMinutes?: number;
+  /**
+   * FACTORY-972: the hard per-boss hourly cap on DELIVERED `agent:stalled`
+   * wakes — see `Config.stalledWakeMaxPerHour`'s own doc comment. Optional;
+   * omitted, `DEFAULT_STALLED_WAKE_MAX_PER_HOUR` is used.
+   */
+  stalledWakeMaxPerHour?: number;
+  /**
+   * FACTORY-972: the `/health` counter's writer for a DELIVERED stalled
+   * wake — same "optional callback, caller owns the counter" shape
+   * `onCommentCheckSkipped` above already is. Called once per delivered
+   * wake, after the rate cap has already admitted it.
+   */
+  onStalledWake?: (recipient: string) => void;
+  /**
+   * FACTORY-972: the `/health` counter's writer for a stalled wake that the
+   * hourly rate cap rejected — counted and logged, never delivered (item 4).
+   */
+  onStalledWakeCapped?: (recipient: string) => void;
 }
 
 /**
@@ -214,15 +282,15 @@ export interface IssueResourceDeps {
  */
 /**
  * BUTCHR-240: the `todoWorkers` fetch seam `createAbandonedDetector`
- * (src/agents/abandoned.ts) optionally takes — a single `deps.search(...)`
- * call, the same house pattern `createRelated` below uses for its own
- * batched extra query. Lives here, beside `TODO_WORKER_JQL`, rather than
+ * (src/agents/abandoned.ts) optionally takes. FACTORY-191 uses searchAll:
+ * all matching pages or a rejection, never a first-page-only snapshot.
+ * Lives here, beside `TODO_WORKER_JQL`, rather than
  * inside `abandoned.ts` itself, so that module's dependency surface never
  * has to import a JQL string or know how a search is actually issued — it
  * only takes a `() => Promise<JiraIssue[]>` function.
  */
-export function createTodoWorkersFetch(deps: Pick<IssueResourceDeps, "search">): () => Promise<JiraIssue[]> {
-  return () => deps.search(TODO_WORKER_JQL);
+export function createTodoWorkersFetch(deps: { searchAll(jql: string): Promise<JiraIssue[]> }): () => Promise<JiraIssue[]> {
+  return () => deps.searchAll(TODO_WORKER_JQL);
 }
 
 function createRelated(deps: Pick<IssueResourceDeps, "search" | "links">) {
@@ -308,7 +376,7 @@ interface SuppressionVerdict {
  * (prev, next) pair of `{ primary, related }` issue arrays and asks what
  * changed, rather than diffing `JiraIssue` fields itself.
  */
-export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log">): EventRules<JiraIssue> {
+export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" | "comments" | "standDown" | "log" | "onCommentCheckSkipped" | "blockedWakeDebounceMinutes" | "stalledWakeDebounceMinutes" | "stalledWakeMaxPerHour" | "onStalledWake" | "onStalledWakeCapped">): EventRules<JiraIssue> {
   // BUTCHR-350 AC1: every `[notify-suppressed]` line goes through this, and
   // only this — never a direct `process.stdout`/`process.stderr` write. The
   // default is a fresh closure that looks up `console.error` at CALL time
@@ -326,6 +394,41 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
   // that always delivers rather than suppresses on an unknown baseline;
   // seeding is what keeps a ledger hit from ever meeting that case.
   const commentCursor = new Map<string, string | null>();
+  // FACTORY-922 REVIEW FIX (PR #732 round 1 — BLOCKING): `commentCursor`
+  // alone does NOT retain "the snapshot" the ticket's own fix (1) promises.
+  // `decide()` is only ever invoked for a key that `changedPrimary`/
+  // `changedRelated` names, which `changedKeys` derives purely from THIS
+  // poll's own (prev, next) pair — a key whose §3D check was skipped/failed
+  // this poll, with nothing ELSE about it moving on a LATER poll, produces
+  // an IDENTICAL (prev, next) pair on that later poll (prev is literally
+  // this poll's own `next`, carried forward by the loop) and so never even
+  // reaches `decide()` again: `changedKeys` sees no diff and `commentCursor`
+  // is never consulted. A foreign comment whose check failed/was shed is
+  // therefore lost forever unless some UNRELATED field happens to change
+  // later — exactly the "lost change" fix (1) forbids, not an edge case.
+  // `pendingRecheck` closes that gap: a key added here is force-included in
+  // `changedPrimary`/`changedRelated` below on EVERY later poll (even one
+  // with an otherwise content-identical diff) until its check genuinely
+  // resolves — removed the moment ANY `fetchComments(key)` call this poll
+  // succeeds (see `fetchComments`'s own success branch), regardless of
+  // which arm made that call: a successful fetch is a fresh, authoritative
+  // read of the ticket's comments, which resolves the pending uncertainty
+  // whether or not THIS poll's own arm is the one that ends up naming it
+  // (the existing KAN-838 "fold" precedent already accepts this for other
+  // arms' own cursor advances — see ledgerHitSuppressed's own doc comment).
+  const pendingRecheck = new Set<string>();
+
+  // FACTORY-949 (implementing story FACTORY-948): the last wall-clock ms a
+  // boss wake actually FIRED for a ticket key — persists ACROSS polls, same
+  // in-memory-only tradeoff `commentCursor`/`pendingRecheck` above already
+  // make (lost on daemon restart; see Config.blockedWakeDebounceMinutes's
+  // own doc comment). Keyed by the blocked ticket's OWN key, never by
+  // (key, watcher): the debounce is per EPISODE of that ticket going
+  // blocked, not per boss watching it — a ticket with two bosses (not
+  // expected, but not excluded either) must still fire at most once per
+  // episode, not once per boss.
+  const blockedWakeFired = new Map<string, number>();
+  const blockedWakeDebounceMs = (deps.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
 
   const issueOf = (list: readonly JiraIssue[], key: string) => list.find((i) => i.key === key);
   const relatedIssueOf = (list: readonly RelatedResource<JiraIssue>[], key: string) => list.find((r) => r.issue.key === key)?.issue;
@@ -356,23 +459,108 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
       // second `deps.comments(key)` call for the same key/poll. Every
       // existing consumer here only ever destructured `ok`/`newest`, so
       // adding a field changes nothing for them.
-      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }>>();
-      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[] } | { ok: false }> => {
+      //
+      // FACTORY-865: `newest`/`ids` are computed from `excludeBookkeepingComments`'s
+      // result, never the raw fetch — every downstream consumer of this
+      // cursor (baseline seeding, crossDaemonSuppressed, ledgerHitSuppressed,
+      // the stand-down unseen-ids check, and the undetermined-reason
+      // fallback's `preCommentCursor` comparison) therefore only ever sees
+      // butchr's own `[butchr:*]` bookkeeping chatter as if it were never
+      // posted at all, so it can no longer defeat daemon-label-only
+      // suppression. See diff.ts's own doc comment on WAKE_MARKERS for why
+      // this is still exactly right for an allowlisted agent-directed
+      // marker (it is never filtered out in the first place).
+      // FACTORY-922: the `ok: false` branch now carries WHY, so `decide()`'s
+      // own §3D fallback (the only consumer that cares — every other
+      // consumer here only ever checked `!result.ok`, unaffected by the
+      // added field) can log/count `load` vs `failed` distinctly instead of
+      // collapsing both into one undifferentiated "could not check". `load`
+      // is a real Atlassian signal (429, or a 5xx — the server itself
+      // saying "not now"), never a guess; everything else (a network error,
+      // any other HTTP status, or `deps.comments` simply not wired up) is
+      // `failed`.
+      // FACTORY-954/FACTORY-949: `rows` (the full filtered comment list, body
+      // included — see excludeBookkeepingComments) rides alongside
+      // `ids`/`newest` so the related-space boss-relevance check below
+      // (`isBossRelevantComment`) and `blockedWake`'s own marker-dedup check
+      // can both read a flagged comment's TEXT without a second
+      // `deps.comments` call — every existing consumer here only ever
+      // destructured `ok`/`newest`/`ids`, so adding a field changes nothing
+      // for them.
+      const commentsCache = new Map<string, Promise<{ ok: true; newest: string | null; ids: readonly string[]; rows: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }>>();
+      const fetchComments = (key: string): Promise<{ ok: true; newest: string | null; ids: readonly string[]; rows: readonly JiraComment[] } | { ok: false; reason: SkippedCommentCheckReason }> => {
         let p = commentsCache.get(key);
         if (!p) {
           p = (async () => {
-            if (!deps.comments) return { ok: false as const };
+            if (!deps.comments) return { ok: false as const, reason: "failed" as const };
             try {
-              const comments = await deps.comments(key);
-              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id) };
-            } catch {
-              return { ok: false as const };
+              const comments = excludeBookkeepingComments(await deps.comments(key));
+              // FACTORY-922 REVIEW FIX: a successful fetch is a fresh,
+              // authoritative read — it resolves `pendingRecheck` for this
+              // key regardless of which arm made the call (see
+              // `pendingRecheck`'s own doc comment above for why that's
+              // correct, not merely convenient).
+              pendingRecheck.delete(key);
+              return { ok: true as const, newest: comments[0]?.id ?? null, ids: comments.map((c) => c.id), rows: comments };
+            } catch (err) {
+              const reason: SkippedCommentCheckReason = err instanceof AtlassianHttpError && (err.status === 429 || err.status >= 500) ? "load" : "failed";
+              return { ok: false as const, reason };
             }
           })();
           commentsCache.set(key, p);
         }
         return p;
       };
+
+      // FACTORY-949 (implementing story FACTORY-948, items 4-5): whether a
+      // boss wake should actually FIRE for `key`'s blocked transition this
+      // poll — debounced per ticket (item 4) and deduped against
+      // escalate.ts's own `[butchr:blocked]` marker (item 5). Returns
+      // `false` for "do not fire" in BOTH cases, same as every suppression
+      // arm above — the caller (`decide()` below) simply falls through to
+      // the ordinary `suppressed()` stack when this returns `false`, which
+      // (being a daemon-label-only diff) suppresses it the same routine way
+      // as any other agent:* flip.
+      const blockedWake = async (key: string): Promise<boolean> => {
+        const now = Date.now();
+        const last = blockedWakeFired.get(key);
+        if (last !== undefined && now - last < blockedWakeDebounceMs) return false; // item 4: debounced
+        // item 5 ("same episode"): operationalized, per this ticket's own
+        // instruction to decide and document it, as "a `[butchr:blocked]`
+        // marker comment landed on this ticket within the window that would
+        // otherwise debounce a bare label re-flip" — i.e. the marker's own
+        // `created` timestamp falls no earlier than `now - debounceMs`. The
+        // marker is NEVER filtered out by `excludeBookkeepingComments`
+        // (WAKE_MARKERS, this file's own import from diff.ts), so the SAME
+        // `fetchComments(key)` call every other arm already shares this
+        // poll already carries it when present — no extra Jira call.
+        const result = await fetchComments(key);
+        if (result.ok) {
+          const windowStart = now - blockedWakeDebounceMs;
+          const markerAlreadyPosted = result.rows.some(
+            (c) => c.body.startsWith(BLOCKED_ESCALATION_MARKER) && Date.parse(c.created) >= windowStart,
+          );
+          if (markerAlreadyPosted) {
+            // The marker already covers this episode — record it as fired
+            // so a LATER bare label flip inside the same window still
+            // debounces against it, without this function having delivered
+            // a second, redundant wake of its own.
+            blockedWakeFired.set(key, now);
+            return false;
+          }
+        }
+        // `!result.ok` (comments unreadable, or `deps.comments` not wired):
+        // fail OPEN toward firing, not toward silence — the opposite
+        // direction every OTHER comments() consumer above fails, because
+        // THEIR default (not suppressing) already delivers via the general
+        // classifier below; this ticket's own item 1 makes THIS event's
+        // default "deliver", so an unreadable dedup check must not be the
+        // thing that silently loses it.
+        blockedWakeFired.set(key, now);
+        return true;
+      };
+
+
 
       // BASELINE SEEDING (KAN-828 item 3): every key sighted THIS poll with
       // no recorded comment-cursor entry yet gets one seeded now, from its
@@ -437,7 +625,33 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             const hadBaseline = commentCursor.has(key);
             const baseline = commentCursor.get(key) ?? null;
             commentCursor.set(key, result.newest);
-            if (!hadBaseline) return { suppressed: false }; // unknown baseline: never suppress
+            // FACTORY-865 (ticket scope item 3): a daemon-label-ONLY diff
+            // (the only way this branch is ever reached — see the
+            // `isDaemonLabelOnlyDiff` guard above) can never itself be a
+            // reason to wake anyone, so an unknown baseline is no longer
+            // the "cannot know -> deliver" case it used to be: it is
+            // suppressed, same as a genuine echo. STATED LIMIT on how often
+            // this branch is actually the one that fires rather than the
+            // echo check just below it: baseline seeding (this module's own
+            // top-of-file comment) already seeds every key in THIS poll's
+            // own seenKeys before any decide() call runs, from the EXACT
+            // SAME memoized `fetchComments` promise this line also reads —
+            // so a seeding fetch that SUCCEEDS has already set the baseline
+            // by the time this runs (making `result.newest === baseline`
+            // below the one that actually suppresses), and a seeding fetch
+            // that FAILS yields the identical cached failure here, hitting
+            // the `!result.ok` return above before ever reaching this line.
+            // This `!hadBaseline` branch is therefore DEFENSIVE under this
+            // module's current invariants, not demonstrated to be live —
+            // kept (rather than left as dead code) because the contract it
+            // states is correct on its own terms regardless of whether
+            // today's seeding order keeps it from ever actually firing, and
+            // because a future change to that order must not silently
+            // reopen the fail-open hole this closes. The cursor is still
+            // seeded, just above, from THIS successful fetch either way —
+            // fail-open discipline is unaffected: nothing is suppressed on a
+            // FAILED fetch, only on a SUCCESSFUL one.
+            if (!hadBaseline) return { suppressed: true };
             if (result.newest === baseline) return { suppressed: true }; // arm 3 echo — no line, see above
             // A mover is now established (`result.newest !== baseline`,
             // both checks above already ruled out). `result.newest` is only
@@ -716,9 +930,118 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
         return verdict;
       };
 
+      // FACTORY-954: whether `id`'s own comment body (looked up in `rows`,
+      // the same filtered — `excludeBookkeepingComments` already dropped
+      // bare `[butchr:*]` bookkeeping — list `fetchComments` just fetched)
+      // is a WORKER->BOSS marker: either `key`'s own identity tag
+      // (`[${key}] …`, the one shape `speakOnOwnChannel`/`tagComment`
+      // give EVERY comment `key`'s own agent posts on its own ticket —
+      // report_to_boss and ask_boss alike, see src/tools/relationship.ts/
+      // src/tools/speak.ts; `submit_to_boss` posts no comment at all, it is
+      // covered by the status-transition arm below instead), or one of the
+      // allowlisted `WAKE_MARKERS` daemon escalations (`[butchr:blocked]`
+      // and friends — src/jira-watch/diff.ts), which are agent-directed
+      // boss escalations even though daemon-authored. `id === null` (the
+      // comment-DELETION edge, see SuppressionVerdict's own doc comment) has
+      // no body to check and is never boss-relevant. A `[review]` reply was
+      // checked against this ticket's own base commit and found to travel
+      // the OPPOSITE direction only (tell_worker, boss -> worker, tagged
+      // with the BOSS's own identity — never the worker's) — it never
+      // reaches this predicate's input as an incoming related-space comment,
+      // so it is deliberately not matched here (see this ticket's PR
+      // description for the full citation).
+      //
+      // KNOWN LIMIT (review finding, FACTORY-954): `jira_add_comment`
+      // (src/tools/defs.ts) auto-tags EVERY agent-authored comment with the
+      // caller's identity, the SAME `[${key}] ` shape report_to_boss/
+      // ask_boss use — not only theirs. The self-tag check below therefore
+      // cannot distinguish a deliberate report to the boss from an
+      // incidental note `key`'s own agent left on its own ticket via the
+      // sideways jira_add_comment channel; both pass. Jira's comment body
+      // carries no signal for "which tool posted this", so this predicate
+      // has no way to tell them apart — accepted as a known limit, not
+      // fixed here. In practice this narrows the gap this ticket closes
+      // (any AGENT-authored comment on the ticket now wakes its boss, not
+      // merely a `report_to_boss`/`ask_boss` one) without reopening it
+      // fully: a HUMAN's or a PEER's comment (no self-tag, or a different
+      // one) still correctly stays silent.
+      const isBossRelevantComment = (key: string, rows: readonly JiraComment[], id: string | null): boolean => {
+        if (id === null) return false;
+        const row = rows.find((r) => r.id === id);
+        if (!row) return false;
+        if (row.body.startsWith(`[${key}] `)) return true;
+        for (const marker of WAKE_MARKERS) if (row.body.startsWith(marker)) return true;
+        return false;
+      };
+
+      // FACTORY-954 — THE RELATED-SPACE ALLOWLIST. `primary` space is
+      // completely untouched by this ticket (every existing `finalize(...)`
+      // call for it is unchanged); this gate sits between the classifier
+      // below and `finalize` ONLY for `space === "related"`, and gates on
+      // the VERDICT's own reason, never re-deriving one:
+      //   - a status transition TO "In Review" or "Done" (the two
+      //     transitions the Epic->Story->Task review/merge flow actually
+      //     depends on reaching the boss);
+      //   - a comment `isBossRelevantComment` above accepts.
+      // Every other reason this module's classifier can name for a related
+      // watcher (label, summary, assignee, description, issuelinks, or any
+      // comment that isn't boss-addressed) is routine child activity and
+      // returns `{ deliver: false }` OUTRIGHT — never through `finalize`,
+      // deliberately: `finalize` can WAKE a sleeping watcher as a side
+      // effect (`sd.wake`), which must never happen for an edge this gate
+      // is about to silence anyway. `appeared`/`disappeared` (existence
+      // changes, not the "any status/label/summary/assignee/description/
+      // issuelinks/comment diff" noise this ticket's own problem statement
+      // names) and the primary-only `pr:*` reason never reach this gate at
+      // all — their own `finalize(...)` call sites, above, are untouched.
+      //
+      // FACTORY-951/FACTORY-964 RECONCILIATION: FACTORY-948/949's
+      // agent:*->agent:blocked carve-out (decide()'s own `blockedWake`
+      // check, below) is now folded into this allowlist as an explicitly
+      // allowed case rather than falling into "everything else" — a
+      // `{ blocked: ... }` reason only ever reaches this gate via that
+      // check, which already restricts it to `space === "related"` and
+      // applies its own debounce/dedup, so allowing it here changes
+      // nothing about WHEN it fires, only that the allowlist itself now
+      // names it instead of relying on bypass ordering.
+      const relatedAllows = (key: string, reason: NotifyReason | undefined, rows: readonly JiraComment[]): boolean => {
+        if (!reason) return false;
+        if ("status" in reason) return reason.status.to === "In Review" || reason.status.to === "Done";
+        if ("comment" in reason) return isBossRelevantComment(key, rows, reason.comment);
+        if ("blocked" in reason) return true;
+        return false;
+      };
+      const deliverToRelated = (
+        key: string,
+        watcher: string,
+        space: "primary" | "related",
+        verdict: EventVerdict,
+        rows: readonly JiraComment[] = [],
+      ): Promise<EventVerdict> => {
+        if (space !== "related" || !verdict.deliver) return finalize(key, watcher, verdict);
+        return relatedAllows(key, verdict.reason, rows) ? finalize(key, watcher, verdict) : Promise.resolve({ deliver: false });
+      };
+
+      // FACTORY-922 REVIEW FIX: force a key with an outstanding, unresolved
+      // §3D check back through `decide()` even when THIS poll's own
+      // (prev, next) pair for it shows no diff at all — see
+      // `pendingRecheck`'s own doc comment above for why `changedKeys`
+      // alone can never do this (it only ever compares one poll's own pair,
+      // and a skipped-check poll's own `next` becomes the NEXT poll's
+      // `prev` unchanged). Only a key still present in `next` is forced in:
+      // one that disappeared is already named by `changedKeys` itself
+      // (the "goneKey" branch), and `decide()`'s own `!after` early return
+      // clears `pendingRecheck` for it (see below) rather than retrying a
+      // key that no longer exists.
+      const withPendingRecheck = (changed: readonly string[], nextKeys: readonly string[]): string[] =>
+        pendingRecheck.size === 0 ? [...changed] : [...new Set([...changed, ...nextKeys.filter((k) => pendingRecheck.has(k))])].sort();
+
       return {
-        changedPrimary: changedKeys(prev.primary, next.primary),
-        changedRelated: changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)),
+        changedPrimary: withPendingRecheck(changedKeys(prev.primary, next.primary), next.primary.map((i) => i.key)),
+        changedRelated: withPendingRecheck(
+          changedKeys(prev.related.map((r) => r.issue), next.related.map((r) => r.issue)),
+          next.related.map((r) => r.issue.key),
+        ),
         async decide(key: string, watcher: string, space: "primary" | "related"): Promise<EventVerdict> {
           const before = space === "primary" ? issueOf(prev.primary, key) : relatedIssueOf(prev.related, key);
           const after = space === "primary" ? issueOf(next.primary, key) : relatedIssueOf(next.related, key);
@@ -770,6 +1093,38 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
             const transition = before && after ? prTransition(before, after) : null;
             if (transition) return finalize(key, watcher, { deliver: true, reason: { pr: transition } });
           }
+          // FACTORY-949 (implementing story FACTORY-948, item 1): a
+          // ticket's agent:* label flipping to `blocked` wakes its BOSS —
+          // deliberately the MIRROR of the pr:* exception just above, never
+          // its twin: that one only ever fires on `space === "primary"`
+          // (the ticket's own agent hearing about itself); this one only
+          // ever fires on `space === "related"`. `createRelated`'s own
+          // related/watchers are built EXCLUSIVELY from `watchedKeys`
+          // (src/jira-watch/routes.ts), which only ever names a ticket's
+          // ACTUAL boss (the one with the outward Implements link to it,
+          // routes.ts's own doc comment) — never a sibling, and never the
+          // ticket's own watcher (that would require `space === "primary"`,
+          // excluded here) — so item 1's "must NOT wake the blocked
+          // ticket's own watcher, nor any sibling's watcher" holds simply
+          // by this being the related space at all; no extra check needed.
+          // Checked BEFORE `suppressed()`, same template as the pr:*
+          // exception above and for the identical reason: a pure agent:*
+          // flip is `isDaemonLabelOnlyDiff`, which `crossDaemonSuppressed`
+          // would otherwise swallow as a routine cross-daemon echo.
+          // `blockedWake(key)` itself applies the debounce (item 4) and the
+          // escalate.ts marker dedup (item 5) — a `false` here falls
+          // straight through to the ordinary `suppressed()` stack below,
+          // same as any other agent:* flip this ticket does not single out.
+          // FACTORY-964: routed through `deliverToRelated` (which, for
+          // `space === "related"`, consults `relatedAllows` before
+          // `finalize`) rather than calling `finalize` directly — the
+          // `blocked` reason is now an explicitly allowed case there, so
+          // this changes nothing about WHEN the wake fires (still gated
+          // only by `space === "related"` plus `blockedWake` above), only
+          // that the allowlist itself names it.
+          if (space === "related" && before && after && blockedTransition(before, after) && (await blockedWake(key))) {
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { blocked: { key } } });
+          }
           // Appear/disappear (no `before` or no `after` to diff at all) is
           // still a real change and is still always delivered, unchecked —
           // unchanged from before this ticket (see `suppressed`'s own
@@ -777,7 +1132,11 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // outright: there is nothing to look up, only a key's presence on
           // either side of the snapshot pair.
           if (!before) return finalize(key, watcher, { deliver: true, reason: { appeared: true } });
-          if (!after) return finalize(key, watcher, { deliver: true, reason: { disappeared: true } });
+          // FACTORY-922 REVIEW FIX: a gone key has nothing left to retry a
+          // §3D check against — clear it rather than force-including it in
+          // `changedPrimary`/`changedRelated` forever (`pendingRecheck`'s
+          // own doc comment above).
+          if (!after) { pendingRecheck.delete(key); return finalize(key, watcher, { deliver: true, reason: { disappeared: true } }); }
           const verdict = await suppressed(key, before, after, watcher);
           if (verdict.suppressed) return { deliver: false };
           // BUTCHR-87: a delivery that escaped suppression BECAUSE the
@@ -800,7 +1159,15 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // reason for what should stay non-structural. `!== undefined`
           // recovers the old `becauseComment === true` meaning on both the
           // with-id and no-id-because-deleted cases.
-          if (verdict.commentId !== undefined) return finalize(key, watcher, { deliver: true, reason: { comment: verdict.commentId } });
+          if (verdict.commentId !== undefined) {
+            // FACTORY-954: `rows` for the related-space boss-relevance check
+            // — the SAME memoized `fetchComments(key)` promise `suppressed()`
+            // (via crossDaemonSuppressed/ledgerHitSuppressed) already
+            // resolved above, so this is a cache hit, never a second Jira
+            // call.
+            const commentFetch = await fetchComments(key);
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { comment: verdict.commentId } }, commentFetch.ok ? commentFetch.rows : []);
+          }
           // The general classifier: every remaining diff the poll can name
           // from the (before, after) `JiraIssue` pair alone, no I/O. Order
           // is a deliberate, documented precedence (more than one can be
@@ -813,65 +1180,126 @@ export function createIssueEventRules(deps: Pick<IssueResourceDeps, "suppress" |
           // a comment this poll never learned about, a link, or a field
           // JiraIssue does not carry at all) falls through to §3(D)'s
           // fallback below.
-          if (before.status !== after.status) return finalize(key, watcher, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
+          if (before.status !== after.status) return deliverToRelated(key, watcher, space, { deliver: true, reason: { status: { from: before.status, to: after.status } } });
           const labelTransition = daemonLabelTransition(before, after);
-          if (labelTransition) return finalize(key, watcher, { deliver: true, reason: { label: labelTransition } });
-          if (before.summary !== after.summary) return finalize(key, watcher, { deliver: true, reason: { summary: true } });
-          // BUTCHR-350 (§3D): the honest "looked, could not (from the
-          // taxonomy above) tell" fallback — REPLACES the old bare `{
-          // deliver: true }` (no `reason` at all). Confirmed at this commit
-          // (the epic's own hypothesis in the ticket, and its own follow-up
-          // comment's structural-constraint finding): a `{ comment: ... }`
-          // reason is reachable ONLY via `verdict.commentId` above, which is
-          // reachable ONLY through crossDaemonSuppressed/ledgerHitSuppressed,
-          // both gated on a daemon-label change being present in THIS
-          // poll's OWN (before, after) diff. A pure foreign-comment bump
-          // (nothing else changed) never reaches that gate, so its FIRST
-          // delivery always fell through to here with no way to name a
-          // comment — not a race, structural, exactly as hypothesised.
-          //
-          // Do NOT change delivery here (§3D's own explicit constraint) —
-          // every branch below still returns `deliver: true`, unconditionally,
-          // exactly as the old bare fallback did. What's added is READING
-          // (never fetching new) already-available per-poll comments()
-          // state to give the REASON three honest, distinguishable shapes
-          // instead of one collapsed "not determinable":
-          //   - `commentsCache` (this poll's shared fetchComments memo) has
-          //     NO entry for `key` at all: no arm had an I/O reason to check
-          //     comments for this key this poll — "unchecked", the common
-          //     case, and the literal mechanism behind §3D's duplicate-notify
-          //     pair (this delivery, then a LATER poll whose daemon-label
-          //     flip finally triggers the check and names `comment`).
-          //   - an entry exists but its fetch failed: "check-failed" — a
-          //     real, different fact from "unchecked" (reuses this
-          //     codebase's existing "could not check" vocabulary — §4 OUT).
-          //   - an entry exists, succeeded, and its `newest` genuinely
-          //     matches `preCommentCursor`'s pre-THIS-poll baseline: comments
-          //     were consulted and POSITIVELY ruled out — "checked-unchanged".
-          //   - an entry exists, succeeded, and `newest` differs from the
-          //     pre-poll baseline (and is non-null): this delivery genuinely
-          //     IS comment-caused, discovered via a DIFFERENT arm's already-
-          //     paid-for fetch this same poll (e.g. a sibling watcher's
-          //     ledger/crossDaemon check on the same key) — named `comment`
-          //     directly, same as `verdict.commentId` above, not a fourth
-          //     `undetermined` shape. STATED RESIDUAL: if an untracked field
-          //     (not status/summary/label/comment — e.g. assignee) is what
-          //     actually bumped `updated` for THIS key, and a genuinely
-          //     unrelated comment happens to have landed in the same window
-          //     AND some other arm happened to have already fetched this
-          //     poll, this could attribute the delivery to that coincidental
-          //     comment. Strictly better than the prior "never even try",
-          //     not a claim of perfect causal precision — see this module's
-          //     own PR description and Confluence doc.
-          const cached = commentsCache.get(key);
-          if (!cached) return finalize(key, watcher, { deliver: true, reason: { undetermined: "unchecked" } });
-          const peeked = await cached;
-          if (!peeked.ok) return finalize(key, watcher, { deliver: true, reason: { undetermined: "check-failed" } });
-          const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
-          if (preBaseline !== undefined && peeked.newest !== null && peeked.newest !== preBaseline) {
-            return finalize(key, watcher, { deliver: true, reason: { comment: peeked.newest } });
+          if (labelTransition) return deliverToRelated(key, watcher, space, { deliver: true, reason: { label: labelTransition } });
+          if (before.summary !== after.summary) return deliverToRelated(key, watcher, space, { deliver: true, reason: { summary: true } });
+          // FACTORY-922 (implementing FACTORY-921's resolved decision
+          // point): assignee, description, and linked-issue changes are
+          // CONFIRMED diffs the (before, after) pair already carries, no
+          // extra I/O needed — the decision explicitly says these must wake
+          // the worker, unlike a priority-only or non-daemon-label-only
+          // change (neither of which `JiraIssue` even carries as a
+          // trackable field — see NotifyReason's own doc comment).
+          // FACTORY-954: for a RELATED watcher none of status(non-In
+          // Review/Done)/label/summary/assignee/description/issuelinks is
+          // boss-relevant — `deliverToRelated` silences all but the two
+          // status transitions the review/merge flow depends on; PRIMARY
+          // behavior is byte-identical (same verdict, just routed through
+          // one more function that is a no-op for `space === "primary"`).
+          if (before.assignee !== after.assignee) return deliverToRelated(key, watcher, space, { deliver: true, reason: { assignee: { from: before.assignee, to: after.assignee } } });
+          if (before.description !== undefined && after.description !== undefined && before.description !== after.description) {
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { description: true } });
           }
-          return finalize(key, watcher, { deliver: true, reason: { undetermined: "checked-unchanged" } });
+          const linkDiff = issuelinksDiff(before, after);
+          if (linkDiff) return deliverToRelated(key, watcher, space, { deliver: true, reason: { issuelinks: linkDiff } });
+          // FACTORY-922 (implementing story FACTORY-921 §1 — REPLACES
+          // BUTCHR-350's §3D fallback below): the old fallback delivered,
+          // unconditionally, on every `updated` bump this taxonomy could
+          // not explain — even the "unchecked" case, where NOTHING this
+          // poll had even tried to look at comments for this key. Measured
+          // on this fleet (see FACTORY-921's own evidence): that is the
+          // ~2-wakes/min/daemon noise this ticket removes. A poll that
+          // cannot CONFIRM a diff must not notify.
+          //
+          // So this fallback now ACTIVELY tries the comment fetch for `key`
+          // — the SAME shared per-poll memo every other arm above already
+          // uses (`fetchComments`): if a sibling arm already called it this
+          // poll (the old "checked-unchanged"/"comment" cases), this reuses
+          // that exact promise, no second Jira call; if nothing had a
+          // reason to yet (the old "unchecked" case), this is the first and
+          // only call for this key this poll.
+          //
+          // Three honest outcomes, nothing guessed:
+          //   - the fetch could not be trusted at all (`!result.ok` — load-
+          //     shed or genuinely failed, see `fetchComments`'s own doc
+          //     comment): do NOT notify, and leave `commentCursor` for `key`
+          //     UNTOUCHED (never advanced) so the identical comparison
+          //     re-runs next poll — no lost change, no blind wake. Logged
+          //     and counted (`skippedCommentCheckLine`/`onCommentCheckSkipped`)
+          //     so an operator can see this is happening, distinctly from
+          //     every `[notify-suppressed]` class above (none of which this
+          //     is — those all learned a real diff existed first).
+          //   - the fetch succeeded and `newest` genuinely moved since
+          //     `preCommentCursor`'s pre-THIS-poll baseline: a real, CONFIRMED
+          //     comment — deliver, named `comment:<id>` exactly as the old
+          //     `verdict.commentId`/"checked, found one" paths already do.
+          //   - the fetch succeeded and nothing moved: this `updated` bump
+          //     is attributed to a field this classifier does not track
+          //     (e.g. a priority or non-daemon label edit — exactly the
+          //     class the resolved FACTORY-921 decision says must NOT wake
+          //     anyone). Advance the snapshot (this poll positively
+          //     observed the newest id, so the NEXT poll must compare
+          //     against it, not a stale one) and stay silent.
+          // BUTCHR-307 INTERACTION (not addressed by FACTORY-921's own text,
+          // reconciled here): a SLEEPING watcher's fail-toward-waking
+          // contract is independent of this fallback's new skip-not-notify
+          // discipline and must survive it untouched — `finalize()`'s own
+          // per-watcher `unseenFor` check (and its own fetchComments
+          // fail-open) is a SEPARATE, more precise safety net than this
+          // fallback's commentCursor comparison, and the old code relied on
+          // ALWAYS handing it a `deliver: true` verdict for every
+          // non-structural uncertain case specifically so THAT check, not
+          // this one, decides whether a sleeping watcher actually wakes.
+          // Collapsing straight to `{ deliver: false }` here for an asleep
+          // watcher would silently reopen the exact "stays asleep on an
+          // unverifiable fetch" hazard BUTCHR-307 exists to close. So: an
+          // AWAKE watcher (the common case, and the one FACTORY-921's noise
+          // measurement is actually about) gets the new behaviour straight;
+          // an ASLEEP watcher is routed through `finalize()` exactly as
+          // before this ticket, unaffected by anything above.
+          const result = await fetchComments(key);
+          const asleep = Boolean(deps.standDown?.isAsleep(watcher));
+          if (!result.ok) {
+            // RATE-LIMITED (ticket's own item 4 wording): log/count once per
+            // UNRESOLVED EPISODE for this key, not once per (poll, watcher)
+            // pair — `pendingRecheck.has(key)` is already true for every
+            // later retry of the SAME still-failing key (including a
+            // second watcher consulting it in this SAME poll, via the
+            // shared `fetchComments` memo), so only the episode's first
+            // sighting ever logs/counts. A key that later resolves, then
+            // fails again, is a NEW episode and logs/counts again.
+            const alreadyPending = pendingRecheck.has(key);
+            // FACTORY-922 REVIEW FIX (PR #732 round 1): mark this key for a
+            // forced retry on a LATER poll even if nothing else about it
+            // ever changes again — see `pendingRecheck`'s own doc comment.
+            // Set for BOTH branches below: an asleep watcher's own
+            // fail-toward-waking wake (right below) answers "does THIS
+            // watcher need waking right now", a narrower question than
+            // "has the §3D check for this KEY actually been confirmed" —
+            // a second awake watcher of the same key (or this same watcher
+            // on a later poll) still needs the retry.
+            pendingRecheck.add(key);
+            if (!alreadyPending) {
+              deps.onCommentCheckSkipped?.(key, result.reason);
+              log(skippedCommentCheckLine(key, result.reason));
+            }
+            if (!asleep) return { deliver: false };
+            // FACTORY-954: "undetermined" never carries a confirmed comment
+            // body to check — not in this ticket's related-space allowlist,
+            // so a related watcher gets `deliver: false` here even while
+            // asleep (a deliberate narrowing of BUTCHR-307's fail-toward-
+            // waking net to PRIMARY space only; see `deliverToRelated`'s own
+            // doc comment).
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { undetermined: "check-failed" } });
+          }
+          commentCursor.set(key, result.newest);
+          const preBaseline = preCommentCursor.has(key) ? (preCommentCursor.get(key) ?? null) : undefined;
+          if (preBaseline !== undefined && result.newest !== null && result.newest !== preBaseline) {
+            return deliverToRelated(key, watcher, space, { deliver: true, reason: { comment: result.newest } }, result.rows);
+          }
+          if (!asleep) return { deliver: false };
+          return deliverToRelated(key, watcher, space, { deliver: true, reason: { undetermined: "checked-unchanged" } });
         },
       };
     },

@@ -7,12 +7,16 @@ to rebase away, no discarded approvals. Do **not** append to a shared
 `## [Unreleased]` section instead; that reintroduces the exact conflict this
 scheme exists to remove.
 
-The release workflow collates every fragment present on `main` at merge time,
-computes the version from their declared bump levels, writes it into
-`package.json` and a dated `## [x.y.z] - YYYY-MM-DD` heading in
-`CHANGELOG.md`, and deletes the fragments it consumed. **Do not** bump
-`package.json`'s version or add a dated CHANGELOG heading yourself — the
-release gate rejects both.
+The release workflow (`.github/workflows/release.yml`, still disabled —
+FACTORY-627) computes the next version at MERGE time from the latest `v*`
+git tag plus the HIGHEST declared bump among the fragments added since that
+tag, tags that commit, and creates a GitHub Release with notes built from
+those fragments. There is **no commit to `main`**: `package.json`'s
+`version` and `CHANGELOG.md` are never written by the release workflow, and
+fragments are never deleted — a fragment simply stops counting once a tag
+is made at or after it (see `scripts/release/git.ts`'s
+`fragmentsAddedSince`). **Do not** bump `package.json`'s version or add a
+dated CHANGELOG heading yourself — the release gate rejects both.
 
 ## Format
 

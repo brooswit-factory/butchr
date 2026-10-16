@@ -34,7 +34,7 @@ const noDashboard = async (): Promise<DashboardResponse> => ({ checked: true, co
 // below that predates the dashboard PAGE and isn't exercising it — the page's
 // own render contract gets its dedicated fixtures in dashboard-page.test.ts,
 // and this file's own dedicated `GET /` describe block below.
-const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } });
+const noHeader = (): DashboardHeaderInfo => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } });
 const noResourceLink = async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` });
 // FACTORY-72: a trivial, empty fixture for every existing ViewDeps literal
 // below that predates /config-inventory and isn't exercising it — that
@@ -167,6 +167,23 @@ describe("butchr webapp + open action", () => {
     expect(html).toContain("open terminal");
     expect(html).toContain("resource");
   });
+  // FACTORY-613 (replays FACTORY-432 / PR #546): route-level smoke test
+  // only — is `/dashboard-app` actually wired to src/web/static-assets.ts
+  // through the real app? The handler's own serving/traversal/fallback
+  // contract is exercised directly (with a real built-app-shaped temp dir)
+  // in test/unit/static-assets.test.ts. This deliberately does NOT assert
+  // 200 vs 503: whether `resolveWebRoot()`'s real filesystem lookup finds an
+  // actual `dist/web` depends on whether `bun run build:web` has been run in
+  // this checkout, which this test must not require or assume either way —
+  // only that the route never 500s. FACTORY-647: a missing build now 503s
+  // (a friendly body naming the remedy), never 404 — see
+  // test/unit/dashboard-app-missing-build.test.ts for that contract's own
+  // dedicated coverage against both states.
+  test("GET /dashboard-app is wired to the static-asset handler (never a 500, regardless of whether the web app has been built yet)", async () => {
+    const r = await fetch(`${base}/dashboard-app`);
+    expect([200, 503]).toContain(r.status);
+    if (r.status === 503) expect(await r.text()).toContain("bun run build:web");
+  });
   test("GET /state returns the active agents", async () => {
     expect(await (await fetch(`${base}/state`)).json()).toEqual([{ issue: "KAN-9", status: "working", summary: "do a thing" }]);
   });
@@ -244,7 +261,7 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     // sha and the stale-currency line the route is supposed to pass through
     // from `deps.header()` actually reach the served page.
     const header = (): DashboardHeaderInfo => ({
-      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9" },
+      build: { sha: "e".repeat(40), shaDirty: false, shaUnknownReason: null, version: "9.9.9", versionProvenance: "tag", versionUnknownReason: null },
       currency: {
         checkedAt: new Date(pollTime).toISOString(),
         verdict: { status: "stale", commitsBehind: 5, commitsAhead: 0, base: { ref: "refs/remotes/origin/main", sha: "c".repeat(40), changedAt: null, changedAtUnknownReason: "x", fetchedAt: null, fetchedAtUnknownReason: "x" }, dirtyUndeterminable: false },
@@ -861,6 +878,13 @@ describe("/health reflects real notify-stage liveness (BUTCHR-57)", () => {
         search: async () => [mode === "quiet" ? base_issue : { ...base_issue, updated: new Date(2026, 0, 1, 0, 0, 0, ++tick).toISOString() }],
         herd,
         notify: async () => { if (!allowNotify) throw new Error("notify blocked for test"); },
+        // FACTORY-922: decide()'s §3D fallback now ACTIVELY checks comments
+        // rather than guessing on a pure `updated` bump — a `comments` dep
+        // whose newest id moves every tick (mirroring `tick` itself) is
+        // what keeps each "changing"-mode diff CONFIRMED, so `notify` is
+        // still actually invoked (and can still actually be made to fail)
+        // every tick, exactly as this test's own comment above requires.
+        comments: async () => [{ id: String(tick), body: "x", created: "c", authorEmail: null }],
         intervalMs: 10,
         onPollSuccess: () => pollHealth.recordSuccess(),
         onNotifySuccess: () => notifyHealth.recordSuccess(),

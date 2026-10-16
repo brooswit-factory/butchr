@@ -4,7 +4,7 @@ import { createStallRemediator, MARKER } from "../../src/agents/stall-remediatio
 const MIN = 60_000;
 
 /** A fake Jira comment store: addComment writes land here, newest-first, exactly like AtlassianClient.comments(). */
-function fakeJira() {
+function fakeJira(clock: () => number = Date.now) {
   const byTicket = new Map<string, { id: string; body: string; created: string }[]>();
   const posted: { target: string; text: string }[] = [];
   let seq = 0;
@@ -12,7 +12,7 @@ function fakeJira() {
     posted,
     addComment: async (issue: string, text: string) => {
       seq++;
-      const now = new Date().toISOString();
+      const now = new Date(clock()).toISOString();
       const rows = byTicket.get(issue) ?? [];
       rows.unshift({ id: `c${seq}`, body: text, created: now });
       byTicket.set(issue, rows);
@@ -60,16 +60,7 @@ describe("createStallRemediator", () => {
     expect(jira.posted).toEqual([]);
   });
 
-  // Hard constraint (AC6), PRECISELY: a null poll never GATES the
-  // act/suppress decision, is never collapsed into "not stalled" or
-  // "confirmed stalled", and never causes a post ON ITS OWN — the APPLIED
-  // label does. A prior version of this suite (and the PR/doc prose) said
-  // the narrower, ambiguous "a null poll never posts" — true only when
-  // `labelApplied` is false, and caught in review as untested for the
-  // `labelApplied: true` combination, where the module actually DOES act.
-  // See StallOutcome's own doc comment in stall-remediation.ts for why that
-  // is deliberate, not a gap.
-  describe("the could-not-verify (null) poll never gates the decision, and is never collapsed", () => {
+  describe("unknown inactivity fails closed without resetting an episode", () => {
     test("null is its own distinct suppressed reason when the label is NOT applied — never conflated with not-a-candidate or stabilizing", async () => {
       const jira = fakeJira();
       const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
@@ -97,25 +88,18 @@ describe("createStallRemediator", () => {
       expect(jira.posted.length).toBe(1);
     });
 
-    // PINS THE REVIEW FINDING: once the label is already APPLIED, a null
-    // stalledPollResult this poll does NOT block remediation — the module
-    // proceeds exactly as it would for `true`. DELIBERATE (see
-    // StallOutcome's own doc comment): gating the wake on a fresh non-null
-    // verification EVERY poll would let a persistently failing comments()
-    // endpoint silently disable the deadlock-breaker during exactly the
-    // degraded conditions where a becalming is most likely.
-    test("once the label IS applied, a null stalledPollResult this poll still acts — the applied label gates, not the raw per-poll fetch", async () => {
+    test("an applied label cannot substitute for current verified inactivity", async () => {
       const jira = fakeJira();
       const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
       const outcome = await rem.check("KAN-1", true, null);
-      expect(outcome.kind).toBe("acted");
-      expect(jira.posted.length).toBe(1);
+      expect(outcome.kind).toBe("suppressed");
+      expect(jira.posted.length).toBe(0);
     });
 
-    test("once the label IS applied, a null stalledPollResult still respects debounce (adoption/rate-cap), same as any other value", async () => {
+    test("unknown observations preserve an already spoken episode", async () => {
       const jira = fakeJira();
       const rem = createStallRemediator({ now: () => 0, addComment: jira.addComment, comments: jira.comments });
-      await rem.check("KAN-1", true, null); // acts once
+      await rem.check("KAN-1", true, true); // acts once
       const again = await rem.check("KAN-1", true, null); // steady state
       expect(again.kind).toBe("suppressed");
       expect(jira.posted.length).toBe(1);
@@ -312,39 +296,13 @@ describe("createStallRemediator", () => {
     expect(logs).toEqual([]);
   });
 
-  // The rate cap is a backstop against a BROKEN or lagging adoption read
-  // (e.g. Jira read-after-write lag on the comments endpoint), not against
-  // legitimate repeat episodes — those are already caught by adoption
-  // itself (see the two tests below). Exercised here with a `comments()`
-  // that never sees the module's own prior posts, forcing every forgotten-
-  // and-retried episode to attempt a genuine new post.
-  test("the rate cap backstops a comments() reader that never sees this module's own prior posts: at most 3 wake comments per hour", async () => {
+  test("a continuous stall stays silent even when history temporarily omits its notice", async () => {
     let now = 0;
     const posted: string[] = [];
-    const logs: string[] = [];
-    const rem = createStallRemediator({
-      now: () => now,
-      addComment: async (_issue, text) => { posted.push(text); },
-      comments: async () => [], // simulates a lagging/broken adoption read — never finds its own prior post
-      log: (l) => logs.push(l),
-    });
-
-    for (let episode = 0; episode < 4; episode++) {
-      now = episode * MIN;
-      rem.forget("KAN-1"); // simulate a fresh episode each time
-      await rem.check("KAN-1", true, true);
-    }
-    expect(posted.length).toBe(3); // the 4th attempt is capped
-    expect(logs.some((l) => l.startsWith("WARNING: [stall]") && l.includes("rate cap reached"))).toBe(true);
+    const rem = createStallRemediator({now: () => now, comments: async () => [], addComment: async (_key, text) => { posted.push(text); }});
+    for (let day = 0; day < 4; day++) { now = day * 1440 * MIN; await rem.check("KAN-1", true, true); }
+    expect(posted).toHaveLength(1);
   });
-
-  // DELIBERATE (see StallRemediationTracker.forget's own doc comment):
-  // dedupe is by Jira EVIDENCE (the fingerprint on the ticket's own comment
-  // history), not by in-memory episode bookkeeping — `forget` resets this
-  // module's own floor/latch, but a real `comments()` reader still finds
-  // the prior wake comment and adopts it. At most one wake comment per
-  // issue for the ticket's lifetime, matching frozen-asleep.ts's identical
-  // single-fingerprint-per-id convention.
   test("a later re-stall after `forget` adopts the SAME prior wake comment rather than posting a new one", async () => {
     let now = 0;
     const jira = fakeJira();
@@ -358,9 +316,9 @@ describe("createStallRemediator", () => {
     expect(jira.posted.length).toBe(1); // adopted, not duplicated
   });
 
-  test("a poll where the label is no longer applied (recovered) resets in-memory tracking, but a later re-stall still adopts the prior comment via Jira evidence", async () => {
+  test("verified recovery permits a later stall to post again", async () => {
     let now = 0;
-    const jira = fakeJira();
+    const jira = fakeJira(() => now);
     const rem = createStallRemediator({ now: () => now, addComment: jira.addComment, comments: jira.comments });
     await rem.check("KAN-1", true, true);
     expect(jira.posted.length).toBe(1);
@@ -368,8 +326,8 @@ describe("createStallRemediator", () => {
     await rem.check("KAN-1", false, false); // recovered: label no longer applied
     now = 5 * MIN;
     const outcome = await rem.check("KAN-1", true, true); // re-stalled
-    expect(outcome.kind).toBe("suppressed");
-    expect(jira.posted.length).toBe(1); // still just the one, adopted
+    expect(outcome.kind).toBe("acted");
+    expect(jira.posted.length).toBe(2); // one per episode
   });
 
   test("elapsed minutes reported are this module's OWN observation window, not fabricated", async () => {

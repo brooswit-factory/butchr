@@ -7,6 +7,7 @@ import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig,
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
+import { absPath } from "../helpers/abs-path";
 
 // FACTORY-118 review round 1: A2/A3/A4/A6 each need a test that PINS the
 // addendum's own claim directly, not just incidentally exercised as a side
@@ -49,8 +50,8 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
     const root = mkdtempSync(join(tmpdir(), "butchr-sticky-"));
     try {
       // Two different real paths reducing to the same "<parent>:<name>" short id — the FACTORY-90 collision example.
-      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
-      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/acme/rinth" });
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "acme", "rinth") });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "acme", "rinth") });
 
       const firstDirBeforeCollision = ensureWorkspaceDir(first, root);
       expect(firstDirBeforeCollision.endsWith("/acme:rinth")).toBe(true); // no collision yet — bare name
@@ -83,8 +84,8 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
       // Short ids "p:a.b" and "p:a-b" — two DIFFERENT directory names (no
       // directory-name collision between them at all) that both slug to
       // "...-p-a-b" (every non-alphanumeric character becomes "-").
-      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a.b" });
-      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/p/a-b" });
+      const first = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("p", "a.b") });
+      const second = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("p", "a-b") });
 
       const firstDir = ensureWorkspaceDir(first, root);
       expect(firstDir.endsWith("/p:a.b")).toBe(true); // no directory-NAME collision — claimed bare
@@ -103,7 +104,7 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
   test("Addendum A6: an in-directory bookkeeping stamp is a HINT, never an authority — a stamp copied into a foreign directory, or left at the wrong leaf for its own key, is never trusted", () => {
     const root = mkdtempSync(join(tmpdir(), "butchr-untrusted-stamp-"));
     try {
-      const realKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/acme/rinth" });
+      const realKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "acme", "rinth") });
       const realDir = ensureWorkspaceDir(realKey, root);
       expect(readBookkeptAgentKey(realDir)).toBe(realKey);
       expect(agentIdOfWorkspacePath(realDir, root)).toBe(realKey);
@@ -123,6 +124,100 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
       // legacy percent-encoded form.
       unlinkSync(join(realDir, ".butchr-agent-key.json"));
       expect(agentIdOfWorkspacePath(realDir, root)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+// FACTORY-570: on win32 a managed-session definition's resourceId is a
+// backslash-separated, drive-lettered Windows path
+// (`C:\Users\broos\...\codex-test.json`) — `managedSessionShortDisplayId`
+// (src/rules/session-definition-type.ts) looks for the LAST `/` to find the
+// bare definition name, finds none, and returns almost the whole raw path as
+// its "short id". Before this ticket, `isValidLeaf` accepted that string
+// verbatim (it only ever rejected `/`, never `:`/`\`), so it was joined
+// straight onto the workspace root — exactly the shape of butchr's own
+// reported failure: `ENOENT: no such file or directory, mkdir
+// 'C:\Users\broos\butchr-workspaces\filesystem\managed-sessions\C:\Users\broos\...'`.
+// `platform` is always injected here (never left at the suite's real
+// `process.platform`) so every case below runs, and proves the SAME thing,
+// on any CI host — including the `windows` job, where the injected value and
+// the real one now agree.
+describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspace leaf — never the raw drive path", () => {
+  const WIN_ROOT = "C:\\Users\\broos\\butchr-workspaces";
+  const WIN_RESOURCE_ID = "C:\\Users\\broos\\butchr\\config\\session-definitions\\codex-test.json";
+
+  test("isValidLeaf: `:` and `\\` are rejected on platform win32 (the hostile shape managedSessionShortDisplayId can produce for a Windows path), but stay valid on posix — Addendum A2's own permissive half, unchanged", () => {
+    // Unchanged, default-platform (posix in this suite) behaviour — the
+    // existing Addendum A2 pin above already covers `isValidLeaf(":")` at
+    // the default, but restated here as the explicit contrast this ticket's
+    // own fix depends on: same string, opposite verdict, platform-gated.
+    expect(isValidLeaf(":", "linux")).toBe(true);
+    expect(isValidLeaf(":", "win32")).toBe(false);
+    expect(isValidLeaf("\\", "linux")).toBe(true);
+    expect(isValidLeaf("\\", "win32")).toBe(false);
+    expect(isValidLeaf(WIN_RESOURCE_ID, "win32")).toBe(false); // the exact hostile "short id" shape this ticket fixes
+    expect(isValidLeaf("codex-test", "win32")).toBe(true); // an ordinary bare name is still fine on win32
+  });
+
+  test("newLayoutDirFor: a managed-session Windows resourceId falls back to the flat, fully percent-encoded legacy leaf — never the raw drive path with its `:`/`\\` intact", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+    const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
+    const leaf = dir.split(/[\\/]/).pop()!; // last path segment, either separator (this host's real path.join picks one)
+    expect(leaf).toBe(encodeURIComponent(WIN_RESOURCE_ID));
+    expect(leaf.includes(":")).toBe(false);
+    expect(leaf.includes("\\")).toBe(false);
+    expect(leaf.includes("/")).toBe(false);
+  });
+
+  test("UNC ids get the same flat treatment as a drive-letter id", () => {
+    const uncId = "\\\\server\\share\\defs\\x.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
+    const leaf = dir.split(/[\\/]/).pop()!;
+    expect(leaf).toBe(encodeURIComponent(uncId));
+    expect(leaf.includes(":")).toBe(false);
+    expect(leaf.includes("\\")).toBe(false);
+  });
+
+  test("round trip holds on win32: encode -> workspaceDirFor -> agentIdOfWorkspacePath decodes back to the exact original key, for a drive-letter id", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+    const dir = workspaceDirFor(key, WIN_ROOT, "win32");
+    expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
+  });
+
+  test("round trip holds on win32 for a UNC id too", () => {
+    const uncId = "\\\\server\\share\\defs\\x.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const dir = workspaceDirFor(key, WIN_ROOT, "win32");
+    expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
+  });
+
+  test("posix behaviour is byte-identical: a managed session still gets its short, bare definition name, never the flat encoded slug", () => {
+    // `platform` (pinned to "linux" here, never this suite's real
+    // `process.platform`) governs only the id/leaf VALIDITY logic
+    // (isValidLeaf/candidateLeaf/isResourceId) — `node:path`'s `join` inside
+    // `workspaceDirFor` itself always uses the REAL host's separator
+    // (backslash on the `windows` CI job), so the leaf — the one thing this
+    // ticket's fix actually changes — is asserted on its own, split on
+    // either separator, rather than against one hardcoded full path.
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/brooswit/.config/butchr/session-definitions/admin-assembly.json" }, "linux");
+    const dir = workspaceDirFor(key, "/root/butchr-workspaces", "linux");
+    expect(dir.split(/[\\/]/).pop()).toBe("admin-assembly");
+  });
+
+  test("real mkdir + rmdir under a temp root: ensureWorkspaceDir actually creates the leaf this fix computes, and the created directory's own basename carries no `:`/`\\`/`/` — the assertion the windows CI job proves on real NTFS, since there `platform: win32` is also this run's real `process.platform`", () => {
+    const root = mkdtempSync(join(tmpdir(), "butchr-570-mkdir-"));
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+      const dir = ensureWorkspaceDir(key, root, "win32");
+      expect(existsSync(dir)).toBe(true);
+      const basename = dir.split(/[\\/]/).pop()!;
+      expect(basename.includes(":")).toBe(false);
+      expect(basename.includes("\\")).toBe(false);
+      expect(basename.includes("/")).toBe(false);
+      expect(basename).toBe(encodeURIComponent(WIN_RESOURCE_ID));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -158,21 +253,21 @@ describe("workspace identity", () => {
     const root = workspaceRoot();
     expect(agentIdOfWorkspacePath(join(root, "kan-42"))).toBe("KAN-42");
     expect(agentIdOfWorkspacePath(join(root, "nested", "KAN-42"))).toBeNull();
-    expect(agentIdOfWorkspacePath("/tmp/KAN-42")).toBeNull();
+    expect(agentIdOfWorkspacePath(absPath("tmp", "KAN-42"))).toBeNull();
     expect(agentIdOfWorkspacePath(null)).toBeNull();
   });
   test("rule agent ids cover every provider and never a legacy workspace", () => {
-    const root = "/w";
-    expect(ruleAgentIdOfWorkspacePath("/w/jira-work/build/KAN-1", root)).toBe("jira-work:build:KAN-1");
-    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/acme%2Fweb%2342", root)).toBe("github-issue:triage:acme%2Fweb%2342");
-    expect(ruleAgentIdOfWorkspacePath("/w/jira-idea/ideas/IDEA-7", root)).toBe("jira-idea:ideas:IDEA-7");
-    expect(ruleAgentIdOfWorkspacePath("/w/zendesk-ticket/support/acme%2312", root)).toBe("zendesk-ticket:support:acme%2312");
-    expect(ruleAgentIdOfWorkspacePath("/w/kan-42", root)).toBeNull();
-    expect(ruleAgentIdOfWorkspacePath("/w/github-issue/triage/not-a-ref", root)).toBeNull();
+    const root = absPath("w");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "jira-work", "build", "KAN-1"), root)).toBe("jira-work:build:KAN-1");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "github-issue", "triage", "acme%2Fweb%2342"), root)).toBe("github-issue:triage:acme%2Fweb%2342");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "jira-idea", "ideas", "IDEA-7"), root)).toBe("jira-idea:ideas:IDEA-7");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "zendesk-ticket", "support", "acme%2312"), root)).toBe("zendesk-ticket:support:acme%2312");
+    expect(ruleAgentIdOfWorkspacePath(join(root, "kan-42"), root)).toBeNull();
+    expect(ruleAgentIdOfWorkspacePath(join(root, "github-issue", "triage", "not-a-ref"), root)).toBeNull();
     expect(ruleAgentIdOfWorkspacePath(null, root)).toBeNull();
   });
   test("BUTCHR-397: a query-level agent's workspace round-trips through workspaceDirFor/agentIdOfWorkspacePath and sits as a SIBLING of that rule's per-resource ones, never their parent", () => {
-    const root = "/w";
+    const root = absPath("w");
     const queryKey = encodeQueryAgentKey({ resourceProvider: "jira-work", ruleId: "triage" });
     const resourceKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "BUTCHR-12" });
     const queryDir = workspaceDirFor(queryKey, root);
@@ -234,385 +329,48 @@ describe("workspace identity", () => {
 });
 
 describe("briefFor / modelFor", () => {
-  test("each type gets its brief; unknown gets default", () => {
-    expect(briefFor("Epic")).toContain("You own one outcome");
-    expect(briefFor("Story")).toContain("one increment of value");
-    expect(briefFor("Task")).toContain("one unit of work");
-    expect(briefFor("Bug")).toContain("Read your ticket");
-  });
-  // FACTORY-40: briefs/bug.md was rewritten from a ~21-line worker-tier stub
-  // ("You own one defect. Reproduce it... work in the repository... submit
-  // the bug for review") into a boss-tier brief, the same tier as an Epic —
-  // it files Stories for the fix and formally reviews them, never touching
-  // code itself. This guards the shape of that rewrite directly, the same
-  // way the merge-check-guard/assertion-check-guard accounting guards its
-  // review-instruction content: a future edit that quietly regresses bug.md
-  // back toward "fix it yourself" fails this loudly instead of only
-  // surfacing in a much later end-to-end symptom.
-  test("FACTORY-40: bug brief is boss-tier — reviews Stories via new_worker, sends a [review] line, states the Done-gate, and carries no worker-stub phrasing instructing it to fix code itself", () => {
-    const brief = briefFor("Bug");
-    // boss-side staffing verb, same as epic.md/story.md teach for their own workers
-    expect(brief).toContain("new_worker");
-    expect(brief).toContain("adopt_worker");
-    // the reviewer-side [review] line shape this brief sends DOWN to a Story
-    expect(brief).toMatch(/\[review\]\s+APPROVED\s+<pr-url>\s+@\s*<full 40-char sha>/);
-    expect(brief).toMatch(/\[review\]\s+CHANGES_REQUESTED\s+<pr-url>\s+@\s*<full 40-char sha>/);
-    // the Done-gate, stated in words (point 6 of FACTORY-40's own ticket)
-    expect(brief).toContain("never closes itself");
-    expect(brief).toContain("Stories is not Done");
-    // negative: none of the old worker-stub's own phrasing survives
-    expect(brief).not.toContain("identify the smallest correct fix");
-    expect(brief).not.toContain("work in the repository and branch named by the ticket");
-    expect(brief).not.toContain("submit the bug for review");
-    // negative: a Bug never authors its own PR — no author-side merge check
-    // (that's Story's/Task's instruction, not a boss's — see
-    // merge-check-guard.test.ts's MERGE_INSTRUCTING_BRIEFS)
-    expect(brief).not.toContain("reviews[].commit.oid");
-  });
-  test("BUTCHR-71: a project resource is selected the SAME WAY an issue's issuetype is — 'project' resolves to briefs/project.md, case-insensitively", () => {
-    expect(briefFor("project")).toContain("You own a **product**, not a ticket");
-    expect(briefFor("Project")).toBe(briefFor("project")); // same case-insensitivity every other entry gets
-  });
-  // BUTCHR-318: project.md must name its inbound surfaces precisely (root
-  // doc comments, plus In-Review epics' ticket comments), say an In
-  // Progress epic cannot reach it, say it hears a running epic only on its
-  // own initiative, and correct the misconception (BUTCHR-277's own doc
-  // asserted this wrongly) that an epic's report_to_boss lands on the root doc.
-  test("project brief names its inbound surfaces precisely and corrects the report_to_boss-lands-on-root-doc misconception", () => {
-    const brief = briefFor("project");
-    expect(brief).toContain("Name your inbound surfaces precisely");
-    expect(brief).toContain("the ticket comments of any epic");
-    expect(brief).toContain("In Progress is not in that result set");
-    expect(brief).toContain("it cannot reach you this way");
-    expect(brief).toContain("You hear a running epic only by reading its ticket yourself");
-    expect(brief).toContain("the epic's own ticket, never on your root doc");
-  });
-  // BUTCHR-331 defect 1: an ISSUE caller's report_to_boss/ask_boss can NEVER
-  // write a root-doc comment (src/tools/speak.ts's project-id branch is the
-  // only path to one) — the brief must name the real writers (the project's
-  // own report_to_boss/ask_boss, a peer's tell_peer, a person or agent
-  // commenting directly) instead of the false "any caller's".
-  test("project brief names the real writers of root-doc comments, not 'any caller's report_to_boss/ask_boss'", () => {
-    const brief = briefFor("project");
-    expect(brief).not.toContain("any caller's `report_to_boss`");
-    expect(brief).toContain("written by YOUR OWN `report_to_boss`/`ask_boss`");
-    expect(brief).toContain("a peer project's `tell_peer`");
-    expect(brief).toContain("a person or agent commenting on the page directly");
-    expect(brief).toContain("never by an issue caller's `report_to_boss`/`ask_boss`");
-  });
-  // BUTCHR-331 defect 2: the project's activation verdict ORs THREE axes
-  // (src/resources/project.ts: versionBehind || commentBehind || epicsBehind)
-  // — a root-doc BODY edit (the version axis) also wakes the project. The
-  // brief previously said "exactly two ... full stop", omitting it.
-  test("project brief names all three wake axes, including the root-doc version/body-edit axis, and drops the false 'exactly two ... full stop' precision", () => {
-    const brief = briefFor("project");
-    expect(brief).not.toContain("exactly two");
-    expect(brief).not.toContain("full stop");
-    expect(brief).toContain("three wake axes");
-    expect(brief).toContain("the VERSION axis");
-  });
-  // BUTCHR-337 defect 1: the VERSION axis parenthetical claimed "epics have
-  // been told to put load-bearing directives in the page body" — false, and
-  // self-contradicting within the same paragraph, which later says an epic
-  // overwriting the root doc body is destructive and not a channel, never a
-  // way for an epic to talk to the project. The VERSION axis itself stays
-  // real; only the false justification is dropped.
-  test("project brief drops the false 'epics have been told' claim from the VERSION axis parenthetical, while the axis itself remains", () => {
-    const brief = briefFor("project");
-    expect(brief).not.toContain("epics have been told");
-    expect(brief).toContain("three wake axes");
-    expect(brief).toContain("the VERSION axis");
-  });
-  // BUTCHR-335 defect 1: "an epic has no verb that edits or comments on your
-  // root doc" was FALSE — confluence_update_page is an unguarded full-body
-  // replace with no check on whose page it is, so an epic CAN overwrite a
-  // project's root doc body with it (src/tools/defs.ts). Only the "comments"
-  // half was ever true. The brief must say so without presenting
-  // confluence_update_page as a usable backchannel to the project.
-  test("project brief no longer claims an epic has no verb that EDITS the root doc, and does not offer confluence_update_page as a backchannel", () => {
-    const brief = briefFor("project");
-    expect(brief).not.toContain("an epic has no verb that edits or comments on your root doc");
-    expect(brief).not.toContain("no verb that edits");
-    expect(brief).toMatch(/no verb that\s+comments on your root doc/);
-    expect(brief).toContain("confluence_update_page");
-    expect(brief).toContain("not a message reaching you");
-    expect(brief).toContain("not a way for an epic to talk to you");
-  });
-  test("models: epic=opus story=opus task=sonnet project=opus, default sonnet", () => {
+  test("models: epic=opus story=opus task=sonnet, default sonnet", () => {
     expect(modelFor("Epic")).toBe("opus");
     expect(modelFor("Story")).toBe("opus");
     expect(modelFor("Task")).toBe("sonnet");
     expect(modelFor("Whatever")).toBe("sonnet");
-    // BUTCHR-71: a project resource gets the SAME tier an epic gets, not the
-    // task-level default — it makes epic-level product judgment.
-    expect(modelFor("project")).toBe("opus");
+    // FACTORY-526: a `jira-project` rule with no explicit agentPreferences
+    // model must not silently spawn Opus — `project` now falls to the same
+    // sonnet default every other unrecognised issue type gets. It used to
+    // get the epic tier (BUTCHR-71); that's now opt-in via agentPreferences.
+    expect(modelFor("project")).toBe("sonnet");
   });
-  test("effort: epic/story/task/project all high, unknown type also defaults to high without throwing", () => {
+  test("effort: epic/story/task high, project low, unknown type defaults to high without throwing", () => {
     expect(effortFor("Epic")).toBe("high");
     expect(effortFor("Story")).toBe("high");
     expect(effortFor("Task")).toBe("high");
-    expect(effortFor("project")).toBe("high");
+    // FACTORY-526: keep the missing-model default cheap on effort too.
+    expect(effortFor("project")).toBe("low");
     expect(() => effortFor("Whatever")).not.toThrow();
     expect(effortFor("Whatever")).toBe("high");
     expect(effortFor("EPIC")).toBe("high");
     expect(effortFor("Story")).toBe("high");
   });
-  test("reviewer briefs carry the [review] verdict-line instruction", () => {
-    expect(briefFor("Epic")).toContain("[review] APPROVED");
-    expect(briefFor("Story")).toContain("[review] APPROVED");
-  });
-  // This guard was written to pin an INSTRUCTION: an epic/story must
-  // transition its child to In Progress, because an assigned-but-To-Do
-  // child is never staffed. BUTCHR-13's review of PR #120 (BUTCHR-43) found
-  // that in epic.md "never staffed" now sits inside a HISTORICAL sentence
-  // explaining a hole new_worker's required disposition already closed, not
-  // an activation instruction — the substring still matches, but what makes
-  // it match moved out from under the guard. That's variant #7 of this
-  // epic's guard-failure family (a check whose SUBJECT moved while the
-  // assertion kept matching) — distinct from too-narrow, too-wide,
-  // wrong-moment, adjacent-field, delta-not-requirement and write-not-effect,
-  // the other six this epic has produced. Kept below, not deleted: in
-  // story.md this text is still an operative warning, not history, and the
-  // guard is weaker, not worthless. The guard that actually pins the
-  // structural property that replaced the instruction is the one right
-  // after it.
-  test("epic and story briefs carry the staffing-activation instruction", () => {
-    expect(briefFor("Epic")).toContain("In Progress");
-    expect(briefFor("Epic")).toContain("never staffed");
-    expect(briefFor("Story")).toContain("In Progress");
-    expect(briefFor("Story")).toContain("never staffed");
-  });
-  // BUTCHR-43: the property that actually replaced the instruction above is
-  // structural, not procedural — new_worker takes a REQUIRED disposition
-  // ("start" or "shelve"+reason) with no default and no third option, so a
-  // filed worker can't be left undeclared. Per-tier on purpose (Epic files
-  // Stories, Story files Tasks — each teaches new_worker at its own call
-  // site, so a rewrite that drops the requirement from only one brief must
-  // fail exactly that tier's expect, not get covered by the other's).
-  //
-  // Scope of what this guards: this can only assert that the BRIEF SAYS the
-  // disposition is required with no default — it says nothing about whether
-  // relationship.ts actually enforces that. If the requirement were removed
-  // from the code tomorrow, this guard would still pass, brief text intact.
-  // The behaviour itself is guarded separately, code-side, by
-  // test/unit/relationship.test.ts and test/unit/tools.test.ts, which assert
-  // the refusals directly (a missing disposition, a reasonless shelve) —
-  // verify those still exist rather than trusting this comment. Two guards,
-  // two different properties (prose vs. behaviour); this one only covers the
-  // first, and the pairing is what covers both.
-  test("epic and story briefs teach new_worker's disposition as required, with no default and no third option", () => {
-    const epic = briefFor("Epic");
-    expect(epic).toContain("required disposition");
-    expect(epic).toContain("no third option and no default");
 
-    const story = briefFor("Story");
-    expect(story).toContain("required disposition");
-    expect(story).toContain("no third option");
-    expect(story).toContain("never left undeclared");
+  test("bundled workflows use explicit targets and preserve review, hold and completion evidence", () => {
+    for (const type of ["Epic", "Story", "Task", "Bug", "project", "unknown"]) {
+      const brief = briefFor(type);
+      for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "jira_update_issue", "add_link"]) expect(brief).toContain(verb);
+      expect(brief).toContain("Hierarchy and review assignments are process conventions, not tool permissions");
+      expect(brief).toContain("Keep cancellations cancelled, freezes frozen");
+      expect(brief).toContain("not proof that the requested behavior works");
+      expect(brief).not.toMatch(/\b(new_worker|ask_boss|submit_to_boss|set_doc)\b/);
+    }
   });
-  // BUTCHR-46: the old `reviewDecision,headRefOid` two-signal check could
-  // not detect a stale approval — `headRefOid` is the PR's CURRENT head, not
-  // the reviewed head, so it keeps matching a local HEAD after every push
-  // while `reviewDecision` stays APPROVED (this repo doesn't dismiss stale
-  // reviews). Both required signals survived exactly the event they existed
-  // to catch, proven live against PR #120's own review history. The guard is
-  // now pinned to `reviews[].commit.oid`, the field this check anchors on
-  // instead of `headRefOid` (NOT immutable itself — see BUTCHR-74, which
-  // caveats this in every merge-instructing channel), plus a negative
-  // assertion that the old command string is gone — the same cheap defense
-  // against a partial revert as the other negative guards here.
-  //
-  // Scope of what this guards: this can only assert that the BRIEF SAYS to
-  // use the last-decisive-review check — it says nothing about whether `gh`
-  // actually returns those fields as described. If the command were wrong
-  // and never caught anything, this guard would still pass, brief text
-  // intact.
-  //
-  // BUTCHR-47: the ordering half of this check was unguarded. The assertion
-  // used to be `toContain("last")` — the bare English word, which ordinary
-  // prose elsewhere in both briefs also contains, so the assertion was
-  // satisfied no matter what the command said. A `] | last` -> `] | first`
-  // mutation (picking the OLDEST decisive review instead of the newest —
-  // reintroducing the stale-approval bug this whole guard exists to prevent)
-  // left every test green. The assertion now pins `] | last`, the actual jq
-  // operator the ordering depends on, because that is the token a
-  // "simplification" would change and the bare word was not enough to catch
-  // it.
-  test("author briefs carry the last-decisive-review merge check, not the stale reviewDecision+headRefOid one", () => {
-    for (const t of ["Story", "Task"]) {
-      const brief = briefFor(t);
+  test("author briefs retain current-head and last-decisive-review checks", () => {
+    for (const type of ["Story", "Task"]) {
+      const brief = briefFor(type);
       expect(brief).toContain("reviews[].commit.oid");
       expect(brief).toContain('select(.state=="APPROVED" or .state=="CHANGES_REQUESTED")');
       expect(brief).toContain("] | last");
-      expect(brief).not.toContain("reviewDecision,headRefOid");
+      expect(brief).toContain("base-merge");
+      expect(brief).toContain("not sufficient");
     }
-  });
-  // BUTCHR-38: the relationship-verb rewrite. Guards below protect the
-  // load-bearing new instructions so the next rewrite can't silently drop
-  // them, the same way the guards above protect the ones before them.
-  test("every brief teaches set_doc's replace-not-append semantic", () => {
-    for (const t of ["Epic", "Story", "Task", "Bug"]) {
-      expect(briefFor(t)).toContain("FULL-BODY REPLACE");
-      expect(briefFor(t)).toContain("not an append");
-    }
-  });
-  // FACTORY-112: FACTORY-84/FACTORY-86 retired automatic per-ticket doc
-  // creation, so a boss can no longer assume its worker has a doc to check —
-  // the staleness check is now conditional on one having been explicitly
-  // requested and existing, not an unconditional part of every review.
-  test("reviewing tiers' checklists reject on doc staleness, conditionally on a doc actually existing", () => {
-    for (const brief of [briefFor("Epic"), briefFor("Story")]) {
-      const collapsed = brief.replace(/\s+/g, " ");
-      expect(collapsed).toContain("staleness there reads as authoritative, so a stale page is grounds to reject");
-      expect(collapsed).toContain("have no doc at all");
-    }
-  });
-  test("the captain's-log convention is fully gone — no title format, no convention link, in any brief", () => {
-    for (const t of ["Epic", "Story", "Task", "Bug"]) {
-      const brief = briefFor(t);
-      expect(brief).not.toContain("Log — ");
-      expect(brief.toLowerCase()).not.toContain("captain's log");
-      expect(brief).not.toContain("10715137");
-    }
-  });
-  test("epic and story briefs teach the boss-side relationship verbs", () => {
-    for (const t of ["Epic", "Story"]) {
-      const brief = briefFor(t);
-      // start_worker added by BUTCHR-42: it was absent from every brief, so
-      // reactivating a shelved worker or pulling one back from In Review had
-      // no documented route. Its presence in this per-tier loop is itself
-      // the guard that would have caught that gap.
-      for (const verb of ["new_worker", "start_worker", "shelve_worker", "adopt_worker", "finish_worker", "prioritize_worker", "tell_worker"]) {
-        expect(brief).toContain(verb);
-      }
-    }
-  });
-  test("story and task briefs teach the worker-side relationship verbs", () => {
-    for (const t of ["Story", "Task"]) {
-      const brief = briefFor(t);
-      for (const verb of ["report_to_boss", "ask_boss", "submit_to_boss"]) {
-        expect(brief).toContain(verb);
-      }
-    }
-  });
-  // BUTCHR-42: GAP 1 — start_worker is also the verb that reverses
-  // shelve_worker, so it belongs right where shelve_worker is taught, in
-  // both epic.md and story.md individually (a per-tier check, not just the
-  // aggregate verb-list guard above, since a brief could name the verb
-  // without covering both reactivation cases).
-  test("epic and story briefs teach start_worker covering both the shelved-reactivation and In-Review-back-to-work cases", () => {
-    for (const t of ["Epic", "Story"]) {
-      const brief = briefFor(t);
-      expect(brief).toContain("start_worker");
-      expect(brief).toContain("back from In Review");
-    }
-  });
-  // BUTCHR-42: GAP 3 — ask_boss was taught in story.md/task.md/default.md
-  // but missing from epic.md specifically, right where "too vague to
-  // decompose" already told an epic agent to comment and stop. An aggregate
-  // check across all briefs would have missed this (ask_boss was already
-  // present elsewhere); this guard is Epic-specific on purpose.
-  test("epic brief names ask_boss for a too-vague-to-decompose epic description", () => {
-    const brief = briefFor("Epic");
-    expect(brief).toContain("ask_boss");
-    expect(brief).toContain("too vague to decompose");
-  });
-  // BUTCHR-318: an epic's boss is a project, which reads the epic's ticket
-  // comments only while the epic is In Review — the too-vague-to-decompose
-  // ask_boss call above happens while the epic is still In Progress, so
-  // epic.md must say plainly that nothing automated is reading it yet.
-  test("epic brief's too-vague-to-decompose passage states ask_boss is unread while the epic is still In Progress", () => {
-    const brief = briefFor("Epic");
-    expect(brief).toContain("if you do have a project boss, it");
-    expect(brief).toContain("reads your ticket's comments only while you are In Review");
-    expect(brief).toContain("nothing automated is reading it at");
-  });
-  // BUTCHR-318: the blocked-dialog escalation passage must state the
-  // Epic→Project conditionality (an In Progress epic's report_to_boss wakes
-  // nobody) and must say submit_to_boss is not a doorbell, plus what an
-  // In Progress epic should do instead (call report_to_boss anyway).
-  test("epic brief's blocked-dialog section states the Epic→Project conditionality and that submit_to_boss is not a doorbell", () => {
-    const brief = briefFor("Epic");
-    expect(brief).toContain("your boss is a");
-    expect(brief).toContain("project, and a project reads an epic's ticket comments only while that epic");
-    expect(brief).toContain("is In Review");
-    expect(brief).toContain('it does NOT "escalate to');
-    expect(brief).toContain("whoever watches you\" the way the same call genuinely does for a Story or a");
-    expect(brief).toContain("`submit_to_boss` is not a doorbell.");
-    expect(brief).toContain("call `report_to_boss` anyway");
-  });
-
-  // BUTCHR-331 defect 3(a): "escalate to a human immediately" named no
-  // mechanism — no verb reaches a human. The brief must instead say the
-  // concrete substance: call report_to_boss anyway, only a person reading
-  // the ticket directly will see it, and no agent will answer.
-  test("epic brief's submit_to_boss-is-not-a-doorbell passage names the concrete mechanism instead of the undefined 'escalate to a human immediately' phrase", () => {
-    const brief = briefFor("Epic");
-    expect(brief).toContain("only a PERSON READING YOUR TICKET DIRECTLY will ever see it");
-    expect(brief).toContain("no agent will answer it");
-    expect(brief).not.toContain("escalate to a human immediately");
-  });
-  // BUTCHR-42: GAP 2 — jira_get_issue, jira_search, jira_add_comment,
-  // confluence_search_pages and confluence_list_spaces are retained
-  // PERMANENTLY (never deprecated, on no removal clock) but that was never
-  // stated anywhere. Each guard below is per-tier and only covers the
-  // briefs where the ticket confirmed the name is actually used, so a
-  // future rewrite can't satisfy it by adding the word "permanent" to one
-  // brief while leaving the other silent.
-  test("every brief marks jira_get_issue as a permanent lookup", () => {
-    for (const t of ["Epic", "Story", "Task", "Bug"]) {
-      expect(briefFor(t)).toContain("permanent lookup");
-    }
-  });
-  test("epic, story, and task briefs mark jira_search as permanent alongside jira_get_issue", () => {
-    for (const t of ["Epic", "Story", "Task"]) {
-      const brief = briefFor(t);
-      expect(brief).toContain("jira_search");
-      expect(brief.toUpperCase()).toContain("PERMANENTLY");
-    }
-  });
-  test("epic and story briefs teach jira_add_comment as the permanent sideways peer channel", () => {
-    for (const t of ["Epic", "Story"]) {
-      const brief = briefFor(t);
-      expect(brief).toContain("jira_add_comment");
-      expect(brief.toLowerCase()).toContain("sideways");
-      expect(brief.toUpperCase()).toContain("PERMANENT");
-    }
-  });
-  test("epic and story briefs teach confluence_search_pages/confluence_list_spaces as permanent discovery tools", () => {
-    for (const t of ["Epic", "Story"]) {
-      const brief = briefFor(t);
-      expect(brief).toContain("confluence_search_pages");
-      expect(brief).toContain("confluence_list_spaces");
-    }
-  });
-  test("every brief points at the ASSIST space", () => {
-    for (const t of ["Epic", "Story", "Task", "Bug"]) {
-      expect(briefFor(t)).toContain("wiki/spaces/ASSIST");
-    }
-  });
-  test("the blocked-dialog ANSWER reply names tell_worker, not a bare comment", () => {
-    expect(briefFor("Epic")).toContain("tell_worker(story, text)");
-    expect(briefFor("Story")).toContain("tell_worker(task, text)");
-  });
-  // BUTCHR-46: `finish_without_a_boss` merged in PR #121 as the successor to
-  // jira_transition(my_own_key, "Done") for the top-level, bossless case
-  // that epic.md's step 5 previously flagged as an honest gap ("no
-  // relationship verb closes a top-level ticket to Done"). The negative
-  // assertion is the cheap guard against a partial revert: `jira_transition`
-  // had exactly one occurrence in epic.md (the parenthetical this replaces)
-  // before this change, so asserting its total absence from the brief is the
-  // simplest honest form, not an approximation of a narrower claim.
-  //
-  // Scope of what this guards: this can only assert that the BRIEF SAYS
-  // finish_without_a_boss and no longer sends an epic to jira_transition for
-  // Done — it says nothing about whether the tool itself behaves that way.
-  // If finish_without_a_boss were deleted from the code tomorrow, this guard
-  // would still pass, brief text intact.
-  test("epic brief teaches finish_without_a_boss and no longer names jira_transition for the Done case", () => {
-    const epic = briefFor("Epic");
-    expect(epic).toContain("finish_without_a_boss");
-    expect(epic).not.toContain("jira_transition");
   });
 });
 describe("interpolate", () => {
@@ -623,6 +381,11 @@ describe("interpolate", () => {
   });
 });
 describe("buildWorkspace", () => {
+  // Reused across several managed-session fixtures below — one canonical filesystem resourceId.
+  const ETC_DEFS_A_JSON = absPath("etc", "defs", "a.json");
+  // Reused across several "never throws for a missing workspace dir" fixtures below.
+  const DOES_NOT_EXIST = absPath("does", "not", "exist");
+
   test("writes CLAUDE.md, interpolated brief.md, and mcp.json with x-issue", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-"));
@@ -676,7 +439,7 @@ describe("buildWorkspace", () => {
     const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp");
       expect(dir).toBe(workspaceDirFor(key, root));
@@ -701,7 +464,7 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-tools-note-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const managedSpec: SpawnSpec = { key: managedKey, issuetype: "managed-session", summary: "s", parent: null, brief: "Tend it." };
       const managedDir = buildWorkspace(managedSpec, "http://x/mcp");
       const managedBrief = readFileSync(join(managedDir, "brief.md"), "utf8");
@@ -709,7 +472,7 @@ describe("buildWorkspace", () => {
       expect(managedBrief).not.toContain(FILESYSTEM_TOOLS_NOTE);
       expect(managedBrief).toContain("freeze_session");
 
-      const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
+      const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: absPath("repo", "a.md") });
       const plainSpec: SpawnSpec = { key: plainKey, issuetype: "filesystem", summary: "s", parent: null, brief: "Keep it current." };
       const plainDir = buildWorkspace(plainSpec, "http://x/mcp");
       const plainBrief = readFileSync(join(plainDir, "brief.md"), "utf8");
@@ -723,18 +486,18 @@ describe("buildWorkspace", () => {
   });
 
   test("PR #394 review fix (round 3): agentLaunchConfig keeps the launched PROCESS at the bookkeeping dir even when spec.cwd is set — see SpawnSpec.cwd's own doc comment (Drovr's launch.cwd===workspace.cwd invariant) — while mcp config stays anchored there too, for both vendors", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: "/repo/some-project" };
-    const bookkeepingDir = "/butchr-workspaces/filesystem/managed-sessions/%2Fetc%2Fdefs%2Fa.json";
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
+    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: absPath("repo", "some-project") };
+    const bookkeepingDir = absPath("butchr-workspaces", "filesystem", "managed-sessions", "%2Fetc%2Fdefs%2Fa.json");
     const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
     expect(claudeLaunch.cwd).toBe(bookkeepingDir);
-    expect(claudeLaunch.cwd).not.toBe("/repo/some-project");
+    expect(claudeLaunch.cwd).not.toBe(absPath("repo", "some-project"));
     expect((claudeLaunch as { mcpConfigPath: string }).mcpConfigPath).toBe(`${bookkeepingDir}/mcp.json`);
     const codexLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "codex" });
     expect(codexLaunch.cwd).toBe(bookkeepingDir);
     // No spec.cwd: byte-for-byte unchanged behaviour for every other spec.
     const noOverride: SpawnSpec = { key: "AGY-1", issuetype: "Task", summary: "s", parent: null };
-    expect(agentLaunchConfig(noOverride, "/some/dir", "pane-1", "name", { provider: "claude" }).cwd).toBe("/some/dir");
+    expect(agentLaunchConfig(noOverride, absPath("some", "dir"), "pane-1", "name", { provider: "claude" }).cwd).toBe(absPath("some", "dir"));
   });
 
   test("PR #394 review fix 2, end-to-end: a spawn through buildWorkspace + agentLaunchConfig never touches pre-existing CLAUDE.md/AGENTS.md/mcp.json in the operator's own working directory, for both vendors (round 3: the guarantee holds trivially now — butchr's process never even launches there)", () => {
@@ -750,7 +513,7 @@ describe("buildWorkspace", () => {
     writeFileSync(join(real, "mcp.json"), ownMcpJson);
     try {
       for (const provider of ["claude", "codex"] as const) {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: `/etc/defs/${provider}.json` });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", `${provider}.json`) });
         const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
         const dir = buildWorkspace(spec, "http://x/mcp", provider);
         const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
@@ -784,9 +547,11 @@ describe("buildWorkspace", () => {
       const mcp = JSON.parse(readFileSync(mcpJsonPath, "utf8"));
       expect(mcp.mcpServers.butchr.url).toBe("http://x/mcp");
       expect(mcp.mcpServers["mud-bridge"]).toEqual({ type: "http", url: "https://mud.internal/mcp", headers: { Authorization: "Bearer secret-token" } });
-      // A resolved secret header value makes mcp.json 0600.
-      const mode = require("node:fs").statSync(mcpJsonPath).mode & 0o777;
-      expect(mode).toBe(0o600);
+      // A resolved secret header value makes mcp.json 0600. FACTORY-569: NTFS has no POSIX permission bits.
+      if (process.platform !== "win32") {
+        const mode = require("node:fs").statSync(mcpJsonPath).mode & 0o777;
+        expect(mode).toBe(0o600);
+      }
       // The persisted, staleness-check-only sidecar carries the binding's metadata (name/url/channel/headersEnvVar NAME) — never a resolved header value.
       const persisted = readFileSync(join(dir, ".butchr-mcp-servers.json"), "utf8");
       expect(persisted).not.toContain("secret-token");
@@ -800,7 +565,8 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("mcp.json keeps its default permissions when no binding resolves a secret header", () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("mcp.json keeps its default permissions when no binding resolves a secret header", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-mcp-nosecret-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -823,7 +589,7 @@ describe("buildWorkspace", () => {
     try {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceMcpServers(dir)).toBeUndefined();
-      expect(workspaceMcpServers("/does/not/exist")).toBeUndefined();
+      expect(workspaceMcpServers(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -861,8 +627,8 @@ describe("buildWorkspace", () => {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspacePermissionMode(dir)).toBeUndefined();
       expect(workspaceStrictMcpConfig(dir)).toBeUndefined();
-      expect(workspacePermissionMode("/does/not/exist")).toBeUndefined();
-      expect(workspaceStrictMcpConfig("/does/not/exist")).toBeUndefined();
+      expect(workspacePermissionMode(DOES_NOT_EXIST)).toBeUndefined();
+      expect(workspaceStrictMcpConfig(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -900,7 +666,7 @@ describe("buildWorkspace", () => {
     try {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceLizardMode(dir)).toBeUndefined();
-      expect(workspaceLizardMode("/does/not/exist")).toBeUndefined();
+      expect(workspaceLizardMode(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -955,8 +721,8 @@ describe("buildWorkspace", () => {
       const dir = buildWorkspace({ key: "KAN-9", issuetype: "Story", summary: "s", parent: null }, "http://x/mcp");
       expect(workspaceModel(dir)).toBeUndefined();
       expect(workspaceEffort(dir)).toBeUndefined();
-      expect(workspaceModel("/does/not/exist")).toBeUndefined();
-      expect(workspaceEffort("/does/not/exist")).toBeUndefined();
+      expect(workspaceModel(DOES_NOT_EXIST)).toBeUndefined();
+      expect(workspaceEffort(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -987,7 +753,7 @@ describe("buildWorkspace", () => {
 
     test("discoverClaudeSessionId returns the NEWEST transcript's id for this cwd, ignoring non-.jsonl files", async () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-"));
-      const dir = "/some/workspace/KAN-20";
+      const dir = absPath("some", "workspace", "KAN-20");
       try {
         fakeTranscript(home, dir, "older-session");
         await tick();
@@ -1003,7 +769,7 @@ describe("buildWorkspace", () => {
     test("discoverClaudeSessionId returns undefined when the project folder doesn't exist (no launch has happened yet, or discovery is checked against the wrong home)", () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
       try {
-        expect(discoverClaudeSessionId("/some/workspace/KAN-21", home)).toBeUndefined();
+        expect(discoverClaudeSessionId(absPath("some", "workspace", "KAN-21"), home)).toBeUndefined();
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -1018,7 +784,7 @@ describe("buildWorkspace", () => {
     // before the launch that produces it.
     test("discoverClaudeSessionId with `after` set NEVER returns a transcript created before that instant, even when it is the newest (or ONLY) one present — falls through to undefined instead of a wrong-but-real id", async () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-after-"));
-      const dir = "/some/workspace/KAN-24";
+      const dir = absPath("some", "workspace", "KAN-24");
       try {
         fakeTranscript(home, dir, "prior-respawns-old-session"); // a real, older transcript from BEFORE this launch
         await tick();
@@ -1028,6 +794,52 @@ describe("buildWorkspace", () => {
         await tick();
         fakeTranscript(home, dir, "this-launchs-real-session"); // now the REAL one for this launch appears
         expect(discoverClaudeSessionId(dir, home, after)).toBe("this-launchs-real-session");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    // FACTORY-631/FACTORY-623/FACTORY-568 regression — the millisecond-
+    // granularity hazard, driven at FUNCTION level (not by looping the full
+    // `herd.test.ts` scenario, which the FACTORY-623 diagnosis measured as
+    // 0/40 locally: its margin is ~5-6ms alone, only ~1.6-2.0ms in the full
+    // suite — the wrong instrument here).
+    //
+    // A naive "write, then `Date.now()`" repro (as the FACTORY-623 diagnosis
+    // measured on ITS OWN host: stale id returned in 476/500 trials) is
+    // itself a TIMING RACE, and racing it is exactly the "loop and hope"
+    // approach that ticket's own diagnosis warns off — measured on THIS
+    // worker's own host/filesystem (see `/tmp` script output recorded in the
+    // PR description), the same race held 0/2000: this host's write+stat+
+    // `Date.now()` sequence consistently takes long enough to roll into the
+    // NEXT millisecond, so a bare timing race can't be trusted to fail here
+    // the way it failed on the diagnosis's host. Driving the exact defect
+    // deterministically needs no race at all: read the file's OWN real
+    // `created` back, then set `after := Math.floor(created)` — a value
+    // `Date.now()` COULD legitimately have produced for a launch starting
+    // anywhere in that same millisecond. By construction `Math.floor(created)
+    // <= created`, so the unmodified `created >= after` check ALWAYS held
+    // (measured 500/500 on this host) and wrongly treated the file as this
+    // launch's own; the fixed `created >= after + AFTER_MARGIN_MS` check
+    // requires `created >= Math.floor(created) + 1`, which is NEVER true,
+    // so the fix rejects it every time (see `discoverClaudeSessionId`'s own
+    // doc comment for why that margin is the correct, minimal one).
+    test("discoverClaudeSessionId never accepts a stale transcript whose `created` floors to the SAME whole millisecond as `after` (FACTORY-631/FACTORY-623/FACTORY-568)", () => {
+      const home = mkdtempSync(join(tmpdir(), "claude-home-ms-hazard-"));
+      try {
+        const dir = absPath("some", "workspace", "KAN-25");
+        const projectDir = join(home, ".claude", "projects", resolve(dir).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        const TRIALS = 200;
+        for (let i = 0; i < TRIALS; i++) {
+          const id = `stale-trial-${i}`;
+          const file = join(projectDir, `${id}.jsonl`);
+          writeFileSync(file, "{}");
+          const stat = statSync(file);
+          const created = stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+          const after = Math.floor(created); // a `Date.now()`-shaped value sharing `created`'s own millisecond — the ambiguous case
+          expect(discoverClaudeSessionId(dir, home, after)).toBeUndefined();
+        }
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -1073,7 +885,7 @@ describe("buildWorkspace", () => {
     test("claudeTranscriptExists is true only for a REAL transcript, false for a missing one or the wrong home", () => {
       const home = mkdtempSync(join(tmpdir(), "claude-home-exists-"));
       const otherHome = mkdtempSync(join(tmpdir(), "claude-home-other-"));
-      const dir = "/some/workspace/KAN-22";
+      const dir = absPath("some", "workspace", "KAN-22");
       try {
         fakeTranscript(home, dir, "real-session");
         expect(claudeTranscriptExists(dir, "real-session", home)).toBe(true);
@@ -1108,7 +920,7 @@ describe("buildWorkspace", () => {
     try {
       const codexDir = buildWorkspace({ key: "KAN-12", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp", "codex");
       expect(workspaceSessionId(codexDir)).toBeUndefined();
-      expect(workspaceSessionId("/does/not/exist")).toBeUndefined();
+      expect(workspaceSessionId(DOES_NOT_EXIST)).toBeUndefined();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -1164,7 +976,7 @@ describe("buildWorkspace", () => {
     const evilDotMcpJson = JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } });
     writeFileSync(join(real, ".mcp.json"), evilDotMcpJson);
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
       const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp", "claude");
       const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider: "claude" });
@@ -1199,8 +1011,8 @@ describe("buildWorkspace", () => {
     const ancestorMcpJson = join(root, ".mcp.json");
     writeFileSync(ancestorMcpJson, JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } }));
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: "/repo/some-project" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
+      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: absPath("repo", "some-project") };
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(/would inherit/);
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(ancestorMcpJson);
       // Nothing was written before the guard fired — refuse-before-write, not partial-then-fail.
@@ -1303,7 +1115,8 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
   // VALUE landed in a group/other-readable mcp.json at the default umask.
   const mode = (path: string) => statSync(path).mode & 0o777;
 
-  test("mcp.json carrying a bound server's resolved header is chmod 0600 (owner-only)", () => {
+  // FACTORY-569: NTFS has no POSIX permission bits — nothing here to assert on win32.
+  test.skipIf(process.platform === "win32")("mcp.json carrying a bound server's resolved header is chmod 0600 (owner-only)", () => {
     withRoot(() => {
       process.env.BUTCHR_TEST_WS_PERM_HEADERS = JSON.stringify({ Authorization: "Bearer secret" });
       try {
@@ -1313,7 +1126,7 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  test("a binding-less mcp.json keeps its default (unchanged) permissions — not tightened when there is no secret to protect", () => {
+  test.skipIf(process.platform === "win32")("a binding-less mcp.json keeps its default (unchanged) permissions — not tightened when there is no secret to protect", () => {
     withRoot(() => {
       const dir = buildWorkspace({ key: "KAN-26", issuetype: "Task", summary: "s", parent: null }, "http://x/mcp");
       const withoutBindings = mode(join(dir, "mcp.json"));
@@ -1336,14 +1149,14 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  test("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
+  test.skipIf(process.platform === "win32")("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
     withRoot(() => {
       const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
       expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
     });
   });
 
-  test("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
+  test.skipIf(process.platform === "win32")("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
     withRoot(() => {
       const spec = { key: "KAN-28", issuetype: "Task", summary: "s", parent: null };
       const dir = buildWorkspace(spec, "http://x/mcp"); // first build: no bindings, default perms
@@ -1375,7 +1188,7 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
       });
     });
 
-    test("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
+    test.skipIf(process.platform === "win32")("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
       withRoot(() => {
         const dir = buildWorkspace({ key: "KAN-31", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_x" }, "http://x/mcp");
         expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
@@ -1405,7 +1218,8 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
           const dir = buildWorkspace({ key: "KAN-34", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...rocketr, headersEnvVar: "BUTCHR_TEST_WS_ROCKETR_HEADERS" }], rocketchatAccount: "butchr_x" }, "http://x/mcp");
           const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
           expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "X-Extra": "v", "x-rocketr-account": "butchr_x" } });
-          expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
+          // FACTORY-569: NTFS has no POSIX permission bits.
+          if (process.platform !== "win32") expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
         } finally { delete process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS; }
       });
     });

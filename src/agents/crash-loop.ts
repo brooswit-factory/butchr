@@ -1,4 +1,5 @@
 import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-helper.js";
+import type { OpsAlertRouter } from "./ops-alert.js";
 
 /**
  * BUTCHR-141 — making a crash-looping agent audible. `planReconcile`
@@ -209,6 +210,50 @@ export interface CrashLoopDetectorDeps {
   /** Recent comments/complaints on `id`'s own channel, newest-first is fine — see this module's own top comment for why a fetch FAILURE must be distinguishable from "fetched fine, nothing found" (never collapsed into the same branch). */
   comments: (id: string) => Promise<readonly CommentRow[]>;
   log?: (line: string) => void;
+  /**
+   * FACTORY-622 — the PUSH half of this detector, for a tier whose
+   * `addComment` has nowhere to go.
+   *
+   * THE DEFECT. A managed session (director, genius, an admin agent) has no
+   * Jira ticket at all, so `src/daemon/index.ts` wires its instance's
+   * `addComment` to a `console.error` and its `comments` to `[]` — see that
+   * wiring's own comment. The complaint is therefore CORRECT and completely
+   * invisible: measured twice, on 2026-10-02 (director and genius, 5+
+   * spawns/hour each, "nowhere to post") and again on 2026-10-03
+   * (admin-brooswit-nexus, 26 refusals, "a crash-loop complaint that reached
+   * only the journal"). Both times a human found out by reading a journal on
+   * the right host, which is the exact pull-only failure `./ops-alert.ts`
+   * exists to fix, and which that module's own header already names this
+   * detector as the planned caller for.
+   *
+   * A THUNK, NOT THE ROUTER ITSELF, and this is the only reason why: both
+   * detector instances are module-level `const`s in `src/daemon/index.ts`
+   * built several hundred lines BEFORE the Rocket.Chat credential the router
+   * is constructed from is even loaded. Taking the router by value would
+   * force that whole chain to move earlier (it is depended on in between) or
+   * read it in its temporal dead zone. Resolved per raise instead, which
+   * also costs nothing: `raise` is itself cheap and synchronous.
+   *
+   * Absent — the ordinary state for a tier that HAS a ticket to comment on —
+   * nothing about this detector changes. It is deliberately NOT wired into
+   * the issue tier: that tier's complaint lands on the resource's own Jira
+   * ticket where the people who care already look, and duplicating it into a
+   * shared room is the "spam destroys a channel's credibility" outcome this
+   * module's own top comment ranks worse than silence.
+   */
+  opsAlert?: () => OpsAlertRouter | undefined;
+  /**
+   * FACTORY-622: why `id`'s last spawn attempt did not leave an agent
+   * running — `HerdrHerd.lastSpawnRefusal` (src/agents/herd.ts), which is
+   * non-destructive precisely so this can be read on every poll. Named in
+   * the ops alert, because "spawned 5 times in 60 minutes" tells a human
+   * there is a loop but not what to do about it, whereas "Current worker
+   * disappeared; refusing implicit replacement" names the condition
+   * outright. `undefined` whenever nothing refused the last attempt (the
+   * agent died AFTER a successful launch, say) — the alert then says so
+   * rather than inventing a reason.
+   */
+  refusalReason?: (id: string) => string | undefined;
 }
 
 export interface CrashLoopDetector {
@@ -281,6 +326,57 @@ export function createCrashLoopDetector(deps: CrashLoopDetectorDeps): CrashLoopD
     return postedAt;
   }
 
+  /**
+   * FACTORY-622: push this crash loop to the ops-alert route. Synchronous
+   * and never throws — `raise` is both by contract, and a detector that
+   * crashed on a posting problem would lose the journal line that was
+   * already working. No-ops when no router is wired (the issue tier, and any
+   * daemon with no posting credential: the router itself degrades to a
+   * journal line there, so this still needs no branch of its own).
+   *
+   * NO SECRETS, structurally rather than by inspection: the three live values
+   * interpolated here are an agent id, an integer, and the refusal string
+   * from `ManagedHerdrResult.reason` — and `reason` is the one field
+   * `opsAlertMessage` passes through `quoteField(..., { redactSecrets: true })`
+   * (see `./ops-alert.ts`), which redacts BEFORE truncating so a secret
+   * cannot straddle the cut. Nothing here reads a token file, an env var, or
+   * an argv.
+   */
+  function raiseOpsAlert(id: string, count: number): void {
+    try {
+      raiseOpsAlertOrThrow(id, count);
+    } catch (e) {
+      // `check`'s own outer try/catch would also swallow this, but it would
+      // swallow the REST OF THE POLL with it: the `for` loop that calls this
+      // would abort, so an id after this one never gets its complaint, and
+      // neither does this one. The new channel must never be able to cost the
+      // journal channel that was already working — caught here, per id, so
+      // every other id's complaint still lands.
+      log(`WARNING: [crashloop] ops alert for ${id} could not be raised: ${(e as Error)?.message ?? e}`);
+    }
+  }
+
+  function raiseOpsAlertOrThrow(id: string, count: number): void {
+    const router = deps.opsAlert?.();
+    if (!router) return;
+    const refusal = deps.refusalReason?.(id);
+    router.raise({
+      // Per session, per condition — the granularity the director's "one
+      // deduplicated post per session per hour" names. NOT keyed on the
+      // reason or the count: both change while the same loop runs, and a key
+      // that moved with them would post on every change instead of once.
+      key: `crashloop:${id}`,
+      condition: "crashloop",
+      subject: `${id} has been spawned ${count} times in the last ${deps.windowMinutes} minutes and has no ticket to report it on`,
+      reason: refusal
+        ? `last spawn attempt was refused: ${refusal}`
+        : "the last spawn attempt was not refused — the agent is dying after a successful launch, so there is no refusal reason to quote",
+      remedy:
+        `Look at why ${id} keeps being spawned. Nothing is suppressing or rate-limiting its spawning: ` +
+        `it will keep being retried on every poll exactly as before, and butchr will not stop on its own.`,
+    });
+  }
+
   async function check(spawning: readonly string[], desired: readonly string[]): Promise<void> {
     try {
       tracker.forgetMissing(new Set(desired));
@@ -313,8 +409,27 @@ export function createCrashLoopDetector(deps: CrashLoopDetectorDeps): CrashLoopD
       fleetWideLogged = false; // condition cleared this poll — a later recurrence logs again
       for (const id of spawning) {
         const times = tracker.recordSpawn(id, deps.now(), windowMs);
-        if (tracker.isSpoken(id)) continue;
         if (times.length < deps.count) continue;
+        // FACTORY-622: raised BEFORE the `isSpoken` latch below, and
+        // therefore on EVERY poll past the threshold — deliberately, for two
+        // reasons that both come straight from the measured incidents.
+        //
+        // First, the latch and the room are answering different questions.
+        // The latch exists so one episode produces one COMMENT; the room's
+        // own hourly dedup (`OpsAlertRouter.raise`, whose doc says in as many
+        // words that it is safe to call on every poll and that the window,
+        // not the caller, decides what posts) exists so one ongoing condition
+        // produces one POST per hour. Gating the raise on the latch would
+        // hand the room's dedup decision to the comment path.
+        //
+        // Second, and this is the actual defect: on the tier that needs this
+        // most, the comment path CANNOT SUCCEED. `postComplaint` returns null
+        // for a failed `comments` fetch and for a rate-cap hit, and the
+        // ticketless wiring's `comments` is a constant `[]` with an
+        // `addComment` that only logs. An alert gated on that path would be
+        // silent in exactly the case it was added for.
+        raiseOpsAlert(id, times.length);
+        if (tracker.isSpoken(id)) continue;
         const at = await postComplaint(id, times.length);
         if (at !== null) tracker.markSpoken(id, at);
       }

@@ -171,7 +171,11 @@ describe("zendesk OAuth token loading", () => {
     }
   });
 
-  test("reads a real owner-only file, and refuses it once group-readable", () => {
+  // FACTORY-569: NTFS has no owner/group/other permission bits — chmod(0o640)
+  // does not make a file "group-readable" on win32, so this real-filesystem
+  // assertion is meaningless there (the fake-`io()` tests above already cover
+  // the same logic without touching real permissions).
+  test.skipIf(process.platform === "win32")("reads a real owner-only file, and refuses it once group-readable", () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-zd-token-"));
     try {
       const path = join(dir, "token");
@@ -303,8 +307,8 @@ describe("zendesk ticket tools", () => {
   test("no tool can reply publicly: exactly a read and an internal note, and the note takes only text", () => {
     const tools = zendeskTicketTools({ client: fakeZendesk(tickets).client, log: () => {} });
     expect(Object.keys(tools).sort()).toEqual(["zendesk_add_internal_note", "zendesk_get_ticket"]);
-    expect(Object.keys(tools.zendesk_add_internal_note!.input)).toEqual(["text"]);
-    expect(Object.keys(tools.zendesk_get_ticket!.input)).toEqual([]);
+    expect(Object.keys(tools.zendesk_add_internal_note!.input)).toEqual(["target", "text"]);
+    expect(Object.keys(tools.zendesk_get_ticket!.input)).toEqual(["target"]);
   });
 
   test("zendesk_get_ticket reads the caller's own ticket and its comments, marked public or internal", async () => {
@@ -321,7 +325,7 @@ describe("zendesk ticket tools", () => {
     const { client, calls } = fakeZendesk(tickets);
     const writes: string[][] = [];
     const tools = zendeskTicketTools({ client, onWrite: (r, u, w) => writes.push([r, u, w]), log: () => {} });
-    expect(await call(tools, "zendesk_add_internal_note", { text: "Reproduced.", public: true }, zdCaller)).toEqual({ ok: true, ticket: "acme#42", note: "901", internal: true });
+    expect(await call(tools, "zendesk_add_internal_note", { text: "Reproduced.", public: true }, zdCaller)).toEqual({ ok: true, ticket: "acme#42", note: "901", internal: true, confirmedPrivate: true });
     expect(calls.filter((c) => c.method === "PUT").map((c) => JSON.parse(c.body!))).toEqual([{ ticket: { comment: { body: `${zendeskNoteTag("support")} Reproduced.`, public: false } } }]);
     expect(writes).toEqual([["acme#42", "2026-09-16T11:00:00Z", ZD]]);
   });
@@ -389,7 +393,7 @@ describe("the MCP auth gate", () => {
     state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }),
     health: () => ({ ok: true, components: [] }),
     dashboard: async () => ({ checked: true as const, confirmedAt: "", rows: [], admission: { cap: 0, residency: null, sources: [] } }),
-    header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "t", version: "0" } }),
+    header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "t", version: "0", versionProvenance: "tag", versionUnknownReason: null } }),
     resourceLink: async () => ({ ok: true as const, url: "x" }),
   };
   const { app, mcp } = buildApp(view as never, {}, () => {});

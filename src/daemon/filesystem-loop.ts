@@ -55,9 +55,14 @@ export const filesystemRules = (rules: readonly Rule[]): Rule[] => rules.filter(
  * with no loop to stop them.
  */
 export function startFilesystemLoop(deps: FilesystemLoopDeps): Stop {
-  const rules = filesystemRules(deps.rules);
+  // FACTORY-657: pass `deps.rules` straight through, never pre-filtered into
+  // a local — `createFilesystemResourceType`'s own `discovery.search`
+  // (src/rules/filesystem-type.ts) already re-derives the enabled
+  // `filesystem` subset on every poll from whatever it reads here, so
+  // filtering it ourselves, once, at loop-start would freeze a snapshot a
+  // rules reload (`RulesHolder.setRules`) could never update.
   const type = createFilesystemResourceType({
-    rules,
+    rules: deps.rules,
     list: deps.list ?? listFilesystemResources,
     log: deps.log,
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsFilesystemAgent),

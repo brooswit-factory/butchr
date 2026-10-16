@@ -2,8 +2,10 @@ import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
 import type { Herd, SpawnSpec } from "../agents/herd.js";
+import { RESTORED_PANE_STALE_REASON_PREFIX } from "../agents/herd.js";
 import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
+import type { SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
 import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
@@ -44,10 +46,24 @@ export interface LoopDeps {
    * src/daemon/index.ts wires it through.
    */
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /**
+   * FACTORY-916 — called INSTEAD OF `onRespawn` immediately above when the
+   * respawn that just succeeded resumed its prior Claude session
+   * (`herd.lastFreshSpawnResumed`, src/agents/herd.ts) rather than starting
+   * fresh — see `reconcileNow`'s own respawn loop for exactly where this
+   * distinction is read, right after `herd.spawn(toSpawn, "respawn")`
+   * returns. Optional and additive: a caller that never wires this simply
+   * keeps getting `onRespawn` for every respawn, resumed or not — unchanged
+   * pre-FACTORY-916 behaviour (an honest, if now slightly imprecise,
+   * "This session is fresh" notice rather than a missing one).
+   */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /** FACTORY-501 — see `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment; threaded straight through. */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   /** Reconcile daemon-owned (agent:*, pr:*) labels on this poll's `issues`. */
   syncLabels?: (issues: readonly JiraIssue[]) => Promise<ReadonlySet<string>>;
   /**
@@ -72,6 +88,10 @@ export interface LoopDeps {
   comments?: (key: string) => Promise<readonly JiraComment[]>;
   /** Free-text daemon log line, e.g. the storm guard's suppression WARNING. Optional; omitted, that line is simply never emitted. */
   log?: (line: string) => void;
+  /** FACTORY-922: threaded straight through to `createIssueEventRules` — see `IssueResourceDeps.onCommentCheckSkipped`'s own doc comment. */
+  onCommentCheckSkipped?: (key: string, reason: SkippedCommentCheckReason) => void;
+  /** FACTORY-949: threaded straight through to `createIssueEventRules` — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
+  blockedWakeDebounceMinutes?: number;
   intervalMs: number;
   onError?: (error: unknown) => void;
   /**
@@ -220,6 +240,8 @@ export const RESUME_WAITING_NOTICE_AT_POLLS = 10;
 
 export interface ReconcileOptions {
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** Storm-guard state; see RespawnGuard. Defaults to a fresh (never-suppressing) instance. */
   guard?: RespawnGuard;
   /** Called, with the exact line to log, when the storm guard suppresses a would-be respawn. */
@@ -242,6 +264,26 @@ export interface ReconcileOptions {
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
   /** State for `onResumeWaiting`'s consecutive-poll count; see `ResumeDeferGuard`. Defaults to a fresh (per-call) instance, matching `guard`'s own default shape. */
   resumeDeferGuard?: ResumeDeferGuard;
+  /**
+   * FACTORY-501 — called ONCE PER POLL (never per-issue) with the exact set
+   * of issues found `"deferred"`/`"stuck"` THIS poll on the
+   * herdr-RESTORED-PANE path specifically — identified at the point `reason`
+   * is read, by `reason.startsWith(RESTORED_PANE_STALE_REASON_PREFIX)`
+   * (`src/agents/herd.ts`), BEFORE `resumeDeferGuard`/`onResumeWaiting` ever
+   * see it. A restored-pane issue never increments `resumeDeferGuard`'s
+   * count and never triggers `onResumeWaiting` — that notice is written for
+   * a model/effort change and would describe the wrong problem here (see
+   * FACTORY-500's item-2 proposal thread); this hook exists so the
+   * RESTORED-pane path gets its own, correctly-worded, wall-clock,
+   * repeating escalation instead — see `src/agents/restored-pane-escalation.ts`
+   * for the actual detector `src/daemon/index.ts` wires in here. The
+   * model/effort path is completely unaffected: this hook is NEVER called
+   * with a model/effort-only deferred/stuck issue, and `onResumeWaiting`'s
+   * own poll-counted, once-only behaviour for that path is untouched by this
+   * ticket. Optional; omitted, no restored-pane escalation runs (existing
+   * behaviour before FACTORY-501, and every caller/test that predates it).
+   */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   /**
    * BUTCHR-66/83: resource ids currently `"asleep"` — see `planReconcile`'s
    * `atRest` param, which this is threaded straight through to. Defaults to
@@ -429,6 +471,8 @@ export interface ReconcileOptions {
    * this ticket, and any caller with nothing to clear).
    */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  /** Successful stop hook; never gates reconciliation. */
+  onStopped?: (id: string) => Promise<void>;
   /**
    * Holds ids against the shared admission cap while their spawn is in
    * flight — `AdmissionController.reserve`. Called for each respawn before
@@ -617,7 +661,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // way). `live` — never `plan.spawn` directly — is what both `opts.admission`
   // and `checkCrashLoop` below actually see. Omitted, `live` is `plan.spawn`
   // itself (the same array), so every existing caller and test is unaffected.
-  const live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
+  let live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
   // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
   // spawn loop below, and is the ONE hook in this function that actually
   // replaces its input rather than merely observing it — see
@@ -692,6 +736,21 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
           failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
         } else {
           await herd.spawn(toSpawn);
+          // FACTORY-916: THE primary case this story exists for — `issue`
+          // was `desired` but not `running` at all (this `admitted`/
+          // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
+          // below, which only ever sees an agent that WAS running) —
+          // i.e. exactly the "daemon respawns a worker after an
+          // unintended stop" shape FACTORY-843's outcome describes. Same
+          // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
+          // callback the stale-argv loop below also consults — see that
+          // loop's own comment for the full contract. Without this read
+          // HERE too, a genuine crash-respawn that resumed would get NO
+          // ticket notice at all: this loop never calls `opts.onRespawn`
+          // in the first place (a brand-new "first ever spawn" needs no
+          // "your session was X" notice), so there is no existing call
+          // this piggybacks on the way the stale-argv loop's does.
+          if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
         }
       } catch (e) {
         failures.push({ id: issue, stage: "spawn", error: e });
@@ -719,6 +778,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   for (const issue of plan.stop) {
     try {
       await herd.stop(issue);
+      await opts.onStopped?.(issue);
       // BUTCHR-412: released only AFTER a successful stop — if herd.stop
       // itself threw, the agent may still be running, and releasing its
       // account out from under a still-live agent would be wrong; a
@@ -736,6 +796,13 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       failures.push({ id: issue, stage: "stop", error: e });
     }
   }
+  // FACTORY-501: issues found herdr-restored-pane-`"deferred"`/`"stuck"`
+  // THIS poll, accumulated across the loop below and handed to
+  // `opts.checkRestoredPaneDeferred` ONCE, after the loop — never per-issue
+  // (see that option's own doc comment for why a single per-poll call, not
+  // an inline notify, is what lets the detector prune a resolved id's
+  // tracked state for free).
+  const restoredPaneDeferredThisPoll: string[] = [];
   for (const issue of plan.respawn) {
     const info = staleByIssue.get(issue)!;
     let reason = info.reason;
@@ -749,6 +816,16 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // honest, distinct explanation.
     if (info.resumable && herd.resumeInPlace) {
       const spec = desired.get(issue)!;
+      // FACTORY-501: read BEFORE `resumeInPlace` overwrites `reason` further
+      // below (the "unresumable"/"failed" rewrite) — `info.reason` is the
+      // ONLY point in this loop the herdr-restored-pane classification
+      // (`isHerdrRestoredPane`, src/agents/herd.ts) is still legible as
+      // such, via the shared `RESTORED_PANE_STALE_REASON_PREFIX` constant
+      // both sides agree on. A model/effort-only resumable issue's reason
+      // never starts with this prefix, so this split touches the restored
+      // path ONLY — see `ReconcileOptions.checkRestoredPaneDeferred`'s own
+      // doc comment for the full scope argument.
+      const isRestoredPane = info.reason.startsWith(RESTORED_PANE_STALE_REASON_PREFIX);
       let outcome: Awaited<ReturnType<NonNullable<Herd["resumeInPlace"]>>>;
       try {
         outcome = await herd.resumeInPlace(spec);
@@ -757,21 +834,45 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
         continue;
       }
       if (outcome === "deferred" || outcome === "stuck") {
-        const count = resumeDeferGuard.count(issue);
-        if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
+        if (isRestoredPane) {
+          // FACTORY-501: deliberately NEVER touches `resumeDeferGuard`/
+          // `onResumeWaiting` — that notice is worded for a model/effort
+          // change and would describe the wrong problem for a restored
+          // pane (FACTORY-500 item-2 proposal thread); this issue's own
+          // wall-clock escalation is handled entirely by
+          // `checkRestoredPaneDeferred` below, once per poll.
+          restoredPaneDeferredThisPoll.push(issue);
+        } else {
+          const count = resumeDeferGuard.count(issue);
+          if (count === RESUME_WAITING_NOTICE_AT_POLLS && opts.onResumeWaiting) await opts.onResumeWaiting(issue, outcome, count);
+        }
         continue; // no stop, no spawn, no guard admission — retried next poll
       }
-      resumeDeferGuard.clear(issue);
+      resumeDeferGuard.clear(issue); // no-op for a restored-pane issue, which never populates this guard
       if (outcome === "resumed") {
         if (opts.onResumePreserved) await opts.onResumePreserved(issue);
         continue;
       }
-      // outcome is "unresumable" or "failed": fall through to the
-      // stop-then-fresh-spawn path below, same as any other stale reason,
-      // with an honest, DISTINCT reason for each — a genuine "no id to
-      // resume with" reads differently from "we tried and it didn't stay up".
+      // outcome is "unresumable", "unresumable-transcript-gone", or
+      // "failed": fall through to the stop-then-fresh-spawn path below, same
+      // as any other stale reason, with an honest, DISTINCT reason for each
+      // — a genuine "no id to resume with" reads differently from "we found
+      // the id but its transcript is gone", which reads differently again
+      // from "we tried and it didn't stay up" (FACTORY-470/472 PR #560
+      // review: the id-vs-transcript distinction was previously conflated).
+      // FACTORY-525: `lastResumeFailureDetail` is read-once (cleared on
+      // read, `HerdrHerd`'s own doc comment) — this is the ONE place
+      // production reads it, immediately after the "failed" outcome that
+      // set it, before anything else can. Falls back to the same explicit
+      // "no exit status captured" wording `HerdrHerd` itself uses when a
+      // fake `Herd` implements `resumeInPlace` but not this optional
+      // accessor, so a missing implementation degrades to an honest
+      // "unavailable" rather than a silent "see the pane for details" that
+      // told an operator nothing this ticket didn't already know was wrong.
       reason = outcome === "failed"
-        ? "session lost: resume failed (the relaunched session did not stay alive — see the pane for details)"
+        ? `session lost: resume failed (the relaunched session did not stay alive — ${herd.lastResumeFailureDetail?.(issue) ?? "no exit status captured"})`
+        : outcome === "unresumable-transcript-gone"
+        ? "session lost: a transcript for the persisted session id could not be found (the id was determined, but its transcript is gone)"
         : "session lost: session id could not be determined";
     }
     if (!guard.admit(issue, poll)) {
@@ -812,6 +913,10 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       }
       if (opts.account) await opts.account.release(issue, "respawn");
       await herd.stop(issue);
+      // FACTORY-1001: a respawn is also a real lifecycle stop. Purge the
+      // stopped pane's agent labels before the replacement is launched so a
+      // failed/restarted pane cannot leave stale ownership behind.
+      await opts.onStopped?.(issue);
       await herd.spawn(toSpawn, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
@@ -837,8 +942,26 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // isolation scope is herd.spawn/stop/respawn specifically (its own
     // title) — production wiring already guarantees this callback never
     // throws (see daemon/index.ts's own `.catch` around its Jira comment).
-    if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
+    // FACTORY-916: `lastFreshSpawnResumed` is READ-ONCE (cleared by this
+    // very read, `HerdrHerd`'s own doc comment) — exactly one of
+    // `onRespawnResumed`/`onRespawn` fires per respawn, never both, and
+    // never a leaked `true` read by a LATER unrelated respawn of the same
+    // issue. `reason` here is unrelated to this check: it is WHY the
+    // staleness detector wanted `issue` respawned at all (a crash, a stale
+    // argv, ...), not whether the respawn then resumed — see
+    // `onRespawnResumed`'s own doc comment (this file).
+    if (herd.lastFreshSpawnResumed?.(issue)) {
+      if (opts.onRespawnResumed) await opts.onRespawnResumed(issue);
+    } else if (opts.onRespawn) await opts.onRespawn(issue, reason, info.observedArgv);
   }
+  // FACTORY-501: called ONCE PER POLL, unconditionally (even with an empty
+  // array) — an empty call still matters, since it is what lets the
+  // detector's own pruning (`RestoredPaneEscalationTracker.forgetMissing`,
+  // src/agents/restored-pane-escalation.ts) clear a PREVIOUSLY-deferred
+  // issue's tracked state the moment it stops appearing here, with no
+  // separate "terminal outcome" signal needed — see
+  // `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment.
+  if (opts.checkRestoredPaneDeferred) await opts.checkRestoredPaneDeferred(restoredPaneDeferredThisPoll);
   // BUTCHR-147: called once per poll, after every isolated spawn/stop/respawn
   // attempt above — never gates or delays anything (see ReconcileOptions.checkReconcileFailure's own doc comment).
   // REVIEW FIX (PR #204 round 1): `running` (captured once, above, same
@@ -986,6 +1109,15 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     ...(herd.recoverQuota ? { recoverQuota: (spec: SpawnSpec) => herd.recoverQuota!(spec) } : {}),
     ...(herd.providerOf ? { providerOf: (issue: string) => herd.providerOf!(issue) } : {}),
     resumeInPlace: (spec: SpawnSpec) => herd.resumeInPlace(spec),
+    // FACTORY-525: forwarded explicitly for the SAME reason `providerOf` is,
+    // just above — an optional member silently dropped here would still
+    // compile, and this loop's own reason-string read (just above, in this
+    // same function) is production's only consumer of it.
+    ...(herd.lastResumeFailureDetail ? { lastResumeFailureDetail: (issue: string) => herd.lastResumeFailureDetail!(issue) } : {}),
+    // FACTORY-916: forwarded explicitly for the SAME reason `lastResumeFailureDetail`
+    // immediately above is — `reconcileNow`'s own read of this (just above,
+    // in this same function) is production's only consumer.
+    ...(herd.lastFreshSpawnResumed ? { lastFreshSpawnResumed: (issue: string) => herd.lastFreshSpawnResumed!(issue) } : {}),
   };
 }
 
@@ -1011,10 +1143,14 @@ export interface GenericLoopDeps<T> {
   ownsId: (id: string) => boolean;
   notify: (issue: string, about: string, reason?: NotifyReason) => void | Promise<void>;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
+  /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
+  onRespawnResumed?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumePreserved`'s own doc comment; threaded straight through. */
   onResumePreserved?: (issue: string) => void | Promise<void>;
   /** FACTORY-314 — see `ReconcileOptions.onResumeWaiting`'s own doc comment; threaded straight through. */
   onResumeWaiting?: (issue: string, outcome: "deferred" | "stuck", consecutivePolls: number) => void | Promise<void>;
+  /** FACTORY-501 — see `ReconcileOptions.checkRestoredPaneDeferred`'s own doc comment; threaded straight through. */
+  checkRestoredPaneDeferred?: (deferred: readonly string[]) => Promise<void>;
   syncLabels?: (issues: readonly T[]) => Promise<ReadonlySet<string>>;
   checkParked?: (issues: readonly T[], related: readonly RelatedResource<T>[]) => Promise<void>;
   /** BUTCHR-200: see `LoopDeps.checkAbandoned`'s doc comment above — same placement rule as `checkParked`, no `related` needed. Optional; omitted, abandoned-worker detection simply never runs. */
@@ -1037,6 +1173,7 @@ export interface GenericLoopDeps<T> {
   admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
   /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
   onAdmitted?: (succeeded: readonly string[]) => void;
+  onStopped?: (id: string) => Promise<void>;
   /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
   reserveAdmission?: (ids: readonly string[]) => void;
   /** See `ReconcileOptions.releaseAdmission` — threaded straight through to `reconcileNow` below. */
@@ -1124,8 +1261,10 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+        ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
         ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
         ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
+        ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
         guard: respawnGuard,
         resumeDeferGuard,
         ...(deps.log ? { onSuppressed: (_issue: string, message: string) => deps.log!(message) } : {}),
@@ -1138,6 +1277,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
         ...(deps.admission ? { admission: deps.admission } : {}),
         ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
+        ...(deps.onStopped ? { onStopped: deps.onStopped } : {}),
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
         ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
@@ -1277,6 +1417,8 @@ export function startLoop(deps: LoopDeps): Stop {
       // and lets a test spy on `deps.log` to assert on suppression lines
       // the same way it already can for every other daemon log line.
       ...(deps.log ? { log: deps.log } : {}),
+      ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+      ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
     }),
     spawnConfig: ISSUE_SPAWN_CONFIG,
   };
@@ -1298,8 +1440,10 @@ export function startLoop(deps: LoopDeps): Stop {
     ownsId: () => true,
     notify: deps.notify,
     ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
+    ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
     ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
     ...(deps.onResumeWaiting ? { onResumeWaiting: deps.onResumeWaiting } : {}),
+    ...(deps.checkRestoredPaneDeferred ? { checkRestoredPaneDeferred: deps.checkRestoredPaneDeferred } : {}),
     ...(deps.syncLabels ? { syncLabels: deps.syncLabels } : {}),
     ...(deps.checkParked ? { checkParked: deps.checkParked } : {}),
     ...(deps.checkAbandoned ? { checkAbandoned: deps.checkAbandoned } : {}),

@@ -1,0 +1,25 @@
+.setup-page {
+  max-width: 480px;
+  margin-top: 1rem;
+}
+.setup-page__field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.75rem 0;
+}
+.setup-page__field input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--lp-border-color, #e2e2e2);
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+.setup-page__result {
+  margin-top: 1rem;
+}
+.setup-page__result--ok {
+  color: var(--lp-color-success, #0a7a2f);
+}
+.setup-page__warning {
+  color: var(--lp-color-danger, #b00020);
+}

@@ -1,7 +1,7 @@
 import { z } from "@brooswit/thatch";
 import type { ToolDef } from "@brooswit/thatch";
 import type { AtlassianOps } from "./atlassian.js";
-import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers } from "./docs.js";
+import { getDoc, setDoc, getProjectDoc, setProjectDoc, projectRootDoc, findWorkers, getConfluencePageDocById } from "./docs.js";
 import { aliasTag, classifyCreateIssue, classifyLinkIssues } from "./alias-audit.js";
 import {
   newWorker, startWorker, shelveWorker, adoptWorker, finishWorker, prioritizeWorker, tellWorker, correctWorker,
@@ -9,10 +9,11 @@ import {
   checkWorker, STAFFING_PENDING,
   type Disposition, type PeerIntent,
 } from "./relationship.js";
-import { isProjectId } from "../resources/id.js";
+import { isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { advanceProjectWatermark, resolveEligibleProjects } from "../resources/project.js";
 import { unwrapStorageParagraph } from "./speak.js";
 import { Refusal, withOutcomeRecording } from "./outcome.js";
+import { recordIntentionalStop } from "../agents/stop-cause.js";
 
 /** Role -> Atlassian accountId, for staffing `jira_create_issue` by issuetype (see src/config/config.ts `assignees`). `epic` (BUTCHR-71) staffs an Epic a PROJECT caller's `new_worker`/`adopt_worker` creates or adopts. */
 export interface AssigneeRoles {
@@ -114,6 +115,38 @@ function requireIssueCaller(
   const who = requireCaller(c, verb);
   if (isProjectId(who)) {
     throw new Refusal(`${verb}: refusing a project caller — ${why}`);
+  }
+  return who;
+}
+
+/**
+ * FACTORY-996: the gate for the two new managed-session Confluence read
+ * verbs (`get_my_confluence_page`/`get_my_confluence_page_comments`). TAKES
+ * NO ARGUMENTS BEYOND THE CONNECTION — same shape as `requireProjectCaller`/
+ * `requireIssueCaller` above: the page id is derived EXCLUSIVELY from the
+ * caller's own `x-issue` header, never from a caller-supplied argument, so
+ * which page you get back is never expressible as an argument mistake (the
+ * design `jira_add_comment`'d to FACTORY-992 as the contract these verbs
+ * assume: a `confluence-page` resource's own `x-issue` is its bare numeric
+ * Confluence page id — see `isConfluencePageResourceId`, `src/resources/
+ * id.ts`, for the full reasoning). Refuses an `x-issue` that isn't shaped
+ * like one — a Jira issue key, a Jira project key, a filesystem path, or
+ * anything else — with a message naming what it actually is, rather than
+ * loosening what this accepts to "try to make it work".
+ */
+function requireOwnConfluencePageId(c: { headers: Record<string, string> }, verb: string): string {
+  const who = requireCaller(c, verb);
+  // A PROJECT caller is refused the same, established way every other
+  // project-refusing verb is (`refuseProjectCaller`, same message shape the
+  // BUTCHR-82 disposition enumeration's "refuses" bucket pins on): a
+  // confluence-page resource is never a project's own resource — only an
+  // issue-tier (managed-session) agent is ever spawned FOR one. This also
+  // means the shape check below only ever has to reject an ISSUE-tier
+  // caller whose own x-issue isn't a confluence-page id — the project case
+  // is already handled here.
+  refuseProjectCaller(c, verb, "a confluence-page resource is never a project's own resource — this verb only reads an issue-tier agent's own confluence-page resource, derived from its x-issue");
+  if (!isConfluencePageResourceId(who)) {
+    throw new Refusal(`${verb}: refusing — this connection's x-issue ("${who}") is not a confluence-page resource id (a bare numeric Confluence page id); this verb only reads the caller's OWN confluence-page resource, derived solely from x-issue, never from an argument`);
   }
   return who;
 }
@@ -227,6 +260,8 @@ export function atlassianTools(
    * its pane.
    */
   standDown?: (key: string, seen: ReadonlyMap<string, readonly string[]>) => void,
+  /** Registry composers wrap validation and execution once at their outer boundary. */
+  recordOutcomes = true,
 ): Record<string, ToolDef<any>> {
   const audit = (c: { headers: Record<string, string> }, what: string) =>
     log(`  [tools] ${c.headers["x-butchr-agent"] ?? c.headers["x-issue"] ?? "?"} → ${what}`);
@@ -864,7 +899,7 @@ export function atlassianTools(
     stand_down: {
       description:
         'ISSUE CALLER ONLY (refuses a project caller — a project already has `check_in` for this same last-act purpose; use that instead). Your LAST ACT before your session ends, when the next thing that can happen is an event you cannot cause yourself: releases your pane and stops you from occupying an admission-cap slot while you wait. NOT a self-exit — do not try to end your own session, and this does not transition your ticket\'s status at all; the daemon closes your pane FOR you, through its existing stop route, once this call lands. TAKES NO ARGUMENTS: the only state this can ever act on is the caller\'s own, so there is nothing to get wrong — same reasoning as check_in/submit_to_boss/report_to_boss. ' +
-        'It re-reads, directly from Jira, the current comment ids on your own ticket and on every ticket you currently have a worker on, and records that as what you have already seen. WHAT WAKES YOU, EXACTLY (characterized by test, not aspirational): a STATUS change on any of those tickets (a worker reaching In Review is the common one) always wakes you; a SUMMARY edit on any of them always wakes you; a pr:* review-state transition on YOUR OWN ticket always wakes you; and a NEW COMMENT that is not in the recorded set — on your own ticket or a worker\'s, including a question, a report, or a [butchr:blocked] escalation — wakes you. WHAT DOES NOT WAKE YOU: a daemon label change on a WORKER\'s ticket on its own — that worker\'s own agent:* label flipping between states, and a pr:* transition on the WORKER\'s ticket unaccompanied by a new comment. That is deliberate (those flip constantly and would wake a boss for nothing), so do not stand down expecting to be woken by a worker\'s PR label moving; the events you actually wait for (a worker reaching In Review, a worker asking you something, an escalation) are all in the waking list. ' +
+        'It re-reads, directly from Jira, the current comment ids on your own ticket and on every ticket you currently have a worker on, and records that as what you have already seen. WHAT WAKES YOU, EXACTLY (characterized by test, not aspirational — FACTORY-954 narrowed the WORKER half of this list, FACTORY-948/949/964 carved a single exception back into it; YOUR OWN ticket is unaffected, see each line below): a STATUS change on YOUR OWN ticket always wakes you; a worker reaching IN REVIEW OR DONE always wakes you — any other status change on a worker\'s ticket (e.g. To Do -> In Progress) does not. A worker\'s own agent:* label flipping TO `agent:blocked` ALSO always wakes you (debounced per ticket, deduped against the daemon\'s own [butchr:blocked] marker for the same episode) — the ONE daemon-label flip on a worker\'s ticket that is never routine child activity; every OTHER agent:* flip on a worker\'s ticket (idle/working/stalled, or unblocking back out of `agent:blocked`) still does not wake you on its own. A SUMMARY edit on YOUR OWN ticket always wakes you; a summary edit on a WORKER\'s ticket no longer wakes you on its own. A pr:* review-state transition on YOUR OWN ticket always wakes you (never applicable to a worker\'s ticket either way). A NEW COMMENT not in the recorded set on YOUR OWN ticket always wakes you, whatever it says; on a WORKER\'s ticket, only a comment ADDRESSED TO YOU wakes you now — the worker\'s own report_to_boss/ask_boss (tagged with its own ticket key), or one of the daemon\'s agent-directed escalations ([butchr:blocked]/[butchr:respawn]/[butchr:stall]/[butchr:unresponsive]) — a routine, unaddressed comment on a worker\'s ticket no longer wakes you. WHAT DOES NOT WAKE YOU: a daemon label change on a WORKER\'s ticket on its own, EXCEPT the agent:blocked flip named above — every other agent:* label flip between states, and a pr:* transition on the WORKER\'s ticket unaccompanied by a boss-addressed comment; also, now, a worker\'s summary/assignee/description/issuelinks edit, and any comment on a worker\'s ticket that isn\'t addressed to you. That is deliberate (those flip constantly, or are routine child activity, and would wake a boss for nothing), so do not stand down expecting to be woken by a worker\'s PR label moving or by every comment on a worker\'s ticket; the events you actually wait for (a worker reaching In Review, a worker asking you something, a worker going blocked, an escalation) are all in the waking list. ' +
         'A missed or wrongly-suppressed edge is BOUNDED, not silent forever: you will be forced awake again after a maximum sleep duration even if nothing new ever arrives — if you see yourself woken with nothing apparently new, that bound is very likely why, and it means an edge was probably missed, not that anything is wrong with your ticket. ' +
         '**Call this ONLY after you have actually acted on everything you can currently see — exactly like check_in, calling this before you have handled something you already know about is the one way to make this fail silently:** that event is folded into "already seen" the moment you call this, and will not wake you on its own. ' +
         'On waking, you are a FRESH session with no memory of this one — re-read your own ticket AND every worker\'s ticket, because the reason you woke is not guaranteed to reach you as a message: the channel push this fires only lands on a currently-connected session, and you were not one. Never call this on behalf of another issue — there is no key parameter, same reasoning as report_to_boss/submit_to_boss.',
@@ -890,6 +925,13 @@ export function atlassianTools(
           return { ok: true, key: who, asleep: false, watching: keys, note: "stand_down is not available for this agent: you were NOT put to sleep and your session was NOT released. Stay in this session; changes to your ticket still reach you as messages." };
         }
         standDown(who, seen);
+        // FACTORY-849/FACTORY-852: recorded AFTER the in-memory sleep is
+        // declared, never before — same "don't claim a durable fact until
+        // the thing it describes actually happened" ordering as every
+        // other write in this handler. Best-effort, never throws (see
+        // `recordIntentionalStop`'s own doc comment); a filesystem problem
+        // here must not undo the sleep this call already put the caller in.
+        recordIntentionalStop(who, "stand_down");
         return { ok: true, key: who, asleep: true, watching: keys };
       },
     },
@@ -907,6 +949,31 @@ export function atlassianTools(
         const raw = await ops.getPageComments(doc.id);
         const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
         audit(c, `get_doc_comments (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
+        return comments;
+      },
+    },
+    get_my_confluence_page: {
+      description:
+        "FACTORY-996: read path for a MANAGED-SESSION agent whose own resource is a Confluence page (a future `confluence-page` ResourceType, FACTORY-992) — NOT for a Jira-ticket-bound doc, which stays on `get_doc`. TAKES NO KEY: the page id comes EXCLUSIVELY from the caller's own `x-issue` header (a bare numeric Confluence page id), never from an argument — which page you get is never expressible as an argument mistake, and there is no way to name any OTHER page through this verb. Refuses any caller whose `x-issue` isn't shaped like a confluence-page resource id (a Jira issue key, a Jira project key, a filesystem path, anything malformed) — this does not loosen `get_doc`'s own `assertValidKey` Jira-key check, it is a completely separate path for a completely different caller shape. " +
+        "BOUNDED, CALLER-CONTROLLABLE RANGE READ, SAME SHAPE AS get_doc (BUTCHR-270): `offset`/`limit` (both in characters) page through a body too large for one MCP result; `expectVersion` is REQUIRED whenever `offset` > 0 and a mismatch REFUSES rather than risking a spliced body from two versions. See get_doc's own description for the full three-arm result shape (`{found:false}` never happens here — see getConfluencePageDocById's own doc comment) and the exact pagination protocol; it is identical here.",
+      input: { offset: z.number().int().optional(), limit: z.number().int().optional(), expectVersion: z.number().int().optional() },
+      handler: async (a, c) => {
+        const { offset, limit, expectVersion } = a as { offset?: number; limit?: number; expectVersion?: number };
+        const pageId = requireOwnConfluencePageId(c, "get_my_confluence_page");
+        audit(c, `get_my_confluence_page ${pageId} (self)`);
+        return getConfluencePageDocById(ops, pageId, offset, limit, expectVersion);
+      },
+    },
+    get_my_confluence_page_comments: {
+      description:
+        "FACTORY-996: the comments counterpart to get_my_confluence_page — reads a MANAGED-SESSION agent's OWN confluence-page resource's footer comments. TAKES NO ARGUMENTS: the page id comes exclusively from the caller's own `x-issue`, same gate and same refusal shape as get_my_confluence_page; there is no key parameter, so there is no way to read any OTHER page's comments through this verb. NOT the same thing as `get_doc_comments`, which is PROJECT-CALLER-ONLY and reads a project's own root doc — this is issue-tier-only (a confluence-page-resource caller specifically), the opposite caller shape. " +
+        "Returns `{ results: [{ id, body, author?, created? }] }`, NEWEST-COMMENT-ORDER NOT GUARANTEED (the raw order `getPageComments` returns, same caveat `get_doc_comments` documents). `body` comes back as PLAIN TEXT: `getPageComments` itself returns raw storage-format XHTML, undone here with the same `unwrapStorageParagraph` get_doc_comments already uses (src/tools/speak.ts) — no `<p>...</p>` wrapper and no entity escaping survive.",
+      input: {},
+      handler: async (_a, c) => {
+        const pageId = requireOwnConfluencePageId(c, "get_my_confluence_page_comments");
+        const raw = await ops.getPageComments(pageId);
+        const comments = { results: raw.results.map((r) => ({ ...r, body: unwrapStorageParagraph(r.body) })) };
+        audit(c, `get_my_confluence_page_comments ${pageId} (self) (${comments.results.length} comment${comments.results.length === 1 ? "" : "s"})`);
         return comments;
       },
     },
@@ -1012,5 +1079,5 @@ export function atlassianTools(
   // BUTCHR-341: the ONE place `tools` is assembled — see `withOutcomeRecording`'s
   // own doc comment (src/tools/outcome.ts) for why wrapping happens exactly
   // here rather than at each of the 34 definitions above.
-  return withOutcomeRecording(tools, log);
+  return recordOutcomes ? withOutcomeRecording(tools, log) : tools;
 }

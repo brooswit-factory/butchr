@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { loadConfig, describeConfig } from "../../src/config/config.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, validateAtlassianSiteShape } from "../../src/config/config.js";
 import { workspaceRoot } from "../../src/agents/workspace.js";
+import { checkExtensionOrigin } from "../../src/web/origin-guard.js";
 
 const noRead = () => { throw new Error("should not read"); };
 const base = { ATLASSIAN_SITE: "https://x.atlassian.net/", ATLASSIAN_EMAIL: "a@b.c", ATLASSIAN_TOKEN: "tok" };
@@ -14,7 +15,7 @@ describe("loadConfig", () => {
     }, noRead);
     expect(c.agent).toEqual({ provider: "agy", providers: ["claude", "agy", "codex"], roleProviders: {
       project: ["agy", "claude"], epic: ["agy", "codex"], story: ["codex", "agy"], task: ["agy"],
-    } });
+    }, restoredResume: new Set(["buddy", "genius"]) });
     expect(describeConfig(c)).toContain("provider=agy");
     for (const order of ["agy,agy", "agy,unknown", "agy,", ""]) {
       expect(() => loadConfig({ ...base, BUTCHR_AGENT_PROVIDERS: order }, noRead)).toThrow("ordered list");
@@ -43,6 +44,12 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, ATLASSIAN_TOKEN_FILE: "/t" }, () => "  \n")).toThrow(/empty/);
     expect(() => loadConfig({ ...base, BUTCHR_PORT: "notaport" }, noRead)).toThrow(/BUTCHR_PORT/);
   });
+  test("FACTORY-665: rejects an ATLASSIAN_SITE that isn't exactly https://<name>.atlassian.net", () => {
+    for (const bad of ["https://evil.example.com", "http://x.atlassian.net", "https://x.atlassian.net/extra", "https://x.atlassian.net:8443", "https://x.atlassian.net.evil.com", "https://.atlassian.net", "not-a-url"]) {
+      expect(() => loadConfig({ ...base, ATLASSIAN_SITE: bad }, noRead)).toThrow(/ATLASSIAN_SITE must look like/);
+    }
+    expect(() => loadConfig({ ...base, ATLASSIAN_SITE: "HTTPS://X.ATLASSIAN.NET" }, noRead)).not.toThrow();
+  });
   test("describeConfig never leaks the token value", () => {
     const d = describeConfig(loadConfig({ ...base, ATLASSIAN_TOKEN: "s3cr3t-VALUE" }, noRead));
     expect(d).not.toContain("s3cr3t-VALUE"); expect(d).toContain("***"); expect(d).toContain("12 chars");
@@ -69,6 +76,64 @@ describe("loadConfig", () => {
     expect(loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "20" }, noRead).stalledMinutes).toBe(20);
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
     expect(() => loadConfig({ ...base, BUTCHR_STALLED_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_MINUTES/);
+  });
+
+  test("FACTORY-949: blockedWakeDebounceMinutes defaults to 10, honours BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).blockedWakeDebounceMinutes).toBe(10);
+    expect(loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "20" }, noRead).blockedWakeDebounceMinutes).toBe(20);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES/);
+  });
+
+  test("FACTORY-972: stalledWakeDebounceMinutes defaults to 30, honours BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).stalledWakeDebounceMinutes).toBe(30);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "45" }, noRead).stalledWakeDebounceMinutes).toBe(45);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES/);
+  });
+
+  test("FACTORY-972: stalledWakeMaxPerHour defaults to 6, honours BUTCHR_STALLED_WAKE_MAX_PER_HOUR, and rejects a non-positive or fractional value", () => {
+    expect(loadConfig(base, noRead).stalledWakeMaxPerHour).toBe(6);
+    expect(loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "3" }, noRead).stalledWakeMaxPerHour).toBe(3);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "0" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "1.5" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+    expect(() => loadConfig({ ...base, BUTCHR_STALLED_WAKE_MAX_PER_HOUR: "nope" }, noRead)).toThrow(/BUTCHR_STALLED_WAKE_MAX_PER_HOUR/);
+  });
+
+  test("FACTORY-740: silentStopMode defaults to dry-run, honours off, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).silentStopMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "off" }, noRead).silentStopMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "dry-run" }, noRead).silentStopMode).toBe("dry-run");
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_MODE/);
+  });
+
+  test("FACTORY-740: silentStopSuppressMinutes defaults to 5, honours BUTCHR_SILENT_STOP_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).silentStopSuppressMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "15" }, noRead).silentStopSuppressMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_SILENT_STOP_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_SILENT_STOP_SUPPRESS_MINUTES/);
+  });
+
+  test("FACTORY-845: idlePokeMode defaults to dry-run (same precedent as silentStopMode), honours off/live, and rejects an unknown value", () => {
+    expect(loadConfig(base, noRead).idlePokeMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "off" }, noRead).idlePokeMode).toBe("off");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "dry-run" }, noRead).idlePokeMode).toBe("dry-run");
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "live" }, noRead).idlePokeMode).toBe("live");
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MODE: "enforce" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MODE/);
+  });
+
+  test("FACTORY-845: idlePokeSuppressMinutes defaults to 5, honours BUTCHR_IDLE_POKE_SUPPRESS_MINUTES, and rejects a non-positive value", () => {
+    expect(loadConfig(base, noRead).idlePokeSuppressMinutes).toBe(5);
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "15" }, noRead).idlePokeSuppressMinutes).toBe(15);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "0" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_SUPPRESS_MINUTES/);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_SUPPRESS_MINUTES: "nope" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_SUPPRESS_MINUTES/);
+  });
+
+  test("FACTORY-845: idlePokeMaxPerPoll defaults to 3, honours BUTCHR_IDLE_POKE_MAX_PER_POLL, and rejects a non-positive or fractional value", () => {
+    expect(loadConfig(base, noRead).idlePokeMaxPerPoll).toBe(3);
+    expect(loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "10" }, noRead).idlePokeMaxPerPoll).toBe(10);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "0" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MAX_PER_POLL/);
+    expect(() => loadConfig({ ...base, BUTCHR_IDLE_POKE_MAX_PER_POLL: "1.5" }, noRead)).toThrow(/BUTCHR_IDLE_POKE_MAX_PER_POLL/);
   });
 
   test("abandonedMinutes defaults to 30, honours BUTCHR_ABANDONED_MINUTES, and rejects a non-positive value", () => {
@@ -113,6 +178,35 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("pollStaleMs=60000");
   });
 
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs defaults to 10000, honours BUTCHR_HERDR_TIMEOUT_MS, and rejects 0/negative/NaN/non-numeric", () => {
+    expect(loadConfig(base, noRead).herdrCallTimeoutMs).toBe(10_000);
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "5000" }, noRead).herdrCallTimeoutMs).toBe(5_000);
+    for (const bad of ["0", "-1", "NaN", "nope"]) {
+      expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: bad }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    }
+  });
+  test("FACTORY-751/FACTORY-775: herdrCallTimeoutMs throws above its ceiling (300000) instead of silently clamping", () => {
+    expect(loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300000" }, noRead).herdrCallTimeoutMs).toBe(300_000);
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "300001" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+    // The specific overflow value the finding named (2147483648ms, which bun's
+    // setTimeout silently wraps to ~1ms instead of waiting) must throw too,
+    // not merely "some" large value above the ceiling.
+    expect(() => loadConfig({ ...base, BUTCHR_HERDR_TIMEOUT_MS: "2147483648" }, noRead)).toThrow(/BUTCHR_HERDR_TIMEOUT_MS/);
+  });
+  // FACTORY-772: BOUNDED on both ends (as BUTCHR_HERDR_TIMEOUT_MS now is, too).
+  test("loopWatchdogThresholdMs defaults to 120000, honours BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS, and rejects NaN/below-min/above-max", () => {
+    expect(loadConfig(base, noRead).loopWatchdogThresholdMs).toBe(120_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "60000" }, noRead).loopWatchdogThresholdMs).toBe(60_000);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "nope" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "29999" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(() => loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800001" }, noRead)).toThrow(/BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS/);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "30000" }, noRead).loopWatchdogThresholdMs).toBe(30_000);
+    expect(loadConfig({ ...base, BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS: "1800000" }, noRead).loopWatchdogThresholdMs).toBe(1_800_000);
+  });
+  test("describeConfig includes loopWatchdogThresholdMs", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("loopWatchdogThresholdMs=120000");
+  });
+
   test("assignees are parsed when both BUTCHR_ASSIGNEE_STORY/TASK are set", () => {
     const c = loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:story", BUTCHR_ASSIGNEE_TASK: "712020:task" }, noRead);
     expect(c.assignees).toEqual({ story: "712020:story", task: "712020:task" });
@@ -123,9 +217,9 @@ describe("loadConfig", () => {
     expect(c.assignees.task).toBeUndefined();
   });
   test("describeConfig includes the resolved accountIds and names the consequence when a role is unset, never a token", () => {
-    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "712020:e160cf60-6480-44de-8554-af5b81c584e2", BUTCHR_ASSIGNEE_TASK: "712020:619ec5ec-2e92-492f-8979-91ccda318230" }, noRead));
-    expect(both).toContain("assignees=story:712020:e160");
-    expect(both).toContain("task:712020:619e");
+    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "000000:00000000-0000-0000-0000-000000000000", BUTCHR_ASSIGNEE_TASK: "000000:11111111-1111-1111-1111-111111111111" }, noRead));
+    expect(both).toContain("assignees=story:000000:0000");
+    expect(both).toContain("task:000000:1111");
     const none = describeConfig(loadConfig(base, noRead));
     expect(none).toContain("story:unset — Story creation will be refused");
     expect(none).toContain("task:unset — Task creation will be refused");
@@ -142,8 +236,8 @@ describe("loadConfig", () => {
     expect(c.assignees.epic).toBeUndefined();
   });
   test("describeConfig includes the resolved epic accountId, and names the consequence when unset, never a token", () => {
-    const set = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "712020:e160cf60-6480-44de-8554-af5b81c584e2" }, noRead));
-    expect(set).toContain("epic:712020:e160");
+    const set = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_EPIC: "000000:00000000-0000-0000-0000-000000000000" }, noRead));
+    expect(set).toContain("epic:000000:0000");
     const unset = describeConfig(loadConfig(base, noRead));
     expect(unset).toContain("epic:unset — Epic creation will be refused");
   });
@@ -253,6 +347,22 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("lizardApprovalSound=disabled");
     expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1" }, noRead))).toContain("lizardApprovalSound=enabled overridePath=(default: drovr's bundled asset)");
     expect(describeConfig(loadConfig({ ...base, BUTCHR_LIZARD_APPROVAL_SOUND: "1", BUTCHR_LIZARD_APPROVAL_SOUND_PATH: "/x/lizard.mp3" }, noRead))).toContain("lizardApprovalSound=enabled overridePath=/x/lizard.mp3");
+  });
+
+  // FACTORY-581 SAFETY GUARD 4: OFF (undefined) by default — unset or
+  // blank/whitespace-only means permission-answering stays fleet-wide, the
+  // exact behaviour before this field existed; no new flag, only a narrowing
+  // value for the EXISTING eligiblePanes gate (src/daemon/index.ts).
+  test("permissionAnswerCanaryPaneLabel is absent unless BUTCHR_PERMISSION_ANSWER_CANARY_PANE is set to a non-empty value", () => {
+    expect(loadConfig(base, noRead).permissionAnswerCanaryPaneLabel).toBeUndefined();
+    expect(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "   " }, noRead).permissionAnswerCanaryPaneLabel).toBeUndefined();
+  });
+  test("BUTCHR_PERMISSION_ANSWER_CANARY_PANE (trimmed) sets the canary label", () => {
+    expect(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "  admin-brooswit-nexus  " }, noRead).permissionAnswerCanaryPaneLabel).toBe("admin-brooswit-nexus");
+  });
+  test("describeConfig reports the canary label, or that it's unset (fleet-wide)", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain("permissionAnswerCanaryPaneLabel=(unset — permission-answering is fleet-wide)");
+    expect(describeConfig(loadConfig({ ...base, BUTCHR_PERMISSION_ANSWER_CANARY_PANE: "admin-brooswit-nexus" }, noRead))).toContain("permissionAnswerCanaryPaneLabel=admin-brooswit-nexus");
   });
 
   // BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope, default
@@ -365,25 +475,168 @@ describe("loadConfig", () => {
       expect(d).toContain("adminTokenFile=/etc/ta-token");
     });
   });
+
+  // FACTORY-609 (Part B): always present, independent of the credential
+  // gate above — defaults to the director's own routing (FACTORY-607
+  // comment 28688), overridable per-value via env vars.
+  describe("managedEscalationRouting (FACTORY-609)", () => {
+    test("defaults match the director's routing (FACTORY-607 comment 28688) when nothing is set", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.managedEscalationRouting).toEqual({
+        normalMention: "@admin-assembly", normalRoom: "team-admin",
+        assemblyMention: "@manager-factory", assemblyRoom: "team-engineering",
+        directorMention: "@director", directorRoom: "team-engineering",
+        tier2Minutes: 10, tier3Minutes: 20,
+      });
+    });
+
+    test("every value is independently overridable via its own env var", () => {
+      const c = loadConfig({
+        ...base,
+        BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION: "@custom-answerer",
+        BUTCHR_TEAM_ADMIN_ROOM: "custom-admin-room",
+        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION: "@custom-manager",
+        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM: "custom-eng-room",
+        BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION: "@custom-director",
+        BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM: "custom-director-room",
+        BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "7",
+        BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "15",
+      }, noRead);
+      expect(c.managedEscalationRouting).toEqual({
+        normalMention: "@custom-answerer", normalRoom: "custom-admin-room",
+        assemblyMention: "@custom-manager", assemblyRoom: "custom-eng-room",
+        directorMention: "@custom-director", directorRoom: "custom-director-room",
+        tier2Minutes: 7, tier3Minutes: 15,
+      });
+    });
+
+    test("rejects a non-positive or non-numeric tier delay", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "0" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "not-a-number" }, noRead)).toThrow();
+    });
+
+    test("rejects tier3 <= tier2 — the director's own ordering is a correctness constraint, not a style preference", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "20" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "10" }, noRead)).toThrow();
+    });
+
+    test("describeConfig reports the full routing table", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("managedEscalationRouting=");
+      expect(d).toContain("@admin-assembly");
+      expect(d).toContain("@manager-factory");
+      expect(d).toContain("@director");
+      expect(d).toContain("tier2Minutes=10");
+      expect(d).toContain("tier3Minutes=20");
+    });
+  });
+
+  describe("opsAlert (FACTORY-630)", () => {
+    test("defaults to the director's own room, mention and dedup window, with no env set at all", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.opsAlert).toEqual({ room: "team-admin", mention: "@director", dedupMinutes: 60 });
+    });
+
+    test("is ALWAYS present, even with no Rocket.Chat posting credential — the [butchr:ops-alert] journal line needs these values regardless of whether posting is configured", () => {
+      const c = loadConfig(base, noRead);
+      expect(c.managedEscalationRocketChat).toBeUndefined();
+      expect(c.opsAlert.room).toBe("team-admin");
+    });
+
+    test("each value is overridable", () => {
+      const c = loadConfig({ ...base, BUTCHR_OPS_ALERT_ROOM: "team-engineering", BUTCHR_OPS_ALERT_MENTION: "@manager-factory", BUTCHR_OPS_ALERT_DEDUP_MINUTES: "15" }, noRead);
+      expect(c.opsAlert).toEqual({ room: "team-engineering", mention: "@manager-factory", dedupMinutes: 15 });
+    });
+
+    test("a literal `none` mention means post with NO mention — an empty env var cannot express that, since it is indistinguishable from unset", () => {
+      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "none" }, noRead).opsAlert.mention).toBe("");
+      // Empty/whitespace is UNSET, and so takes the default rather than
+      // silently producing an unmentioned room nobody asked for.
+      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "   " }, noRead).opsAlert.mention).toBe("@director");
+    });
+
+    test("rejects a non-positive or non-numeric dedup window rather than silently disabling dedup", () => {
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "0" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "-5" }, noRead)).toThrow();
+      expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "soon" }, noRead)).toThrow();
+    });
+
+    test("describeConfig names the room, the mention, the window, and says when no posting credential exists", () => {
+      const d = describeConfig(loadConfig(base, noRead));
+      expect(d).toContain("opsAlert=#team-admin");
+      expect(d).toContain("dedupMinutes=60");
+      expect(d).toContain("NO posting credential");
+    });
+  });
 });
 
-describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token)", () => {
-  test("defaults to an empty allowlist — fail-closed, every origin rejected", () => {
+describe("extensionAuth (FACTORY-339; FACTORY-464/FACTORY-465 dropped the bearer token; FACTORY-497/FACTORY-475 hardcodes Cleavr's fixed id as the ONLY allowed origin)", () => {
+  const CLEAVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+  // FACTORY-497: removed the tests for the three-way unset/explicit-empty/
+  // additive env semantics (`BUTCHR_EXTENSION_ORIGINS` had a real effect on
+  // the allowlist) — there is no longer any env-driven allowlist behavior
+  // to assert: `loadConfig` never reads that variable into `extensionAuth`
+  // at all any more, so those cases no longer exist to test. No security
+  // assertion is weakened: the replacement tests below still assert the
+  // fixed id is allowed, every other id is rejected, and absent Origin is
+  // refused — plus a new assertion (below) that the variable's value now
+  // has NO effect on the allowlist, which is a strictly stronger claim than
+  // "additive" ever was.
+
+  test("extensionAuth is always exactly Cleavr's fixed id, regardless of environment", () => {
     const c = loadConfig(base, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: [] });
+    expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEAVR_ORIGIN] });
   });
-  test("BUTCHR_EXTENSION_ORIGINS is read, trimmed and split on commas", () => {
-    const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop, chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba " }, noRead);
-    expect(c.extensionAuth).toEqual({ allowedOrigins: ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "chrome-extension://ponmlkjihgfedcbaponmlkjihgfedcba"] });
-  });
-  test("rejects a BUTCHR_EXTENSION_ORIGINS entry that isn't a well-formed chrome-extension:// origin", () => {
-    for (const bad of ["https://evil.example", "chrome-extension://tooshort", "chrome-extension://ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP", "not-a-uri-at-all"]) {
-      expect(() => loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: bad }, noRead)).toThrow("BUTCHR_EXTENSION_ORIGINS");
+  test("setting BUTCHR_EXTENSION_ORIGINS has no effect on the allowlist, however it's set", () => {
+    for (const value of ["chrome-extension://abcdefghijklmnopabcdefghijklmnop", "", "not-a-uri-at-all", ","]) {
+      const c = loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: value }, noRead);
+      expect(c.extensionAuth).toEqual({ allowedOrigins: [CLEAVR_ORIGIN] });
     }
   });
-  test("describeConfig reports the allowlist, and names the fail-closed consequence when it's empty — no token to ever leak", () => {
-    expect(describeConfig(loadConfig(base, noRead))).toContain("extensionAuth=origins=EMPTY — every origin rejected");
-    const d = describeConfig(loadConfig({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, noRead));
-    expect(d).toContain("extensionAuth=origins=chrome-extension://abcdefghijklmnopabcdefghijklmnop");
+  test("setting BUTCHR_EXTENSION_ORIGINS triggers the ignored-variable warning; unset does not", () => {
+    expect(ignoredExtensionOriginsWarning({ ...base, BUTCHR_EXTENSION_ORIGINS: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" })).toContain("BUTCHR_EXTENSION_ORIGINS");
+    expect(ignoredExtensionOriginsWarning({ ...base, BUTCHR_EXTENSION_ORIGINS: "" })).toContain("BUTCHR_EXTENSION_ORIGINS");
+    expect(ignoredExtensionOriginsWarning(base)).toBeUndefined();
+  });
+  test("describeConfig reports the single fixed-id allowlist", () => {
+    expect(describeConfig(loadConfig(base, noRead))).toContain(`extensionAuth=origins=${CLEAVR_ORIGIN}`);
+  });
+});
+
+describe("guard behavior with the real config (FACTORY-497/FACTORY-475)", () => {
+  const CLEAVR_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+  test("default config allows the fixed Cleavr id and rejects any other origin", () => {
+    const c = loadConfig(base, noRead);
+    expect(checkExtensionOrigin({ origin: CLEAVR_ORIGIN }, c.extensionAuth).ok).toBe(true);
+    expect(checkExtensionOrigin({ origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop" }, c.extensionAuth).ok).toBe(false);
+  });
+  test("absent Origin is still refused (403) even with the default allowlist populated", () => {
+    const c = loadConfig(base, noRead);
+    const r = checkExtensionOrigin({ origin: null }, c.extensionAuth);
+    expect(r).toEqual({ ok: false, status: 403, body: { error: "origin required" }, corsHeaders: {}, reason: "origin required" });
+  });
+});
+
+describe("FACTORY-665 (PR-2): isAtlassianConfigured / validateAtlassianSiteShape", () => {
+  test("isAtlassianConfigured is true only when site+email+(token or token file) are all present and non-blank", () => {
+    expect(isAtlassianConfigured(base)).toBe(true);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: "  " })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_EMAIL: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_TOKEN: undefined })).toBe(false);
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_TOKEN: undefined, ATLASSIAN_TOKEN_FILE: "/t" })).toBe(true);
+  });
+  test("isAtlassianConfigured never validates the site's shape — only presence (loadConfig/validateAtlassianSiteShape own that)", () => {
+    expect(isAtlassianConfigured({ ...base, ATLASSIAN_SITE: "not a url at all" })).toBe(true);
+  });
+  test("validateAtlassianSiteShape accepts exactly https://<name>.atlassian.net, case-insensitively, and rejects everything else", () => {
+    expect(() => validateAtlassianSiteShape("https://x.atlassian.net")).not.toThrow();
+    expect(() => validateAtlassianSiteShape("https://my-team.atlassian.net")).not.toThrow();
+    expect(() => validateAtlassianSiteShape("HTTPS://X.ATLASSIAN.NET")).not.toThrow();
+    for (const bad of ["https://evil.example.com", "http://x.atlassian.net", "https://x.atlassian.net/", "https://x.atlassian.net/path", "https://x.atlassian.net:443", "https://x.atlassian.net.evil.com", "https://.atlassian.net", "https://-x.atlassian.net", "ftp://x.atlassian.net", ""]) {
+      expect(() => validateAtlassianSiteShape(bad)).toThrow(/ATLASSIAN_SITE must look like/);
+    }
   });
 });

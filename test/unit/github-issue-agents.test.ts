@@ -138,7 +138,7 @@ describe("the MCP auth gate", () => {
     state: async () => [], open: async () => ({ ok: true }), openPane: async () => ({ ok: true }),
     health: () => ({ ok: true, components: [] }),
     dashboard: async () => ({ checked: true as const, confirmedAt: "", rows: [], admission: { cap: 0, residency: null, sources: [] } }),
-    header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "t", version: "0" } }),
+    header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "t", version: "0", versionProvenance: "tag", versionUnknownReason: null } }),
     resourceLink: async () => ({ ok: true as const, url: "x" }),
   };
   const { app, mcp } = buildApp(view as never, {}, () => {});
@@ -165,7 +165,7 @@ describe("github issue tools", () => {
   test("github_get_issue reads the caller's own issue: title, body, type and comments", async () => {
     const { client, calls } = fakeGithub(issues);
     const tools = githubIssueTools({ client, log: () => {} });
-    expect(Object.keys(tools[`github_get_issue`]!.input)).toEqual([]);
+    expect(Object.keys(tools[`github_get_issue`]!.input)).toEqual(["target"]);
     expect(await call(tools, "github_get_issue", {}, ghCaller)).toMatchObject({
       issue: "acme/w#12", title: "Crash on save", body: "steps…", type: "Bug", state: "open",
       comments: [{ id: "5", author: "alice", body: "any update?", created: "c", updated: "c" }],

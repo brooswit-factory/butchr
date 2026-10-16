@@ -99,6 +99,12 @@ const DISPOSITIONS: Record<string, Disposition> = {
   // direction (`requireIssueCaller`, defs.ts — same shape as
   // `refuseProjectCaller`, just a mirrored gate function).
   stand_down: "refuses",
+  // FACTORY-996: a confluence-page resource is never a project's own
+  // resource — only an issue-tier (managed-session) agent is ever spawned
+  // for one, so both new verbs refuse a project caller via the same
+  // `refuseProjectCaller` gate every other "refuses" verb uses.
+  get_my_confluence_page: "refuses",
+  get_my_confluence_page_comments: "refuses",
 
   // Exists ONLY for a project caller; refuses an issue caller instead
   // (`requireProjectCaller`, defs.ts — the gate runs in the opposite
@@ -316,16 +322,17 @@ describe('project-caller disposition enumeration (BUTCHR-82) — "refuses" and "
   // Sanity on the buckets themselves — if a future edit to DISPOSITIONS
   // leaves one of these empty, the loops below would silently assert
   // nothing and this file would look green while checking less than it
-  // claims to. Pinned to the counts this ticket found: as of BUTCHR-307,
-  // 4 "refuses" verbs (submit_to_boss, finish_without_a_boss,
-  // file_where_it_belongs, stand_down) and, as of BUTCHR-185/BUTCHR-215,
+  // claims to. Pinned to the counts this ticket found: as of FACTORY-996,
+  // 6 "refuses" verbs (submit_to_boss, finish_without_a_boss,
+  // file_where_it_belongs, stand_down, get_my_confluence_page,
+  // get_my_confluence_page_comments) and, as of BUTCHR-185/BUTCHR-215,
   // 4 "project-only" verbs (check_in, get_doc_comments, list_peers,
   // tell_peer). If a FUTURE verb is legitimately added to either
   // bucket, this assertion SHOULD go red — that is correct, not a bug: update
   // the expected count here to match the new, deliberate total. Do not delete
   // this assertion to get green; update the number.
   test("both buckets are non-empty (guards the loops below against silently checking nothing)", () => {
-    expect(refusesVerbs.length).toBe(4);
+    expect(refusesVerbs.length).toBe(6);
     expect(projectOnlyVerbs.length).toBe(4);
   });
 

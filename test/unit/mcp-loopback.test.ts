@@ -23,7 +23,7 @@ const view = {
   openPane: async () => ({ ok: false }),
   health: () => ({ ok: true, components: [] }),
   dashboard: async () => ({ checked: true as const, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sources: [] } }),
-  header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0" } }),
+  header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } }),
   resourceLink: async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` }),
 };
 const tools = {

@@ -12,9 +12,17 @@
  * root is removed after the last test.
  */
 import { afterAll, afterEach, beforeEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// On macOS os.tmpdir() is /var/folders/..., and /var is a symlink to
+// /private/var. Code that realpaths a root (filesystem discovery, session
+// definitions) or refuses symlinked paths (Drovr's native transcript reader)
+// then disagrees with the unresolved path a test built from it. os.tmpdir()
+// reads TMPDIR on every call, so resolving it once here gives every test a real
+// path. A no-op wherever the temp dir is already real (Linux /tmp).
+process.env.TMPDIR = realpathSync(tmpdir());
 
 export const testWorkspaceRoot = mkdtempSync(join(tmpdir(), "butchr-test-workspaces-"));
 

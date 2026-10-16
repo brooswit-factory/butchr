@@ -198,7 +198,6 @@ function createJiraIdeaEventRules(deps: JiraIdeaResourceDeps) {
 }
 
 export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): ResourceType<JiraIdeaItem> {
-  const rules = deps.rules.filter((r) => r.resourceProvider === "jira-idea");
   const excluded = onceExcluded("jira-idea", "not a proven Product Discovery idea", deps.log);
   // `related` runs right after `search` in the same poll, so it reads this poll's ideas.
   let latest: RuleMatch[] = [];
@@ -213,6 +212,10 @@ export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): Resource
     discovery: {
       idOf: (m) => (isIdeaUnit(m) ? unitAgentKey(m) : m.agentKey),
       search: async () => {
+        // FACTORY-657: read live, every poll — never hoisted to a local
+        // outside this closure — so a rules reload (src/rules/rules.ts's
+        // `RulesHolder`) is reflected on this loop's very next poll.
+        const rules = deps.rules.filter((r) => r.resourceProvider === "jira-idea");
         latest = await searchJiraIdeaRules({ rules, search: deps.search, excluded });
         deps.onMatches?.(latest);
         if (deps.runningIds) logExecutionModeSwitches("jira-idea", rules, await deps.runningIds(), decodeAnyAgentKey, deps.log);
@@ -243,7 +246,15 @@ export function createJiraIdeaResourceType(deps: JiraIdeaResourceDeps): Resource
       },
     },
     activation: { verdictFor: () => "active" },
-    eventRules: createJiraIdeaEventRules({ ...deps, rules }),
+    // FACTORY-657: `deps.rules` here is still the FULL, live, all-providers
+    // array (never pre-filtered) — `createJiraIdeaEventRules`'s own
+    // `createRuleEventRules` call (src/rules/resource-type.ts) filters by
+    // rule id it already holds per ticket, not by iterating this list, so
+    // passing the unfiltered live array costs nothing and keeps this
+    // constructed-once object reading the SAME live reference `search()`
+    // above re-filters on every poll, rather than a jira-idea-only snapshot
+    // frozen at this moment.
+    eventRules: createJiraIdeaEventRules(deps),
     spawnConfig: { specFor: (m) => (isIdeaUnit(m) ? (m.kind === "resource" ? specForJiraIdea(m.match) : specForRuleQuery(m.rule, m.agentKey)) : specForJiraIdea(m as unknown as RuleMatch)) },
   };
 }

@@ -1,0 +1,9 @@
+# FACTORY-569: without this, Git for Windows' default `core.autocrlf=true`
+# checks every text file out with CRLF line endings on windows-latest CI
+# runners, while every in-repo string comparison (generated content, this
+# suite's own fixtures) is built with a literal `\n`. That single silent
+# byte-level difference was the actual root cause of test/unit/load-
+# inventory.test.ts's ~216 Windows CI failures — not a path-separator bug.
+# `eol=lf` pins checkout to LF on every OS regardless of the runner's own
+# git config, so a committed file's bytes stay identical everywhere.
+* text=auto eol=lf

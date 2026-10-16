@@ -62,15 +62,44 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // `changeNudge` (only Jira-issue-shaped resources call this function).
   // Folded into the same defensive fallback rather than given its own
   // clause here, for the same reason `pr`/`linked` are.
+  // FACTORY-998: `confluencePageEdit`/`confluencePageComment` ARE reachable
+  // here now — `confluencePageNudge` below (a real `confluence-page` agent's
+  // own nudge, src/rules/confluence-page-type.ts) calls THIS function, unlike
+  // the FACTORY-997 standalone-page event path, which never wired itself
+  // into any nudge renderer at all. Given their own clauses just below,
+  // mirroring `notifyReasonTag`'s own rendering of the same two members.
   if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
+  if ("confluencePageEdit" in reason) return `was edited (version ${reason.confluencePageEdit.from} → ${reason.confluencePageEdit.to})`;
+  if ("confluencePageComment" in reason) return `got ${reason.confluencePageComment.ids.length} new footer comment${reason.confluencePageComment.ids.length === 1 ? "" : "s"}`;
   if ("status" in reason) return `changed status from "${reason.status.from}" to "${reason.status.to}"`;
   if ("label" in reason) {
     const { prefix, from, to } = reason.label;
     return `changed its ${prefix}:* label from ${prefix}:${from ?? "none"} to ${prefix}:${to ?? "none"}`;
   }
   if ("summary" in reason) return "had its summary edited";
+  // FACTORY-922: assignee/description/issuelinks are the three further
+  // confirmed-diff classes the resolved FACTORY-921 decision adds — see
+  // NotifyReason's own doc comment.
+  if ("assignee" in reason) return `was reassigned from ${reason.assignee.from ?? "unassigned"} to ${reason.assignee.to ?? "unassigned"}`;
+  if ("description" in reason) return "had its description edited";
+  if ("issuelinks" in reason) {
+    const { added, removed } = reason.issuelinks;
+    const parts: string[] = [];
+    if (added.length) parts.push(`linked to ${added.join(", ")}`);
+    if (removed.length) parts.push(`unlinked from ${removed.join(", ")}`);
+    return `had its linked issues changed (${parts.join("; ")})`;
+  }
+  // FACTORY-949: named explicitly (never folded into the `label` clause
+  // above) since the TWO producers of this reason (issue.ts's boss wake,
+  // project.ts's manager wake) need the SAME wording whether `about` is the
+  // blocked ticket itself or the project that owns it — see NotifyReason's
+  // own doc comment.
+  if ("blocked" in reason) return `has its ticket ${reason.blocked.key} newly agent:blocked — it needs you`;
+  // FACTORY-972: same "named explicitly, same wording for both producers"
+  // reasoning as `blocked` just above — see NotifyReason's own doc comment.
+  if ("stalled" in reason) return `has its ticket ${reason.stalled.key} newly agent:stalled — it needs you`;
   // BUTCHR-351: `reason.comment === null` means the mover was a comment
   // DELETION, not an addition (see NotifyReason's own doc comment) —
   // "got a new comment" would be actively wrong there.
@@ -147,6 +176,9 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if ("status" in reason) return ` (status:${reason.status.from}→${reason.status.to})`;
   if ("label" in reason) return ` (${reason.label.prefix}:${reason.label.from ?? "none"}→${reason.label.prefix}:${reason.label.to ?? "none"})`;
   if ("summary" in reason) return " (summary changed)";
+  if ("assignee" in reason) return ` (assignee:${reason.assignee.from ?? "none"}→${reason.assignee.to ?? "none"})`;
+  if ("description" in reason) return " (description changed)";
+  if ("issuelinks" in reason) return ` (issuelinks:+${reason.issuelinks.added.length}/-${reason.issuelinks.removed.length})`;
   if ("undetermined" in reason) {
     if (reason.undetermined === "check-failed") return " (reason: could not check — comments fetch failed)";
     if (reason.undetermined === "checked-unchanged") return " (reason: not determinable — checked comments, unchanged)";
@@ -158,7 +190,18 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   // would produce. Still a `(comment:` PREFIX, so AC4's own reasoning for
   // why no distinct tag is warranted (this module's top comment) still
   // holds: additive, not a meaning change to the existing shape.
-  return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`; // "comment" in reason
+  if ("comment" in reason) return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`;
+  if ("blocked" in reason) return ` (blocked:${reason.blocked.key})`; // FACTORY-949
+  if ("stalled" in reason) return ` (stalled:${reason.stalled.key})`; // FACTORY-972
+  // FACTORY-997: same "unreachable via notifyRuleAgent in practice" shape
+  // as `definitionField` above — a standalone Confluence page's own event
+  // rules (src/resources/confluence-page.ts) are not wired into this tag's
+  // caller at all (no production `[notify]` line is ever produced for
+  // them yet; see that module's top comment on scope). Handled explicitly
+  // rather than folded into an untyped fallback, so a future wiring-in
+  // gets a tag "for free" rather than reopening this function.
+  if ("confluencePageEdit" in reason) return ` (confluencePageEdit:${reason.confluencePageEdit.from}→${reason.confluencePageEdit.to})`;
+  return ` (confluencePageComment:${reason.confluencePageComment.ids.length})`; // "confluencePageComment" in reason
 }
 
 /**
@@ -235,6 +278,21 @@ export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEv
  */
 export function filesystemNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Filesystem resource ${resource} ${reasonClause(reason)} — re-read it from disk.`;
+}
+
+/**
+ * FACTORY-998: the agent-facing push for a `confluence-page` agent's own
+ * child page. Carries no page-authored text (an edit or a new footer
+ * comment is read fresh, never pushed into the prompt — see this ticket's
+ * own "Agent safety" writeup and src/rules/confluence-page-type.ts); names
+ * the tool to re-read with (`get_my_confluence_page`, FACTORY-993/996,
+ * src/tools/defs.ts), since a confluence-page agent has no Jira/GitHub/
+ * Zendesk read tools. `reasonClause` already renders `confluencePageEdit`/
+ * `confluencePageComment` (and `appeared`/`disappeared`, for a
+ * singleton/persistent rule's query agent) without any change here.
+ */
+export function confluencePageNudge(resource: string, reason: NotifyReason | undefined): string {
+  return `[butchr] Confluence page ${resource} ${reasonClause(reason)} — re-read it with get_my_confluence_page.`;
 }
 
 /**

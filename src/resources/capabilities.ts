@@ -23,16 +23,21 @@
 import type { ResourceRef } from "./resource-ref.js";
 import type { JiraWorkItemRef } from "./jira-work-item-ref.js";
 import type { ZendeskTicketRef } from "./zendesk-ticket-ref.js";
+import type { TrelloCardRef } from "./trello-card-ref.js";
 
 /**
- * The eight resource providers this codebase has any notion of today — a
+ * The resource providers this codebase has any notion of today — a
  * superset of `ResourceRef`'s six kinds (`RESOURCE_REF_PROVIDERS`,
- * ./resource-ref.ts). `jira-idea` and `zendesk-ticket` are resource types
- * this codebase already staffs agents for (src/resources/jira-idea.ts,
- * zendesk-ticket.ts) but are deliberately excluded from `ResourceRef` itself
- * — see that module's own header. Capability declaration needs to answer
- * for all eight, so this list is its own, wider superset rather than an
- * extension of `RESOURCE_REF_PROVIDERS`.
+ * ./resource-ref.ts). `jira-idea`, `zendesk-ticket` and `trello-card` are
+ * resource types this codebase has client/auth code for
+ * (src/resources/jira-idea.ts, zendesk-ticket.ts, trello-card.ts) but are
+ * deliberately excluded from `ResourceRef` itself — see that module's own
+ * header. Capability declaration needs to answer for all of them, so this
+ * list is its own, wider superset rather than an extension of
+ * `RESOURCE_REF_PROVIDERS`. `trello-card` (FACTORY-1009) is additive
+ * alongside the existing Jira/Confluence providers — no rule type, agent
+ * staffing, or MCP tool wires it in yet; see trello-card.ts's own "Scope"
+ * note.
  */
 export const CAPABILITY_PROVIDERS = [
   "jira-work-item",
@@ -42,6 +47,7 @@ export const CAPABILITY_PROVIDERS = [
   "github-issue",
   "github-pr",
   "zendesk-ticket",
+  "trello-card",
   "filesystem",
   "webpage",
 ] as const;
@@ -64,7 +70,8 @@ export type Capability = (typeof CAPABILITIES)[number];
 export type CapabilityRef =
   | ResourceRef
   | ({ provider: "jira-idea" } & JiraWorkItemRef)
-  | ({ provider: "zendesk-ticket" } & ZendeskTicketRef);
+  | ({ provider: "zendesk-ticket" } & ZendeskTicketRef)
+  | ({ provider: "trello-card" } & TrelloCardRef);
 
 /**
  * Thrown when a capability-gated invocation (today: `readComments`/
@@ -91,13 +98,29 @@ export class UnsupportedCapabilityError extends Error {
  * this table only carries the boolean a caller can safely act on.
  */
 const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
-  "jira-work-item": { query: true, read: true, snapshot: true, comments: true, links: true, createTask: false },
+  "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
-  "confluence-page": { query: false, read: false, snapshot: false, comments: true, links: true, createTask: false },
+  // FACTORY-998: `query` flipped true — a real provider/rule now exists
+  // (src/rules/confluence-page-type.ts, `{"ancestor": "<page id>"}`), usable
+  // by a caller with zero provider-specific knowledge the same way every
+  // other `true` cell here is. `read` stays `false` on purpose: a bare
+  // version-number read is not what this cell means (see the handoff doc's
+  // own "partial implementation" carve-out this module's header cites) —
+  // page CONTENT is read via `get_my_confluence_page`
+  // (FACTORY-993/996, src/tools/defs.ts), a self-only verb with no
+  // provider-agnostic entry point, not through a shared `read` capability.
+  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false },
   "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
+  // FACTORY-1009: query/read/comments mirror zendesk-ticket's own row — a
+  // real REST client exists for all three (trello-card.ts), reusable by a
+  // zero-provider-knowledge caller through comments.ts the same way. `links`
+  // stays false (no ResourceRef/link-store integration, same reason
+  // zendesk-ticket's does); no event-rules/poll wiring exists, so `snapshot`
+  // is the plain "absent" case, not a flip under "The snapshot bar".
+  "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false },
   filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false },
   webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false },
 };

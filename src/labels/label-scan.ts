@@ -108,6 +108,16 @@ export const KNOWN_NON_LABEL_LITERALS: readonly LabelLiteralExclusion[] = [
     text: "butchr:doc",
     reason: "The KNOWN_NON_LABEL_LITERALS entry above, restating the literal it documents — not a second use of it as a label.",
   },
+  {
+    file: "src/agents/claude-hooks.ts",
+    text: "butchr:file-execution-veto",
+    reason: "FACTORY-625 HOOK_MARKER — a marker embedded as a trailing shell comment inside the PreToolUse hook command written into a workspace's own .claude/settings.json, so the idempotent merge can recognise and replace butchr's own entry. It identifies a line in a settings FILE, never a Jira issue: it is never passed to addLabels/removeLabels and never appears in a `labels` array. Nothing withdraws it from a ticket because it is never on one; the install's own `enabled: false` path is what removes it from the file.",
+  },
+  {
+    file: "src/labels/label-scan.ts",
+    text: "butchr:file-execution-veto",
+    reason: "The KNOWN_NON_LABEL_LITERALS entry above, restating the literal it documents — same self-reference as the butchr:doc pair.",
+  },
 ];
 
 const exclusionKey = (file: string, text: string): string => `${file} ${text}`;

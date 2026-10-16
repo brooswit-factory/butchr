@@ -127,8 +127,22 @@ function pinnedActiveComment(id: string, elapsedMinutes: number, boundMinutes: n
 
 export interface PinnedActiveDetectorDeps {
   now: () => number;
-  /** Minutes an idle/done streak must hold, uninterrupted, before a complaint is posted — reuses config.stalledMinutes (BUTCHR_STALLED_MINUTES): same phenomenon (an idle/done agent, unattended, past a window), same threshold semantics as the issue tier's own `stalled` check. */
+  /** Minutes an idle/done streak must hold, uninterrupted, before a complaint is posted — reuses config.stalledMinutes (BUTCHR_STALLED_MINUTES): same phenomenon (an idle/done agent, unattended, past a window), same threshold semantics as the issue tier's own `stalled` check. The FALLBACK threshold when `minutesFor` is omitted, or returns `undefined` for a given `id`. */
   minutes: number;
+  /**
+   * FACTORY-845: per-`id` override of `minutes` above — e.g. a jira-project
+   * (manager) rule's own `idlePokeMinutes` (FACTORY-844/846's per-rule
+   * config), resolved by the caller (src/daemon/index.ts) from whichever
+   * rule matched this id this poll. Returning `undefined` for a given `id`
+   * (no matching rule, or none set one) falls back to `minutes` — NEVER a
+   * hardcoded 30, same convention the issue tier's idle-poke engine
+   * (src/agents/idle-poke.ts) uses for the same field. OPTIONAL and
+   * additive: every existing caller/fixture that doesn't supply it sees
+   * IDENTICAL behaviour to before this field existed (`tracker` is
+   * constructed with the SAME single `minutes` for every id, exactly as
+   * it always has been) — this dep only changes anything when supplied.
+   */
+  minutesFor?: (id: string) => number | undefined;
   /**
    * issue/project id -> raw herdr agent_status for every currently running
    * butchr agent. THE SAME closure src/daemon/index.ts already builds for
@@ -253,7 +267,7 @@ export function createPinnedActiveDetector(deps: PinnedActiveDetectorDeps): Pinn
    * a genuinely re-opened episode permanently unreachable — it is a delay,
    * not a loss.
    */
-  async function postComplaint(id: string, elapsedMinutes: number, closedBeforeTs: number | undefined): Promise<number | null> {
+  async function postComplaint(id: string, elapsedMinutes: number, closedBeforeTs: number | undefined, resolvedMinutes: number): Promise<number | null> {
     const rows = await deps.comments(id).catch((e) => {
       log(`WARNING: [pinned] comments fetch failed for ${id}: ${(e as Error)?.message ?? e}`);
       return null;
@@ -284,7 +298,7 @@ export function createPinnedActiveDetector(deps: PinnedActiveDetectorDeps): Pinn
       return null;
     }
     try {
-      await deps.addComment(id, pinnedActiveComment(id, elapsedMinutes, deps.minutes));
+      await deps.addComment(id, pinnedActiveComment(id, elapsedMinutes, resolvedMinutes));
     } catch (e) {
       const message = (e as Error)?.message ?? String(e);
       if (loggedFailure.get(id) !== message) {
@@ -297,7 +311,7 @@ export function createPinnedActiveDetector(deps: PinnedActiveDetectorDeps): Pinn
     rateCap.record(id, deps.now());
     cappedLogged.delete(id);
     const postedAt = deps.now();
-    log(`[pinned] ${id} past the ${deps.minutes}-minute pinned-active window (${elapsedMinutes}m) — complaint posted`);
+    log(`[pinned] ${id} past the ${resolvedMinutes}-minute pinned-active window (${elapsedMinutes}m) — complaint posted`);
     return postedAt;
   }
 
@@ -320,7 +334,21 @@ export function createPinnedActiveDetector(deps: PinnedActiveDetectorDeps): Pinn
       const statuses = await deps.agentStatuses();
       for (const id of activeRunning) {
         const label: ObservedLabel = mapAgentStatus(statuses.get(id) ?? null);
-        const qualifies = tracker.observe(id, label);
+        const baseQualifies = tracker.observe(id, label);
+        // FACTORY-845: `tracker` itself is still constructed with ONE
+        // uniform `deps.minutes` (unchanged — see this module's own doc
+        // comment on `minutesFor`), so a per-`id` override is applied here,
+        // against the tracker's own precise `streakStart` (never the
+        // rounded `elapsedMinutes`, to avoid a boundary disagreeing with
+        // `tracker.observe`'s own ms-exact comparison for the common case
+        // where no override applies). `baseQualifies` is reused verbatim
+        // when `minutesFor` resolves to the SAME number as `deps.minutes`
+        // — i.e. every existing caller/test that never supplies
+        // `minutesFor` sees byte-identical behaviour to before this field
+        // existed.
+        const resolvedMinutes = deps.minutesFor?.(id) ?? deps.minutes;
+        const streakStart = tracker.streakStart(id);
+        const qualifies = resolvedMinutes === deps.minutes ? baseQualifies : streakStart != null && deps.now() - streakStart >= resolvedMinutes * 60_000;
         if (!qualifies) {
           // Streak broken (or not yet started) this poll — never a
           // candidate right now. If this episode had already been spoken
@@ -342,7 +370,7 @@ export function createPinnedActiveDetector(deps: PinnedActiveDetectorDeps): Pinn
         if (quotaLogged.delete(id)) log(`[pinned] ${id} no longer quota-blocked — complaint eligible again`);
 
         const elapsedMinutes = tracker.elapsedMinutes(id) ?? 0;
-        const at = await postComplaint(id, elapsedMinutes, closedBefore.get(id));
+        const at = await postComplaint(id, elapsedMinutes, closedBefore.get(id), resolvedMinutes);
         if (at !== null) spoken.set(id, at);
       }
     } catch (e) {

@@ -14,6 +14,7 @@ import { bridgeWorkspace } from "../../src/mcp/workspace.js";
 import { createOwnWriteLedger } from "../../src/jira-watch/own-writes.js";
 import { EXECUTION_MODES, parseRules, type Rule } from "../../src/rules/rules.js";
 import { createRuleEventRules, createRuleResourceType, FOREIGN_RULE_ID, foreignImplementerKeys, ownsRuleAgent, relatedForRules, searchRules, specForMatch, specForRuleQuery, uniqueIssues, type RuleMatch } from "../../src/rules/resource-type.js";
+import { parseSuppressedLine } from "../../src/jira-watch/suppressed-log.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue =>
@@ -86,6 +87,11 @@ describe("rule discovery", () => {
     expect(spec).toEqual({
       key: "jira-work:task:BUTCHR-7", resource: "BUTCHR-7", issuetype: "Task", summary: "summary of BUTCHR-7", parent: "BUTCHR-1",
       brief: "do it", agents: [{ harness: "codex", model: "gpt-5" }, { harness: "claude", effort: "max" }],
+      // FACTORY-916: `specForMatch` now always carries the already-fetched
+      // issue's own status/labels, so the spawn decision's `classifyStop`
+      // call needs no second Jira fetch — see that field's own doc comment
+      // (src/agents/workspace.ts, `SpawnSpec.ticketStatus`).
+      ticketStatus: "In Progress", ticketLabels: [],
     });
   });
 
@@ -115,6 +121,29 @@ describe("rule discovery", () => {
     const querySpec = specForRuleQuery(lizardRule!, "jira-work:manual:%40query");
     expect(querySpec.permissionMode).toBe("default");
     expect(querySpec.lizardMode).toBe(true);
+  });
+
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): `resumeOnRespawn`/
+  // `resumeContextCutoff` (FACTORY-851) are forwarded the same way, EXCEPT
+  // `resumeOnRespawn` is absent-means-ON (no tri-state), so an explicit
+  // `false` must still reach the spec — a truthy-only forward (the shape
+  // `lizardMode` above uses) would silently drop it. `ticketStatus`/
+  // `ticketLabels` are always present — this already-fetched issue's own
+  // fields, never conditional on the rule.
+  test("FACTORY-916: resumeOnRespawn/resumeContextCutoff are forwarded (including an explicit false), and ticketStatus/ticketLabels always ride along", () => {
+    const [rule] = rules({ id: "resume", query: "q", resumeOnRespawn: false, resumeContextCutoff: 5000 });
+    const spec = specForMatch({ agentKey: "jira-work:resume:BUTCHR-7", rule: rule!, issue: issue("BUTCHR-7", { status: "In Review", labels: ["a", "b"] }) });
+    expect(spec.resumeOnRespawn).toBe(false);
+    expect(spec.resumeContextCutoff).toBe(5000);
+    expect(spec.ticketStatus).toBe("In Review");
+    expect(spec.ticketLabels).toEqual(["a", "b"]);
+
+    const [plainRule] = rules({ id: "plain2", query: "q" });
+    const plainSpec = specForMatch({ agentKey: "jira-work:plain2:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") });
+    expect(plainSpec).not.toHaveProperty("resumeOnRespawn");
+    expect(plainSpec).not.toHaveProperty("resumeContextCutoff");
+    expect(plainSpec.ticketStatus).toBe("In Progress"); // issue()'s own default
+    expect(plainSpec.ticketLabels).toEqual([]);
   });
 });
 
@@ -352,6 +381,75 @@ describe("rule relationships", () => {
     // Only the boss ticket's agents watch, so dropping BOTH of them leaves nothing.
     const noBossAgents = keys(ms).filter((k) => !k.endsWith(":BUTCHR-1"));
     expect(relatedForRules(ruleSet, ms, noBossAgents)).toEqual([]);
+  });
+
+  // FACTORY-947/952: a Task's events must never reach its Epic — enforced as
+  // an issue-type TIER check at the point `implementsEdge` would otherwise
+  // record a boss-routing edge, not a chain-walking change (routing has
+  // always been, and stays, strictly one hop: see this file's own
+  // BUTCHR-388 describe block). Confirmed live on the fleet this ticket was
+  // filed against: an Epic adopting an otherwise-bossless Task directly via
+  // `adopt_worker` produces the exact same Implements-link shape as a
+  // genuine mislink, and both are rejected the same way — see FACTORY-955's
+  // own ticket comment for the journal line this test is modeled on.
+  describe("FACTORY-952: one-hop-only boss routing (a Task's Implements link must resolve to a Story, never an Epic)", () => {
+    const plain = rules({ id: "a", query: "q1" }, { id: "b", query: "q2" });
+    const ruleA = byId(plain, "a");
+    const ruleB = byId(plain, "b");
+
+    test("a Task implementing an Epic directly: not routed, and logged as a topology rejection", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, task)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([]);
+      expect(logs).toHaveLength(1);
+      expect(parseSuppressedLine(logs[0]!)).toMatchObject({
+        key: "BUTCHR-2",
+        watcher: "jira-work:a:BUTCHR-1",
+        arm: "topology",
+        fields: { implementer_type: "Task", boss_type: "Epic" },
+      });
+    });
+
+    test("the same stray Task->Epic link, supplied as a cross-daemon foreign implementer, is rejected identically", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const foreignTask = issue("BUTCHR-2", { issuetype: "Task" });
+      const ms = [match(ruleA, epic)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [foreignTask], (l) => logs.push(l))).toEqual([]);
+      expect(logs).toHaveLength(1);
+      expect(parseSuppressedLine(logs[0]!)?.arm).toBe("topology");
+    });
+
+    test("regression: a Story implementing an Epic still routes normally (the ordinary one-hop case)", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const story = issue("BUTCHR-2", { issuetype: "Story", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, story)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:a:BUTCHR-1"] },
+      ]);
+      expect(logs).toEqual([]);
+    });
+
+    test("regression: a Task implementing its Story still routes normally (the ordinary one-hop case)", () => {
+      const story = issue("BUTCHR-1", { issuetype: "Story", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, story), match(ruleB, task)];
+      const logs: string[] = [];
+      expect(relatedForRules(plain, ms, keys(ms), [], (l) => logs.push(l))).toEqual([
+        { issue: ms[1]!, watchers: ["jira-work:a:BUTCHR-1"] },
+      ]);
+      expect(logs).toEqual([]);
+    });
+
+    test("no `log` dep wired: the stray edge is still rejected, just silently (never throws)", () => {
+      const epic = issue("BUTCHR-1", { issuetype: "Epic", issuelinks: implementedBy("BUTCHR-2") });
+      const task = issue("BUTCHR-2", { issuetype: "Task", issuelinks: implementsBoss("BUTCHR-1") });
+      const ms = [match(ruleA, epic), match(ruleB, task)];
+      expect(relatedForRules(plain, ms, keys(ms))).toEqual([]);
+    });
   });
 
   test("an inward connection rule hears the connecting rule's ticket over Relates; the link is read from either end", () => {
@@ -604,6 +702,39 @@ describe("rule relationships", () => {
     }
     // The worker's own agents still hear it on the primary path, each under its own key.
     expect([...ev.changedPrimary].sort()).toEqual(["jira-work:review:BUTCHR-2", "jira-work:story:BUTCHR-2"]);
+  });
+
+  // FACTORY-972 (story FACTORY-971): the end-to-end counterpart to
+  // test/unit/stalled-wake.test.ts — THIS level is where "the stalled
+  // ticket's own watcher and siblings never woken" is actually enforced
+  // (`entry.watchers.includes(watcher)`, this file's own `decide()` just
+  // above), not inside `createIssueEventRules` itself. Mirrors "the boss
+  // learns a child's status change" just above, for an agent:*->
+  // agent:stalled label transition instead of a status change.
+  test("stalled label-only transitions do not wake the boss, sibling, or worker", async () => {
+    const events = createRuleEventRules({ rules: ruleSet });
+    const snap = (ms: RuleMatch[]) => ({ primary: ms.map(asUnit), related: asRelatedUnits(relatedForRules(ruleSet, ms, keys(ms))) });
+    const before = world(worker({ labels: ["agent:working"] }));
+    const after = world(worker({ labels: ["agent:stalled"], updated: "later" }));
+    const heard = relatedIdFor(after, "BUTCHR-2");
+    const ev = await events.poll(snap(before), snap(after));
+    expect(ev.changedRelated).toEqual([heard]);
+    expect(await ev.decide(heard, "jira-work:epic:BUTCHR-1", "related")).toEqual({ deliver: false });
+    // `stalledWake`'s own debounce (like `blockedWake`'s — see
+    // `blockedWakeFired`'s own doc comment in issue.ts) is keyed by the
+    // STALLED TICKET, not by (ticket, watcher): "a ticket with two bosses
+    // ... must still fire at most once per episode, not once per boss."
+    // "review" also matches the boss ticket here (this file's own "every
+    // rule on the boss ticket hears it" guarantee for an ORDINARY change),
+    // but asking it about the SAME already-fired episode in the SAME poll
+    // correctly gets nothing more — the episode already fired, to whichever
+    // watcher asked first.
+    expect((await ev.decide(heard, "jira-work:review:BUTCHR-1", "related")).deliver).toBe(false);
+    // No agent on the WORKER ticket itself, and a sibling rule's agent key
+    // that is NOT actually one of this entry's watchers, gets anything.
+    for (const other of ["jira-work:story:BUTCHR-2", "jira-work:review:BUTCHR-2", "jira-work:audit:BUTCHR-1"]) {
+      expect(await ev.decide(heard, other, "related")).toEqual({ deliver: false });
+    }
   });
 
   test("a worker agent's own write is swallowed for itself but still reaches its boss", async () => {

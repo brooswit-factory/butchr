@@ -4,14 +4,27 @@ import type { BuildIdentity } from "./build-identity.js";
 import { renderBuildCurrencyLines, type CurrencyVerdict } from "./build-currency.js";
 
 /**
- * The systemd unit this process runs under, derived from `/proc/self/cgroup`.
- * `none` means the process is not under systemd at all (non-Linux, or a
- * cgroup with no `*.service` component) — an honest "no journal to read",
- * never a guessed unit.
+ * The systemd unit this process runs under, derived from `/proc/self/cgroup`
+ * — or, on a native Windows host (FACTORY-560), the Scheduled Task launched
+ * by `scripts/windows-host/launcher.ts`, derived from the two env vars that
+ * launcher sets before spawning the daemon (`BUTCHR_WINDOWS_TASK_NAME`,
+ * `BUTCHR_WINDOWS_LOG_FILE`) rather than any OS-native process/cgroup
+ * introspection — Windows has no per-process equivalent of `/proc/self/cgroup`
+ * to read this back from, so the launcher tells the daemon what it is,
+ * the same way `EnvironmentFile=` tells a systemd unit its own secrets.
+ * `unit`/`journalctl` are reused (not renamed) for the `windows-task` case —
+ * `unit` holds the task's name, `journalctl` holds a `Get-Content`
+ * invocation for its log file — deliberately, so every existing caller that
+ * narrows on `kind !== "none"` and reads `.unit`/`.journalctl` (`toBuildReport`,
+ * `scripts/audit-alias-calls.ts`'s `journalInvocationFor`) keeps compiling
+ * and behaving sensibly with no changes of its own.
+ * `none` means neither a systemd unit nor a Windows scheduled task was
+ * detected — an honest "no journal to read", never a guessed one.
  */
 export type SystemdInfo =
   | { readonly kind: "user"; readonly unit: string; readonly journalctl: string }
   | { readonly kind: "system"; readonly unit: string; readonly journalctl: string }
+  | { readonly kind: "windows-task"; readonly unit: string; readonly journalctl: string }
   | { readonly kind: "none" };
 
 /**
@@ -41,7 +54,29 @@ export function parseCgroup(cgroup: string): SystemdInfo {
     : { kind: "system", unit, journalctl: `journalctl -u ${unit}` };
 }
 
+/**
+ * Parse the two env vars `scripts/windows-host/launcher.ts` sets before
+ * spawning the daemon into a `SystemdInfo`. Pure — takes the env map, not
+ * `process.env` directly — for the same testability reason `parseCgroup`
+ * takes the cgroup text rather than reading the file itself. Both vars must
+ * be present and non-blank, or this is honestly `{ kind: "none" }` — a
+ * daemon started by hand (`bun run src/daemon/index.ts` from an ordinary
+ * terminal) never claims a task/log file it doesn't actually have.
+ */
+export function parseWindowsTaskEnv(env: Readonly<Record<string, string | undefined>>): SystemdInfo {
+  const taskName = env.BUTCHR_WINDOWS_TASK_NAME?.trim();
+  const logFile = env.BUTCHR_WINDOWS_LOG_FILE?.trim();
+  if (!taskName || !logFile) return { kind: "none" };
+  return { kind: "windows-task", unit: taskName, journalctl: `Get-Content -Path "${logFile}" -Tail 200 -Wait` };
+}
+
 function readSystemdInfo(): SystemdInfo {
+  // Windows has no cgroup to read at all — `readFileSync("/proc/self/cgroup", ...)`
+  // would just throw ENOENT there, so branch explicitly rather than relying
+  // on that catch to happen to land on the right answer.
+  if (process.platform === "win32") {
+    return parseWindowsTaskEnv(process.env);
+  }
   try {
     return parseCgroup(readFileSync("/proc/self/cgroup", "utf8"));
   } catch {
@@ -123,6 +158,13 @@ export function deriveGroundTruth(mcpUrl: string): GroundTruth {
 export function groundTruthText(gt: GroundTruth, build: BuildIdentity, currency: CurrencyVerdict): string {
   const unitLine = gt.systemd.kind === "none" ? "(none — not running under a systemd unit)" : gt.systemd.unit;
   const journalLine = gt.systemd.kind === "none" ? "not running under a systemd unit — no journal to read" : gt.systemd.journalctl;
+  // FACTORY-560: a windows-task daemon has no systemd unit and no journalctl
+  // at all — relabel these two lines rather than call a Windows Scheduled
+  // Task a "systemd unit" or a `Get-Content` invocation "journalctl". Every
+  // other kind (including "none") keeps the exact original labels so
+  // existing callers pinning "systemd unit:"/"journalctl:" text keep passing.
+  const unitLabel = gt.systemd.kind === "windows-task" ? "scheduled task" : "systemd unit";
+  const journalLabel = gt.systemd.kind === "windows-task" ? "diagnostics" : "journalctl";
   return [
     "# Ground truth (authoritative)",
     "",
@@ -134,8 +176,8 @@ export function groundTruthText(gt: GroundTruth, build: BuildIdentity, currency:
     `- measured at: ${gt.measuredAt}`,
     `- host: ${gt.hostname}`,
     `- port: ${gt.port ?? "unknown (mcpUrl did not parse as a URL)"}`,
-    `- systemd unit: ${unitLine}`,
-    `- journalctl: ${journalLine}`,
+    `- ${unitLabel}: ${unitLine}`,
+    `- ${journalLabel}: ${journalLine}`,
     `- daemon pid: ${gt.pid}`,
     "",
     "This snapshot is only as fresh as the timestamp above: it is written once,",

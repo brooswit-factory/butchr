@@ -1,0 +1,5 @@
+bump: minor
+
+### Changed
+- `release.yml` (still disabled) now computes the next version from the latest `v*` git tag plus the highest `changelog.d/` fragment bump since that tag, and creates a tag + GitHub Release directly — no bot commit to `main`, no `package.json` or `CHANGELOG.md` write, no npm. `scripts/release/release.ts --dry-run` prints what the next release would be without creating anything; `ci.yml`'s `release-gate` job runs it informationally on every PR.
+- The daemon's reported version (`/health`'s `build.version`, the dashboard header, `GET /health`'s `build` field) is now derived at startup from the latest reachable `v*` git tag (`X.Y.Z`, or `X.Y.Z+N` for N commits past it) instead of the frozen `package.json` number, which never moves under the tag-based release design above. Falls back to `package.json`'s version, with the reason stated in `build.versionUnknownReason`, when no tag is reachable (no git, no tag, a shallow clone) — never a silent stale number presented as current.

@@ -4,16 +4,18 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
-import { spawnArgs, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
+import { persistIntentionalStop, workspaceStopCause } from "../../src/agents/stop-cause.js";
+import { spawnArgs, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { specForSessionDefinition, builtinManagedSessionsRule } from "../../src/rules/session-definition-type.js";
 import { effectiveAgent } from "../../src/resources/session-definition.js";
 import { createAdmissionController, ADMISSION2_TAG } from "../../src/agents/admission.js";
 import { rcUsernameFor } from "../../src/accounts/identity.js";
+import { absPath } from "../helpers/abs-path";
 
 const clearQuota = () => {
   processProviderAvailability.clear({ provider: "claude", accountId: "default" });
@@ -27,6 +29,12 @@ interface FakeProcess { pid: number; argv?: string[] | null; name?: string }
 
 function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string | undefined; workspace_id?: string }>) {
   const started: any[] = []; const closed: string[] = []; const renamed: any[] = []; const metadata: any[] = []; const creates: any[] = [];
+  // FACTORY-720: every `pane.report_agent_session` call `HerdrHerd.spawn()`
+  // makes once a fresh/respawned launch discovers and persists a NEW id —
+  // tracked here (never rejecting on its own) so tests can assert the exact
+  // reports made; `reportAgentSessionFails` lets a test flip it into the
+  // "herdr call fails" branch without touching every other fixture user.
+  const reportedSessions: any[] = []; let reportAgentSessionFails = false;
   let createdCwd: string | undefined; let createdWorkspaceId = "w9";
   const client = {
     agent: { list: async () => ({ agents: agents.map((a) => {
@@ -35,7 +43,15 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string 
       const workspace_id = a.workspace_id ?? "w9";
       return cwd ? { ...a, agent: "claude", cwd, workspace_id } : { ...a, workspace_id };
     }) }), start: async (p: any) => { started.push(p); agents.push({ name: p.name, pane_id: p.pane_id, cwd: createdCwd, workspace_id: createdWorkspaceId }); } },
-    pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
+    pane: {
+      close: async (id: string) => { closed.push(id); },
+      read: async () => ({ read: { text: "" } }),
+      reportAgentSession: async (p: any) => {
+        if (reportAgentSessionFails) throw new Error("herdr socket hiccup");
+        reportedSessions.push(p);
+        return {};
+      },
+    },
     workspace: {
       // `label` is passed to `workspace.create` by drovr's own `ManagedHerdrLifecycle.start()`
       // (never to `agent.start`) — see this fake's own `creates` tracking array below.
@@ -44,7 +60,10 @@ function fakeHerdr(agents: Array<{ name?: string; pane_id: string; cwd?: string 
       reportMetadata: async (p: any) => { metadata.push(p); return {}; },
     },
   };
-  return { client: client as any, started, closed, renamed, metadata, creates };
+  return {
+    client: client as any, started, closed, renamed, metadata, creates, reportedSessions,
+    setReportAgentSessionFails: (v: boolean) => { reportAgentSessionFails = v; },
+  };
 }
 
 describe("agent name convention", () => {
@@ -191,7 +210,7 @@ describe("HerdrHerd", () => {
     expect(f.started[0].args).toContain("--dangerously-load-development-channels=server:butchr");
     // the kickoff prompt is the FIRST argument: the variadic mcp flag would
     // swallow a trailing positional as one of its own entries
-    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args[0]).toBe(KICKOFF_PROMPT);
     expect(f.started[0].args[f.started[0].args.length - 1]).toBe("--dangerously-load-development-channels=server:butchr");
     const cfgPath = f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1];
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
@@ -211,15 +230,15 @@ describe("HerdrHerd", () => {
     // path, not by the narrower buildWorkspace/agentLaunchConfig-only tests the PR review itself ran.
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://localhost:7717/mcp", instant);
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/defs/a.json" });
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("defs", "a.json") });
     await herd.spawn({
       key, issuetype: "managed-session", summary: "s", parent: null,
       brief: "Keep this repo's docs and dependency versions current.",
-      cwd: "/repo/some-project",
+      cwd: absPath("repo", "some-project"),
       agents: [{ harness: "claude", model: "sonnet" }],
     });
     expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
-    expect(f.started[0].args[0]).toContain("/repo/some-project");
+    expect(f.started[0].args[0]).toContain(absPath("repo", "some-project"));
     expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
     expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
   });
@@ -776,6 +795,7 @@ describe("staleIssues", () => {
   }
   const instant = () => Promise.resolve();
   const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
+  const DEF_RESOURCE = absPath("etc", "defs", "a.json"); // reused across most tests in this block
 
   test("AGY residents are checked using the Drovr launch contract", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
@@ -811,7 +831,7 @@ describe("staleIssues", () => {
 
   test("a claude process carrying the full flag set -> not stale", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd([{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
     const herd = new HerdrHerd(client, "http://x/mcp", instant);
     expect(await herd.staleIssues()).toEqual([]);
@@ -824,14 +844,14 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-mcp-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
       // "expected" reconstruction) uses, so the channel-flag joining format
       // is guaranteed consistent rather than hand-guessed here.
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", mcpServers }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, mcpServers }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -848,12 +868,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-mcp-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       const mcpServers = [{ name: "mud-bridge", type: "http" as const, url: "https://mud.internal/mcp", channel: true }];
       writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify(mcpServers));
       // Missing the server:mud-bridge channel flag the definition now calls for.
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -880,13 +900,13 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Built via the SAME spawnArgs a real spawn (and staleIssues' own
       // "expected" reconstruction) uses, so the flag value is guaranteed
       // consistent rather than hand-guessed here.
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", permissionMode: "auto" }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, permissionMode: "auto" }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -903,11 +923,11 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("auto"));
       // Missing the --permission-mode auto flag the persisted definition now calls for.
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -928,10 +948,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", strictMcpConfig: true }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, strictMcpConfig: true }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       expect(await herd.staleIssues()).toEqual([]);
@@ -948,10 +968,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-strict-mcp-config-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-strict-mcp-config.json"), JSON.stringify(true));
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -977,10 +997,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
-      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1002,12 +1022,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-on-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // The definition has just been edited to lizardMode: true, and the daemon persisted that at the last managed-sessions poll...
       writeFileSync(join(cwd, ".butchr-lizard-mode.json"), JSON.stringify(true));
       // ...but the agent itself is still the one running from BEFORE the edit — still carrying the bypass flag.
-      const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillBypassedArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1024,12 +1044,44 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-toggle-off-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // No .butchr-lizard-mode.json — the definition has just been edited BACK to lizardMode: false/unset.
       // The agent itself is still the one running from BEFORE that edit — launched without the bypass flag.
-      const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json", lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const stillLizardArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, lizardMode: true }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillLizardArgv, name: "codex" }]) });
+      const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      expect(stale[0]!.reason).toContain("--dangerously-bypass-approvals-and-sandbox");
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-577/Correction 3: `checkManagedAgentArgv`'s bypass-flag
+  // comparison is one-directional (the whole block is gated behind
+  // `if (expected.includes(bypassFlag))`), so only manual -> YOLO is
+  // detectable in butchr today. This test proves that ONE direction for
+  // spec.permissionMode (as opposed to lizardMode, covered above); the
+  // opposite direction (YOLO -> manual) is NOT achievable here and is
+  // deliberately not asserted as if it respawned — see FACTORY-578's PR
+  // body/comment for the drovr ticket filed against the missing half.
+  test("FACTORY-577: a managed-session CODEX agent's definition changing permissionMode from manual to bypassPermissions (persisted at build time) IS flagged stale and respawns to pick up the bypass flag", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-toggle-to-bypass-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const cwd = ensureWorkspaceDir(key);
+      // The definition has just been edited to permissionMode: "bypassPermissions", and the daemon persisted that at the last managed-sessions poll...
+      writeFileSync(join(cwd, ".butchr-permission-mode.json"), JSON.stringify("bypassPermissions"));
+      // ...but the agent itself is still the one running from BEFORE the edit — launched manual, no bypass flag.
+      const stillManualArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE, permissionMode: "default" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillManualArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       const stale = await herd.staleIssues();
       expect(stale).toHaveLength(1);
@@ -1067,9 +1119,9 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-lizard-mode-absent-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
-      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
+      const goodArgv = ["codex", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
       expect(await herd.staleIssues()).toEqual([]);
@@ -1094,8 +1146,8 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-default-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE };
       // The REAL buildWorkspace — no permissionMode on the spec, so
       // `.butchr-permission-mode.json` is never written (buildWorkspace only
       // persists an EXPLICIT value), matching a real spec-construction site
@@ -1121,12 +1173,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-permission-mode-deploy-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
-      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
+      const spec = { key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE };
       const cwd = buildWorkspace(spec, "http://x/mcp", "claude"); // no permissionMode persisted, same as before this ticket.
       // What every currently-running agent's argv actually looks like today: no --permission-mode flag was ever
       // sent by butchr, so Drovr's own `launch.permissionMode ?? "bypassPermissions"` fallback produced this value.
-      const preChangeArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const preChangeArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "bypassPermissions", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: preChangeArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant);
       const stale = await herd.staleIssues();
@@ -1164,11 +1216,11 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
-      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const goodArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: goodArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
       expect(await herd.staleIssues()).toEqual([]);
@@ -1185,12 +1237,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-drift-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // Spawned a while ago at Sonnet/medium...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("medium"));
-      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const staleArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: staleArgv, name: "claude" }]) });
       // ...but the definition now resolves to Fable/xhigh (an edit, or a table edit).
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
@@ -1217,13 +1269,13 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-respawn-clean-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       // The respawn already happened: buildWorkspace persisted the NEW resolved model/effort...
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
       writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
       // ...and the running process now reflects it too (argv itself never carries --model/--effort comparison, but the workspace persistence does).
-      const freshArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const freshArgv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
       for (let poll = 0; poll < 5; poll++) expect(await herd.staleIssues()).toEqual([]);
@@ -1248,12 +1300,12 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-e2e-power-scale-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const rule = builtinManagedSessionsRule("/etc/defs");
-      const resourcePath = "/etc/defs/admin-agentcost.json";
+      const rule = builtinManagedSessionsRule(absPath("etc", "defs"));
+      const resourcePath = absPath("etc", "defs", "admin-agentcost.json");
       const agentKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: rule.id, resourceId: resourcePath });
       // The REAL resolver (effectiveAgent) and REAL spec builder (specForSessionDefinition) —
       // exactly what searchSessionDefinitions/specForSessionDefinitionUnit run in production.
-      const definitionAt100_70 = { workingDirectory: "/repo/admin-agentcost", brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
+      const definitionAt100_70 = { workingDirectory: absPath("repo", "admin-agentcost"), brief: "Track spend.", vendor: "claude" as const, modelPower: 100, effort: 70, permissionMode: "default" as const, execution: "swarm" as const, account: "none" as const, role: "worker" as const, frozen: false };
       const spec = specForSessionDefinition({ agentKey, rule, resource: { path: resourcePath, kind: "file", name: "admin-agentcost.json", size: 10, mtimeMs: 1 }, definition: definitionAt100_70 });
       expect(spec.agents).toEqual([{ harness: "claude", model: "fable", effort: "xhigh" }]); // DoD item 1: modelPower=100/effort=70 -> Fable at xhigh.
       // The REAL buildWorkspace — persists .butchr-model.json/.butchr-effort.json exactly as a real spawn would.
@@ -1294,10 +1346,10 @@ describe("staleIssues", () => {
       const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-match-"));
       process.env.BUTCHR_WORKSPACES = root;
       try {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // no .butchr-model.json/.butchr-effort.json — the pre-this-ticket build never wrote them.
         // A pre-existing build's real launch: agentLaunchConfig always emits both --model and --effort for Claude, unconditionally (its own default fallback resolved to sonnet/high here).
-        const argv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default, not Drovr's bypassPermissions fallback.
+        const argv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default, not Drovr's bypassPermissions fallback.
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
         // The tier1 definition still resolves to sonnet, no effort — matches what's actually running.
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "sonnet" }));
@@ -1315,9 +1367,9 @@ describe("staleIssues", () => {
       const root = mkdtempSync(join(tmpdir(), "herd-legacy-tier-drift-"));
       process.env.BUTCHR_WORKSPACES = root;
       try {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
         const cwd = ensureWorkspaceDir(key); // legacy: no persisted model/effort file.
-        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const legacyArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
         // The operator has since moved this definition to modelPower=100/effort=70 (Fable/xhigh).
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
@@ -1327,7 +1379,7 @@ describe("staleIssues", () => {
         // Respawn happens: buildWorkspace persists the NEW resolved values.
         writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("fable"));
         writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("xhigh"));
-        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "fable", "--effort", "xhigh", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
+        const freshArgv = ["claude", KICKOFF_PROMPT, "--model", "fable", "--effort", "xhigh", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
         const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
         const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "fable", effort: "xhigh" }));
         for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
@@ -1347,7 +1399,7 @@ describe("staleIssues", () => {
         const issue = "jira-work:triage:KAN-500";
         const cwd = workspaceDirFor(issue);
         mkdirSync(cwd, { recursive: true }); // legacy: no persisted model/effort file.
-        const argv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default.
+        const argv = ["claude", KICKOFF_PROMPT, "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: no persisted permission mode -> butchr's own default.
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "opus", effort: "high" }));
         expect(await herd.staleIssues()).toEqual([]);
@@ -1367,7 +1419,7 @@ describe("staleIssues", () => {
         const issue = "jira-work:triage:KAN-501";
         const cwd = workspaceDirFor(issue);
         mkdirSync(cwd, { recursive: true });
-        const legacyArgv = ["claude", "follow your CLAUDE.md", "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+        const legacyArgv = ["claude", KICKOFF_PROMPT, "--model", "opus", "--effort", "high", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
         const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: legacyArgv, name: "claude" }]) });
         // An operator edit to rules.json moved this rule to a different explicit model.
         const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
@@ -1376,7 +1428,7 @@ describe("staleIssues", () => {
         expect(stale[0]!.reason).toContain("opus"); expect(stale[0]!.reason).toContain("haiku");
         writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("haiku"));
         writeFileSync(join(cwd, ".butchr-effort.json"), JSON.stringify("low"));
-        const freshArgv = ["claude", "follow your CLAUDE.md", "--model", "haiku", "--effort", "low", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
+        const freshArgv = ["claude", KICKOFF_PROMPT, "--model", "haiku", "--effort", "low", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"]; // FACTORY-138: matches the new default.
         const { client: freshClient } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: freshArgv, name: "claude" }]) });
         const herdAfterRespawn = new HerdrHerd(freshClient, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => ({ model: "haiku", effort: "low" }));
         for (let poll = 0; poll < 5; poll++) expect(await herdAfterRespawn.staleIssues()).toEqual([]);
@@ -1425,10 +1477,10 @@ describe("staleIssues", () => {
     const root = mkdtempSync(join(tmpdir(), "herd-model-effort-unresolved-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/a.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: DEF_RESOURCE });
       const cwd = ensureWorkspaceDir(key);
       writeFileSync(join(cwd, ".butchr-model.json"), JSON.stringify("sonnet"));
-      const argv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: "/etc/defs/a.json" }, cwd)];
+      const argv = ["claude", ...spawnArgs({ key, issuetype: "managed-session", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd)];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv, name: "claude" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, undefined, undefined, undefined, undefined, () => undefined);
       expect(await herd.staleIssues()).toEqual([]);
@@ -1448,7 +1500,7 @@ describe("staleIssues", () => {
   test("pane.process_info rejects -> unknown, not stale, and does not abort the sweep for other issues", async () => {
     const cwd = join(workspaceRoot(), "KAN-783");
     const otherCwd = join(workspaceRoot(), "KAN-9");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${otherCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${otherCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd(
       [{ name: "butchr-kan-783", pane_id: "w1:p1", cwd }, { name: "butchr-kan-9", pane_id: "w1:p2", cwd: otherCwd }],
       { "w1:p1": async () => { throw new Error("herdr socket hiccup"); }, "w1:p2": ok([{ pid: 2, argv: goodArgv, name: "claude" }]) },
@@ -1501,7 +1553,7 @@ describe("staleIssues", () => {
     // processes outside the pane's OWN foreground list, so the stray is
     // structurally invisible to the verdict.
     const cwd = join(workspaceRoot(), "KAN-811");
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${cwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const { client } = fakeHerdrWithCwd(
       [{ name: "butchr-kan-811", pane_id: "w1:p1", cwd }],
       // Only w1:p1 (the named, healthy pane) is ever queried — a stray pane
@@ -1538,14 +1590,14 @@ describe("staleIssues", () => {
       const oldKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/legacy#7" });
       const oldCwd = join(root, ...oldKey.split(":"));
       mkdirSync(oldCwd, { recursive: true });
-      const oldArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const oldArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${oldCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       // New-layout: a different github-issue key, already migrated (a real,
       // stamped ensureWorkspaceDir claim at its short leaf).
       const newKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "bugs", resourceId: "acme/shiny#9" });
       const newCwd = ensureWorkspaceDir(newKey);
       expect(newCwd.endsWith("/github-issue/bugs/shiny#9")).toBe(true);
-      const newArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+      const newArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${newCwd}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
 
       const { client } = fakeHerdrWithCwd(
         [{ pane_id: "w-old:p1", cwd: oldCwd }, { pane_id: "w-new:p1", cwd: newCwd }],
@@ -1735,7 +1787,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     // a) pane closed AND a new agent started whose args equal the full spawn argv
     expect(f.closed).toEqual(["w1:p1"]);
     expect(f.started.length).toBe(1);
-    expect(f.started[0].args[0]).toBe("follow your CLAUDE.md");
+    expect(f.started[0].args[0]).toBe(KICKOFF_PROMPT);
     expect(f.started[0].args).toContain("--permission-mode");
     expect(f.started[0].args).toContain("acceptEdits"); // FACTORY-138: no explicit permissionMode on the spec -> butchr's own default.
     expect(f.started[0].args[f.started[0].args.indexOf("--mcp-config") + 1]).toBe(dir + "/mcp.json");
@@ -1748,7 +1800,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
   });
 
   test("b) a second pass, now with process-info showing the full argv, closes/starts nothing", async () => {
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const f = fakeHerdrStale(ok([{ pid: 1, argv: goodArgv, name: "claude" }]));
     const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];
@@ -1777,7 +1829,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
     // pane.process_info is scoped to ONE pane, so the stray (which lives on
     // some other, non-butchr-managed pane) is never even asked about here —
     // there is no cwd-based lookup left for it to pollute.
-    const goodArgv = ["claude", "follow your CLAUDE.md", "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
+    const goodArgv = ["claude", KICKOFF_PROMPT, "--model", "sonnet", "--permission-mode", "acceptEdits", "--mcp-config", `${dir}/mcp.json`, "--dangerously-load-development-channels", "server:butchr"];
     const f = fakeHerdrStale(ok([{ pid: 999999, argv: goodArgv, name: "claude" }]));
     const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: unknown[] = [];
@@ -1814,12 +1866,12 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
 // currently-running agent — never the bare `spec.key` (this ticket's own
 // change), and the full agent key is preserved in herdr metadata.
 describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () => {
-  test("an ordinary rule-engine spawn labels its workspace \"<shortId> · <ruleId>\", not the bare key", async () => {
+  test("an ordinary rule-engine spawn labels its workspace \"<ruleId> · <shortId>\", not the bare key", async () => {
     const f = fakeHerdr([]);
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
     await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null });
-    expect(f.creates[0].label).toBe("FACTORY-51 · jira-work");
+    expect(f.creates[0].label).toBe("jira-work · FACTORY-51");
   });
 
   test("a legacy/bare key (no rule-engine encoding) still labels as itself — unchanged, pre-FACTORY-95 behaviour", async () => {
@@ -1843,8 +1895,8 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
     process.env.BUTCHR_WORKSPACES = root;
     try {
       // Same "<parent>:<name>" (brooswit-factory:rinth) under two different roots — the exact FACTORY-90 collision example.
-      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
       expect(incoming > running).toBe(true); // pins the ordering this test relies on
       // `ensureWorkspaceDir`, not a bare `workspaceDirFor` string: a real
       // already-running agent's workspace is always claimed+stamped on disk
@@ -1856,11 +1908,11 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
       const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
       const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
       await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-      expect(f.creates[0].label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(f.creates[0].label).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
       // `labelFor` unconditionally reasserts every OTHER member of the group's own
       // correct label whenever the group has more than one member — cheap, idempotent,
       // and never relies on knowing whether herdr's own stored value already agrees.
-      expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "brooswit-factory:rinth · repos" }]);
+      expect(f.renamed).toEqual([{ workspace_id: "w-running", label: "repos · brooswit-factory:rinth" }]);
       expect(f.creates[0].label).not.toBe(f.renamed[0]?.label); // the one invariant that matters: never shared
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
@@ -1873,18 +1925,18 @@ describe("spawn wiring: short display id as the herdr label (FACTORY-95)", () =>
     const root = mkdtempSync(join(tmpdir(), "herd-collide-before-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
-      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
+      const running = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
+      const incoming = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
       expect(incoming < running).toBe(true); // pins the ordering this test relies on — the reverse of the case above
       const runningCwd = ensureWorkspaceDir(running); // see the sibling test above for why this must be a real, stamped claim
       const f = fakeHerdr([{ pane_id: "p-running", cwd: runningCwd, workspace_id: "w-running" }]);
       const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
       await herd.spawn({ key: incoming, issuetype: "Task", summary: "s", parent: null });
-      expect(f.creates[0].label).toBe("brooswit-factory:rinth · repos");
+      expect(f.creates[0].label).toBe("repos · brooswit-factory:rinth");
       // The already-running sibling must be relabeled to the suffix RIGHT NOW — not left bare until a later restart.
       expect(f.renamed).toHaveLength(1);
       expect(f.renamed[0]).toMatchObject({ workspace_id: "w-running" });
-      expect(f.renamed[0]?.label).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(f.renamed[0]?.label).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
       expect(f.metadata.find((m) => m.workspace_id === "w-running")).toEqual({ workspace_id: "w-running", source: "butchr", tokens: { agentKey: running } });
       // The one invariant that matters: no two live workspaces ever share a label.
       expect(f.creates[0].label).not.toBe(f.renamed[0]?.label);
@@ -1929,7 +1981,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
-    expect(renameFor("wA")).toBe("FACTORY-51 · jira-work");
+    expect(renameFor("wA")).toBe("jira-work · FACTORY-51");
     expect(renameFor("wB")).toBe("triage");
     const metadataFor = (workspaceId: string) => f.metadata.find((m) => m.workspace_id === workspaceId);
     expect(metadataFor("wA")).toEqual({ workspace_id: "wA", source: "butchr", tokens: { agentKey: keyA } });
@@ -1937,7 +1989,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
   });
 
   test("never touches a workspace whose pane cwd is NOT butchr's own (ownership proven via cwd, never via herdr's current label)", async () => {
-    const f = fakeHerdr([{ pane_id: "p1", cwd: "/home/someone/unrelated-project", workspace_id: "wX" }]);
+    const f = fakeHerdr([{ pane_id: "p1", cwd: absPath("home", "someone", "unrelated-project"), workspace_id: "wX" }]);
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     expect(f.renamed).toEqual([]);
@@ -1949,8 +2001,8 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const root = mkdtempSync(join(tmpdir(), "herd-relabel-collide-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-      const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+      const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+      const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
       // Real, stamped claims (FACTORY-118) — see the spawn-time collision
       // tests above for why a bare `workspaceDirFor` string here would leave
       // `agentIdOfWorkspacePath` unable to resolve either fake pane's cwd
@@ -1964,8 +2016,8 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
       const renameFor = (workspaceId: string) => f.renamed.find((r) => r.workspace_id === workspaceId)?.label;
       const labels = [renameFor("wA"), renameFor("wB")];
       expect(new Set(labels).size).toBe(2); // never shared
-      expect(labels).toContain("brooswit-factory:rinth · repos"); // one keeps the bare label
-      expect(labels.find((l) => l !== "brooswit-factory:rinth · repos")).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+      expect(labels).toContain("repos · brooswit-factory:rinth"); // one keeps the bare label
+      expect(labels.find((l) => l !== "repos · brooswit-factory:rinth")).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
@@ -1978,7 +2030,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
     await herd.relabelOwnedWorkspaces();
     await herd.relabelOwnedWorkspaces();
-    expect(f.renamed.map((r) => r.label)).toEqual(["FACTORY-51 · jira-work", "FACTORY-51 · jira-work"]);
+    expect(f.renamed.map((r) => r.label)).toEqual(["jira-work · FACTORY-51", "jira-work · FACTORY-51"]);
   });
 
   test("never throws when herdr itself is unreachable — logged and swallowed, like reap.ts's own detector", async () => {
@@ -2007,7 +2059,7 @@ describe("relabelOwnedWorkspaces (FACTORY-95: relabel running workspaces in plac
     const lines: string[] = [];
     const herd = new HerdrHerd(f as any, "http://x/mcp", instant, (l) => lines.push(l));
     await herd.relabelOwnedWorkspaces();
-    expect(renamed).toEqual([{ workspace_id: "w-good", label: "FACTORY-1 · jira-work" }]);
+    expect(renamed).toEqual([{ workspace_id: "w-good", label: "jira-work · FACTORY-1" }]);
     expect(lines.some((l) => l.includes(`WARNING: [relabel] ${bad}`))).toBe(true);
   });
 });
@@ -2094,6 +2146,91 @@ describe("staleArgvOutcome", () => {
   });
 });
 
+// FACTORY-470/472: the identity check that classifies a herdr-restored
+// pane (herdr's OWN restore after a host hard reset — a bare
+// `claude --resume <pre-boot-session-id>`, none of butchr's flags)
+// as resumable via the SAME full-flag `resumeInPlace()` path, WITHOUT
+// widening FACTORY-411/#556's flag-diff allowlist and without a new
+// field-by-field staleness classifier — see `isHerdrRestoredPane`'s own
+// doc comment (src/agents/herd.ts) for the full reasoning.
+describe("isHerdrRestoredPane", () => {
+  test("true: the pane's own --resume value matches the persisted session id", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123"], "abc-123")).toBe(true);
+  });
+  test("false: no persisted session id at all (never discovered, or invalidated by FACTORY-418)", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123"], undefined)).toBe(false);
+  });
+  test("false: the pane's --resume value names a DIFFERENT session than the one persisted", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "some-other-id"], "abc-123")).toBe(false);
+  });
+  test("false: no --resume flag in argv at all (an ordinary fresh-spawned agent, not herdr-restored)", () => {
+    expect(isHerdrRestoredPane(["claude", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+  // PR #560 review: the --resume match alone is not enough — a pane butchr
+  // ITSELF relaunched via resumeInPlace() also carries --resume <persisted
+  // id> forever afterward. Without the --mcp-config discriminator, any
+  // LATER unrelated drift on that already-`--resume`d pane would be
+  // misclassified "herdr restored" instead of going through the ordinary
+  // allowlist path — silently widening resume-in-place to other
+  // definition-change cases, which this ticket's scope excludes.
+  test("false: --resume matches, but --mcp-config IS present — a pane butchr itself already relaunched, not a herdr restore", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--mcp-config", "/some/mcp.json", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+  // FACTORY-491 (director item 4): the discriminator must require ALL
+  // THREE of butchr's own launch flags absent — narrower than PR #560's
+  // original single-flag (--mcp-config) check, which a pane missing only
+  // --mcp-config but still carrying --permission-mode or the channels flag
+  // would have incorrectly passed.
+  test("false: --resume matches and --mcp-config is absent, but --permission-mode IS present — not every butchr flag is missing", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--permission-mode", "acceptEdits"], "abc-123")).toBe(false);
+  });
+  test("false: --resume matches and --mcp-config is absent, but --dangerously-load-development-channels IS present — not every butchr flag is missing", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--dangerously-load-development-channels", "server:x"], "abc-123")).toBe(false);
+  });
+  test("true: --resume matches and ALL THREE butchr flags are absent", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume", "abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  // FACTORY-491 (director item 1): defensive hardening for forms herdr's
+  // OWN measured restore shape (FACTORY-467 comment 27815:
+  // `["claude", "--resume", "<id>", "--model", "haiku"]`, the separate-
+  // argument form the pre-existing indexOf+1 match already handled) does
+  // not presently produce — never a fix for a live break, sequenced by
+  // convenience rather than urgency (epic comment 27818).
+  test("true: the --resume=<id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume=abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("true: the short -r <id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "-r", "abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("true: the short -r=<id> form", () => {
+    expect(isHerdrRestoredPane(["claude", "-r=abc-123", "--model", "haiku"], "abc-123")).toBe(true);
+  });
+  test("false: the --resume=<id> form names a DIFFERENT session than the one persisted", () => {
+    expect(isHerdrRestoredPane(["claude", "--resume=some-other-id"], "abc-123")).toBe(false);
+  });
+});
+
+describe("restoredResumeEnabledFor", () => {
+  test("off never enables it, regardless of agent name", () => {
+    expect(restoredResumeEnabledFor("off", "buddy")).toBe(false);
+    expect(restoredResumeEnabledFor("off", undefined)).toBe(false);
+  });
+  test("all enables it for every agent, including one with no name at all", () => {
+    expect(restoredResumeEnabledFor("all", "buddy")).toBe(true);
+    expect(restoredResumeEnabledFor("all", "anything-else")).toBe(true);
+    expect(restoredResumeEnabledFor("all", undefined)).toBe(true);
+  });
+  test("a named list enables it only for a listed name", () => {
+    const policy = new Set(["buddy", "genius"]);
+    expect(restoredResumeEnabledFor(policy, "buddy")).toBe(true);
+    expect(restoredResumeEnabledFor(policy, "genius")).toBe(true);
+    expect(restoredResumeEnabledFor(policy, "someone-else")).toBe(false);
+  });
+  test("a named list never enables it for an agent with no name (an ordinary rule-engine agent, not a managed session)", () => {
+    expect(restoredResumeEnabledFor(new Set(["buddy", "genius"]), undefined)).toBe(false);
+  });
+});
+
 describe("resumeInPlace", () => {
   const instant = () => Promise.resolve();
   const CLAUDE_PROC = { pid: 1, argv: ["claude"], name: "claude" };
@@ -2106,7 +2243,7 @@ describe("resumeInPlace", () => {
    * changes when `pane.sendKeys` (the `/exit`) and `agent.start` (the
    * relaunch) are called, the same way a real pane would.
    */
-  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean } = {}) {
+  function statefulHerdr(pane: string, cwd: string, initialStatus: "idle" | "working" | "done" = "idle", options: { crashesOnStart?: boolean; nameTaken?: boolean; launchPending?: boolean; processGone?: boolean } = {}) {
     let status: string = initialStatus;
     let foreground: "claude" | "shell" = "claude";
     // FACTORY-314 (epic review on PR #513, point 3): the REAL argv from the
@@ -2118,9 +2255,17 @@ describe("resumeInPlace", () => {
     let lastArgv: string[] = CLAUDE_PROC.argv;
     const sent: Array<{ text?: string; keys?: string[] }> = [];
     const started: any[] = [];
+    const closed: string[] = [];
     const client = {
       agent: {
-        list: async () => ({ agents: [{ agent: foreground === "claude" ? "claude" : undefined, agent_status: status, cwd, pane_id: pane, workspace_id: "w1" }] }),
+        // FACTORY-491 (director evidence, FACTORY-467 comment 27770/27774,
+        // measured by admin-assembly on real codey): a bare-shell pane's
+        // entry is ABSENT from herdr's agent.list — not present with
+        // `agent: undefined`. This fixture previously listed it with
+        // `agent: undefined` while keeping the entry, which is what
+        // produced the review's own withdrawn "state 3" prediction; fixed
+        // to match reality.
+        list: async () => ({ agents: foreground === "claude" ? [{ agent: "claude", agent_status: status, cwd, pane_id: pane, workspace_id: "w1", launch_pending: options.launchPending === true }] : [] }),
         start: async (p: any) => {
           started.push(p);
           // FACTORY-314 (PR #513 review fix, live-tested): the OLD process
@@ -2136,12 +2281,22 @@ describe("resumeInPlace", () => {
         },
       },
       pane: {
-        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
+        // FACTORY-489: `processGone` decouples processInfo from `foreground`
+        // — herdr's agent.list() bookkeeping can still list a pane as
+        // launch-pending claude for a moment after its actual OS process has
+        // already died; this simulates exactly that lag, independent of
+        // whatever `list()` above still reports.
+        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
+        // FACTORY-491 (director item 3): records every defensive close so
+        // tests can assert `resumeInPlaceExclusive`'s own "failed" paths
+        // close the pane by id directly, independent of `herd.stop()`'s
+        // separate identity-matched close.
+        close: async (id: string) => { closed.push(id); },
       },
     };
-    return { client: client as any, sent, started };
+    return { client: client as any, sent, started, closed };
   }
 
   async function withTempWorkspaces<T>(fn: () => Promise<T>): Promise<T> {
@@ -2165,6 +2320,24 @@ describe("resumeInPlace", () => {
    * home directory, never the real one. `persistDiscoveredSessionId` writes
    * the SAME `.butchr-session-id.json` `HerdrHerd.startProviders` itself
    * would have written after discovering it post-launch.
+   *
+   * FACTORY-631/FACTORY-623/FACTORY-568 hardening: at least one caller
+   * (the "FACTORY-314 (epic review, round 3)" test below) immediately
+   * follows this with a REAL `herd.spawn()`, whose own `launchStartedAt =
+   * Date.now()` (`HerdrHerd.startProviders`) is what `discoverClaudeSessionId`
+   * filters this very transcript against. Relying on plain wall-clock
+   * ordering between the write just below and that later `Date.now()` call
+   * risks landing in the SAME millisecond — exactly the "created >= after
+   * compares true on a sub-ms birthtime vs a whole-ms `after`" hazard
+   * `discoverClaudeSessionId`'s own doc comment now documents (its fixed
+   * `AFTER_MARGIN_MS` bound needs the write to be in a STRICTLY EARLIER
+   * millisecond, not merely "earlier" by some fraction). A real, awaited
+   * delay here is the only thing that actually moves the value the filter
+   * reads (`birthtimeMs`, immutable once written — `utimesSync` cannot
+   * touch it, see the FACTORY-418 test's own hardening a few lines below
+   * for where that was tried and measured ineffective) — comfortably larger
+   * than any CI scheduler jitter this suite has measured (~2ms in the full
+   * suite), without being large enough to slow the suite down meaningfully.
    */
   async function withResumableSession<T>(cwd: string, id: string, fn: (home: string) => Promise<T>): Promise<T> {
     const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
@@ -2176,6 +2349,7 @@ describe("resumeInPlace", () => {
       mkdirSync(projectDir, { recursive: true });
       writeFileSync(join(projectDir, `${id}.jsonl`), "{}");
       persistDiscoveredSessionId(cwd, id);
+      await new Promise((r) => setTimeout(r, 50)); // see doc comment above — a real gap, not a retry or a fix for the production bound
       return await fn(home);
     } finally {
       rmSync(home, { recursive: true, force: true });
@@ -2204,6 +2378,81 @@ describe("resumeInPlace", () => {
         expect(workspaceSessionId(cwd)).toBe("original-session"); // a --resume relaunch keeps the SAME id, never rediscovered
         expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
         expect(workspaceEffort(cwd)).toBe("medium");
+      });
+    });
+  });
+
+  // FACTORY-489 (FACTORY-312, source read of herdr at the running version's
+  // tag, not a live measurement): agent_status is computed from screen state
+  // independently of the managed-agent launch phase, so a pane whose claude
+  // launch is still pending can report agent_status "idle"/"done" — a state
+  // `isIdle()` alone would treat as ready to `/exit`. `launchPending` is the
+  // one signal that distinguishes it. This pair must be able to fail for
+  // the reason it tests and no other: (a) proves the guard actually blocks
+  // /exit when launch_pending is true even though agent_status says idle;
+  // (b) proves the SAME fixture/spec, with only launch_pending flipped to
+  // false, is NOT blocked — so (a) passing isn't just an artifact of some
+  // OTHER gate (missing session id, wrong provider, etc.) misfiring.
+  test("deferred: a launch-pending pane reporting agent_status idle is NOT resumed — no /exit is sent", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-901" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("deferred");
+        expect(f.sent).toEqual([]); // no /exit text, no enter keys — the pane was never touched
+        expect(f.started).toHaveLength(0); // no relaunch attempted either
+      });
+    });
+  });
+
+  test("negative control: the SAME idle pane, with launch_pending false, IS resumed — proves the fixture (and every other gate) is otherwise satisfied, so the guard above is what blocked it", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-902" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: false });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(f.sent).toEqual([{ text: "/exit" }, { keys: ["enter"] }]);
+        expect(f.started).toHaveLength(1);
+      });
+    });
+  });
+
+  // FACTORY-489 (FACTORY-312 review correction): pins the launchPending
+  // guard's PLACEMENT, not just its existence. A guard placed BEFORE
+  // `providerOfPane` would return "deferred" for one detection pass on a
+  // pane whose agent.list() entry still lags with launch_pending:true after
+  // the underlying claude process has already died — herdr clears the
+  // managed agent once it observes the exit, so that guard-first ordering
+  // would only delay, by one poll, the existing "unresumable" ->
+  // stop()/spawn() recovery that a "no process found" providerOfPane result
+  // already provides for that case; this test proves the guard runs AFTER
+  // providerOfPane instead, so that recovery is immediate rather than
+  // delayed. The entry itself (and launch_pending:true) is present, but the
+  // pane's OS process is gone. NOTE: the fixture (statefulHerdr with
+  // processGone:true) holds launch_pending true INDEFINITELY, since it does
+  // not model herdr's own release path — its shape pins the guard's
+  // placement, not a claim about how long the real launch_pending state
+  // persists after a process dies.
+  test("unresumable, NOT deferred: launch_pending true but the pane's OS process is already gone — the existing providerOfPane gate wins, not the launchPending guard", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-903" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true, processGone: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("unresumable");
+        expect(f.sent).toEqual([]);
+        expect(f.started).toHaveLength(0);
       });
     });
   });
@@ -2254,7 +2503,14 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: herdr accepted the launch and nothing threw — no exit
+        // code is available from herdr for a pane's process, so this is the
+        // honest ceiling, not a gap.
+        expect(herd.lastResumeFailureDetail(key)).toBe("no exit status captured");
         expect(f.started).toHaveLength(1); // the attempt WAS made
+        // FACTORY-491 (director item 3): the pane is closed by id directly,
+        // defence in depth ahead of reconcileNow's own herd.stop()+spawn().
+        expect(f.closed).toEqual(["w1:p1"]);
         // Old values stand — never overwritten by a relaunch that didn't take.
         expect(workspaceModel(cwd)).toBe("claude-opus-5");
         expect(workspaceEffort(cwd)).toBe("high");
@@ -2293,6 +2549,13 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: the herdr rejection itself is the reason — carried
+        // through from the `agent.start` throw, not lost on the way to
+        // "failed".
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: agent.start: agent name already used [agent_name_taken]");
+        // FACTORY-491 (director item 3): closed by id directly, independent
+        // of herd.stop()'s own identity-matched close in the fallthrough.
+        expect(f.closed).toEqual(["w1:p1"]);
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });
@@ -2315,6 +2578,12 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace(spec);
         expect(outcome).toBe("failed");
+        // FACTORY-525: ANY relaunch error, not just `agent_name_taken`,
+        // survives as this outcome's reason.
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: transport hiccup");
+        // FACTORY-491 (director item 3): closed by id directly, independent
+        // of herd.stop()'s own identity-matched close in the fallthrough.
+        expect(f.closed).toEqual(["w1:p1"]);
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });
@@ -2340,6 +2609,10 @@ describe("resumeInPlace", () => {
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         await expect(herd.resumeInPlace(spec)).rejects.toThrow("transport hiccup");
         expect(workspaceSessionId(cwd)).toBe("original-session");
+        // FACTORY-491 (director item 3): the defensive close is scoped to a
+        // genuine "failed" outcome only — a re-occupied pane throws instead,
+        // and must not be closed out from under whatever now occupies it.
+        expect(f.closed).toEqual([]);
       });
     });
   });
@@ -2397,7 +2670,7 @@ describe("resumeInPlace", () => {
   // persisted id whose transcript no longer exists (corrupted state, or a
   // discovery bug) must fail safe — never attempt `--resume` against a
   // conversation that isn't there.
-  test("unresumable: a persisted session id whose transcript is missing — never attempts /exit", async () => {
+  test("unresumable-transcript-gone: a persisted session id whose transcript is missing — never attempts /exit", async () => {
     await withTempWorkspaces(async () => {
       const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
       const { tmpdir } = require("node:os") as typeof import("node:os");
@@ -2409,7 +2682,12 @@ describe("resumeInPlace", () => {
         const f = statefulHerdr("w1:p1", cwd);
         const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
         const outcome = await herd.resumeInPlace({ key, issuetype: "Task", summary: "s", parent: null });
-        expect(outcome).toBe("unresumable");
+        // PR #560 review: a DISTINCT outcome from the bare "unresumable"
+        // the OTHER two tests around this one assert — the id here WAS
+        // determined ("ghost-session"); only its transcript is gone, which
+        // deserves its own honest respawn-comment wording, not "session id
+        // could not be determined" (see src/daemon/loop.ts's reason mapping).
+        expect(outcome).toBe("unresumable-transcript-gone");
         expect(f.sent).toEqual([]);
       } finally {
         rmSync(home, { recursive: true, force: true });
@@ -2513,6 +2791,12 @@ describe("resumeInPlace", () => {
         // anything in the launch argv (`p.args`) — never influenced by butchr.
         f.client.agent.start = async (p: any) => {
           await realStart(p);
+          // FACTORY-631/FACTORY-623/FACTORY-568: see the matching comment
+          // on the FACTORY-426 fixture below — a real, awaited delay so
+          // this fake write lands safely past `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS`, the same way a real Claude launch's own
+          // (much slower) transcript write always does.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `${claudeChosenId}.jsonl`), "{}");
@@ -2523,6 +2807,271 @@ describe("resumeInPlace", () => {
         expect(f.started[0]!.args).not.toContain("--session-id"); // confirms the real launch path carries no butchr-chosen id at all
         expect(f.started[0]!.args).not.toContain("--resume");
         expect(workspaceSessionId(cwd)).toBe(claudeChosenId); // discovered from Claude's OWN transcript, not guessed
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): the spawn-path
+  // resume decision, driven through the REAL `HerdrHerd.spawn()` ->
+  // `tryClaudeResume()` path — a fake herdr client only at the RPC
+  // boundary. UNLIKE the FACTORY-314 test immediately above (an ordinary
+  // fresh spawn, which DOES go through the real `ManagedHerdrLifecycle`),
+  // this path deliberately bypasses it — see `tryClaudeResume`'s own doc
+  // comment (src/agents/herd.ts) for why Drovr's own `ManagedAgentLaunch`/
+  // `buildAgentStartParams` has no session-id/resume concept at all, so
+  // `pane.processInfo` is stubbed here (not provided by the shared
+  // `fakeHerdr` fixture) for the post-launch liveness check
+  // `tryClaudeResume` performs before trusting a herdr-accepted launch.
+  test("FACTORY-916: an unintended-stop respawn with a persisted session id and its transcript under cutoff launches with --resume <id>, never rediscovers, and leaves the persisted id untouched", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-resume-"));
+      try {
+        const priorId = "prior-conversation-id";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "{}"); // pre-existing — this launch must never overwrite or discover a NEW one
+        const f = fakeHerdr([]); // no live agent — this is the respawn's own fresh launch
+        f.client.pane.processInfo = async () => ({ process_info: { pane_id: "w9:p1", foreground_processes: [{ pid: 1, argv: ["claude", "--resume", priorId], name: "claude" }] } });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).toContain("--resume");
+        expect(f.started[0]!.args[f.started[0]!.args.indexOf("--resume") + 1]).toBe(priorId);
+        expect(workspaceSessionId(cwd)).toBe(priorId); // untouched — never invalidated, never "rediscovered" into something else
+        expect(herd.lastFreshSpawnResumed(key)).toBe(true); // read-once signal the daemon's respawn-resumed comment hook relies on
+        expect(herd.lastFreshSpawnResumed(key)).toBe(false); // ...and only once
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-916: the flag-off / intentional-stop / missing-transcript /
+  // over-cutoff fallback outcomes are all covered directly against
+  // `decideRespawnResume` itself (test/unit/respawn-resume-decision.test.ts)
+  // — this is the one "does the fallback reach a REAL spawn correctly"
+  // check: no persisted session id at all is the simplest fallback to
+  // drive through the real path, and must behave EXACTLY like the
+  // pre-FACTORY-916 "no id to discover from" case the FACTORY-314 test
+  // above already covers (no `--resume`, no `--session-id`) — going through
+  // the real `ManagedHerdrLifecycle`-based `startProviders`, never
+  // `tryClaudeResume` (which returns `undefined` before touching herdr at
+  // all when `decideRespawnResume` has no id to resume with).
+  test("FACTORY-916: no persisted session id at all -> an ordinary fresh spawn, no --resume, same as pre-FACTORY-916 behaviour", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const f = fakeHerdr([]); // this launch's own discovery finds nothing — no transcript is ever written by this fake
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+      expect(f.started).toHaveLength(1);
+      expect(f.started[0]!.args).not.toContain("--resume");
+      expect(herd.lastFreshSpawnResumed(key)).toBe(false);
+    });
+  });
+
+  // FACTORY-930 (epic FACTORY-843, story FACTORY-850): the defect the
+  // epic's formal review of PR #739 found — `decideRespawnResume` (called
+  // inside `tryClaudeResume`) and the non-claude branch's own
+  // `clearStopCause` both clear this workspace's stop-cause marker as soon
+  // as a spawn DECISION is made, before the launch it is deciding for has
+  // actually run. A launch that then FAILS must not leave the marker
+  // cleared — otherwise the VERY NEXT spawn attempt reads no marker at
+  // all, misclassifies as `unintended`, and resumes a session the agent
+  // deliberately stood down from, breaking `stand_down`'s own contract.
+  test("FACTORY-930: a spawn whose launch FAILS does not consume the intentional-stop marker — the next spawn attempt still starts fresh, never resuming", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-920" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-failed-spawn-"));
+      try {
+        persistIntentionalStop(cwd, "stand_down");
+        // A resumable prior session — present so that, if the bug were
+        // still live, attempt #2 below would have every ingredient it
+        // needs to WRONGLY resume once the marker is gone.
+        const priorId = "prior-conversation-that-must-not-resume";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "{}");
+
+        const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] };
+
+        // Attempt #1: the decision reads the marker above as `intentional`,
+        // so `tryClaudeResume` attempts no launch at all and this falls
+        // through to the ordinary multi-provider spawn — which FAILS
+        // outright here (a non-busy `agent.start` rejection, never
+        // retried, same shape as "a non-busy agent.start rejection is
+        // never retried" above).
+        const failingClient = {
+          agent: { list: async () => ({ agents: [] }), start: async () => { throw new Error("boom"); } },
+          workspace: { create: async () => ({ root_pane: "wX:p1" }) },
+          pane: { close: async () => {} },
+        };
+        const herd1 = new HerdrHerd(failingClient as any, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await expect(herd1.spawn(spec)).rejects.toThrow("boom");
+
+        // The marker must still be there — nothing above ever actually
+        // launched, so nothing should have consumed it.
+        expect(workspaceStopCause(cwd)?.reason).toBe("stand_down");
+
+        // Attempt #2, a healthy fake this time: if the marker had been
+        // lost (the pre-fix behaviour), this decision would read
+        // `unintended`, find the resumable transcript above, and launch
+        // with `--resume`. With the fix, the still-present marker reads
+        // `intentional` again, so this is an ordinary FRESH launch.
+        const f2 = fakeHerdr([]);
+        const herd2 = new HerdrHerd(f2.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd2.spawn(spec);
+        expect(f2.started).toHaveLength(1);
+        expect(f2.started[0]!.args).not.toContain("--resume"); // fresh, never resumed
+        // This second attempt DID actually launch — the marker is now
+        // correctly gone, so a LATER genuine crash (no intervening
+        // start_worker) would resume instead of reading this stale record
+        // forever (the original FACTORY-852 property this story must not
+        // regress).
+        expect(workspaceStopCause(cwd)).toBeUndefined();
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-930: the FACTORY-852 property this story must preserve, driven
+  // through the real `HerdrHerd.spawn()` path rather than `decideRespawnResume`
+  // directly (that half is already covered unit-level by
+  // test/unit/respawn-resume-decision.test.ts's own marker-clearing tests) —
+  // this asserts the INTEGRATION: a spawn that actually succeeds leaves the
+  // marker cleared, same as before this ticket.
+  test("FACTORY-930: a successful fresh spawn clears a stood-down marker", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-921" });
+      const cwd = workspaceDirFor(key);
+      persistIntentionalStop(cwd, "stand_down");
+      const f = fakeHerdr([]);
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] });
+      expect(f.started).toHaveLength(1);
+      expect(f.started[0]!.args).not.toContain("--resume"); // the marker correctly forced a fresh start, not a resume
+      expect(workspaceStopCause(cwd)).toBeUndefined(); // cleared by this successful spawn
+    });
+  });
+
+  // FACTORY-720 (PR #678 review, BLOCKING): `reportPersistedAgentSessions`
+  // (./report-agent-sessions.ts) reports a persisted id to herdr only ONCE,
+  // at daemon startup. Without ALSO reporting at the point `spawn()` itself
+  // persists a id, a later respawn in the SAME pane (model/effort change,
+  // crash-loop restart, an ordinary relaunch) would leave herdr still
+  // holding whatever the earlier report said — a confident wrong `--resume`
+  // into a finished conversation on the NEXT herdr restart. RED FIRST
+  // against the pre-fix code: this test fails because nothing ever calls
+  // `pane.reportAgentSession` from `spawn()` at all.
+  test("FACTORY-720: a respawn that discovers and persists a NEW session id reports the NEW id to herdr, not the old one", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-908" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-report-"));
+      try {
+        // Passed by reference into `fakeHerdr` so the test can mutate it
+        // between calls: emptying it between the two `spawn()` calls below
+        // simulates herdr no longer listing a live agent for this pane (a
+        // crash-loop restart, the ticket's own example) — the ONLY way to
+        // drive a SECOND real launch through `startProviders` rather than
+        // `spawnExclusive`'s "noop — already has a live agent" short-circuit.
+        const agents: any[] = [];
+        const f = fakeHerdr(agents);
+        const realStart = f.client.agent.start;
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        let nextId = "";
+        f.client.agent.start = async (p: any) => {
+          await realStart(p);
+          await new Promise((r) => setTimeout(r, 20));
+          writeFileSync(join(projectDir, `${nextId}.jsonl`), "{}");
+        };
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+
+        // First launch: Claude picks C1. The sweep (not exercised here) would
+        // have been the only reporter before this fix; `spawn()` itself now
+        // also reports it.
+        nextId = "claude-session-C1";
+        await herd.spawn(spec);
+        expect(workspaceSessionId(cwd)).toBe("claude-session-C1");
+        expect(f.reportedSessions).toEqual([{ pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C1", source: "herdr:claude" }]);
+
+        // Respawn of the SAME pane (e.g. a crash-loop restart): mirrors the
+        // real `reconcileNow` sequence (its own big comment above
+        // `clearVanishedWorker` names it: "the normal reconcile loop stops
+        // the stale agent and respawns it") — `herd.stop()` releases
+        // `ManagedHerdrLifecycle`'s cached `active` identity, and clearing
+        // the fixture's `agents` list simulates herdr no longer listing the
+        // old (crashed) pane, so the next `spawn()` is a genuine fresh
+        // launch rather than `spawnExclusive`'s "noop" short-circuit.
+        await herd.stop(key);
+        agents.length = 0;
+        // Claude picks a DIFFERENT id, C2, this time. Disk now says C2 —
+        // herdr must be told C2 too, not left holding C1 from above.
+        nextId = "claude-session-C2";
+        await herd.spawn(spec);
+        expect(workspaceSessionId(cwd)).toBe("claude-session-C2");
+        expect(f.reportedSessions).toEqual([
+          { pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C1", source: "herdr:claude" },
+          { pane_id: "w9:p1", agent: "claude", agent_session_id: "claude-session-C2", source: "herdr:claude" },
+        ]);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-720 (PR #678 review): same "a report hiccup must never read as a
+  // failed spawn" discipline `reportFullAgentKey` already follows for
+  // `workspace.reportMetadata` — a failed `pane.reportAgentSession` call at
+  // the exact moment a fresh/respawned launch persists its new id must not
+  // make `spawn()` itself reject. The launch already succeeded; only the
+  // herdr notification about it failed.
+  test("FACTORY-720: a failed pane.reportAgentSession report after a successful launch does not fail the spawn", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-909" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-report-fail-"));
+      try {
+        const f = fakeHerdr([]);
+        f.setReportAgentSessionFails(true);
+        const realStart = f.client.agent.start;
+        const claudeChosenId = "claude-picked-this-id-despite-report-failure";
+        f.client.agent.start = async (p: any) => {
+          await realStart(p);
+          await new Promise((r) => setTimeout(r, 20));
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `${claudeChosenId}.jsonl`), "{}");
+        };
+        const logs: string[] = [];
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => logs.push(l), undefined, undefined, homeOf(home));
+
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null }); // must not throw
+        expect(f.started).toHaveLength(1);
+        expect(workspaceSessionId(cwd)).toBe(claudeChosenId); // the launch's own bookkeeping is unaffected
+        expect(f.reportedSessions).toEqual([]); // the report never actually recorded (it rejected)
+        expect(logs.some((l) => l.includes("WARNING") && l.includes("herdr socket hiccup"))).toBe(true);
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
@@ -2545,32 +3094,82 @@ describe("resumeInPlace", () => {
    * entries (`ManagedHerdrLifecycle.resolveCurrent()`'s own idle check).
    */
   function fakeHerdrFullCycle(cwd: string) {
-    const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; foreground: "claude" | "shell" } = { agents: [], foreground: "shell" };
+    // FACTORY-622: `panes` is a SEPARATE registry from `agents`, and that
+    // separation is the whole point — real herdr can list a pane that has no
+    // agent on it (the bare shell a `/exit` leaves behind), and it can also
+    // stop listing a pane entirely (its workspace was closed). Before this,
+    // the fixture modelled only `agents`, so neither state was reachable and
+    // `pane.list` did not exist at all. Every pre-existing test keeps the
+    // behaviour it had: `workspace.create` registers the pane it returns and
+    // `pane.close` removes it, which is exactly what those tests already
+    // assumed implicitly.
+    const state: { agents: Array<{ pane_id: string; cwd: string; agent?: string; agent_status: string }>; panes: string[]; foreground: "claude" | "shell" } = { agents: [], panes: [], foreground: "shell" };
     let paneCounter = 0;
+    // FACTORY-470/472: the REAL argv the last successful `agent.start` was
+    // called with — needed by `staleIssues()`'s own `isHerdrRestoredPane`
+    // check (this ticket), which PR #551's own tests never exercised
+    // through this fixture. Additive only: every existing #551 test still
+    // gets the exact same fixed shell/claude foreground shape it always did.
+    let lastArgv: string[] = ["claude"];
     const started: any[] = []; const closed: string[] = []; const sent: any[] = []; const creates: any[] = [];
     let nameTakenNext = false;
+    let otherErrorNext = false;
+    let keepForegroundAfterExit = false;
     const client = {
       agent: {
         list: async () => ({ agents: state.agents.map((a) => ({ ...a })) }),
         start: async (p: any) => {
           started.push(p);
           if (nameTakenNext) { nameTakenNext = false; throw HerdrError.from("agent.start", { code: "agent_name_taken", message: "agent name already used" }); }
+          if (otherErrorNext) { otherErrorNext = false; throw new Error("herdr RPC transport hiccup"); }
+          lastArgv = ["claude", ...(p.args ?? [])];
           state.agents = [...state.agents.filter((a) => a.pane_id !== p.pane_id), { pane_id: p.pane_id, cwd, agent: "claude", agent_status: "idle" }];
           state.foreground = "claude";
         },
       },
       pane: {
-        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: ["claude"], name: "claude" }] : [] } }),
+        list: async () => ({ panes: state.panes.map((pane_id) => ({ pane_id, cwd })) }),
+        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
-        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); state.foreground = "shell"; },
-        close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); },
+        sendKeys: async (p: any) => { sent.push({ keys: p.keys }); if (!keepForegroundAfterExit) state.foreground = "shell"; },
+        close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); state.panes = state.panes.filter((p) => p !== id); },
         read: async () => ({ read: { text: "" } }),
       },
-      workspace: { create: async (p: any) => { paneCounter++; creates.push(p); return { root_pane: { pane_id: `fresh-${paneCounter}` } }; } },
+      workspace: { create: async (p: any) => { paneCounter++; creates.push(p); const pane_id = `fresh-${paneCounter}`; state.panes = [...state.panes, pane_id]; return { root_pane: { pane_id } }; } },
     };
     return {
       client: client as any, started, closed, sent, creates, state,
       setNameTakenOnNextStart: () => { nameTakenNext = true; },
+      // FACTORY-622: keep `pane.processInfo` reporting claude in the
+      // foreground even after the `/exit` keystroke — the ONLY way to reach
+      // `resumeInPlaceExclusive`'s `"stuck"` outcome through this fixture,
+      // since that outcome is defined by the pane still being occupied when
+      // the exit deadline passes. The real pane then empties a moment later
+      // (`emptyPane` below), which is precisely the sequence measured on
+      // v0.19.0 for admin-brooswit-nexus.
+      keepForegroundAfterExit: () => { keepForegroundAfterExit = true; },
+      /**
+       * FACTORY-622: the pane's provider exits, WITHOUT butchr closing the
+       * pane. herdr keeps listing the pane (it is a live bare shell) and
+       * drops its agent entry, which is the state the director's own evidence
+       * describes as "the pane emptied".
+       */
+      emptyPane: () => { state.foreground = "shell"; state.agents = []; },
+      /**
+       * FACTORY-622: something OUTSIDE butchr closes the workspace — a direct
+       * herdr `workspace.close`, never butchr's own `stop()`. Both the pane
+       * and its agent vanish from herdr, and nothing tells
+       * `ManagedHerdrLifecycle` about it. Deliberately does NOT go through
+       * `pane.close` above: that is the path butchr itself uses, and routing
+       * this through it would not reproduce the defect (it would also be
+       * recorded in `closed`, hiding whether the production code closed
+       * anything of its own).
+       */
+      closeWorkspaceExternally: () => { state.panes = []; state.agents = []; state.foreground = "shell"; },
+      // FACTORY-470/472: force the NEXT `agent.start` to throw a non-
+      // agent_name_taken error — the second door PR #551's floor fix
+      // covers (`postExitOutcome()` applies identically to both).
+      setOtherErrorOnNextStart: () => { otherErrorNext = true; },
       // Simulates herdr's OWN bookkeeping eventually forgetting a dead
       // pane's agent-name registration (the "old process can still hold
       // this pane's agent name... for a moment" gap `staleIssues()`'s own
@@ -2615,6 +3214,16 @@ describe("resumeInPlace", () => {
         f.client.agent.start = async (p: any) => {
           await rawStart(p);
           sessionCounter++;
+          // FACTORY-631/FACTORY-623/FACTORY-568: a real, awaited delay, not
+          // a sleep standing in for the production fix — `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS` (see its own doc comment) requires a
+          // transcript to land in a STRICTLY LATER millisecond than
+          // `launchStartedAt` to be accepted as this launch's own. A real
+          // Claude launch takes tens of milliseconds to seconds to do that
+          // on its own; this fake `agent.start` writes synchronously, with
+          // no real elapsed time at all, so it needs an explicit, realistic
+          // gap to stay a true positive instead of flaking on that margin.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
@@ -2676,6 +3285,16 @@ describe("resumeInPlace", () => {
         f.client.agent.start = async (p: any) => {
           await rawStart(p);
           sessionCounter++;
+          // FACTORY-631/FACTORY-623/FACTORY-568: a real, awaited delay, not
+          // a sleep standing in for the production fix — `discoverClaudeSessionId`'s
+          // `AFTER_MARGIN_MS` (see its own doc comment) requires a
+          // transcript to land in a STRICTLY LATER millisecond than
+          // `launchStartedAt` to be accepted as this launch's own. A real
+          // Claude launch takes tens of milliseconds to seconds to do that
+          // on its own; this fake `agent.start` writes synchronously, with
+          // no real elapsed time at all, so it needs an explicit, realistic
+          // gap to stay a true positive instead of flaking on that margin.
+          await new Promise((r) => setTimeout(r, 20));
           const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
           mkdirSync(projectDir, { recursive: true });
           writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
@@ -2698,6 +3317,233 @@ describe("resumeInPlace", () => {
       } finally {
         rmSync(home, { recursive: true, force: true });
       }
+    });
+  });
+
+  /**
+   * FACTORY-622 — shared setup for this ticket's own tests, factored out of
+   * the two FACTORY-426 tests above (which keep their inline copies rather
+   * than being rewritten around this: their assertions are about a shipped
+   * fix and are not this ticket's to disturb).
+   *
+   * The `agent.start` wrapper is the same one those tests use, and it is
+   * needed for the same reason: `startProviders` runs
+   * `discoverClaudeSessionId` after a SUCCESSFUL launch, which only accepts a
+   * transcript written in a strictly later millisecond than the launch began
+   * (see `withResumableSession`'s own doc comment). Without it a successful
+   * spawn still succeeds but logs a WARNING, which would sit in the middle of
+   * the log assertions below.
+   */
+  async function withFullCycleHerd<T>(
+    resourceId: string,
+    fn: (ctx: { f: ReturnType<typeof fakeHerdrFullCycle>; herd: HerdrHerd; spec: { key: string; issuetype: string; summary: string; parent: null }; lines: string[]; cwd: string }) => Promise<T>,
+  ): Promise<T> {
+    return await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-622-"));
+      try {
+        const f = fakeHerdrFullCycle(cwd);
+        let sessionCounter = 0;
+        const rawStart = f.client.agent.start;
+        f.client.agent.start = async (p: any) => {
+          await rawStart(p);
+          sessionCounter++;
+          await new Promise((r) => setTimeout(r, 20));
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `session-${sessionCounter}.jsonl`), "{}");
+        };
+        const lines: string[] = [];
+        // A clock that advances a second per READ, not a fixed value: the
+        // post-`/exit` wait in `resumeInPlaceExclusive` is a
+        // `monotonicNow()`-bounded loop whose injected `wait` is `instant`
+        // here, so a frozen clock would spin it forever and a real clock
+        // would make the `"stuck"` test below sit through the full
+        // `RESUME_EXIT_TIMEOUT_MS` of real time.
+        let clock = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home), () => (clock += 1_000));
+        return await fn({ f, herd, spec, lines, cwd });
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  }
+
+  /**
+   * THE regression test for this ticket's originally reported cause. Verified
+   * to FAIL without `clearVanishedWorker` (src/agents/herd.ts): every spawn
+   * after the external close logs `waiting - handoff blocked` and
+   * `f.started` never leaves 1, which is the live-confirmed stall — the
+   * director and genius panes on 2026-10-02, recoverable only by restarting
+   * `butchr.service`.
+   *
+   * Deliberately calls NOTHING but `herd.spawn()` between the close and the
+   * recovery: no `herd.stop()` (that is FACTORY-426's route, and needing it
+   * here is the defect), no freeze/unfreeze (that is what admin-assembly had
+   * to do by hand on 2026-10-03), and no restart. The second `spawn()` is
+   * what the next ordinary reconcile poll would do.
+   */
+  test("FACTORY-622: a workspace closed directly in herdr (not via butchr stop) gets its stale worker state cleared, and the next spawn succeeds with no restart", async () => {
+    await withFullCycleHerd("FACTORY-920", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+
+      // Something external closes the workspace. butchr is told nothing, and
+      // still holds `originalPane` as its current worker.
+      f.closeWorkspaceExternally();
+
+      // The reconcile poll that follows: desired, not running, so it spawns.
+      // This one is still refused — the repair is state-only, by design.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      expect(lines.some((l) => l.includes("waiting - handoff blocked"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state") && l.includes(originalPane) && l.includes("closed outside butchr"))).toBe(true);
+      // The reason is retained non-destructively for the ops alert, and it is
+      // the SDK's own wording, not a string this test or the fix invented.
+      expect(herd.lastSpawnRefusal(spec.key)).toBe("Current worker disappeared; refusing implicit replacement");
+
+      // The next poll's spawn — the one that used to be refused forever.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+      expect(f.state.agents).toHaveLength(1);
+      expect(f.state.agents[0]!.pane_id).not.toBe(originalPane); // an honest fresh pane, not a phantom reuse
+      expect(herd.lastSpawnRefusal(spec.key)).toBeUndefined(); // cleared by the successful spawn
+      // Nothing was closed by butchr: the workspace was already gone, so
+      // there was nothing to close — only identity to forget.
+      expect(f.closed).toEqual([]);
+    });
+  });
+
+  /**
+   * The director's scope addition (2026-10-03): the same wedge via
+   * `resumeInPlace`, which FACTORY-426's fix does not reach because no
+   * `herd.stop()` ever runs for a `"stuck"` outcome. Measured on v0.19.0:
+   * admin-brooswit-nexus logged `"stuck"` at 05:41:44 after a 05:41:34
+   * `/exit`, the pane emptied, the cached identity was never cleared, and 26
+   * consecutive spawns were refused until admin-assembly cleared it by hand
+   * with `session freeze` + `unfreeze`.
+   *
+   * The acceptance criterion names the recovery exactly: respawn succeeds
+   * with NO freeze/unfreeze. Note the pane is still LISTED here — only its
+   * provider exited — so this is the branch that the pane-gone test above
+   * does not cover, and the one that proves the fix is keyed on evidence
+   * about the pane rather than on how the pane came to be empty.
+   */
+  test("FACTORY-622: a resume-in-place 'stuck' whose pane empties afterwards is cleared too, and the respawn succeeds with no freeze/unfreeze", async () => {
+    await withFullCycleHerd("FACTORY-921", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+
+      // The pane does not vacate before the exit deadline, so the resume
+      // returns "stuck" — a bare retry, with no stop/spawn behind it.
+      f.keepForegroundAfterExit();
+      expect(await herd.resumeInPlace(spec)).toBe("stuck");
+      expect(f.sent.some((s) => s.text === "/exit")).toBe(true);
+
+      // ...and then the pane empties anyway, a moment later. herdr still
+      // lists the pane; it just has no provider on it any more.
+      f.emptyPane();
+      expect(f.state.panes).toEqual([originalPane]);
+
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1); // still refused on this poll
+      expect(lines.some((l) => l.includes("cleared stale worker state") && l.includes("still listed but empty"))).toBe(true);
+      // The orphaned bare shell IS closed in this branch, unlike the
+      // closed-workspace one: the next spawn must not have to launch beside it.
+      expect(f.closed).toContain(originalPane);
+
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+      expect(f.state.agents).toHaveLength(1);
+      expect(f.state.agents[0]!.pane_id).not.toBe(originalPane);
+    });
+  });
+
+  /**
+   * The ticket's second requirement, as its own test: "Only clear when herdr
+   * positively reports the workspace/pane missing. A herdr error or timeout
+   * is NOT proof it is gone; do not clear on that."
+   *
+   * This is the test that would catch the dangerous version of this fix. If
+   * `clearVanishedWorker` treated a failed `pane.list()` as evidence, it
+   * would clear the identity of a worker that is in fact alive and herdr is
+   * merely unreachable about — and the next poll would launch a SECOND agent
+   * beside it, in the same workspace.
+   */
+  test("FACTORY-622: a pane.list() failure is not proof the pane is gone — the worker state is left exactly as it was", async () => {
+    await withFullCycleHerd("FACTORY-922", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      f.closeWorkspaceExternally();
+      f.client.pane.list = async () => { throw new Error("herdr RPC transport hiccup"); };
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("pane.list() failed so herdr confirmed nothing") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+
+      // Still wedged, deliberately: with no proof, the safe answer is to keep
+      // refusing. Once herdr answers again, the very next poll recovers.
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      f.client.pane.list = async () => ({ panes: [] });
+      await herd.spawn(spec);
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(2);
+    });
+  });
+
+  /**
+   * The third case the ticket asks for: an intact worker is untouched. The
+   * pane is listed AND still running its provider; only herdr's `agent.list`
+   * bookkeeping has dropped the entry (the measured lag `staleIssues()`'s own
+   * comment describes). Clearing here would discard the identity of a live
+   * agent, so the fix must refuse to — a pane that exists but whose agent has
+   * died is FACTORY-426's stop-then-spawn case, not this one.
+   */
+  test("FACTORY-622: a blocked spawn whose held pane is still running a provider clears nothing", async () => {
+    await withFullCycleHerd("FACTORY-923", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      expect(f.started).toHaveLength(1);
+      const originalPane = f.state.agents[0]!.pane_id;
+      // The agent entry is gone from herdr's bookkeeping; the pane and its
+      // claude process are both still there.
+      f.forgetAllAgents();
+      expect(f.state.panes).toEqual([originalPane]);
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("still running a provider") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+      expect(f.closed).toEqual([]); // the live pane is never closed
+      expect(f.started).toHaveLength(1);
+    });
+  });
+
+  /**
+   * The same guard one step further in: a `processInfo` that SUCCEEDS but
+   * reports no foreground data at all is `"unknown"`, not `"empty"`. A shell
+   * that is still starting reports exactly this, and so does a pane blocked
+   * on a dialog — absence of data is not absence of a process. Without this
+   * distinction `paneOccupancy` would be the same two-valued check
+   * `providerOfPane` already is, and this fix would clear on a herdr hiccup
+   * by a different door than the one the test above closes.
+   */
+  test("FACTORY-622: a processInfo that reports no foreground data is unknown, not empty — nothing is cleared", async () => {
+    await withFullCycleHerd("FACTORY-924", async ({ f, herd, spec, lines }) => {
+      await herd.spawn(spec);
+      f.forgetAllAgents();
+      f.client.pane.processInfo = async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id } });
+
+      await herd.spawn(spec);
+      expect(lines.some((l) => l.includes("of unknown occupancy") && l.includes("left untouched"))).toBe(true);
+      expect(lines.some((l) => l.includes("cleared stale worker state"))).toBe(false);
+      expect(f.started).toHaveLength(1);
     });
   });
 
@@ -2729,6 +3575,54 @@ describe("resumeInPlace", () => {
       const herd2 = new HerdrHerd(f2.client, "http://x/mcp", instant, (l) => lines2.push(l));
       await expect(herd2.resumeInPlace(spec)).rejects.toThrow("herdr hiccup");
       expect(lines2).toEqual([`${RESUME_TAG} ${key} threw — herdr hiccup`]);
+    });
+  });
+
+  // FACTORY-525: the fix this ticket exists for — before it, `[resume] KEY
+  // failed` carried no reason at all (the exact shape agentsafety's batch 1
+  // report observed live). Covers both the log line AND the separate
+  // `lastResumeFailureDetail` accessor `reconcileNow` (loop.ts) reads to
+  // build its own respawn comment — one attempt, two consumers, same value.
+  test("FACTORY-525: a 'failed' outcome's log line and lastResumeFailureDetail both carry the reason — a herdr error when the relaunch itself was rejected", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-914" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const lines: string[] = [];
+        const f = statefulHerdr("w1:p1", cwd, "idle", { nameTaken: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(lines).toEqual([`${RESUME_TAG} ${key} failed — herdr error: agent.start: agent name already used [agent_name_taken]`]);
+        // Read-once: the SAME detail the log line already rendered is still
+        // there for a second, independent consumer (`reconcileNow`) — and is
+        // gone after that read, so a later unrelated poll never sees a stale
+        // detail from this attempt.
+        expect(herd.lastResumeFailureDetail(key)).toBe("herdr error: agent.start: agent name already used [agent_name_taken]");
+        expect(herd.lastResumeFailureDetail(key)).toBeUndefined();
+      });
+    });
+  });
+
+  // FACTORY-525: the OTHER half of "the herdr error and the exit status,
+  // where they are available" — when herdr accepted the launch and nothing
+  // threw, there is no herdr error and no exit code (herdr exposes none for
+  // a pane's process), so the log line must say so explicitly rather than
+  // printing nothing.
+  test("FACTORY-525: a 'failed' outcome with nothing thrown (Claude simply didn't stay up) logs 'no exit status captured'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-915" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const lines: string[] = [];
+        const f = statefulHerdr("w1:p1", cwd, "idle", { crashesOnStart: true });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, (l) => lines.push(l), undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed");
+        expect(lines).toEqual([`${RESUME_TAG} ${key} failed — no exit status captured`]);
+      });
     });
   });
 
@@ -2826,13 +3720,13 @@ describe("resumeInPlace", () => {
       // `.butchr-mcp-servers.json` (`workspaceMcpServers`) for THIS shape;
       // a bare rule-engine spec instead needs a `mcpBindingsOf` callback
       // this test doesn't wire up.
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/etc/defs/factory-913.json" });
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "factory-913.json") });
       const cwd = ensureWorkspaceDir(key);
       const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
-      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, resource: "/etc/defs/factory-913.json", mcpServers: [binding] };
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, resource: absPath("etc", "defs", "factory-913.json"), mcpServers: [binding] };
       await withResumableSession(cwd, "original-session", async (home) => {
         const f = statefulHerdr("w1:p1", cwd);
-        const oldArgv = spawnArgs({ key, issuetype: "managed-session", summary: "", parent: null, resource: "/etc/defs/factory-913.json" }, cwd);
+        const oldArgv = spawnArgs({ key, issuetype: "managed-session", summary: "", parent: null, resource: absPath("etc", "defs", "factory-913.json") }, cwd);
         await f.client.agent.start({ args: oldArgv });
         f.started.length = 0;
         const { writeFileSync } = require("node:fs") as typeof import("node:fs");
@@ -2850,6 +3744,353 @@ describe("resumeInPlace", () => {
         expect(mcpJson.mcpServers.chan1).toEqual({ type: "http", url: "http://example/mcp" });
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
+    });
+  });
+
+  // PR #560 review — the scope-creep case `isHerdrRestoredPane`'s own
+  // --mcp-config discriminator exists to close: a pane butchr ITSELF
+  // already relaunched via resumeInPlace() (so its live argv carries
+  // `--resume <id>` PLUS the full flag set, `--mcp-config` included) that
+  // LATER drifts for an unrelated, ordinary reason must still be classified
+  // through FACTORY-411/#556's allowlist as before — never mistaken for a
+  // herdr restore just because `--resume` is present. Without the
+  // discriminator, this would be silently misclassified "herdr restored"
+  // and relaunched via the identity path with the WRONG stated reason,
+  // quietly widening resume-in-place's reach to any drift on any
+  // already-`--resume`d pane — exactly what FACTORY-470 puts out of scope.
+  test("staleIssues(): a pane already relaunched via resumeInPlace (carries --resume AND the full flag set) that later drifts is classified via the ordinary allowlist, never as 'herdr restored'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "factory-918.json") });
+      const cwd = ensureWorkspaceDir(key);
+      const binding = { name: "chan1", type: "http" as const, url: "http://example/mcp", channel: true };
+      persistDiscoveredSessionId(cwd, "already-resumed-session");
+      const f = statefulHerdr("w1:p1", cwd);
+      // The argv THIS workspace's own prior resumeInPlace() relaunch would
+      // have produced — full flags (--mcp-config included), PLUS --resume.
+      // Never a herdr-restore shape: butchr itself built this argv.
+      const priorArgv = spawnArgs(
+        { key, issuetype: "managed-session", summary: "", parent: null, resource: absPath("etc", "defs", "factory-918.json") },
+        cwd, { provider: "claude", resumeSessionId: "already-resumed-session" },
+      );
+      await f.client.agent.start({ args: priorArgv.slice(1) }); // drop the leading "claude" positional; statefulHerdr re-adds it
+      f.started.length = 0;
+      // A later, unrelated drift: the definition now binds a NEW channel
+      // server (FACTORY-411/#556's own allowed shape) that the persisted
+      // `.butchr-mcp-servers.json` doesn't know about yet.
+      const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+      writeFileSync(join(cwd, ".butchr-mcp-servers.json"), JSON.stringify([binding]));
+
+      const herd = new HerdrHerd(f.client, "http://x/mcp", instant);
+      const stale = await herd.staleIssues();
+      expect(stale).toHaveLength(1);
+      // The ordinary allowlist path fired (FACTORY-411/#556) — NOT this
+      // ticket's herdr-restored identity path.
+      expect(stale[0]!.reason).toContain("--dangerously-load-development-channels");
+      expect(stale[0]!.reason).not.toContain("herdr restored");
+      expect(stale[0]!.resumable).toBe(true); // still resumable — just via the allowlist, not the identity check
+    });
+  });
+
+  // FACTORY-470/472 — the ticket's own headline case: herdr's OWN
+  // restore-after-host-hard-reset (independent of butchr, outside this
+  // repo's source) produces exactly this shape — a live claude process
+  // whose observed argv is a bare `--resume <pre-boot-session-id>`, none of
+  // butchr's own flags (permission-mode, mcp-config, channels) at all. This
+  // is the "0 of 15 real panes" gap: under FACTORY-411/#556's allowlist
+  // alone, its checkArgv reason always also lists `--mcp-config` (never on
+  // that allowlist), so it would be `resumable: false` forever. Asserts the
+  // identity path (`isHerdrRestoredPane`) is what actually classifies it —
+  // not a coincidental allowlist pass — then relaunches with the FULL flag
+  // set (same builder a fresh spawn uses, per this ticket's scope decision)
+  // and proves no respawn loop across SEVERAL consecutive polls afterward
+  // (FACTORY-470 review comment: the persisted-id equality this mechanism
+  // relies on must not drift after the relaunch it itself triggers).
+  test("FACTORY-470/472: a herdr-restored pane (bare `claude --resume <id>`, no butchr flags) is classified resumable via identity, relaunches with the full flag set, and is never flagged again across several consecutive polls", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-914" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        // Simulate herdr's own restore: a bare `claude --resume <id>` —
+        // never something butchr itself built (contrast with every other
+        // test in this file, which seeds `lastArgv` via a real
+        // `spawnArgs(...)`/`agentStartParams(...)` call).
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        // FACTORY-491: this test proves the identity mechanism itself, not
+        // the canary gate — enable BUTCHR_RESTORED_RESUME's policy for every
+        // agent so the herdr-restored classification below is reachable
+        // regardless of the {buddy, genius}-only production default.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true);
+        expect(stale[0]!.reason).toContain("herdr restored");
+        // Confirm the IDENTITY path fired, not a coincidental allowlist
+        // pass: this reason's missing-flag list includes --mcp-config,
+        // which resumableArgvReason must still refuse on its own.
+        const missing = stale[0]!.reason.match(/\(([^)]+)\)/)?.[1] ?? "";
+        expect(missing).toContain("--mcp-config");
+        expect(resumableArgvReason(`argv lacks ${missing}`, "claude")).toBe(false);
+
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        const args: string[] = f.started[0]!.args;
+        expect(args[args.indexOf("--resume") + 1]).toBe("original-session");
+        expect(args).toEqual(expect.arrayContaining([
+          "--model", "claude-opus-5", "--effort", "medium",
+          "--permission-mode", DEFAULT_PERMISSION_MODE,
+          "--mcp-config", join(cwd, "mcp.json"),
+        ]));
+        expect(f.started[0]!.pane_id).toBe("w1:p1"); // same pane, never a new one
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+
+        for (let poll = 0; poll < 3; poll++) {
+          expect(await herd.staleIssues()).toEqual([]);
+        }
+      });
+    });
+  });
+
+  // FACTORY-491 (director item 5) — the canary/kill switch, exercised
+  // through `staleIssues()` end to end rather than only the pure
+  // `restoredResumeEnabledFor` unit above: a managed session named
+  // "buddy" is enabled by the {buddy, genius} default (the epic's own
+  // reading of the ambiguous director steer), an ordinary jira-work
+  // (non-managed-session) agent is NOT — the default policy names agents,
+  // and only a managed session has one to check against.
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME defaulting to {buddy, genius} enables identity classification for a managed session named 'buddy'", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "buddy.json") });
+      const cwd = ensureWorkspaceDir(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: new Set(["buddy", "genius"]) });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true);
+        expect(stale[0]!.reason).toContain("herdr restored");
+      });
+    });
+  });
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME defaulting to {buddy, genius} does NOT enable identity classification for an ordinary (non-managed-session) agent — it has no name to match", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-919" });
+      const cwd = workspaceDirFor(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: new Set(["buddy", "genius"]) });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false); // falls through to the ordinary allowlist, which refuses --mcp-config
+      });
+    });
+  });
+  test("FACTORY-491: BUTCHR_RESTORED_RESUME=off disables identity classification even for a canary-listed managed session", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", "buddy.json") });
+      const cwd = ensureWorkspaceDir(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "original-session"] });
+        f.started.length = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "off" });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false);
+      });
+    });
+  });
+  // FACTORY-491 (director item 4, FACTORY-467 comment 27818 + FACTORY-73's
+  // outstanding hazard question relayed on FACTORY-467, 2026-09-28
+  // 23:05Z: whether a `launch_pending: true` entry can report
+  // `agent_status: "idle"`, which would let `resumeInPlace` send `/exit`
+  // to a claude that has not finished starting) — checked BEFORE the
+  // identity match regardless of `agent_status`, so this guard holds even
+  // in that unresolved case.
+  test("FACTORY-491: a pane whose claude launch is still pending (launch_pending: true) is never classified herdr-restored, even when its argv already carries a matching --resume", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-920" });
+      const cwd = workspaceDirFor(key);
+      await withResumableSession(cwd, "original-session", async () => {
+        const client = {
+          agent: {
+            list: async () => ({ agents: [{ agent: "claude", agent_status: "idle", cwd, pane_id: "w1:p1", workspace_id: "w1", launch_pending: true }] }),
+          },
+          pane: {
+            processInfo: async () => ({ process_info: { pane_id: "w1:p1", foreground_processes: [{ pid: 1, name: "claude", argv: ["claude", "--resume", "original-session"] }] } }),
+          },
+        };
+        const herd = new HerdrHerd(client as any, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" });
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.reason).not.toContain("herdr restored");
+        expect(stale[0]!.resumable).toBe(false); // falls through to the ordinary allowlist, which refuses --mcp-config
+      });
+    });
+  });
+
+  // FACTORY-470/472 (boss review on FACTORY-472, relaying FACTORY-312/PR
+  // #551 — now MERGED, rebased onto here): resumeInPlaceExclusive is SHARED
+  // between the pre-existing model/effort resume path and this ticket's
+  // herdr-restored-pane path — a relaunch failing AFTER `/exit` has already
+  // landed (the measured-live `agent_name_taken` race) is reachable through
+  // EITHER. Before #551, this left `ManagedHerdrLifecycle`'s `this.active`
+  // pointing at a gone pane forever (a permanent wedge — this file's own
+  // git history has the version of this test that proved it). #551's floor
+  // fix re-checks pane occupancy post-collision and reports `"failed"`
+  // (never `"stuck"`) when the pane is confirmed empty, which routes
+  // through `reconcileNow`'s existing stop-then-spawn fallback. Proven here
+  // through the REAL `resumeInPlaceExclusive` + `spawnExclusive` code paths
+  // (via `fakeHerdrFullCycle`, the same fixture PR #551's own recovery test
+  // uses, extended only to track argv — see that fixture's own doc comment)
+  // — this ticket's herdr-restored classification reaches the exact same
+  // recovery #551 already proved for the model/effort path, not a new one.
+  test("FACTORY-470/472 + FACTORY-312/#551: a herdr-restored pane's relaunch colliding with agent_name_taken AFTER /exit reports 'failed' and a later herd.stop()+herd.spawn() actually recovers it", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-916" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-herdr-restored-wedge-"));
+      try {
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, "original-session.jsonl"), "{}");
+        persistDiscoveredSessionId(cwd, "original-session");
+
+        const f = fakeHerdrFullCycle(cwd);
+        // Seed the herdr-restore shape directly (this daemon never itself
+        // launched this pane — no prior herd.spawn(), unlike PR #551's own
+        // recovery test): a bare `claude --resume <id>`, none of butchr's
+        // flags. Calling the real `agent.start` (not HerdrHerd's) sets
+        // `state.agents`/`lastArgv`/`foreground` exactly as a real launch would.
+        await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the wedge/recovery mechanism, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        f.setNameTakenOnNextStart();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed"); // not "stuck" — #551's floor fix in effect
+        expect(f.sent.some((s) => s.text === "/exit")).toBe(true); // confirms /exit really was sent before the collision
+        // FACTORY-491 (director item 3): closed by id directly, inside
+        // resumeInPlace itself — before reconcileNow's own fallthrough
+        // (mirrored below) ever runs its separate identity-matched close.
+        expect(f.closed).toEqual(["w1:p1"]);
+
+        // herdr eventually forgets the dead pane's registration (see
+        // fakeHerdrFullCycle's own doc comment for why this is the honest
+        // way to reach the state this test cares about), then
+        // reconcileNow's ACTUAL contract for a "failed" outcome —
+        // herd.stop() THEN herd.spawn() — mirrored directly.
+        f.forgetAllAgents();
+        await herd.stop(spec.key);
+        await herd.spawn(spec);
+
+        expect(f.started).toHaveLength(2); // the collision attempt, then the recovering spawn — f.started was reset after seeding, so this counts only the two attempts this test drives
+        expect(f.state.agents).toHaveLength(1);
+        expect(f.state.agents[0]!.pane_id).not.toBe("w1:p1"); // a genuinely NEW pane — an honest fresh restart, since the herdr-restored session's own history is what was actually lost here (not this ticket's scope to prevent — only a CLEAN relaunch collision is)
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-470/472 (epic review, FACTORY-470 comment 27586): the SAME
+  // question for the OTHER door of `resumeInPlaceExclusive`'s
+  // `startManagedAgent` catch — any error that is NOT `agent_name_taken`.
+  // #551's floor fix applies the identical `postExitOutcome()` re-check to
+  // this branch too: with the pane confirmed empty, ANY relaunch error now
+  // reports `"failed"` (never a raw propagated throw), so it recovers the
+  // same way as the agent_name_taken door above.
+  test("FACTORY-470/472 + FACTORY-312/#551: a herdr-restored pane's relaunch throwing a non-agent_name_taken error AFTER /exit ALSO reports 'failed' and recovers the same way", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-917" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task" as const, summary: "s", parent: null };
+      const home = mkdtempSync(join(tmpdir(), "claude-home-herdr-restored-wedge-2-"));
+      try {
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        writeFileSync(join(projectDir, "original-session.jsonl"), "{}");
+        persistDiscoveredSessionId(cwd, "original-session");
+
+        const f = fakeHerdrFullCycle(cwd);
+        await f.client.agent.start({ pane_id: "w1:p1", args: ["--resume", "original-session"] });
+        f.started.length = 0;
+
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the wedge/recovery mechanism, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale[0]!.resumable).toBe(true); // classified via this ticket's identity check
+
+        f.setOtherErrorOnNextStart();
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("failed"); // never a raw propagated throw — #551's floor fix applies to this door too
+        // FACTORY-491 (director item 3): closed by id directly, inside resumeInPlace itself.
+        expect(f.closed).toEqual(["w1:p1"]);
+
+        f.forgetAllAgents();
+        await herd.stop(spec.key);
+        await herd.spawn(spec);
+
+        expect(f.started).toHaveLength(2); // the collision attempt, then the recovering spawn
+        expect(f.state.agents).toHaveLength(1);
+        expect(f.state.agents[0]!.pane_id).not.toBe("w1:p1");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-470/472 acceptance criterion 3/4: a pane that LOOKS
+  // herdr-restored (a bare `--resume <id>` argv) but whose transcript is
+  // genuinely gone must still fail safe — FACTORY-418's invalidation is
+  // unconditional, whatever detection path found the pane resumable-looking.
+  test("FACTORY-470/472: a herdr-restored-looking pane with a genuinely missing transcript falls back to unresumable, never relaunched", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-915" });
+      const cwd = workspaceDirFor(key);
+      persistDiscoveredSessionId(cwd, "vanished-session"); // persisted, but no transcript file exists anywhere
+      const home = mkdtempSync(join(tmpdir(), "claude-home-empty-"));
+      try {
+        const f = statefulHerdr("w1:p1", cwd);
+        await f.client.agent.start({ args: ["--resume", "vanished-session"] });
+        f.started.length = 0;
+        // FACTORY-491: enable the canary for every agent — this test proves
+        // the transcript-gone fail-safe, not the canary gate.
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, { provider: "claude", restoredResume: "all" }, undefined, homeOf(home));
+        const stale = await herd.staleIssues();
+        expect(stale).toHaveLength(1);
+        expect(stale[0]!.resumable).toBe(true); // the identity match alone can't know the transcript is gone
+        const outcome = await herd.resumeInPlace({ key, issuetype: "Task", summary: "s", parent: null });
+        expect(outcome).toBe("unresumable-transcript-gone"); // resumeInPlaceExclusive's own transcript check catches it — id was known, only the transcript is gone
+        expect(f.started).toEqual([]); // never attempted a relaunch
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { InstanceFreezeStore } from "@brooswit/drovr-events";
 import {
   archiveSessionDefinition, assertArchiveDirDisjoint, defaultSessionArchiveIo, definitionBasenameProblem,
@@ -15,9 +15,10 @@ import { listFilesystemResources } from "../../src/resources/filesystem.js";
 import { desiredFrom, reconcileNow } from "../../src/daemon/loop.js";
 import type { Herd } from "../../src/agents/herd.js";
 import type { SpawnSpec } from "../../src/agents/workspace.js";
+import { absPath } from "../helpers/abs-path";
 
 const goodDef = (over: Record<string, unknown> = {}) => ({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
+  workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
 });
 
 async function tmp(prefix: string): Promise<string> {
@@ -26,42 +27,43 @@ async function tmp(prefix: string): Promise<string> {
 
 describe("sessionArchiveDir", () => {
   test("BUTCHR_SESSION_ARCHIVE_DIR override wins", () => {
-    expect(sessionArchiveDir({ BUTCHR_SESSION_ARCHIVE_DIR: "/custom/archive" }, "/defs")).toBe("/custom/archive");
+    expect(sessionArchiveDir({ BUTCHR_SESSION_ARCHIVE_DIR: absPath("custom", "archive") }, absPath("defs"))).toBe(absPath("custom", "archive"));
   });
 
   test("trims whitespace on the override, same discipline as sessionDefinitionsPath", () => {
-    expect(sessionArchiveDir({ BUTCHR_SESSION_ARCHIVE_DIR: "  /custom/archive  " }, "/defs")).toBe("/custom/archive");
+    expect(sessionArchiveDir({ BUTCHR_SESSION_ARCHIVE_DIR: `  ${absPath("custom", "archive")}  ` }, absPath("defs"))).toBe(absPath("custom", "archive"));
   });
 
   test("default: a sibling of the definitions directory, suffixed -archive", () => {
-    expect(sessionArchiveDir({}, "/home/x/.config/butchr/session-definitions")).toBe("/home/x/.config/butchr/session-definitions-archive");
+    expect(sessionArchiveDir({}, absPath("home", "x", ".config", "butchr", "session-definitions"))).toBe(`${absPath("home", "x", ".config", "butchr", "session-definitions")}-archive`);
   });
 
   test("default is derived from sessionDefinitionsPath() itself when no definitionsDir is given explicitly", () => {
-    const env = { BUTCHR_SESSION_DEFINITIONS_DIR: "/explicit/defs" };
-    expect(sessionArchiveDir(env)).toBe("/explicit/defs-archive");
+    const env = { BUTCHR_SESSION_DEFINITIONS_DIR: absPath("explicit", "defs") };
+    expect(sessionArchiveDir(env)).toBe(`${absPath("explicit", "defs")}-archive`);
   });
 });
 
 describe("assertArchiveDirDisjoint", () => {
   test("throws when the archive dir equals the definitions dir", () => {
-    expect(() => assertArchiveDirDisjoint("/defs", "/defs")).toThrow(/must not equal or sit inside/);
+    expect(() => assertArchiveDirDisjoint(absPath("defs"), absPath("defs"))).toThrow(/must not equal or sit inside/);
   });
 
   test("throws when the archive dir is a subfolder of the definitions dir", () => {
-    expect(() => assertArchiveDirDisjoint("/defs", "/defs/archive")).toThrow(/must not equal or sit inside/);
+    expect(() => assertArchiveDirDisjoint(absPath("defs"), absPath("defs", "archive"))).toThrow(/must not equal or sit inside/);
   });
 
   test("throws through a .. traversal that resolves inside the definitions dir", () => {
-    expect(() => assertArchiveDirDisjoint("/defs", "/defs/sub/../nested")).toThrow(/must not equal or sit inside/);
+    const defs = absPath("defs");
+    expect(() => assertArchiveDirDisjoint(defs, `${defs}${sep}sub${sep}..${sep}nested`)).toThrow(/must not equal or sit inside/);
   });
 
   test("does not throw for a genuine sibling", () => {
-    expect(() => assertArchiveDirDisjoint("/defs", "/defs-archive")).not.toThrow();
+    expect(() => assertArchiveDirDisjoint(absPath("defs"), `${absPath("defs")}-archive`)).not.toThrow();
   });
 
   test("does not throw for an unrelated directory entirely", () => {
-    expect(() => assertArchiveDirDisjoint("/defs", "/somewhere/else")).not.toThrow();
+    expect(() => assertArchiveDirDisjoint(absPath("defs"), absPath("somewhere", "else"))).not.toThrow();
   });
 });
 
@@ -91,6 +93,14 @@ describe("definitionBasenameProblem", () => {
     expect(definitionBasenameProblem("C:\\Windows\\a.json")).toContain("bare file name");
   });
 
+  // FACTORY-569: a Windows drive-relative name (no separator at all — resolves
+  // against drive C:'s own cwd, not `dir`) and an NTFS Alternate Data Stream
+  // name both slip past the "/"/"\\" check alone; both contain a bare ":".
+  test("rejects a bare colon — a Windows drive-relative name or an NTFS alternate-data-stream name, neither caught by the separator check alone", () => {
+    expect(definitionBasenameProblem("C:a.json")).toContain("bare file name");
+    expect(definitionBasenameProblem("a.json:hidden")).toContain("bare file name");
+  });
+
   test("a leading dot alone (an ordinary hidden-looking name) is NOT rejected by this check — dotfiles are excluded elsewhere (listing-level), not here", () => {
     expect(definitionBasenameProblem(".hidden.json")).toBeNull();
   });
@@ -118,7 +128,7 @@ describe("archiveSessionDefinition / unarchiveSessionDefinition — name validat
   });
 
   test("archive refuses an empty name", async () => {
-    const { io } = fakeArchiveIo({ "/active/a.json": "X" });
+    const { io } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "X" });
     const result = await archiveSessionDefinition(io, "");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("must not be empty");
@@ -201,12 +211,17 @@ describe("archiveSessionDefinition / unarchiveSessionDefinition — real disk", 
   });
 });
 
+const FAKE_ACTIVE_DIR = absPath("active");
+const FAKE_ARCHIVE_DIR = absPath("archive");
+const FAKE_ACTIVE_A_JSON = join(FAKE_ACTIVE_DIR, "a.json");
+const FAKE_ARCHIVE_A_JSON = join(FAKE_ARCHIVE_DIR, "a.json");
+
 /** In-memory fake, for refusal/hook/EXDEV cases real disk can't easily force. */
 function fakeArchiveIo(files: Record<string, string> = {}, opts: { renameFailures?: Array<NodeJS.ErrnoException | null>; mkdirFails?: boolean; onArchived?: OnArchived } = {}) {
   const renameFailures = [...(opts.renameFailures ?? [])];
   const io: SessionArchiveIo = {
-    activeDir: "/active",
-    archiveDir: "/archive",
+    activeDir: FAKE_ACTIVE_DIR,
+    archiveDir: FAKE_ARCHIVE_DIR,
     rename: async (from, to) => {
       const nextFailure = renameFailures.shift();
       if (nextFailure) throw nextFailure;
@@ -228,38 +243,38 @@ function fakeArchiveIo(files: Record<string, string> = {}, opts: { renameFailure
 
 describe("archiveSessionDefinition — fake io", () => {
   test("refuses when the archive directory cannot be created; nothing moved", async () => {
-    const { io, files } = fakeArchiveIo({ "/active/a.json": "CONTENT" }, { mkdirFails: true });
+    const { io, files } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" }, { mkdirFails: true });
     const result = await archiveSessionDefinition(io, "a.json");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("cannot create archive directory");
-    expect(files).toEqual({ "/active/a.json": "CONTENT" });
+    expect(files).toEqual({ [FAKE_ACTIVE_A_JSON]: "CONTENT" });
   });
 
   test("cross-filesystem fallback: EXDEV on the direct rename triggers copy + rename-into-place + unlink-source, ending with the SAME content at the destination and nothing left at the source or under a temp name", async () => {
     const exdev = Object.assign(new Error("cross-device link"), { code: "EXDEV" }) as NodeJS.ErrnoException;
-    const { io, files } = fakeArchiveIo({ "/active/a.json": "CONTENT" }, { renameFailures: [exdev] });
+    const { io, files } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" }, { renameFailures: [exdev] });
     const result = await archiveSessionDefinition(io, "a.json");
-    expect(result).toEqual({ ok: true, path: "/archive/a.json" });
-    expect(files).toEqual({ "/archive/a.json": "CONTENT" }); // exactly one key: no source, no stray temp file
+    expect(result).toEqual({ ok: true, path: FAKE_ARCHIVE_A_JSON });
+    expect(files).toEqual({ [FAKE_ARCHIVE_A_JSON]: "CONTENT" }); // exactly one key: no source, no stray temp file
   });
 
   test("a permanent failure on the fallback's own rename-into-place leaves the source untouched and cleans up its own temp file, never leaving a partial file at the destination name", async () => {
     const exdev = Object.assign(new Error("cross-device link"), { code: "EXDEV" }) as NodeJS.ErrnoException;
     const permFail = new Error("disk full");
-    const { io, files } = fakeArchiveIo({ "/active/a.json": "CONTENT" }, { renameFailures: [exdev, permFail] });
+    const { io, files } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" }, { renameFailures: [exdev, permFail] });
     await expect(archiveSessionDefinition(io, "a.json")).rejects.toThrow("disk full");
-    expect(files["/active/a.json"]).toBe("CONTENT"); // source never unlinked
-    expect(files["/archive/a.json"]).toBeUndefined(); // destination never landed
+    expect(files[FAKE_ACTIVE_A_JSON]).toBe("CONTENT"); // source never unlinked
+    expect(files[FAKE_ARCHIVE_A_JSON]).toBeUndefined(); // destination never landed
     expect(Object.keys(files).filter((k) => k.endsWith(".tmp"))).toEqual([]); // temp file cleaned up
   });
 
   test("hook is called with the ACTIVE-path agent key and the new (archived) path, after a successful move", async () => {
     const calls: Array<{ agentKey: string; path: string }> = [];
     const onArchived: OnArchived = async (info) => { calls.push(info); };
-    const { io } = fakeArchiveIo({ "/active/a.json": "CONTENT" }, { onArchived });
+    const { io } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" }, { onArchived });
     const result = await archiveSessionDefinition(io, "a.json");
     expect(result.ok).toBe(true);
-    expect(calls).toEqual([{ agentKey: sessionAgentKey("/active/a.json"), path: "/archive/a.json" }]);
+    expect(calls).toEqual([{ agentKey: sessionAgentKey(FAKE_ACTIVE_A_JSON), path: FAKE_ARCHIVE_A_JSON }]);
   });
 
   test("hook is NOT called on a refusal (missing source)", async () => {
@@ -273,16 +288,16 @@ describe("archiveSessionDefinition — fake io", () => {
 
   test("a hook failure is reported on the result but does NOT undo the move", async () => {
     const onArchived: OnArchived = async () => { throw new Error("rocket-chat unreachable"); };
-    const { io, files } = fakeArchiveIo({ "/active/a.json": "CONTENT" }, { onArchived });
+    const { io, files } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" }, { onArchived });
     const result = await archiveSessionDefinition(io, "a.json");
-    expect(result).toEqual({ ok: true, path: "/archive/a.json", hookError: "rocket-chat unreachable" });
-    expect(files).toEqual({ "/archive/a.json": "CONTENT" }); // still moved
+    expect(result).toEqual({ ok: true, path: FAKE_ARCHIVE_A_JSON, hookError: "rocket-chat unreachable" });
+    expect(files).toEqual({ [FAKE_ARCHIVE_A_JSON]: "CONTENT" }); // still moved
   });
 
   test("omitted hook (default no-op) does not throw and reports no hookError", async () => {
-    const { io } = fakeArchiveIo({ "/active/a.json": "CONTENT" });
+    const { io } = fakeArchiveIo({ [FAKE_ACTIVE_A_JSON]: "CONTENT" });
     const result = await archiveSessionDefinition(io, "a.json");
-    expect(result).toEqual({ ok: true, path: "/archive/a.json" });
+    expect(result).toEqual({ ok: true, path: FAKE_ARCHIVE_A_JSON });
   });
 });
 

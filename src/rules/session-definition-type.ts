@@ -35,7 +35,7 @@ import { isFilesystemResourceId, MAX_ENCODED_SEGMENT_BYTES } from "../resources/
 import { parseFilesystemQuery, type FilesystemQuery } from "../resources/filesystem-query.js";
 import { isMissingRootError, listFilesystemResources, type FilesystemResource } from "../resources/filesystem.js";
 import { parseResourceRef } from "../resources/resource-ref.js";
-import { controllerCanonicalName, isHiddenDefinitionFile, parseSessionDefinitionFile, effectiveAgent, type SessionDefinition } from "../resources/session-definition.js";
+import { controllerCanonicalName, isDefinitionJsonFile, isHiddenDefinitionFile, parseSessionDefinitionFile, effectiveAgent, type SessionDefinition } from "../resources/session-definition.js";
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import type { OversizedResource } from "./filesystem-type.js";
 import { onceOversized } from "./filesystem-type.js";
@@ -256,6 +256,25 @@ export function onceMissingRoot(log: ((line: string) => void) | undefined): Miss
 }
 
 /**
+ * FACTORY-755 — told about a non-hidden candidate whose basename is not a
+ * `.json` definition file at all (a `*.json.bak-*` backup, `notes.txt`,
+ * `README`, ...): it was never offered as a definition in the first place,
+ * distinctly from `InvalidDefinition` (which names a `.json` file that WAS
+ * offered but failed to parse/validate). Never staffed either way.
+ */
+export type SkippedNonDefinitionFile = (path: string) => void;
+
+/** Logs a skipped non-definition file once per path — never respammed while it persists. Same dedup shape as `onceFrozenDefinition`. */
+export function onceSkippedNonDefinitionFile(log: ((line: string) => void) | undefined): SkippedNonDefinitionFile {
+  const logged = new Set<string>();
+  return (path) => {
+    if (logged.has(path)) return;
+    logged.add(path);
+    log?.(`[managed-sessions] ${path} is not a definition file, never staffed`);
+  };
+}
+
+/**
  * Every eligible (valid, not frozen) definition this poll — the ONE place
  * "eligible" is decided. A missing well-known directory is 0 definitions,
  * NEVER a poll error (PR #394 review fix 3): most daemons simply have no
@@ -279,6 +298,7 @@ export async function searchSessionDefinitions(
   onFrozen?: FrozenDefinition,
   onMissingRoot?: MissingRoot,
   onDeprecatedTier?: DeprecatedTierDefinition,
+  onSkippedNonDefinition?: SkippedNonDefinitionFile,
 ): Promise<SessionDefinitionMatch[]> {
   const query = parseFilesystemQuery(deps.rule.query);
   let resources: FilesystemResource[];
@@ -294,6 +314,7 @@ export async function searchSessionDefinitions(
     if (seen.has(resource.path)) continue;
     seen.add(resource.path);
     if (isHiddenDefinitionFile(resource.name)) continue; // BUTCHR-455 review fix: never a candidate, never logged — see isHiddenDefinitionFile's own doc comment.
+    if (!isDefinitionJsonFile(resource.name)) { onSkippedNonDefinition?.(resource.path); continue; } // FACTORY-755: positive allowlist — see isDefinitionJsonFile's own doc comment.
     if (!isFilesystemResourceId(resource.path)) { onOversized?.(deps.rule, resource.path); continue; }
     let definition: SessionDefinition;
     try {
@@ -535,6 +556,7 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
   const onFrozen = onceFrozenDefinition(deps.log);
   const onMissingRoot = onceMissingRoot(deps.log);
   const onDeprecatedTier = onceDeprecatedTier(deps.log);
+  const onSkippedNonDefinition = onceSkippedNonDefinitionFile(deps.log);
   // FACTORY-53/FACTORY-71: this poll's own matches, read by `related` below
   // — mirrors `createJiraProjectResourceType`'s own `let latest`
   // (src/rules/jira-project-type.ts).
@@ -544,7 +566,7 @@ export function createManagedSessionResourceType(deps: ManagedSessionResourceDep
     discovery: {
       idOf: unitAgentKey,
       search: async () => {
-        const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot, onDeprecatedTier);
+        const matches = await searchSessionDefinitions(deps, onOversized, onInvalid, onFrozen, onMissingRoot, onDeprecatedTier, onSkippedNonDefinition);
         if (deps.roles) {
           deps.roles.clear();
           for (const m of matches) deps.roles.set(m.agentKey, m.definition.role);

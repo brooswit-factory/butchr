@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE } from "../../src/agents/argv.js";
+import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT, kickoffFor, controlCharStartArgs, assertSafeStartArgv } from "../../src/agents/argv.js";
 import { SESSION_PERMISSION_MODES } from "../../src/resources/session-definition.js";
 import { RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
@@ -11,17 +11,17 @@ describe("spawnArgs", () => {
     const launch = agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy", model: "test-model" });
     expect(launch).toEqual(buildAgentStartParams({
       provider: "agy", cwd: "/w/KAN-783", paneId: "pane", name: "worker",
-      prompt: "follow your AGENTS.md", model: "test-model", skipPermissions: true,
+      prompt: AGENTS_KICKOFF_PROMPT, model: "test-model", skipPermissions: true,
     }));
-    expect(launch.args).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--model", "test-model", "--dangerously-skip-permissions"]);
-    expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", "follow your AGENTS.md", "--dangerously-skip-permissions"]);
+    expect(launch.args).toEqual(["--prompt-interactive", AGENTS_KICKOFF_PROMPT, "--model", "test-model", "--dangerously-skip-permissions"]);
+    expect(spawnArgs(spec, "/w/KAN-783", { provider: "agy" })).toEqual(["--prompt-interactive", AGENTS_KICKOFF_PROMPT, "--dangerously-skip-permissions"]);
     expect(providerOrder({ provider: "agy", providers: ["claude", "agy"], roleProviders: { task: ["agy", "codex"] } }, "Task")).toEqual(["agy", "codex"]);
   });
   test("FACTORY-138: a spec with no permissionMode gets butchr's own default, acceptEdits, in the built argv — not Drovr's bypassPermissions fallback", () => {
     const args = spawnArgs(spec, "/w/KAN-783");
-    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args[0]).toBe(KICKOFF_PROMPT);
     expect(args).toEqual([
-      "follow your CLAUDE.md",
+      KICKOFF_PROMPT,
       "--model", "sonnet",
       "--effort", "high",
       "--permission-mode", DEFAULT_PERMISSION_MODE,
@@ -47,7 +47,7 @@ describe("spawnArgs", () => {
   test("BUTCHR-453/BUTCHR-463: spec.strictMcpConfig produces --strict-mcp-config in a Claude launch's argv; absent produces no such flag", () => {
     const withFlag = spawnArgs({ ...spec, strictMcpConfig: true }, "/w/KAN-783");
     expect(withFlag).toEqual([
-      "follow your CLAUDE.md",
+      KICKOFF_PROMPT,
       "--model", "sonnet",
       "--effort", "high",
       "--permission-mode", DEFAULT_PERMISSION_MODE,
@@ -85,8 +85,8 @@ describe("spawnArgs", () => {
 
   test("PR #394 review fix (round 2/3): a spec WITHOUT cwd is byte-for-byte unchanged — kickoff stays \"follow your CLAUDE.md\"/\"follow your AGENTS.md\" even when brief is set", () => {
     const briefedSpec = { ...spec, brief: "Some rule-engine brief text." };
-    expect(spawnArgs(briefedSpec, "/w/KAN-783")[0]).toBe("follow your CLAUDE.md");
-    expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe("follow your AGENTS.md");
+    expect(spawnArgs(briefedSpec, "/w/KAN-783")[0]).toBe(KICKOFF_PROMPT);
+    expect(spawnArgs(briefedSpec, "/w/KAN-783", { provider: "codex" })[0]).toBe(AGENTS_KICKOFF_PROMPT);
   });
 
   test("BUTCHR-408 (McsServerBinding ported from S4): a channel:true bound server adds its own development-channels flag alongside server:butchr; channel:false does not", () => {
@@ -203,6 +203,109 @@ describe("checkArgv", () => {
   });
 });
 
+// FACTORY-892: herdr's agent.start rejects any start argument containing a
+// control character before it ever tries to shell-quote it. FACTORY-735/739
+// regressed this by making the kickoff prompt multi-line. These tests cover
+// the pre-flight guard (controlCharStartArgs/assertSafeStartArgv), that the
+// real kickoff constants and kickoffFor's second branch are now clean, and
+// that the guard is actually wired into the real argv-building paths —
+// table-driven over every provider and both spec shapes the ticket names.
+describe("FACTORY-892: control-character pre-flight guard", () => {
+  test("controlCharStartArgs finds nothing in ordinary argv", () => {
+    expect(controlCharStartArgs(["claude", "--model", "sonnet"])).toEqual([]);
+  });
+
+  test("controlCharStartArgs reports the index and value of every offending argument", () => {
+    const found = controlCharStartArgs(["ok", "bad\nline", "also\rbad", "\0", "fine"]);
+    expect(found).toEqual([
+      { index: 1, value: "bad\nline" },
+      { index: 2, value: "also\rbad" },
+      { index: 3, value: "\0" },
+    ]);
+  });
+
+  test("assertSafeStartArgv does not throw on clean argv", () => {
+    expect(() => assertSafeStartArgv(["claude", "--model", "sonnet"])).not.toThrow();
+  });
+
+  test("assertSafeStartArgv throws with a butchr-authored message naming every offending argument, never a bare herdr-shaped 4xx", () => {
+    expect(() => assertSafeStartArgv(["ok", "bad\nline"])).toThrow(/control character.*args\[1\]/s);
+  });
+
+  test("every C0/C1 control character trips the guard, including tab (Rust's char::is_control is true for it too) — an ordinary space does not", () => {
+    for (const bad of ["\n", "\r", "\0", "\t", "\x1b", "\x7f"]) expect(controlCharStartArgs([bad])).toHaveLength(1);
+    for (const ok of [" ", "hello world", ""]) expect(controlCharStartArgs([ok])).toEqual([]);
+  });
+
+  test("KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT are one line each, with the required reminder text, and pass the guard", () => {
+    for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      expect(prompt).not.toContain("\n");
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+      expect(() => assertSafeStartArgv([prompt])).not.toThrow();
+    }
+  });
+
+  // FACTORY-940: briefs/_before-you-stop.md starts with a Markdown `##`
+  // heading; flattening to one line must strip that marker rather than just
+  // collapsing the newlines around it, or the kickoff reads literally as
+  // "follow your CLAUDE.md. ## Before you stop or go idle Before you stop …".
+  test("FACTORY-940: KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT never carry a leading Markdown heading marker from the shared section", () => {
+    for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      expect(prompt).not.toContain("##");
+      expect(prompt).not.toMatch(/(^|\s)#{1,6}\s/);
+    }
+  });
+
+  // The latent case FACTORY-891's review flagged: kickoffFor's second
+  // branch (spec.cwd + spec.brief) builds its own prompt string, independent
+  // of the two KICKOFF_PROMPT constants above, and must flatten/guard it too.
+  test("kickoffFor flattens a multi-line spec.brief to one line and the result passes the guard — table-driven over every provider", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Line one.\nLine two.\r\nLine three." };
+    for (const provider of ["claude", "codex", "agy"] as const) {
+      const prompt = kickoffFor(provider, cwdSpec);
+      expect(prompt).not.toContain("\n");
+      expect(prompt).not.toContain("\r");
+      expect(prompt).toContain("Line one. Line two. Line three.");
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+    }
+  });
+
+  test("kickoffFor without cwd/brief still returns the ordinary single-line kickoff for every provider", () => {
+    for (const provider of ["claude", "codex", "agy"] as const) {
+      const prompt = kickoffFor(provider, spec);
+      expect(controlCharStartArgs([prompt])).toEqual([]);
+    }
+  });
+
+  // The guard is a BACKSTOP, not just a flattening exercise: a control
+  // character that flattening's \s+ collapse does not touch (a bare NUL is
+  // not whitespace) must still surface as a loud butchr-side error here,
+  // not an opaque herdr invalid_agent_argument 4xx three layers down.
+  test("kickoffFor throws butchr's own error for a spec.brief control character that flattening cannot remove", () => {
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "before\0after" };
+    expect(() => kickoffFor("claude", cwdSpec)).toThrow(/control character/);
+  });
+
+  // Table-driven over every provider AND both spec shapes the ticket names
+  // (plain, and cwd+brief), through the REAL argv-building paths —
+  // spawnArgs()/agentStartParams() — not just kickoffFor in isolation.
+  describe("the real argv-building paths never produce a control character, for any provider or spec shape", () => {
+    const specsByName: Record<string, typeof spec & { cwd?: string; brief?: string }> = {
+      "plain spec": spec,
+      "spec with cwd+brief": { ...spec, cwd: "/repo/some-project", brief: "Multi-line.\nBrief text.\r\nThird line." },
+    };
+    for (const [specName, s] of Object.entries(specsByName)) {
+      for (const provider of ["claude", "codex", "agy"] as const) {
+        test(`${provider} / ${specName}`, () => {
+          const args = spawnArgs(s, "/w/KAN-783", { provider });
+          expect(controlCharStartArgs(args)).toEqual([]);
+          expect(() => assertSafeStartArgv(args)).not.toThrow();
+        });
+      }
+    }
+  });
+});
+
 // BUTCHR-411: a rule binds any MCP channel server; `server:butchr` remains
 // bound exactly as today, and a bound server's own `channel` flag decides
 // whether it also joins the (variadic) channel flag.
@@ -215,7 +318,7 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
 
   test("a bound channel server appends its own --dangerously-load-development-channels flag, kickoff still first", () => {
     const args = spawnArgs({ ...spec, mcpServers: [mud] }, "/w/KAN-783");
-    expect(args[0]).toBe("follow your CLAUDE.md");
+    expect(args[0]).toBe(KICKOFF_PROMPT);
     expect(args).toContain("--dangerously-load-development-channels=server:butchr");
     expect(args).toContain("--dangerously-load-development-channels=server:mud");
     // server:butchr's own flag precedes the bound one — order follows spec.mcpServers, butchr always first.
@@ -391,6 +494,98 @@ describe("FACTORY-108: codex lizard mode — manual-approval launch", () => {
   });
 });
 
+describe("FACTORY-577: codex spec.permissionMode honored", () => {
+  const BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
+  const NON_BYPASS_MODES = SESSION_PERMISSION_MODES.filter((m) => m !== "bypassPermissions");
+
+  test('explicit "bypassPermissions" => codex launch has the bypass flag, bypassApprovalsAndSandbox true explicitly', () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(true);
+  });
+
+  test.each(NON_BYPASS_MODES)('explicit permissionMode %s => manual, bypass flag absent', (mode) => {
+    const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: mode }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
+  // Absent spec.permissionMode falls through to today's pre-existing rule
+  // exactly: unchanged for a jira-project-keyed agent (manual), a plain rule
+  // agent (bypass), and a non-jira-project resourceProvider key (bypass) —
+  // this case can never fire for a managed session (permissionMode is a
+  // required field there), only for rule-engine/jira agents.
+  test("absent permissionMode: jira-project-keyed agent stays manual, unchanged", () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+  });
+
+  test("absent permissionMode: plain rule agent stays bypassed, unchanged", () => {
+    const args = spawnArgs(spec, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  test("absent permissionMode: a non-jira-project resourceProvider key stays bypassed, unchanged", () => {
+    const triage = { key: "jira-work:triage:KAN-1", issuetype: "Task", summary: "s", parent: null };
+    const args = spawnArgs(triage, "/w/KAN-1", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  // FACTORY-108 regression guard, required explicitly per FACTORY-577
+  // review: absent permissionMode with lizardMode: true must still yield
+  // manual — the third pre-existing case in the precedence comment above.
+  // (Already implied by the pre-existing "FACTORY-108: codex lizard mode"
+  // describe block below, which this fix does not touch; stated again here
+  // under its own name so this describe block is a complete, self-contained
+  // record of every case the FACTORY-577 precedence comment documents.)
+  test("absent permissionMode with lizardMode: true still yields manual, unchanged", () => {
+    const args = spawnArgs({ ...spec, lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(false);
+  });
+
+  // PRECEDENCE, both directions: an explicit permissionMode on a
+  // jira-project-keyed agent overrides the jira-project manual default.
+  test('explicit "bypassPermissions" on a jira-project agent overrides the jira-project manual default', () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "bypassPermissions" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+  });
+
+  test('explicit "default" on a jira-project agent still yields manual (same as the default, redundantly)', () => {
+    const pm = { key: "jira-project:project-managers:GK", issuetype: "Project", summary: "s", parent: null, permissionMode: "default" as const };
+    const args = spawnArgs(pm, "/w/GK", { provider: "codex", disabledMcpServers: [] });
+    expect(args).not.toContain(BYPASS_FLAG);
+  });
+
+  // PRECEDENCE over lizardMode too — this is the single most important new
+  // case: `permissionMode: "bypassPermissions"` + `lizardMode: true` is a
+  // genuinely self-contradictory definition (YOLO means no approval dialog
+  // ever appears, so lizardMode's auto-answering becomes dead code for that
+  // pane — see the precedence comment in agentLaunchConfig's Codex branch,
+  // src/agents/argv.ts, for the full reasoning on why explicit
+  // permissionMode deliberately wins anyway). Proven directly rather than
+  // left to fall out of evaluation order.
+  test('explicit "bypassPermissions" overrides lizardMode: true (the deliberate self-contradiction)', () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions", lizardMode: true }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    expect(args).toContain(BYPASS_FLAG);
+    const launch = agentLaunchConfig({ ...spec, permissionMode: "bypassPermissions", lizardMode: true }, "/w/KAN-783", "pane", "worker", { provider: "codex" });
+    expect(launch.provider === "codex" && launch.bypassApprovalsAndSandbox).toBe(true);
+  });
+
+  // Claude-path behavior is untouched by this fix: FACTORY-138's own
+  // default/precedence tests above already pin that; this just re-confirms
+  // spec.permissionMode still flows straight through unmodified for Claude.
+  test("Claude launch argv is unaffected by this fix", () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", { provider: "claude" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("bypassPermissions");
+  });
+});
+
 // FACTORY-314 (PR #513 review fix): `--resume` — appended ONLY by
 // `agentStartParams()`/`spawnArgs()`, and ONLY when `agent.resumeSessionId`
 // is set (`HerdrHerd.resumeInPlace()`'s own caller). A fresh Claude launch
@@ -457,5 +652,17 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
       }
       expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
     });
+  });
+
+  // FACTORY-526: the incident this ticket fixes — a jira-project rule with no
+  // agentPreferences model used to spawn Opus/high via modelFor/effortFor's
+  // old "project" cell. No `agent.model`/`agent.effort` override here, same
+  // as a rule that left agentPreferences unset (or set it with no `model` on
+  // the matching harness entry) — either way `agent` arrives with no model.
+  test("a jira-project Claude agent with no agentPreferences model no longer spawns Opus", () => {
+    const pm = { key: "jira-project:unity-manager:GK", issuetype: "project", summary: "s", parent: null };
+    const args = spawnArgs(pm, "/w/GK", { provider: "claude" });
+    expect(args[args.indexOf("--model") + 1]).toBe("sonnet");
+    expect(args[args.indexOf("--effort") + 1]).toBe("low");
   });
 });

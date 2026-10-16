@@ -10,6 +10,7 @@ import { githubIssueShortDisplayId } from "../../src/rules/github-issue-type.js"
 import { githubPrShortDisplayId } from "../../src/rules/github-pr-type.js";
 import { zendeskTicketShortDisplayId } from "../../src/rules/zendesk-ticket-type.js";
 import { baseDisplayLabel, resolveDisplayLabels } from "../../src/rules/display-label.js";
+import { absPath } from "../helpers/abs-path";
 
 // FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): one describe block
 // per provider's own short-id method — each is its OWN function (the
@@ -70,16 +71,16 @@ describe("per-provider short display id", () => {
 });
 
 describe("baseDisplayLabel: combining a short id with its rule id", () => {
-  test("an ordinary resource agent displays \"<shortId> · <ruleId>\" (operator's own example)", () => {
+  test("an ordinary resource agent displays \"<ruleId> · <shortId>\" (operator's own example)", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
-    expect(baseDisplayLabel(key)).toBe("FACTORY-51 · jira-work");
+    expect(baseDisplayLabel(key)).toBe("jira-work · FACTORY-51");
   });
 
   test("a managed session displays its bare short id alone — no \"· ruleId\" suffix", () => {
     const key = encodeAgentKey({
       resourceProvider: "filesystem",
       ruleId: MANAGED_SESSIONS_RULE_ID,
-      resourceId: "/home/brooswrit/.config/butchr/session-definitions/admin-assembly.json",
+      resourceId: absPath("home", "brooswrit", ".config", "butchr", "session-definitions", "admin-assembly.json"),
     });
     expect(baseDisplayLabel(key)).toBe("admin-assembly");
   });
@@ -94,8 +95,24 @@ describe("baseDisplayLabel: combining a short id with its rule id", () => {
   });
 
   test("an ordinary filesystem resource agent combines <parent>:<name> with its rule id", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/brooswit-factory/rinth" });
-    expect(baseDisplayLabel(key)).toBe("brooswit-factory:rinth · repos");
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "brooswit-factory", "rinth") });
+    expect(baseDisplayLabel(key)).toBe("repos · brooswit-factory:rinth");
+  });
+
+  test("FACTORY-862: the label is \"<ruleId> · <resourceId>\" — rule id FIRST, middle-dot separator kept, for every combining provider", () => {
+    const cases: Array<[Parameters<typeof encodeAgentKey>[0], string]> = [
+      [{ resourceProvider: "jira-work", ruleId: "bugs", resourceId: "FACTORY-774" }, "bugs · FACTORY-774"],
+      [{ resourceProvider: "github-pr", ruleId: "reviews", resourceId: "brooswit-factory/butchr#43" }, "reviews · butchr#43"],
+      [{ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: "acme#4567" }, "support · #4567"],
+    ];
+    for (const [key, expected] of cases) expect(baseDisplayLabel(encodeAgentKey(key))).toBe(expected);
+  });
+
+  test("FACTORY-862: the collision suffix still trails the WHOLE label, after the resource id", () => {
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
+    const labels = resolveDisplayLabels([a, b], () => {});
+    expect([labels.get(a), labels.get(b)].filter((l) => /^repos · brooswit-factory:rinth-[0-9a-f]{6}$/.test(l ?? "")).length).toBe(1);
   });
 });
 
@@ -105,22 +122,22 @@ describe("resolveDisplayLabels: deterministic, loud collision handling (FACTORY-
     const b = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "FACTORY-2" });
     const lines: string[] = [];
     const labels = resolveDisplayLabels([a, b], (l) => lines.push(l));
-    expect(labels.get(a)).toBe("FACTORY-1 · triage");
-    expect(labels.get(b)).toBe("FACTORY-2 · triage");
+    expect(labels.get(a)).toBe("triage · FACTORY-1");
+    expect(labels.get(b)).toBe("triage · FACTORY-2");
     expect(lines).toEqual([]);
   });
 
   test("two resources under different roots collide on the same <parent>:<name> — disambiguated, not silently shared, one warning logged", () => {
     // Same "<parent>:<name>" (brooswit-factory:rinth) reached under two different roots.
-    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
     const lines: string[] = [];
     const labels = resolveDisplayLabels([a, b], (l) => lines.push(l));
-    const bareLabel = "brooswit-factory:rinth · repos";
+    const bareLabel = "repos · brooswit-factory:rinth";
     expect(labels.get(a)).not.toBe(labels.get(b)); // never shared
     expect([labels.get(a), labels.get(b)]).toContain(bareLabel); // one keeps the bare label
     const suffixed = [labels.get(a), labels.get(b)].find((l) => l !== bareLabel)!;
-    expect(suffixed).toMatch(/^brooswit-factory:rinth · repos-[0-9a-f]{6}$/);
+    expect(suffixed).toMatch(/^repos · brooswit-factory:rinth-[0-9a-f]{6}$/);
     expect(lines.length).toBe(1); // one warning for the whole group, not one per key
     expect(lines[0]).toContain(bareLabel);
   });
@@ -134,8 +151,8 @@ describe("resolveDisplayLabels: deterministic, loud collision handling (FACTORY-
   });
 
   test("determinism: the SAME colliding set always resolves the SAME way, regardless of input order or which key is asked about first", () => {
-    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
     const forward = resolveDisplayLabels([a, b]);
     const backward = resolveDisplayLabels([b, a]);
     expect(forward.get(a)).toBe(backward.get(a));
@@ -143,8 +160,8 @@ describe("resolveDisplayLabels: deterministic, loud collision handling (FACTORY-
   });
 
   test("stability across spawn-path vs. relabel-in-place-path universes: a key's label is the same whether resolved alone-plus-siblings or as part of the full running set (same agent -> same label both ways)", () => {
-    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/home/one/brooswit-factory/rinth" });
-    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/srv/two/brooswit-factory/rinth" });
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("home", "one", "brooswit-factory", "rinth") });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("srv", "two", "brooswit-factory", "rinth") });
     const c = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "triage", resourceId: "FACTORY-9" });
     // "Spawn path": the running set at the moment `b` is spawned already contains `a` and `c`.
     const atSpawnTime = resolveDisplayLabels([a, c, b]);
@@ -156,12 +173,12 @@ describe("resolveDisplayLabels: deterministic, loud collision handling (FACTORY-
   });
 
   test("a three-way collision disambiguates every member but the bare-label winner, each with its own distinct suffix", () => {
-    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/a/brooswit-factory/rinth" });
-    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/b/brooswit-factory/rinth" });
-    const c = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: "/c/brooswit-factory/rinth" });
+    const a = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("a", "brooswit-factory", "rinth") });
+    const b = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("b", "brooswit-factory", "rinth") });
+    const c = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("c", "brooswit-factory", "rinth") });
     const labels = resolveDisplayLabels([a, b, c]);
     const values = [labels.get(a)!, labels.get(b)!, labels.get(c)!];
     expect(new Set(values).size).toBe(3); // all distinct
-    expect(values.filter((v) => v === "brooswit-factory:rinth · repos").length).toBe(1); // exactly one bare winner
+    expect(values.filter((v) => v === "repos · brooswit-factory:rinth").length).toBe(1); // exactly one bare winner
   });
 });

@@ -3,6 +3,8 @@ import { isActive } from "../reconcile/plan.js";
 import { AGENT_PREFIX, canHavePr, desiredLabels, diffLabels, isActiveStatusLabel, isAgentLabel, isDaemonLabel, mapAgentStatus, type AgentLabel, type PrLookup } from "./plan.js";
 import type { StalledCheck } from "../agents/stalled.js";
 import type { StallRemediator } from "../agents/stall-remediation.js";
+import type { SilentStopCheck } from "../agents/silent-stop.js";
+import type { IdlePokeEngine, IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
 
 export interface LabelWriter {
@@ -40,6 +42,32 @@ export interface SyncDeps {
    */
   stallRemediation?: StallRemediator;
   /**
+   * FACTORY-740: the "would flag" dry-run detector — logs ONLY, never a
+   * Jira write of any kind (no comment/label/transition/escalation/wake),
+   * same disables-entirely-when-omitted shape as `stalled`/`stallRemediation`
+   * above. See src/agents/silent-stop.ts's own top comment for why this is
+   * checked unconditionally, every poll, for every active issue.
+   */
+  silentStop?: SilentStopCheck;
+  /**
+   * FACTORY-845: the per-rule-configurable idle poke — a second, independent
+   * consumer of `stalled`'s own streak (see src/agents/idle-poke.ts's own top
+   * comment for why it is a separate module from `stallRemediation` above,
+   * not an extension of it). Omitted disables idle-poke evaluation entirely,
+   * same shape as every other optional dep here.
+   */
+  idlePoke?: IdlePokeEngine;
+  /**
+   * This poll's resolved idle-poke config for one issue — built by the
+   * caller from whichever rule(s) matched this ticket (src/daemon/index.ts),
+   * since `syncLabels` itself only ever sees de-duplicated issues, not the
+   * (rule, issue) matches that produced them. Returning `undefined` means
+   * no enabled rule carries an override for this ticket; `idlePoke.check`
+   * then falls back to its own global default and `idlePokeEnabled ?? true`.
+   * Never called when `idlePoke` itself is omitted.
+   */
+  idlePokeRuleConfig?: (issue: string) => IdlePokeRuleConfig | undefined;
+  /**
    * BUTCHR-352: THIS poll's admission census for the withheld set
    * (src/agents/admission.ts's `AdmissionController.census()`) — either the
    * set of issue keys a TRUSTED (`checked: true`) bucket reports withheld
@@ -66,6 +94,12 @@ export interface SyncDeps {
    * old isOwnLabelBump swallow into the same mechanism agent writes use.
    */
   onWrite?: (keys: readonly string[]) => void;
+  /**
+   * FACTORY-1001: scan active, labelled tickets outside the rule-query
+   * result too. Receives this poll's already-read live-herd snapshot, so it
+   * does not add a second herdr observation or invent a notification path.
+   */
+  reconcileAbsentLiveAgentLabels?: (liveKeys: ReadonlySet<string>, ownedKeys: ReadonlySet<string>) => Promise<void>;
   log?: (line: string) => void;
   /**
    * Called once at the end of every syncLabels run, after all issues (and
@@ -163,9 +197,14 @@ export function createLabelSync(deps: SyncDeps) {
   };
 
   return async function syncLabels(issues: readonly JiraIssue[]): Promise<ReadonlySet<string>> {
+    // FACTORY-845: reset the fleet-wide per-poll poke counter ONCE per
+    // poll, before any issue's `idlePoke.check` call — see
+    // src/agents/idle-poke.ts's own `beginPoll` doc comment.
+    deps.idlePoke?.beginPoll();
     const written = new Set<string>();
     const seen = new Set(issues.map((i) => i.key));
     const agents = await deps.agentStatuses();
+    await deps.reconcileAbsentLiveAgentLabels?.(new Set(agents.keys()), new Set(issues.map((issue) => issue.key)));
     // BUTCHR-352: read once per poll, synchronously — see this dep's own doc
     // comment for why this is never a second I/O call.
     const withheldKeys = deps.withheld?.();
@@ -173,13 +212,39 @@ export function createLabelSync(deps: SyncDeps) {
     for (const issue of issues) {
       let agentStatus: string | null;
       let stalled = false;
+      // KAN-824: epics never have a branch, so a search for one can only ever
+      // miss — skip the call entirely rather than let it burn a GitHub
+      // search. Computed here (ahead of the active/inactive branch below,
+      // not after it as before FACTORY-740) so `silentStop`'s dry-run log
+      // line can cite the SAME lookup for context — never a second search.
+      // `prTrackingApplies` is kept SEPARATE from `prState` itself: `prState`
+      // stays `null` whenever tracking doesn't apply here (unchanged from
+      // before FACTORY-740 — desiredLabels' own `null` vs `"unknown"`
+      // distinction below must not shift), but `silentStop`'s `prOpen`
+      // context needs a THIRD distinction `PrLookup` doesn't carry: "tracking
+      // doesn't apply/isn't configured at all" (genuinely unknown, logged as
+      // such) versus "tracking applies and confirmed there's no PR" (a real
+      // `false`) — collapsing those into the same `null` would silently
+      // mislabel every PR-less or non-PR-capable ticket's dry-run line as
+      // "pr open=no" instead of "unknown".
+      const prTrackingApplies = !!deps.prState && canHavePr(issue.issuetype);
+      const prState = prTrackingApplies ? await deps.prState!(issue.key) : null;
       if (!isActive(issue.status)) {
         stabilizer.clear(issue.key);
         deps.stalled?.forget(issue.key);
         deps.stallRemediation?.forget(issue.key);
+        deps.silentStop?.forget(issue.key);
+        deps.idlePoke?.forget(issue.key);
         agentStatus = null;
       } else {
         const observed = mapAgentStatus(agents.get(issue.key) ?? null);
+        // FACTORY-740: dry-run only, logs-only, never gates anything below —
+        // see src/agents/silent-stop.ts's own top comment. Always observed
+        // (same "every poll, not just the interesting ones" discipline
+        // `deps.stalled` uses just below), so its own dedup/suppression
+        // bookkeeping sees every transition.
+        const prOpen = !prTrackingApplies || prState === "unknown" ? undefined : prState === "open" || prState === "approved" || prState === "changes-requested";
+        await deps.silentStop?.check(issue.key, observed, { ...(prOpen !== undefined ? { prOpen } : {}) });
         // Always observed (even when not idle), so the tracker's "since
         // spawn, continuously idle" streak sees every poll, not just the
         // ones where the result might matter.
@@ -212,7 +277,8 @@ export function createLabelSync(deps: SyncDeps) {
         // steady state) rather than as a new periodic log source of its own.
         if (stalledNow) {
           const elapsed = deps.stalled?.elapsedMinutes?.(issue.key);
-          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}, no non-daemon-chatter comment during that streak`);
+          const threshold = deps.stalled?.thresholdMinutes?.(issue.key);
+          deps.log?.(`[labels] ${issue.key} stalled: idle/done continuously since last stopping work${elapsed != null ? ` (${elapsed}m)` : ""}${threshold != null ? `, configured threshold ${threshold}m` : ""}, no non-daemon-chatter comment during that streak`);
         }
         const applied = agentLabelOf(issue.labels);
         // `null` means the comments fetch failed — "could not verify", a
@@ -249,7 +315,7 @@ export function createLabelSync(deps: SyncDeps) {
         // wake it was meant to deliver). `stalledResult` is threaded through
         // uncollapsed so the module can distinguish "could not verify" from
         // "stabilizing" from "nothing going on" for its own log lines,
-        // without any of those ever gating whether it acts.
+        // and suppress a notice when current inactivity cannot be verified.
         //
         // BUTCHR-353: this ticket's own outward `Implements` links ARE its
         // workers — already hydrated on `issue.issuelinks` by `search()`'s
@@ -262,11 +328,23 @@ export function createLabelSync(deps: SyncDeps) {
         // — `undefined` only when Jira genuinely didn't hydrate it, treated
         // as "not Done" by gatherWorkerSignals, never fabricated.
         const workers = (issue.issuelinks ?? []).filter((l) => l.type === "Implements" && l.otherEnd === "outward").map((l) => ({ key: l.key, ...(l.status !== undefined ? { status: l.status } : {}) }));
-        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers);
+        await deps.stallRemediation?.check(issue.key, applied === "stalled", stalledResult, deps.stalled?.elapsedMinutes?.(issue.key) ?? null, workers, deps.stalled?.streakStart?.(issue.key));
+
+        // FACTORY-845: always evaluated, every poll, for every active
+        // issue — never only when `stalledNow`/`stalled` — so the
+        // restart/herdr-reconnect gap this engine measures off its own
+        // consecutive invocations (see idle-poke.ts's 90-second-trap
+        // comment) sees every poll, exactly like `deps.stalled`/
+        // `deps.silentStop` above.
+        {
+          const ruleConfig = deps.idlePokeRuleConfig?.(issue.key);
+          await deps.idlePoke?.check(issue.key, {
+            streakStart: deps.stalled?.streakStart?.(issue.key) ?? null,
+            status: issue.status,
+            ...(ruleConfig !== undefined ? { ruleConfig } : {}),
+          });
+        }
       }
-      // KAN-824: epics never have a branch, so a search for one can only ever
-      // miss — skip the call entirely rather than let it burn a GitHub search.
-      const prState = deps.prState && canHavePr(issue.issuetype) ? await deps.prState(issue.key) : null;
       const withheld = withheldKeys === undefined ? false : withheldKeys === "unknown" ? "unknown" : withheldKeys.has(issue.key);
       const desired = desiredLabels({ status: issue.status, agentStatus, prState, stalled, withheld, currentLabels: issue.labels });
       const ok = await write(written, issue.key, issue.labels, desired);
@@ -278,6 +356,8 @@ export function createLabelSync(deps: SyncDeps) {
       stabilizer.clear(key);
       deps.stalled?.forget(key);
       deps.stallRemediation?.forget(key);
+      deps.silentStop?.forget(key);
+      deps.idlePoke?.forget(key);
       const current = lastLabels.get(key)!;
       // BUTCHR-352: admission:* is lifecycle-bound to active status the same
       // way agent:* is — see isActiveStatusLabel's own doc comment — so both

@@ -1,89 +1,101 @@
 import { describe, expect, test } from "bun:test";
-import { capacityRoleFor, UNCOUNTED_ISSUE_TYPES } from "../../src/agents/capacity-role.js";
+import { capacityRoleFor } from "../../src/agents/capacity-role.js";
 import { createAdmissionController, type AgentCapacityRole } from "../../src/agents/admission.js";
+import { encodeAgentKey } from "../../src/rules/agent-key.js";
 
 /**
- * BUTCHR-422 — the fleet cap counts only leaf work (Task, Sub-task).
- * Project agents and Epic/Story/Bug agents are classified "sentinel": never
- * counted toward `maxAgents`, never withheld. `capacity-role.ts` does not
- * exist before this change, so this whole file fails to load on prior main.
- *
- * FACTORY-39 (FACTORY-37, review fix): Bug moved from the counted set to
- * the uncounted one here — a Bug is now a BOSS, the same tier as an Epic,
- * so it idles while its Stories run exactly like an Epic does, and must be
- * exempt from the cap the same way. The expectations this pinned for Bug as
- * a worker are an intended spec change, authorized at review, not a
- * weakening — Task and Sub-task stay counted.
+ * FACTORY-757 (supersedes BUTCHR-422/FACTORY-39): capacity is decided
+ * SOLELY by a rule's own `role` field — issue type (Epic/Story/Bug/Task/
+ * Sub-task alike) no longer changes the outcome at all. A rule silent on
+ * `role` is counted ("worker"), the field's own schema default. The only
+ * agents that stay sentinel without a rule saying so are the two
+ * construction-level exceptions: bare project-tier ids, and `jira-project`
+ * agents (BUTCHR-425, kept migration-free on purpose — see
+ * src/agents/capacity-role.ts's own doc comment).
  */
 
-const types: Record<string, string> = {
-  "BUTCHR-1": "Epic", "BUTCHR-2": "Story", "BUTCHR-3": "Task", "BUTCHR-4": "Sub-task", "BUTCHR-5": "Bug", "BUTCHR-6": "story",
-};
-const issuetypeOf = (key: string) => types[key];
 const noRuleRole = (): AgentCapacityRole | undefined => undefined;
-const roleOf = (id: string) => capacityRoleFor(id, noRuleRole, issuetypeOf);
+const roleOf = (id: string) => capacityRoleFor(id, noRuleRole);
 
-describe("capacityRoleFor (BUTCHR-422)", () => {
-  test("Epic, Story and Bug agents are uncounted (sentinel); Task and Sub-task are counted (worker)", () => {
-    expect(roleOf("jira-work:epics:BUTCHR-1")).toBe("sentinel");
-    expect(roleOf("jira-work:stories:BUTCHR-2")).toBe("sentinel");
+describe("capacityRoleFor (FACTORY-757)", () => {
+  test("counted by default: a rule silent on role counts, for every issue type alike", () => {
+    expect(roleOf("jira-work:epics:BUTCHR-1")).toBe("worker");
+    expect(roleOf("jira-work:stories:BUTCHR-2")).toBe("worker");
     expect(roleOf("jira-work:tasks:BUTCHR-3")).toBe("worker");
     expect(roleOf("jira-work:subtasks:BUTCHR-4")).toBe("worker");
-    expect(roleOf("jira-work:bugs:BUTCHR-5")).toBe("sentinel"); // FACTORY-39: Bug is a boss now, not leaf work
+    expect(roleOf("jira-work:bugs:BUTCHR-5")).toBe("worker");
   });
 
-  test("issue type matching is case- and whitespace-insensitive", () => {
-    expect(roleOf("jira-work:stories:BUTCHR-6")).toBe("sentinel");
-    expect([...UNCOUNTED_ISSUE_TYPES].sort()).toEqual(["bug", "epic", "story"]);
+  test("issue type no longer changes the outcome: same rule role, same decision for task-shaped and epic-shaped items", () => {
+    const sentinelRule = (): AgentCapacityRole => "sentinel";
+    expect(capacityRoleFor("jira-work:epics:BUTCHR-1", sentinelRule)).toBe("sentinel");
+    expect(capacityRoleFor("jira-work:tasks:BUTCHR-3", sentinelRule)).toBe("sentinel");
+    expect(capacityRoleFor("jira-work:bugs:BUTCHR-5", sentinelRule)).toBe("sentinel");
+    const workerRule = (): AgentCapacityRole => "worker";
+    expect(capacityRoleFor("jira-work:epics:BUTCHR-1", workerRule)).toBe("worker");
+    expect(capacityRoleFor("jira-work:tasks:BUTCHR-3", workerRule)).toBe("worker");
   });
 
-  test("project-tier agents (bare project key) are uncounted", () => {
+  test("one code path for every provider: github-issue and zendesk-ticket both defer to the rule's own role, with no provider branch", () => {
+    const sentinelRule = (): AgentCapacityRole => "sentinel";
+    const githubKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "triage", resourceId: "acme/widgets#99" });
+    const zendeskKey = encodeAgentKey({ resourceProvider: "zendesk-ticket", ruleId: "support", resourceId: "acme#123" });
+    expect(capacityRoleFor(githubKey, noRuleRole)).toBe("worker");
+    expect(capacityRoleFor(githubKey, sentinelRule)).toBe("sentinel");
+    expect(capacityRoleFor(zendeskKey, noRuleRole)).toBe("worker");
+    expect(capacityRoleFor(zendeskKey, sentinelRule)).toBe("sentinel");
+  });
+
+  test("a rule's own role still applies to leaf work", () => {
+    const sentinelRule = (): AgentCapacityRole => "sentinel";
+    expect(capacityRoleFor("jira-work:director:BUTCHR-3", sentinelRule)).toBe("sentinel");
+    expect(capacityRoleFor("jira-work:tasks:BUTCHR-3", () => "worker")).toBe("worker");
+  });
+
+  test("project-tier agents (bare project key) are sentinel by construction, with no rule backing them at all", () => {
     expect(roleOf("BUTCHR")).toBe("sentinel");
     expect(roleOf("ATMO")).toBe("sentinel");
   });
 
-  test("bare issue-key agents follow the same issue-type rule", () => {
-    expect(roleOf("BUTCHR-1")).toBe("sentinel");
+  test("bare issue-key agents (no rule) fail safe to worker — uncounted only ever comes from a rule's own role", () => {
+    expect(roleOf("BUTCHR-1")).toBe("worker");
     expect(roleOf("BUTCHR-3")).toBe("worker");
   });
 
-  test("fail-safe: an unknown issue type stays counted — nothing escapes the cap by guessing", () => {
+  test("fail-safe: an id whose rule cannot be resolved stays counted — nothing escapes the cap by guessing", () => {
     expect(roleOf("jira-work:tasks:BUTCHR-999")).toBe("worker");
     expect(roleOf("BUTCHR-999")).toBe("worker");
     expect(roleOf("not a key at all")).toBe("worker");
   });
 
-  test("a rule's own BUTCHR-398 role still applies to leaf work", () => {
-    const sentinelRule = (): AgentCapacityRole => "sentinel";
-    expect(capacityRoleFor("jira-work:director:BUTCHR-3", sentinelRule, issuetypeOf)).toBe("sentinel");
-    expect(capacityRoleFor("jira-work:tasks:BUTCHR-3", () => "worker", issuetypeOf)).toBe("worker");
-  });
-
-  test("Epic/Story/Bug stay uncounted even if their rule says worker", () => {
-    expect(capacityRoleFor("jira-work:epics:BUTCHR-1", () => "worker", issuetypeOf)).toBe("sentinel");
-    expect(capacityRoleFor("jira-work:bugs:BUTCHR-5", () => "worker", issuetypeOf)).toBe("sentinel");
-  });
-
-  test("BUTCHR-425: jira-project agents are always sentinels, never workers, even when their rule's own role is \"worker\" (the default a rule file that omits `role` gets)", () => {
+  test("BUTCHR-425: jira-project agents are always sentinel, never workers, even when their rule's own role is \"worker\" (the default a rule file that omits `role` gets)", () => {
     const alwaysWorker = (): AgentCapacityRole => "worker";
-    expect(capacityRoleFor("jira-project:managers:BUTCHR", alwaysWorker, issuetypeOf)).toBe("sentinel");
-    expect(capacityRoleFor("jira-project:managers:BUTCHR", noRuleRole, issuetypeOf)).toBe("sentinel");
+    expect(capacityRoleFor("jira-project:managers:BUTCHR", alwaysWorker)).toBe("sentinel");
+    expect(capacityRoleFor("jira-project:managers:BUTCHR", noRuleRole)).toBe("sentinel");
     expect(roleOf("jira-project:managers:ATMO")).toBe("sentinel");
   });
 });
 
-describe("admission with leaf-only capacity (BUTCHR-422)", () => {
-  test("with the cap full of Task agents, Epic, Story and Bug agents still start; another Task is withheld", async () => {
+describe("admission with per-rule capacity (FACTORY-757)", () => {
+  test("uncounted (sentinel) rule's agents consume no slot and are never withheld, even with the cap full", async () => {
+    const roleOf = (id: string): AgentCapacityRole => (id.includes("epics") ? "sentinel" : "worker");
     const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:tasks:BUTCHR-3"], roleOf });
-    const admitted = await ctrl.admit(["jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2", "jira-work:bugs:BUTCHR-5"], []);
-    expect(admitted).toEqual(["jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2", "jira-work:bugs:BUTCHR-5"]);
+    const admitted = await ctrl.admit(["jira-work:epics:BUTCHR-1"], []);
+    expect(admitted).toEqual(["jira-work:epics:BUTCHR-1"]);
   });
 
-  test("resident Epic/Story/project agents consume no slots — only leaf work is counted", async () => {
+  test("counted (worker) agent IS withheld with the cap full", async () => {
+    const roleOf = (id: string): AgentCapacityRole => (id.includes("epics") ? "sentinel" : "worker");
+    const ctrl = createAdmissionController({ cap: 1, residency: async () => ["jira-work:tasks:BUTCHR-3"], roleOf });
+    const admitted = await ctrl.admit(["jira-work:tasks:BUTCHR-4"], []);
+    expect(admitted).toEqual([]);
+  });
+
+  test("resident sentinel/project agents consume no slots — only worker rules are counted", async () => {
     const ctrl = createAdmissionController({
       cap: 1,
       residency: async () => ["BUTCHR", "jira-work:epics:BUTCHR-1", "jira-work:stories:BUTCHR-2"],
-      roleOf,
+      roleOf: (id) => capacityRoleFor(id, (rid) => (rid.includes("epics") || rid.includes("stories") ? "sentinel" : undefined)),
     });
     expect(await ctrl.admit(["jira-work:tasks:BUTCHR-3"], [])).toEqual(["jira-work:tasks:BUTCHR-3"]);
     expect(ctrl.snapshot()).toMatchObject({ residency: 0, sentinels: 3 });

@@ -1,7 +1,8 @@
 import { createCloudClient, isNotFoundError } from "jira.js";
 import { createV2Client, createV1Client } from "confluence.js";
 import { createClient as createConfluenceClient } from "confluence.js/core";
-import type { AtlassianOps } from "./atlassian.js";
+import type { AtlassianOps, IssueCommentRecord } from "./atlassian.js";
+import { adfToText } from "../atlassian/client.js";
 
 /** One paragraph of plain text as ADF (what Jira v3 wants for descriptions/comments). */
 export const adf = (text: string) => ({
@@ -505,7 +506,7 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // Runaway protection: `MAX_COMMENT_PAGES` throws rather than returning a
     // silently partial list if none of the three signals above is ever hit.
     getIssueComments: async (key) => {
-      const results: Array<{ id: string }> = [];
+      const results: IssueCommentRecord[] = [];
       let startAt = 0;
       let total: number | undefined;
       const PAGE_SIZE = 100;
@@ -516,14 +517,33 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
           );
         }
         const r: any = await jira.issueComments.getComments({ issueIdOrKey: key, orderBy: "-created", startAt, maxResults: PAGE_SIZE });
-        const batch: any[] = r?.comments ?? [];
-        for (const c of batch) results.push({ id: c.id });
+        if (!r || typeof r !== "object" || !Array.isArray(r.comments)) {
+          throw new Error(`getIssueComments(${key}): malformed response at startAt=${startAt} (no \`comments\` array) — refusing to report an empty or partial list`);
+        }
+        const batch: any[] = r.comments;
+        for (const c of batch) {
+          const validBody = typeof c?.body === "string" || (c?.body && typeof c.body === "object" && !Array.isArray(c.body) && c.body.type === "doc" && Array.isArray(c.body.content));
+          if (!c || typeof c.id !== "string" || !validBody) {
+            throw new Error(`getIssueComments(${key}): malformed comment at startAt=${startAt} (id, or body that is neither a string nor an ADF doc) — refusing to return it as readable`);
+          }
+          results.push({
+            id: c.id,
+            body: typeof c.body === "string" ? c.body : adfToText(c.body),
+            bodyRaw: c.body ?? null,
+            created: c.created ?? "",
+            author: { accountId: c.author?.accountId ?? null, displayName: c.author?.displayName ?? null, email: c.author?.emailAddress ?? null },
+          });
+        }
         const responseTotal = typeof r?.total === "number" ? r.total : undefined;
         const responseMaxResults = typeof r?.maxResults === "number" ? r.maxResults : undefined;
         if (responseTotal !== undefined) total = responseTotal;
         startAt += batch.length;
-        if (responseTotal !== undefined) {
-          if (batch.length === 0) break; // safety net even when `total` is known — see this op's own doc comment
+        if (total !== undefined) {
+          // A total seen on ANY page binds the walk: stopping short of it is an error, never a partial list.
+          if (batch.length === 0) {
+            if (startAt < total) throw new Error(`getIssueComments(${key}): empty page at startAt=${startAt} before reported total ${total} — refusing to return a silently partial list`);
+            break;
+          }
         } else if (responseMaxResults !== undefined) {
           if (batch.length < responseMaxResults) break; // short against what the server actually honoured
         } else if (batch.length === 0) {

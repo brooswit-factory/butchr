@@ -6,7 +6,7 @@
 import { isFilesystemResourceId } from "../resources/filesystem-ref.js";
 import { isGithubIssueRef } from "../resources/github-issue-ref.js";
 import { isGithubPrRef } from "../resources/github-pr-ref.js";
-import { isIssueKey, isProjectId } from "../resources/id.js";
+import { isIssueKey, isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
 
 /**
@@ -20,7 +20,7 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * issue), and (BUTCHR-407) local filesystem resources (files/directories, no
  * external credential). Only providers with an adapter are listed.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -61,9 +61,22 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * `zendesk-ticket`: a canonical `<subdomain>#<id>` (`acme#123`).
  * `filesystem`: a canonical absolute path (`/home/butchr/repo/src/index.ts`),
  * resolved via `realpath` by discovery before it ever reaches this check
- * (src/resources/filesystem.ts).
+ * (src/resources/filesystem.ts). `confluence-page`: a bare numeric
+ * Confluence page id (`ConfluencePageRef`'s own canonical form,
+ * `../resources/confluence-page-ref.ts`) — the matched CHILD page's own id,
+ * never the rule's own ancestor id.
  */
-export function isResourceId(provider: ResourceProvider, id: string): boolean {
+/**
+ * FACTORY-570: `platform` is forwarded only to the `filesystem` case's
+ * `isFilesystemResourceId` (the one provider whose native id shape is
+ * platform-dependent — see FACTORY-558) and defaults to `process.platform`,
+ * unchanged for every real caller; every other provider's id shape has no
+ * platform dependence at all. Exists so `encodeAgentKey`/`decodeAgentKey`
+ * below can round-trip a Windows filesystem id (`C:\...`, a UNC share) from
+ * a test running on any host, same discipline as FACTORY-558's own
+ * `isFilesystemResourceId(id, platform)`.
+ */
+export function isResourceId(provider: ResourceProvider, id: string, platform: NodeJS.Platform = process.platform): boolean {
   switch (provider) {
     case "jira-work": return isIssueKey(id);
     case "jira-project": return isProjectId(id);
@@ -71,28 +84,29 @@ export function isResourceId(provider: ResourceProvider, id: string): boolean {
     case "github-pr": return isGithubPrRef(id);
     case "jira-idea": return isIssueKey(id);
     case "zendesk-ticket": return isZendeskTicketRef(id);
-    case "filesystem": return isFilesystemResourceId(id);
+    case "filesystem": return isFilesystemResourceId(id, platform);
+    case "confluence-page": return isConfluencePageResourceId(id);
   }
 }
 
 const SEP = ":";
 const joinKey = (p: AgentKeyParts): string => [p.resourceProvider, p.ruleId, p.resourceId].map(encodeURIComponent).join(SEP);
 
-export function encodeAgentKey(parts: AgentKeyParts): string {
+export function encodeAgentKey(parts: AgentKeyParts, platform: NodeJS.Platform = process.platform): string {
   if (!oneOf(RESOURCE_PROVIDERS, parts.resourceProvider)) throw new Error(`invalid resource provider: ${JSON.stringify(parts.resourceProvider)}`);
   if (!isRuleId(parts.ruleId)) throw new Error(`invalid rule id: ${JSON.stringify(parts.ruleId)}`);
-  if (!isResourceId(parts.resourceProvider, parts.resourceId)) throw new Error(`invalid ${parts.resourceProvider} resource id: ${JSON.stringify(parts.resourceId)}`);
+  if (!isResourceId(parts.resourceProvider, parts.resourceId, platform)) throw new Error(`invalid ${parts.resourceProvider} resource id: ${JSON.stringify(parts.resourceId)}`);
   return joinKey(parts);
 }
 
 /** Inverse of `encodeAgentKey`; `null` for anything it could not have produced. */
-export function decodeAgentKey(key: string): AgentKeyParts | null {
+export function decodeAgentKey(key: string, platform: NodeJS.Platform = process.platform): AgentKeyParts | null {
   const raw = key.split(SEP);
   if (raw.length !== 3) return null;
   let decoded: string[];
   try { decoded = raw.map(decodeURIComponent); } catch { return null; }
   const [resourceProvider, ruleId, resourceId] = decoded as [string, string, string];
-  if (!oneOf(RESOURCE_PROVIDERS, resourceProvider) || !isRuleId(ruleId) || !isResourceId(resourceProvider, resourceId)) return null;
+  if (!oneOf(RESOURCE_PROVIDERS, resourceProvider) || !isRuleId(ruleId) || !isResourceId(resourceProvider, resourceId, platform)) return null;
   const parts = { resourceProvider, ruleId, resourceId };
   return joinKey(parts) === key ? parts : null;
 }
@@ -175,8 +189,8 @@ export type AnyAgentKeyParts = ({ kind: "resource" } & AgentKeyParts) | ({ kind:
  * works") should keep using `decodeAgentKey` directly: a query-level key
  * correctly fails it, since there is no single resource to name.
  */
-export function decodeAnyAgentKey(key: string): AnyAgentKeyParts | null {
-  const resource = decodeAgentKey(key);
+export function decodeAnyAgentKey(key: string, platform: NodeJS.Platform = process.platform): AnyAgentKeyParts | null {
+  const resource = decodeAgentKey(key, platform);
   if (resource) return { kind: "resource", ...resource };
   const query = decodeQueryAgentKey(key);
   return query ? { kind: "query", ...query } : null;

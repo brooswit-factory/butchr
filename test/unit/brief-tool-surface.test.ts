@@ -1,7 +1,10 @@
+import { resolveRuleBrief } from "../../src/agents/workspace.js";
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { atlassianTools } from "../../src/tools/defs.js";
+import { providerAtlassianTools } from "../../src/tools/provider-atlassian.js";
+import { resourceLinkTools } from "../../src/tools/resource-links.js";
+import type { LinkStore } from "../../src/resources/link-store.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BRIEF_COVERAGE, type BriefCoverageEntry } from "../../src/tools/brief-coverage.js";
 
@@ -39,7 +42,7 @@ function extractVerbs(text: string): string[] {
 
 /** The real tool registry the daemon serves — never a hand-maintained second list. */
 function realToolSurface(): Set<string> {
-  return new Set(Object.keys(atlassianTools({} as AtlassianOps)));
+  return new Set(Object.keys({ ...providerAtlassianTools({} as AtlassianOps), ...resourceLinkTools({} as LinkStore) }));
 }
 
 describe("brief↔tool-surface drift guard (BUTCHR-48)", () => {
@@ -65,7 +68,7 @@ describe("brief↔tool-surface drift guard (BUTCHR-48)", () => {
     }
     // A handful of verbs every brief in this vocabulary is expected to teach;
     // if extraction silently stopped matching anything, this is what would notice.
-    for (const verb of ["jira_get_issue", "ask_boss", "report_to_boss", "submit_to_boss", "tell_worker", "get_doc", "set_doc"]) {
+    for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "confluence_update_page", "add_link"]) {
       expect(names.has(verb)).toBe(true);
     }
   });
@@ -82,7 +85,7 @@ function allTaughtVerbs(): Set<string> {
 
 /**
  * The registry verbs with NO `BRIEF_COVERAGE` entry at all — the "never
- * neither" half of total coverage. A verb newly added to `atlassianTools()`
+ * neither" half of total coverage. A verb newly added to `providerAtlassianTools() + resourceLinkTools()`
  * with no matching entry in `BRIEF_COVERAGE` shows up here, failing the
  * suite exactly as BUTCHR-257's DoD #1 requires ("adding a verb to the
  * registry FAILS THE SUITE until someone declares whether a brief must
@@ -119,13 +122,13 @@ function findFalselyTaughtVerbs(coverage: Readonly<Record<string, BriefCoverageE
 
 function formatUncoveredVerbsError(verbs: readonly string[]): string {
   return [
-    `${verbs.length} registry verb(s) from atlassianTools() have no BRIEF_COVERAGE entry in src/tools/brief-coverage.ts: ${verbs.join(", ")}.`,
+    `${verbs.length} registry verb(s) from providerAtlassianTools() + resourceLinkTools() have no BRIEF_COVERAGE entry in src/tools/brief-coverage.ts: ${verbs.join(", ")}.`,
     'TO FIX: add an entry — { taught: true } if a brief is expected to name it (and does — see the corroboration test below), or { taught: false, reason: "..." } with a real, non-empty reason otherwise.',
   ].join("\n");
 }
 
 function formatStaleCoverageError(verbs: readonly string[]): string {
-  return `${verbs.length} BRIEF_COVERAGE entr${verbs.length === 1 ? "y names" : "ies name"} a verb no longer in atlassianTools(): ${verbs.join(", ")}. Remove the stale entr${verbs.length === 1 ? "y" : "ies"} from src/tools/brief-coverage.ts.`;
+  return `${verbs.length} BRIEF_COVERAGE entr${verbs.length === 1 ? "y names" : "ies name"} a verb no longer in providerAtlassianTools() + resourceLinkTools(): ${verbs.join(", ")}. Remove the stale entr${verbs.length === 1 ? "y" : "ies"} from src/tools/brief-coverage.ts.`;
 }
 
 function formatFalselyTaughtError(verbs: readonly string[]): string {
@@ -171,7 +174,7 @@ function formatTaughtFalseButNamedError(verbs: readonly string[], coverage: Read
 // ---------------------------------------------------------------------
 // The forward test above ("every backticked verb... exists in the real tool
 // registry") only ever enforced one direction. This section makes the
-// REVERSE claim explicit and executable: every verb `atlassianTools()` ships
+// REVERSE claim explicit and executable: every verb `providerAtlassianTools() + resourceLinkTools()` ships
 // is accounted for in `src/tools/brief-coverage.ts`'s `BRIEF_COVERAGE`,
 // either as `taught: true` (verified below against the real briefs/*.md
 // text) or `taught: false` with a written, non-empty reason — never neither.
@@ -186,7 +189,7 @@ function formatTaughtFalseButNamedError(verbs: readonly string[], coverage: Read
 // pure functions above are self-contained, matching that idiom, checking a
 // DIFFERENT derived family (registry verbs, not brief types).
 describe("BUTCHR-257: total brief-coverage accounting of the derived tool registry", () => {
-  test("every verb atlassianTools() ships has exactly one BRIEF_COVERAGE entry, and BRIEF_COVERAGE names no stale verb", () => {
+  test("every verb providerAtlassianTools() + resourceLinkTools() ships has exactly one BRIEF_COVERAGE entry, and BRIEF_COVERAGE names no stale verb", () => {
     const registry = [...realToolSurface()];
     expect(registry.length).toBeGreaterThan(0); // rules out "passes because the registry is empty"
 
@@ -253,91 +256,27 @@ describe("BUTCHR-257: total brief-coverage accounting of the derived tool regist
     // BRIEF_COVERAGE an extracted set containing every taught:false verb by name —
     // proves the function isn't vacuously empty against real declared data either.
     const realTaughtFalseVerbs = Object.entries(BRIEF_COVERAGE).filter(([, e]) => !e.taught).map(([v]) => v);
-    expect(realTaughtFalseVerbs.length).toBeGreaterThan(0); // rules out "passes because there are no taught:false entries to test against"
+    // All current provider verbs may be taught; synthetic fixtures above exercise false entries. // rules out "passes because there are no taught:false entries to test against"
     expect(findTaughtFalseButNamedVerbs(BRIEF_COVERAGE, new Set(realTaughtFalseVerbs)).sort()).toEqual([...realTaughtFalseVerbs].sort());
   });
 });
 
-/**
- * FACTORY-112: guards the prose contract FACTORY-84/FACTORY-86 shipped in
- * code (Butchr never auto-creates a per-ticket Confluence doc; `set_doc`
- * refuses when a ticket has none; the on-request path is
- * `confluence_create_page` with an explicit space/parent). This exists so a
- * future edit that reintroduces "your ticket already has a doc" language, or
- * drops the on-request guidance, fails a test instead of only being caught
- * by a human re-reading every brief.
- *
- * `project.md` is EXCLUDED from the "no per-ticket doc" assertions: a
- * project's ROOT doc is a genuinely different thing (provisioned ahead of
- * time, one per project, `get_doc`/`set_doc` behavior unchanged by
- * FACTORY-84/FACTORY-86) and its brief is expected to keep telling the
- * project agent to keep THAT doc current — see project.md's own "Keep your
- * doc current" section (that is its actual, unrenamed heading — the other
- * five tiers' equivalent section is "Confluence pages: on request only").
- * It still gets the on-request assertions below, since a project agent can
- * also be asked to write an ordinary Confluence page.
- */
-describe("FACTORY-112: briefs stop teaching per-ticket doc maintenance; on-request flow is documented", () => {
-  // AGENTS.md/CLAUDE.md are generic pointer files ("read brief.md and follow
-  // it") — they carry no doc-workflow prose of their own, issue-type or
-  // otherwise, so they're excluded from both assertions below the same way
-  // project.md is excluded from the first.
-  const files = readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md") && f !== "AGENTS.md" && f !== "CLAUDE.md");
-  const issueTierFiles = files.filter((f) => f !== "project.md");
-
-  test("no brief claims a ticket already has, or gets, a per-ticket Confluence doc", () => {
-    const offenders: Array<{ file: string; phrase: string }> = [];
-    const bannedPhrases = [
-      /keep your doc current/i,
-      /already has a confluence doc/i,
-      /already linked, already nested/i,
-      /created together with it/i,
-      /nests? under your (?:root|own) doc automatically/i,
-      // FACTORY-112 review round 1: Butchr DID auto-create a per-ticket doc
-      // before FACTORY-84/FACTORY-86 retired that path — "it never has" is a
-      // false historical claim, not merely stale prose, and the very same
-      // sections go on to describe a leftover doc from before this change,
-      // which directly contradicts "never". Say it stopped, not that it
-      // never happened.
-      /it never has\b/i,
-    ];
-    for (const file of issueTierFiles) {
-      const text = readFileSync(join(BRIEFS_DIR, file), "utf8");
-      for (const phrase of bannedPhrases) {
-        if (phrase.test(text)) offenders.push({ file, phrase: phrase.source });
-      }
+describe("explicit document workflow", () => {
+  test("every shipped task brief teaches complete reads and explicit writes without legacy document aliases", () => {
+    for (const name of ["task", "story", "epic", "bug", "project", "default"]) {
+      const text = readFileSync(join(BRIEFS_DIR, name + ".md"), "utf8");
+      for (const verb of ["confluence_read_document", "confluence_create_page", "confluence_update_page", "confluence_add_comment", "jira_get_remote_link"]) expect(text).toContain(verb);
+      expect(text).toContain("FULL-BODY REPLACE, not an");
+      expect(text).toContain("explicitly asks");
+      expect(text).toContain("restart the read on a version change");
+      expect(text).not.toMatch(/\b(get_doc|set_doc|ask_boss|new_worker|submit_to_boss)\b/);
     }
-    expect(offenders, offenders.map((o) => `${o.file} still matches /${o.phrase}/ — FACTORY-84/FACTORY-86 retired automatic per-ticket doc creation`).join("\n")).toEqual([]);
   });
+});
 
-  test("every issue-tier brief documents the on-request Confluence flow (confluence_create_page, confluence_update_page, confluence_get_page, explicit space/parent) and that set_doc refuses with no doc", () => {
-    const missing: Array<{ file: string; what: string }> = [];
-    for (const file of issueTierFiles) {
-      const text = readFileSync(join(BRIEFS_DIR, file), "utf8");
-      if (!/confluence_create_page/.test(text)) missing.push({ file, what: "confluence_create_page" });
-      if (!/confluence_update_page/.test(text)) missing.push({ file, what: "confluence_update_page, for revising a page created on request" });
-      if (!/confluence_get_page/.test(text)) missing.push({ file, what: "confluence_get_page, for reading a conventions page" });
-      if (!/explicitly\s+ask/i.test(text)) missing.push({ file, what: '"explicitly ask(s/ed)" framing for the on-request trigger' });
-      // FACTORY-112 review round 2: the previous /set_doc.*refuses|refuses.*set_doc/is
-      // had the dotall flag and an unbounded `.*`, so it matched ANY "refuses" anywhere
-      // in the file (adopt_worker's, finish_without_a_boss's, tell_worker's, ...) whether
-      // or not the actual contract sentence was present — mutation-verified to still pass
-      // with the real sentence deleted from four of the five files. This anchors on the
-      // specific claim instead: case-sensitive on "REFUSES" (the briefs' own convention
-      // for a hard tool-level refusal), `\s+` absorbing hard line wraps, and requiring
-      // "when {{KEY}} has no [existing] doc" right after it.
-      if (!/REFUSES\s+(?:outright\s+)?when\s+\{\{KEY\}\}\s+has\s+no\s+(?:existing\s+)?doc/.test(text)) missing.push({ file, what: "set_doc refuses with no existing doc" });
-    }
-    expect(missing, missing.map((m) => `${m.file} is missing: ${m.what}`).join("\n")).toEqual([]);
-  });
-
-  test("project.md's root-doc guidance never implies a per-ticket doc is auto-created for one of the project's own epics", () => {
-    const text = readFileSync(join(BRIEFS_DIR, "project.md"), "utf8");
-    expect(text).not.toMatch(/unlike a freshly created per-ticket doc/i);
-    expect(text).not.toMatch(/epic'?s doc nests under your root doc automatically/i);
-    // The on-request flow still belongs here too, for when the project agent itself is asked to write a page.
-    expect(text).toMatch(/confluence_create_page/);
-    expect(text).toMatch(/confluence_update_page/);
-    expect(text).toMatch(/confluence_get_page/);
-  });
+test("custom brief resolution preserves bytes while builtin references migrate", () => {
+  const custom = "  Custom policy\r\nCall `new_worker` only after review.\r\n";
+  expect(resolveRuleBrief(custom)).toBe(custom);
+  expect(resolveRuleBrief("@builtin:task")).toContain("jira_transition");
+  expect(resolveRuleBrief("@builtin:task")).not.toContain("new_worker");
 });

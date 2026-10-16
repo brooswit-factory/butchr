@@ -199,7 +199,9 @@
  * answer, which is the whole point of not choosing a threshold-shaped fix.
  */
 import type { AtlassianOps } from "../tools/atlassian.js";
-import type { JiraIssue } from "../atlassian/types.js";
+import type { JiraIssue, JiraComment } from "../atlassian/types.js";
+import { MARKER as BLOCKED_ESCALATION_MARKER } from "../agents/escalate.js";
+import { DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES } from "../config/config.js";
 import type {
   Activation,
   EventPoll,
@@ -211,6 +213,19 @@ import type {
 } from "./types.js";
 
 const PROPERTY_KEY = "butchr";
+
+/**
+ * FACTORY-972: deliberately NOT `import { MARKER } from
+ * "../agents/stall-remediation.js"` — that module imports
+ * src/tools/relationship.ts, which imports THIS module
+ * (`resolveEligibleProjects`/`advanceProjectWatermark`), so pulling it in
+ * here would be a genuine import cycle (project.ts -> stall-remediation.ts
+ * -> relationship.ts -> project.ts), unlike `BLOCKED_ESCALATION_MARKER`'s
+ * import above (escalate.ts has no such chain). Duplicated as a literal
+ * instead — the SAME precedent src/jira-watch/diff.ts's own `WAKE_MARKERS`
+ * already sets for this exact string, rather than importing it.
+ */
+
 
 /**
  * BUTCHR-227 DoD #9 / §6: the space ceiling on a Jira project entity
@@ -516,6 +531,32 @@ export interface ProjectResource {
   /** The same classification seam as `unseenCommentIds`, per in-review epic key — see that field's own doc comment. */
   unseenEpicCommentIds: Readonly<Record<string, readonly string[]>>;
   watermark: ProjectWatermark;
+  /**
+   * FACTORY-949 (story FACTORY-948, item 2): every ticket key IN THIS
+   * PROJECT currently carrying the `agent:blocked` label, this poll —
+   * project-wide, deliberately NOT scoped to In-Review epics the way
+   * `observedEpics` above is, and deliberately including a ticket with no
+   * boss (an orphan task): item 2 says the project's manager must wake for
+   * those too. Unlike `observedCommentIds`/`observedEpics`, this axis is
+   * NOT run through the persistent `watermark`/`check_in` mechanism this
+   * file's own top comment describes for version/comments/epics — see
+   * `createProjectEventRules`'s own top comment for why an in-memory-only
+   * debounce (the same tradeoff `createIssueEventRules` already makes) was
+   * chosen instead, and what that tradeoff costs.
+   */
+  observedBlockedKeys: readonly string[];
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * observedBlockedKeys above): the SAME shape — every ticket key in this
+   * project currently carrying `agent:stalled`, project-wide, including an
+   * orphan task — for the manager's own stalled-wake axis
+   * (`createProjectEventRules` below). A SEPARATE field, never merged with
+   * `observedBlockedKeys`: a ticket can only ever carry one `agent:*`
+   * label value at a time, so the two sets are always disjoint, but kept
+   * apart anyway so each axis's own candidate/debounce bookkeeping reads
+   * its own field rather than re-filtering a merged one by label value.
+   */
+  observedStalledKeys: readonly string[];
 }
 
 export const projectIdOf = (p: ProjectResource): string => p.key;
@@ -1108,6 +1149,28 @@ export interface ProjectResourceDeps {
    * widened.
    */
   allowlist: ReadonlySet<string>;
+  /**
+   * FACTORY-949 (story FACTORY-948, item 5): the SAME shape
+   * `IssueResourceDeps.comments` (src/resources/issue.ts) already takes —
+   * used ONLY by `createProjectEventRules`'s own blocked-wake dedup check,
+   * to see whether escalate.ts's `[butchr:blocked]` marker already posted
+   * for a candidate ticket's episode (same operational definition issue.ts
+   * uses — see that module's `blockedWake`'s own doc comment). Optional;
+   * omitted, the dedup check simply never finds a marker (fails toward
+   * firing, same direction issue.ts's own check fails toward on an
+   * unreadable fetch) and the debounce axis alone still applies.
+   */
+  comments?: (key: string) => Promise<readonly JiraComment[]>;
+  /** FACTORY-949: the boss/manager-wake debounce window — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
+  blockedWakeDebounceMinutes?: number;
+  /** FACTORY-972: the manager stalled-wake debounce window — see `IssueResourceDeps.stalledWakeDebounceMinutes`'s own doc comment. */
+  stalledWakeDebounceMinutes?: number;
+  /** FACTORY-972: the manager's own hourly rate cap on delivered stalled wakes — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment. */
+  stalledWakeMaxPerHour?: number;
+  /** FACTORY-972: the `/health` counter writer for a delivered manager stalled wake — see `IssueResourceDeps.onStalledWake`'s own doc comment. */
+  onStalledWake?: (recipient: string) => void;
+  /** FACTORY-972: the `/health` counter writer for a manager stalled wake the hourly cap rejected — see `IssueResourceDeps.onStalledWakeCapped`'s own doc comment. */
+  onStalledWakeCapped?: (recipient: string) => void;
 }
 
 /** One project this codebase has decided is a peer — see `resolveEligibleProjects`'s own doc comment. `rootDocId`/`wake` are internal fields `loadProjects` needs to build a full `ProjectResource`; the `list_peers` MCP verb (src/tools/defs.ts) reads only `key`/`name` off this and must NOT surface `rootDocId` (BUTCHR-188: a page id captured in a listing can go stale between the listing and a later send — resolve it fresh at send time instead). */
@@ -1232,6 +1295,30 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
     (epicsByProject.get(key) ?? epicsByProject.set(key, []).get(key)!).push(epic);
   }
 
+  // FACTORY-949 (story FACTORY-948, item 2): project-wide, unlike
+  // `epicsInReview` above — every ticket in an eligible project currently
+  // carrying `agent:blocked`, regardless of issuetype or status, so an
+  // orphan task (no boss to hear item 1's wake) still surfaces to the
+  // project's manager. One extra search call per poll, same budget-conscious
+  // style as `epicsInReview`'s own call just above.
+  const blockedTickets = eligibleKeys.length ? await deps.search(`project IN (${eligibleKeys.join(",")}) AND labels = "agent:blocked"`) : [];
+  const blockedKeysByProject = new Map<string, string[]>();
+  for (const t of blockedTickets) {
+    const key = projectKeyOfIssue(t.key);
+    (blockedKeysByProject.get(key) ?? blockedKeysByProject.set(key, []).get(key)!).push(t.key);
+  }
+
+  // FACTORY-972 (story FACTORY-971, extending FACTORY-949's blockedTickets
+  // search above): the SAME project-wide (not epic-scoped), orphan-task-
+  // inclusive search, for `agent:stalled` instead — see
+  // `ProjectResource.observedStalledKeys`'s own doc comment.
+  const stalledTickets = eligibleKeys.length ? await deps.search(`project IN (${eligibleKeys.join(",")}) AND labels = "agent:stalled"`) : [];
+  const stalledKeysByProject = new Map<string, string[]>();
+  for (const t of stalledTickets) {
+    const key = projectKeyOfIssue(t.key);
+    (stalledKeysByProject.get(key) ?? stalledKeysByProject.set(key, []).get(key)!).push(t.key);
+  }
+
   const ineligible: ProjectResource[] = admitted
     .filter((p) => !eligible.some((e) => e.key === p.key))
     .map((p) => ({
@@ -1245,6 +1332,8 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
       unseenCommentIds: [],
       unseenEpicCommentIds: {},
       watermark: EMPTY_WATERMARK,
+      observedBlockedKeys: [],
+      observedStalledKeys: [],
     }));
 
   const resolved: ProjectResource[] = await Promise.all(
@@ -1298,6 +1387,8 @@ async function loadProjects(deps: ProjectResourceDeps): Promise<ProjectResource[
         unseenCommentIds,
         unseenEpicCommentIds,
         watermark,
+        observedBlockedKeys: blockedKeysByProject.get(p.key) ?? [],
+        observedStalledKeys: stalledKeysByProject.get(p.key) ?? [],
       };
     }),
   );
@@ -1337,6 +1428,15 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
   if (prev.observedVersion !== next.observedVersion) return true;
   if (!sameIdSet(prev.observedCommentIds, next.observedCommentIds)) return true;
   if (prev.observedEpics.length !== next.observedEpics.length) return true;
+  // FACTORY-949: SET equality, same reasoning as `sameIdSet`'s own doc
+  // comment — `observedBlockedKeys` is built from a JQL search with no
+  // `ORDER BY` of its own, so two polls observing the identical blocked set
+  // could return it in a different array order with nothing having
+  // actually changed.
+  if (!sameIdSet(prev.observedBlockedKeys, next.observedBlockedKeys)) return true;
+  // FACTORY-972: same SET-equality reasoning as `observedBlockedKeys` just
+  // above, for its stalled twin.
+  // Stalled labels are display-only; the visible comment follows ordinary delivery.
   const prevEpics = new Map(prev.observedEpics.map((e) => [e.key, e.commentIds]));
   return next.observedEpics.some((e) => {
     const before = prevEpics.get(e.key);
@@ -1350,7 +1450,76 @@ function changed(prev: ProjectResource, next: ProjectResource): boolean {
  * of the issue tier's Implements-chain concept), so every notification is
  * primary/self, `watcher === key` always.
  */
-export function createProjectEventRules(): EventRules<ProjectResource> {
+/**
+ * FACTORY-949 (story FACTORY-948, item 2): `deps` is deliberately OPTIONAL
+ * and NEW — every pre-existing caller/test called this with zero arguments,
+ * and keeps working unchanged (no `comments` dep means the marker-dedup
+ * check below always fails toward firing; the debounce window falls back to
+ * `DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES`, same as `createIssueEventRules`).
+ *
+ * The blocked-wake axis deliberately does NOT reuse `projectVerdict`/the
+ * persistent `watermark` mechanism version/comments/epics above share —
+ * that mechanism's own hard constraint (this file's top comment, "WATERMARKS
+ * AND WHERE THEY LIVE") is that a watermark may be advanced ONLY by the
+ * project AGENT itself, after it acts (via `check_in`), never by the daemon
+ * — wiring a THIRD watermark axis through that same contract would mean
+ * widening `check_in`'s own tool surface (src/tools/defs.ts) to also report
+ * which blocked tickets it has acted on, a change this ticket does not make.
+ * Instead this reuses the SAME in-memory-only debounce/dedup shape
+ * `createIssueEventRules`'s own `blockedWake` already established for the
+ * boss wake — cheaper, and consistent across both producers of `{ blocked
+ * }` (see NotifyReason's own doc comment) — at the STATED cost that a
+ * daemon restart forgets which episodes it already fired for (same cost
+ * `commentCursor`/`pendingRecheck` already accept there).
+ *
+ * STATED LIMIT: if more than one ticket in the same project newly qualifies
+ * in the same poll, only the first (by key, sorted) is named in this poll's
+ * `NotifyReason` — `EventVerdict` carries exactly one reason. The others are
+ * not lost: each still has its own entry in `blockedWakeFired` untouched, so
+ * every one of them is still a `changedPrimary` candidate (its key is still
+ * in `observedBlockedKeys`, unseen by `prevBlockedSet`) on the VERY NEXT
+ * poll and fires there instead, one at a time — the project tier's own poll
+ * cadence (`PROJECT_POLL_INTERVAL_MS`) is the only delay this adds.
+ */
+export function createProjectEventRules(deps?: Pick<ProjectResourceDeps, "comments" | "blockedWakeDebounceMinutes" | "stalledWakeDebounceMinutes" | "stalledWakeMaxPerHour" | "onStalledWake" | "onStalledWakeCapped">): EventRules<ProjectResource> {
+  // Persists ACROSS polls — same cross-poll, in-memory-only shape
+  // `createIssueEventRules`'s `blockedWakeFired` already is; see this
+  // function's own top comment for why no persistent watermark is used here.
+  const blockedWakeFired = new Map<string, number>();
+  const blockedWakeDebounceMs = (deps?.blockedWakeDebounceMinutes ?? DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES) * 60_000;
+
+  // Same shape/reasoning as `createIssueEventRules`'s own `blockedWake` —
+  // see that function's own doc comment (src/resources/issue.ts) for the
+  // debounce (item 4) and marker-dedup (item 5) rules this mirrors exactly,
+  // against the SAME escalate.ts marker. Not shared code between the two
+  // modules because their comment readers differ in shape (`deps.comments`
+  // here is a bare optional function, no per-poll memoization seam to
+  // plug into — this module has no equivalent of issue.ts's `fetchComments`
+  // cache to reuse, and adding one purely for this axis would be more
+  // machinery than the one call per CANDIDATE (not per key) this needs).
+  const blockedWake = async (key: string): Promise<boolean> => {
+    const now = Date.now();
+    const last = blockedWakeFired.get(key);
+    if (last !== undefined && now - last < blockedWakeDebounceMs) return false;
+    if (deps?.comments) {
+      try {
+        const comments = await deps.comments(key);
+        const windowStart = now - blockedWakeDebounceMs;
+        const markerAlreadyPosted = comments.some((c) => c.body.startsWith(BLOCKED_ESCALATION_MARKER) && Date.parse(c.created) >= windowStart);
+        if (markerAlreadyPosted) {
+          blockedWakeFired.set(key, now);
+          return false;
+        }
+      } catch {
+        // Fail OPEN toward firing — see issue.ts's `blockedWake`'s own doc
+        // comment for why an unreadable dedup check must not be the thing
+        // that silently loses this event.
+      }
+    }
+    blockedWakeFired.set(key, now);
+    return true;
+  };
+
   return {
     async poll(prev: PollSnapshot<ProjectResource>, next: PollSnapshot<ProjectResource>): Promise<EventPoll> {
       const prevByKey = new Map(prev.primary.map((p) => [p.key, p]));
@@ -1365,6 +1534,23 @@ export function createProjectEventRules(): EventRules<ProjectResource> {
         async decide(key: string, _watcher: string, _space: "primary" | "related"): Promise<EventVerdict> {
           const p = nextByKey.get(key);
           if (!p) return { deliver: false };
+          // FACTORY-949 (item 2): a ticket newly present in this project's
+          // `observedBlockedKeys` since the LAST poll (not merely present —
+          // see this function's own top comment on why "still blocked,
+          // unchanged" must not re-fire merely because debounce elapsed)
+          // wakes the project's manager, sorted for a deterministic pick
+          // among more than one candidate (this function's own top comment,
+          // "STATED LIMIT"). Checked BEFORE `projectVerdict`, same template
+          // `createIssueEventRules`'s boss-wake branch uses ahead of its own
+          // `suppressed()` call: this is a DIFFERENT axis from the
+          // version/comments/epics watermark `projectVerdict` answers for,
+          // and must not wait on it.
+          const before = prevByKey.get(key);
+          const prevBlockedSet = new Set(before?.observedBlockedKeys ?? []);
+          const candidates = [...p.observedBlockedKeys].filter((k) => !prevBlockedSet.has(k)).sort();
+          for (const k of candidates) {
+            if (await blockedWake(k)) return { deliver: true, reason: { blocked: { key: k } } };
+          }
           // Reuses `projectVerdict` rather than a second decision mechanism
           // (per this file's top comment): a change that is already fully
           // watermarked (Hazard 1's own-comment case) verdicts `asleep`/
@@ -1384,7 +1570,7 @@ export function createProjectResourceType(deps: ProjectResourceDeps): ResourceTy
       search: () => loadProjects(deps),
     },
     activation: PROJECT_ACTIVATION,
-    eventRules: createProjectEventRules(),
+    eventRules: createProjectEventRules(deps),
     spawnConfig: PROJECT_SPAWN_CONFIG,
   };
 }

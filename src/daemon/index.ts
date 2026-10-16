@@ -1,37 +1,62 @@
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
-import { createJiraProjectResourceType, ownsJiraProjectAgent } from '../rules/jira-project-type.js';
+import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
-import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals } from "@brooswit/drovr";
+import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
-import { loadConfig, describeConfig } from "../config/config.js";
+import { createOutstandingGuard } from "./herdr-subscribe-deadline.js";
+import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured } from "../config/config.js";
+import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
+import { runSetupModeDaemon } from "./setup-mode.js";
+import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
+import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
+import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
 import { buildApp, notifyAgent } from "./app.js";
+import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js";
+// FACTORY-1010: a SEPARATE import statement from the one above on purpose —
+// test/unit/notify-deliver-seams.test.ts's own regex pins that exact
+// `import { deliverNotice, renderNotifyDelivery } from "../notify/deliver.js"`
+// line verbatim (acceptance D: "the shared gate is imported ... not
+// reimplemented locally"), so widening it inline would break that guard for
+// a reason unrelated to what it actually checks.
+import type { NotifyDeliveryMode } from "../notify/deliver.js";
 import { inventoryCodexMcp } from "../agents/argv.js";
 import { inventoryAgyMcp } from "../mcp/registration.js";
-import { combineHealth, createLoopHealth, createResourceLoopHealth } from "./health.js";
+import { combineHealth, createLoopHealth, createResourceLoopHealth, createTickHealth } from "./health.js";
+import { createLoopWatchdog } from "./loop-watchdog.js";
 import { DAEMON_HOSTNAME, listenOptions } from "./listen.js";
 import { createCoverageTracker } from "./coverage.js";
 import { createCurrencyTracker } from "./currency.js";
-import { HerdrHerd, type NudgeResult } from "../agents/herd.js";
+import { HerdrHerd } from "../agents/herd.js";
+import { reportPersistedAgentSessions } from "../agents/report-agent-sessions.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
 import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { hostname } from "node:os";
 import { StatusFloorTracker } from "../agents/status-floor.js";
-import { createDashboardFeed, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
+import { createDashboardFeed, cwdAgentResolvers, DASHBOARD_DETECTOR, type IssueMeta, type DashboardAgent } from "../agents/dashboard.js";
 import { buildResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { projectRootDoc } from "../tools/docs.js";
 import { resolveResourceLink } from "../resources/resource-link.js";
 import { buildIdentity, toBuildReport, describeBuild } from "../agents/build-identity.js";
+import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
-import { createRuleResourceType, ownsRuleAgent, uniqueIssues, type RuleMatch } from "../rules/resource-type.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole } from "../rules/rules.js";
+import { resourceMatches, type ExecutionUnit } from "../rules/execution.js";
+import { createIdlePokeEngine, type IdlePokeRuleConfig } from "../agents/idle-poke.js";
+import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
+import { runCapacityRoleMigration, type CapacityRoleMigrationOutcome } from "../rules/capacity-role-migration.js";
+import { FIRST_RULE_ID } from "../rules/rules-write-registry.js";
+import { RULE_FORM_CATALOG } from "../rules/rule-form-catalog.js";
+import { reloadRules } from "../rules/reload.js";
+import { createRuleResourceType, ownsRuleAgent, uniqueIssues, stalledMinutesForIssues, type RuleMatch } from "../rules/resource-type.js";
 import type { NotifyReason } from "../resources/types.js";
 import { decodeAnyAgentKey, decodeQueryAgentKey } from "../rules/agent-key.js";
-import type { AgentCapacityRole } from "../agents/admission.js";
+import type { AgentCapacityRole, RuleRateLimit } from "../agents/admission.js";
 import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
@@ -39,39 +64,45 @@ import { watchBlocked } from "../agents/blocked.js";
 import { createEscalator } from "../agents/escalation-loop.js";
 import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
+import { createOpsAlertRouter } from "../agents/ops-alert.js";
 import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
 import { startPermissionAnswerWatch, type PermissionAnswerPushFrame, type PermissionAnswerSubscription } from "../agents/permission-answer-watch.js";
 import { ruleLizardModeOf as sharedRuleLizardModeOf } from "../agents/permission-answer-loop.js";
 import { createApprovalSoundNotifier } from "../agents/approval-sound.js";
 import { withIdleDialogDetection } from "../agents/idle-dialog.js";
-import { detectTerminalPrefix, resolveAttach, attachRefusalMessage } from "../terminal/open.js";
+import { detectTerminalPrefix, hasDesktopDisplay, resolveAttach, attachRefusalMessage, terminalCommand } from "../terminal/open.js";
 import { resolvePtyPane, isPaneStillLive } from "../terminal/pty-attach.js";
 import { realAtlassian } from "../tools/atlassian-real.js";
-import { atlassianTools } from "../tools/defs.js";
+import { providerAtlassianTools } from "../tools/provider-atlassian.js";
+import { agentSnapshot, doAgentStart, planAgentStop, doAgentStop, planAgentShelve, doAgentShelve, doAgentAdopt, doAgentPrioritize, type AgentWriteDeps } from "../agents/agents-write.js";
 import { createLabelSync } from "../labels/sync.js";
+import { isAgentLabel } from "../labels/plan.js";
 import { createNotifyGate } from "../labels/notify-gate.js";
 import { PrTracker } from "../labels/pr.js";
-import { sweepStaleAgentLabels } from "../labels/sweep.js";
+import { sweepAbsentLiveAgentLabels, sweepStaleAgentLabels } from "../labels/sweep.js";
 import { watchSessionLimits } from "../agents/session-limit-watch.js";
 import { createQuotaGate } from "../agents/quota-gate.js";
 import { createCaptureStore } from "../agents/capture-store.js";
 import { createStalledCheck } from "../agents/stalled.js";
+import { createSilentStopCheck } from "../agents/silent-stop.js";
 import { createStallRemediator } from "../agents/stall-remediation.js";
+import { createPinnedActiveDetector } from "../agents/pinned-active.js";
 import { createOwnWriteLedger, DAEMON_WRITER } from "../jira-watch/own-writes.js";
-import { respawnComment, resumePreservedComment } from "../agents/respawn.js";
+import { respawnComment, respawnResumedComment, resumePreservedComment } from "../agents/respawn.js";
 import { createParkedDetector } from "../agents/parked.js";
 import { createAbandonedDetector } from "../agents/abandoned.js";
 import { prReviewStateNudge } from "../agents/pr-nudge.js";
 import { changeNudge, linkedChangeNudge, notifyReasonTag } from "../agents/change-nudge.js";
 import { speakOnOwnChannel, createOwnChannelComments } from "../tools/speak.js";
 import { createCrashLoopDetector } from "../agents/crash-loop.js";
+import { createRestoredPaneEscalationDetector } from "../agents/restored-pane-escalation.js";
 import { createReconcileFailureDetector } from "../agents/reconcile-failure.js";
 import { createReaper } from "../agents/reap.js";
 import { createAdmissionController } from "../agents/admission.js";
 import { createGithubIssueClient } from "../resources/github-issue.js";
 import { githubIssueStaffing, type GithubIssueMatch } from "../rules/github-issue-type.js";
 import type { GithubIssueRef } from "../resources/github-issue-ref.js";
-import { forJiraCallers, githubIssueTools } from "../tools/github-issue.js";
+import { githubIssueTools } from "../tools/github-issue.js";
 import { GITHUB_ISSUE_POLL_MS, startGithubIssueLoop } from "./github-issue-loop.js";
 import { createGithubPrClient } from "../resources/github-pr.js";
 import { githubPrStaffing } from "../rules/github-pr-type.js";
@@ -82,17 +113,21 @@ import { jiraIdeaTools } from "../tools/jira-idea.js";
 import { ideaGithubLinkTools } from "../tools/idea-github-link.js";
 import { JIRA_IDEA_POLL_MS, jiraIdeaRules, startJiraIdeaLoop } from "./jira-idea-loop.js";
 import { createResidencyGuard } from "../agents/residency-guard.js";
-import { createZendeskTicketClient } from "../resources/zendesk-ticket.js";
-import { zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import { loadZendeskAuth, createZendeskTicketClient } from "../resources/zendesk-ticket.js";
+import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
+import { confluencePageRules, CONFLUENCE_PAGE_POLL_MS, startConfluencePageLoop } from "./confluence-page-loop.js";
 import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
 import { sessionDefinitionsPath } from "../resources/session-definition.js";
 import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
 import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessionDefinitionUndo, type LastUiWriteRef as SessionDefinitionLastUiWriteRef } from "../resources/session-definitions-write.js";
+import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
+import { listAllFileLinks } from "../resources/link-store.js";
 import { sessionArchiveDir } from "../resources/session-archive.js";
-import { buildQueryAgentInventory } from "../agents/query-agent-inventory.js";
+import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
 import { listFilesystemResources } from "../resources/filesystem.js";
 import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
@@ -105,10 +140,26 @@ import { createAccountLifecycle } from "../agents/account-lifecycle.js";
 import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
 import { runLinkCli } from "../cli/link-cli.js";
 import { runSessionCli } from "../cli/session-cli.js";
+import { runRulesCli } from "../cli/rules-cli.js";
 import { resourceLinkTools } from "../tools/resource-links.js";
 import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
 import { createRoutingLinkStore } from "../resources/link-store-router.js";
 import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
+import { createRulesPreviewer } from "../web/rules-preview.js";
+import { isSameUidPeerAsync } from "../web/peer-uid.js";
+import { rulesEtag } from "../rules/write-rules.js";
+import { createCsrfTokenIssuer } from "../web/csrf.js";
+import { createWriteRateLimiter } from "../web/write-rate-limit.js";
+import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
+import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache, createRule, planRuleCreate } from "../rules/rules-write.js";
+import { buildSettingsApiResponse } from "../web/settings-api.js";
+import { createCachedUnitHint } from "../web/settings-unit-hint.js";
+import { testJiraConnection } from "../web/jira-connection-test.js";
+import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
+import { writeSetting } from "../settings/write-settings.js";
+import { restartDaemon } from "../web/daemon-restart.js";
+import { readDaemonLogs, DEFAULT_DAEMON_LOGS_MAX_LINES, DEFAULT_DAEMON_LOGS_MAX_BYTES } from "../web/daemon-logs.js";
+import { currentSystemdInfo } from "../agents/ground-truth.js";
 
 // FACTORY-7: `butchr link list|add|remove` is the one subcommand this
 // binary has (package.json's `bin.butchr` builds solely from THIS file —
@@ -129,6 +180,15 @@ if (process.argv[2] === "session") {
   process.exit(await runSessionCli(process.argv.slice(3)));
 }
 
+// FACTORY-621: `butchr rules check [file]` — validates a rules file and
+// dry-runs its jira-work/jira-idea queries, read-only. Same precedent as
+// `link`/`session` immediately above: intercepted before config/rules
+// loading so a syntactically-broken rules file can be diagnosed with this
+// command even though it would make the daemon itself refuse to start.
+if (process.argv[2] === "rules") {
+  process.exit(await runRulesCli(process.argv.slice(3)));
+}
+
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
 // `console.error` resolves that reference at CALL time, so this single
@@ -138,9 +198,57 @@ if (process.argv[2] === "session") {
 // installed here rather than at any individual call site.
 installLogSink();
 
+// FACTORY-665 (epic FACTORY-659, slice S2): `settings.json` is a layer of
+// NON-SECRET defaults strictly UNDER the environment for a small allowlist
+// of keys (fleet cap, provider order, default model, poll-staleness
+// tolerance) — `effectiveSettingsEnv` returns `process.env` unchanged for
+// every key an env var already sets, and fills in the settings.json value
+// only where the environment left a gap. `settingsFileResult.problems`
+// (invalid JSON, wrong owner, a symlink, too-wide a mode, a non-
+// allowlisted key, an out-of-range value) is reported LOUDLY — one journal
+// line per problem, right here at startup, BEFORE `loadConfig` ever runs —
+// and, once `teamAdminNotify` exists further down this file, also raised
+// as an ops alert (see that section's own comment for why this can't post
+// immediately: the poster isn't built yet this early in the file).
+const settingsFileResult = loadSettingsFile(process.env);
+for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
+const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
+// FACTORY-694 item 6: ONE shared cache instance for this process's lifetime
+// — every `GET /api/settings` call (both the read path below and the
+// re-read after a settings write) shares the same ~30s TTL memo, so a burst
+// of dashboard polls spawns at most one `systemctl` child per window
+// instead of one per request. See `createCachedUnitHint`'s own doc comment.
+const cachedUnitHint = createCachedUnitHint();
+// FACTORY-665 (PR-2) — a fresh install with no Atlassian identity yet must
+// not crash at startup: it starts in SETUP MODE instead (serving only
+// `/health`, the dashboard shell, and the setup API — see
+// `./setup-mode.ts`'s own header) until an operator configures it through
+// the dashboard. `resolveEffectiveJiraEnv` is what makes a RESTART after a
+// successful setup actually leave setup mode: it fills in site/email/token
+// from this daemon's own previously-persisted setup state (the durable
+// identity file + the managed token file) for any field `process.env`
+// itself leaves unset — env still wins per-field, exactly as before, for
+// every operator who sets these by hand. Checked BEFORE `loadConfig`
+// itself, which still throws for every OTHER kind of misconfiguration
+// exactly as before — this is not a general "never crash" change, only the
+// one case setup mode exists for.
+const effectiveJiraEnv = resolveEffectiveJiraEnv(effectiveEnv, { onWarn: (line) => console.error(`butchr: ${line}`) });
+if (!isAtlassianConfigured(effectiveJiraEnv)) {
+  // Setup mode ONLY for a truly fresh install (no site, email, token, identity file or managed token file at all).
+  // Any PARTIAL state is a misconfiguration: exit 1 loudly, exactly as before, instead of serving a quiet setup page with nothing polling (agentsafety A2 review item 3).
+  const partial = [effectiveJiraEnv.ATLASSIAN_SITE, effectiveJiraEnv.ATLASSIAN_EMAIL, effectiveJiraEnv.ATLASSIAN_TOKEN, effectiveJiraEnv.ATLASSIAN_TOKEN_FILE].some((v) => !!v?.trim());
+  if (partial) {
+    console.error("butchr: Missing required config: ATLASSIAN_SITE, ATLASSIAN_EMAIL and ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE) must all be set (partial Atlassian configuration is not setup mode). Inputs counted: ATLASSIAN_SITE/ATLASSIAN_EMAIL/ATLASSIAN_TOKEN/ATLASSIAN_TOKEN_FILE, the identity file written by UI setup (jira-identity.json in the butchr config directory) and the managed token file (secrets/atlassian-token). To start setup over, delete BOTH files.");
+    process.exit(1);
+  }
+  await runSetupModeDaemon();
+  // runSetupModeDaemon returns once app.listen() is called; the listening server keeps the process alive, so park here instead of falling through to the real daemon (or exiting).
+  await new Promise<never>(() => {});
+}
+
 let config;
 try {
-  config = loadConfig(process.env as Record<string, string | undefined>, (p) => readFileSync(p, "utf8"));
+  config = loadConfig(effectiveJiraEnv, (p) => readFileSync(p, "utf8"));
 } catch (e) {
   console.error(`butchr: ${(e as Error).message}`);
   console.error("See .env.example for the required configuration.");
@@ -148,6 +256,13 @@ try {
 }
 if (config.agent) config.agent = inventoryCodexMcp(config.agent, (line) => console.error(`butchr: ${line}`));
 if (config.agent) config.agent = inventoryAgyMcp(config.agent, (line) => console.error(`butchr: ${line}`));
+
+// FACTORY-497: an existing systemd drop-in from before this ticket may still
+// set BUTCHR_EXTENSION_ORIGINS — say so once rather than silently ignoring it.
+{
+  const ignoredExtensionOrigins = ignoredExtensionOriginsWarning(process.env as Record<string, string | undefined>);
+  if (ignoredExtensionOrigins) console.error(`butchr: ${ignoredExtensionOrigins}`);
+}
 
 // FACTORY-339: `resolveUrlToResource`'s own deps — this daemon's configured
 // Jira site as a bare, lower-cased HOST (never the full `https://` URL
@@ -161,26 +276,80 @@ const resourceLookupDeps = { jiraHost: new URL(config.atlassian.site).hostname.t
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
 // an absent file means zero rules (there are no built-in defaults), announced
 // so an idle daemon is never a mystery.
-let rules;
 let missingRulesPath: string | null = null;
-try {
-  const loaded = loadRules(process.env as Record<string, string | undefined>);
-  rules = loaded.rules;
-  if (loaded.origin === "missing") missingRulesPath = loaded.path;
-  const enabled = rules.filter((r) => r.enabled).map((r) => r.id);
-  if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed`);
-  else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
-} catch (e) {
-  console.error(`butchr: ${(e as Error).message}`);
-  process.exit(1);
+// FACTORY-669: at TRUE first run only (see `../rules/seed-first-run.ts`'s own
+// doc comment for the exact conditions), seed ONE disabled template rule
+// before `loadRules` below ever runs for real, so a fresh install's
+// dashboard (FACTORY-663) has something to edit/enable with no hand-edited
+// JSON and no restart. Captured here rather than acted on immediately: the
+// ops-alert router this seed's own "seeded"/"vanished" outcomes need to post
+// through (agentsafety constraint 4) is constructed much later in this same
+// file's startup sequence, after the Rocket.Chat credential is resolved —
+// the raise happens there, right after that router exists (search
+// `firstRunSeedOutcome` below).
+const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
+if (firstRunSeedOutcome.kind === "seeded") {
+  console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); edit its query in the dashboard, then enable it (its brief is file-only — edit that in ${firstRunSeedOutcome.path} by hand if you want it)`);
+  if (firstRunSeedOutcome.dirPermissionsWarning) console.error(`WARNING: butchr: ${firstRunSeedOutcome.dirPermissionsWarning}`);
+} else if (firstRunSeedOutcome.kind === "vanished-established-install") {
+  console.error(
+    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but a prior backup (.bak-*) exists in its directory — this looks like an established install whose rules file vanished, not a fresh one, so no template was seeded. Restore it (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
+  );
+} else if (firstRunSeedOutcome.kind === "config-dir-not-empty") {
+  console.error(
+    `WARNING: butchr: no rules file at ${firstRunSeedOutcome.path}, but its directory already holds other state (beyond what the web setup flow itself writes) — this looks like an established install some other way, not a fresh one, so no template was seeded. Add a rules file (from a backup, or by hand) and SIGHUP/restart; nothing is staffed until then.`,
+  );
+} else if (firstRunSeedOutcome.kind === "seed-failed") {
+  console.error(`WARNING: butchr: first-run seed of ${firstRunSeedOutcome.path} failed, starting with no rules as if the file were simply absent: ${firstRunSeedOutcome.error}`);
 }
+// FACTORY-810 (implementing FACTORY-754, epic FACTORY-748): runs BEFORE
+// `loadRules` below ever reads the file for real, same ordering as the
+// first-run seed just above — this migration must see an absent `role` as
+// genuinely absent (never the schema's defaulted `"worker"`), which only
+// reading the raw text (not `loadRules`'s parsed/defaulted `Rule[]`) can
+// tell it. Idempotent and existence-based (see
+// `../rules/capacity-role-migration.ts`'s own doc comment): a file with
+// nothing to migrate is never touched — no backup, no rewritten mtime — so
+// this costs nothing on every subsequent, ordinary startup.
+const capacityRoleMigrationOutcome: CapacityRoleMigrationOutcome = runCapacityRoleMigration(process.env as Record<string, string | undefined>);
+if (capacityRoleMigrationOutcome.kind === "migrated") {
+  console.error(`butchr: upgrade migration — wrote role: "sentinel" onto ${capacityRoleMigrationOutcome.migratedIds.length} jira-work rule(s) that relied on the deleted issue-type capacity exemption (FACTORY-757): ${capacityRoleMigrationOutcome.migratedIds.join(", ")}`);
+  for (const entry of capacityRoleMigrationOutcome.plan) {
+    if (entry.outcome === "skip" && entry.reason !== "not-jira-work" && entry.reason !== "already-has-role") {
+      console.error(`butchr: upgrade migration — left rule ${entry.id} untouched (${entry.reason}${entry.issueTypes ? `: ${entry.issueTypes.join(", ")}` : ""})`);
+    }
+  }
+} else if (capacityRoleMigrationOutcome.kind === "unreadable") {
+  console.error(`butchr: upgrade migration — could not read the rules file to check for a capacity-role migration (${capacityRoleMigrationOutcome.error}); proceeding to the normal rules loader, which will report any real problem with it`);
+}
+const rulesHolder = (() => {
+  try {
+    const loaded = loadRules(process.env as Record<string, string | undefined>);
+    if (loaded.origin === "missing") missingRulesPath = loaded.path;
+    const enabled = loaded.rules.filter((r) => r.enabled).map((r) => r.id);
+    if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
+    else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
+    return createRulesHolder(loaded.rules, sourceEtagOf(loaded.text));
+  } catch (e) {
+    console.error(`butchr: ${(e as Error).message}`);
+    process.exit(1);
+  }
+})();
+// FACTORY-657: every consumer below reads through `getRules()` rather than
+// closing over a `rules` snapshot — see `RulesHolder`'s own doc comment
+// (src/rules/rules.ts) for why this makes a SIGHUP reload (or an
+// in-process `reloadRules` call, FACTORY-663) take effect without a
+// restart, and what still doesn't (a provider with
+// ZERO enabled rules — and so no client/loop at all — at startup still
+// needs one to ever begin staffing; see the SIGHUP handler below).
+const getRules = rulesHolder.getRules;
 // BUTCHR-398: log every sentinel rule at startup, one line each, so an
 // operator can see at a glance what is exempt from the fleet agent cap —
 // the epic decision's own ask ("log each sentinel rule at startup"). No
 // warning for an unflagged rule: `role` defaults to `"worker"`, and that
 // default needs no announcement (this task's own ticket: "deliberately NO
 // startup warning for rules without a role").
-for (const r of rules) {
+for (const r of getRules()) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
 }
 // BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
@@ -258,7 +427,7 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
     const manifestRole = managedSessionRoles.get(id);
     if (manifestRole) return manifestRole;
   }
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.role;
 };
 /**
@@ -276,21 +445,48 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  * every other rule-launched agent reads straight off its own `Rule`.
  */
 const ruleLizardModeOf = (id: string): boolean =>
-  sharedRuleLizardModeOf(id, { rules, isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
-// BUTCHR-422 (FACTORY-39 moved Bug out of the counted set): only leaf work
-// (Task/Sub-task) counts toward the cap — project agents and Epic/Story/Bug
-// agents are classified "sentinel" here (see src/agents/capacity-role.ts).
-// `issueMeta` (declared below, filled by every jira-work search) supplies
-// the issue type; it is only read at call time, after the whole module has
-// initialised.
-const roleOfAgent = (id: string): AgentCapacityRole =>
-  capacityRoleFor(id, ruleRoleOfAgent, (key) => issueMeta.get(key)?.issuetype);
+  sharedRuleLizardModeOf(id, { rules: getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
+// FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
+// capacity is decided solely by each rule's own `role` field — see
+// src/agents/capacity-role.ts for the construction-level exceptions (bare
+// project agents, `jira-project` agents) and why issue type no longer plays
+// any part here.
+const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleRoleOfAgent);
+/**
+ * FACTORY-907 — same decode-then-look-up-by-rule shape as `ruleRoleOfAgent`
+ * immediately above, one field over: resolves a candidate id's own rule
+ * `maxNewPerTick`/`minSecondsBetweenAdmissions` (if either is set) for
+ * `AdmissionControllerDeps.rateLimitOf` (src/agents/admission.ts). `undefined`
+ * for anything unresolved (a legacy/bare-issue agent, a rule since removed,
+ * or a resolvable rule that sets neither field) — unlike `roleOfAgent`,
+ * there is no fail-safe-to-limited default to get wrong here: an id this
+ * cannot resolve simply keeps today's behaviour, same as a resolved rule
+ * that never sets either field (see `RuleRateLimit`'s own doc comment).
+ * BUTCHR-408's managed-session agents have no rule-engine `Rule` of their
+ * own (see `managedSessionRoles`'s own comment above) and so are never
+ * rate-limited by this — out of this ticket's scope, which wires exactly
+ * the rule-engine providers `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * validate for.
+ */
+const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return undefined;
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
+  return {
+    ruleId: rule.id,
+    ...(rule.maxNewPerTick !== undefined ? { maxNewPerTick: rule.maxNewPerTick } : {}),
+    ...(rule.minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: rule.minSecondsBetweenAdmissions } : {}),
+  };
+};
 
-// BUTCHR-405: logged once per unresolved reference, and the same list rides
-// on /health (see combineHealth call below) — both come from
-// unresolvedRelationships so they can never disagree.
-const unresolvedRuleRelationships = unresolvedRelationships(rules);
-for (const u of unresolvedRuleRelationships) console.error(`  ${formatUnresolvedRelationshipWarning(u)}`);
+// BUTCHR-405: logged once per unresolved reference at startup, from this
+// boot's own rules. /health (see combineHealth call below) recomputes this
+// fresh from `getRules()` on every request instead of reusing this one-time
+// list — FACTORY-657: a reload can fix (or introduce) an unresolved
+// relationship, and /health must never keep reporting this boot's stale
+// verdict after one.
+for (const u of unresolvedRelationships(getRules())) console.error(`  ${formatUnresolvedRelationshipWarning(u)}`);
 
 /**
  * BUTCHR-411 — `HerdrHerd.staleIssues()`'s own `mcpBindingsOf` seam (see that
@@ -304,7 +500,7 @@ for (const u of unresolvedRuleRelationships) console.error(`  ${formatUnresolved
 const mcpBindingsOf = (id: string) => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.mcpServers;
 };
 
@@ -330,7 +526,7 @@ const resolvedAgentOf = (id: string, provider: string): { model?: string; effort
   if (ownsManagedSessionAgent(id)) return managedSessionResolvedAgents.get(id);
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
   return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
@@ -356,7 +552,7 @@ const accountPolicyOf = (id: string): AccountPolicy => {
     const manifestPolicy = managedSessionAccountPolicies.get(id);
     if (manifestPolicy) return manifestPolicy;
   }
-  const rule = rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   return rule?.account ?? "none";
 };
 
@@ -393,7 +589,7 @@ const accountNameOf = (id: string): string | undefined =>
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
 // runs and nothing is spawned for one (announced by startGithubIssueLoop).
-const githubStaffing = githubIssueStaffing(rules, config.github);
+const githubStaffing = githubIssueStaffing(getRules(), config.github);
 const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -402,7 +598,7 @@ const githubIssues = githubStaffing.run && config.github
 // Config["github"]'s own doc comment) but are their own provider, staffing
 // gate, client and loop — a rules file with github-issue rules and no
 // github-pr rules stays unaffected, and vice versa.
-const githubPrStaffingResult = githubPrStaffing(rules, config.github);
+const githubPrStaffingResult = githubPrStaffing(getRules(), config.github);
 const githubPrs = githubPrStaffingResult.run && config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -411,20 +607,38 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // ZENDESK_OAUTH_TOKEN_FILE; otherwise none of them runs and nothing is spawned
 // for one (announced by startZendeskTicketLoop). The token file is read only
 // when an enabled zendesk-ticket rule exists.
-const zendeskStaffing = zendeskTicketStaffing(rules, process.env as Record<string, string | undefined>);
+const zendeskStaffing = zendeskTicketStaffing(getRules(), process.env as Record<string, string | undefined>);
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
 // filesystem rules need no external credential — every enabled one always
 // runs, reading the local disk directly (src/resources/filesystem.ts).
-const fsRules = filesystemRules(rules);
+const fsRules = filesystemRules(getRules());
+
+// FACTORY-998: confluence-page rules need no SEPARATE credential either —
+// this daemon never reaches here without a fully-configured Atlassian site
+// (the setup-mode gate above), so the real `ops` client built below already
+// covers it; every enabled confluence-page rule always runs.
+const confluencePageEnabledRules = confluencePageRules(getRules());
 
 const atlassian = new AtlassianClient(config.atlassian.site, config.atlassian.email, config.atlassian.token, undefined, (line) => console.error(`  ${line}`));
 // jira-idea rules share this Jira client but are their own provider: their
 // own loop, agents, MCP identity and read/comment tools (src/tools/jira-idea.ts).
-const ideaRules = jiraIdeaRules(rules);
+const ideaRules = jiraIdeaRules(getRules());
 const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined;
+// Tool connections are independent of agent staffing. Reuse clients where possible;
+// keep the same credentials, organization/account boundaries and Zendesk opt-in.
+const githubToolIssues = githubIssues ?? (config.github
+  ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const githubToolPrs = githubPrs ?? (config.github
+  ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs }) : undefined);
+const jiraToolIdeas = jiraIdeas ?? createJiraIdeaClient(atlassian);
+const zendeskToolAuth = !zendeskTickets && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
+  ? loadZendeskAuth(process.env) : undefined;
+const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
+  ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskToolAuth.subdomain, token: zendeskToolAuth.token }) : undefined);
+
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
 // This gate preflights that per project (first sight, cached for the run)
@@ -432,7 +646,15 @@ const jiraIdeas = ideaRules.length ? createJiraIdeaClient(atlassian) : undefined
 // Shared between the poll loop and the one-time startup sweep below so both
 // see the same cached verdict per project.
 const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassian.email, log: (line) => console.error(`  ${line}`) });
-const herdr = new DrovrClient(config.herdrSocket ? { socketPath: config.herdrSocket } : {});
+// FACTORY-722: `timeoutMs` bounds EVERY call this shared client makes
+// (`@brooswit/herdr-sdk`'s `rpc()` arms its timer around the whole
+// connect-write-respond sequence, not merely the read) — see
+// `Config.herdrCallTimeoutMs`'s own doc comment for why this one knob is the
+// actual fix for the wedge finding this ticket closes, not a defensive
+// extra: before this, a hung herdr socket left `herdr.agent.list()` and
+// `herdr.subscribe()` pending forever, wedging every caller that serializes
+// on one of them.
+const herdr = new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs });
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
 // rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
@@ -464,6 +686,17 @@ const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefin
 // Fire-and-forget: a slow or failing herdr must never delay the rest of
 // startup, and the method itself never throws.
 void herd.relabelOwnedWorkspaces();
+// FACTORY-714/FACTORY-713/FACTORY-704 (re-aimed) — report each already-
+// running pane's persisted Claude session id to herdr, once per daemon
+// startup, for whichever panes herdr doesn't already hold an
+// `agent_session` for (see `reportPersistedAgentSessions`'s own doc
+// comment, src/agents/report-agent-sessions.ts, for why this is the real
+// fix — not the abandoned settle-gate approach — and why it is safe to run
+// on every startup). Same fire-and-forget, idempotent-startup-sweep shape
+// as `relabelOwnedWorkspaces` immediately above: a slow or failing herdr
+// must never delay the rest of startup, and the function itself never
+// throws (per-pane failures are swallowed and logged inside it).
+void reportPersistedAgentSessions({ herdr, log: (line) => console.error(`  ${line}`) });
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
 // binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the
@@ -516,8 +749,9 @@ const ADMISSION_SOURCE_ZENDESK_TICKET = "zendesk-ticket";
 // it exists only so the admission census can report on this tier by name,
 // the same reason every other provider gets its own named source.
 const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
-const jiraProjectEnabled = rules.some((r) => r.enabled && r.resourceProvider === "jira-project");
+const jiraProjectEnabled = getRules().some((r) => r.enabled && r.resourceProvider === "jira-project");
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
+const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
 // BUTCHR-408: unlike every rule above, the managed-sessions query is built
 // into the daemon, never a user rules.json rule — it always runs (no
 // staffing gate, same "every enabled filesystem rule always runs" reasoning
@@ -537,9 +771,11 @@ const admissionController = createAdmissionController({
   // Rule for every heterogeneous definition file, so it cannot carry a
   // per-file role itself).
   roleOf: roleOfAgent,
+  // FACTORY-907: see `rateLimitOfAgent`'s own doc comment above.
+  rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(fsRules.length ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -588,7 +824,7 @@ const dashboardWithheldStatusFloor = new StatusFloorTracker(() => Date.now());
 const metaFor = (key: string): IssueMeta | undefined => {
   const query = decodeQueryAgentKey(key);
   if (!query) return issueMeta.get(resourceKeyOf(key));
-  const rule = rules.find((r) => r.id === query.ruleId && r.resourceProvider === query.resourceProvider);
+  const rule = getRules().find((r) => r.id === query.ruleId && r.resourceProvider === query.resourceProvider);
   return { summary: rule ? `${rule.id} (query agent)` : "(query agent — rule not found)", issuetype: "task" };
 };
 const dashboardFeed = createDashboardFeed({
@@ -701,6 +937,13 @@ const filesystemHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * FILESYSTEM_POLL_MS),
   log: (line) => console.error(line),
 });
+const confluencePageHealth = createResourceLoopHealth({
+  name: "confluence-page",
+  enabled: confluencePageEnabledRules.length > 0,
+  ...(confluencePageEnabledRules.length ? {} : { disabledReason: "no enabled confluence-page rules" }),
+  thresholdMs: Math.max(config.pollStaleMs, 3 * CONFLUENCE_PAGE_POLL_MS),
+  log: (line) => console.error(line),
+});
 // BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
 const managedSessionsHealth = createResourceLoopHealth({
   name: "managed-sessions",
@@ -746,8 +989,173 @@ const isStaffed = async (key: string): Promise<boolean | null> => {
   }
 };
 
+// FACTORY-647: resolved ONCE — the real production resolution
+// (src/web/static-assets.ts), read both by the startup check right below and
+// by `/health`'s `dashboardApp` field (see `health` in `buildApp(...)`
+// below) — never two independent resolutions that could disagree.
+const dashboardAppRoot = resolveWebRoot();
+
 const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.port}`, herd, (line) => console.error(line));
+
+// FACTORY-660: `GET /api/rules/:id/preview`'s own dry-run — one shared
+// instance (not rebuilt per request) so its per-rule rate-limit map
+// actually accumulates across requests. Reuses THIS daemon's own LIVE
+// `getRules` (review round 2, R2: a function, read fresh every call — see
+// `RulesPreviewDeps.rules`'s own doc comment — never a startup snapshot, so
+// a reload takes effect on the very next preview) and the SAME
+// `atlassian.searchAll` capability the poll loops themselves call — the
+// ONLY Jira capability it is ever given.
+const rulesPreviewer = createRulesPreviewer({ rules: getRules, search: (jql) => atlassian.searchAll(jql), maxAgents: config.maxAgents });
+
+// FACTORY-662: this process's one CSRF token (`GET /api/session` hands it
+// out; every write route checks it) — minted once, here, never per-request
+// and never persisted (see `../web/csrf.ts`'s own header).
+const csrfIssuer = createCsrfTokenIssuer();
+
+// N2 (FACTORY-678): ONE shared per-client write-flood limiter instance —
+// same discipline as `rulesPreviewer`/`scopeOf` above — covering all four
+// write-shaped routes (`../web/view.ts` wires this same instance into
+// each), at its own real default window/cap (`../web/write-rate-limit.ts`).
+const writeRateLimit = createWriteRateLimiter();
+
+// FACTORY-664: a SEPARATE, tighter limiter for `POST /api/settings/jira/test`
+// (1 per 5s, per the ticket's own spec) — this route makes a real outbound
+// credentialed call, so it does not share the generic write budget above.
+const jiraTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
+
+// FACTORY-665: `POST /api/daemon/restart`'s own limiter — 1 per 10 minutes,
+// per the ticket's own spec. Keyed by a single fixed string (not per-client
+// like `writeRateLimit`/`jiraTestRateLimit` above): restarting butchr once
+// already affects every client, so there is no meaningful per-client budget
+// to track separately.
+const daemonRestartRateLimitInstance = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 1 });
+const daemonRestartRateLimit = () => daemonRestartRateLimitInstance("daemon-restart");
+// FACTORY-665 (PR-2): `PUT /api/settings/jira/token` (rotation) gets its own
+// setup-code manager — this daemon is already configured, so no code is
+// minted at startup (there is nothing to onboard); an operator mints one
+// on demand via `SIGUSR2` whenever they actually want to rotate the token
+// (same handler setup mode installs — see `../setup/setup-code.ts`'s own
+// header for why this exists in BOTH modes, not just the unconfigured one).
+const jiraTokenRotateCodeManager = createSetupCodeManager();
+installSetupCodeSigusr2Handler(jiraTokenRotateCodeManager, (line) => console.error(line));
+// Same two-budget shape setup mode uses for the identical reason — see
+// `ViewDeps.jiraTokenTestRateLimit`/`jiraTokenWriteRateLimit`'s own doc
+// comments (`../web/view.ts`).
+const jiraTokenTestRateLimit = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 5 });
+const jiraTokenWriteRateLimit = createWriteRateLimiter({ windowMs: 60 * 60_000, max: 3 });
+
+// FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
+// itself (same directory FACTORY-658's own backups live in) — every
+// accepted/rejected write appends one line here AND raises a non-deduped
+// alert through the SAME Rocket.Chat poster the managed-session escalator
+// and ops-alert router already share (`teamAdminNotify`, defined further
+// down this file) — referenced here only inside a closure not called until
+// an actual write happens, well after `teamAdminNotify` is initialized; see
+// `ptyAttach.read`'s own comment just below in this file for the identical,
+// already-established pattern.
+const auditLogPath = join(dirname(rulesPath()), WEB_WRITE_AUDIT_LOG_BASENAME);
+// B4 (agentsafety second pass): ONE logger instance, not rebuilt per call —
+// its rejected-write aggregation (`createAuditLogger`'s own header) only
+// works if the SAME instance sees every write.
+const auditWrite = createAuditLogger({
+  append: fileAuditAppend(auditLogPath),
+  // Deferred to CALL time (not evaluated here) — `teamAdminNotify` is
+  // declared further down this file; this closure isn't invoked until an
+  // actual write happens, well after it's initialized. Same pattern as
+  // `ptyAttach.read`'s own comment elsewhere in this file.
+  postAlert: (text: string) => (teamAdminNotify ? teamAdminNotify(config.opsAlert.room, text) : Promise.resolve()),
+  host: hostname(),
+  log: (line) => console.error(line),
+});
+
+// FACTORY-662's own rules-write orchestration (`../rules/rules-write.ts`),
+// bound to THIS daemon's env/config. `reload` calls the REAL
+// `reloadRules(rulesHolder)` (FACTORY-657, merged) — the SAME function
+// `SIGHUP` already calls below, so a web write's reload and a SIGHUP's
+// reload can never drift: every consumer reading through `getRules()`
+// (the whole daemon, after FACTORY-657) sees the swap on its very next
+// poll, no restart needed (B5a, agentsafety second pass: the previous
+// version left this a stub — a UI write reported `reload:{"applied":true}`
+// while the holder kept the OLD query). `scopeOf` reuses the SAME
+// previewer `GET /api/rules/:id/preview` already shares — never a second
+// Jira query mechanism — and fails safe (treats a failed/unavailable
+// preview as an unbounded scope, which forces the confirm gate rather than
+// silently skipping it). N1 (FACTORY-678): wrapped in `createScopeCache`
+// (`../rules/rules-write.ts`) — ONE shared 10s-TTL cache, so `planRuleWrite`
+// and `writeRuleEnabled` calling this for the SAME rule id moments apart
+// (a UI's normal plan-then-apply flow) share one real previewer call
+// instead of the second one being refused by the previewer's own 2s
+// per-rule rate limit (which previously fell through to the
+// `Number.POSITIVE_INFINITY` fail-safe below, tripping the scope ceiling
+// on every back-to-back apply).
+const scopeOf = createScopeCache(async (id: string, queryOverride: string): Promise<number> => {
+  const result = await rulesPreviewer(id, queryOverride);
+  return result.ok ? result.total : Number.POSITIVE_INFINITY;
+});
+const rulesWriteDeps = {
+  env: process.env,
+  reload: () => {
+    const result = reloadRules(rulesHolder);
+    // FACTORY-685 (N4): every successful write already calls this via
+    // `toOutcome` — clearing the scope cache here, unconditionally, means a
+    // cached scope reading can never outlive the write (or SIGHUP, or the
+    // `reloadRulesNow` HTTP route below, which clear it the same way) that
+    // may have invalidated it.
+    scopeOf.clear();
+    return { applied: result.ok, problems: result.problems };
+  },
+  // STALE-FILE REFUSAL (agentsafety second pass): the daemon's own
+  // currently-loaded rules etag — see `RulesWriteDeps.getSourceEtag`'s own
+  // doc comment (`../rules/rules-write.ts`) for the incident this closes.
+  getSourceEtag: () => rulesHolder.getSourceEtag(),
+};
+
+// FACTORY-666 — shared by every `agentsWrite.*` binding above: this
+// daemon's own already-constructed `ops` (Jira) and `herd` (process
+// control/stop), plus `config.assignees` (the SAME `Roles` shape
+// `atlassianTools`'s own `adopt_worker` already staffs by — `../tools/
+// relationship.ts`'s `Roles` is a structural duplicate of `AssigneeRoles`,
+// never a second type).
+const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
+
+// FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+// path's own deps — `dir`/`store` are the SAME `sessionDefinitionsPath()`/
+// `defaultSessionFreezeIo().store` `configInventory` above already reads,
+// never a second resolution. `lastUiWrite` is its OWN ref (undo scoped to
+// THIS write path only, never shared with `rulesWriteDeps.lastUiWrite`).
+const sessionDefinitionsWriteDeps = {
+  dir: () => sessionDefinitionsPath(),
+  store: defaultSessionFreezeIo().store,
+  lastUiWrite: { value: null } as SessionDefinitionLastUiWriteRef,
+};
+
+// FACTORY-962 (epic FACTORY-659, slice D1 follow-up): the links write
+// path's own deps — `path` is the SAME `defaultLinksStorePath()` the
+// `butchr link` CLI and `resourceLinkTools` already read/write, never a
+// second resolution. `lastUiWrite` is its OWN ref (undo scoped to THIS
+// write path only, never shared with `sessionDefinitionsWriteDeps.lastUiWrite`).
+const linksWriteDeps = {
+  path: () => defaultLinksStorePath(),
+  lastUiWrite: { value: null } as LastLinksUiWrite,
+};
+
+// FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
+// caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
+// HTTP exposure of the SAME trigger) are literally the same function —
+// defined once here so the two call sites can never drift from each other
+// or from `SIGHUP`'s own handler below, which also calls `reloadRules`
+// directly against this one `rulesHolder`.
+const reloadRulesInProcess = () => {
+  const result = reloadRules(rulesHolder);
+  scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
+  return result;
+};
+
 const { app, mcp } = buildApp({
+  getRules,
+  getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
+  reloadRulesNow: reloadRulesInProcess,
+  daemonReload: reloadRulesInProcess,
   state: async () => {
     return (await herd.managedAgents()).map(({ issue, status }) => ({
       issue,
@@ -759,7 +1167,7 @@ const { app, mcp } = buildApp({
     const pane = await herd.paneFor(issue);
     if (!pane) return { ok: false, error: "agent not running for " + issue };
     if (!terminalPrefix) return { ok: false, error: "no terminal emulator found (set BUTCHR_TERMINAL)" };
-    Bun.spawn([...terminalPrefix, "herdr", "agent", "attach", pane], { stdio: ["ignore", "ignore", "ignore"] });
+    Bun.spawn(terminalCommand(terminalPrefix, pane), { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
   // BUTCHR-267: pane-keyed sibling of `open` above — the dashboard row link
@@ -771,13 +1179,36 @@ const { app, mcp } = buildApp({
   // handed to `herdr agent attach`.
   openPane: async (pane) => {
     const livePanes = (await herd.managedAgents()).map((agent) => agent.pane);
-    const hasDisplay = Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
+    const hasDisplay = hasDesktopDisplay(process.env);
     const decision = resolveAttach(pane, livePanes, terminalPrefix ?? null, hasDisplay);
     if (!decision.ok) return { ok: false, error: attachRefusalMessage(decision.refusal) };
     Bun.spawn(decision.argv, { stdio: ["ignore", "ignore", "ignore"] });
     return { ok: true };
   },
-  health: () => combineHealth([loopHealth, notifyHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, managedSessionsHealth], unresolvedRuleRelationships, escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings()),
+  // FACTORY-666 — the dashboard's agent-control panel: start, stop, shelve,
+  // adopt and prioritize a fleet worker ticket. `agentWriteDeps` below
+  // reuses this daemon's OWN already-constructed `ops` (Jira) and `herd`
+  // (process control) — no second Jira client, no second herdr client.
+  agentsWrite: {
+    snapshot: (issue) => agentSnapshot(agentWriteDeps, issue),
+    start: (issue) => doAgentStart(agentWriteDeps, issue),
+    planStop: (issue) => planAgentStop(agentWriteDeps, issue),
+    stop: (issue) => doAgentStop(agentWriteDeps, issue),
+    planShelve: (issue, reason) => planAgentShelve(agentWriteDeps, issue, reason),
+    shelve: (issue, reason) => doAgentShelve(agentWriteDeps, issue, reason),
+    adopt: (issue, input) => doAgentAdopt(agentWriteDeps, issue, input),
+    prioritize: (issue, priority) => doAgentPrioritize(agentWriteDeps, issue, priority),
+  },
+  // FACTORY-772: `issueLoopWatchdog` is assigned further below (after the
+  // issue loop itself is started — see that call site's own comment for
+  // why), but this closure only runs lazily per `/health` request, by which
+  // point module-load has long finished and the forward reference has
+  // resolved — same reasoning as every other health-sibling source here.
+  // FACTORY-752 (FACTORY-746 (c)): `permissionAnswerHealth` (assigned further
+  // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
+  // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
+  // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
@@ -791,7 +1222,7 @@ const { app, mcp } = buildApp({
   // startup above), never a second load or a second staffing decision.
   configInventory: () =>
     buildQueryAgentInventory({
-      rulesFile: { path: rulesPath(), rules, error: null },
+      rulesFile: { path: rulesPath(), rules: getRules(), error: null },
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
@@ -849,46 +1280,256 @@ const { app, mcp } = buildApp({
     send: (pane, text) => sendPane(pane, text),
     pollMs: 250,
   },
+  // FACTORY-660: the rules page's own Origin/Host guard — this daemon's own
+  // loopback origin at its own port, never a configurable allowlist (see
+  // src/web/dashboard-origin-guard.ts's own header).
+  dashboardOriginGuard: { port: config.port },
+  // FACTORY-660 (SPEC CHANGE (c); PR #642 review round 2, G2/G3): same-UID
+  // peer check for BOTH `GET /api/rules` and `GET /api/rules/:id/preview`
+  // — `client` (address+port) is read in src/web/view.ts from
+  // `server.requestIP(request)`; this daemon's own listening address+port
+  // (`DAEMON_HOSTNAME`/`config.port`) is the other half of the FULL socket
+  // 4-tuple `peer-uid.ts` looks up in `/proc/net/tcp`(6) (G3: matching on
+  // port alone is not a unique socket identity). FACTORY-662 (write path)
+  // builds its own equivalent closure from the SAME `isSameUidPeer` helper,
+  // over the SAME `{ address: DAEMON_HOSTNAME, port: config.port }`.
+  peerUidCheck: (client) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }),
+  // FACTORY-660: `GET /api/rules`' own data — SAME discipline as
+  // `configInventory` above: `rules: getRules()`/`error: null` are this
+  // daemon's own already-loaded, already-validated LIVE values (review
+  // round 2, R2 — read fresh, through the holder, never a startup-only
+  // array; an invalid file would have kept this daemon from starting at
+  // all, so `error` here is always `null`), never a second parse. `mtime`
+  // and `fileEtag` (review round 1, note (b); review round 2, G1:
+  // `rulesEtag()`, FACTORY-658, FACTORY-662's F7 requirement) are the real
+  // per-request I/O this route needs (the file's own current bytes/mtime),
+  // accepted for the same reason `configInventory` above accepts its own
+  // session-definition-listing I/O: a distinct, infrequently-hit route,
+  // never on `/`'s or `/dashboard`'s own request path. `getRulesSourceEtag()`
+  // (passed to `buildApp` above) is read fresh too, by this route itself —
+  // that gap between it and this call's own `fileEtag` is exactly what
+  // `stale` reports.
+  // FACTORY-729: `GET /api/rules/catalog`'s own data — pure constants, no I/O.
+  rulesCatalog: () => RULE_FORM_CATALOG,
+  rulesFileState: async () => {
+    let mtime: string | null = null;
+    try {
+      mtime = (await stat(rulesPath())).mtime.toISOString();
+    } catch {
+      mtime = null;
+    }
+    return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
+  },
+  rulesPreview: (id, queryOverride) => rulesPreviewer(id, queryOverride),
+  // FACTORY-662: the write path's own deps — see the comments just above
+  // `rulesWriteDeps`'s own declaration for why `reload` is a stub and
+  // `scopeOf` reuses `rulesPreviewer`.
+  csrf: csrfIssuer,
+  writeGuard: { dashboardOriginGuard: { port: config.port }, peerUidCheck: (client) => isSameUidPeerAsync(client, { server: { address: DAEMON_HOSTNAME, port: config.port } }), csrf: csrfIssuer },
+  rulesWrite: {
+    enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
+    fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
+    undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
+    plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+    // FACTORY-731: `hasLiveAgents` reads the SAME poll-fed
+    // `dashboardFeed.snapshot().rows` every other "is this rule staffed"
+    // check in this daemon already reads (`ruleHasLiveAgent`'s own doc
+    // comment, `../agents/query-agent-inventory.ts`, names the exact race
+    // this accepts) — never a fresh census of its own.
+    delete: (id, ifMatch, confirm) => writeRuleDelete(id, ifMatch, confirm, (ruleId) => ruleHasLiveAgent(ruleId, dashboardFeed.snapshot().rows), rulesWriteDeps),
+    // FACTORY-927: the SAME shared `scopeOf`/`rulesWriteDeps` every other
+    // rules write above reuses — `createRule`'s own reload-on-success and
+    // stale-file refusal ride the identical wiring, never a second copy.
+    create: (input, confirm, planHash) => createRule(input, confirm, planHash, scopeOf, rulesWriteDeps),
+    planCreate: (input, confirm) => planRuleCreate(input, confirm, scopeOf, rulesWriteDeps),
+  },
+  // FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+  // orchestration (`../resources/session-definitions-write.ts`) — reuses
+  // this daemon's own already-constructed `sessionDefinitionsWriteDeps`
+  // above, never a second freeze store or directory resolution.
+  sessionDefinitionsWrite: {
+    fields: (name, patch, ifMatch, confirm) => writeSessionDefinitionFields(sessionDefinitionsWriteDeps, name, patch, ifMatch, confirm),
+    frozen: (name, frozen, ifMatch) => writeSessionDefinitionFrozen(sessionDefinitionsWriteDeps, name, frozen, ifMatch),
+    undo: (backupId) => writeSessionDefinitionUndo(sessionDefinitionsWriteDeps, backupId),
+  },
+  // FACTORY-962 (epic FACTORY-659, slice D1 follow-up): `GET /api/links`'s
+  // own read — the file-backed link store only (see `listAllFileLinks`'s
+  // own header for why a jira-project-owned link can't be enumerated this
+  // way), read fresh every request, same discipline as `configInventory`.
+  linksRead: () => listAllFileLinks(defaultLinksStorePath()),
+  // FACTORY-962: the links write orchestration (`../resources/links-write.ts`)
+  // — reuses this daemon's own already-constructed `linksWriteDeps` above,
+  // never a second path resolution.
+  linksWrite: {
+    add: (resource, target) => writeLinkAdd(linksWriteDeps, resource, target),
+    remove: (resource, target) => writeLinkRemove(linksWriteDeps, resource, target),
+    undo: (backupId) => writeLinkUndo(linksWriteDeps, backupId),
+  },
+  auditWrite,
+  writeRateLimit,
+  // FACTORY-664 (epic FACTORY-659, slice S1, READ-ONLY): `GET /api/settings`'s
+  // own data — read fresh every request (one `fs.stat` plus a best-effort
+  // `systemctl --user show` call), never a startup snapshot, same discipline
+  // as `rulesFileState` above.
+  // FACTORY-665: `effectiveEnv` (settings.json layered under `process.env`,
+  // computed once at startup above) is what this daemon ACTUALLY runs
+  // with; `process.env` itself (unmerged) and the settings.json values it
+  // was built from are passed through too, so `buildSettingEntries` can
+  // report `source: "environment" | "file" | "default"` correctly for
+  // every allowlisted key — see that function's own doc comment.
+  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
+  // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
+  // daemon's own already-loaded credentials, never anything from the
+  // request itself.
+  jiraTest: () => testJiraConnection(config.atlassian),
+  jiraTestRateLimit,
+  // FACTORY-665: `PUT /api/settings/:key` — writes through
+  // `writeSetting` (`../settings/write-settings.ts`), then re-reads the
+  // SAME effective response `GET /api/settings` would serve (process.env
+  // itself is unaffected by a settings.json write — only a restart picks
+  // up the new value, hence `restartNeeded: true` on every allowlisted
+  // key — but the just-written settings.json value is still worth
+  // reflecting back immediately as `source: "file"`, so the UI's "restart
+  // needed" badge has an accurate current/pending value to show it against).
+  settingsWrite: async (key, value, confirm) => {
+    writeSetting(key, value, confirm);
+    const fresh = loadSettingsFile(process.env);
+    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
+  },
+  // FACTORY-665: `POST /api/daemon/restart` — fixed-argv `systemctl --user
+  // restart butchr.service`, ONLY when this daemon is actually running
+  // under that unit (see `../web/daemon-restart.ts`'s own header).
+  daemonRestart: () => restartDaemon(),
+  daemonRestartRateLimit,
+  // FACTORY-668 (C1, read): `currentSystemdInfo()` is this process's OWN
+  // measured identity — the SAME derivation `ENVIRONMENT.md`'s "ground
+  // truth" and `/health`'s `build.unit`/`build.journalctl` already use —
+  // never a guessed unit name.
+  daemonLogs: () => readDaemonLogs(currentSystemdInfo(), { maxLines: DEFAULT_DAEMON_LOGS_MAX_LINES, maxBytes: DEFAULT_DAEMON_LOGS_MAX_BYTES }),
+  // FACTORY-665 (PR-2): this daemon is already configured, so `GET
+  // /api/setup/status` always reports `configured: true` here — the
+  // dashboard's Setup page never shows once this is wired (setup mode,
+  // `./setup-mode.ts`, is the only place `configured: false` is ever
+  // returned).
+  setupStatus: () => ({ configured: true }),
+  // `PUT /api/settings/jira/token` — ROTATION only: site/email are this
+  // daemon's own already-loaded `config.atlassian` values (never settable
+  // from the request body here — see `ViewDeps.jiraTokenRotate`'s own doc
+  // comment), and `requireEnvCheck: true` means an env-provided token
+  // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 before
+  // the setup code is even checked.
+  jiraTokenRotate: (input, rateGate) => handleJiraTokenWrite(
+    { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
+    { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
+    { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
+  ),
+  jiraTokenTestRateLimit,
+  jiraTokenWriteRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
 // loop reads.
 }, {
-  // Jira/Confluence tools refuse github-issue, github-pr, jira-idea, zendesk-ticket and filesystem agents; each provider's own tools exist only when its rules run.
-  ...forJiraCallers(atlassianTools(ops, undefined, config.assignees, recordOwnWrite, isStaffed)),
-  // FACTORY-7/FACTORY-5: registered unconditionally, unlike every
-  // provider-specific tool set below it — the local file store needs no
-  // credentials and works for every ResourceRef kind, and a `jira-project`
-  // owner routes to the project-property-backed store instead (this daemon
-  // already has Jira credentials loaded, unlike the CLI, so the factory
-  // below is cheap and side-effect-free rather than genuinely lazy) — see
-  // `src/resources/link-store-router.ts` for the routing decision itself.
-  ...resourceLinkTools(
-    routingLinkStore,
-    (line) => console.error(line),
-  ),
-  ...(githubIssues ? githubIssueTools({ client: githubIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(githubPrs ? githubPrTools({ client: githubPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(zendeskTickets ? zendeskTicketTools({ client: zendeskTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(jiraIdeas ? jiraIdeaTools({ client: jiraIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  // Linking needs both providers running: authorization reads both loops' latest matches.
-  ...(githubIssues && jiraIdeas ? ideaGithubLinkTools({ ideas: jiraIdeas, github: githubIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
-  // BUTCHR-456: registered unconditionally, like resourceLinkTools above — a
-  // managed-session agent needs no external credential to be authorized
-  // (the grant lives in another definition's own manifest), and the SAME
-  // sessionDefinitionsPath()/listFilesystemResources/defaultSessionFreezeIo()
-  // the managed-sessions loop and `butchr session` CLI already use, never a
-  // second resolution of "where definitions live" or "which freeze store".
+  // Provider operations use the daemon's connections, independent of caller role.
+  ...providerAtlassianTools(ops, undefined, recordOwnWrite),
+  ...resourceLinkTools(routingLinkStore, (line) => console.error(line)),
+  ...(githubToolIssues ? githubIssueTools({ client: githubToolIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(githubToolPrs ? githubPrTools({ client: githubToolPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(zendeskToolTickets ? zendeskTicketTools({ client: zendeskToolTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  ...(jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
+  // Linking requires both configured provider clients; their account checks remain authoritative.
+  ...(githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  // Session control retains its explicit controller authorization and containment.
   ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
 console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${describeConfig(config)})`);
+
+// FACTORY-657 (FACTORY-643 slice 1, epic FACTORY-659): re-read rules.json
+// without a restart. `reloadRules` (src/rules/reload.ts) goes through the
+// exact same `loadRules` validation `butchr rules check` already dry-runs
+// — on a problem it leaves `rulesHolder` untouched (the running rules keep
+// running) and this logs the problem(s) once; on success it swaps the
+// holder's contents IN PLACE, which every provider's own per-poll read
+// (see `RulesHolder`'s own doc comment) picks up on its very next poll. A
+// rule a reload removes or disables does not kill its agent(s) mid-ticket:
+// the reconciler's ordinary stop/reap path ends them on a later poll,
+// exactly as a restart's first poll already does today (README's own
+// "Applying a change" section) — this changes nothing about that.
+//
+// No new HTTP route and no CLI subcommand here, per this ticket's own
+// scope correction (FACTORY-657 comment, 2026-10-05): the web write path
+// FACTORY-663 adds will call `reloadRules(rulesHolder)` in-process, right
+// after it writes rules.json itself, using this SAME function — SIGHUP is
+// the only trigger this daemon listens for on its own.
+//
+// Reload is per-poll, not instantaneous: every rule-reading site above
+// reads `getRules()` live, and several of them do so at more than one
+// `await` boundary within the SAME poll (e.g. a loop's `search()` reading
+// `deps.rules` once, then a later step reading it again). A SIGHUP landing
+// mid-poll can therefore be visible partway through that one poll's own
+// work; it is always fully applied by the NEXT poll. This mirrors the
+// existing restart behavior (the first poll after a restart already reads
+// whatever rules.json says then) and is not a new kind of tear — see
+// `test/unit/rules-reload.test.ts`'s own "does not tear" case for what IS
+// guaranteed: a single `discovery.search()` call's own result set never
+// mixes pre- and post-reload rules.
+//
+// Review round 1 (manager-factory): several startup-only computations do
+// NOT follow a reload, because they gate whether a provider's client/loop
+// exists AT ALL, not just which of its rules are enabled — `jiraProjectEnabled`,
+// `fsRules`, `githubStaffing.run`/`githubPrStaffingResult.run`,
+// `zendeskStaffing` (also re-reading its OAuth token file would be wrong -
+// credentials don't change via a rules reload), and `jiraIdeas`'s client
+// creation. A provider with ZERO enabled rules of its own kind at startup
+// has no running loop for SIGHUP to wake: bringing up that provider's very
+// first rule still needs a restart. `sweepStaleAgentLabels` similarly runs
+// once, at startup, and is unaffected either way.
+process.on("SIGHUP", () => {
+  const before = rulesHolder.getRules().length;
+  const result = reloadRules(rulesHolder);
+  scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
+  if (!result.ok) {
+    console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
+    for (const line of result.problems) console.error(`  ${line}`);
+    return;
+  }
+  const enabled = rulesHolder.getRules().filter((r) => r.enabled).map((r) => r.id);
+  // Deliberately loud (not just "0 enabled") when a previously non-empty
+  // rules set reloads to zero: `reloadRules` above already refuses to swap
+  // in a MISSING file over a non-empty holder (that's the accident case),
+  // so reaching zero here means the file was present and parsed to
+  // genuinely zero enabled rules — an operator's real "disable everything"
+  // — but it is rare enough, and consequential enough (every rule-having
+  // agent stops on the next reconcile poll), to call out by name rather
+  // than let it read like any other reload.
+  console.error(
+    enabled.length === 0 && before > 0
+      ? `butchr: rules reloaded from ${result.path}: 0 enabled (was ${before}) — every rule-having agent will stop on the next reconcile poll`
+      : `butchr: rules reloaded from ${result.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : ""}`,
+  );
+  if (result.added.length) console.error(`  added: ${result.added.join(", ")}`);
+  if (result.removed.length) console.error(`  removed: ${result.removed.join(", ")}`);
+  if (result.changed.length) console.error(`  changed: ${result.changed.join(", ")}`);
+  if (!result.added.length && !result.removed.length && !result.changed.length) console.error(`  no change`);
+});
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
 // daemon's own /health `build` field serves (see `health` above) — never a
 // second derivation — so a journal window can be attributed to a BUILD, not
 // only a pid (journald's pid only bounds one daemon generation).
 console.error(`  ${describeBuild(toBuildReport(buildIdentity))}`);
+// FACTORY-647: "fail loudly at startup" — the journal half of this ticket's
+// fix, naming the exact missing path and remedy; `/health`'s `dashboardApp`
+// field (see `health` above) is the OTHER half, for an uptime checker. Never
+// fatal: the old server-rendered pages (`/`, `/configurations`) work fine
+// without this build, so the daemon starts either way.
+{
+  const startupDashboardAppStatus = dashboardAppStatus(dashboardAppRoot);
+  if (!startupDashboardAppStatus.built) {
+    console.error(`  [butchr:dashboard-app] web build missing at ${startupDashboardAppStatus.path} — run \`bun run build:web\` (or \`bun run build\`) and restart; GET /dashboard-app/* will 503 until then`);
+  }
+}
 console.error(`  terminal: ${terminalPrefix ? terminalPrefix.join(" ") : "NONE — set BUTCHR_TERMINAL to open agent shells"}`);
 if (!config.github) console.error("  pr:* labels disabled: set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS to enable PR discovery");
 
@@ -916,17 +1557,23 @@ const prTracker = config.github ? new PrTracker({ fetchImpl: fetch, token: confi
 // KAN-804/807: "idle since it stopped working, never spoke" — comments are only fetched
 // for issues that already satisfy the cheap preconditions (see stalled.ts),
 // never on every poll.
-// BUTCHR-305/BUTCHR-238: extracted so `createLabelSync` below and
-// `pinnedActiveDetector` further down (project loop only) share the SAME
-// herdr.agent.list() read rather than each defining its own — "wire from the
-// existing seam, do not add a second reader". Behaviour-preserving: this is
-// the exact closure `syncLabels` was already given, moved to a name instead
-// of an inline argument.
-/** The ticket a pane's workspace works, for rule-engine workspaces only — a legacy workspace is never attributed to its ticket. */
-const ownedAgentOfCwd = (cwd: string | null | undefined): string | null => {
-  const id = agentIdOfWorkspacePath(cwd);
-  return id && ownsRuleAgent(id) ? id : null;
-};
+// BUTCHR-305/BUTCHR-238: extracted so this closure is importable by name
+// rather than reproduced inline — `createLabelSync` below has since moved to
+// its own `agentStatusesFeedingDashboard` tee (FACTORY-407, see that
+// closure's own doc comment), so the one live consumer of THIS closure today
+// is `pinnedActiveDetector` further down (project loop only, FACTORY-941).
+/**
+ * The ticket a pane's workspace works, for rule-engine workspaces only — a
+ * legacy workspace is never attributed to its ticket.
+ *
+ * Deliberately gated by `ownsRuleAgent` (jira-work only): this feeds
+ * `resourceOfCwd` (label sync) and `escalationTargetOfCwd` (the
+ * blocked-dialog escalator), and neither may ever see a `jira-project`
+ * manager pane (an escalation target there would open a Confluence-comment
+ * write and control channel on it). The dashboard's own, wider gate is
+ * `dashboardAgentOfCwd` below.
+ */
+const { ownedAgentOfCwd, dashboardAgentOfCwd } = cwdAgentResolvers(agentIdOfWorkspacePath);
 const resourceOfCwd = (cwd: string | null | undefined): string | null => {
   const id = ownedAgentOfCwd(cwd);
   return id ? resourceKeyOf(id) : null;
@@ -944,7 +1591,7 @@ const resourceOfCwd = (cwd: string | null | undefined): string | null => {
  * status map (`statusMapFromAgents`, which needs the BARE key to match a
  * Jira search's own issue keys). FACTORY-407: the dashboard no longer goes
  * through `resourceOfCwd` at all — `agentStatusesFeedingDashboard` below
- * feeds `buildDashboardRows` the FULL owned key (`ownedAgentOfCwd` itself,
+ * feeds `buildDashboardRows` the FULL key (`dashboardAgentOfCwd`,
  * undiscarded) via a separate `agent_key` field, because `resourceOfCwd`'s
  * bare fallback is exactly what made every real `AgentDashboardRow.resourceKey`
  * undecodable — see that ticket for the full history.
@@ -962,9 +1609,18 @@ const statusMapFromAgents = (agents: readonly DashboardAgent[]): ReadonlyMap<str
   }
   return m;
 };
+// FACTORY-941: keyed by the FULL agentKey (`dashboardAgentOfCwd`, both
+// `jira-work` and `jira-project` providers — see `cwdAgentResolvers`'s own
+// doc comment, src/agents/dashboard.ts), never the bare key `resourceOfCwd`
+// produces: `pinnedActiveDetector`'s ids are `ProjectMatch.agentKey`
+// (`desiredFrom`'s `discovery.idOf` for the project resource type —
+// src/rules/jira-project-type.ts), which `resourceOfCwd` would always
+// resolve to `null` for (it is DELIBERATELY gated to `ownsRuleAgent` —
+// see `ownedAgentOfCwd`'s own doc comment above), making this map
+// structurally incapable of matching a project id if built that way.
 const agentStatuses = async (): Promise<ReadonlyMap<string, string>> => {
   const { agents } = await herdr.agent.list();
-  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd) })));
+  return statusMapFromAgents(agents.map((a) => ({ ...a, resource_key: dashboardAgentOfCwd(a.cwd) })));
 };
 // BUTCHR-269/BUTCHR-308: the ISSUE loop's own `agentStatuses`, identical to
 // the shared one above except that it tees /dashboard's poll-fed snapshot off
@@ -1004,9 +1660,9 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
       // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
       // own correlation identifier (`buildDashboardRows`); `resource_key`
       // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
-      // `statusMapFromAgents` below already needs. One `ownedAgentOfCwd` call
-      // per agent either way — `resourceOfCwd` already makes its own.
-      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: ownedAgentOfCwd(a.cwd) })) };
+      // `statusMapFromAgents` below already needs. `agent_key` uses the
+      // dashboard-only `dashboardAgentOfCwd`; `resource_key` stays on `ownedAgentOfCwd`.
+      return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: dashboardAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
     coverage.recordDeclined(DASHBOARD_DETECTOR);
@@ -1015,9 +1671,21 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   coverage.recordChecked(DASHBOARD_DETECTOR);
   return statusMapFromAgents(agents);
 };
+let stalledMinutesByIssue: ReadonlyMap<string, number> = new Map();
 const stalled = createStalledCheck({
   now: () => Date.now(),
   minutes: config.stalledMinutes,
+  minutesFor: (issue) => stalledMinutesByIssue.get(issue),
+  comments: (issue) => atlassian.comments(issue),
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-740: dry-run only — see src/agents/silent-stop.ts's own top
+// comment. `undefined` when BUTCHR_SILENT_STOP_MODE=off, the same
+// disables-entirely-when-omitted shape `stalled`/`stallRemediation` use —
+// src/labels/sync.ts's `silentStop?.check` is then simply never called.
+const silentStop = config.silentStopMode === "off" ? undefined : createSilentStopCheck({
+  now: () => Date.now(),
+  suppressMinutes: config.silentStopSuppressMinutes,
   comments: (issue) => atlassian.comments(issue),
   log: (line) => console.error(`  ${line}`),
 });
@@ -1069,6 +1737,100 @@ const stallRemediation = createStallRemediator({
   labels: async (key) => (await ops.getIssue(key) as { fields?: { labels?: string[] } })?.fields?.labels ?? [],
   log: (line) => console.error(`  ${line}`),
 });
+
+// FACTORY-845: this poll's resolved idle-poke config per issue, built from
+// the rule engine's own (rule, issue) matches just before `syncLabels` runs
+// (see the `syncLabels: (matches) => ...` wiring further down this file) —
+// `syncLabels` itself only ever sees de-duplicated issues, never the match
+// list that produced them (src/rules/resource-type.ts's `uniqueIssues`
+// deliberately discards rule identity), so this is the one place that
+// association is still available. A ticket matched by more than one
+// enabled rule resolves by the most conservative reading per field,
+// independently: ANY matching rule's explicit `idlePokeEnabled: false`
+// disables the poke outright (an opt-out from one rule should never be
+// overridden by another rule's silence); among rules that leave it
+// enabled, the SMALLEST explicit `idlePokeMinutes` wins (the more urgent
+// configured interval, never the global, never an unset rule's silence);
+// the first matching rule's explicit `idlePokeMessage` wins (arbitrary but
+// deterministic — multi-rule-match on one ticket is an edge case this
+// story's acceptance criteria do not exercise, so this is a simple,
+// documented default rather than a modelled trade-off).
+const idlePokeRuleConfigByIssue = new Map<string, IdlePokeRuleConfig>();
+function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): void {
+  idlePokeRuleConfigByIssue.clear();
+  for (const m of resourceMatches(units)) {
+    if (!m.rule.enabled) continue;
+    const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
+    if (m.rule.idlePokeEnabled === false) {
+      idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
+      continue;
+    }
+    if (existing?.idlePokeEnabled === false) continue; // an earlier rule's explicit opt-out already wins
+    const idlePokeMinutes = m.rule.idlePokeMinutes !== undefined && (existing?.idlePokeMinutes === undefined || m.rule.idlePokeMinutes < existing.idlePokeMinutes) ? m.rule.idlePokeMinutes : existing?.idlePokeMinutes;
+    const idlePokeMessage = existing?.idlePokeMessage ?? m.rule.idlePokeMessage;
+    idlePokeRuleConfigByIssue.set(m.issue.key, {
+      idlePokeEnabled: true,
+      ...(idlePokeMinutes !== undefined ? { idlePokeMinutes } : {}),
+      ...(idlePokeMessage !== undefined ? { idlePokeMessage } : {}),
+    });
+  }
+}
+
+// FACTORY-941: this poll's resolved pinned-active minutes override per
+// jira-project agentKey — `pinnedActiveMinutesFor` (src/rules/
+// jira-project-type.ts, exported there so its resolution logic is directly
+// unit-testable without importing this module) rebuilds this fresh from
+// each poll's own matches; see the `projectType.discovery.search` wrap
+// further down for exactly where/why.
+let pinnedActiveMinutesByProject: ReadonlyMap<string, number> = new Map();
+
+// FACTORY-845: the channel half, copying the SAME call shape every other
+// delivery seam in this file already uses (`deliverNotice`/
+// `renderNotifyDelivery`, the MCP notify call, `herd.nudge`) — an
+// EIGHTH seam in this file, which is why
+// test/unit/notify-deliver-seams.test.ts's exact-count assertions are
+// updated in this same commit (7 -> 8) — see that test file's own doc
+// comment and this story's PR body for why that is the INTENDED outcome of
+// adding a seam, not a sign anything is wrong.
+// FACTORY-1010: deliberately does NOT read `Rule.notifyDeliveryMode` here.
+// This seam already resolves config across however many rules match one
+// ISSUE (`idlePokeRuleConfigByIssue`/`updateIdlePokeRuleConfig` above), a
+// different shape than every OTHER seam's one-rule-per-agent-key lookup
+// (`ruleNotifyDeliveryMode`) — merging a categorical transport choice the
+// same way `idlePokeEnabled`/`idlePokeMinutes`/`idlePokeMessage` already
+// merge is left to a follow-up rather than guessed at here. This is also a
+// stall-remediation wake nudge, not an update notification about a ticket
+// change, which is the event family this ticket's acceptance criteria name.
+const deliverIdlePoke = async (issue: string, text: string): Promise<{ via: "channel" | "prompt" }> => {
+  const result = await deliverNotice({
+    pushChannel: () => notifyAgent(mcp, issue, issue, text),
+    nudgePrompt: () => herd.nudge(issue, text),
+  });
+  console.error(`  [notify] ${issue} ← idle-poke: ${renderNotifyDelivery(result)}`);
+  // FACTORY-1010: `result.via` is never `"none"` here — this call passes no
+  // explicit `mode`, and `"none"` is only ever returned for one (src/notify/
+  // deliver.ts's own doc comment on `NotifyDelivery`).
+  if (result.via === "none") throw new Error(`unreachable: deliverIdlePoke got via "none" without an explicit mode (${issue})`);
+  return { via: result.via };
+};
+
+// FACTORY-845: the per-rule-configurable idle poke — see src/agents/
+// idle-poke.ts's own top comment for why this is a separate, thin module
+// built on `stalled`'s own streak rather than an extension of
+// `stallRemediation` above. `undefined` when BUTCHR_IDLE_POKE_MODE=off,
+// the same disables-entirely-when-omitted shape `silentStop` above uses.
+const idlePoke = config.idlePokeMode === "off" ? undefined : createIdlePokeEngine({
+  now: () => Date.now(),
+  dryRun: config.idlePokeMode !== "live",
+  globalMinutes: config.stalledMinutes,
+  defaultMessage: DEFAULT_IDLE_POKE_MESSAGE,
+  suppressMinutes: config.idlePokeSuppressMinutes,
+  maxPokesPerPoll: config.idlePokeMaxPerPoll,
+  comments: (issue) => atlassian.comments(issue),
+  addComment: async (issue, text) => { await ops.addComment(issue, text); },
+  deliver: deliverIdlePoke,
+  log: (line) => console.error(`  ${line}`),
+});
 // BUTCHR-24: escalates a staffed child stuck in To Do under a live boss —
 // see src/agents/parked.ts. Posts through the same `ops.addComment` seam as
 // every other daemon-side comment write; no second Atlassian writer.
@@ -1115,7 +1877,7 @@ const abandonedDetector = createAbandonedDetector({
   addComment: async (issue, text) => { await ops.addComment(issue, text); },
   comments: ownChannelComments,
   links: (issue) => atlassian.links(issue),
-  todoWorkers: createTodoWorkersFetch({ search: (jql) => atlassian.search(jql) }),
+  todoWorkers: createTodoWorkersFetch({ searchAll: (jql) => atlassian.searchAll(jql) }),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-141: audible-only crash-loop detection — see src/agents/crash-loop.ts
@@ -1170,7 +1932,7 @@ const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== n
 // (below) now always runs, a `.butchr-rc-accounts.json` read every 30
 // minutes, even on a daemon that will never provision anything.
 const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
-if (!rcAuth.ok && rules.some((r) => r.enabled && r.account !== "none")) {
+if (!rcAuth.ok && getRules().some((r) => r.enabled && r.account !== "none")) {
   console.error(`  WARNING: [account] enabled rule(s) request a Rocket.Chat account policy but Rocket.Chat is not usable (${rcAuth.reason}) — every ensureAccount call will refuse until this is fixed`);
 }
 const rcClient = rcAuth.ok
@@ -1268,6 +2030,47 @@ const managedSessionCrashLoopDetector = createCrashLoopDetector({
   addComment: async (id, text) => { console.error(`  [managed-sessions:crash-loop] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
   comments: () => Promise.resolve([]),
   log: (line) => console.error(`  ${line}`),
+  // FACTORY-622: the two `addComment`/`comments` lines directly above are
+  // the whole defect this adds a channel for — they are correct, and they
+  // reach a journal on one host and nothing else. A managed session's crash
+  // loop was therefore invisible twice over: 2026-10-02 (director and
+  // genius, "nowhere to post") and 2026-10-03 (admin-brooswit-nexus, 26
+  // "refusing implicit replacement" refusals, "a crash-loop complaint that
+  // reached only the journal"). Wired ONLY here, never into
+  // `issueCrashLoopDetector` above, which already posts on the resource's
+  // own ticket — see `CrashLoopDetectorDeps.opsAlert`'s own doc comment for
+  // that reasoning and for why this is a thunk: `opsAlertRouter` is
+  // constructed several hundred lines below, after the Rocket.Chat
+  // credential it needs is loaded, so reading it by value here would be a
+  // temporal-dead-zone access.
+  opsAlert: () => opsAlertRouter,
+  refusalReason: (id) => herd.lastSpawnRefusal(id),
+});
+// FACTORY-501 (FACTORY-500 item 2, option b) — audible-only escalation for a
+// herdr-restored pane stuck "deferred"/"stuck" on `herd.resumeInPlace()`, so
+// a busy-forever restored agent is never silently degraded with no notice —
+// see `src/agents/restored-pane-escalation.ts`'s own top comment for the
+// full mechanism. TWO SEPARATE INSTANCES, same reasoning as
+// issueCrashLoopDetector/managedSessionCrashLoopDetector above: an issue-tier
+// agent has a Jira ticket to comment on, a managed-session agent (buddy,
+// genius) does not.
+const issueRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => {
+    if (isQueryLevelAgent(id)) { console.error(`  [restored-pane-escalation] ${id}: query-level agent — no single ticket to comment on, skipping`); return; }
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-501: a managed-session agent has NO Jira ticket to comment on at
+// all — same reasoning as `managedSessionCrashLoopDetector` immediately
+// above, and every id this instance ever sees is one of these ids (wired
+// ONLY into `startManagedSessionsLoop` below), so `addComment` always logs
+// rather than branching on `isQueryLevelAgent`.
+const managedSessionRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => { console.error(`  [managed-sessions:restored-pane-escalation] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
+  log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
 // see src/agents/reconcile-failure.ts for the full mechanism, and that
@@ -1301,6 +2104,23 @@ const issueReconcileFailureDetector = createReconcileFailureDetector({
 // second close. `herd` (the raw HerdrHerd instance, not `scopedHerd`'s
 // wrapper) is used directly — `strandedCandidates`/`closeStranded` are
 // HerdrHerd methods outside the `Herd` interface `scopedHerd` wraps.
+// A successful stop/reap is authoritative evidence that this daemon owned the
+// pane. Purge every agent:* value, including agent:none, through the existing
+// quiet writer and own-write ledger; no comment or notification path exists.
+const purgeStoppedAgentLabels = async (agentKeys: readonly string[]): Promise<void> => {
+  const keys = [...new Set(agentKeys.map(resourceKeyOf))];
+  if (!keys.length) return;
+  const issues = await atlassian.search(`key IN (${keys.join(",")})`);
+  const written: string[] = [];
+  for (const issue of issues) {
+    const remove = issue.labels.filter(isAgentLabel);
+    if (!remove.length) continue;
+    await labelWriter.updateLabels(issue.key, { remove });
+    written.push(issue.key);
+  }
+  if (written.length) recordOwnWrite(written, DAEMON_WRITER);
+};
+
 const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
@@ -1311,6 +2131,7 @@ const issueReaper = createReaper({
   // nothing else in this daemon would otherwise release a temporary account
   // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
   ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
+  onReaped: async (agentKey) => purgeStoppedAgentLabels([agentKey]),
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-287: a live per-issue residency census, independent of
@@ -1360,8 +2181,18 @@ const syncLabels = createLabelSync({
   ...(prTracker ? { prState: (key: string) => prTracker.stateFor(key), onPollEnd: () => prTracker.endPoll() } : {}),
   stalled,
   stallRemediation,
+  ...(silentStop ? { silentStop } : {}),
+  ...(idlePoke ? { idlePoke, idlePokeRuleConfig: (key: string) => idlePokeRuleConfigByIssue.get(key) } : {}),
   withheld: issueAdmissionWithheld,
   coverage,
+  reconcileAbsentLiveAgentLabels: (liveKeys, ownedKeys) => sweepAbsentLiveAgentLabels({
+    search: (jql) => atlassian.search(jql),
+    jira: labelWriter,
+    liveKeys,
+    ownedKeys,
+    onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
+    log: (line) => console.error(`  ${line}`),
+  }),
   onWrite: (keys) => recordOwnWrite(keys, DAEMON_WRITER),
   log: (line) => console.error(`  ${line}`),
 });
@@ -1390,7 +2221,7 @@ watchSessionLimits({
 // while the daemon was down. createLabelSync's bookkeeping is in-memory and
 // the 15s poll only ever sees active tickets, so nothing else ever revisits
 // this. Not a new polling timer — runs once, here, and never again.
-if (rules.some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
+if (getRules().some(r => r.enabled && r.resourceProvider === "jira-work")) void sweepStaleAgentLabels({
   search: (jql) => atlassian.search(jql),
   jira: labelWriter,
   log: (line) => console.error(`  ${line}`),
@@ -1411,6 +2242,24 @@ if (rules.some(r => r.enabled && r.resourceProvider === "jira-work")) void sweep
 // src/jira-watch/linked-eventing.ts's own top comment for why this is
 // "UNCHANGED IN SHAPE": the actual channel-push mechanism below is
 // untouched, only its `reason` branching gains one more case).
+// FACTORY-1010 — the per-rule explicit delivery choice (`Rule.notifyDeliveryMode`),
+// resolved once here and reused by every rule-owned `deliverNotice` seam
+// below. A direct lookup, never the idle-poke engine's own multi-rule-per-
+// ISSUE merge (`updateIdlePokeRuleConfig` below): an agent key carries
+// exactly the one rule that owns it (`decodeAnyAgentKey`'s own doc comment,
+// src/rules/agent-key.ts), so there is no "several rules matched one
+// agent" case to resolve here the way several rules CAN match one issue.
+// `undefined` — the absent case `deliverNotice` itself already treats as
+// today's channel-first/prompt-fallback behaviour — for a key that fails
+// to decode, or whose owning rule cannot be found (defensive; every real
+// agent key handed to a `deliver` closure was produced for a rule
+// `getRules()` still lists).
+const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined => {
+  const decoded = decodeAnyAgentKey(agent);
+  if (!decoded) return undefined;
+  return getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider)?.notifyDeliveryMode;
+};
+
 const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
   // BUTCHR-398 (review finding 5): `issue` is the agent's OWN identity —
   // for a query-level agent that's its own query key, shown as-is in
@@ -1425,17 +2274,26 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const msg = reason && "linked" in reason ? linkedChangeNudge(issue, reason.linked.events)
     : reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
     : changeNudge(issue, aboutIssue, reason);
-  void notifyAgent(mcp, agent, aboutIssue, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-  const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
+  const result = await deliverNotice({
+    pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
+    nudgePrompt: () => herd.nudge(agent, msg),
+    mode: ruleNotifyDeliveryMode(agent),
+  });
   const reasonTag = notifyReasonTag(reason);
-  const promptState = outcome.refusal
-    ? `refused (session limit, resets ${outcome.refusal.resetsAt !== null ? new Date(outcome.refusal.resetsAt).toISOString() : "unknown"})`
-    : outcome.delivered ? "delivered" : "refused/absent";
-  console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: Claude channel attempted (Codex excluded), prompt ${promptState}`);
+  console.error(`  [notify] ${agent} ← ${aboutIssue}${reasonTag}: ${renderNotifyDelivery(result)}`);
 };
 
+// FACTORY-922: lifetime count of `decide()`'s skip-not-notify fallback —
+// see `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+let commentChecksSkipped = 0;
+
+// FACTORY-972: lifetime counts of the `agent:stalled` boss wake — see
+// `stalledWakes`/`stalledWakesCapped`'s own doc comments (src/daemon/health.ts).
+let stalledWakes = 0;
+let stalledWakesCapped = 0;
+
 const ruleResourceType = createRuleResourceType({
-  rules,
+  rules: getRules(),
   // searchAll, never search: a first-page-only result would read as tickets
   // leaving the query and stop their agents.
   search: async (jql) => {
@@ -1446,6 +2304,21 @@ const ruleResourceType = createRuleResourceType({
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   comments: (key) => atlassian.comments(key),
   log: (line) => console.error(`  ${line}`),
+  // FACTORY-922: the `/health` counter's one writer — see
+  // `commentChecksSkipped`'s own doc comment (src/daemon/health.ts).
+  onCommentCheckSkipped: () => { commentChecksSkipped++; },
+  // FACTORY-949: the boss-wake debounce window — see
+  // `Config.blockedWakeDebounceMinutes`'s own doc comment.
+  blockedWakeDebounceMinutes: config.blockedWakeDebounceMinutes,
+  // FACTORY-972: the boss stalled-wake debounce/cap — see
+  // `Config.stalledWakeDebounceMinutes`/`stalledWakeMaxPerHour`'s own doc
+  // comments.
+  stalledWakeDebounceMinutes: config.stalledWakeDebounceMinutes,
+  stalledWakeMaxPerHour: config.stalledWakeMaxPerHour,
+  // FACTORY-972: the `/health` counters' one writer each — see
+  // `stalledWakes`/`stalledWakesCapped`'s own doc comments (src/daemon/health.ts).
+  onStalledWake: () => { stalledWakes++; },
+  onStalledWakeCapped: () => { stalledWakesCapped++; },
   runningIds: async () => (await herd.runningIssues()).filter(ownsRuleAgent),
   // BUTCHR-436: gates each rule's own `linkedRemoteLinks` opt-in — a rule
   // that leaves it absent/false never calls this (see
@@ -1476,7 +2349,19 @@ const ruleResourceType = createRuleResourceType({
   notify: notifyRuleAgent,
 });
 
-runResourceLoop(ruleResourceType, {
+// FACTORY-772: wrapped in a function, rather than called inline once, so
+// the watchdog below can discard a wedged loop's `Stop` handle and start a
+// completely independent replacement in its place — see
+// src/daemon/loop-watchdog.ts's own top comment for why this (never a
+// shared in-flight flag the old and new loop would have to race over) is
+// the restart shape this ticket's watchdog relies on. Every dependency
+// closed over here (herd, ops, the detectors, admissionController, …) is
+// itself a long-lived instance shared across every call, so a restart
+// recreates ONLY the `watch()` loop's own internal state (RespawnGuard,
+// ResumeDeferGuard, the notify-tick hash counter — all local to
+// `runResourceLoop`/`startLoop`) — never re-registers an agent, re-reads
+// config, or duplicates any of this daemon's other long-lived state.
+const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   herd,
   ownsId: ownsRuleAgent,
   notify: notifyRuleAgent,
@@ -1489,6 +2374,23 @@ runResourceLoop(ruleResourceType, {
     const issue = resourceKeyOf(agent);
     await ops.addComment(issue, respawnComment(agent, reason, new Date().toISOString())).catch((e) =>
       console.error(`  WARNING: [reconcile] respawn notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
+  },
+  onStopped: (agent) => purgeStoppedAgentLabels([agent]),
+  // FACTORY-916: `herd.lastFreshSpawnResumed` told `reconcileNow` this
+  // respawn resumed its prior Claude session via an ordinary fresh spawn
+  // (never `resumeInPlace()` — that is `onResumePreserved` below), so it
+  // fires INSTEAD OF `onRespawn` above for this one respawn — see that
+  // callback's own doc comment (src/daemon/loop.ts) for why exactly one of
+  // the two always fires. Posts the third wording (`respawnResumedComment`),
+  // not `respawnComment` (wrongly says "this session is fresh") and not
+  // `resumePreservedComment` (wrongly says "your ticket has not changed" —
+  // this agent's PROCESS was actually gone, unlike `resumeInPlace()`'s).
+  onRespawnResumed: async (agent) => {
+    console.error(`  [reconcile] ${agent} respawned, resumed its prior session`);
+    if (isQueryLevelAgent(agent)) return;
+    const issue = resourceKeyOf(agent);
+    await ops.addComment(issue, respawnResumedComment(agent, new Date().toISOString())).catch((e) =>
+      console.error(`  WARNING: [reconcile] respawn-resume notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
   // FACTORY-314: a model/effort-only change resumed the SAME session —
   // distinct marker/wording from `onRespawn` above (never "re-read your
@@ -1513,9 +2415,24 @@ runResourceLoop(ruleResourceType, {
     await ops.addComment(issue, `[butchr:resume] A model/effort change for ${agent} is still waiting to resume (checked ${consecutivePolls} polls ago and every poll since): ${why}. Nothing was interrupted; the daemon will keep retrying rather than force a restart.`).catch((e) =>
       console.error(`  WARNING: [reconcile] resume-waiting notice failed for ${agent}: ${(e as Error)?.message ?? e}`));
   },
+  // FACTORY-501: the herdr-RESTORED-PANE deferred/stuck counterpart of
+  // `onResumeWaiting` immediately above — see
+  // `src/agents/restored-pane-escalation.ts`'s own top comment. Never called
+  // for a model/effort-only deferral (src/daemon/loop.ts's own split at the
+  // `RESTORED_PANE_STALE_REASON_PREFIX` check).
+  checkRestoredPaneDeferred: issueRestoredPaneEscalationDetector.check,
   // Label sync and the parked/abandoned detectors work per TICKET, so they
   // see each matched issue once however many rules matched it.
-  syncLabels: (matches) => syncLabels(uniqueIssues(matches)),
+  syncLabels: (matches) => {
+    // FACTORY-845: refresh this poll's per-issue idle-poke rule config
+    // BEFORE calling syncLabels, from the SAME matches it is about to
+    // discard rule identity from — see `updateIdlePokeRuleConfig`'s own
+    // doc comment above for why this is the only place that association
+    // is still available.
+    if (idlePoke) updateIdlePokeRuleConfig(matches);
+    stalledMinutesByIssue = stalledMinutesForIssues(matches);
+    return syncLabels(uniqueIssues(matches));
+  },
   checkParked: (matches) => parkedDetector.check(uniqueIssues(matches), []),
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
   checkCrashLoop: issueCrashLoopDetector.check,
@@ -1534,6 +2451,34 @@ runResourceLoop(ruleResourceType, {
   onNotifySuccess: () => notifyHealth.recordSuccess(),
 });
 
+let stopIssueLoop = startIssueLoop();
+
+// FACTORY-772: the backstop for any never-settling await that
+// BUTCHR_HERDR_TIMEOUT_MS and the permission-answer watchdog do NOT cover
+// (see src/daemon/loop-watchdog.ts's own top comment) — `pollLoop` and
+// `notify` are two independent liveness heartbeats for the ONE issue loop
+// started above, so both names share a single restart action: discard the
+// current `Stop` handle and start a completely fresh loop in its place.
+// Reported under BOTH names in `/health`'s `loopWatchdog` sibling (wired
+// into the `health` callback far above this file — see that call site's
+// own comment for why the forward reference there is safe) since one
+// restart fixes both.
+const issueLoopWatchdog = createLoopWatchdog(
+  [{
+    names: ["pollLoop", "notify"],
+    components: () => [...loopHealth.status().components, ...notifyHealth.status().components],
+    restart: () => {
+      try {
+        stopIssueLoop();
+      } catch (e) {
+        console.error(`  WARNING: [watchdog] stopping the wedged issue loop threw (starting its replacement anyway): ${(e as Error)?.message ?? e}`);
+      }
+      stopIssueLoop = startIssueLoop();
+    },
+  }],
+  { thresholdMs: config.loopWatchdogThresholdMs, log: (line) => console.error(line) },
+);
+
 // The github-issue rule loop: its own agents only, its own admission bucket
 // under the same host cap, and none of the Jira-writing detectors above.
 if (githubIssues) console.error(`  github-issue rules: ${githubStaffing.rules.map((r) => r.id).join(", ")}`);
@@ -1544,12 +2489,16 @@ let ideaMatches: readonly RuleMatch[] = [];
 startGithubIssueLoop({
   onMatches: (matches) => { githubMatches = matches; },
   staffing: githubStaffing,
+  rules: getRules(),
   client: githubIssues ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_ISSUE),
@@ -1567,12 +2516,16 @@ startGithubIssueLoop({
 if (githubPrs) console.error(`  github-pr rules: ${githubPrStaffingResult.rules.map((r) => r.id).join(", ")}`);
 startGithubPrLoop({
   staffing: githubPrStaffingResult,
+  rules: getRules(),
   client: githubPrs ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_GITHUB_PR),
@@ -1590,7 +2543,7 @@ startGithubPrLoop({
 if (jiraIdeas) console.error(`  jira-idea rules: ${ideaRules.map((r) => r.id).join(", ")}`);
 if (!githubIssues && ideaRules.some((r) => r.relationships?.inwardConnectionRules?.length)) console.error("  WARNING: jira-idea rules list github-issue rules, but github-issue rules are not staffed; ideas hear no GitHub issues");
 startJiraIdeaLoop({
-  rules,
+  rules: getRules(),
   search: async (jql) => {
     const issues = await atlassian.searchAll(jql);
     for (const i of issues) issueMeta.set(i.key, { summary: i.summary, issuetype: i.issuetype });
@@ -1605,9 +2558,12 @@ startJiraIdeaLoop({
   } : {}),
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (key, updated, watcher) => ownWrites.shouldSuppress(key, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_IDEA),
@@ -1624,12 +2580,16 @@ startJiraIdeaLoop({
 if (zendeskStaffing.run) console.error(`  zendesk-ticket rules: ${zendeskStaffing.rules.map((r) => r.id).join(", ")} (subdomain ${zendeskStaffing.subdomain})`);
 startZendeskTicketLoop({
   staffing: zendeskStaffing,
+  rules: getRules(),
   client: zendeskTickets ?? { searchAll: async () => [], comments: async () => [] },
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_ZENDESK_TICKET),
@@ -1647,12 +2607,15 @@ startZendeskTicketLoop({
 // (a file or directory) is never written to by butchr itself.
 if (fsRules.length) console.error(`  filesystem rules: ${fsRules.map((r) => r.id).join(", ")}`);
 startFilesystemLoop({
-  rules,
+  rules: getRules(),
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_FILESYSTEM),
   onAdmitted: admissionController.recordSpawned,
@@ -1663,9 +2626,45 @@ startFilesystemLoop({
   onError: (e) => filesystemHealth.recordError(e),
 });
 
+// FACTORY-998: the confluence-page rule loop — its own agents and admission
+// bucket, reusing the SAME `ops` (AtlassianOps) instance every other
+// Confluence/Jira read path in this daemon already uses: no new credential,
+// no new staffing gate (see `confluencePageEnabledRules`'s own comment,
+// above `fsRules`).
+if (confluencePageEnabledRules.length) console.error(`  confluence-page rules: ${confluencePageEnabledRules.map((r) => r.id).join(", ")}`);
+startConfluencePageLoop({
+  rules: getRules(),
+  getChildPages: (parentId, cursor) => ops.getChildPages(parentId, cursor),
+  getPageVersions: (pageIds) => ops.getPageVersions(pageIds),
+  getPageComments: (pageId) => ops.getPageComments(pageId),
+  getPage: (pageId) => ops.getPage(pageId),
+  herd,
+  deliver: async (agent, resource, msg) => {
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+      mode: ruleNotifyDeliveryMode(agent),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_CONFLUENCE_PAGE),
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => confluencePageHealth.recordSuccess(),
+  onError: (e) => confluencePageHealth.recordError(e),
+});
+
 // BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
 // read from rules.json, over the well-known definitions directory. Same
 // admission/health wiring shape as every rule loop above, its own bucket.
+//
+// FACTORY-1010: deliberately OUT of this ticket's scope — its agents come
+// from `SessionDefinition` manifests (src/resources/session-definition.ts),
+// never a `Rule`, so there is no `notifyDeliveryMode` to read here, and
+// `ruleNotifyDeliveryMode` is not called below (it would resolve to
+// `undefined` for any key it was handed anyway, byte-identical to today).
 console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
 startManagedSessionsLoop({
   roles: managedSessionRoles,
@@ -1675,15 +2674,39 @@ startManagedSessionsLoop({
   account: accountLifecycle,
   herd,
   deliver: async (agent, resource, msg) => {
-    void notifyAgent(mcp, agent, resource, msg).catch((e) => console.error(`  [notify] Claude channel failed: ${String(e)}`));
-    const outcome = await herd.nudge(agent, msg).catch((): NudgeResult => ({ delivered: false }));
-    console.error(`  [notify] ${agent}: Claude channel attempted (Codex excluded), prompt ${outcome.delivered ? "delivered" : "refused/absent"}`);
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
   },
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_MANAGED_SESSIONS),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
   checkCrashLoop: managedSessionCrashLoopDetector.check,
+  // FACTORY-505: the gap FACTORY-500 found and this comment used to name —
+  // `onResumeWaiting`/`onResumePreserved` never reached `startManagedSessionsLoop`
+  // at all, so a managed session (buddy, genius) deferring a model/effort
+  // resume was silent however long it deferred, and a successful in-place
+  // resume never even logged. Same "no Jira ticket to comment on" reasoning
+  // as `managedSessionCrashLoopDetector`/`managedSessionRestoredPaneEscalationDetector`
+  // above — log only, never `ops.addComment`. See
+  // `ManagedSessionsLoopDeps.onResumeWaiting`/`.onResumePreserved`'s own doc
+  // comments (src/daemon/session-definitions-loop.ts).
+  onResumeWaiting: (agent, outcome, consecutivePolls) => {
+    console.error(`  [managed-sessions:resume-waiting] ${agent}: resume still waiting after ${consecutivePolls} polls (${outcome}) — no Jira ticket to comment on, logging instead`);
+  },
+  onResumePreserved: (agent) => {
+    console.error(`  [managed-sessions] ${agent} resumed in place (session preserved)`);
+  },
+  // FACTORY-501: REQUIRED wiring — without this, a restored-pane escalation
+  // would silently never fire for buddy/genius (the canary set), the exact
+  // gap FACTORY-500 found in `onResumeWaiting`/`onResumePreserved` above
+  // `startManagedSessionsLoop` never receiving them either. See
+  // `ManagedSessionsLoopDeps.checkRestoredPaneDeferred`'s own doc comment
+  // (src/daemon/session-definitions-loop.ts).
+  checkRestoredPaneDeferred: managedSessionRestoredPaneEscalationDetector.check,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => managedSessionsHealth.recordSuccess(),
   onError: (e) => managedSessionsHealth.recordError(e),
@@ -1735,16 +2758,22 @@ const managedEscalationAuth = config.managedEscalationRocketChat
       ROCKETCHAT_ADMIN_TOKEN_FILE: config.managedEscalationRocketChat.adminTokenFile,
     })
   : { ok: false as const, reason: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL/_USER_ID/_TOKEN_FILE not set" };
+// FACTORY-609 (Part B): the same one credential now posts to EITHER room —
+// there is no second Nexus grant, only a second ROOM, and RocketChatPoster
+// already takes a channel per call (FACTORY-607 comment 28784 item 4). The
+// routing values themselves (which room/mention each tier uses) live in
+// `config.managedEscalationRouting`, always present regardless of whether
+// this credential is configured — see that field's own doc comment.
+const managedEscalationRooms = [...new Set([config.managedEscalationRouting.normalRoom, config.managedEscalationRouting.assemblyRoom, config.managedEscalationRouting.directorRoom])];
 if (!managedEscalationAuth.ok) {
-  console.error(`  managed-session #team-admin escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
+  console.error(`  managed-session escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
 } else {
-  console.error(`  managed-session #team-admin escalation enabled → #${config.managedEscalationRocketChat!.room} (Rocket.Chat)`);
+  console.error(`  managed-session escalation enabled → #${managedEscalationRooms.join(", #")} (Rocket.Chat)`);
 }
 const teamAdminNotify = managedEscalationAuth.ok
   ? (() => {
       const poster = createRocketChatPoster({ fetchImpl: fetch, url: managedEscalationAuth.url, adminUserId: managedEscalationAuth.adminUserId, adminToken: managedEscalationAuth.adminToken });
-      const room = config.managedEscalationRocketChat!.room;
-      return async (text: string) => { await poster.postMessage(room, text); };
+      return async (room: string, text: string) => { await poster.postMessage(room, text); };
     })()
   : undefined;
 
@@ -1785,6 +2814,7 @@ const escalator = createEscalator({
   // FACTORY-369: absent (undefined) whenever `managedEscalationAuth` isn't
   // ok — see that constant's own comment just above for the fallback.
   ...(teamAdminNotify ? { teamAdminNotify } : {}),
+  managedEscalationRouting: config.managedEscalationRouting,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
@@ -1864,7 +2894,76 @@ blockingEscalationTimer.unref?.();
 // host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
 // the full design and why its delivery (a journal line + a `/health` sibling
 // field, both below) survives a dead Claude credential.
-const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now() });
+// FACTORY-630: the PUSH destination for this alert, and for every later ops
+// condition that reuses the route. Built on the SAME `teamAdminNotify`
+// closure the managed-session escalator is wired behind above — one poster,
+// one credential, a second room per call, no second Rocket.Chat client. When
+// that credential is absent, `post` is undefined and the router degrades to
+// its own journal line, leaving this alert exactly as it behaved before this
+// ticket (the journal line and `/health` below are untouched by it).
+const opsAlertRouter = createOpsAlertRouter({
+  ...(teamAdminNotify ? { post: teamAdminNotify } : {}),
+  room: config.opsAlert.room,
+  mention: config.opsAlert.mention,
+  host: hostname(),
+  now: () => Date.now(),
+  log: (line) => console.log(line),
+  dedupWindowMs: config.opsAlert.dedupMinutes * 60_000,
+});
+if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
+else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
+
+// FACTORY-665: the settings.json problems already logged to the journal
+// above (before `opsAlertRouter` existed this early in the file) ALSO get
+// an ops alert, one per problem, `dedupWindowMs: 0` (non-deduped — same
+// "never swallowed by the router's own hourly dedup" reasoning as the
+// first-run-seed alert just below), since these are the "refuse LOUDLY"
+// cases the ticket's own design constraint calls out by name.
+for (const problem of settingsFileResult.problems) {
+  opsAlertRouter.raise({ key: `settings-file-problem:${problem}`, condition: "settings-file-problem", subject: settingsFilePath(), reason: problem, dedupWindowMs: 0 });
+}
+
+// FACTORY-669, agentsafety constraint 4: one alert, raised here rather than
+// at the seed's own call site (far above, before `opsAlertRouter` existed —
+// see `firstRunSeedOutcome`'s own comment there). The "vanished" case passes
+// `dedupWindowMs: 0` so it is never swallowed by the router's ordinary
+// hourly dedup (agentsafety: "a vanished rules file on an established
+// install must be noticed") — moot for THIS call alone (seeding runs once
+// per process, so the router's in-memory dedup state can never have seen
+// this key before), but it makes the non-deduped intent explicit rather
+// than relying on that coincidence.
+if (firstRunSeedOutcome.kind === "seeded") {
+  opsAlertRouter.raise({
+    key: "first-run-seed",
+    condition: "first-run-seed",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: `seeded one disabled template rule (${FIRST_RULE_ID}) at true first run`,
+    remedy: "Edit the template rule's query in the dashboard, then enable it; its brief is file-only, edited in the rules file by hand if you want it.",
+  });
+} else if (firstRunSeedOutcome.kind === "vanished-established-install") {
+  opsAlertRouter.raise({
+    key: `rules-file-vanished:${firstRunSeedOutcome.path}`,
+    condition: "rules-file-vanished",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: "the default rules file is absent but a prior .bak-* backup exists in its directory — an established install's rules file appears to have vanished, so no first-run template was seeded",
+    remedy: "Restore the rules file (from a .bak-* backup, or by hand) and SIGHUP/restart the daemon; nothing is staffed until then.",
+    dedupWindowMs: 0,
+  });
+} else if (firstRunSeedOutcome.kind === "config-dir-not-empty") {
+  // FACTORY-685 (L1): same non-deduped discipline as the "vanished" case
+  // above — this is also "an established install some other way", never
+  // swallowed by the router's ordinary hourly dedup.
+  opsAlertRouter.raise({
+    key: `rules-config-dir-not-empty:${firstRunSeedOutcome.path}`,
+    condition: "rules-config-dir-not-empty",
+    subject: `rules file ${firstRunSeedOutcome.path}`,
+    reason: "the default rules file is absent and its directory holds no .bak-* backup, but the directory already holds other state — this looks like an established install some other way, so no first-run template was seeded",
+    remedy: "Add a rules file (from a backup, or by hand) and SIGHUP/restart the daemon; nothing is staffed until then.",
+    dedupWindowMs: 0,
+  });
+}
+
+const credentialDeathTracker = createCredentialDeathTracker({ log: (line) => console.log(line), now: () => Date.now(), opsAlert: opsAlertRouter });
 const loginExpiredWatcher = createLoginExpiredWatcher({
   onLoginExpired: (escalation) => credentialDeathTracker.onLoginExpired(escalation),
   onLoginExpiredResolved: (resolved) => credentialDeathTracker.onLoginExpiredResolved(resolved),
@@ -1941,11 +3040,19 @@ function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const decoded = decodeAnyAgentKey(id);
   return decoded && decoded.kind === "resource" ? basename(decoded.resourceId) : id;
 }
+// FACTORY-581 SAFETY GUARD 4: canary narrowing, applied AFTER `lizardModeLabel`
+// decides a pane's label exactly as before — see `Config.permissionAnswerCanaryPaneLabel`'s
+// own doc comment for the one-step rollback/widen and why this rides the
+// existing `eligiblePanes` gate instead of a new flag. Unset (the default):
+// every pane `lizardModeLabel` allows stays eligible, byte-for-byte today's
+// behaviour.
 const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: string | null | undefined }[]): ReadonlyMap<string, string> => {
   const out = new Map<string, string>();
   for (const a of agents) {
     const label = lizardModeLabel(a.cwd);
-    if (label) out.set(a.pane_id, label);
+    if (!label) continue;
+    if (config.permissionAnswerCanaryPaneLabel !== undefined && label !== config.permissionAnswerCanaryPaneLabel) continue;
+    out.set(a.pane_id, label);
   }
   return out;
 };
@@ -1983,6 +3090,23 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // one sweep, same bound as before this ticket), not the only path.
 const PERMISSION_ANSWER_INTERVAL_MS = 20_000;
 const PERMISSION_ANSWER_READ_TIMEOUT_MS = 8_000;
+// FACTORY-752 (FACTORY-746 (c)): liveness for the permission-answer tick —
+// the exact observable the 10-08 incident's own silence was missing (two
+// `agent.list()` rejections, then NO line at all until a 50-minute-later
+// restart). `thresholdMs` follows the SAME "at least three polls of the
+// slower loop" convention the resource-loop healths above already use
+// (`Math.max(config.pollStaleMs, 3 * <this loop's own interval>)`) — three
+// missed sweeps (60s) is long enough that an ordinary slow tick (one pane
+// near its own `PERMISSION_ANSWER_READ_TIMEOUT_MS` deadline) never trips it,
+// but short enough that a genuinely wedged loop is flagged in roughly a
+// minute, not the ~50 minutes the incident actually ran silent for. See
+// `createTickHealth`'s own doc comment (src/daemon/health.ts) for why this
+// rides in `components[]` (the liveness AND) rather than beside it.
+const permissionAnswerHealth = createTickHealth({
+  name: "permissionAnswer",
+  thresholdMs: Math.max(config.pollStaleMs, 3 * PERMISSION_ANSWER_INTERVAL_MS),
+  log: (line) => console.error(line),
+});
 // FACTORY-100/FACTORY-103: OFF unless BUTCHR_LIZARD_APPROVAL_SOUND is set
 // (see Config.lizardApprovalSound's own doc comment) — `enabled: false`
 // makes `createApprovalSoundNotifier` return a no-op `notifyApproved` before
@@ -2013,9 +3137,44 @@ async function* paneAgentStatusFrames(sub: Awaited<ReturnType<DrovrClient["subsc
     }
   }
 }
+/**
+ * FACTORY-722: `DrovrClient.subscribe`/`HerdrClient.subscribe` opens its own
+ * long-lived connection OUTSIDE `rpc()` (`Subscription.open`,
+ * `@brooswit/herdr-sdk`) and never reads `herdr`'s own `timeoutMs` at all —
+ * confirmed against that package's own source, which passes only
+ * `socketPath` through, never the options object `timeoutMs` lives on. So
+ * `config.herdrCallTimeoutMs` (which bounds every OTHER call this daemon
+ * makes through `herdr`, including `agent.list()`) does nothing for this
+ * one — a hung connect or a never-acked `events.subscribe` here would still
+ * wedge `permission-answer-watch.ts`'s `runSubscription` forever without
+ * this wrapper, leaving the push fast-path permanently unarmed (the sweep
+ * alone would still answer prompts, just without the fast path — but a
+ * caller can't know that from here, so this closes the gap rather than
+ * relying on the fallback). Reuses `config.herdrCallTimeoutMs` rather than a
+ * second knob — this is the same "a herdr call must not hang forever" bound,
+ * just on the one call path the SDK doesn't already cover.
+ */
+// A `const` capture, not a direct `config.herdrCallTimeoutMs` read below:
+// `config` itself is an un-annotated `let` narrowed by control flow (see its
+// own declaration above), and TypeScript cannot carry that narrowing into a
+// hoisted top-level `function` declaration — reading `config` directly from
+// inside one (as the deadline guard below originally did) makes the WHOLE
+// variable implicitly `any`, including every other read of it in this
+// file. A `const` has a definite type at its own declaration site
+// regardless of where it's later closed over, so capturing the one field
+// this function needs here sidesteps the problem entirely.
+const HERDR_CALL_TIMEOUT_MS = config.herdrCallTimeoutMs;
+// FACTORY-751/FACTORY-775: ONE guard instance for the lifetime of this
+// daemon process, shared across every `subscribeAgentStatus` call
+// (including across resubscribes with a different pane-id set) — see
+// `createOutstandingGuard`'s own doc comment (herdr-subscribe-deadline.ts)
+// for why a fresh instance per call would defeat the bound entirely.
+const guardedHerdrSubscribe = createOutstandingGuard<Awaited<ReturnType<DrovrClient["subscribe"]>>>(
+  HERDR_CALL_TIMEOUT_MS,
+  (ms) => new HerdrTransportError(`events.subscribe: no ack within ${ms}ms`),
+);
 function subscribeAgentStatus(paneIds: readonly string[]): Promise<PermissionAnswerSubscription> {
-  return herdr
-    .subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id })))
+  return guardedHerdrSubscribe(() => herdr.subscribe(paneIds.map((pane_id) => ({ type: "pane.agent_status_changed" as const, pane_id }))))
     .then((sub) => ({ [Symbol.asyncIterator]: () => paneAgentStatusFrames(sub), close: () => sub.close() }));
 }
 startPermissionAnswerWatch(
@@ -2027,7 +3186,30 @@ startPermissionAnswerWatch(
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
     onApproved: approvalSoundNotifier.notifyApproved,
+    // FACTORY-581 SAFETY GUARD 3: attributes a managed-session pane's "no
+    // longer blocked" line to THIS pass, tagged with drovr's own
+    // `recognizedVia` — see `Escalator.onPermissionAnswered`'s own doc
+    // comment (src/agents/escalation-loop.ts). A no-op for every
+    // non-managed-session pane.
+    onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
+    // FACTORY-752 (FACTORY-746 (c)): see `permissionAnswerHealth`'s own
+    // declaration above and `createTickHealth`'s doc comment for the full
+    // reasoning — never called together for the same tick.
+    onTickSuccess: () => permissionAnswerHealth.recordSuccess(),
+    onTickError: (e) => permissionAnswerHealth.recordError(e),
     subscribe: subscribeAgentStatus,
+    // FACTORY-722 fix-scope item (d): the watchdog's own journal line
+    // (`[watchdog] restarted permission-answer`, permission-answer-watch.ts)
+    // already fires on every trip regardless of alert routing below —
+    // deduped per trip set of pane ids, so a watchdog that keeps tripping on
+    // the SAME stuck panes doesn't spam the room every 30s check.
+    onWatchdogTripped: (stuckPaneIds) => opsAlertRouter.raise({
+      key: `permission-answer-watchdog:${stuckPaneIds.slice().sort().join(",")}`,
+      condition: "permission-answer-watchdog",
+      subject: "permission-answer watch",
+      reason: `${stuckPaneIds.length} pane(s) blocked with a push trigger unconsumed for over 5 minutes — forced a resubscribe and tick restart: ${stuckPaneIds.join(", ")}`,
+      remedy: "Check journalctl for '[permission-answer]'/'[watchdog]' lines and whether herdr itself is healthy; if this keeps tripping, the daemon may need a restart.",
+    }),
   },
   PERMISSION_ANSWER_INTERVAL_MS,
 );
@@ -2111,13 +3293,40 @@ watchPrompts({
   onError: (e) => console.error(`  [prompts] error: ${(e as Error)?.message ?? e}`),
 });
 
+// BUTCHR-305/BUTCHR-238/FACTORY-941: audible-only pinned-active detection
+// for the project/manager tier — see src/agents/pinned-active.ts's own top
+// comment for the full derivation of why this shape (a resource both
+// `desired` "active" and `running`, with its agent stopped acting) is
+// invisible to every other detector, and why it is wired into the PROJECT
+// loop only (the issue tier already covers the same phenomenon via
+// `syncLabels`/`stallRemediation` above). `minutesFor` resolves per-id from
+// `pinnedActiveMinutesByProject`, refreshed each poll by the
+// `projectType.discovery.search` wrap further down (see that wrap's own
+// comment for why NOT `syncLabels`, unlike the issue tier's
+// `updateIdlePokeRuleConfig`). `addComment`/
+// `comments` decode `id` (a full `ProjectMatch.agentKey`) to its bare
+// project key via `resourceKeyOf` before reaching Jira/Confluence — neither
+// `speakOnOwnChannel` nor `ownChannelComments` understands an encoded
+// agentKey (see `issueCrashLoopDetector`'s own identical `resourceKeyOf`
+// wrapping above for the established precedent).
+const pinnedActiveDetector = createPinnedActiveDetector({
+  now: () => Date.now(),
+  minutes: config.stalledMinutes,
+  minutesFor: (id) => pinnedActiveMinutesByProject.get(id),
+  agentStatuses,
+  addComment: async (id, text) => { await speakOnOwnChannel(ops, resourceKeyOf(id), text); },
+  comments: (id) => ownChannelComments(resourceKeyOf(id)),
+  quotaBlocked: (id) => herd.resourceQuotaBlocked(resourceKeyOf(id)) || quotaGate.blockedIds().some((qid) => resourceKeyOf(qid) === resourceKeyOf(id)),
+  log: (line) => console.error(`  [pinned-active] ${line}`),
+});
+
 // Free-form jira-project resource agents (BUTCHR-425): no ticket, Confluence,
 // or boss/worker workflow — just discovery (matching Jira projects), spawn,
 // and residency/admission, sharing the same host cap and herd namespace as
 // every other rule provider. Always sentinels (src/agents/capacity-role.ts),
 // so admission never withholds one regardless of `config.maxAgents`.
 const projectType = createJiraProjectResourceType({
-  rules,
+  rules: getRules(),
   search: (q) => atlassian.searchProjects(q),
   isFrozen: async (id) => (await herd.frozen([id])).has(id),
   prepare: (spec) => resourceConnections.prepare(spec),
@@ -2133,6 +3342,24 @@ const projectType = createJiraProjectResourceType({
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
 });
+// FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
+// matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
+// `reconcileNow`/`checkPinnedActive` above — `discovery.search()` is the
+// first thing each poll calls (ahead of `reconcileNow`, which in turn runs
+// ahead of `syncLabels` — see that file's own call order), so wrapping it
+// here, rather than updating from `syncLabels` the way
+// `updateIdlePokeRuleConfig` does for the issue tier, is what keeps this
+// map current for the SAME poll's `checkPinnedActive` call rather than one
+// poll stale. `pinnedActiveMinutesFor` itself lives in jira-project-type.ts
+// (exported there, unit-tested directly) — this wrap is only the glue that
+// refreshes the module-level binding `pinnedActiveDetector.minutesFor`
+// reads above.
+const projectDiscoverySearch = projectType.discovery.search;
+projectType.discovery.search = async () => {
+  const matches = await projectDiscoverySearch();
+  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  return matches;
+};
 runResourceLoop(projectType, {
   herd,
   ownsId: ownsJiraProjectAgent,
@@ -2141,8 +3368,13 @@ runResourceLoop(projectType, {
   notify: async () => {},
   onRespawn: async (id, reason) => { console.error(`  [jira-project] ${id} respawned: ${reason}`); },
   // No labels to sync; the only per-poll bookkeeping is retiring MCP
-  // connections for agents that dropped out of this poll's matches.
+  // connections for agents that dropped out of this poll's matches. The
+  // pinned-active minutes refresh (FACTORY-941) is NOT done here: `syncLabels`
+  // runs AFTER `reconcileNow` (src/daemon/loop.ts's own call order), which is
+  // too late for `checkPinnedActive` below to see this poll's rule matches —
+  // see the `projectType.discovery.search` wrap above instead.
   syncLabels: async (matches) => { await resourceConnections.retain(new Set(matches.map((m) => m.agentKey))); return new Set<string>(); },
+  checkPinnedActive: pinnedActiveDetector.check,
   admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_JIRA_PROJECT),
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_PROJECT),

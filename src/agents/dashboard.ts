@@ -45,8 +45,44 @@
  */
 import { isProjectId } from "../resources/id.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
+import { ownsRuleAgent } from "../rules/resource-type.js";
+import { ownsJiraProjectAgent } from "../rules/jira-project-type.js";
 import { StatusFloorTracker, type StatusFloor } from "./status-floor.js";
 import type { AdmissionCensus } from "./admission.js";
+
+/**
+ * FACTORY-532 (implementing FACTORY-531): which providers' agents get a
+ * dashboard row at all — this is the predicate `src/daemon/index.ts`'s
+ * `dashboardAgentOfCwd` (`cwdAgentResolvers`) feeds `DashboardAgent.agent_key` through, and therefore
+ * the predicate `buildDashboardRows` below (only an agent with a truthy
+ * `agent_key` produces a row) ultimately gates. `jira-work` (`ownsRuleAgent`)
+ * and `jira-project` (`ownsJiraProjectAgent`) ONLY — a DELIBERATELY NARROW
+ * carve-out, not a general fix for FACTORY-461 (still open, still unowned):
+ * that ticket documents the SAME hiding for github-issue/github-pr/
+ * zendesk-ticket/filesystem too, and rules that widening the general case is
+ * a decision for whoever picks that ticket up, not something to fold into
+ * this one. Do not add another provider here without reading FACTORY-461
+ * first.
+ */
+export const ownsDashboardAgent = (id: string): boolean => ownsRuleAgent(id) || ownsJiraProjectAgent(id);
+
+/**
+ * The two cwd -> agent-key resolvers, deliberately split. `ownedAgentOfCwd`
+ * (jira-work only, `ownsRuleAgent`) feeds label sync and the blocked-dialog
+ * escalator, and must resolve `null` for a `jira-project` manager pane.
+ * `dashboardAgentOfCwd` (`ownsDashboardAgent`) feeds ONLY the dashboard's
+ * `agent_key` — and so the same snapshot that gates `/agents/:agentKey/pty`.
+ */
+export const cwdAgentResolvers = (agentIdOfCwd: (cwd: string | null | undefined) => string | null) => ({
+  ownedAgentOfCwd: (cwd: string | null | undefined): string | null => {
+    const id = agentIdOfCwd(cwd);
+    return id && ownsRuleAgent(id) ? id : null;
+  },
+  dashboardAgentOfCwd: (cwd: string | null | undefined): string | null => {
+    const id = agentIdOfCwd(cwd);
+    return id && ownsDashboardAgent(id) ? id : null;
+  },
+});
 
 /** The name this endpoint registers itself under in the shared coverage tracker (src/daemon/coverage.ts) — see this module's own header for why the recordChecked/recordDeclined calls themselves live in src/daemon/index.ts instead. */
 export const DASHBOARD_DETECTOR = "dashboard";

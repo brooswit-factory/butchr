@@ -1,0 +1,92 @@
+/**
+ * FACTORY-657 (FACTORY-643 slice 1, epic FACTORY-659): re-reads the rules
+ * file into a `RulesHolder` (./rules.ts) without a daemon restart. Two
+ * triggers call this with the SAME function, so they can never disagree:
+ * `src/daemon/index.ts`'s own `SIGHUP` handler, and — per the epic's own
+ * scope correction on this ticket — an in-process call FACTORY-663's future
+ * web write path makes directly, after it writes the rules file itself, no
+ * HTTP round-trip or CLI needed.
+ *
+ * Goes through the EXACT SAME `loadRules` (and so the exact same
+ * `parseRules` validation) `butchr rules check` already dry-runs against —
+ * never a second parser. An invalid file (bad JSON, a schema violation)
+ * leaves the holder untouched: `setRules` is only ever called after a
+ * load succeeds, so "keep the running rules" is a consequence of ordering,
+ * not a separate code path that could drift from it.
+ *
+ * A rule removed or disabled by a reload does not kill its running
+ * agent(s) mid-ticket: `setRules` only changes what the NEXT poll's
+ * discovery considers enabled (see `RulesHolder`'s own doc comment); the
+ * reconciler's existing stop/reap path (src/daemon/loop.ts) is what
+ * actually ends an agent whose ticket no longer matches any enabled rule,
+ * exactly as it already does for a restart today (see README's own
+ * "Applying a change" section) — a reload changes nothing about that path.
+ */
+import { loadRules, rulesPath, sourceEtagOf, type ReadRulesFile, type Rule, type RulesEnv, type RulesHolder } from "./rules.js";
+
+export interface ReloadResult {
+  ok: boolean;
+  /** The path `loadRules` read (or would have read) — present even on failure, for the caller's own log line. */
+  path: string;
+  /** Enabled rule ids present after this reload that were not enabled before it (a new rule, or one just enabled). Empty on failure. */
+  added: string[];
+  /** Enabled rule ids present before this reload that are not enabled after it (a rule removed or disabled). Empty on failure. */
+  removed: string[];
+  /** Rule ids enabled both before and after whose definition otherwise differs (query, brief, relationships, …). Empty on failure. */
+  changed: string[];
+  /** `loadRules`' own error message, one entry per line — empty on success. */
+  problems: string[];
+  /**
+   * FACTORY-657, agentsafety review R2: the holder's NEW `getSourceEtag()`
+   * value after this reload — unset (the OLD etag, unchanged) on failure,
+   * since nothing was swapped. FACTORY-660/662's stale-file flag reads this
+   * off `reloadRulesNow()`'s own result rather than calling `getSourceEtag()`
+   * separately, so there is no window where the two could disagree.
+   */
+  sourceEtag?: string;
+}
+
+const byId = (rules: readonly Rule[]) => new Map(rules.filter((r) => r.enabled).map((r) => [r.id, r] as const));
+
+/**
+ * `holder` is the daemon's own live `RulesHolder` (see `createRulesHolder`,
+ * ./rules.ts) — `setRules` is called on it directly, in place, so every
+ * consumer already reading through `holder.getRules()` sees the swap on
+ * its very next poll. `env`/`read` default to `loadRules`'s own defaults
+ * (the real environment, the real filesystem); both are only ever
+ * overridden by a test.
+ */
+export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRulesFile): ReloadResult {
+  let loaded: { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined };
+  try {
+    loaded = loadRules(env, read);
+  } catch (e) {
+    return { ok: false, path: rulesPath(env), added: [], removed: [], changed: [], problems: (e as Error).message.split("\n") };
+  }
+  // A missing file is `loadRules`' own VALID "zero rules" case (see its doc
+  // comment) — fine for a fresh daemon that has never had a rules file, but
+  // on an established install with running rules a vanished file (a bad
+  // mount, an editor that writes via rename-then-delete mid-SIGHUP, a
+  // deleted/moved file) is almost certainly an accident, not an operator's
+  // "disable everything" — swapping it in would wipe every running rule and
+  // the next reconcile poll would stop every agent. Refuse instead: only
+  // accept `missing` when the holder is ALREADY empty (there is nothing it
+  // could wipe). A present-but-empty `rules: []` file stays a valid, loud
+  // reload below — that IS an operator's deliberate "disable everything",
+  // distinguishable from a vanished file by `loadRules` itself.
+  if (loaded.origin === "missing" && holder.getRules().length > 0) {
+    return { ok: false, path: loaded.path, added: [], removed: [], changed: [], problems: [`rules file missing at ${loaded.path}; keeping the running ${holder.getRules().length} rule(s)`] };
+  }
+  const before = byId(holder.getRules());
+  const after = byId(loaded.rules);
+  const added = [...after.keys()].filter((id) => !before.has(id));
+  const removed = [...before.keys()].filter((id) => !after.has(id));
+  const changed = [...after.keys()].filter((id) => before.has(id) && JSON.stringify(before.get(id)) !== JSON.stringify(after.get(id)));
+  const sourceEtag = sourceEtagOf(loaded.text);
+  // Set together, synchronously, with nothing else able to run in between
+  // (single-threaded JS, no `await` here) — see `RulesHolder`'s own doc
+  // comment for why the two must never be set independently.
+  holder.setRules(loaded.rules);
+  holder.setSourceEtag(sourceEtag);
+  return { ok: true, path: loaded.path, added, removed, changed, problems: [], sourceEtag };
+}

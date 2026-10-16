@@ -1,0 +1,5 @@
+bump: patch
+
+### Fixed
+
+- **A `jira-project` rule with no explicit `agentPreferences` model spawned a Claude Opus/high agent by default (FACTORY-526).** `modelFor`/`effortFor` (`src/agents/workspace.ts`) mapped the `project` issue type to the same tier an epic gets (BUTCHR-71's "epic-level product judgment" decision) — so a brand-new rule with no `agentPreferences`, or one whose matching harness entry left `model` unset, silently got Opus at high effort with no rule-file signal that it would. Observed live: the `unity-manager` `jira-project` rule's first spawn came up as Opus 5.5/high for about a minute before being pinned to sonnet/medium by hand, against a weekly budget already around 80%. `project` now falls to the same `sonnet` default every other unrecognised issue type gets, at `low` effort — a rule that genuinely wants epic-tier judgment opts in explicitly via `agentPreferences[].model`/`effort`. `epic`/`story`/`task` tiers, and any rule that already sets its own `model`/`effort`, are unaffected. `docs/agent-providers.md` and `docs/project-agents.md` (the example rules doc) now say what the default is and how to override it.

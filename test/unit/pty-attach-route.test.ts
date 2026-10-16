@@ -6,6 +6,7 @@ import { listenOptions } from "../../src/daemon/listen.js";
 import { encodeAgentKey } from "../../src/rules/agent-key.js";
 import { PTY_CLOSED_REASON } from "../../src/terminal/pty-bridge.js";
 import { resolvePtyPane } from "../../src/terminal/pty-attach.js";
+import { createOriginGuardLogger } from "../../src/web/origin-guard-log.js";
 
 const fakeMcp = { connections: { list: () => [] } } as unknown as McpHandle;
 const ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop";
@@ -58,6 +59,13 @@ describe("GET /agents/:agentKey/pty — upgrade refusals (HTTP-level, before any
     expect(res.status).toBe(403);
     expect((await res.json() as { error: string }).error).toBe("origin not allowed");
   });
+  test("non-allowlisted Origin on a jira-project manager key: 403 (FACTORY-532 widened the dashboard snapshot, not the guard)", async () => {
+    const projectKey = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "unity-manager", resourceId: "GK" });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps() }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(projectKey)}/pty`, { headers: { upgrade: "websocket", origin: OTHER_ORIGIN } }));
+    expect(res.status).toBe(403);
+    expect((await res.json() as { error: string }).error).toBe("origin not allowed");
+  });
   test("malformed agent key: refused (404), Origin otherwise allowlisted", async () => {
     // Uses the REAL `resolvePtyPane` (via `resolveDeps` below), not the
     // always-"unknown-pane" fake `liveResolveDeps` above — a fake that never
@@ -77,6 +85,46 @@ describe("GET /agents/:agentKey/pty — upgrade refusals (HTTP-level, before any
     const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", origin: ORIGIN } }));
     expect(res.status).toBe(404);
     expect(((await res.json()) as { error: string }).error).toBe(`no such live pane: ${AGENT_KEY} (not one of this daemon's own running agents)`);
+  });
+});
+
+describe("FACTORY-476: guard rejections on the PTY upgrade path are logged", () => {
+  test("MISSING Origin: one line, path normalized to the route PATTERN (never the raw agentKey — FACTORY-502), result 'origin required'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps(), originGuardLog }));
+    await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket" } }));
+    expect(lines.length).toBe(1);
+    expect(lines[0]).toContain("method=GET");
+    // FACTORY-502 (a): the dedupe key (and the printed line) is the ROUTE
+    // PATTERN, not the raw path — see origin-guard-log.ts's own header for
+    // why the agent key must never be the thing that varies either.
+    expect(lines[0]).toContain("path=/agents/:agentKey/pty");
+    expect(lines[0]).not.toContain(encodeURIComponent(AGENT_KEY));
+    expect(lines[0]).toContain("origin=absent");
+    expect(lines[0]).toContain("result=origin required");
+  });
+  test("non-allowlisted Origin: one line, result 'origin not allowed'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, ptyAttach: liveResolveDeps(), originGuardLog }));
+    await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", origin: OTHER_ORIGIN } }));
+    expect(lines).toEqual([expect.stringContaining("result=origin not allowed")]);
+  });
+  test("extensionAuth omitted (empty allowlist): result 'allowlist empty'", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ ptyAttach: liveResolveDeps(), originGuardLog }));
+    await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", origin: ORIGIN } }));
+    expect(lines).toEqual([expect.stringContaining("result=allowlist empty")]);
+  });
+  test("a resolve failure (unknown pane, ptyAttach disabled) past the origin guard logs nothing — out of this ticket's scope", async () => {
+    const lines: string[] = [];
+    const originGuardLog = createOriginGuardLogger({ now: () => 0, log: (l) => lines.push(l) });
+    const app = liveView(fakeMcp, baseDeps({ extensionAuth: AUTH, originGuardLog }));
+    const res = await app.handle(new Request(`http://local/agents/${encodeURIComponent(AGENT_KEY)}/pty`, { headers: { upgrade: "websocket", origin: ORIGIN } }));
+    expect(res.status).toBe(503);
+    expect(lines).toEqual([]);
   });
 });
 

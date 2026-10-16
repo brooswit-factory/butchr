@@ -1,6 +1,79 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
-import { isExtensionOrigin } from "../web/origin-guard.js";
+import type { RestoredResumePolicy } from "../agents/argv.js";
+import { MANAGED_ESCALATION_DEFAULTS, OPS_ALERT_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
+
+/**
+ * FACTORY-491 — the epic's own reading of an ambiguous director steer
+ * (FACTORY-467 comment 27788: "defaulting to buddy or genius only" read as
+ * both being canary candidates, not a choice between them), stated
+ * explicitly here and in the PR description so the director can correct it
+ * in one line. These are managed-session definition names
+ * (`managedSessionShortDisplayId`, src/rules/session-definition-type.ts),
+ * not issue keys.
+ */
+export const DEFAULT_RESTORED_RESUME_AGENTS = ["buddy", "genius"] as const;
+
+/**
+ * FACTORY-497 (implementing FACTORY-475, epic FACTORY-330 — operator
+ * decision quoted verbatim in FACTORY-330 comment 27837: "not only the
+ * default, the only option. I want it to be the only path, and the others
+ * cleaned out."): Cleavr's manifest.json pins a fixed `"key"` (see that
+ * repo's README, "Fixed extension id"), so its extension id is stable
+ * across every install rather than path-derived, and it is now the ONLY
+ * allowed origin — hardcoded, not configurable. There is no allowlist to
+ * widen or narrow any more: an operator-supplied `BUTCHR_EXTENSION_ORIGINS`
+ * is read only long enough to warn that it is ignored (see
+ * `ignoredExtensionOriginsWarning` below), never merged into this value.
+ * This replaces the FACTORY-475/FACTORY-477 default-plus-additive-override
+ * scheme that briefly existed before this ticket.
+ */
+const CLEAVR_EXTENSION_ORIGIN = "chrome-extension://geffpgminecanhmpafbliajpeleoocan";
+
+/**
+ * FACTORY-751/FACTORY-775: upper bound for `BUTCHR_HERDR_TIMEOUT_MS` — see
+ * `Config.herdrCallTimeoutMs`'s own doc comment for the full rationale
+ * (well under the 2147483647ms int32 `setTimeout` overflow point bun
+ * 1.3.14 shares with `node:timers`, chosen because this knob's own purpose
+ * is already defeated long before that point, not because the overflow
+ * itself is the only concern).
+ */
+export const HERDR_CALL_TIMEOUT_MS_CEILING = 300_000;
+
+/**
+ * FACTORY-949 (story FACTORY-948): the single source of the "10" default
+ * for `Config.blockedWakeDebounceMinutes` below — referenced by name, never
+ * re-literaled, by `createIssueEventRules`/`createProjectEventRules`
+ * (src/resources/issue.ts, src/resources/project.ts) when a caller omits
+ * `blockedWakeDebounceMinutes` from their deps (every existing test/caller
+ * built before this ticket).
+ */
+export const DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES = 10;
+
+/**
+ * FACTORY-972 (story FACTORY-971, extending FACTORY-949/951): the single
+ * source of the "30" default for `Config.stalledWakeDebounceMinutes` —
+ * same "referenced by name, never re-literaled" contract
+ * `DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES` above already has, now also by
+ * `createProjectEventRules`'s stalled-wake axis. Deliberately a different
+ * default from the blocked debounce's 10: this ticket's filing-time
+ * measurement (~11 of 21 live agents Stalled) found `agent:stalled` far
+ * noisier than `agent:blocked`, so a longer window is the starting point —
+ * see this ticket's own PR description for the measured projection.
+ */
+export const DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES = 30;
+
+/**
+ * FACTORY-972: the single source of the "6" default for
+ * `Config.stalledWakeMaxPerHour` — the hard per-recipient cap
+ * `createHourlyRateCap` (src/jira-watch/wake-rate-cap.ts) enforces on top
+ * of the per-ticket debounce above. No precedent default to reuse in this
+ * codebase (see that module's own doc comment); chosen as a round number
+ * comfortably above a quiet recipient's steady state but well below the
+ * filing-time measurement's worst observed burst, pending the DoD 6
+ * measurement this ticket's own PR posts.
+ */
+export const DEFAULT_STALLED_WAKE_MAX_PER_HOUR = 6;
 
 /**
  * Butchr's configuration, parsed from the environment once at startup.
@@ -17,6 +90,44 @@ export interface Config {
   port: number;
   /** herdr socket; defaults to herdr's own default when unset. */
   herdrSocket?: string;
+  /**
+   * FACTORY-722: client-side deadline (`HerdrClientOptions.timeoutMs`,
+   * `@brooswit/herdr-sdk`) on every call the daemon's single shared
+   * `DrovrClient` instance makes to herdr (src/daemon/index.ts). Before this,
+   * that instance was constructed with no `timeoutMs` at all, so a herdr
+   * socket wedge (confirmed live: FACTORY-722's own wedge journal — a socket
+   * error that never produced a rejection) left `herdr.agent.list()` and
+   * `herdr.subscribe()` calls pending FOREVER. Every caller that serializes
+   * on one of those two calls then wedges too — not just the one that made
+   * the call: `permission-answer-watch.ts`'s `inFlight` guard only clears in
+   * the `.finally()` of a tick whose first await is `agent.list()`, and
+   * `HerdrHerd.runningIssues()` (src/agents/herd.ts) — read by
+   * `admissionController`'s shared `residency()` — is the SAME call, which
+   * is why pollLoop/notify/jira-idea/filesystem/managed-sessions all went
+   * stale together in that incident, not only the permission-answer timer.
+   * Default 10_000: comfortably below every sweep interval a hung call could
+   * otherwise block forever (the permission-answer watch's 20s,
+   * `PERMISSION_ANSWER_READ_TIMEOUT_MS`'s 8s), while still a small multiple
+   * of the 5s loops (`watchPrompts`, `blockingEscalationTimer`) that also
+   * serialize on this client — a timeout this short recovers within one or
+   * two of their ticks instead of a human noticing hours later.
+   *
+   * FACTORY-751/FACTORY-775: bounded above by `HERDR_CALL_TIMEOUT_MS_CEILING`
+   * (300_000, 5 minutes) — `loadConfig` throws rather than accepting a value
+   * past it. Below that ceiling this knob behaves as documented; ABOVE it,
+   * on bun 1.3.14, `setTimeout(fn, ms)` for `ms > 2147483647` (~24.8 days,
+   * the int32 millisecond overflow point `node:timers`/Bun share) silently
+   * wraps and fires in about 1ms instead of waiting — i.e. a LARGER value
+   * would make every herdr call reject almost immediately, the exact
+   * opposite of what setting it was meant to do. 300_000 is chosen well
+   * under that overflow point (not merely under it) because this knob's own
+   * purpose — failing a hung call fast enough for a human or the daemon's
+   * own recovery paths to notice — is already defeated long before 2^31ms;
+   * a 5-minute ceiling still comfortably covers a deliberately patient
+   * operator while refusing a value that would make the knob meaningless
+   * (or, past the overflow point, backwards).
+   */
+  herdrCallTimeoutMs: number;
   /** Terminal-emulator prefix for opening an agent shell; detected at startup if unset. */
   terminalPrefix?: string[];
   /**
@@ -96,6 +207,41 @@ export interface Config {
     room: string;
   };
   /**
+   * FACTORY-609 (Part B): rooms, mentions and the 10/20-minute tier delays
+   * for a managed-session escalation's tiered routing — "config, not
+   * literals" per the director's spec (FACTORY-607 comment 28778). ALWAYS
+   * present (unlike `managedEscalationRocketChat` above, which is gated on
+   * a credential that may not exist yet) — these values are needed for the
+   * `[managed-escalation]` journal line and the composed message text
+   * regardless of whether posting is actually configured, so there is
+   * nothing to gate. Defaults to `MANAGED_ESCALATION_DEFAULTS`
+   * (escalation-helper.ts) — the SAME constant `src/agents/escalation-loop.ts`
+   * falls back to when this dep is omitted, so there is exactly one place
+   * the director's default routing values are written down.
+   */
+  managedEscalationRouting: ManagedEscalationRouting;
+  /**
+   * FACTORY-630: routing for the generic OPS-ALERT path
+   * (`src/agents/ops-alert.ts`) — the push destination for a daemon
+   * condition no agent can fix or even be told about, of which
+   * `credential-dead` (`src/agents/login-expired-alert.ts`) is the first.
+   * ALWAYS present, for the same reason `managedEscalationRouting` above is:
+   * these values are needed for the `[butchr:ops-alert]` journal line
+   * regardless of whether a POSTING credential exists, so there is nothing
+   * to gate. The credential itself is deliberately NOT a new env group —
+   * the ops-alert route reuses `managedEscalationRocketChat`'s one, because
+   * there is no second Nexus grant to ask for, only a second CALLER of the
+   * same poster (`RocketChatPoster` already takes a channel per call).
+   */
+  opsAlert: {
+    /** Defaults to `team-admin` (the director's own choice on FACTORY-630) when BUTCHR_OPS_ALERT_ROOM is unset. */
+    room: string;
+    /** Prepended to every ops-alert post so a human is actually pinged — the whole defect FACTORY-630 closes is a correct alert that reached nobody. Defaults to `@director`, since these conditions are by construction unfixable by any agent. Set BUTCHR_OPS_ALERT_MENTION to a literal `none` to post with no mention at all. */
+    mention: string;
+    /** The dedup window: at most one post per condition per this many minutes (the director's figure is 60). Config, not a literal, so a flapping-credential incident can be tuned without a release. */
+    dedupMinutes: number;
+  };
+  /**
    * KAN-804/807/BUTCHR-279: minutes an active ticket's agent must sit
    * idle/done, continuously since it last stopped working (a swallowed
    * kickoff that never worked counts from first observed running, since it
@@ -104,6 +250,106 @@ export interface Config {
    * kickoff nor a post-work becalming should look like a finished agent.
    */
   stalledMinutes: number;
+  /**
+   * FACTORY-949 (story FACTORY-948): the debounce window for the
+   * agent:blocked-transition wake (boss + project manager) — a re-flip into
+   * `agent:blocked` for the SAME ticket within this many minutes of the
+   * last FIRED wake for that ticket does not re-fire (`blocked -> working ->
+   * blocked` inside the window is exactly one event). In-memory only, same
+   * as every other piece of `createIssueEventRules`'s own cross-poll state
+   * (`commentCursor`, `pendingRecheck`) — lost on daemon restart, which is
+   * an accepted tradeoff this ticket shares with those, not a new one.
+   * Default 10, same family as `stalledMinutes`/`parkedMinutes` above.
+   */
+  blockedWakeDebounceMinutes: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, extending FACTORY-949's
+   * blockedWakeDebounceMinutes above): the SAME debounce shape, for the
+   * `agent:stalled` transition instead — a re-flip into `agent:stalled` for
+   * the SAME ticket within this many minutes of the last FIRED wake for
+   * that ticket does not re-fire. In-memory only, same tradeoff. Default 30
+   * (`DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES` above) — deliberately longer
+   * than the blocked default: see that constant's own doc comment.
+   */
+  stalledWakeDebounceMinutes: number;
+  /**
+   * FACTORY-972: the hard per-recipient hourly cap on DELIVERED
+   * `agent:stalled` wakes (boss and project manager each capped
+   * separately) — see `createHourlyRateCap`'s own doc comment
+   * (src/jira-watch/wake-rate-cap.ts) for why this is a SEPARATE axis from
+   * `stalledWakeDebounceMinutes` above, not a replacement for it. A wake
+   * that would exceed this cap is counted (`/health`'s `stalledWakesCapped`)
+   * and logged, never delivered. Default 6
+   * (`DEFAULT_STALLED_WAKE_MAX_PER_HOUR` above).
+   */
+  stalledWakeMaxPerHour: number;
+  /**
+   * FACTORY-740: the silent-stop detector's mode. `"off"` runs nothing at
+   * all (today's behaviour, pre-FACTORY-740). `"dry-run"` — the default —
+   * runs src/agents/silent-stop.ts's detector but ONLY logs
+   * `[silent-stop] would flag KEY` lines; it never writes Jira (no comment,
+   * label, transition, escalation, or wake) regardless of what it observes.
+   * There is deliberately no enforcing value yet: FACTORY-736 (blocked on
+   * this story) adds one when it wires up real action on this signal — see
+   * src/agents/silent-stop.ts's own top comment for why the detector itself
+   * is already structured so that flip costs no rewrite, only a new mode
+   * value and a caller that acts on `check`'s result.
+   */
+  silentStopMode: "off" | "dry-run";
+  /**
+   * FACTORY-740 DoD 3: minutes after a daemon start or a detected
+   * herdr-reconnect gap during which a stop is suppressed (not evaluated,
+   * not logged as a flag) — see src/agents/silent-stop.ts's
+   * `DISCONTINUITY_GAP_MS` doc comment for how the gap itself is detected.
+   * Default 5: comfortably more than one ~15s poll cycle's worth of margin
+   * for herdr/the daemon to finish reconnecting and for any panes it
+   * restarts to report a steady status again, while staying well under 2%
+   * of the ~24h measurement window DoD 5 asks for, so the suppression
+   * window itself never meaningfully shrinks the data collected.
+   */
+  silentStopSuppressMinutes: number;
+  /**
+   * FACTORY-845: the per-rule-configurable idle poke's mode. `"off"` runs
+   * nothing (src/agents/idle-poke.ts is never constructed). `"dry-run"` —
+   * the default, same precedent FACTORY-738/740 set for silentStopMode
+   * above and for the same reason: the first-enable-burst and the
+   * resident-and-idle population this story's ticket measured (~23 of a
+   * 24-slot admission cap) mean a live default could mass-poke on day one
+   * of a bare merge — runs every guard and logs every outcome
+   * (`[idle-poke] would poke KEY ...` / skipped / suppressed) but never
+   * calls `addComment` or the channel/prompt delivery gate. `"live"` is the
+   * only mode that actually pokes. Deliberately does NOT affect the
+   * EXISTING global stall wake (src/agents/stall-remediation.ts), which
+   * stays live regardless of this setting — see idle-poke.ts's own top
+   * comment for why the two are independent mechanisms on independent
+   * clocks.
+   */
+  idlePokeMode: "off" | "dry-run" | "live";
+  /**
+   * FACTORY-845: minutes after a daemon start or a detected herdr-reconnect
+   * gap during which the idle-poke engine suppresses a poke — same
+   * DISCONTINUITY_GAP_MS shape as silentStopSuppressMinutes above, but a
+   * SEPARATE knob and a separate in-memory gap tracker (src/agents/
+   * idle-poke.ts keeps its own `lastInvokedAt`/`lastDiscontinuityAt`,
+   * independent of silent-stop.ts's): the module-boundary instruction on
+   * this ticket forbids sharing mutable state with silent-stop.ts. Default
+   * 5, matching silentStopSuppressMinutes's own default and rationale.
+   */
+  idlePokeSuppressMinutes: number;
+  /**
+   * FACTORY-845: the first-enable-burst guard — a hard cap on how many
+   * tickets the idle-poke engine will actually poke (not merely evaluate)
+   * in a single ~15s poll, across the whole fleet. Sized well under the
+   * measured ~23-of-24 resident-and-idle population this story's ticket
+   * reports: a cap of 3 drains a 23-ticket cold-start burst over roughly 2
+   * minutes (23/3 * 15s) rather than poking all 23 in one tick, while a
+   * steady-state fleet (a handful of newly-idle
+   * tickets per poll under ordinary operation) is never meaningfully
+   * delayed by it. See idle-poke.ts's own top comment for the alternative
+   * (baseline-on-first-observation) this story considered and did not
+   * choose, and why.
+   */
+  idlePokeMaxPerPoll: number;
   /**
    * BUTCHR-24: minutes a staffed child must sit continuously in To Do under
    * a live (In Progress) boss before the parked-ticket detector's stage 1
@@ -258,6 +504,23 @@ export interface Config {
    */
   pollStaleMs: number;
   /**
+   * FACTORY-772: how long, in ms, the issue-loop watchdog (src/daemon/
+   * loop-watchdog.ts) tolerates `pollLoop` or `notify` reporting `stale`
+   * (see `pollStaleMs` above — this is a DIFFERENT, longer threshold: going
+   * stale briefly is normal and `/health` already reports it; this is the
+   * point at which the daemon stops waiting and restarts the loop itself)
+   * before forcing a fresh `runResourceLoop` in its place. Default 120_000
+   * (2 minutes, the story's own stated default). BOUNDS-CHECKED, unlike
+   * `BUTCHR_HERDR_TIMEOUT_MS` above (shipped with no upper bound in #682 —
+   * see that var's own comment — a defect this var deliberately does not
+   * repeat): rejected below 30_000 (a watchdog that can trip faster than a
+   * few slow-but-genuine polls would false-positive) or above 1_800_000 (30
+   * minutes — past this a knob this large is not "configure the threshold",
+   * it is "disable the watchdog", which should be an explicit, auditable
+   * choice this var does not offer).
+   */
+  loopWatchdogThresholdMs: number;
+  /**
    * Role -> Atlassian accountId, for staffing `jira_create_issue` by
    * issuetype. All three are optional so a daemon that only ever reads Jira
    * still boots; the refusal for an unstaffable Story/Task/Epic happens
@@ -319,6 +582,41 @@ export interface Config {
    * take down an unrelated daemon" contract as `github`/`rocketchat` above.
    */
   lizardApprovalSound?: { overridePath?: string };
+  /**
+   * FACTORY-581 SAFETY GUARD 4: OPTIONAL, OFF by default (absent =
+   * `BUTCHR_PERMISSION_ANSWER_CANARY_PANE` unset/empty — fleet-wide, today's
+   * behaviour exactly, with no new feature flag of its own). When set, this
+   * is the ONLY pane label `permissionAnswerEligiblePanes`
+   * (src/daemon/index.ts) returns as eligible that tick, REGARDLESS of what
+   * `lizardModeLabel` itself would otherwise allow for every other pane —
+   * narrowing the EXISTING `PermissionAnswerLoopDeps.eligiblePanes` gate
+   * (`src/agents/permission-answer-loop.ts`'s own documented single
+   * enforcement point: "a pane left out of that map is never scanned or
+   * answered AT ALL") rather than inventing a second one, per FACTORY-460's
+   * diagnosis finding (d) and FACTORY-581's own instruction not to add a new
+   * flag. Canaries drovr 0.16.8 as a whole (the new file-edit fallback,
+   * recognizedVia `"no-separator-file-edit"`, plus every pre-existing
+   * matcher) on exactly one named pane rather than carving the file-edit
+   * shape out specifically — `eligiblePanes` has no per-dialog-type
+   * granularity to carve with, only per-pane, so this is the coarsest grain
+   * the existing gate offers, same grain FACTORY-67/DROVR-42 already
+   * establishes for `lizardMode` itself.
+   *
+   * ONE-STEP ROLLBACK: unset `BUTCHR_PERMISSION_ANSWER_CANARY_PANE` (or set
+   * it empty) and restart the daemon — every other pane's own
+   * `lizardModeLabel` eligibility reverts to exactly what it was before this
+   * field existed, with nothing else to undo. WIDEN TO FLEET-WIDE: the same
+   * one step, in the same direction — unset the variable once the canary
+   * window is judged safe.
+   *
+   * The label compared against is `lizardModeLabel`'s OWN return value (the
+   * resource id's basename, or the bare agent id for a query-level agent —
+   * see that function's own doc comment), not a raw pane id: a pane id can
+   * change across a respawn, but the label naming WHICH AGENT is stable,
+   * which is what lets an operator name the canary agent once rather than
+   * re-pointing this at a new pane id every time herdr reassigns one.
+   */
+  permissionAnswerCanaryPaneLabel?: string;
   /**
    * BUTCHR-91/BUTCHR-68: the project tier's opt-in staffing scope — a
    * project key must appear here to ever be staffed (see
@@ -393,7 +691,7 @@ export interface Config {
   /**
    * FACTORY-339 (implementing FACTORY-335, epic FACTORY-330): the
    * Origin-allowlist auth for browser-extension-facing daemon routes
-   * (`GET /resources/for-url`, `GET /agents/:agentKey/pty` — see
+   * (`GET`/`POST /resources/for-url`, `GET /agents/:agentKey/pty` — see
    * `../web/origin-guard.ts`).
    *
    * FACTORY-464/FACTORY-465 dropped this section's original bearer-token
@@ -406,12 +704,13 @@ export interface Config {
    * that sets `Origin: chrome-extension://<allowlisted-id>` by hand — see
    * `../web/origin-guard.ts`'s own header for this stated in full.
    *
-   * DELIBERATELY ALWAYS PRESENT (unlike `github`/`rocketchat`, which are
-   * `undefined` when off): a guarded route always has an `extensionAuth`
-   * object to pass straight to the guard, with NO config-shape branch of
-   * its own. An empty/unset `BUTCHR_EXTENSION_ORIGINS` yields `allowedOrigins:
-   * []`, which the guard treats as "reject everything" — fail-closed by
-   * construction, never "no allowlist configured, so allow everything".
+   * FACTORY-497 (implementing FACTORY-475): NOT CONFIGURABLE any more.
+   * `allowedOrigins` is always exactly `[CLEAVR_EXTENSION_ORIGIN]` — there is
+   * no env var, default-plus-override, or operator allowlist left to
+   * describe here. DELIBERATELY ALWAYS PRESENT (unlike `github`/
+   * `rocketchat`, which are `undefined` when off): a guarded route always
+   * has an `extensionAuth` object to pass straight to the guard, with NO
+   * config-shape branch of its own.
    */
   extensionAuth: { allowedOrigins: string[] };
 }
@@ -445,7 +744,26 @@ export interface ConfigEnv {
   BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?: string | undefined;
   BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?: string | undefined;
   BUTCHR_TEAM_ADMIN_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES?: string | undefined;
+  /** FACTORY-630: the ops-alert route's room/mention/dedup window — see `Config.opsAlert`. */
+  BUTCHR_OPS_ALERT_ROOM?: string | undefined;
+  BUTCHR_OPS_ALERT_MENTION?: string | undefined;
+  BUTCHR_OPS_ALERT_DEDUP_MINUTES?: string | undefined;
+  BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
+  BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
+  BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
+  BUTCHR_STALLED_WAKE_MAX_PER_HOUR?: string | undefined;
+  BUTCHR_SILENT_STOP_MODE?: string | undefined;
+  BUTCHR_SILENT_STOP_SUPPRESS_MINUTES?: string | undefined;
+  BUTCHR_IDLE_POKE_MODE?: string | undefined;
+  BUTCHR_IDLE_POKE_SUPPRESS_MINUTES?: string | undefined;
+  BUTCHR_IDLE_POKE_MAX_PER_POLL?: string | undefined;
   BUTCHR_PARKED_MINUTES?: string | undefined;
   BUTCHR_ABANDONED_MINUTES?: string | undefined;
   BUTCHR_ATREST_MINUTES?: string | undefined;
@@ -457,6 +775,8 @@ export interface ConfigEnv {
   BUTCHR_UNRESPONSIVE_MINUTES?: string | undefined;
   BUTCHR_IDLE_DIALOG_MINUTES?: string | undefined;
   BUTCHR_POLL_STALE_MS?: string | undefined;
+  BUTCHR_HERDR_TIMEOUT_MS?: string | undefined;
+  BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS?: string | undefined;
   BUTCHR_ASSIGNEE_STORY?: string | undefined;
   BUTCHR_ASSIGNEE_TASK?: string | undefined;
   BUTCHR_ASSIGNEE_EPIC?: string | undefined;
@@ -464,9 +784,12 @@ export interface ConfigEnv {
   BUTCHR_PERMISSION_AUDIT_PATH?: string | undefined;
   BUTCHR_LIZARD_APPROVAL_SOUND?: string | undefined;
   BUTCHR_LIZARD_APPROVAL_SOUND_PATH?: string | undefined;
+  BUTCHR_PERMISSION_ANSWER_CANARY_PANE?: string | undefined;
   BUTCHR_PROJECT_ALLOWLIST?: string | undefined;
   BUTCHR_MAX_AGENTS?: string | undefined;
+  /** FACTORY-497: no longer a real config knob — kept only so `loadConfig` can detect a daemon environment that still sets it and warn once (`ignoredExtensionOriginsWarning`); it is never read into `Config.extensionAuth`. */
   BUTCHR_EXTENSION_ORIGINS?: string | undefined;
+  BUTCHR_RESTORED_RESUME?: string | undefined;
 }
 
 /** `readFile` is injected so config parsing stays pure and testable. */
@@ -488,15 +811,26 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     if (value !== undefined) roleProviders[role] = parseOrder(value, key);
   }
   const model = env.BUTCHR_AGENT_MODEL === undefined ? undefined : required(env.BUTCHR_AGENT_MODEL, "BUTCHR_AGENT_MODEL");
+  // FACTORY-491: BUTCHR_RESTORED_RESUME = "off" | "all" | a comma-separated
+  // list of managed-session names. Unset defaults to DEFAULT_RESTORED_RESUME_AGENTS
+  // (see that constant's own doc comment) — "off"/today's behaviour is never
+  // the silent default, so enabling the canary further is opt-in but it
+  // ships live for its own agreed default set.
+  const restoredResumeRaw = env.BUTCHR_RESTORED_RESUME?.trim();
+  const restoredResume: RestoredResumePolicy = restoredResumeRaw === undefined || restoredResumeRaw === ""
+    ? new Set(DEFAULT_RESTORED_RESUME_AGENTS)
+    : restoredResumeRaw === "off" || restoredResumeRaw === "all"
+    ? restoredResumeRaw
+    : new Set(restoredResumeRaw.split(",").map((name) => name.trim()).filter(Boolean));
   const site = required(env.ATLASSIAN_SITE, "ATLASSIAN_SITE").replace(/\/+$/, "");
+  validateAtlassianSiteShape(site);
   const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
   const token = env.ATLASSIAN_TOKEN_FILE
     ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
     : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
   if (!token) throw new Error("Atlassian token is empty");
 
-  const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
+  const port = parsePort(env);
 
   const githubToken = env.GITHUB_TOKEN_FILE ? readFile(env.GITHUB_TOKEN_FILE).trim() : undefined;
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
@@ -544,8 +878,89 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     managedEscalationRocketChat = { url: teamAdminUrl, adminUserId: teamAdminAdminUserId, adminTokenFile: teamAdminTokenFile, room };
   }
 
+  // FACTORY-609 (Part B): routing is ALWAYS present (see `Config.
+  // managedEscalationRouting`'s own doc comment for why it is not gated on
+  // `managedEscalationRocketChat` the way the credential above is) — every
+  // value here defaults to `MANAGED_ESCALATION_DEFAULTS`, the director's own
+  // routing (FACTORY-607 comment 28688), so an operator who sets none of
+  // these still gets correct behaviour. `normalRoom` deliberately reuses
+  // BUTCHR_TEAM_ADMIN_ROOM (already parsed above) rather than a second env
+  // var — tier 1/2 of an ordinary managed session is the SAME room
+  // FACTORY-369 already shipped under that name.
+  const managedEscalationAnswererMention = env.BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.normalMention;
+  const managedEscalationNormalRoom = env.BUTCHR_TEAM_ADMIN_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.normalRoom;
+  const managedEscalationAssemblyMention = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyMention;
+  const managedEscalationAssemblyRoom = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyRoom;
+  const managedEscalationDirectorMention = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.directorMention;
+  const managedEscalationDirectorRoom = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.directorRoom;
+  const managedEscalationTier2Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier2Minutes;
+  if (!Number.isFinite(managedEscalationTier2Minutes) || managedEscalationTier2Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES}`);
+  const managedEscalationTier3Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier3Minutes;
+  if (!Number.isFinite(managedEscalationTier3Minutes) || managedEscalationTier3Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES}`);
+  if (managedEscalationTier3Minutes <= managedEscalationTier2Minutes) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES (${managedEscalationTier3Minutes}) must be greater than BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES (${managedEscalationTier2Minutes})`);
+  const managedEscalationRouting: ManagedEscalationRouting = {
+    normalMention: managedEscalationAnswererMention,
+    normalRoom: managedEscalationNormalRoom,
+    assemblyMention: managedEscalationAssemblyMention,
+    assemblyRoom: managedEscalationAssemblyRoom,
+    directorMention: managedEscalationDirectorMention,
+    directorRoom: managedEscalationDirectorRoom,
+    tier2Minutes: managedEscalationTier2Minutes,
+    tier3Minutes: managedEscalationTier3Minutes,
+  };
+
+  // FACTORY-630: the ops-alert route's own routing — see `Config.opsAlert`'s
+  // doc comment for why it is always present and why it deliberately adds no
+  // new credential env group. `OPS_ALERT_DEFAULTS` (src/agents/ops-alert.ts
+  // has the route; the defaults live in escalation-helper.ts alongside
+  // MANAGED_ESCALATION_DEFAULTS) is the single place these literals are
+  // written down, so this parser and any caller that falls back cannot drift.
+  const opsAlertRoom = env.BUTCHR_OPS_ALERT_ROOM?.trim() || OPS_ALERT_DEFAULTS.room;
+  // A literal `none` means "post with no mention", distinct from UNSET
+  // (which takes the default mention): an operator who wants an unpinged
+  // room needs a way to say so that an empty env var cannot express, since
+  // an empty value is indistinguishable from unset after `?.trim() ||`.
+  const opsAlertMentionRaw = env.BUTCHR_OPS_ALERT_MENTION?.trim();
+  const opsAlertMention = opsAlertMentionRaw === undefined || opsAlertMentionRaw === "" ? OPS_ALERT_DEFAULTS.mention : opsAlertMentionRaw === "none" ? "" : opsAlertMentionRaw;
+  const opsAlertDedupMinutes = env.BUTCHR_OPS_ALERT_DEDUP_MINUTES ? Number(env.BUTCHR_OPS_ALERT_DEDUP_MINUTES) : OPS_ALERT_DEFAULTS.dedupMinutes;
+  if (!Number.isFinite(opsAlertDedupMinutes) || opsAlertDedupMinutes <= 0) throw new Error(`BUTCHR_OPS_ALERT_DEDUP_MINUTES is not a positive number: ${env.BUTCHR_OPS_ALERT_DEDUP_MINUTES}`);
+  const opsAlert = { room: opsAlertRoom, mention: opsAlertMention, dedupMinutes: opsAlertDedupMinutes };
+
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
+
+  const blockedWakeDebounceMinutes = env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES ? Number(env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES) : DEFAULT_BLOCKED_WAKE_DEBOUNCE_MINUTES;
+  if (!Number.isFinite(blockedWakeDebounceMinutes) || blockedWakeDebounceMinutes <= 0) throw new Error(`BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES is not a positive number: ${env.BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES}`);
+
+  const stalledWakeDebounceMinutes = env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES ? Number(env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES) : DEFAULT_STALLED_WAKE_DEBOUNCE_MINUTES;
+  if (!Number.isFinite(stalledWakeDebounceMinutes) || stalledWakeDebounceMinutes <= 0) throw new Error(`BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES is not a positive number: ${env.BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES}`);
+
+  // FACTORY-972: a COUNT (wakes per hour), same Number.isInteger discipline
+  // BUTCHR_MAX_AGENTS/BUTCHR_IDLE_POKE_MAX_PER_POLL already use below for the
+  // same reason — a fractional cap is meaningless, not merely harmless.
+  const stalledWakeMaxPerHour = env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR ? Number(env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR) : DEFAULT_STALLED_WAKE_MAX_PER_HOUR;
+  if (!Number.isInteger(stalledWakeMaxPerHour) || stalledWakeMaxPerHour <= 0) throw new Error(`BUTCHR_STALLED_WAKE_MAX_PER_HOUR is not a positive integer: ${env.BUTCHR_STALLED_WAKE_MAX_PER_HOUR}`);
+
+  const silentStopModeRaw = env.BUTCHR_SILENT_STOP_MODE?.trim();
+  if (silentStopModeRaw !== undefined && silentStopModeRaw !== "" && silentStopModeRaw !== "off" && silentStopModeRaw !== "dry-run") {
+    throw new Error(`BUTCHR_SILENT_STOP_MODE must be "off" or "dry-run": ${env.BUTCHR_SILENT_STOP_MODE}`);
+  }
+  const silentStopMode: "off" | "dry-run" = silentStopModeRaw === "off" ? "off" : "dry-run";
+
+  const silentStopSuppressMinutes = env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES ? Number(env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES) : 5;
+  if (!Number.isFinite(silentStopSuppressMinutes) || silentStopSuppressMinutes <= 0) throw new Error(`BUTCHR_SILENT_STOP_SUPPRESS_MINUTES is not a positive number: ${env.BUTCHR_SILENT_STOP_SUPPRESS_MINUTES}`);
+
+  const idlePokeModeRaw = env.BUTCHR_IDLE_POKE_MODE?.trim();
+  if (idlePokeModeRaw !== undefined && idlePokeModeRaw !== "" && idlePokeModeRaw !== "off" && idlePokeModeRaw !== "dry-run" && idlePokeModeRaw !== "live") {
+    throw new Error(`BUTCHR_IDLE_POKE_MODE must be "off", "dry-run" or "live": ${env.BUTCHR_IDLE_POKE_MODE}`);
+  }
+  const idlePokeMode: "off" | "dry-run" | "live" = idlePokeModeRaw === "off" ? "off" : idlePokeModeRaw === "live" ? "live" : "dry-run";
+
+  const idlePokeSuppressMinutes = env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES ? Number(env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES) : 5;
+  if (!Number.isFinite(idlePokeSuppressMinutes) || idlePokeSuppressMinutes <= 0) throw new Error(`BUTCHR_IDLE_POKE_SUPPRESS_MINUTES is not a positive number: ${env.BUTCHR_IDLE_POKE_SUPPRESS_MINUTES}`);
+
+  const idlePokeMaxPerPoll = env.BUTCHR_IDLE_POKE_MAX_PER_POLL ? Number(env.BUTCHR_IDLE_POKE_MAX_PER_POLL) : 3;
+  if (!Number.isInteger(idlePokeMaxPerPoll) || idlePokeMaxPerPoll <= 0) throw new Error(`BUTCHR_IDLE_POKE_MAX_PER_POLL is not a positive integer: ${env.BUTCHR_IDLE_POKE_MAX_PER_POLL}`);
 
   const parkedMinutes = env.BUTCHR_PARKED_MINUTES ? Number(env.BUTCHR_PARKED_MINUTES) : 10;
   if (!Number.isFinite(parkedMinutes) || parkedMinutes <= 0) throw new Error(`BUTCHR_PARKED_MINUTES is not a positive number: ${env.BUTCHR_PARKED_MINUTES}`);
@@ -576,6 +991,17 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   if (!Number.isFinite(idleDialogMinutes) || idleDialogMinutes <= 0) throw new Error(`BUTCHR_IDLE_DIALOG_MINUTES is not a positive number: ${env.BUTCHR_IDLE_DIALOG_MINUTES}`);
   const pollStaleMs = env.BUTCHR_POLL_STALE_MS ? Number(env.BUTCHR_POLL_STALE_MS) : 60_000;
   if (!Number.isFinite(pollStaleMs) || pollStaleMs <= 0) throw new Error(`BUTCHR_POLL_STALE_MS is not a positive number: ${env.BUTCHR_POLL_STALE_MS}`);
+  const herdrCallTimeoutMs = env.BUTCHR_HERDR_TIMEOUT_MS ? Number(env.BUTCHR_HERDR_TIMEOUT_MS) : 10_000;
+  if (!Number.isFinite(herdrCallTimeoutMs) || herdrCallTimeoutMs <= 0) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS is not a positive number: ${env.BUTCHR_HERDR_TIMEOUT_MS}`);
+  if (herdrCallTimeoutMs > HERDR_CALL_TIMEOUT_MS_CEILING) throw new Error(`BUTCHR_HERDR_TIMEOUT_MS=${herdrCallTimeoutMs} is above the ceiling (${HERDR_CALL_TIMEOUT_MS_CEILING}ms): see Config.herdrCallTimeoutMs's own doc comment for why a larger value defeats this knob's purpose`);
+  // FACTORY-772: bounded, unlike BUTCHR_HERDR_TIMEOUT_MS above — see
+  // Config.loopWatchdogThresholdMs' own doc comment for why both ends are
+  // checked (NaN/invalid/out-of-range all rejected clearly, never a silent
+  // fallback) rather than merely "is it a positive number".
+  const loopWatchdogThresholdMs = env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS ? Number(env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS) : 120_000;
+  if (!Number.isFinite(loopWatchdogThresholdMs) || loopWatchdogThresholdMs < 30_000 || loopWatchdogThresholdMs > 1_800_000) {
+    throw new Error(`BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS must be a number between 30000 and 1800000 (ms): ${env.BUTCHR_LOOP_WATCHDOG_THRESHOLD_MS}`);
+  }
 
   const assigneeStory = env.BUTCHR_ASSIGNEE_STORY?.trim();
   const assigneeTask = env.BUTCHR_ASSIGNEE_TASK?.trim();
@@ -590,6 +1016,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ? { ...(lizardApprovalSoundOverridePath ? { overridePath: lizardApprovalSoundOverridePath } : {}) }
     : undefined;
 
+  const permissionAnswerCanaryPaneLabel = env.BUTCHR_PERMISSION_ANSWER_CANARY_PANE?.trim() || undefined;
+
   const projectAllowlist = env.BUTCHR_PROJECT_ALLOWLIST ? env.BUTCHR_PROJECT_ALLOWLIST.split(",").map((k) => k.trim()).filter(Boolean) : [];
 
   // BUTCHR-284: unlike the *_MINUTES knobs above (fractional is meaningless
@@ -598,20 +1026,24 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const maxAgents = env.BUTCHR_MAX_AGENTS ? Number(env.BUTCHR_MAX_AGENTS) : 8;
   if (!Number.isInteger(maxAgents) || maxAgents <= 0) throw new Error(`BUTCHR_MAX_AGENTS is not a positive integer: ${env.BUTCHR_MAX_AGENTS}`);
 
-  // FACTORY-464/FACTORY-465: NEVER default an empty/unset allowlist to
-  // anything but `[]` — the guard (`../web/origin-guard.ts`) treats that as
-  // "reject every origin", the fail-closed default this section must keep
-  // (see `Config.extensionAuth`'s own doc comment).
-  const extensionOrigins = env.BUTCHR_EXTENSION_ORIGINS ? env.BUTCHR_EXTENSION_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean) : [];
-  for (const origin of extensionOrigins) {
-    if (!isExtensionOrigin(origin)) throw new Error(`BUTCHR_EXTENSION_ORIGINS contains an invalid chrome-extension:// origin: ${JSON.stringify(origin)}`);
-  }
+  // FACTORY-497: hardcoded, the only allowed origin — see
+  // `CLEAVR_EXTENSION_ORIGIN`'s own doc comment at this file's top for why
+  // there is nothing left to parse from the environment here.
+  const extensionOrigins = [CLEAVR_EXTENSION_ORIGIN];
 
   return {
     atlassian: { site, email, token },
-    agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}) },
+    agent: { provider, ...(providers ? { providers } : {}), ...(Object.keys(roleProviders).length ? { roleProviders } : {}), ...(model ? { model } : {}), restoredResume },
     port,
     stalledMinutes,
+    blockedWakeDebounceMinutes,
+    stalledWakeDebounceMinutes,
+    stalledWakeMaxPerHour,
+    silentStopMode,
+    silentStopSuppressMinutes,
+    idlePokeMode,
+    idlePokeSuppressMinutes,
+    idlePokeMaxPerPoll,
     parkedMinutes,
     abandonedMinutes,
     atRestMinutes,
@@ -623,11 +1055,15 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     unresponsiveMinutes,
     idleDialogMinutes,
     pollStaleMs,
+    herdrCallTimeoutMs,
+    loopWatchdogThresholdMs,
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
     ...(rocketchat ? { rocketchat } : {}),
     ...(managedEscalationRocketChat ? { managedEscalationRocketChat } : {}),
+    managedEscalationRouting,
+    opsAlert,
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
       ...(assigneeTask ? { task: assigneeTask } : {}),
@@ -636,15 +1072,80 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     captureDir,
     permissionAuditPath,
     ...(lizardApprovalSound ? { lizardApprovalSound } : {}),
+    ...(permissionAnswerCanaryPaneLabel ? { permissionAnswerCanaryPaneLabel } : {}),
     projectAllowlist,
     maxAgents,
     extensionAuth: { allowedOrigins: extensionOrigins },
   };
 }
 
+/**
+ * FACTORY-497: a daemon whose environment still sets `BUTCHR_EXTENSION_ORIGINS`
+ * (e.g. an existing systemd drop-in from before this ticket) must not
+ * silently ignore it — this names the exact ignored variable and states
+ * that only Cleavr's fixed id is allowed, so an operator who still has that
+ * drop-in in place sees why it no longer does anything. `undefined` when
+ * the variable is unset, meaning nothing to warn about. Pure, like
+ * `loadConfig`/`describeConfig`; the caller (`src/daemon/index.ts`) is
+ * responsible for actually logging it once, at startup.
+ */
+export function ignoredExtensionOriginsWarning(env: ConfigEnv): string | undefined {
+  if (env.BUTCHR_EXTENSION_ORIGINS === undefined) return undefined;
+  return "BUTCHR_EXTENSION_ORIGINS is set but ignored — only Cleavr's fixed extension id is allowed now (FACTORY-497/FACTORY-475)";
+}
+
 function required(v: string | undefined, name: string): string {
   if (!v || !v.trim()) throw new Error(`Missing required config: ${name}`);
   return v.trim();
+}
+
+/**
+ * FACTORY-665 (PR-2), agentsafety A2's own finding: `ATLASSIAN_SITE` was
+ * read unvalidated (round-1, config.ts:615) — the client sends `Basic
+ * email:token` to WHATEVER host this names, so an operator typo or a
+ * malicious override here is a credential-exfiltration vector, not just a
+ * cosmetic one. Pinned to exactly `https://<name>.atlassian.net` (no path,
+ * no port, no query/fragment, no trailing content past the host) — called
+ * from `loadConfig` for the env-provided site AND from the setup-mode
+ * write route (`../web/setup-api.ts`) for an operator-provided one, so
+ * there is exactly one place this shape is defined.
+ */
+const ATLASSIAN_SITE_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.atlassian\.net$/i;
+
+export function validateAtlassianSiteShape(site: string): void {
+  if (!ATLASSIAN_SITE_RE.test(site)) {
+    throw new Error(`ATLASSIAN_SITE must look like https://<name>.atlassian.net (got ${JSON.stringify(site)})`);
+  }
+}
+
+/**
+ * FACTORY-665 (PR-2) — the daemon's own pre-`loadConfig` check: true iff
+ * every field `loadConfig` would otherwise require for the Atlassian
+ * section is present (same presence rule `required()`/the token branch
+ * above already enforce — mirrored here, not re-derived, so this can
+ * never drift into reporting "configured" for an env `loadConfig` would
+ * still reject). `src/daemon/index.ts` calls this BEFORE `loadConfig` to
+ * decide whether to start the real daemon or setup mode (`../daemon/setup-mode.ts`)
+ * — see that module's own header. Does NOT validate the site's shape or
+ * read the token file; only presence, to decide which path to take at all.
+ */
+/**
+ * FACTORY-665 (PR-2) — split out of `loadConfig` so `../daemon/setup-mode.ts`
+ * can resolve the SAME `BUTCHR_PORT` the real daemon would, without first
+ * needing a full `loadConfig` call (which requires Atlassian identity —
+ * exactly what setup mode exists to not require yet).
+ */
+export function parsePort(env: ConfigEnv): number {
+  const port = env.BUTCHR_PORT ? Number(env.BUTCHR_PORT) : 7717;
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`BUTCHR_PORT is not a valid port: ${env.BUTCHR_PORT}`);
+  return port;
+}
+
+export function isAtlassianConfigured(env: ConfigEnv): boolean {
+  const hasSite = !!env.ATLASSIAN_SITE?.trim();
+  const hasEmail = !!env.ATLASSIAN_EMAIL?.trim();
+  const hasToken = !!env.ATLASSIAN_TOKEN?.trim() || !!env.ATLASSIAN_TOKEN_FILE?.trim();
+  return hasSite && hasEmail && hasToken;
 }
 
 /** AccountIds are not secrets; truncate them only for readability, never redact. */
@@ -744,13 +1245,18 @@ export const describeConfig = (c: Config): string =>
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : "disabled"} ` +
   `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
   `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
-  `stalledMinutes=${c.stalledMinutes} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} ` +
+  `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
+  `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
+  `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} parkedMinutes=${c.parkedMinutes} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +
   `captureDir=${c.captureDir} permissionAuditPath=${c.permissionAuditPath} ` +
   `lizardApprovalSound=${c.lizardApprovalSound ? `enabled overridePath=${c.lizardApprovalSound.overridePath ?? "(default: drovr's bundled asset)"}` : "disabled"} ` +
+  `permissionAnswerCanaryPaneLabel=${c.permissionAnswerCanaryPaneLabel ?? "(unset — permission-answering is fleet-wide)"} ` +
   `projectAllowlist=${c.projectAllowlist.length ? c.projectAllowlist.join(",") : "EMPTY — project tier staffs nothing"} ` +
   `maxAgents=${c.maxAgents} ` +
-  // FACTORY-464/FACTORY-465: no token to ever log — an empty allowlist is
-  // itself the fail-closed state (see `Config.extensionAuth`'s own doc comment).
+  // FACTORY-464/FACTORY-465: no token to ever log. FACTORY-497: always
+  // exactly Cleavr's fixed id now — see `Config.extensionAuth`'s own doc
+  // comment; the "EMPTY" fallback is dead code path kept only because
+  // `allowedOrigins` is still typed as an array, never actually empty.
   `extensionAuth=origins=${c.extensionAuth.allowedOrigins.join(",") || "EMPTY — every origin rejected"}`;

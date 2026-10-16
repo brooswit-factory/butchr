@@ -74,6 +74,65 @@ like a fingerprint a directive parser could mistake for one** — drovr's own
 OAuth token except a human doing a real, interactive browser `/login`), and
 wiring or documenting it as such would be actively misleading.
 
+## The third channel: a Rocket.Chat post (FACTORY-630)
+
+Both delivery paths above are correct, both survive a dead credential — and
+both are **pull-only**. They require a human to already be looking: at the
+right host's journal, with the right `journalctl` form for that unit (trust
+your own workspace's `ENVIRONMENT.md` for it, never a value copied from
+someone else's), or at a `curl` of `/health`. On 2026-10-02 at 18:37Z this
+alert fired exactly as designed and nobody saw it, which is FACTORY-630.
+
+FACTORY-630 adds a **push** channel: a Rocket.Chat post, via the generic
+ops-alert route in `src/agents/ops-alert.ts`. The key property that makes it
+legitimate here, under this document's own "why this alert cannot be
+agent-mediated" argument, is that **the Rocket.Chat poster's credential has
+nothing to do with the Claude credential this condition kills.** It is an RC
+user-id/token pair read from a token file (FACTORY-369/609/611,
+`createRocketChatPoster` in `src/resources/rocketchat.ts`); posting with it
+involves no Claude session, no API call to Anthropic, and no agent anywhere
+in the path. It is not a Jira comment, not an `@`-mention of an agent
+account, and not an `ANSWER` affordance — it carries no fingerprint and
+nothing a directive parser could mistake for one, for the same reason
+everything else here does not: there is no answer to an expired OAuth token
+except a human in a real browser.
+
+It is **strictly additive**. The journal line and `/health` are unchanged,
+and they remain the channels that still work when Rocket.Chat itself is
+unreachable or has no credential configured. With no posting credential the
+route degrades to one `[butchr:ops-alert]` journal line per condition saying
+so, and the alert behaves exactly as it did before FACTORY-630.
+
+### Why the room is rate-capped on a clock and the journal line is not
+
+This is a deliberate asymmetry, and it is the one place where the two
+channels do NOT agree:
+
+- The **journal line** collapses on EPISODE boundaries (see
+  `createCredentialDeathTracker` above): one line per episode, and a new
+  episode always gets a line immediately, because a generic time window
+  could swallow a legitimately new episode's FIRST line if it opened inside
+  the window following a previous one's close. That is the complete,
+  un-rate-limited record, and FACTORY-630 does not touch it.
+- The **room post** is capped at one per condition per hour (configurable,
+  `BUTCHR_OPS_ALERT_DEDUP_MINUTES`), because the room is a place real people
+  read and the director's requirement is explicitly "one deduplicated post
+  per condition per hour" — a flapping credential, which is precisely an
+  episode closing and reopening, must not spam it.
+
+The cost of that cap is real and is stated rather than hidden: **a genuinely
+new episode opening within an hour of the last post is not posted again.**
+It is never silent, though — the suppression writes its own
+`[butchr:ops-alert]` journal line naming when the next post for that key
+becomes possible, so the pull channel keeps full fidelity and a human can
+always reconstruct what the room did not say.
+
+A recovery gets one short "recovered" post, gated on the same
+`reason: "recovered"`-only rule as the journal clear below, and additionally
+on the alert post for that condition having actually SUCCEEDED first — a lone
+"X recovered" in a room that never heard X was broken reads as a condition
+somebody else already handled.
+
 ## Why it is host-wide, not per-pane or per-ticket
 
 One expired credential kills every pane on a daemon at once. Escalating

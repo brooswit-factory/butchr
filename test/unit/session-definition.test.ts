@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   parseSessionDefinition, parseSessionDefinitionFile, sessionDefinitionProblems, sessionDefinitionsPath,
   tierToModel, effectiveAgent, SESSION_DEFINITION_VENDORS, SESSION_PERMISSION_MODES, SESSION_TIERS,
 } from "../../src/resources/session-definition.js";
+import { absPath, nativeRoot } from "../helpers/abs-path";
 
-const HOME = "/home/tester";
+const HOME = absPath("home", "tester");
 const good = () => ({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto",
+  workingDirectory: absPath("repo", "project"), brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "auto",
 });
 
 describe("sessionDefinitionProblems", () => {
@@ -34,10 +36,24 @@ describe("sessionDefinitionProblems", () => {
     expect(at("")[0]).toContain("workingDirectory must be a non-empty string");
     expect(at(7)[0]).toContain("workingDirectory must be a non-empty string");
     expect(at("relative/path")[0]).toContain("must be absolute");
-    expect(at("/a/")[0]).toContain("trailing slash");
+    expect(at(`${absPath("a")}/`)[0]).toContain("trailing slash");
     expect(at("~otheruser/x")[0]).toContain("~user is not supported");
     expect(at("~/work")).toEqual([]);
-    expect(at("/")).toEqual([]);
+    expect(at(nativeRoot())).toEqual([]);
+  });
+  // FACTORY-558: platform injected (never `process.platform`), so this runs on any OS.
+  test("platform: win32 — accepts a drive-letter or UNC workingDirectory, backslash or forward slash", () => {
+    const WIN_HOME = "C:\\Users\\bob";
+    const at = (workingDirectory: unknown) => sessionDefinitionProblems({ ...good(), workingDirectory }, "def", WIN_HOME, "win32");
+    expect(at("relative\\path")[0]).toContain("must be absolute");
+    expect(at("C:\\repo\\")[0]).toContain("trailing slash");
+    expect(at("~otheruser\\x")[0]).toContain("~user is not supported");
+    expect(at("~\\work")).toEqual([]);
+    expect(at("~/work")).toEqual([]);
+    expect(at("C:\\repo\\project")).toEqual([]);
+    expect(at("C:/repo/project")).toEqual([]);
+    expect(at("\\\\server\\share\\project")).toEqual([]);
+    expect(at("C:\\")).toEqual([]);
   });
   test("brief: must be a non-empty string", () => {
     expect(sessionDefinitionProblems({ ...good(), brief: "" }, "def")).toEqual(['def.brief must be a non-empty string']);
@@ -93,6 +109,12 @@ describe("sessionDefinitionProblems", () => {
     expect(SESSION_PERMISSION_MODES).toContain("auto");
     for (const permissionMode of SESSION_PERMISSION_MODES) expect(sessionDefinitionProblems({ ...good(), permissionMode }, "def")).toEqual([]);
     expect(sessionDefinitionProblems({ ...good(), permissionMode: "yolo" }, "def")[0]).toContain("permissionMode must be one of");
+  });
+  test("FACTORY-275: 'manual' is accepted alongside 'default' — the launcher's own alias for its real canonical value, not a replacement for it", () => {
+    expect(SESSION_PERMISSION_MODES).toContain("default");
+    expect(SESSION_PERMISSION_MODES).toContain("manual");
+    expect(sessionDefinitionProblems({ ...good(), permissionMode: "default" }, "def")).toEqual([]);
+    expect(sessionDefinitionProblems({ ...good(), permissionMode: "manual" }, "def")).toEqual([]);
   });
   test("strictMcpConfig: optional boolean, absent means today's behaviour exactly", () => {
     expect(sessionDefinitionProblems(good(), "def")).toEqual([]);
@@ -358,16 +380,26 @@ describe("effectiveAgent", () => {
 });
 
 describe("sessionDefinitionsPath", () => {
+  // FACTORY-569: sessionDefinitionsPath builds its result with node:path's
+  // OS-native `join` (never an injected platform), so the expected value
+  // here must be built the SAME way — a hardcoded "/"-joined literal would
+  // mismatch a real win32 join's backslashes even though nothing was
+  // "rejected"; this is the mixed-separator failure class, not the
+  // absolute-path-shape one `absPath` alone covers.
+  const XDG = absPath("xdg");
+  const HOME = absPath("home", "x");
+
   test("BUTCHR_SESSION_DEFINITIONS_DIR wins outright", () => {
-    expect(sessionDefinitionsPath({ BUTCHR_SESSION_DEFINITIONS_DIR: "/custom/defs", XDG_CONFIG_HOME: "/xdg", HOME: "/home/x" })).toBe("/custom/defs");
+    const custom = absPath("custom", "defs");
+    expect(sessionDefinitionsPath({ BUTCHR_SESSION_DEFINITIONS_DIR: custom, XDG_CONFIG_HOME: XDG, HOME })).toBe(custom);
   });
   test("falls back to $XDG_CONFIG_HOME/butchr/session-definitions", () => {
-    expect(sessionDefinitionsPath({ XDG_CONFIG_HOME: "/xdg", HOME: "/home/x" })).toBe("/xdg/butchr/session-definitions");
+    expect(sessionDefinitionsPath({ XDG_CONFIG_HOME: XDG, HOME })).toBe(join(XDG, "butchr", "session-definitions"));
   });
   test("falls back to $HOME/.config/butchr/session-definitions with no XDG_CONFIG_HOME — same shape as rulesPath", () => {
-    expect(sessionDefinitionsPath({ HOME: "/home/x" })).toBe("/home/x/.config/butchr/session-definitions");
+    expect(sessionDefinitionsPath({ HOME })).toBe(join(HOME, ".config", "butchr", "session-definitions"));
   });
   test("empty-string overrides count as unset", () => {
-    expect(sessionDefinitionsPath({ BUTCHR_SESSION_DEFINITIONS_DIR: "  ", XDG_CONFIG_HOME: "", HOME: "/home/x" })).toBe("/home/x/.config/butchr/session-definitions");
+    expect(sessionDefinitionsPath({ BUTCHR_SESSION_DEFINITIONS_DIR: "  ", XDG_CONFIG_HOME: "", HOME })).toBe(join(HOME, ".config", "butchr", "session-definitions"));
   });
 });

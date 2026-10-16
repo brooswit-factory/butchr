@@ -1,5 +1,5 @@
 import { readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 
 /** Every .ts source that must be loadable: src/** and scripts/**, excluding tests and this generator's own output. */
 export function loadableFiles(root: string): string[] {
@@ -8,7 +8,13 @@ export function loadableFiles(root: string): string[] {
     for (const name of readdirSync(dir)) {
       const p = join(dir, name);
       if (statSync(p).isDirectory()) { walk(p); continue; }
-      if (name.endsWith(".ts") && !name.endsWith(".d.ts")) out.push(relative(root, p));
+      // FACTORY-569: every downstream use of this string (loadTestPathFor's
+      // "/" split, the generated file's own import specifier) is POSIX-shaped
+      // on purpose — an ES module specifier is always "/"-separated, even on
+      // win32. `relative` returns the OS-native separator (backslash on
+      // win32), so it must be normalized here, once, rather than at each
+      // of those callers.
+      if (name.endsWith(".ts") && !name.endsWith(".d.ts")) out.push(relative(root, p).split(sep).join("/"));
     }
   };
   for (const top of ["src", "scripts"]) walk(join(root, top));
@@ -20,9 +26,14 @@ export const loadTestPathFor = (file: string) => `test/load/${file.replace(/\.ts
 
 /** Entry-point scripts run on import (they call process.exit / hit the network); they are load-tested as a subprocess with a guard env instead. */
 export const RUNS_ON_IMPORT = new Set([
-  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/collate.ts",
-  "scripts/release/notes.ts", "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
+  "scripts/load/generate.ts", "scripts/release/check.ts", "scripts/release/release.ts",
+  "scripts/coverage/gate.ts", "scripts/verify-generated-is-committed.ts",
   "scripts/verify-spawn-effort.ts", "scripts/verify-workspace-ground-truth.ts", "scripts/verify-review-commit-immutability.ts", "src/daemon/index.ts",
+  // FACTORY-892: calls main() unconditionally at import time — real herdr
+  // I/O (workspace.create, agent.start, pane.processInfo, pane.close,
+  // workspace.close). Importing it during `bun test` must not do any of
+  // that; it is run for real only by the dedicated `spawn-smoke` CI job.
+  "scripts/verify-ci-spawn-smoke.ts",
   // BUTCHR-250: a one-off vendoring script that fetches a live URL and
   // writes src/tools/html4-named-entities.generated.ts as a side effect of
   // being run — importing it must not actually hit the network or rewrite

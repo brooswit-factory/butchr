@@ -103,7 +103,7 @@ other and of every other field):
 
 | field | values | default | reaches argv? |
 |---|---|---|---|
-| `permissionMode` | `default` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → butchr's own default applies (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, src/agents/argv.ts), for every provider including `jira-project` since FACTORY-129 | yes — `SpawnSpec.permissionMode` |
+| `permissionMode` | `default` \| `manual` \| `acceptEdits` \| `bypassPermissions` \| `plan` \| `auto` | absent → butchr's own default applies (`DEFAULT_PERMISSION_MODE`, `acceptEdits`, src/agents/argv.ts), for every provider including `jira-project` since FACTORY-129 | yes — `SpawnSpec.permissionMode` |
 | `lizardMode` | boolean | absent → eligible (`ruleLizardModeOf`: `rule.lizardMode !== false`); explicit `false` → never scanned | no — daemon-side only |
 
 **Rollout, and there is no global override.** `permissionMode` reaches
@@ -121,6 +121,20 @@ that turns this default off fleet-wide; rolling one rule back means setting
 `permissionMode: "bypassPermissions"` explicitly on it (which respawns that
 rule's agents once) — "leave it unset" now means `acceptEdits`, not the
 pre-FACTORY-138 behaviour.
+
+**Vocabulary (FACTORY-275).** `default` and `manual` are the SAME value at
+the launcher — Claude's own `--permission-mode` treats `manual` as an
+accepted alias for its real canonical `default` (verified against a real
+`claude` invocation, not just `--help`/`--version`; see
+`SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts,
+for the full reproduction). Both are forwarded verbatim, unchanged, so use
+whichever reads better; nothing distinguishes them at runtime. `auto` keeps
+its one existing meaning (Claude's own per-prompt model-classifier judgment)
+and is never treated as a synonym for `bypassPermissions` here, which skips
+every permission check unconditionally with no judgment involved — the
+operator-facing friendly name for `bypassPermissions` is **"unattended
+mode"** (prose/docs only; the wire value is unchanged for back-compat, and
+there is no permission-mode UI to relabel — see docs/managed-sessions.md).
 
 **What they do.** `lizardMode: true` is the operator's own name (FACTORY-67)
 for turning on the daemon's standalone permission-answer timer
@@ -177,16 +191,73 @@ hard-reject `lizardMode: true`/an explicit `permissionMode` for `vendor:
 ranked FALLBACK list (see "The vendor selector" below), and which harness an
 individual launch actually gets is a runtime decision no validator here can
 see. Both fields are therefore accepted unconditionally at the schema level;
-for a launch that happens to land on Codex or Agy, `permissionMode` is
-silently never forwarded (`agentLaunchConfig` only reads it on the Claude
-branch, the same silent-ignore precedent an absent `permissionMode` already
-has today) and `lizardMode` is silently inert (drovr's Claude-specific dialog
-recognition never matches a non-Claude pane) — never a validation error.
+FACTORY-577: for a launch that lands on Codex, `permissionMode` now IS
+forwarded (`agentLaunchConfig`'s Codex branch maps it onto
+`bypassApprovalsAndSandbox`, same as `SessionDefinition.permissionMode` —
+see docs/managed-sessions.md's "Per-vendor launch differences") — only an
+Agy-resolved launch still silently drops it (that branch never reads
+`permissionMode` at all). `lizardMode` is still silently inert for Codex
+only when `permissionMode` is itself absent from that spec (drovr's own
+Codex approval-answering has nothing to answer once the bypass flag is
+dropped) and inert outright for Agy (drovr's Claude-specific dialog
+recognition never matches a non-Claude pane) — never a validation error
+either way.
 
 **Absent means unchanged, verified.** A rules document that sets neither
 field loads and behaves byte-for-byte as before this ticket — no new key on
 any parsed `Rule`, no new `SpawnSpec` field on any `specFor*` output, no
 change to which panes the permission-answer timer scans.
+
+### Canary: narrowing `eligiblePanes` to one pane (FACTORY-581 SAFETY GUARD 4)
+
+`@brooswit/drovr` >= 0.16.8 (FACTORY-580/586/587) adds a new no-separator
+file-edit/create recognition sibling to `autoAnswerPermissions` — a new
+AUTO-ANSWER PATH the permission-answer timer presses keys through, same as
+every pre-existing matcher. Per FACTORY-460's diagnosis finding (d) and
+FACTORY-581's own instruction, there is **no new feature flag** for this: it
+rides the EXISTING `PermissionAnswerLoopDeps.eligiblePanes` gate
+(`src/agents/permission-answer-loop.ts`'s own documented single enforcement
+point — "a pane left out of that map is never scanned or answered AT ALL"),
+narrowed by one optional config value, `Config.permissionAnswerCanaryPaneLabel`
+(`BUTCHR_PERMISSION_ANSWER_CANARY_PANE`, trimmed; unset/blank is the default
+and means fleet-wide, unchanged).
+
+**What it does.** When set, `permissionAnswerEligiblePanes` in
+`src/daemon/index.ts` drops every pane whose `lizardModeLabel` does not
+EXACTLY equal this value — `lizardModeLabel` itself (and therefore
+`permissionMode`/`lizardMode` resolution above) is computed first and
+completely unchanged; the canary value only filters its OUTPUT. A pane whose
+label doesn't match is excluded from the eligible map exactly as if
+`lizardMode: false` had been set on it for this tick — never scanned, never
+answered, by the same construction `lizardMode: false` already uses.
+
+**Grain: per-pane, not per-dialog-type.** `eligiblePanes` has no concept of
+WHICH dialog a pane might show, only whether the pane is scanned at all —
+there is no way to carve "only the new file-edit fallback" out of a blanket
+pane gate without a second, dialog-type-aware flag, which is exactly what
+FACTORY-581 forbids inventing. So this canaries drovr 0.16.8 as a WHOLE (the
+new fallback plus every pre-existing matcher) on one named pane, the same
+coarse grain `lizardMode` itself already operates at — not a file-edit-only
+canary.
+
+**ONE-STEP ROLLBACK and widen.** Unset `BUTCHR_PERMISSION_ANSWER_CANARY_PANE`
+(or set it empty) and restart the daemon: every other pane's eligibility
+reverts to exactly what `lizardModeLabel` alone would produce, with nothing
+else to undo. Widening to fleet-wide after a successful canary window is the
+SAME one step, in the same direction.
+
+**Attribution during the canary.** Read `docs/managed-sessions.md`'s
+"Resolution, with a DISTINCT, ATTRIBUTABLE tag per clearing path" — a
+managed-session canary pane's cleared dialogs show up tagged
+`no longer blocked (answered: recognizedVia=no-separator-file-edit)`
+specifically for the new fallback, composing with drovr's own JSONL audit
+(`grep '"recognizedVia":"no-separator-file-edit"' <auditPath>`,
+`docs/permission-approval.md` GUARD 3/7 in `@brooswit/drovr`) rather than
+requiring a second, separate signal.
+
+**Absent means unchanged, verified** — same discipline as the rest of this
+section: a daemon started with no `BUTCHR_PERMISSION_ANSWER_CANARY_PANE`
+behaves byte-for-byte as before this field existed.
 
 ## The vendor selector: already there, not duplicated
 
@@ -434,15 +505,34 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
   fails, or its rule has since been removed) is always a WORKER — an
   unrecognised agent silently escaping the cap would be the opposite of
   safe.
-- **`jira-project` is always a sentinel** (BUTCHR-425), unconditionally —
-  `capacityRoleFor` (`src/agents/capacity-role.ts`) checks the resource
-  provider before ever consulting the rule's own `role` field, the same
-  precedence its Epic/Story-issue-type check already uses. Free-form project
-  managers are operator-directed, not admission-capped workers: Codey runs
-  dozens of them, and none may consume `BUTCHR_MAX_AGENTS`. This is a
-  DIFFERENT mechanism from the `role` field's own default — a `jira-project`
-  rule that never sets `role` at all (every live rule today) still gets
-  `"sentinel"`, not the field's own `"worker"` default.
+- **FACTORY-757: capacity is a per-query decision, not a per-issue-type
+  one.** Earlier (BUTCHR-422/FACTORY-39), `capacityRoleFor`
+  (`src/agents/capacity-role.ts`) also exempted any Jira work item whose
+  issue type was Epic, Story or Bug, regardless of its rule's own `role` —
+  a `jira-work`-specific special case layered on top of this field. That
+  hardcoding is gone: an `epics`/`stories`/`bugs`-shaped rule now counts
+  exactly like any other rule, unless it explicitly sets `role: "sentinel"`
+  itself. This is a deliberate behaviour change — a live rules file that
+  relied on the old issue-type exemption now needs to add `role: "sentinel"`
+  to each rule it wants exempt. **FACTORY-757 itself shipped this
+  migration-free** (see `changelog.d/FACTORY-757.md`'s "No migration and no
+  UI ship with this change"); FACTORY-810 (implementing FACTORY-754, epic
+  FACTORY-748) closed that gap with an upgrade-time migration — see
+  "Upgrade migration: pre-FACTORY-757 issue-type exemption" below.
+- **`jira-project` is still always a sentinel** (BUTCHR-425), unconditionally
+  — `capacityRoleFor` checks the resource provider before ever consulting
+  the rule's own `role` field. Free-form project managers are
+  operator-directed, not admission-capped workers: Codey runs dozens of
+  them, and none may consume `BUTCHR_MAX_AGENTS`. Unlike the issue-type
+  exemption just above, this ONE exception survived FACTORY-757's cleanup on
+  purpose — removing it would require every live `jira-project` rule to add
+  `role: "sentinel"` just to keep today's behaviour, which is exactly the
+  migration this ticket's definition of done rules out. This is a DIFFERENT
+  mechanism from the `role` field's own default — a `jira-project` rule that
+  never sets `role` at all (every live rule today) still gets `"sentinel"`,
+  not the field's own `"worker"` default. A bare project-tier agent (no rule
+  at all — the project-wide agent, e.g. a plain `BUTCHR` id) is sentinel for
+  the same construction-level reason: there is no rule to ask for a `role`.
 - **Reporting**: the `[admission2]` log line and the `/dashboard` admission
   panel report `residency(workers)=<n> sentinels=<m>` — a deliberate format
   change from the old bare `residency=<n>` (same convention `ADMISSION2_TAG`
@@ -455,6 +545,211 @@ it did not wait on the fleet's own agent cap. Independent of `execution` and
 loaded `rules` list, so it works across every provider) into the single
 shared `AdmissionController` instance every rule loop's admission bucket
 already draws from.
+
+## Per-rule admission rate limiting: `maxNewPerTick` / `minSecondsBetweenAdmissions` (FACTORY-907, epic FACTORY-906)
+
+**Rationale**: lowering a rule's priority filter can land a whole batch of
+workers on one poll — 4 cores can't absorb that; measured live, load5 hit
+49 within 4 minutes at 21:50 PDT. The fleet-wide cap (`BUTCHR_MAX_AGENTS`,
+`src/agents/admission.ts`) bounds how many agents are RESIDENT at once, but
+says nothing about how FAST one rule's own lane may claim that cap on a
+single poll. These two fields are that per-rule throttle:
+
+- **`maxNewPerTick?: number` (integer ≥ 1)**: at most this many NEW agents
+  (desired but not yet running) are admitted for this rule per `admit()`
+  call.
+- **`minSecondsBetweenAdmissions?: number` (integer ≥ 1)**: at most one new
+  admission for this rule every this-many seconds, wall-clock.
+- **Both set**: both must allow — neither field overrides the other.
+  `minSecondsBetweenAdmissions` can still block a second admission within
+  one call even when `maxNewPerTick` alone would have allowed it.
+- **Absent (either or both)**: today's behaviour exactly, byte-for-byte —
+  no log line changes, no ordering changes, nothing.
+- **Never affects an already-running agent**, and **never raises the fleet
+  cap** — this only ever narrows how much of that cap one rule's lane may
+  claim on one poll. The shared cap still applies on top: a candidate this
+  limiter would allow can still be cap-withheld, and that is logged and
+  counted as a CAP withholding, never a rate-limit one (see
+  `admitWithRateLimits`'s own doc comment, `src/agents/admission.ts`, for
+  why the two are computed in one pass rather than two, to keep that
+  distinction honest).
+- **Deferred, never dropped, and never reported as cap-withheld**: a
+  candidate the rate limit holds back this poll is retried on the next one,
+  in the SAME wait-ordered position (`orderByWait`) it would have had
+  anyway, and shares the exact wait ledger a cap-withheld candidate already
+  uses for that ordering — a candidate that leaves `desired` for good
+  (ticket closed) is reclaimed by the same evict-after-unseen bound
+  (`LEDGER_UNSEEN_EVICTION_CALLS`) cap-withholding already relies on. But a
+  rate-deferred id is explicitly EXCLUDED (PR #734 review) from every one of
+  the cap's own reporting surfaces — `/health`'s `longestWait`, the
+  per-source admission census bucket (and so the `admission:withheld` Jira
+  label it feeds), and the `[admission2] cap=... withheld N/M wanted: ...`
+  line's own count and id list — because it was never withheld BY THE CAP
+  (it may have had cap headroom to spare). Those three only ever report a
+  candidate the SHARED CAP actually ran out on; a rate limiter's own
+  deferral is visible exclusively through the distinct `rate-limit` line
+  below.
+- **No persisted state**: both counters (this call's admission count per
+  rule, and each rule's last-admitted wall-clock time) live only in the
+  `AdmissionController` instance's own memory. A daemon restart starts
+  fresh and re-derives purely from live state — there is nothing to
+  migrate or clean up on disk.
+- **Reporting**: a deferral fires `[admission2] rate-limit rule=<id>
+  admitted=<a> deferred=<d> maxNewPerTick=<n> minSeconds=<m> next-in=<s>s`
+  — a DISTINCT line from the ordinary `[admission2] cap=... admitted=...
+  withheld ...` line (same `[admission2]` tag, extended, never a silently
+  reinterpreted shape), one per rule that actually had a candidate deferred
+  by its own rate limit this call, throttled to at most once per rule per
+  60 seconds so a saturated rule's own deferral cannot spam every poll. A
+  field this rule left unset prints `-`, never a number that would
+  misreport it as configured.
+- **Read-only in the rules API/preview** (`GET /api/rules`) as
+  `maxNewPerTick`/`minSecondsBetweenAdmissions`, `null` when unset — not yet
+  on the web write surface (a later story, same discipline as every other
+  read-only-for-now field this endpoint already carries).
+
+Example:
+
+```json
+{
+  "id": "triage",
+  "resourceProvider": "jira-work",
+  "query": "project = FACTORY AND status = \"To Do\"",
+  "brief": "Pick up a newly assigned ticket.",
+  "maxNewPerTick": 2,
+  "minSecondsBetweenAdmissions": 30
+}
+```
+
+— admits at most 2 new `triage` agents per poll, and never more than one
+every 30 seconds, regardless of how many tickets a lowered priority filter
+just made eligible all at once.
+### Setting `role` from the rules API and the Rules page form (FACTORY-817, story FACTORY-756, epic FACTORY-748)
+
+Until this ticket, `role` was file-only — an operator had to hand-edit
+`rules.json` to flip a rule's capacity inclusion. It is now exposed as a
+first-class field through both the rules write surface this codebase
+already has (FACTORY-662/FACTORY-729) and the Rules page form it serves:
+
+- `GET /api/rules` includes each rule's current `role` (unchanged — it
+  already did). `GET /api/rules/catalog` additionally serves a
+  `capacityRoles: { values: ["worker", "sentinel"], default: "worker" }`
+  field alongside the per-harness catalog (`src/rules/rule-form-catalog.ts`)
+  — one global pair of values plus the engine's own default, since `role`
+  (unlike the harness/model/effort/permission-mode fields) applies
+  uniformly across every provider, not per-harness.
+- `PUT /api/rules/:id` now accepts `role` as an editable top-level field
+  (`EDITABLE_TOP_LEVEL_FIELDS`, `src/rules/rules-write-registry.ts`),
+  validated against `AGENT_ROLES`, going through the SAME catalog-validated
+  write/audit-line path every other field here does — no second validation
+  mechanism.
+- **`role: "sentinel"` requires an explicit `confirm: true`** on the write
+  that sets it, the SAME discipline `permissionMode: "bypassPermissions" |
+  "auto"` and `lizardMode: true` already carry
+  (`requireConfirmForRiskyFields`, `src/rules/rules-write.ts`) —
+  deliberately, not an oversight: opting a rule's agent(s) OUT of
+  `BUTCHR_MAX_AGENTS` entirely is exactly the kind of change that must never
+  slip in silently alongside an unrelated edit. `"worker"` (the default,
+  ON) needs no confirm. The plan route's `confirmReason` names this gate
+  `"capacity-sentinel"` when it is the reason a write requires confirm.
+- The toggle is deliberately **not a restart-triggering field** — unlike
+  `query`/`permissionMode`/`lizardMode`/`agentPreferences`, changing `role`
+  never changes an already-running agent's own launch (`SpawnSpec`); it
+  only changes a classification the admission controller reads fresh every
+  reconciliation poll (`ruleRoleOfAgent` calls `getRules()` live,
+  `src/daemon/index.ts`). `computeLocalPlanCounts` (`src/rules/rules-write.ts`)
+  does not count a `role`-only change as a restart.
+- **The Rules page form**: FACTORY-725/FACTORY-729 shipped their
+  catalog-sourced dropdowns and the lizard toggle on the first-rule setup
+  form (`FirstRuleSetup.tsx`) first. FACTORY-730 (PR #704, merged to
+  `main`) then shipped the generic existing-rule edit dialog
+  (`RuleEditDialog.tsx`, opened from the Rules table's per-row Edit
+  button), so an "Included in capacity" toggle on an already-created rule
+  is no longer a gap. FACTORY-856 (story FACTORY-756) adds that toggle to
+  `RuleEditDialog` too, in the same field-definition/validation/layout
+  pattern as its own lizard toggle (`rule-edit-capacity-toggle` /
+  `rule-edit-capacity-notice`, mirroring `rule-edit-lizard-mode-toggle` /
+  `rule-edit-lizard-notice`) — the toggle now lands on BOTH surfaces: the
+  first-rule setup form and the existing-rule edit dialog. `buildFieldsPatch`
+  sends `role` only when the draft differs from the rule's own current
+  value (the dialog's existing "only send what changed" discipline, unlike
+  `FirstRuleSetup`'s always-send). Toggling it off shows the same "never a
+  default, needs confirm" notice pattern the lizard toggle already uses,
+  and the write goes through the same catalog-validated `PUT /api/rules/:id`
+  path (`confirmReason: "capacity-sentinel"`) described above.
+- **`jira-project` rules are unaffected by this toggle** — they are
+  sentinel by construction (`capacityRoleFor` checks the resource provider
+  BEFORE ever consulting the rule's own `role`, see above), so the toggle
+  would have no effect for one. The form shows it disabled with an
+  explanatory note for a `jira-project` rule rather than implying a control
+  the engine will ignore.
+- **Operator-facing summary**: capacity inclusion is now a per-query
+  choice, made per rule, defaulting to counted ("worker") — it is no
+  longer inferred from the Jira issue type (that hardcoding was removed by
+  FACTORY-757, see above). An operator who wants a rule's agents excluded
+  from `BUTCHR_MAX_AGENTS` turns this toggle off (or sets `role: "sentinel"`
+  by hand) and confirms; leaving it on (the default) means that query's
+  agents consume fleet capacity exactly like every other worker rule.
+
+## Upgrade migration: pre-FACTORY-757 issue-type exemption (FACTORY-810, implementing FACTORY-754, epic FACTORY-748)
+
+FACTORY-757 (above) deliberately shipped with no migration: a live
+`jira-work` rule whose JQL relied on the deleted Epic/Story/Bug issue-type
+exemption would silently start counting toward `BUTCHR_MAX_AGENTS` the
+moment that code ran, unless an operator had already added `role:
+"sentinel"` itself. FACTORY-810 closes that gap with an upgrade-time
+migration (`src/rules/capacity-role-migration.ts`), run once at daemon
+startup — same convention `../agents/workspace-migration.ts` and
+`../rules/seed-first-run.ts` already use: existence-based, idempotent, and
+run BEFORE `loadRules` reads the file for the daemon's own real startup.
+
+**What gets migrated, and why nothing else does** — restated from
+FACTORY-754's own corrected description, since it is easy to over-scope:
+
+1. **`jira-work` rules whose query relies on the deleted exemption** — the
+   only real target. Written with `role: "sentinel"` so each one's
+   post-upgrade counting decision stays identical to its pre-upgrade one.
+2. **`jira-work` task/subtask rules** — already counted before and after
+   (the schema default); writing `role: "worker"` would be a redundant
+   no-op, so these are left untouched.
+3. **`jira-project` (manager) rules, and bare project-tier ids** — sentinel
+   by construction (`capacityRoleFor` checks this before ever consulting a
+   rule's `role` — see "Fleet capacity role" above); writing `role` onto
+   one would be config the capacity path never reads, so these are never
+   even classified.
+4. **`github-issue`/`github-pr`/`zendesk-ticket`/`filesystem` rules** — the
+   pre-FACTORY-757 exemption never covered a non-Jira provider; these were
+   always counted and still are, so nothing is written.
+
+**How a rule's issue-type restriction is recognised**: `jira-work`'s
+`query` is a plain JQL string with no structured representation anywhere
+in this codebase (`searchRules`, `src/rules/resource-type.ts`, hands it to
+Jira verbatim). `classifyJqlQuery` (`src/rules/capacity-role-migration.ts`)
+recognises exactly the canonical shape `docs/rules.example.json` uses — a
+single, top-level, AND-ed, non-negated `issuetype = X` or `issuetype IN
+(X, Y, …)` clause — and REFUSES to guess about anything looser: zero or
+multiple top-level `issuetype` clauses, a clause joined by a top-level
+`OR`, a negated operator (`!=`, `NOT IN`), or unbalanced parens/quotes all
+classify as "skip, cannot classify" rather than a guess in either
+direction. A query this function cannot classify is left untouched and
+logged at startup (`butchr: upgrade migration — left rule <id> untouched
+(<reason>)`) — the safe default stays "counted" (today's new behaviour),
+never a wrongly-granted exemption.
+
+**Idempotency** (a hard requirement, since the epic's own interim
+mitigation — admin-assembly setting `role` by hand ahead of the code
+landing — may already have run): a rule that already carries an explicit
+`role` in the raw JSON, `"sentinel"` or `"worker"` alike, is never even
+classified, let alone overwritten. `runCapacityRoleMigration` goes one
+step further than "the field doesn't change" — when its plan has nothing
+to migrate, it never calls the rules writer at all, so a second (or every
+subsequent) run performs zero filesystem writes: no new backup, no touched
+mtime, a genuine no-op rather than a written-but-unchanged file. The write
+itself, when one is needed, goes through `setRuleRole`
+(`src/rules/write-rules.ts`) — the same surgical, formatting-preserving
+text editor `setRuleEnabled` already established for its own field, so
+every other rule, field, and byte of whitespace in the file survives
+untouched.
 
 ## Herdr workspace labels: short display ids, collisions, and full-key metadata (FACTORY-95, implementing FACTORY-90, epic FACTORY-83)
 
@@ -512,13 +807,13 @@ information, unlike an arbitrary filesystem resource where the parent is
 exactly what disambiguates "which `rinth` is this." `display-label.ts`'s one
 dispatch point tells the two apart by **rule id**
 (`MANAGED_SESSIONS_RULE_ID`), never by provider alone. A managed session's
-label also has no `· <ruleId>` suffix — every session shares the same
+label also has no `<ruleId> · ` prefix — every session shares the same
 reserved rule id, so appending it would be pure noise.
 
 ### Combining a short id with the rule id
 
-An ordinary resource agent displays `"<shortId> · <ruleId>"`, e.g.
-`"FACTORY-51 · jira-work"`.
+An ordinary resource agent displays `"<ruleId> · <shortId>"`, e.g.
+`"jira-work · FACTORY-51"`.
 
 ### Collisions: deterministic and loud
 
@@ -679,7 +974,7 @@ after via the bookkeeping stamp described in `docs/workspace-layout.md`.
 Three points worth knowing without opening that doc:
 
 1. **The leaf is the provider's short id alone**, never combined with the
-   rule id the way a herdr LABEL combines it (`"<shortId> · <ruleId>"`) — a
+   rule id the way a herdr LABEL combines it (`"<ruleId> · <shortId>"`) — a
    workspace path already carries the rule id as its own separate directory
    segment (`<provider>/<ruleId>/<leaf>`), so appending it into the leaf too
    would duplicate it. `jira-work`/`jira-idea`/`jira-project`'s identity

@@ -15,27 +15,57 @@
  * Rules live in a JSON file OUTSIDE the repo: `BUTCHR_RULES_FILE` when set,
  * else `$XDG_CONFIG_HOME/butchr/rules.json`, else
  * `~/.config/butchr/rules.json`. When the DEFAULT file is absent there are
- * ZERO rules and nothing is staffed; nothing is written. An explicit
- * `BUTCHR_RULES_FILE` that does not exist is an error: a typo must never
- * read as "no rules" and stop every rule agent. There are no built-in
- * rules or templates — a present file is the only source of rules.
+ * ZERO rules and nothing is staffed. An explicit `BUTCHR_RULES_FILE` that
+ * does not exist is an error: a typo must never read as "no rules" and stop
+ * every rule agent. There are no built-in rules — `loadRules` itself never
+ * invents one — but FACTORY-669 is a single, narrow exception to "nothing is
+ * written": at TRUE first run only (the default path absent, no
+ * `BUTCHR_RULES_FILE` override, no prior `.bak-*` state —
+ * `../rules/seed-first-run.ts`'s own doc comment has the exact conditions),
+ * `src/daemon/index.ts`'s startup seeds exactly one DISABLED template rule
+ * (`ui-first-rule`, the reserved `ui-` prefix FACTORY-662's web write path
+ * alone may touch) before this function is ever called for real, through
+ * `./write-rules.ts`'s `createRulesFileExclusive` — never from HTTP, MCP, a
+ * reload, or a file watcher, and never again once the daemon has started.
  */
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import type { NotifyDeliveryMode } from "../notify/deliver.js";
 import { builtinBriefProblem } from "../agents/workspace.js";
 import { filesystemQueryProblems } from "../resources/filesystem-query.js";
+import { confluencePageQueryProblems } from "../resources/confluence-page-query.js";
 import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { githubPrQueryProblems } from "../resources/github-pr.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
+import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
-/** Agent harnesses Drovr can launch. */
-export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
-export type AgentHarness = (typeof AGENT_HARNESSES)[number];
+/**
+ * FACTORY-669: the exact placeholder string the first-run template seeds
+ * `ui-first-rule.query` with — a sentinel the write path (FACTORY-662's
+ * `./rules-write-registry.ts`, re-exporting this same constant) recognizes
+ * to refuse enabling the template before its query has been edited to
+ * something real, so a careless enable can never silently stage every
+ * ticket in the project. Lives here (rather than in the write-registry,
+ * which only CONSUMES it) because `./seed-first-run.ts` needs it and must
+ * not import from `./rules-write-registry.ts` — that module already imports
+ * FROM `rules.ts` (`isRuleId` etc.), and the write path is a later, web-only
+ * concern this plain data constant has no need to depend on.
+ */
+export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
+/**
+ * FACTORY-729: moved to `./agent-harness.ts` (that module's own top comment
+ * explains why — a dependency-free leaf, safe for browser-bundled code to
+ * import a VALUE from, unlike this module, which pulls in `node:fs`/
+ * `node:crypto`) and re-exported here unchanged for every existing
+ * importer of `rules.js`.
+ */
+export { AGENT_HARNESSES, type AgentHarness };
 /**
  * FACTORY-75: moved to src/resources/power-scale.ts (that module's own top
  * comment explains why — it needs this type for its shared effort table,
@@ -45,29 +75,40 @@ export type AgentHarness = (typeof AGENT_HARNESSES)[number];
 export { AGENT_EFFORTS, type AgentEffort };
 /**
  * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same five
- * Claude permission-mode values `SessionDefinition.permissionMode` accepts
+ * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
- * an INDEPENDENT copy here rather than imported: that module already imports
- * `ExecutionMode`/`AccountPolicy`/`AgentRole`/`McpServerBinding` FROM this
- * file, so importing its `SESSION_PERMISSION_MODES` back would cycle this
- * file with it. Claude-only, like `SessionDefinition.permissionMode` —
- * silently never forwarded to a Codex or Agy launch (`agentLaunchConfig`,
- * src/agents/argv.ts, only ever reads `spec.permissionMode` on its Claude
- * branch). Unlike `SessionDefinition`, a `Rule` has no single fixed `vendor`
- * to validate this against — `agentPreferences` is a ranked FALLBACK list,
- * not one committed choice, and the harness an individual agent actually
- * gets is a runtime decision (`src/agents/herd.ts`) no validator here can
- * see — so there is deliberately no Codex-vendor rejection for this field: a
- * rule that falls back to Codex/Agy for one launch simply gets the same
- * silent no-op an absent `permissionMode` already gives that branch today —
- * the same "no rejection, validated-but-silently-unforwarded" treatment
- * `SessionDefinition.permissionMode` itself gets for a `vendor: "codex"`
- * definition (only `SessionDefinition.strictMcpConfig` is HARD-rejected
- * there — see that field's own doc comment). `Rule.lizardMode` below is a
- * DIFFERENT case as of FACTORY-108 — see its own doc comment.
+ * an INDEPENDENT copy of that constant (not imported FROM that module: it
+ * already imports `ExecutionMode`/`AccountPolicy`/`AgentRole`/
+ * `McpServerBinding` FROM this file, so importing its
+ * `SESSION_PERMISSION_MODES` back would cycle this file with it).
+ * FACTORY-729: THIS copy's own value+type now live in `./agent-harness.ts`
+ * (a dependency-free leaf — see that module's own top comment) and are
+ * re-exported here unchanged, same reason/pattern as `AGENT_HARNESSES`
+ * above. FACTORY-577: no longer Claude-only — `agentLaunchConfig`
+ * (src/agents/argv.ts) reads `spec.permissionMode` on its Codex branch too
+ * now (mapped onto `bypassApprovalsAndSandbox`), same as `permissionMode`'s
+ * own doc comment there. Still silently never forwarded to an Agy launch
+ * (that branch never reads it at all). Unlike `SessionDefinition`, a `Rule`
+ * has no single fixed `vendor` to validate this against — `agentPreferences`
+ * is a ranked FALLBACK list, not one committed choice, and the harness an
+ * individual agent actually gets is a runtime decision (`src/agents/herd.ts`)
+ * no validator here can see — so there is deliberately no Codex-vendor
+ * rejection for this field: a rule that falls back to Codex now gets the
+ * SAME explicit mapping a Claude launch gets (no longer a silent no-op),
+ * and a rule that falls back to Agy still gets the same silent no-op an
+ * absent `permissionMode` always gave that branch. `Rule.lizardMode` below
+ * is a DIFFERENT case as of FACTORY-108 — see its own doc comment.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (src/resources/session-definition.ts) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here. The
+ * constant itself is edited in `./agent-harness.ts`, not here.
  */
-export const RULE_PERMISSION_MODES = ["default", "acceptEdits", "bypassPermissions", "plan", "auto"] as const;
-export type RulePermissionMode = (typeof RULE_PERMISSION_MODES)[number];
+export { RULE_PERMISSION_MODES, type RulePermissionMode };
 
 /**
  * How many agents a rule runs (BUTCHR-392/BUTCHR-397; see `docs/execution-modes.md`).
@@ -104,9 +145,15 @@ export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
  * per-agent: a swarm rule's every per-resource agent is a sentinel, or a
  * singleton/persistent rule's one query-level agent is. See
  * src/agents/admission.ts for how residency/admission honour this.
+ *
+ * FACTORY-817: THIS copy's own value+type now live in `./agent-harness.ts`
+ * (a dependency-free leaf — see that module's own top comment) and are
+ * re-exported here unchanged, same reason/pattern as `AGENT_HARNESSES`/
+ * `RULE_PERMISSION_MODES` above — the rule form's "Included in capacity"
+ * toggle (`dashboard-app/src/components/FirstRuleSetup.tsx`) needs this as
+ * a real VALUE, via `./rule-form-catalog.ts`.
  */
-export const AGENT_ROLES = ["worker", "sentinel"] as const;
-export type AgentRole = (typeof AGENT_ROLES)[number];
+export { AGENT_ROLES, type AgentRole };
 
 /**
  * FACTORY-75: `modelPower`/`effortPower` are the SAME 0-100 two-axis
@@ -323,10 +370,14 @@ export interface Rule {
    */
   linkedDescriptionLinks?: boolean;
   /**
-   * FACTORY-87 — Claude `--permission-mode` for agents THIS rule launches,
+   * FACTORY-87 — the permission mode for agents THIS rule launches,
    * forwarded to `SpawnSpec.permissionMode` by every `specFor*` builder
    * (`specForMatch`/`specForRuleQuery`, `specForProject`,
    * `specForGithubIssue*`, `specForGithubPr*`, `specForFilesystem*`).
+   * Originally Claude's own `--permission-mode` only; FACTORY-577: also
+   * reaches a Codex-resolved launch now (mapped onto
+   * `bypassApprovalsAndSandbox` — see `RULE_PERMISSION_MODES`'s own doc
+   * comment above and `agentLaunchConfig`'s Codex branch, src/agents/argv.ts).
    * `src/agents/workspace.ts`'s persist-at-spawn/read-back stale-argv pair
    * (FACTORY-43) already reads `spec.permissionMode` generically for every
    * provider, not just managed sessions, so no new wiring is needed there —
@@ -372,22 +423,26 @@ export interface Rule {
    * it to its own live state) as `rule.lizardMode !== false`, regardless of
    * vendor — unchanged by FACTORY-108.
    *
-   * FACTORY-108: UNLIKE `permissionMode` above, and unlike scanning
-   * eligibility just described, this field is ALSO forwarded onto
-   * `SpawnSpec.lizardMode` by every `specFor*` builder (the same ones
-   * `permissionMode` threads through) — but there ONLY on an EXPLICIT `true`
-   * (`rule.lizardMode ? { lizardMode: true } : {}`), never merely-absent —
-   * so a Codex-resolved launch (`agentLaunchConfig`'s Codex branch,
-   * src/agents/argv.ts) can read it and drop
+   * FACTORY-108: unlike scanning eligibility just described, this field is
+   * ALSO forwarded onto `SpawnSpec.lizardMode` by every `specFor*` builder
+   * (the same ones `permissionMode` threads through) — but there ONLY on an
+   * EXPLICIT `true` (`rule.lizardMode ? { lizardMode: true } : {}`), never
+   * merely-absent — so a Codex-resolved launch (`agentLaunchConfig`'s Codex
+   * branch, src/agents/argv.ts) can read it and drop
    * `--dangerously-bypass-approvals-and-sandbox` only when a rule opted in
-   * explicitly. See `SpawnSpec.lizardMode`'s own doc comment
-   * (src/agents/workspace.ts) for the full contract, including the
-   * FACTORY-43-style persist-at-spawn/read-back stale-argv pair this now
-   * rides generically (nothing rule-specific was added for it). A Claude- or
-   * Agy-resolved launch still ignores it completely (neither branch of
-   * `agentLaunchConfig` reads `spec.lizardMode`), so the scanning-eligibility
-   * paragraph above remains the whole story for those two vendors — only a
-   * Codex fallback is new territory.
+   * explicitly, and only when `permissionMode` above is itself absent —
+   * FACTORY-577: `permissionMode`, when set, now ALSO reaches a Codex
+   * launch (mapped onto `bypassApprovalsAndSandbox`, same as it always has
+   * for Claude's own launch mode — see that field's own doc comment above)
+   * and wins over this field, in both directions. See `SpawnSpec.lizardMode`'s
+   * own doc comment (src/agents/workspace.ts) for the full contract,
+   * including the FACTORY-43-style persist-at-spawn/read-back stale-argv
+   * pair this now rides generically (nothing rule-specific was added for
+   * it). A Claude- or Agy-resolved launch still ignores THIS field
+   * completely (neither branch of `agentLaunchConfig` reads
+   * `spec.lizardMode`), so the scanning-eligibility paragraph above remains
+   * the whole story for those two vendors — only a Codex fallback is new
+   * territory.
    *
    * **Deliberate rule-side asymmetry (story decision, FACTORY-106/FACTORY-324):**
    * a rule-launched Codex agent with `lizardMode` merely ABSENT is "eligible"
@@ -421,12 +476,221 @@ export interface Rule {
    * deliberate, documented scope boundary, not an oversight.
    */
   lizardMode?: boolean;
+  /**
+   * FACTORY-907 (epic FACTORY-906) — gentles a rule's own lane of
+   * admissions: at most this many NEW agents (desired but not yet running —
+   * see `src/agents/admission.ts`'s own "WITHHOLDING, NOT DROPPING" header)
+   * are admitted for THIS rule per `admit()` call. Independent of
+   * `resourceProvider`/`execution`/`account`/`role`, same house style as
+   * every other independently-optional knob above. Absent: today's
+   * behaviour exactly — unchanged, byte-for-byte, down to the log line (see
+   * `minSecondsBetweenAdmissions` immediately below for the shared
+   * rationale). Never affects an ALREADY-RUNNING agent, and never raises
+   * `BUTCHR_MAX_AGENTS`'s own fleet-wide cap — this only ever narrows how
+   * much of that cap one rule's lane may claim on a single poll; a
+   * candidate this defers is retried on the next poll, in the same
+   * wait-ordered position it would have had anyway, never dropped or marked
+   * stalled/blocked/withheld-by-cap.
+   */
+  maxNewPerTick?: number;
+  /**
+   * FACTORY-907 — companion to `maxNewPerTick` immediately above: at most
+   * one new admission for THIS rule every this-many seconds, wall-clock
+   * (`AdmissionControllerDeps.now`, src/agents/admission.ts — injectable for
+   * tests, `Date.now` in production). When BOTH fields are set on the same
+   * rule, BOTH must allow an admission for it to proceed — neither alone
+   * overrides the other. Rationale (the ticket's own problem statement):
+   * lowering a rule's priority filter can land a whole batch of workers on
+   * one poll, and four cores can't absorb that burst (measured: load5 49 in
+   * 4 minutes at 21:50 PDT) — these two fields are the rule-level throttle
+   * that makes each step gentle, independent of `BUTCHR_MAX_AGENTS` itself.
+   * Absent: today's behaviour exactly, unchanged.
+   */
+  minSecondsBetweenAdmissions?: number;
+  /**
+   * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — opts this rule's
+   * agent(s) into resuming their prior Claude session on a respawn that
+   * follows an UNINTENDED stop (crash, daemon restart, wedge, pane death),
+   * rather than starting fresh from the ticket and brief every time.
+   * Absent means ON — FACTORY-843's own default-on decision — and there is
+   * deliberately no tri-state: a rule either resumes (absent or explicit
+   * `true`) or it doesn't (explicit `false`). This field is CONFIG ONLY —
+   * schema, validation, and surfacing (this ticket, FACTORY-851) — nothing
+   * in this daemon reads it yet. Actually wiring resume-on-respawn into the
+   * spawn path (classifying intentional-vs-unintended per FACTORY-849, then
+   * honouring this flag and `resumeContextCutoff` below) is FACTORY-850, which
+   * this ticket's scope guard explicitly forbids touching: do not change
+   * spawn, respawn, stale-argv, `resumeInPlace`, the `BUTCHR_RESTORED_RESUME`
+   * policy, or the session-id store from here.
+   */
+  resumeOnRespawn?: boolean;
+  /**
+   * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — the transcript-size
+   * cutoff (in tokens) above which `resumeOnRespawn` is skipped even though
+   * it would otherwise apply, falling back to a fresh start (FACTORY-850's
+   * concern, not this ticket's). Bounds the token/memory cost an unattended
+   * respawn can incur resuming a large transcript. Absent means
+   * `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see that constant's own doc
+   * comment for why 100,000 was chosen). Validated as a positive integer —
+   * 0, negative, non-integer, and NaN are all rejected, same `isPositiveInt`
+   * every other token/count field in this file already uses. Like
+   * `resumeOnRespawn` above, this field is schema/validation/surfacing only;
+   * nothing reads it yet (FACTORY-850). Named `...ContextCutoff`, not the
+   * more obvious `...TokenCutoff`: the rules API response (`../web/rules-api.ts`)
+   * applies a defensive, repo-wide redaction to any key matching
+   * `/token|secret|password|authorization/i`, and a literal `TokenCutoff`
+   * key was silently rewritten to `"[redacted]"` there — caught by this
+   * ticket's own API tests, not by inspection.
+   */
+  resumeContextCutoff?: number;
+  /**
+   * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY —
+   * this EXTENDS the existing global `stalledMinutes` (src/config/config.ts,
+   * env `BUTCHR_STALLED_MINUTES`, default 10) instead of adding a parallel
+   * idle-poke threshold. Nothing in the daemon reads this field yet —
+   * wiring a per-rule override into `StalledTracker` (src/agents/
+   * stalled.ts) and the wake-comment remediator (src/agents/stall-
+   * remediation.ts) is FACTORY-845's job, which this ticket's text names
+   * as the engine story reading these field names; this field only
+   * describes what a rule WOULD want once that wiring exists. When
+   * ABSENT — unlike `execution`/`account`/`role` above — there is
+   * deliberately NO default resolved here: the rule simply inherits the
+   * global `stalledMinutes` as it already does today, so an install that
+   * configures nothing keeps its existing 10-minute threshold unchanged.
+   * The epic's own "30 min" default is achieved by a rule (or the global
+   * config) explicitly setting it, not by this field silently resolving
+   * to 30 for everyone — see FACTORY-844's ticket comment for why:
+   * flipping every install from 10 to 30 by default would be a behaviour
+   * change dressed as a config addition. Same "positive number"
+   * validation idiom as `stalledMinutes`.
+   */
+  idlePokeMinutes?: number;
+  /** Manual stalled-detection threshold in minutes. Absent inherits the daemon default; independent of idle pokes. */
+  stalledMinutes?: number;
+  /**
+   * FACTORY-846: per-rule override of the wake comment's own closing
+   * sentence (`DEFAULT_TAIL` in src/agents/stall-remediation.ts's
+   * `wakeComment`). Nothing reads this yet — see `idlePokeMinutes`'s own
+   * doc comment above for the FACTORY-845 split. Once wired, this is
+   * intended to REPLACE that sentence for a plain stall wake on this
+   * rule's tickets — never appended alongside it, which would be the
+   * "doubling pokes" outcome FACTORY-844 rules out — and never applied to
+   * BUTCHR-353's "correctly waiting" branch (`correctlyWaitingTail`): that
+   * text is safety advice (don't close/transition a ticket that's
+   * correctly waiting on a worker) and must not be silently swapped out by
+   * an arbitrary per-rule string. ABSENT means today's existing wake text
+   * is sent unchanged — there is no new default value resolved here, mirror
+   * of `idlePokeMinutes` above for the same reason. When PRESENT, must be
+   * non-empty: an empty string means "no text", which would silently do
+   * nothing useful, so it is REJECTED rather than treated as valid — use
+   * `idlePokeEnabled: false` to silence the poke for this rule instead.
+   */
+  idlePokeMessage?: string;
+  /**
+   * FACTORY-846: opt this rule's tickets OUT of the stall wake comment
+   * (src/agents/stall-remediation.ts) entirely, once FACTORY-845 wires a
+   * per-rule read into that path — `agent:stalled` detection itself
+   * (src/agents/stalled.ts) is untouched either way, since this is CONFIG
+   * SURFACE for the REMEDIATION (delivery) half, not a second detector.
+   * Defaults to `true` (on) when absent — unlike `idlePokeMinutes`/
+   * `idlePokeMessage` above, "on" is already today's unconditional
+   * behaviour for every rule, so resolving this to `true` here changes
+   * nothing for an install that sets nothing, and `parseRules` always
+   * resolves it to an explicit boolean rather than leaving it absent.
+   *
+   * Still typed OPTIONAL on `Rule` itself, same as `execution`/`account`/
+   * `role` (which `parseRules` ALSO always resolves): this interface
+   * doubles as a literal-object shape at many call sites across the
+   * codebase (tests, fixtures) that build a `Rule` directly without going
+   * through `parseRules`, and a required field here would force every one
+   * of those to pick a value. A caller that needs the resolved,
+   * always-true-when-absent reading does `rule.idlePokeEnabled ?? true`,
+   * same as `../web/rules-api.ts`.
+   */
+  idlePokeEnabled?: boolean;
+  /**
+   * FACTORY-1010 — per-rule, explicit choice of notification transport for
+   * this rule's own agent(s): `"channel"` sends ONLY over the agent's MCP
+   * dev channel, `"prompt"` sends ONLY as a direct typed-prompt nudge.
+   * Reuses the existing two transports `deliverNotice` already has
+   * (src/notify/deliver.ts) — this field names which ONE of them is used,
+   * never both, and never a new transport. ABSENT (the default, same
+   * tri-state-free discipline as `resumeOnRespawn`/`lizardMode` above) is
+   * today's behaviour exactly, unchanged: `deliverNotice`'s own
+   * channel-first-with-prompt-fallback gate, byte-for-byte — this field is
+   * never silently resolved to either value here. An explicit value skips
+   * that fallback entirely: `"channel"` with a channel miss (unavailable,
+   * refused, or the push itself throwing) reports a clear non-delivery
+   * result rather than trying the prompt; `"prompt"` never attempts the
+   * channel push at all. See `deliverNotice`'s own doc comment
+   * (src/notify/deliver.ts) for the exact non-fallback contract, and
+   * `NOTIFY_DELIVERY_MODES` immediately below for the validated values.
+   * Threaded through every rule-owned delivery seam that routes through
+   * `deliverNotice` (src/daemon/index.ts) — NOT through the managed-session
+   * (`SessionDefinition`) delivery seam, which has no `Rule` to read this
+   * from, and NOT through the idle-poke engine's own per-ISSUE multi-rule
+   * merge (`idlePokeRuleConfigByIssue`/`IdlePokeRuleConfig`,
+   * src/agents/idle-poke.ts) — that is a distinct stall-remediation wake
+   * nudge, not an update notification, and merging a categorical transport
+   * choice across several matching rules the way `idlePokeEnabled`/
+   * `idlePokeMinutes`/`idlePokeMessage` already do is deliberately left to
+   * a follow-up rather than guessed at here.
+   */
+  notifyDeliveryMode?: NotifyDeliveryMode;
 }
+
+/**
+ * FACTORY-1010 — the two transports `Rule.notifyDeliveryMode` may pin a
+ * rule's own agent(s) to; see that field's own doc comment for the
+ * byte-identical-when-absent contract. Re-exports `deliver.ts`'s own type
+ * rather than declaring an independent copy, so the validated rules-file
+ * value and the gate's own parameter can never drift apart.
+ */
+export const NOTIFY_DELIVERY_MODES = ["channel", "prompt"] as const;
+export type { NotifyDeliveryMode };
+
+/**
+ * FACTORY-851 — default `Rule.resumeContextCutoff` when a rule leaves it
+ * unset. Chosen to bound the token/memory cost a respawn can incur resuming
+ * a large transcript (the reason this cutoff exists at all — see
+ * `Rule.resumeContextCutoff`'s own doc comment and epic FACTORY-843) while
+ * staying large enough that an ORDINARY worker session — the common case
+ * this mechanism must not needlessly defeat — still resumes: 100,000 tokens
+ * is well under a Claude context window (200,000 tokens on every model this
+ * codebase launches today, per `../resources/power-scale.ts`'s model
+ * tables), leaving headroom for the system prompt, tool definitions, and
+ * fresh conversation after a resume, while comfortably covering a typical
+ * ticket's working transcript.
+ */
+export const DEFAULT_RESUME_CONTEXT_CUTOFF = 100_000;
+
+/**
+ * FACTORY-846: the epic's own declared idle-poke interval (30 minutes) — NOT
+ * the value `Rule.idlePokeMinutes` silently resolves to when a rule sets
+ * nothing (see that field's own doc comment above: resolving to this here
+ * would be the "silently change every install's stall threshold from 10 to
+ * 30" behaviour the epic explicitly rules out; the true fallback for an
+ * unset rule is today's global `stalledMinutes`). Exported for callers that
+ * want a concrete seed/display value for a rule that has not opted in yet —
+ * `../web/rules-api.ts`'s API response and the Rules page form in
+ * `dashboard-app` both show this as the starting value before a rule sets
+ * its own.
+ */
+export const DEFAULT_IDLE_POKE_MINUTES = 30;
+/**
+ * FACTORY-846: the epic's own declared idle-poke message text, reusing the
+ * FACTORY-735 "before you stop" wording. Same "seed/display value, not an
+ * auto-resolved default" caveat as `DEFAULT_IDLE_POKE_MINUTES` above — the
+ * true fallback for a rule that sets nothing is today's existing wake text
+ * already sent by `src/agents/stall-remediation.ts`, unchanged.
+ */
+export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down";
 
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode",
+  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
+  "notifyDeliveryMode",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -591,6 +855,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (resourceProvider === "zendesk-ticket") for (const p of zendeskTicketQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
     else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "confluence-page") for (const p of confluencePageQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
     if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
@@ -619,11 +884,42 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     const { permissionMode, lizardMode } = raw;
     if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
     if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
+    // FACTORY-907: same independently-optional house style as every field above — independent of resourceProvider/execution/account/role/linked-eventing/permissionMode/lizardMode.
+    const { maxNewPerTick, minSecondsBetweenAdmissions } = raw;
+    if (maxNewPerTick !== undefined && !isPositiveInt(maxNewPerTick)) errors.push(`${at}.maxNewPerTick must be a positive integer`);
+    if (minSecondsBetweenAdmissions !== undefined && !isPositiveInt(minSecondsBetweenAdmissions)) errors.push(`${at}.minSecondsBetweenAdmissions must be a positive integer`);
+    // FACTORY-851: independent of every field above, same house style — no tri-state for `resumeOnRespawn` (absent or `true` both mean on; only explicit `false` means off).
+    const { resumeOnRespawn, resumeContextCutoff } = raw;
+    if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
+    if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
+    // FACTORY-846: idlePokeMinutes/idlePokeMessage stay OPTIONAL — same
+    // absent-means-absent style as permissionMode/lizardMode immediately
+    // above, deliberately NOT the always-defaulted execution/account/role
+    // style, because resolving either to a brand-new default here would be
+    // exactly the "silently change every install" conflict FACTORY-844
+    // calls out (see Rule.idlePokeMinutes/idlePokeMessage's own doc
+    // comments). idlePokeEnabled DOES get an always-resolved default
+    // (true), because "on" is already today's unconditional behaviour.
+    const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
+    const { stalledMinutes } = raw;
+    if (stalledMinutes !== undefined && (typeof stalledMinutes !== "number" || !Number.isFinite(stalledMinutes) || stalledMinutes <= 0)) errors.push(`${at}.stalledMinutes must be a positive number`);
+    if (stalledMinutes !== undefined && resourceProvider !== "jira-project" && !(resourceProvider === "jira-work" && (execution === undefined || execution === "swarm"))) errors.push(`${at}.stalledMinutes requires a jira-work swarm rule or jira-project rule with an existing stalled detector`);
+    if (idlePokeMinutes !== undefined && (!Number.isFinite(idlePokeMinutes) || (idlePokeMinutes as number) <= 0)) errors.push(`${at}.idlePokeMinutes must be a positive number`);
+    if (idlePokeMessage !== undefined && !nonEmpty(idlePokeMessage)) errors.push(`${at}.idlePokeMessage must be a non-empty string`);
+    if (idlePokeEnabled !== undefined && typeof idlePokeEnabled !== "boolean") errors.push(`${at}.idlePokeEnabled must be a boolean`);
+    // FACTORY-1010: independent of every field above, same absent-means-absent
+    // house style as `permissionMode`/`lizardMode` — ABSENT must stay
+    // today's channel-first/prompt-fallback behaviour, so there is
+    // deliberately no always-resolved default here (unlike `execution`/
+    // `account`/`role`, which DO resolve). See `Rule.notifyDeliveryMode`'s
+    // own doc comment.
+    const { notifyDeliveryMode } = raw;
+    if (notifyDeliveryMode !== undefined && !oneOf(NOTIFY_DELIVERY_MODES, notifyDeliveryMode)) errors.push(`${at}.notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
     const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem" || resourceProvider === "confluence-page") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -645,6 +941,15 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
       ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),
       ...(lizardMode !== undefined ? { lizardMode: lizardMode as boolean } : {}),
+      ...(maxNewPerTick !== undefined ? { maxNewPerTick: maxNewPerTick as number } : {}),
+      ...(minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: minSecondsBetweenAdmissions as number } : {}),
+      ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
+      ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
+      ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),
+      ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
+      ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
+      ...(notifyDeliveryMode !== undefined ? { notifyDeliveryMode: notifyDeliveryMode as NotifyDeliveryMode } : {}),
+      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
     });
   });
   for (const { at, id, provider } of refs) {
@@ -678,18 +983,90 @@ const readIfExists: ReadRulesFile = (path) => {
  * Loads and validates rules. A missing default file is `origin: "missing"`
  * with zero rules — there is no fallback — so a caller can say plainly why
  * nothing is staffed. A missing explicit `BUTCHR_RULES_FILE` throws.
+ *
+ * `text` is the EXACT raw string `read` returned (`undefined` for a missing
+ * file) — the one and only read of the file this call makes. FACTORY-657,
+ * agentsafety review R2: a caller computing a source etag (`RulesHolder`'s
+ * `setSourceEtag`, `src/rules/reload.ts`) reads THIS field rather than
+ * calling `read`/`readFileSync` a second time, so the hash can never
+ * disagree with what `parseRules` above actually validated (a second read
+ * could race a concurrent write and hash different bytes than were parsed).
  */
-export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[] } {
+/** The SAME `sha256(text ?? "")` convention `src/rules/write-rules.ts`'s `rulesEtag` uses, applied to `loadRules`' own `text` field — the one `sourceEtag` computation, shared by startup (`src/daemon/index.ts`) and `reloadRules` (`src/rules/reload.ts`), so the two can never drift to different hashes for the same bytes. */
+export const sourceEtagOf = (text: string | undefined): string => createHash("sha256").update(text ?? "", "utf8").digest("hex");
+
+export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined } {
   const path = rulesPath(env);
   const text = read(path);
   if (text === undefined) {
     if (env.BUTCHR_RULES_FILE?.trim()) throw new Error(`BUTCHR_RULES_FILE ${path} does not exist; fix or unset it (only the default path may be absent)`);
-    return { path, origin: "missing", rules: [] };
+    return { path, origin: "missing", rules: [], text: undefined };
   }
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }
-  return { path, origin: "file", rules: parseRules(doc, path) };
+  return { path, origin: "file", rules: parseRules(doc, path), text };
+}
+
+/**
+ * FACTORY-657: a live holder for the rules this daemon is currently
+ * running. `loadRules` itself stays a one-shot, pure read — this is the
+ * seam `src/daemon/index.ts` wires every consumer through instead of a
+ * `let rules` it reassigns, so a reload (`setRules`, driven by SIGHUP, or
+ * an in-process `reloadRules` call from FACTORY-663's future web write
+ * path) takes effect on each provider's very next poll, with no daemon
+ * restart.
+ *
+ * `getRules()` always returns the SAME array instance; `setRules` mutates
+ * its CONTENTS in place (`splice`, never a reassignment) rather than
+ * handing back a new array. That one property is load-bearing: most
+ * consumers in this codebase read `deps.rules` live, per poll, straight off
+ * the object they were constructed with (see e.g. `createRuleResourceType`'s
+ * own `discovery.search`, src/rules/resource-type.ts) — if `setRules`
+ * replaced the array instead of mutating it, every one of those
+ * already-constructed closures would keep the OLD array forever, and this
+ * holder would need to thread a getter *function* through every one of
+ * them instead. Mutating in place means a plain `rules: getRules()` at
+ * construction time is already reload-safe.
+ *
+ * The flip side of mutating in place (agentsafety review R1): any consumer
+ * that iterates `getRules()`'s array DIRECTLY (not a `.filter()`/`.map()`
+ * copy, which is a new array the splice above can never touch) across an
+ * `await` is reading a live array a concurrent `setRules` can splice
+ * mid-loop — `for...of`'s index-based stepping can then skip (or revisit)
+ * an element. Every such site in this codebase snapshots first
+ * (`for (const rule of [...deps.rules])`, `createRuleEventRules`'s own
+ * `poll`, src/rules/resource-type.ts) specifically because of this; a new
+ * site that loops `getRules()`/`deps.rules` directly with an `await`
+ * inside must do the same.
+ */
+export interface RulesHolder {
+  getRules(): readonly Rule[];
+  /** Replaces the held rules' CONTENTS in place — see this interface's own doc comment for why identity is preserved rather than reassigned. */
+  setRules(next: readonly Rule[]): void;
+  /**
+   * FACTORY-657, agentsafety review R2: sha256 hex of the EXACT text the
+   * currently-held rules were parsed from (`loadRules`'s own `text` field;
+   * `undefined` only for the startup "no file at all" case — never
+   * recomputed by a second file read). The SAME `sha256(text ?? "")`
+   * convention `src/rules/write-rules.ts`'s `rulesEtag` already uses, so a
+   * consumer comparing the two (FACTORY-660/662's stale-file flag) is
+   * comparing like with like.
+   */
+  getSourceEtag(): string | undefined;
+  /** Set together with `setRules` by `reloadRules` (src/rules/reload.ts) — never independently, so the two can never name different file reads. */
+  setSourceEtag(etag: string | undefined): void;
+}
+
+export function createRulesHolder(initial: readonly Rule[], initialSourceEtag?: string): RulesHolder {
+  const live: Rule[] = [...initial];
+  let sourceEtag = initialSourceEtag;
+  return {
+    getRules: () => live,
+    setRules: (next) => { live.splice(0, live.length, ...next); },
+    getSourceEtag: () => sourceEtag,
+    setSourceEtag: (etag) => { sourceEtag = etag; },
+  };
 }
 
 /** One enabled jira-work rule's relationship field naming a rule id this daemon has no rule for. */

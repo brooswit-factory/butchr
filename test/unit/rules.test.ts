@@ -3,9 +3,9 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, encodeQueryAgentKey,
-  EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, parseRules, RESOURCE_PROVIDERS,
-  RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
+  ACCOUNT_POLICIES, decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, DEFAULT_IDLE_POKE_MESSAGE, DEFAULT_IDLE_POKE_MINUTES,
+  encodeAgentKey, encodeQueryAgentKey, EXECUTION_MODES, formatUnresolvedRelationshipWarning, isResourceId, loadRules, NOTIFY_DELIVERY_MODES, parseRules,
+  RESOURCE_PROVIDERS, RULE_ID_MAX, RULE_PERMISSION_MODES, rulesPath, unresolvedRelationships, type Rule,
 } from "../../src/rules/rules.js";
 import { ownsRuleAgent } from "../../src/rules/resource-type.js";
 import { ownsGithubIssueAgent } from "../../src/rules/github-issue-type.js";
@@ -14,11 +14,14 @@ import { ownsJiraIdeaAgent } from "../../src/rules/jira-idea-type.js";
 import { ownsZendeskTicketAgent } from "../../src/rules/zendesk-ticket-type.js";
 import { ownsJiraProjectAgent } from "../../src/rules/jira-project-type.js";
 import { ownsFilesystemAgent } from "../../src/rules/filesystem-type.js";
+import { ownsConfluencePageAgent } from "../../src/rules/confluence-page-type.js";
 import { legacyAgents } from "../../src/daemon/legacy-preflight.js";
 import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/workspace.js";
 
 const minimal = { id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "triage it" };
 const parsedMinimal = { ...minimal, enabled: true };
+/** FACTORY-846: idlePokeMinutes/idlePokeMessage stay absent unless a rule sets them; only idlePokeEnabled always resolves (to true). */
+const idlePokeDefaults = { idlePokeEnabled: true };
 
 describe("rulesPath", () => {
   test("explicit override wins over XDG", () => {
@@ -34,7 +37,7 @@ describe("loadRules", () => {
   test("absent default file is zero rules, marked missing, and nothing is written", () => {
     const writes: string[] = [];
     const r = loadRules({ XDG_CONFIG_HOME: "/x" }, (p) => { writes.push(p); return undefined; });
-    expect(r).toEqual({ path: "/x/butchr/rules.json", origin: "missing", rules: [] });
+    expect(r).toEqual({ path: "/x/butchr/rules.json", origin: "missing", rules: [], text: undefined });
     expect(writes).toEqual(["/x/butchr/rules.json"]);
   });
   test("an explicit BUTCHR_RULES_FILE that does not exist is an error, never zero rules", () => {
@@ -47,15 +50,16 @@ describe("loadRules", () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   test("a present empty file is also zero rules", () => {
-    expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [] });
+    expect(loadRules({ BUTCHR_RULES_FILE: "/r.json" }, () => '{"rules":[]}')).toEqual({ path: "/r.json", origin: "file", rules: [], text: '{"rules":[]}' });
   });
   test("default reader: absent file is missing, present file parses, a directory throws", () => {
     const dir = mkdtempSync(join(tmpdir(), "butchr-rules-"));
     try {
-      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [] });
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "missing", rules: [], text: undefined });
       mkdirSync(join(dir, "butchr"));
-      writeFileSync(join(dir, "butchr", "rules.json"), JSON.stringify({ rules: [minimal] }));
-      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none", role: "worker" } as never] });
+      const rulesText = JSON.stringify({ rules: [minimal] });
+      writeFileSync(join(dir, "butchr", "rules.json"), rulesText);
+      expect(loadRules({ XDG_CONFIG_HOME: dir })).toEqual({ path: join(dir, "butchr", "rules.json"), origin: "file", rules: [{ ...parsedMinimal, execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults } as never], text: rulesText });
       expect(() => loadRules({ BUTCHR_RULES_FILE: dir })).toThrow();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -77,17 +81,20 @@ describe("parseRules", () => {
     };
     const other = { ...minimal, id: "other" };
     expect(parseRules({ rules: [full, other] })).toEqual([
-      { ...full, query: "status = Open", execution: "swarm", account: "none", role: "worker", agentPreferences: [{ harness: "codex", model: "gpt-5", effort: "xhigh" }, { harness: "claude" }, { harness: "claude", model: "haiku" }] },
-      { ...other, enabled: true, execution: "swarm", account: "none", role: "worker" },
+      { ...full, query: "status = Open", execution: "swarm", account: "none", role: "worker", agentPreferences: [{ harness: "codex", model: "gpt-5", effort: "xhigh" }, { harness: "claude" }, { harness: "claude", model: "haiku" }], ...idlePokeDefaults },
+      { ...other, enabled: true, execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
-  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker", () => {
+  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker; idlePokeEnabled defaults to on, but idlePokeMinutes/idlePokeMessage stay absent (the true fallback is today's existing global stalledMinutes/wake text, unchanged)", () => {
     const [r] = parseRules({ rules: [minimal] });
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.enabled).toBe(true);
     expect(r!.execution).toBe("swarm");
     expect(r!.account).toBe("none");
     expect(r!.role).toBe("worker");
+    expect(r!.idlePokeMinutes).toBeUndefined();
+    expect(r!.idlePokeMessage).toBeUndefined();
+    expect(r!.idlePokeEnabled).toBe(true);
   });
   test("rejects a non-document", () => {
     for (const doc of [null, [], {}, { rules: {} }]) expect(() => parseRules(doc)).toThrow('"rules" array');
@@ -244,7 +251,7 @@ describe("execution and account (BUTCHR-397)", () => {
   test("every valid value is accepted for every provider — the two fields are provider-generic", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       for (const execution of EXECUTION_MODES) for (const account of ACCOUNT_POLICIES) {
-        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+        const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, execution, account }] });
         expect(r).toMatchObject({ resourceProvider, execution, account });
       }
@@ -279,10 +286,10 @@ describe("execution and account (BUTCHR-397)", () => {
     };
     const rules = parseRules(preChangeDoc);
     expect(rules).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR AND status = Open", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR AND status = Open", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
       {
         id: "epics", enabled: true, resourceProvider: "jira-work", query: "issuetype = Epic", brief: "@builtin:epic", execution: "swarm", account: "none", role: "worker",
-        agentPreferences: [{ harness: "claude", model: "opus" }], relationships: { childRule: "triage" },
+        agentPreferences: [{ harness: "claude", model: "opus" }], relationships: { childRule: "triage" }, ...idlePokeDefaults,
       },
     ] as never);
     // The agent key a swarm rule's match produces is a pure function of (resourceProvider, ruleId, resourceId) —
@@ -298,7 +305,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   });
   test("both values are accepted for every provider, independent of execution and account", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const role of ["worker", "sentinel"] as const) for (const execution of EXECUTION_MODES) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, role, execution }] });
         expect(r).toMatchObject({ resourceProvider, role, execution });
@@ -311,7 +318,7 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
   test("a pre-change rules document (no role) loads unchanged, plus the worker default — no example/shipped rules file needs to opt in", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
 });
@@ -319,14 +326,14 @@ describe("role (BUTCHR-398 — fleet capacity: worker default, sentinel opt-out)
 describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side companion to DROVR-42's lizard mode)", () => {
   test("both absent when omitted — no default the way execution/account/role get one", () => {
     const [r] = parseRules({ rules: [minimal] });
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.permissionMode).toBeUndefined();
     expect(r!.lizardMode).toBeUndefined();
   });
 
   test("every permissionMode value and both lizardMode values are accepted for every provider, independent of execution/account/role/each other", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const permissionMode of RULE_PERMISSION_MODES) for (const lizardMode of [true, false]) {
         const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, permissionMode, lizardMode }] });
         expect(r).toMatchObject({ resourceProvider, permissionMode, lizardMode });
@@ -345,7 +352,7 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
 
   test("rejects a bad permissionMode value, naming the rule and field", () => {
     expect(() => parseRules({ rules: [{ ...minimal, permissionMode: "yolo" }] }, "f.json"))
-      .toThrow("f.json: rules[0].permissionMode must be one of default, acceptEdits, bypassPermissions, plan, auto");
+      .toThrow("f.json: rules[0].permissionMode must be one of default, manual, acceptEdits, bypassPermissions, plan, auto");
   });
 
   test("rejects a non-boolean lizardMode, naming the rule and field", () => {
@@ -356,7 +363,104 @@ describe("permissionMode/lizardMode (FACTORY-87/FACTORY-76 — rule-side compani
   test("a pre-change rules document (neither field) loads unchanged", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
+    ] as never);
+  });
+});
+
+describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-906 — admission rate limit)", () => {
+  test("both absent when omitted — no default, same as permissionMode/lizardMode", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.maxNewPerTick).toBeUndefined();
+    expect(r!.minSecondsBetweenAdmissions).toBeUndefined();
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
+  });
+
+  test("both fields accepted for every provider, independent of execution/account/role/each other", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 }] });
+      expect(r).toMatchObject({ resourceProvider, maxNewPerTick: 2, minSecondsBetweenAdmissions: 30 });
+    }
+  });
+
+  test("either field may be set without the other — independent", () => {
+    const [onlyTick] = parseRules({ rules: [{ ...minimal, maxNewPerTick: 1 }] });
+    expect(onlyTick!.maxNewPerTick).toBe(1);
+    expect(onlyTick!.minSecondsBetweenAdmissions).toBeUndefined();
+    const [onlySeconds] = parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 60 }] });
+    expect(onlySeconds!.minSecondsBetweenAdmissions).toBe(60);
+    expect(onlySeconds!.maxNewPerTick).toBeUndefined();
+  });
+
+  test("rejects a non-positive-integer maxNewPerTick, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: 1.5 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+    expect(() => parseRules({ rules: [{ ...minimal, maxNewPerTick: -1 }] }, "f.json"))
+      .toThrow("f.json: rules[0].maxNewPerTick must be a positive integer");
+  });
+
+  test("rejects a non-positive-integer minSecondsBetweenAdmissions, naming the rule and field", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, minSecondsBetweenAdmissions: 0 }] }, "f.json"))
+      .toThrow("f.json: rules[0].minSecondsBetweenAdmissions must be a positive integer");
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
+    ] as never);
+  });
+});
+
+describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
+  test("both absent when omitted — no default the way execution/account/role get one", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
+    expect(r!.resumeOnRespawn).toBeUndefined();
+    expect(r!.resumeContextCutoff).toBeUndefined();
+  });
+
+  test("both values and every provider accept the field, independent of execution/account/role/each other — same house style as permissionMode/lizardMode", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      for (const resumeOnRespawn of [true, false]) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, resumeOnRespawn, resumeContextCutoff: 50_000 }] });
+        expect(r).toMatchObject({ resourceProvider, resumeOnRespawn, resumeContextCutoff: 50_000 });
+      }
+    }
+  });
+
+  test("resumeContextCutoff may be set without resumeOnRespawn, and vice versa — the two fields are independent", () => {
+    const [onlyCutoff] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
+    expect(onlyCutoff!.resumeContextCutoff).toBe(1);
+    expect(onlyCutoff!.resumeOnRespawn).toBeUndefined();
+    const [onlyFlag] = parseRules({ rules: [{ ...minimal, resumeOnRespawn: false }] });
+    expect(onlyFlag!.resumeOnRespawn).toBe(false);
+    expect(onlyFlag!.resumeContextCutoff).toBeUndefined();
+  });
+
+  test("rejects a non-boolean resumeOnRespawn, naming the rule and field — no tri-state", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, resumeOnRespawn: "yes" }] }, "f.json"))
+      .toThrow("f.json: rules[0].resumeOnRespawn must be a boolean");
+  });
+
+  test.each([0, -1, 1.5, NaN, "100000", null])("rejects resumeContextCutoff %p as not a positive integer, naming the rule and field", (bad) => {
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: bad }] }, "f.json"))
+      .toThrow("f.json: rules[0].resumeContextCutoff must be a positive integer");
+  });
+
+  test("a positive integer resumeContextCutoff is accepted, including 1", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
+    expect(r!.resumeContextCutoff).toBe(1);
+  });
+
+  test("a pre-change rules document (neither field) loads unchanged — byte-for-byte the same shape as before this ticket", () => {
+    const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
+    expect(parseRules(preChangeDoc)).toEqual([
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
 });
@@ -469,7 +573,7 @@ describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a r
 describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default inert)", () => {
   test("all five are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
     const [r] = parseRules({ rules: [minimal] });
-    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "query", "resourceProvider", "role"]);
+    expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.linkedEventing).toBeUndefined();
     expect(r!.linkedPollIntervalMs).toBeUndefined();
     expect(r!.maxLinkedItems).toBeUndefined();
@@ -499,7 +603,7 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
 
   test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
-      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : minimal.query;
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true }] });
       expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true });
     }
@@ -531,8 +635,175 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
   test("a pre-change rules document (none of the five set) loads unchanged — no existing rules file needs to opt in", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
-      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker" },
+      { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
+  });
+});
+
+// FACTORY-846 (epic FACTORY-836, story FACTORY-844): the idle poke's three
+// per-rule config knobs — CONFIG SURFACE ONLY, nothing reads these yet.
+// idlePokeMinutes/idlePokeMessage stay absent when omitted, same
+// "no default the way execution/account/role get one" house style as
+// permissionMode/lizardMode above — see `Rule.idlePokeMinutes`'s own doc
+// comment for why: resolving to DEFAULT_IDLE_POKE_MINUTES (30) here would be
+// the "silently change every install's stall threshold from 10 to 30"
+// outcome the epic explicitly rules out. idlePokeEnabled is the one
+// exception and always resolves (to `true`), since "on" is already today's
+// unconditional behaviour for every rule.
+describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour change)", () => {
+  test("a valid override on each field is accepted and kept", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, idlePokeMinutes: 45, idlePokeMessage: " go check your ticket ", idlePokeEnabled: false }] });
+    expect(r).toMatchObject({ idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false });
+  });
+
+  test("omitted idlePokeMinutes/idlePokeMessage stay absent — the true fallback is the existing global stalledMinutes, unchanged; only idlePokeEnabled resolves, to true", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.idlePokeMinutes).toBeUndefined();
+    expect(r!.idlePokeMessage).toBeUndefined();
+    expect(r!.idlePokeEnabled).toBe(true);
+  });
+
+  test("DEFAULT_IDLE_POKE_MINUTES/DEFAULT_IDLE_POKE_MESSAGE are the epic's own declared seed values, for callers like the rules API/dashboard-app that want a concrete display default — not what parseRules resolves an absent field to", () => {
+    expect(DEFAULT_IDLE_POKE_MINUTES).toBe(30);
+    expect(DEFAULT_IDLE_POKE_MESSAGE).toBe("You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down");
+  });
+
+  test("idlePokeEnabled: false is accepted and kept — same as omitted-defaults-to-true, just explicit", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, idlePokeEnabled: false }] });
+    expect(r!.idlePokeEnabled).toBe(false);
+  });
+
+  test("rejects a non-positive or non-finite idlePokeMinutes", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "30", null]) {
+      expect(() => parseRules({ rules: [{ ...minimal, idlePokeMinutes: bad }] }, "f.json")).toThrow("f.json: rules[0].idlePokeMinutes must be a positive number");
+    }
+  });
+
+  test("a fractional idlePokeMinutes is accepted — unlike the linked-eventing ms/count knobs, this field is not integer-only", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, idlePokeMinutes: 2.5 }] });
+    expect(r!.idlePokeMinutes).toBe(2.5);
+  });
+
+  test('rejects a blank or non-string idlePokeMessage — empty means rejected, not "no text" (use idlePokeEnabled: false for that)', () => {
+    for (const bad of ["", "   ", 5, null]) {
+      expect(() => parseRules({ rules: [{ ...minimal, idlePokeMessage: bad }] }, "f.json")).toThrow("f.json: rules[0].idlePokeMessage must be a non-empty string");
+    }
+  });
+
+  test("rejects a non-boolean idlePokeEnabled", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, idlePokeEnabled: "yes" }] }, "f.json")).toThrow("f.json: rules[0].idlePokeEnabled must be a boolean");
+  });
+
+  test("all three bad at once are all reported together", () => {
+    let msg = "";
+    try { parseRules({ rules: [{ ...minimal, idlePokeMinutes: -1, idlePokeMessage: "", idlePokeEnabled: "no" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
+    expect(msg).toContain("f.json: rules[0].idlePokeMinutes must be a positive number");
+    expect(msg).toContain("f.json: rules[0].idlePokeMessage must be a non-empty string");
+    expect(msg).toContain("f.json: rules[0].idlePokeEnabled must be a boolean");
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false }] });
+      expect(r).toMatchObject({ resourceProvider, idlePokeMinutes: 10, idlePokeMessage: "poke", idlePokeEnabled: false });
+    }
+  });
+});
+
+// FACTORY-1010: `Rule.notifyDeliveryMode` — the per-rule explicit choice
+// between the agent's MCP channel and a direct typed prompt for every
+// update/notification `deliverNotice` seam this rule owns. Same
+// absent-means-absent house style as `permissionMode`/`lizardMode` above:
+// omitted must stay today's channel-first/prompt-fallback behaviour
+// byte-for-byte, so there is deliberately no default resolved here.
+describe("notifyDeliveryMode (FACTORY-1010 — per-rule explicit delivery choice)", () => {
+  test("omitted stays absent — today's channel-first/prompt-fallback behaviour, unchanged", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.notifyDeliveryMode).toBeUndefined();
+  });
+
+  test("accepts and keeps each valid value", () => {
+    for (const mode of NOTIFY_DELIVERY_MODES) {
+      const [r] = parseRules({ rules: [{ ...minimal, notifyDeliveryMode: mode }] });
+      expect(r!.notifyDeliveryMode).toBe(mode);
+    }
+  });
+
+  test("rejects any value outside the two supported transports", () => {
+    for (const bad of ["both", "none", "Channel", "", 1, true, null]) {
+      expect(() => parseRules({ rules: [{ ...minimal, notifyDeliveryMode: bad }] }, "f.json")).toThrow("f.json: rules[0].notifyDeliveryMode must be one of channel, prompt");
+    }
+  });
+
+  test("every valid value is accepted for every provider — provider-generic, like execution/account/role and the idle-poke knobs above", () => {
+    for (const resourceProvider of RESOURCE_PROVIDERS) {
+      const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
+      for (const mode of NOTIFY_DELIVERY_MODES) {
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, notifyDeliveryMode: mode }] });
+        expect(r).toMatchObject({ resourceProvider, notifyDeliveryMode: mode });
+      }
+    }
+  });
+});
+
+/**
+ * FACTORY-842 (epic FACTORY-836, story FACTORY-839) — per-role idle-poke
+ * DEFAULTS on top of FACTORY-846's config surface. There is no separate
+ * "role default" storage in the schema: shipping a role default means
+ * seeding that value into `docs/rules.example.json` for that role's rule
+ * (see `test/unit/rules-example.test.ts`); overriding it means an operator
+ * editing that SAME field on their own copy of the rule in their live
+ * `rules.json`. These tests prove: (1) a rule-level value — whether it is
+ * the shipped role default or an operator's own edit — always wins over the
+ * absent-field fallback, and (2) the `jira-work` role defaults the epic
+ * names resolve to the minutes the epic actually asked for. What these
+ * tests do NOT prove (FACTORY-845 does not exist yet): that an override
+ * changes real poke TIMING in a running agent — only that `parseRules`
+ * loads/validates the intended value, per FACTORY-836's own instruction not
+ * to claim engine behaviour this PR does not implement.
+ */
+describe("per-role idle-poke defaults (FACTORY-842 — config/resolution only, no engine)", () => {
+  test("a rule's own idlePokeMinutes always wins, whether it's a shipped role default or an operator's own override of it — same field, no separate layer", () => {
+    // Shipped role default for "tasks" is 10 (docs/rules.example.json). An operator who disagrees edits
+    // the SAME field on their own copy of the rule — there is no second "role default" value to reconcile.
+    const shipped = parseRules({ rules: [{ ...minimal, id: "tasks", idlePokeMinutes: 10 }] })[0]!;
+    const overridden = parseRules({ rules: [{ ...minimal, id: "tasks", idlePokeMinutes: 5 }] })[0]!;
+    expect(shipped.idlePokeMinutes).toBe(10);
+    expect(overridden.idlePokeMinutes).toBe(5);
+  });
+
+  test("a rule with no idlePokeMinutes at all falls back to the global stalledMinutes default (10) — never the epic's 30, per FACTORY-844/846's decision", () => {
+    const [r] = parseRules({ rules: [minimal] });
+    expect(r!.idlePokeMinutes).toBeUndefined(); // the true fallback lives outside Rule — see config.ts's stalledMinutes (default 10), not read here
+  });
+
+  test("the epic's named jira-work role defaults, as this ticket ships them in docs/rules.example.json", () => {
+    const byRole: Record<string, number> = { epics: 240, stories: 60, tasks: 10 };
+    for (const [id, idlePokeMinutes] of Object.entries(byRole)) {
+      const [r] = parseRules({ rules: [{ ...minimal, id, idlePokeMinutes }] });
+      expect(r!.idlePokeMinutes).toBe(idlePokeMinutes);
+    }
+  });
+
+  /**
+   * project/manager (epic group 2): a `Rule` CAN carry idlePokeMinutes for a
+   * `jira-project` resource exactly like a `jira-work` one — the field is
+   * provider-generic (see the "every valid value is accepted for every
+   * provider" test above). This is NOT shipped inside docs/rules.example.json
+   * (BUTCHR-400 fixes that file to one jira-work rule per ticket-worker
+   * role only — see that file's own test); it is documented separately in
+   * docs/idle-poke-role-defaults.md as its own example. This test proves
+   * only that the shape in that doc actually parses/validates — not that
+   * anything reads it yet: `src/agents/pinned-active.ts` (the project-tier's
+   * own stall mechanism) is wired to the GLOBAL `stalledMinutes` only, so
+   * this value is INERT until FACTORY-845 wires a per-rule read for the
+   * project tier.
+   */
+  test("a jira-project (project/manager) rule example carries idlePokeMinutes=720 (12h), parses cleanly — inert until FACTORY-845", () => {
+    const projectManagerExample = { id: "project-managers", resourceProvider: "jira-project" as const, query: '{"leadAccountId":"me"}', brief: "@builtin:project", idlePokeMinutes: 720 };
+    const [r] = parseRules({ rules: [projectManagerExample] });
+    expect(r).toMatchObject({ resourceProvider: "jira-project", idlePokeMinutes: 720, idlePokeEnabled: true });
   });
 });
 
@@ -628,7 +899,7 @@ describe("query-level agent keys (BUTCHR-397)", () => {
 
   test("every provider's ownership predicate recognises its own query-level agent, and no other provider's", () => {
     const owners: Record<(typeof RESOURCE_PROVIDERS)[number], (id: string) => boolean> = {
-      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent,
+      "jira-work": ownsRuleAgent, "github-issue": ownsGithubIssueAgent, "github-pr": ownsGithubPrAgent, "jira-idea": ownsJiraIdeaAgent, "zendesk-ticket": ownsZendeskTicketAgent, "jira-project": ownsJiraProjectAgent, "filesystem": ownsFilesystemAgent, "confluence-page": ownsConfluencePageAgent,
     };
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const key = encodeQueryAgentKey({ resourceProvider, ruleId: "triage" });
@@ -655,5 +926,6 @@ function exampleResourceId(provider: (typeof RESOURCE_PROVIDERS)[number]): strin
     case "zendesk-ticket": return "acme#12";
     case "jira-project": return "BUTCHR";
     case "filesystem": return "/tmp/example.txt";
+    case "confluence-page": return "123456";
   }
 }

@@ -1,83 +1,13 @@
-import { findMarked, RateCap, HOUR_MS, type CommentRow } from "./escalation-helper.js";
+import { findMarked, type CommentRow } from "./escalation-helper.js";
 import { staffingFromWorkerLabels, ASK_MARKER } from "../tools/relationship.js";
 
-/**
- * BUTCHR-221/BUTCHR-210 — the missing half of the stall deadlock-breaker.
- * `agent:stalled` (src/agents/stalled.ts, consumed by src/labels/sync.ts) is
- * a VISIBILITY signal only — a label plus a log line — and nothing in the
- * codebase ever consumed it to actually wake the agent. This module is the
- * remediator: post ONE debounced, observational wake comment per continuous
- * stalled episode, built the same way as parked.ts / frozen-asleep.ts
- * (MARKER, fingerprint, adoption-dedupe, RateCap) so it reuses the house
- * mechanism instead of inventing a second one. Closer in shape to
- * frozen-asleep.ts than parked.ts: a single latched wake, not a multi-stage
- * escalation — "post a debounced wake comment" (singular), not a ladder.
- *
- * GATING, THE MOST IMPORTANT DESIGN DECISION HERE: `check` fires on whether
- * `agent:stalled` is the label ALREADY APPLIED to the ticket — i.e. the
- * label as freshly read from Jira at the START of this poll (src/labels/
- * sync.ts's `applied`) — never on this same poll's newly-stabilized
- * candidate (`label`/`stalled` in that file, computed AFTER `applied` and
- * written to Jira only this poll, if it changed). Two reasons this must be
- * "applied", not "just-stabilized-this-poll":
- *
- * 1. FOOTING PARITY (required by this ticket): `agent:stalled` itself is
- *    deliberately delayed by AgentLabelStabilizer (two consecutive
- *    confirming polls) before it is ever written — a remediation comment is
- *    LOUDER than the label, so it must never be cheaper to trigger. Gating
- *    on `applied` is strictly a superset of "stabilized this poll": it
- *    additionally requires the label to have actually been WRITTEN and then
- *    read back as Jira's own truth on a LATER poll — never more eager than
- *    the label, only ever equal or more conservative.
- *
- * 2. THE OWN-WRITE HAZARD (this ticket's own warning, empirically real —
- *    see test/unit/stall-remediation.test.ts's own-write race test):
- *    src/labels/sync.ts's `onWrite` (wired in src/daemon/index.ts to
- *    `recordOwnWrite`) fires an ASYNC read-back of the ticket's `updated`
- *    field, RIGHT AFTER a label write, and records it under writer
- *    "daemon" in the own-write ledger (src/jira-watch/own-writes.ts) — a
- *    record that suppresses the notify ping for EVERY watcher of that
- *    ticket, including its own agent (own-writes.ts's own header comment).
- *    If a wake comment posted on the SAME poll as the `agent:stalled`
- *    write, it could land before that read-back resolves; the read-back
- *    would then capture an `updated` value that already includes the wake
- *    comment, and the very next poll would swallow the wake it was meant to
- *    deliver — the deadlock-breaker firing and being silently eaten by the
- *    mechanism built to stop the daemon nudging agents about its own label
- *    churn. Gating on `applied` (necessarily at least one full poll behind
- *    the write, since `applied` is read at the TOP of a poll, before that
- *    poll's own writes happen) guarantees a full poll interval between the
- *    label write and any comment this module posts. That margin is not
- *    hopeful: own-writes.ts's own TTL comment states its window is sized
- *    for "one write + one read-back + one poll cycle" — this module simply
- *    never acts inside that window for the SAME state transition.
- *
- * This does NOT weaken the ledger (untouched) — it sequences the caller so
- * the write this module makes is never a candidate for being folded into
- * another write's read-back in the first place.
- *
- * BUTCHR-353 — THE WAKE PROSE GETS A THIRD BRANCH: the two paragraphs above
- * are about WHEN this module speaks; this addendum is about WHAT it says.
- * Until this ticket, `wakeComment` below modelled only *done* and *stuck*,
- * and offered exactly two pieces of advice (close/transition the ticket, or
- * act on it now) — both actively harmful to a THIRD state this module had no
- * vocabulary for: a boss correctly waiting on one of its own workers (a
- * worker withheld at the fleet-wide admission cap, one sitting In Review
- * awaiting this ticket's own review, or one that asked this ticket a
- * question with no reply yet). `gatherWorkerSignals` below reads the stalled
- * ticket's own non-Done workers (free — `WorkerLink`, from data
- * src/labels/sync.ts already fetched this poll — plus, ONLY on the one poll
- * that is actually about to post, one label read and one comment read per
- * non-Done worker) and reuses BUTCHR-352's own label-path rule
- * (`staffingFromWorkerLabels`, src/tools/relationship.ts) rather than
- * inventing a second "marker means waiting" test — see that function's own
- * doc comment for why a probe was deliberately NOT added here instead.
- */
+/** Post one visible comment per verified stalled episode. Ordinary comment
+ * delivery wakes the ticket and its linked watchers. The notice never resets
+ * the inactivity detector. Existing visible comment history supports adoption
+ * after restart; observed real activity permits a later episode to speak. */
 
 export const MARKER = "[butchr:stall]";
 
-/** Mirrors parked.ts/frozen-asleep.ts's per-target escalation budget — a backstop here, since the spokenAt latch below is the primary (and normally sole) debounce. */
-const MAX_PER_HOUR = 3;
 
 interface Entry {
   /**
@@ -116,22 +46,9 @@ export class StallRemediationTracker {
     this.entries.get(issue)!.spokenAt = at;
   }
 
-  /**
-   * Drop tracking for `issue` — it left the candidate set (recovered, went
-   * inactive, or disappeared), so a LATER stall starts a fresh IN-MEMORY
-   * floor rather than inheriting a stale one (e.g. for the elapsed-minutes
-   * fallback). This is NOT what makes a later re-stall skip posting again —
-   * that is `findMarked` re-discovering the fingerprint on the ticket's own
-   * comment history (evidence-based, not memory-based), which `forget`
-   * neither helps nor hinders: dedupe by Jira evidence outlives this
-   * in-memory entry entirely, exactly like frozen-asleep.ts's own
-   * single-fingerprint-per-id convention (`fingerprint: ${id}`, no episode
-   * component). DELIBERATE, stated here because it is easy to expect the
-   * opposite: this module posts AT MOST ONE wake comment per issue for the
-   * ticket's LIFETIME (until that comment is deleted), not one per episode —
-   * see test/unit/stall-remediation.test.ts's own re-stall tests for the
-   * behaviour this produces.
-   */
+  /** Drop local tracking; visible history still prevents duplicate adoption. */
+  spokenAt(issue: string): number | undefined { return this.entries.get(issue)?.spokenAt; }
+
   forget(issue: string): void {
     this.entries.delete(issue);
   }
@@ -246,26 +163,7 @@ const fingerprintNeedle = (issue: string): string => `fingerprint: ${issue}\n`;
  * requirement names: acted / suppressed (always with a reason) /
  * attempted-and-failed (always with the error) / not-a-candidate.
  *
- * THE PRECISE, CORRECTED CLAIM ABOUT `null` (a prior version of this comment
- * overstated it, caught in review): a `null` poll (`stalled.check()` could
- * not verify) never GATES the act/suppress decision, is never collapsed
- * into "not stalled" or "confirmed stalled", and never causes a post ON ITS
- * OWN — the APPLIED label does. That is narrower than "a null poll never
- * posts". When `labelApplied` is false, a `null` `stalledPollResult` is its
- * own distinct SUPPRESSED reason (see `check`'s own doc comment) — it is
- * never folded into "not-a-candidate" (confirmed not stalled) or treated as
- * if it were `true`. But when `labelApplied` is ALREADY true, this module
- * proceeds to adopt/rate-cap/post EXACTLY as it would for a `true` or even
- * an omitted `stalledPollResult` — `stalledPollResult` is not consulted at
- * all on that path. THIS IS DELIBERATE, not an oversight: once the label
- * is durably applied (read back from Jira, not merely this poll's own
- * candidate), gating the wake on ALSO getting a fresh non-null verification
- * THIS poll would mean a persistently failing comments() endpoint silently
- * disables the deadlock-breaker during exactly the degraded conditions
- * where a becalming is most likely — fail-into-silence, this story's own
- * failure mode, traded for a different failure mode than the one AC6 names.
- * Pinned by test/unit/stall-remediation.test.ts's
- * "labelApplied=true with a null stalledPollResult still acts" test.
+ * Unknown observations suppress a new notice without closing the episode.
  */
 export type StallOutcome =
   | { kind: "acted"; issue: string }
@@ -344,11 +242,8 @@ export interface StallRemediator {
    * on the ticket (see this module's own top comment for why applied, never
    * this-poll's-just-stabilized value). `stalledPollResult` is this poll's
    * raw `stalled.check()` result (`true` / `false` / `null` — the three-state
-   * "could not verify" outcome), threaded through UNCOLLAPSED and used only
-   * to distinguish, for logging, "genuinely nothing going on" from
-   * "something's brewing but the label isn't applied yet" from "could not
-   * verify this poll" — it never gates whether this module acts (that is
-   * `labelApplied` alone). `realElapsedMinutes`, when supplied (src/labels/
+   * "could not verify" outcome). A post requires both a verified current stall
+   * and an already applied label. `realElapsedMinutes`, when supplied (src/labels/
    * sync.ts passes `stalled.elapsedMinutes(issue)`), is the GENUINE
    * current-streak duration stalled.ts's own tracker measured — reported
    * in the wake comment in place of this module's own floor, which (since
@@ -370,7 +265,7 @@ export interface StallRemediator {
    * today's wake text, unchanged (see `gatherWorkerSignals`'s own doc
    * comment for the full rule and its cost).
    */
-  check: (issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[]) => Promise<StallOutcome>;
+  check: (issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[], activityAt?: number | null) => Promise<StallOutcome>;
   /** Forget tracking for a ticket leaving the active/candidate set (mirrors StalledCheck.forget's call sites in src/labels/sync.ts). */
   forget: (issue: string) => void;
 }
@@ -520,133 +415,57 @@ async function gatherWorkerSignals(deps: StallRemediationDeps, stalledKey: strin
  */
 export function createStallRemediator(deps: StallRemediationDeps): StallRemediator {
   const tracker = new StallRemediationTracker(deps.now);
-  const rateCap = new RateCap(MAX_PER_HOUR, HOUR_MS);
-  // One "rate cap reached" WARNING per issue until it frees up — mirrors
-  // parked.ts's `cappedLogged` / frozen-asleep.ts's own copy of the same
-  // pattern: without this a permanently capped issue would log once per
-  // poll forever (this module's own steady-state flood guard).
-  const cappedLogged = new Set<string>();
-  // Last failure reason logged per issue, so a PERMANENT write failure logs
-  // once instead of once per 15s poll — mirrors src/labels/sync.ts's own
-  // `loggedFailure` map; a failure whose reason actually changes still gets
-  // its own line.
+  const closedBefore = new Map<string, number>();
+  const pending = new Map<string, Promise<StallOutcome>>();
   const loggedFailure = new Map<string, string>();
-  // Issues currently believed quota-blocked, per the LAST poll this module
-  // logged the transition for — same log-flood discipline as
-  // `cappedLogged`/`loggedFailure` above: a quota-blocked ticket re-enters
-  // this branch every ~15s for hours (this module's own steady-state flood
-  // guard applies here too), so log entering AND leaving the state exactly
-  // once each, never every poll in between.
   const quotaLogged = new Set<string>();
   const log = (line: string) => deps.log?.(line);
 
-  async function check(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[]): Promise<StallOutcome> {
+  async function evaluate(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[], activityAt?: number | null): Promise<StallOutcome> {
     try {
-      if (!labelApplied) {
-        // Reset on any poll where the label is not applied — whether that's
-        // "never stalled", "recovered", or "still stabilizing" — so a LATER
-        // stall starts a fresh episode rather than inheriting a stale
-        // spokenAt from a previous one (mirrors frozen-asleep.ts's
-        // forgetMissing reasoning, applied per-call instead of per-batch
-        // since this module is invoked per-issue from sync.ts's existing
-        // per-issue loop).
-        tracker.forget(issue);
-        if (stalledPollResult === null) {
-          // COULD NOT VERIFY: a genuinely third outcome, never "not a
-          // candidate" (which would assert confirmed-not-stalled) — src/
-          // labels/sync.ts already emits its own dedicated WARNING for this
-          // case ("stalled check could not verify"), so this module stays
-          // silent here rather than duplicating it (composes with, per this
-          // ticket's own instruction, instead of duplicating).
-          return { kind: "suppressed", issue, reason: "stalled check could not verify this poll (comments fetch failed) — not treated as stalled or not-stalled" };
-        }
-        if (stalledPollResult === true) {
-          // Something is brewing (raw stalled this poll) but agent:stalled
-          // is not yet the applied label — either still accumulating the
-          // stabilizer's two consecutive confirmations, or it was just
-          // written THIS poll and `applied` (read at the top of the poll,
-          // before any write) has not caught up yet. Low-volume by
-          // construction (this window is at most a couple of polls per
-          // episode), so logged every time rather than deduped.
-          log(`[stall] ${issue} stabilizer has not confirmed yet (raw stalled this poll, agent:stalled not yet applied)`);
-          return { kind: "suppressed", issue, reason: "stabilizer has not confirmed yet" };
+      if (stalledPollResult === false) {
+        const spokenAt = tracker.spokenAt(issue);
+        // Raising a configured timeout does not constitute real activity.
+        if (activityAt === undefined || activityAt === null || spokenAt === undefined || activityAt > spokenAt) {
+          if (spokenAt !== undefined) closedBefore.set(issue, Math.max(deps.now(), spokenAt));
+          tracker.forget(issue);
         }
         return { kind: "not-a-candidate", issue };
       }
-
+      if (stalledPollResult === null) return { kind: "suppressed", issue, reason: "stalled check could not verify this poll (comments fetch failed) - not treated as stalled or not-stalled" };
+      if (!labelApplied) return { kind: "suppressed", issue, reason: "stabilizer has not confirmed yet" };
       const e = tracker.observe(issue);
-      if (e.spokenAt !== undefined) {
-        // Steady state: already remediated this episode. Silent — this is
-        // exactly the branch a 457-detections-over-two-hours becalming
-        // re-enters every ~15s; logging it every poll is the flood this
-        // ticket explicitly calls out. The ORIGINAL "acted" (or "adopted")
-        // line, still in the journal, is the legible record of why.
-        return { kind: "suppressed", issue, reason: `already remediated at ${new Date(e.spokenAt).toISOString()}` };
-      }
-      // CRITERION 10 — checked before touching Jira at all, and before the
-      // rate cap / adoption bookkeeping below: a quota-blocked target cannot
-      // read a wake comment, and posting into it burns the very quota whose
-      // return ends the outage, so this is cheaper AND safer to check first,
-      // not merely first for cost's sake. Deliberately does NOT call
-      // tracker.markSpoken — a quota-blocked poll is not remediated, so a
-      // later poll (quota recovered, still stalled) must still be free to
-      // act, not find itself already latched as spoken-for.
+      if (e.spokenAt !== undefined) return { kind: "suppressed", issue, reason: `already remediated at ${new Date(e.spokenAt).toISOString()}` };
       if (deps.quotaBlocked?.(issue)) {
         if (!quotaLogged.has(issue)) {
           quotaLogged.add(issue);
-          log(`[stall] ${issue} quota-blocked — suppressing wake comment (target cannot read it while blocked, and posting would burn the quota whose return ends the outage)`);
+          log(`[stall] ${issue} quota-blocked - suppressing wake comment`);
         }
         return { kind: "suppressed", issue, reason: "quota-blocked" };
       }
-      if (quotaLogged.delete(issue)) {
-        log(`[stall] ${issue} no longer quota-blocked — wake comment eligible again`);
-      }
-
-      const ownFloorMinutes = Math.round((deps.now() - e.firstObservedAt) / 60_000);
-      const elapsedMinutes = realElapsedMinutes ?? ownFloorMinutes;
-
+      if (quotaLogged.delete(issue)) log(`[stall] ${issue} no longer quota-blocked - wake comment eligible again`);
       const rows = await deps.comments(issue).catch((err) => {
         log(`WARNING: [stall] comments fetch failed for ${issue}: ${(err as Error)?.message ?? err}`);
         return null;
       });
-      // COULD NOT CHECK for an existing wake comment: fails CLOSED (posts
-      // nothing this poll, retries next poll) — never "nothing to adopt,
-      // post a fresh one", which would spam the ticket on every transient
-      // fetch failure. Mirrors parked.ts's postStage / frozen-asleep.ts's
-      // postComplaint.
-      if (rows === null) return { kind: "suppressed", issue, reason: "comments fetch failed — could not check for an existing wake comment, retrying next poll" };
-
-      const existing = findMarked(rows, MARKER, [fingerprintNeedle(issue)]);
+      if (rows === null) return { kind: "suppressed", issue, reason: "comments fetch failed - could not check for an existing wake comment, retrying next poll" };
+      // Only real activity closes an episode. Daemon notices and label churn
+      // cannot rearm it. No episode identifier or counter is written to Jira.
+      const activity = rows.filter(r => !r.body.startsWith("[butchr:"));
+      if (activity.some(r => !Number.isFinite(Date.parse(r.created)))) return { kind: "suppressed", issue, reason: "comment activity time could not be verified" };
+      const floor = Math.max(closedBefore.get(issue) ?? -Infinity, ...activity.map(r => Date.parse(r.created)));
+      const existing = findMarked(rows.filter(r => !Number.isFinite(Date.parse(r.created)) || Date.parse(r.created) > floor), MARKER, [fingerprintNeedle(issue)]);
       if (existing) {
-        const adoptedAt = Date.parse(existing.created) || deps.now();
-        tracker.markSpoken(issue, adoptedAt);
+        const createdAt = Date.parse(existing.created);
+        tracker.markSpoken(issue, Number.isFinite(createdAt) ? createdAt : deps.now());
         log(`[stall] adopted existing wake comment for ${issue} from comment ${existing.id} (daemon restart)`);
         return { kind: "suppressed", issue, reason: `adopted existing comment ${existing.id} from ${existing.created}` };
       }
-
-      if (!rateCap.allow(issue, deps.now())) {
-        if (!cappedLogged.has(issue)) {
-          cappedLogged.add(issue);
-          log(`WARNING: [stall] rate cap reached (${MAX_PER_HOUR}/hour) for ${issue} — wake comment logged only, not posted (further cap hits for ${issue} are logged only once until it frees up)`);
-        }
-        return { kind: "suppressed", issue, reason: `rate cap reached (${MAX_PER_HOUR}/hour)` };
-      }
-
-      // BUTCHR-353: paid ONLY here — past every earlier short-circuit
-      // (already-remediated, quota-blocked, adopted-existing, rate-capped)
-      // — so worker reads happen at most ONCE per stalled episode, on
-      // exactly the poll that is about to actually post, never on every
-      // poll of a becalming (see gatherWorkerSignals's own doc comment for
-      // the per-call bound).
+      const elapsedMinutes = realElapsedMinutes ?? Math.round((deps.now() - e.firstObservedAt) / 60_000);
       const signals = await gatherWorkerSignals(deps, issue, workers, log);
-
-      try {
-        await deps.addComment(issue, wakeComment(issue, elapsedMinutes, signals));
-      } catch (err) {
+      try { await deps.addComment(issue, wakeComment(issue, elapsedMinutes, signals)); }
+      catch (err) {
         const message = (err as Error)?.message ?? String(err);
-        // Fail LOUDLY: no state recorded that would make the next poll
-        // believe this succeeded — spokenAt is untouched, so the very next
-        // poll retries exactly as if nothing had been attempted.
         if (loggedFailure.get(issue) !== message) {
           loggedFailure.set(issue, message);
           log(`WARNING: [stall] wake comment write failed for ${issue}: ${message}`);
@@ -654,18 +473,22 @@ export function createStallRemediator(deps: StallRemediationDeps): StallRemediat
         return { kind: "failed", issue, error: message };
       }
       loggedFailure.delete(issue);
-      rateCap.record(issue, deps.now());
-      cappedLogged.delete(issue);
-      const postedAt = deps.now();
-      tracker.markSpoken(issue, postedAt);
+      tracker.markSpoken(issue, deps.now());
       log(`[stall] ${issue} wake comment posted (agent:stalled applied, continuously observed for ${elapsedMinutes}m)`);
       return { kind: "acted", issue };
-    } catch (e) {
-      const message = (e as Error)?.message ?? String(e);
+    } catch (err) {
+      const message = (err as Error)?.message ?? String(err);
       log(`WARNING: [stall] detector error for ${issue}: ${message}`);
       return { kind: "failed", issue, error: message };
     }
   }
-
-  return { check, forget: (issue) => tracker.forget(issue) };
+  // Serialize overlapping observations for the same ticket, including recovery.
+  function check(issue: string, labelApplied: boolean, stalledPollResult: boolean | null, realElapsedMinutes?: number | null, workers?: readonly WorkerLink[], activityAt?: number | null): Promise<StallOutcome> {
+    const previous = pending.get(issue) ?? Promise.resolve();
+    const task = previous.then(() => evaluate(issue, labelApplied, stalledPollResult, realElapsedMinutes, workers, activityAt));
+    pending.set(issue, task);
+    void task.finally(() => { if (pending.get(issue) === task) pending.delete(issue); });
+    return task;
+  }
+  return { check, forget: issue => tracker.forget(issue) };
 }

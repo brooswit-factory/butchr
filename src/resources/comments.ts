@@ -5,9 +5,15 @@
  * either function on a provider that hasn't declared `comments` throws
  * `UnsupportedCapabilityError` before any provider-specific code runs.
  *
- * Implemented for FIVE providers today — `jira-work-item`, `jira-idea`,
- * `github-issue`, `zendesk-ticket`, `confluence-page` — each reusing that
- * provider's own existing native comment methods, never a reimplementation:
+ * Implemented for SIX providers today — `jira-work-item`, `jira-idea`,
+ * `github-issue`, `zendesk-ticket`, `confluence-page`, `trello-card`
+ * (FACTORY-1009, additive alongside the existing Jira/Confluence providers)
+ * — each reusing that provider's own existing native comment methods, never
+ * a reimplementation:
+ *   - `trello-card`: `TrelloCardClient.comments`/`.addComment`
+ *     (./trello-card.ts) — every Trello comment is visible to the whole
+ *     board (no private-note concept like Zendesk's); `.addComment` re-reads
+ *     the card (`get()`) first and refuses a card outside `TRELLO_BOARD_ID`.
  *   - `jira-work-item`: `AtlassianClient.allComments`/`addComment`
  *     (src/atlassian/client.ts).
  *   - `jira-idea`: `JiraIdeaClient.comments`/`.addComment` (./jira-idea.ts),
@@ -67,9 +73,11 @@ import type { AtlassianOps } from "../tools/atlassian.js";
 import type { GithubComment, GithubIssueClient } from "./github-issue.js";
 import type { JiraIdeaClient } from "./jira-idea.js";
 import type { ZendeskComment, ZendeskTicketClient } from "./zendesk-ticket.js";
+import type { TrelloCardClient, TrelloComment } from "./trello-card.js";
 import { formatConfluencePageRef } from "./confluence-page-ref.js";
 import { formatJiraWorkItemRef } from "./jira-work-item-ref.js";
 import { formatZendeskTicketRef } from "./zendesk-ticket-ref.js";
+import { formatTrelloCardRef } from "./trello-card-ref.js";
 import { assertSupports, UnsupportedCapabilityError, type CapabilityProvider, type CapabilityRef } from "./capabilities.js";
 
 /** The canonical, provider-agnostic comment shape every provider's comments map onto. */
@@ -98,6 +106,7 @@ type JiraCommentClient = Pick<AtlassianClient, "allComments" | "addComment">;
 type JiraIdeaCommentClient = Pick<JiraIdeaClient, "comments" | "addComment">;
 type GithubIssueCommentClient = Pick<GithubIssueClient, "comments" | "addComment">;
 type ZendeskTicketCommentClient = Pick<ZendeskTicketClient, "comments" | "addInternalNote">;
+type TrelloCardCommentClient = Pick<TrelloCardClient, "comments" | "addComment">;
 /**
  * A `Pick` of `AtlassianOps` (src/tools/atlassian.ts), not a bespoke
  * `confluence-page` client wrapper — this daemon's `AtlassianOps`-typed
@@ -121,6 +130,7 @@ export interface CommentClients {
   "github-issue"?: GithubIssueCommentClient;
   "zendesk-ticket"?: ZendeskTicketCommentClient;
   "confluence-page"?: ConfluencePageCommentClient;
+  "trello-card"?: TrelloCardCommentClient;
 }
 
 function requireClient<T>(client: T | undefined, provider: CapabilityProvider): T {
@@ -131,6 +141,7 @@ function requireClient<T>(client: T | undefined, provider: CapabilityProvider): 
 const mapJiraComment = (c: JiraComment): Comment => ({ id: c.id, author: c.authorEmail, timestamp: c.created, body: c.body });
 const mapGithubComment = (c: GithubComment): Comment => ({ id: c.id, author: c.author, timestamp: c.created, body: c.body });
 const mapZendeskComment = (c: ZendeskComment): Comment => ({ id: c.id, author: c.authorId !== null ? String(c.authorId) : null, timestamp: c.created, body: c.body });
+const mapTrelloComment = (c: TrelloComment): Comment => ({ id: c.id, author: c.authorId, timestamp: c.created, body: c.body });
 
 /**
  * `AtlassianOps.getPageComments`' own per-comment shape, verified against
@@ -261,6 +272,12 @@ export async function readComments(clients: CommentClients, ref: CapabilityRef):
       const raw = await client.getPageComments(pageId);
       return [...raw.results].sort(compareConfluenceCommentsByCreatedAscending).map(mapConfluenceComment);
     }
+    case "trello-card": {
+      const client = requireClient(clients["trello-card"], ref.provider);
+      const { boardId, cardId } = ref;
+      const raw = await client.comments({ boardId, cardId });
+      return raw.map(mapTrelloComment);
+    }
     default:
       // Unreachable today (assertSupports above already refused every other
       // provider) — checked explicitly, not assumed, so this stays correct
@@ -325,6 +342,12 @@ export async function addComment(clients: CommentClients, ref: CapabilityRef, bo
         throw new Error(`confluence-page commentOnPage for page ${pageId} WAS posted, but its id could not be confirmed (the response carried no usable id) — do not retry, it would duplicate the comment`);
       }
       return { id: rawId };
+    }
+    case "trello-card": {
+      const client = requireClient(clients["trello-card"], ref.provider);
+      const { boardId, cardId } = ref;
+      const created = await client.addComment({ boardId, cardId }, body);
+      return { id: created.id };
     }
     default:
       throw new UnsupportedCapabilityError(ref.provider, "comments");

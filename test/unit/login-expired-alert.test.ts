@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CREDENTIAL_DEATH_MARKER, createCredentialDeathTracker } from "../../src/agents/login-expired-alert.js";
+import { CREDENTIAL_DEATH_MARKER, CREDENTIAL_DEATH_CONDITION, createCredentialDeathTracker } from "../../src/agents/login-expired-alert.js";
 
 function fakeDeps(host = "test-host") {
   const lines: string[] = [];
@@ -223,5 +223,155 @@ describe("createCredentialDeathTracker (FACTORY-363/FACTORY-397)", () => {
     const tracker = createCredentialDeathTracker({ log: (l) => lines.push(l), now: () => 0 });
     tracker.onLoginExpired({ paneId: "p1", detail: "Login expired · Please run /login" });
     expect(tracker.current()?.host).toBe(hostname());
+  });
+});
+
+/**
+ * FACTORY-630: the PUSH channel. Everything above this point exercises the
+ * tracker with NO `opsAlert` dep, which is the pre-FACTORY-630 behaviour —
+ * that those tests still pass unchanged is the proof this route is strictly
+ * additive and the journal line / `/health` channels were not touched.
+ *
+ * Stub router only: these tests assert WHAT the tracker raises and WHEN, not
+ * how a post is composed or deduplicated (`test/unit/ops-alert.test.ts` owns
+ * that, with its own stub poster and stub clock).
+ */
+describe("createCredentialDeathTracker → ops-alert route (FACTORY-630)", () => {
+  function routerSpy() {
+    const raised: { key: string; condition: string; subject: string; reason: string; remedy?: string }[] = [];
+    const recovered: { key: string; condition: string; subject: string; note: string }[] = [];
+    return {
+      raised,
+      recovered,
+      router: {
+        raise: (a: { key: string; condition: string; subject: string; reason: string; remedy?: string }) => { raised.push(a); },
+        recover: (r: { key: string; condition: string; subject: string; note: string }) => { recovered.push(r); },
+      },
+    };
+  }
+
+  test("the first onLoginExpired raises an ops alert naming the condition, the host, the pane and drovr's own detail verbatim", () => {
+    const { deps } = fakeDeps("servyboi");
+    const { router, raised } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "w1T:p1", detail: "Login expired · Please run /login" });
+
+    expect(raised.length).toBe(1);
+    expect(raised[0]!.condition).toBe(CREDENTIAL_DEATH_CONDITION);
+    expect(raised[0]!.key).toBe(`${CREDENTIAL_DEATH_CONDITION}:servyboi`);
+    expect(raised[0]!.subject).toInclude("servyboi");
+    expect(raised[0]!.subject).toInclude("w1T:p1");
+    // Never a message this module asserts itself — the installed binary emits
+    // at least five distinct credential-death strings.
+    expect(raised[0]!.reason).toBe("Login expired · Please run /login");
+    expect(raised[0]!.remedy).toInclude("/login");
+  });
+
+  test("the alert key is per HOST, so one daemon's dead credential is one deduplicated condition however many panes die with it", () => {
+    const { deps } = fakeDeps("servyboi");
+    const { router, raised } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "w1T:p1", detail: "Login expired" });
+    tracker.onLoginExpired({ paneId: "w1V:p1", detail: "Login expired" });
+    tracker.onLoginExpired({ paneId: "w6Z:p1", detail: "Login expired" });
+
+    expect(new Set(raised.map((r) => r.key)).size).toBe(1);
+  });
+
+  test("raises on EVERY onLoginExpired, not only the episode-opening one — this is what gives a failed post a retry, with the router (not this module) owning the dedup window", () => {
+    const { deps, lines } = fakeDeps();
+    const { router, raised } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+
+    expect(raised.length).toBe(3);
+    // And the JOURNAL line keeps its own once-per-episode semantics, untouched.
+    expect(lines.filter((l) => l.startsWith(CREDENTIAL_DEATH_MARKER)).length).toBe(1);
+  });
+
+  test("a later `detail` is carried into the raise — the most recent transcript text drovr matched, not the first", () => {
+    const { deps } = fakeDeps();
+    const { router, raised } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    tracker.onLoginExpired({ paneId: "p1", detail: "OAuth token revoked · Please run /login" });
+
+    expect(raised[1]!.reason).toBe("OAuth token revoked · Please run /login");
+  });
+
+  test("a `recovered` resolution that closes the episode asks for ONE recovery, naming the reason that closed it", () => {
+    const { deps, advance } = fakeDeps("servyboi");
+    const { router, recovered } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    advance(900_000);
+    tracker.onLoginExpiredResolved({ paneId: "p1", reason: "recovered" });
+
+    expect(recovered.length).toBe(1);
+    expect(recovered[0]!.key).toBe(`${CREDENTIAL_DEATH_CONDITION}:servyboi`);
+    expect(recovered[0]!.note).toInclude("recovered");
+    expect(recovered[0]!.note).toInclude("900s");
+  });
+
+  test("`pane-gone` NEVER asks for a recovery — ordinary pane churn is not the credential coming back, and telling the room the outage is over while it is still running is worse than the original silence", () => {
+    const { deps } = fakeDeps();
+    const { router, recovered } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    tracker.onLoginExpiredResolved({ paneId: "p1", reason: "pane-gone" });
+
+    expect(recovered.length).toBe(0);
+    expect(tracker.current()).toBeDefined();
+  });
+
+  test("`superseded` NEVER asks for a recovery — it is the ORDINARY shape of a dead credential being retried", () => {
+    const { deps } = fakeDeps();
+    const { router, recovered } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+    tracker.onLoginExpiredResolved({ paneId: "p1", reason: "superseded" });
+
+    expect(recovered.length).toBe(0);
+    expect(tracker.current()).toBeDefined();
+  });
+
+  test("pane churn mid-episode (a pane id genuinely changing under the alert) still ends in exactly one recovery, and only once a real recovery closes it", () => {
+    const { deps } = fakeDeps();
+    const { router, raised, recovered } = routerSpy();
+    const tracker = createCredentialDeathTracker({ ...deps, opsAlert: router });
+
+    // The respawn churn FACTORY-357 measured: w6Z:p1 -> w74:p1, nothing fixed.
+    tracker.onLoginExpired({ paneId: "w6Z:p1", detail: "Login expired" });
+    tracker.onLoginExpiredResolved({ paneId: "w6Z:p1", reason: "pane-gone" });
+    tracker.onLoginExpired({ paneId: "w74:p1", detail: "Login expired" });
+    expect(recovered.length).toBe(0);
+
+    tracker.onLoginExpiredResolved({ paneId: "w74:p1", reason: "recovered" });
+
+    expect(recovered.length).toBe(1);
+    expect(raised.length).toBe(2);
+    expect(tracker.current()).toBeUndefined();
+  });
+
+  test("a tracker with NO opsAlert dep raises nothing and still logs and tracks exactly as before — the route is optional and additive", () => {
+    const { deps, lines } = fakeDeps();
+    const tracker = createCredentialDeathTracker(deps);
+
+    expect(() => {
+      tracker.onLoginExpired({ paneId: "p1", detail: "Login expired" });
+      tracker.onLoginExpiredResolved({ paneId: "p1", reason: "recovered" });
+    }).not.toThrow();
+
+    expect(lines.filter((l) => l.startsWith(CREDENTIAL_DEATH_MARKER)).length).toBe(2);
+    expect(tracker.current()).toBeUndefined();
   });
 });

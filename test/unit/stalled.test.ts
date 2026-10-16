@@ -296,7 +296,7 @@ describe("createStalledCheck", () => {
     });
     await check.check("KAN-1", "idle"); // floor starts at now=0
     now = 10 * 60_000;
-    expect(await check.check("KAN-1", "idle")).toBe(false); // disqualified, not silently ignored
+      expect(await check.check("KAN-1", "idle")).toBeNull(); // unverifiable activity cannot close an episode
     expect(logs.some((l) => l.includes("WARNING") && l.includes("[stalled]") && l.includes("KAN-1") && l.includes("c1") && l.includes("unparseable"))).toBe(true);
   });
 
@@ -478,5 +478,22 @@ describe("createStalledCheck", () => {
     await check.check("KAN-1", "idle");
     now = 25 * 60_000;
     expect(check.elapsedMinutes?.("KAN-1")).toBe(25);
+  });
+
+  // FACTORY-845: `streakStart` is the exact instant, not `elapsedMinutes`'s
+  // rounded duration — exposed so a second consumer (the idle-poke engine,
+  // src/agents/idle-poke.ts) can identify an idle "episode" by this precise
+  // value rather than reconstructing it from a rounded minute count.
+  test("streakStart is exposed on the built StalledCheck, and matches the precise instant observe() first armed the floor", async () => {
+    let now = 0;
+    const check = createStalledCheck({ now: () => now, minutes: 10, comments: async () => [] });
+    expect(check.streakStart?.("KAN-1")).toBe(null); // never observed yet
+    now = 90_000; // an instant not on a whole-minute boundary
+    await check.check("KAN-1", "idle");
+    expect(check.streakStart?.("KAN-1")).toBe(90_000);
+    now = 5 * 60_000;
+    expect(check.streakStart?.("KAN-1")).toBe(90_000); // unchanged while the streak holds
+    await check.check("KAN-1", "working"); // breaks the streak
+    expect(check.streakStart?.("KAN-1")).toBe(null);
   });
 });

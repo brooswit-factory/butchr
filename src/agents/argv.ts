@@ -9,9 +9,77 @@ import {
   type ManagedAgentLaunch,
   type ParamsOf,
 } from "@brooswit/drovr";
+// Bun embeds this at build time, so the built binary carries it — same discipline as workspace.ts's own briefs/*.md imports.
+import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 
-/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. */
-export const KICKOFF_PROMPT = "follow your CLAUDE.md";
+/**
+ * FACTORY-892: herdr's `agent.start` rejects any start argument containing a
+ * control character (C0 U+0000-U+001F or C1 U+007F-U+009F, matching
+ * Rust's `char::is_control`) BEFORE it ever tries to shell-quote it —
+ * observed as `invalid_agent_argument` / "agent arguments cannot be encoded
+ * safely for the target shell". FACTORY-735/739 regressed exactly this: a
+ * literal `\n\n` landed in the kickoff prompt, which is `args[0]` of every
+ * `agent.start` call (`@brooswit/drovr`'s `buildAgentStartParams`). See
+ * `kickoffFor` and `assertSafeStartArgv` below for where this is now
+ * enforced butchr-side, before `agent.start` is ever called.
+ */
+const CONTROL_CHAR_PATTERN = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Every control character in `args`, by index — empty when `args` is safe to hand to `agent.start`. */
+export function controlCharStartArgs(args: readonly string[]): Array<{ index: number; value: string }> {
+  return args.flatMap((value, index) => (CONTROL_CHAR_PATTERN.test(value) ? [{ index, value }] : []));
+}
+
+/**
+ * The butchr-side pre-flight guard FACTORY-892 asks for: fails loudly, with
+ * butchr's own message, instead of letting a control character reach herdr
+ * and come back as an opaque `invalid_agent_argument` 4xx. Deliberately a
+ * NEW function, not a change to `checkArgv`'s (`checkManagedAgentArgv`'s)
+ * contract below — that one compares expected-vs-observed argv for
+ * staleness and is not a validator; see its own re-export doc comment.
+ */
+export function assertSafeStartArgv(args: readonly string[]): void {
+  const bad = controlCharStartArgs(args);
+  if (bad.length === 0) return;
+  const detail = bad.map(({ index, value }) => `args[${index}]=${JSON.stringify(value)}`).join(", ");
+  throw new Error(`refusing to start agent: control character(s) in start argv — herdr rejects these before shell-quoting (${detail})`);
+}
+
+/**
+ * FACTORY-940: `briefs/_before-you-stop.md` (and any other hand-written
+ * Markdown source this feeds) opens with a `#`-style heading — stripped here
+ * so it never survives flattening as a literal `##` sitting mid-sentence.
+ * Only a LEADING marker is touched; the rest of the text is untouched.
+ */
+const MARKDOWN_LEADING_LINE_MARKER = /^(?:#{1,6}|>+|[-*+]|\d+\.)\s+/;
+
+/** Collapses all whitespace (including newlines) to single spaces, so the result is always safe as ONE start argument. */
+const flattenToSingleLine = (text: string): string =>
+  text.trim().replace(MARKDOWN_LEADING_LINE_MARKER, "").replace(/\s+/g, " ");
+
+/**
+ * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
+ * every kickoff prompt below, so it is in context from the agent's very
+ * first turn — not just inside `brief.md` (which a long session's own
+ * context compaction can push out) — and so it is still there at the moment
+ * the agent is deciding whether to stop or go idle. Same shared source
+ * (`briefs/_before-you-stop.md`) `src/agents/workspace.ts`'s own
+ * `BEFORE_YOU_STOP_INCLUDE_MARKER` resolves into every `briefs/*.md`
+ * template — this is the SECOND of the two places FACTORY-735 requires the
+ * text to land, not a competing copy of it.
+ *
+ * FACTORY-892: flattened to one line (`flattenToSingleLine`, not just
+ * `.trim()`) — `briefs/_before-you-stop.md` is hand-wrapped Markdown with
+ * real newlines mid-sentence, and a multi-line kickoff is exactly the
+ * regression this ticket fixes. See `CONTROL_CHAR_PATTERN`'s own doc
+ * comment above for why.
+ */
+const KICKOFF_REMINDER = flattenToSingleLine(BEFORE_YOU_STOP);
+
+/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. ONE LINE — see FACTORY-892 above. */
+export const KICKOFF_PROMPT = `follow your CLAUDE.md. ${KICKOFF_REMINDER}`;
+/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above, same reminder appended. ONE LINE — see FACTORY-892 above. */
+export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md. ${KICKOFF_REMINDER}`;
 /**
  * FACTORY-127/FACTORY-138 (operator decision, FACTORY-67 director comment
  * 2026-09-26 22:24Z): butchr's own default for a Claude launch whose spec
@@ -31,8 +99,22 @@ export const KICKOFF_PROMPT = "follow your CLAUDE.md";
  */
 export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;
+/**
+ * FACTORY-491 (director item 5, FACTORY-467 comment 27774/27788): the
+ * `BUTCHR_RESTORED_RESUME` canary/kill switch for herdr-restored-pane
+ * resume-in-place (`isHerdrRestoredPane`, src/agents/herd.ts) — `"off"`
+ * disables it fleet-wide (today's allowlist/stop+spawn behaviour,
+ * unconditionally), `"all"` enables it for every managed session, and a
+ * `ReadonlySet` enables it only for the named managed sessions (their bare
+ * definition name — `managedSessionShortDisplayId`,
+ * src/rules/session-definition-type.ts — e.g. `"buddy"`). Parsed once in
+ * `loadConfig` (src/config/config.ts); see that parse for the default.
+ */
+export type RestoredResumePolicy = "off" | "all" | ReadonlySet<string>;
 export interface AgentConfig {
   provider: AgentProvider; providers?: AgentProvider[]; roleProviders?: Partial<Record<"project" | "epic" | "story" | "task", AgentProvider[]>>; model?: string; effort?: string; disabledMcpServers?: Array<{ name: string; transport: "stdio" | "streamable_http" }>; codexSpawnBlocked?: string; agySpawnBlocked?: string;
+  /** FACTORY-491 — see `RestoredResumePolicy`'s own doc comment. Defaults to `{buddy, genius}` in `loadConfig` when `BUTCHR_RESTORED_RESUME` is unset. */
+  restoredResume?: RestoredResumePolicy;
   /**
    * FACTORY-314 (PR #513 review fix) — set ONLY by `HerdrHerd.resumeInPlace()`
    * (src/agents/herd.ts) for a model/effort-only change on a still-alive
@@ -94,10 +176,26 @@ export function inventoryCodexMcp(
  * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
  * PROJECT's own file (if any), never butchr's generated one, and the
  * definition's `brief` would never reach the agent at all.
+ *
+ * FACTORY-892: this is the ONE function every start path (the real spawn
+ * path's `kickoff` callback into `ManagedHerdrLifecycle.start()`, and
+ * `agentStartParams`/`spawnArgs` below) calls to get the prompt that becomes
+ * `args[0]` of `agent.start`. `spec.brief` is operator/rule-authored and can
+ * be multi-line — the SAME class of break the two KICKOFF_PROMPT constants
+ * had, just latent until a multi-line brief is used — so it is flattened
+ * here too, and the result is asserted safe before it ever leaves this
+ * function, as a backstop for any control character flattening doesn't
+ * catch (e.g. a bare `\0`, which is not whitespace).
  */
 export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
-  if (spec?.cwd && spec.brief) return `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${spec.brief}`;
-  return provider === "claude" ? KICKOFF_PROMPT : "follow your AGENTS.md";
+  const prompt =
+    spec?.cwd && spec.brief
+      ? `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${flattenToSingleLine(spec.brief)}`
+      : provider === "claude"
+        ? KICKOFF_PROMPT
+        : AGENTS_KICKOFF_PROMPT;
+  assertSafeStartArgv([prompt]);
+  return prompt;
 };
 
 /**
@@ -190,16 +288,45 @@ export function agentLaunchConfig(
       cwd: dir,
       prompt: "",
       ...(agent.model ? { model: agent.model } : {}),
-      // FACTORY-108: `spec.lizardMode` is Codex's own "manual approval mode"
-      // launch signal (the Codex counterpart of Claude's `permissionMode:
-      // "default"` — Codex has no `permissionMode` concept) — omitting the
-      // bypass flag is what lets the daemon's permission-answer timer's
-      // `autoAnswerCodexApprovals` pass (src/agents/permission-answer-loop.ts)
-      // ever see a pending dialog to answer at all (a bypassed launch shows
-      // none). ORed with the pre-existing unconditional jira-project case
-      // (a freeform project manager's own always-manual review mode,
-      // unrelated to lizardMode).
-      ...(decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode ? {bypassApprovalsAndSandbox:false}: {}),
+      // FACTORY-577: today's rule is THREE cases, in precedence order:
+      //   1. an EXPLICIT `spec.permissionMode` wins outright, in both
+      //      directions, over everything below — `"bypassPermissions"` =>
+      //      the bypass flag (set true explicitly, rather than resting on
+      //      drovr's own `!== false` default, so the intent is legible here
+      //      and in a test's assertion); any other explicit mode
+      //      (`"default"`/`"acceptEdits"`/`"plan"`/`"auto"`) => manual.
+      //   2. ABSENT `spec.permissionMode`: the pre-existing unconditional
+      //      jira-project case (a freeform project manager's own
+      //      always-manual review mode) => manual.
+      //   3. ABSENT `spec.permissionMode`, not jira-project: `spec.lizardMode`
+      //      is Codex's own "manual approval mode" launch signal (FACTORY-108
+      //      — the Codex counterpart of Claude's `permissionMode: "default"`,
+      //      Codex has no `permissionMode` concept of its own) — omitting the
+      //      bypass flag is what lets the daemon's permission-answer timer's
+      //      `autoAnswerCodexApprovals` pass (src/agents/permission-answer-loop.ts)
+      //      ever see a pending dialog to answer at all (a bypassed launch
+      //      shows none) — truthy => manual.
+      // DELIBERATE SELF-CONTRADICTION, case 1 over case 3: a managed-session
+      // definition can set `permissionMode: "bypassPermissions"` AND
+      // `lizardMode: true` at once (`specForSessionDefinition` forwards
+      // `lizardMode` for `vendor: "codex"` independently of the required
+      // `permissionMode` field — src/rules/session-definition-type.ts). Case
+      // 1 wins, so that pane launches bypassed — no approval dialog EVER
+      // appears, which makes `lizardMode`'s auto-answering dead code for it.
+      // This is intentional (FACTORY-577 decision, not an oversight): an
+      // explicit `permissionMode` is a stronger, launch-time-legible signal
+      // than `lizardMode`'s own manual-mode side effect, and a definition
+      // author who sets both has asked for two contradictory things — YOLO
+      // wins because it is the more specific, more recently-stated intent.
+      // If a future story wants `lizardMode: true` to instead force manual
+      // even over an explicit `bypassPermissions`, that is a precedence
+      // change to make deliberately here, not something to fall out of
+      // reordering this conditional.
+      ...(spec.permissionMode !== undefined
+        ? { bypassApprovalsAndSandbox: spec.permissionMode === "bypassPermissions" }
+        : decodeAgentKey(spec.key)?.resourceProvider === "jira-project" || spec.lizardMode
+          ? { bypassApprovalsAndSandbox: false }
+          : {}),
       mcpServers: [
         {
           name: "butchr",
@@ -273,6 +400,12 @@ export function agentStartParams(
   if (agent.provider === "claude" && agent.resumeSessionId) {
     params.args = [...(params.args ?? []), "--resume", agent.resumeSessionId];
   }
+  // FACTORY-892: belt-and-suspenders over the FULL argv, not just the
+  // prompt `kickoffFor` already checked — every other value here is an
+  // internal constant/enum today, never multi-line, but this is what makes
+  // the guard cover "every start argument" as the ticket asks, not just the
+  // one argument that happened to regress.
+  assertSafeStartArgv(params.args ?? []);
   return params;
 }
 

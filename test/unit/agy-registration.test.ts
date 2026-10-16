@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { resolve } from "node:path";
 import { bridgeExecutable, inventoryAgyMcp, registrationMatches } from "../../src/mcp/registration.js";
 
 const root = "/tmp/factory";
@@ -23,7 +24,7 @@ test("AGY registration must target this bridge and workspace root", () => {
   for (const value of [null, {}, { mcpServers: null }, { mcpServers: {} }]) {
     expect(registrationMatches(value, root, executable, bun)).toBe(false);
   }
-  expect(bridgeExecutable()).toEndWith("/butchr/dist/butchr-mcp.js");
+  expect(bridgeExecutable()).toBe(resolve(import.meta.dir, "../../dist/butchr-mcp.js"));
 });
 
 test("AGY readiness only gates configured AGY launches and redacts failures", () => {

@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync, readdirSync } from "node:fs";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { readFileSync, readdirSync, mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { atlassianTools } from "../../src/tools/defs.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { escapeStorageText, unwrapStorageParagraph } from "../../src/tools/speak.js";
 import { OUTCOME_TAG } from "../../src/tools/outcome.js";
+import { workspaceStopCause } from "../../src/agents/stop-cause.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
 function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
@@ -55,7 +57,7 @@ describe("atlassianTools", () => {
       "confluence_create_page", "confluence_get_page", "confluence_list_spaces", "confluence_search_pages", "confluence_update_page",
       "correct_worker",
       "file_where_it_belongs", "finish_without_a_boss", "finish_worker",
-      "get_doc", "get_doc_comments",
+      "get_doc", "get_doc_comments", "get_my_confluence_page", "get_my_confluence_page_comments",
       "jira_add_comment", "jira_assign", "jira_create_issue", "jira_get_issue", "jira_link_issues", "jira_search",
       "jira_set_priority", "jira_transition",
       "list_peers",
@@ -286,8 +288,8 @@ describe("comment identity tagging", () => {
 });
 
 describe("jira_create_issue: role assignment, implements/parent resolution, orphan opt-out (KAN-802)", () => {
-  const STORY_ID = "712020:e160cf60-6480-44de-8554-af5b81c584e2";
-  const TASK_ID = "712020:619ec5ec-2e92-492f-8979-91ccda318230";
+  const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
+  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -468,17 +470,17 @@ describe("jira_create_issue: role assignment, implements/parent resolution, orph
   test("audit line for a Story with implements matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", parent: "KAN-794", implements: "KAN-794" }, conn);
-    expect(audits.some((a) => a.includes("create Story under KAN-794 implements KAN-794 → 712020:e160…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Story under KAN-794 implements KAN-794 → 000000:0000…"))).toBe(true);
   });
   test("audit line for a Task with implements matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Task", summary: "s", parent: "KAN-794", implements: "KAN-795" }, conn);
-    expect(audits.some((a) => a.includes("create Task under KAN-794 implements KAN-795 → 712020:619e…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Task under KAN-794 implements KAN-795 → 000000:1111…"))).toBe(true);
   });
   test("audit line for orphan-by-request matches the ticket's example format", async () => {
     const { tools, audits, conn } = rig();
     await tools.jira_create_issue!.handler({ projectKey: "KAN", issuetype: "Story", summary: "s", implements: "none" }, conn);
-    expect(audits.some((a) => a.includes("create Story under (none) orphan by request → 712020:e160…"))).toBe(true);
+    expect(audits.some((a) => a.includes("create Story under (none) orphan by request → 000000:0000…"))).toBe(true);
   });
 });
 
@@ -633,8 +635,8 @@ describe("confluence_create_page parentId", () => {
 });
 
 describe("jira_assign (KAN-810)", () => {
-  const STORY_ID = "712020:e160cf60-6480-44de-8554-af5b81c584e2";
-  const TASK_ID = "712020:619ec5ec-2e92-492f-8979-91ccda318230";
+  const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
+  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -1560,7 +1562,7 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       getIssue: async () => ({ ok: true }),
       getIssueComments: async (key: string) => {
         getIssueCommentsCalls.push(key);
-        return { results: opts.epicComments?.[key] ?? [] };
+        return { results: (opts.epicComments?.[key] ?? []) as any[] };
       },
       search: async (jql: string) => {
         searchCalls.push(jql);
@@ -1741,7 +1743,7 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
       getIssue: async () => opts.issue ?? { key: "KAN-7" },
       getIssueComments: async (key: string) => {
         getIssueCommentsCalls.push(key);
-        return { results: opts.commentsByKey?.[key] ?? [] };
+        return { results: (opts.commentsByKey?.[key] ?? []) as any[] };
       },
       search: async () => ({ ok: true }),
       addComment: async () => ({ ok: true }),
@@ -1834,6 +1836,52 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
     const result = await tools.stand_down!.handler({}, conn);
     expect(result).toMatchObject({ ok: true, key: "KAN-7", asleep: false, watching: ["KAN-7"] });
     expect((result as { note: string }).note).toMatch(/NOT put to sleep/);
+  });
+
+  // FACTORY-849/FACTORY-852 (PR #719 review, item 1): the actual real-world
+  // write site — this handler calling `recordIntentionalStop`, not merely
+  // `classifyStop` exercised in isolation over a hand-built StopCauseRecord
+  // (stop-cause.test.ts already covers that half). Sandboxes BUTCHR_WORKSPACES
+  // to a throwaway temp dir for the same reason correctWorker's own tests do
+  // in relationship.test.ts: workspaceRoot() defaults to a REAL,
+  // populated `~/butchr-workspaces` otherwise.
+  describe("FACTORY-849/FACTORY-852: stand_down persists an intentional stop-cause marker on the caller's own on-disk workspace(s)", () => {
+    let workspacesRoot: string;
+    const priorEnv = process.env.BUTCHR_WORKSPACES;
+    beforeEach(() => {
+      workspacesRoot = mkdtempSync(join(tmpdir(), "stand-down-stop-cause-test-"));
+      process.env.BUTCHR_WORKSPACES = workspacesRoot;
+    });
+    afterEach(() => {
+      rmSync(workspacesRoot, { recursive: true, force: true });
+      if (priorEnv === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = priorEnv;
+    });
+
+    test("a workspace on disk for the caller gets `.butchr-stop-cause.json` written with reason \"stand_down\" after a successful stand_down", async () => {
+      const dir = join(workspacesRoot, "jira-work", "task", "KAN-7");
+      mkdirSync(dir, { recursive: true });
+      const { tools } = standDownRig({
+        issue: { key: "KAN-7", fields: { issuelinks: [] } },
+        commentsByKey: { "KAN-7": [{ id: "100" }] },
+        onStandDown: () => {},
+      });
+      const conn = { headers: { "x-issue": "KAN-7" } } as any;
+      expect(workspaceStopCause(dir)).toBeUndefined();
+      const result = await tools.stand_down!.handler({}, conn);
+      expect(result).toMatchObject({ ok: true, asleep: true });
+      expect(workspaceStopCause(dir)).toEqual({ reason: "stand_down", at: expect.any(Number) });
+    });
+
+    test("no on-disk workspace for the caller: stand_down still succeeds (best-effort, never throws)", async () => {
+      const { tools } = standDownRig({
+        issue: { key: "KAN-7", fields: { issuelinks: [] } },
+        commentsByKey: { "KAN-7": [{ id: "100" }] },
+        onStandDown: () => {},
+      });
+      const conn = { headers: { "x-issue": "KAN-7" } } as any;
+      await expect(tools.stand_down!.handler({}, conn)).resolves.toMatchObject({ ok: true, asleep: true });
+    });
   });
 });
 
@@ -2025,6 +2073,158 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
       expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).not.toBe(original);
       expect(unwrapStorageParagraph(unwrapStorageParagraph(written))).toBe("the arrow renders as > in storage");
     });
+  });
+});
+
+// FACTORY-996: get_my_confluence_page / get_my_confluence_page_comments, the
+// managed-session agent read path for its OWN confluence-page resource.
+// Narrow scope, called out by the epic as a security requirement: an agent
+// must be unable to read any other page, by argument, by id injection, or
+// by a non-page resource id. Failure conditions stated first, per test, same
+// discipline as get_doc_comments' own block above.
+describe("get_my_confluence_page / get_my_confluence_page_comments (FACTORY-996): managed-session agent's own Confluence page", () => {
+  function pageRig(byPage: Record<string, { title: string; body: string; version: number }>, commentsByPage: Record<string, Array<{ id: string; body: string; author?: string }>> = {}) {
+    const getPageCalls: string[] = [];
+    const getPageCommentsCalls: string[] = [];
+    const audits: string[] = [];
+    const ops: AtlassianOps = {
+      getIssue: async () => ({ ok: true }),
+      getIssueComments: async () => ({ results: [] }),
+      search: async () => ({ issues: [] }),
+      addComment: async () => ({ ok: true }),
+      linkIssues: async () => ({ ok: true }),
+      transition: async () => ({ ok: true }),
+      createIssue: async () => ({ ok: true }),
+      setPriority: async () => ({ ok: true }),
+      assign: async () => ({ ok: true }),
+      createPage: async () => ({ ok: true }),
+      // Keyed strictly by the `pageId` ARGUMENT — never the caller's x-issue
+      // directly and never a hardcoded id — so a reader that ignored the
+      // resolved page id (or leaked a DIFFERENT page's content) is visible
+      // in the assertions below, the same control discipline get_doc_comments'
+      // own rig uses for the batch-endpoint trap.
+      getPage: async (id: string) => {
+        getPageCalls.push(id);
+        const p = byPage[id];
+        if (!p) throw new Error(`pageRig: no such page ${id}`);
+        return { title: p.title, body: { storage: { value: p.body } }, version: { number: p.version }, _links: { base: "https://fake.atlassian.net/wiki", webui: `/pages/${id}` } };
+      },
+      updatePage: async () => ({ ok: true, version: 1 }),
+      searchPages: async () => ({ results: [] }),
+      listSpaces: async () => ({ ok: true }),
+      getRemoteLink: async () => null,
+      upsertRemoteLink: async () => ({ ok: true }),
+      getChildPages: async () => ({ results: [] }),
+      getPageLabels: async () => [],
+      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
+      addLabels: async () => ({ ok: true }),
+      removeLabels: async () => ({ ok: true }),
+      deleteIssue: async () => ({ ok: true }),
+      correctText: async () => ({ ok: true }),
+      commentOnPage: async () => ({ ok: true }),
+      getPageComments: async (pageId: string) => {
+        getPageCommentsCalls.push(pageId);
+        if (!(pageId in commentsByPage)) throw new Error(`pageRig: no comments seeded for page ${pageId}`);
+        return { results: commentsByPage[pageId]! };
+      },
+      searchProjects: async () => ({ values: [] }),
+      getMyself: async () => ({ accountId: "test-account" }),
+      getProjectProperty: async () => { throw new Error("not used by this rig"); },
+      getProjectPropertyOrNull: async () => null,
+      setProjectProperty: async () => ({ ok: true }),
+      getPageVersions: async () => ({}),
+    };
+    const tools = atlassianTools(ops, (l) => audits.push(l));
+    return { tools, getPageCalls, getPageCommentsCalls, audits };
+  }
+
+  const OWN_PAGE_CALLER = { headers: { "x-issue": "500" } } as any;
+
+  test("get_my_confluence_page's and get_my_confluence_page_comments' schemas have NO fields that could name a page — there is no key parameter to get wrong", () => {
+    const { tools } = pageRig({});
+    expect(Object.keys(tools.get_my_confluence_page!.input).sort()).toEqual(["expectVersion", "limit", "offset"]);
+    expect(Object.keys(tools.get_my_confluence_page_comments!.input)).toEqual([]);
+  });
+
+  test("get_my_confluence_page reads the CALLER'S OWN page, derived solely from x-issue", async () => {
+    const { tools, getPageCalls } = pageRig({ "500": { title: "my resource page", body: "<p>hello</p>", version: 1 } });
+    const result = (await tools.get_my_confluence_page!.handler({}, OWN_PAGE_CALLER)) as { found: boolean; id?: string; body?: string };
+    expect(getPageCalls).toEqual(["500"]);
+    expect(result).toMatchObject({ found: true, complete: true, id: "500", body: "<p>hello</p>" });
+  });
+
+  test("get_my_confluence_page_comments reads the CALLER'S OWN page's comments, derived solely from x-issue", async () => {
+    const { tools, getPageCommentsCalls } = pageRig(
+      { "500": { title: "t", body: "b", version: 1 } },
+      { "500": [{ id: "10", body: "<p>a comment</p>", author: "acc-a" }] },
+    );
+    const result = (await tools.get_my_confluence_page_comments!.handler({}, OWN_PAGE_CALLER)) as { results: Array<{ id: string; body: string; author?: string }> };
+    expect(getPageCommentsCalls).toEqual(["500"]);
+    expect(result.results).toEqual([{ id: "10", body: "a comment", author: "acc-a" }]); // unwrapped, plain text
+  });
+
+  // THE SECURITY REQUIREMENT (the epic's own call-out): own page readable;
+  // any attempt to name another page is impossible — there is no argument
+  // that could carry one (asserted above), so this proves the ONLY
+  // remaining route (a caller whose x-issue itself names a different page)
+  // still only ever reads THAT caller's own x-issue, never a second one.
+  test("a DIFFERENT caller's x-issue reads a DIFFERENT page — never cross-contaminated, no argument can override it", async () => {
+    const { tools, getPageCalls } = pageRig({
+      "500": { title: "page A", body: "<p>page A body</p>", version: 1 },
+      "600": { title: "page B", body: "<p>page B body — must never appear for caller 500</p>", version: 1 },
+    });
+    const resultA = (await tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": "500" } } as any)) as { id?: string; body?: string };
+    const resultB = (await tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": "600" } } as any)) as { id?: string; body?: string };
+    expect(getPageCalls).toEqual(["500", "600"]);
+    expect(resultA).toMatchObject({ id: "500", body: "<p>page A body</p>" });
+    expect(resultB).toMatchObject({ id: "600", body: "<p>page B body — must never appear for caller 500</p>" });
+  });
+
+  test("refuses a connection with no x-issue, on both verbs", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: {} } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/x-issue/);
+    await expect(tools.get_my_confluence_page_comments!.handler({}, conn)).rejects.toThrow(/x-issue/);
+  });
+
+  test("refuses a Jira ISSUE KEY caller (e.g. a jira-work agent) — not a confluence-page resource id", async () => {
+    const { tools, getPageCalls, getPageCommentsCalls } = pageRig({});
+    const conn = { headers: { "x-issue": "KAN-7" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+    await expect(tools.get_my_confluence_page_comments!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+    expect(getPageCalls).toEqual([]);
+    expect(getPageCommentsCalls).toEqual([]);
+  });
+
+  test("refuses a Jira PROJECT KEY caller (e.g. a project tier agent) — via the same refuseProjectCaller gate every other project-refusing verb uses (BUTCHR-82 disposition: \"refuses\")", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: { "x-issue": "BUTCHR" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/refusing a project caller/);
+  });
+
+  test("refuses a FILESYSTEM PATH caller (e.g. a managed-session agent whose resource is a file, not yet a Confluence page)", async () => {
+    const { tools } = pageRig({});
+    const conn = { headers: { "x-issue": "/home/agent/workspace/notes.md" } } as any;
+    await expect(tools.get_my_confluence_page!.handler({}, conn)).rejects.toThrow(/not a confluence-page resource id/);
+  });
+
+  test("refuses a malformed/non-numeric x-issue outright, without ever calling getPage", async () => {
+    const { tools, getPageCalls } = pageRig({});
+    // "" is excluded here — an empty x-issue hits the "no x-issue at all"
+    // refusal (requireCaller) first, tested separately above; this test is
+    // about a PRESENT but wrongly-shaped x-issue.
+    for (const bad of ["123abc", "-1", "1.5", "https://wroosbit.atlassian.net/wiki/spaces/X/pages/500/Title"]) {
+      await expect(tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": bad } } as any)).rejects.toThrow(/not a confluence-page resource id/);
+    }
+    expect(getPageCalls).toEqual([]);
+  });
+
+  test("audits the caller's own page id", async () => {
+    const { tools, audits } = pageRig({ "500": { title: "t", body: "b", version: 1 } }, { "500": [] });
+    await tools.get_my_confluence_page!.handler({}, OWN_PAGE_CALLER);
+    await tools.get_my_confluence_page_comments!.handler({}, OWN_PAGE_CALLER);
+    expect(audits.some((l) => l.includes("get_my_confluence_page 500"))).toBe(true);
+    expect(audits.some((l) => l.includes("get_my_confluence_page_comments 500"))).toBe(true);
   });
 });
 
@@ -2485,27 +2685,12 @@ describe("BUTCHR-336: every boss-facing priority surface states the admission me
   });
 });
 
-// BUTCHR-299 (review of BUTCHR-336): the SAME backstop, extended to the
-// briefs — the copy every boss agent actually reads. The tool-description
-// guard above left a hole this fills: deleting the mechanism sentence from
-// a brief used to fail nothing, and a claim in prose that nothing executes
-// is exactly the defect this work exists to remove.
-//
-// The set of briefs is DERIVED, never hand-listed: any brief that tells a
-// boss to revise a worker's priority ("priority as reality shifts") must
-// also state that doing so does not change what gets staffed. That way a
-// brief which GAINS the guidance later is covered automatically, and
-// briefs/task.md — whose only mention is about WHO sets priority, not its
-// effect — is correctly excluded without naming it.
-//
-// Briefs HARD-WRAP, so both sides are matched on whitespace-collapsed text.
-// A line-naive match here reports a confident false negative: the sentence
-// is present but spans a line break. That mistake was actually made while
-// verifying this change, which is why the unwrapping is load-bearing
-// rather than incidental.
-describe("BUTCHR-299: every brief that tells a boss to revise priority also states the admission mechanism", () => {
+// Every brief teaching the current priority operation must explain its actual
+// admission effect. Derive from the advertised verb, independent of caller role.
+// Collapse whitespace because shipped briefs may hard-wrap the mechanism.
+describe("BUTCHR-299: every brief teaching explicit priority changes states the admission mechanism", () => {
   const BRIEFS_DIR = join(import.meta.dir, "..", "..", "briefs");
-  const GUIDANCE = "priority as reality shifts";
+  const GUIDANCE = "`jira_set_priority`";
   const MECHANISM_CLAUSE = "priority is not read by admission or reconcile, so it does not change which ticket is staffed first";
   const unwrapped = (file: string) => readFileSync(join(BRIEFS_DIR, file), "utf8").replace(/\s+/g, " ");
 
@@ -2523,7 +2708,7 @@ describe("BUTCHR-299: every brief that tells a boss to revise priority also stat
     expect(unwrapped(file)).toContain(MECHANISM_CLAUSE);
   });
 
-  test("briefs/task.md is deliberately excluded — its mention is about WHO sets priority, not its effect", () => {
-    expect(withGuidance).not.toContain("task.md");
+  test("task agents receive the same priority mechanism guidance as other callers", () => {
+    expect(withGuidance).toContain("task.md");
   });
 });

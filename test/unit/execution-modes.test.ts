@@ -352,7 +352,13 @@ describe("event delivery to a query-level agent's scope (BUTCHR-398)", () => {
     const m = (over: Partial<JiraIssue> = {}): RuleMatch[] => [{ agentKey: "jira-work:triage:BUTCHR-1", rule: triage!, issue: issue("BUTCHR-1", over) }];
     const snap = (ms: RuleMatch[]) => ({ primary: [] as ExecutionUnit<RuleMatch>[], related: scopeRelatedResources(ms) });
     await events.poll(snap(m()), snap(m())); // warm-up: seeds the baseline at "no comments yet"
-    comments = [{ id: "c1", author: "u", authorEmail: "u@example.invalid", body: "hi", created: "t", updated: "t" }];
+    // FACTORY-954: the query agent's own "related" scope is delivered
+    // through the exact same `createIssueEventRules` machinery a boss/
+    // worker Implements relationship uses (`createRuleEventRules`'s own
+    // `relatedRules`, src/rules/resource-type.ts) — so it is now subject to
+    // the same related-space allowlist. A generic comment body no longer
+    // qualifies; this is the ticket's own self-tag shape instead.
+    comments = [{ id: "c1", author: "u", authorEmail: "u@example.invalid", body: "[BUTCHR-1] hi", created: "t", updated: "t" }];
     // A daemon-label-shaped diff with no status/summary change is what routes through the comment-cursor check in this stack.
     const ev = await events.poll(snap(m()), snap(m({ labels: ["agent:working"], updated: "later" })));
     expect(ev.changedRelated).toEqual(["jira-work:triage:BUTCHR-1"]);
@@ -589,7 +595,16 @@ describe("per-provider convergence and event delivery (BUTCHR-398 review finding
     expect(herd.stopped).toEqual([queryKey2("jira-idea", "ideas")]);
   });
 
-  test("jira-idea: a status change to one of its own scoped ideas is delivered to the query agent", async () => {
+  // FACTORY-954: the query agent's "related" scope is delivered through the
+  // same shared `createIssueEventRules` machinery (src/resources/issue.ts)
+  // a boss/worker Implements relationship uses, so it is now subject to the
+  // same related-space allowlist — a status transition only delivers when
+  // `to` is literally "In Review" or "Done" (the Task/Story/Epic review/
+  // merge flow this ticket's allowlist is scoped to). An idea's own
+  // "Discovery" -> "Explore" transition is neither, so it is no longer
+  // delivered — collateral tightening from reusing the same shared
+  // function, not a jira-idea-specific regression.
+  test("jira-idea: a status change to one of its own scoped ideas that is NOT In Review/Done is not delivered to the query agent", async () => {
     const [ideaRule] = rules({ id: "ideas", resourceProvider: "jira-idea", query: "project = IDEAS", execution: "singleton" });
     let matched: JiraIssue[] = [idea("IDEA-1")];
     // `type` keeps its own internal `latest` state, advanced by each `search()`/`related()`
@@ -604,6 +619,6 @@ describe("per-provider convergence and event delivery (BUTCHR-398 review finding
     const relatedAfter = await type.discovery.related!([queryKey2("jira-idea", "ideas")]);
     const ev = await type.eventRules.poll({ primary: before, related: relatedBefore }, { primary: after, related: relatedAfter });
     expect(ev.changedRelated).toEqual(["jira-idea:ideas:IDEA-1"]);
-    expect(await ev.decide("jira-idea:ideas:IDEA-1", queryKey2("jira-idea", "ideas"), "related")).toEqual({ deliver: true, reason: { status: { from: "Discovery", to: "Explore" } } });
+    expect((await ev.decide("jira-idea:ideas:IDEA-1", queryKey2("jira-idea", "ideas"), "related")).deliver).toBe(false);
   });
 });

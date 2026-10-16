@@ -68,7 +68,7 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `tier` | one of `tier`/`modelPower`+`effort` | **DEPRECATED** (FACTORY-75) — `"tier1"` \| `"tier2"` \| `"tier3"` \| `"tier4"` \| `"tier5"`, mapped to a concrete model by `tierToModel(vendor, tier)`, no effort override at all (reproduces today's launch exactly — see `docs/power-scale.md`'s "Back-compat" section). Kept working, never removed; a definition still using it is logged once per path (`onceDeprecatedTier`). See "Tier -> model mapping" below. |
 | `modelPower` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, which model this vendor launches. Set together with `effort`, never alongside `tier`. See `docs/power-scale.md` for the full table, both canonical target pairs, and why the axis is named `modelPower` rather than "capability". |
 | `effort` | one of `tier`/`modelPower`+`effort` | FACTORY-75 — 0-100 integer, how hard that model thinks, resolved through the shared effort table then translated to this vendor's own CLI/config surface (`--effort` for Claude, `model_reasoning_effort` in `.codex/config.toml` for Codex). Set together with `modelPower`. See `docs/power-scale.md`. |
-| `permissionMode` | yes | `"default"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim (see "Per-vendor launch differences"). |
+| `permissionMode` | yes | `"default"` \| `"manual"` \| `"acceptEdits"` \| `"bypassPermissions"` \| `"plan"` \| `"auto"`. Reaches a Claude launch's `permissionMode` verbatim; FACTORY-577: also mapped onto a Codex launch's `bypassApprovalsAndSandbox` (see "Per-vendor launch differences"). `"default"`/`"manual"` are the SAME launcher value — `manual` is Claude's own `--help`-advertised alias for its real canonical `default` (FACTORY-275; see `SESSION_PERMISSION_MODES`'s own doc comment, src/resources/session-definition.ts). `"bypassPermissions"`'s operator-facing friendly name is **"unattended mode"** — prose only, the wire value is unchanged. |
 | `strictMcpConfig` | no | BUTCHR-453/BUTCHR-463. Boolean, Claude only. `true` reaches a Claude launch's `ClaudeAgentLaunch.strictMcpConfig` (`@brooswit/drovr` >= 0.14.0), emitting `--strict-mcp-config` alongside `--mcp-config` — Claude Code then loads ONLY this agent's own `mcp.json`, no project- or user-level `.mcp.json` discovery on top of it. Absent/`false`: no flag, ordinary discovery. **Rejected at manifest load for `vendor: "codex"`** — see "Per-vendor launch differences" below for why this is a deliberate departure from `permissionMode`'s own precedent. See "Auto + strict MCP" below for the worked Candlestix-director example, and "Nexus's MCP isolation constraint" for how this relates to `assertNoInheritedMcpConfig`. |
 | `lizardMode` | no | DROVR-42/FACTORY-67/FACTORY-138/FACTORY-108. Boolean, accepted at manifest load for BOTH vendors (no vendor rejection here, unlike `strictMcpConfig`, which is still rejected for `vendor: "codex"`). Absent → ELIGIBLE for a `vendor: "claude"` definition (the FACTORY-138 default, `lizardMode ?? (vendor === "claude")`); a `vendor: "codex"` definition stays NOT eligible when absent — the default applies to Claude only. Explicit `false` always means never scanned or touched, for either vendor. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **For `vendor: "claude"`:** never reaches `SpawnSpec` or the launched process's argv, whether from an explicit `true` or the FACTORY-138 default — read live, every poll, by the daemon's separate permission-answer timer. **For `vendor: "codex"` (FACTORY-108):** the opposite — only an EXPLICIT `true` reaches `SpawnSpec.lizardMode` and the launch argv (dropping `--dangerously-bypass-approvals-and-sandbox` so drovr's Codex approval-answering has a dialog to see); since Codex is never eligible by default, there is no default-driven argv change to worry about. See "Codex support" below for the full asymmetry. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
@@ -79,6 +79,9 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
 | `unfreezeControllers` | no | Same shape, for `unfreeze_session` — an INDEPENDENT list; a name in `freezeControllers` grants nothing here, and vice versa. |
 | `linkedEventingProjects` | no | FACTORY-52. Non-empty array of canonical `jira-project:<KEY>` references naming the Jira project(s) this definition opts into linked eventing for. See "`linkedEventingProjects`: per-definition linked-eventing project opt-in" below. |
+| `idlePokeMinutes` | no | FACTORY-926. Reuses `Rule.idlePokeMinutes`'s type/validation verbatim (positive number; no resolved default when absent). **CONFIG-ONLY / INERT** — no engine reads this field yet (see `docs/idle-poke-session-definitions.md`). |
+| `idlePokeMessage` | no | FACTORY-926. Reuses `Rule.idlePokeMessage`'s type/validation verbatim (non-empty string; no resolved default when absent). Same CONFIG-ONLY / INERT status as `idlePokeMinutes`. |
+| `idlePokeEnabled` | no | FACTORY-926. Reuses `Rule.idlePokeEnabled`'s type/validation verbatim — boolean, ALWAYS resolved (default `true`). The un-pokeable guarantee for a utility session (`dialog-monitor`/`genius`/`buddy`) is an explicit `false` here. Same CONFIG-ONLY / INERT status as `idlePokeMinutes` — see `docs/idle-poke-session-definitions.md` for the shipped per-role values and what applying them requires. |
 
 A bad manifest (invalid JSON, an unknown field, a wrong-type/out-of-range
 value) is rejected with every problem named, collected in one pass, same
@@ -362,7 +365,7 @@ usage: butchr session list [--archived]
        butchr session show <name>
        butchr session create <name> --working-directory <dir> --brief <text>
                              --vendor claude|codex --tier tier1..tier5
-                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
                              [--role worker|sentinel] [--frozen]
@@ -1090,9 +1093,24 @@ field is independent, and a definition may set it alongside any
 plus an afterthought. `acceptEdits` auto-accepts file EDITS only — Bash and
 MCP tool prompts still appear there, and those are what lizard mode answers.
 `"bypassPermissions"` skips permission prompts by design, so `lizardMode`
-there has nothing to answer. What `"auto"` does is version-dependent and
-UNVERIFIED here — don't assume it behaves like `bypassPermissions`, and
-don't assume `lizardMode` is therefore a no-op under it.
+there has nothing to answer.
+
+**`"auto"` is NOT an equivalent no-op pair with `"bypassPermissions"`
+(FACTORY-275).** An earlier version of this doc claimed the tool-permission
+dialog "essentially never appears" under either mode, treating them as
+interchangeable — that claim was wrong and has been removed. The installed
+`claude` binary's own `--permission-mode` option help (verified at 2.1.251)
+describes them as genuinely different: `"auto"` — *"Use a model classifier
+to approve/deny permission prompts"*, a real per-prompt judgment that can
+still deny; `"bypassPermissions"` — *"Bypass all permission checks (requires
+allowDangerouslySkipPermissions)"*, which never checks and never denies.
+Neither shows an interactive dialog to a human, which is likely why the two
+were conflated, but "no human-facing dialog" is not "the same behaviour".
+Whether `lizardMode`'s auto-answer ever actually has something to press
+under `"auto"` (i.e. whether the classifier itself ever produces the same
+kind of prompt drovr recognizes) is a separate, still-open question this
+ticket did not attempt to observe live — don't assume either answer without
+watching an `"auto"` pane yourself.
 
 **No stale-argv risk for CLAUDE, unlike `permissionMode`/`strictMcpConfig`
 (FACTORY-43).** Those two fields DO reach the launched process's argv, which
@@ -1123,7 +1141,12 @@ mechanism too" above) DOES reach `SpawnSpec.lizardMode` and the launch argv:
 or sets it explicitly `false`, launches exactly as it does today (bypass
 flag present); a rule- or eligibility-level DEFAULT resolving to `true` (see
 below) never by itself changes this — only the raw, explicit field read at
-launch-config time does.
+launch-config time does. FACTORY-577: all of the above is the `lizardMode`
+story ONLY when `permissionMode` is absent from that same launch spec — an
+explicit `permissionMode` (required on every `SessionDefinition`, so this
+absent case is rule-engine/jira agents only for a managed session) wins
+over `lizardMode` here too, in both directions; see "Per-vendor launch
+differences" below for the `permissionMode` mapping itself.
 
 **The flag choice is coupled to the captured fixture set, not a general
 policy choice.** drovr's Codex prompt recognition was measured against
@@ -1275,42 +1298,60 @@ manifest-load time, not at spawn time) — **including `"bypassPermissions"`**,
 which is honoured exactly as written, with no additional gate: a definition
 file is operator-authored config (the same trust level as `rules.json`
 itself), so a `bypassPermissions` manifest is presumed deliberate, same as
-every other field here. **Codex** has no `permissionMode`
-concept in `CodexAgentLaunch` (its own `trustWorkspace`/
-`bypassApprovalsAndSandbox` fields instead) — a `vendor: "codex"`
-definition's `permissionMode` is validated and stored like any other, but
-is simply not forwarded to a Codex launch. Building Codex-specific
-permission wiring is out of scope for this ticket.
+every other field here. **Codex** has no `permissionMode` field of its own
+in `CodexAgentLaunch` (its own `trustWorkspace`/`bypassApprovalsAndSandbox`
+fields instead) — but (FACTORY-577) `agentLaunchConfig`'s Codex branch
+(`src/agents/argv.ts`) now MAPS a definition's `permissionMode` onto
+`bypassApprovalsAndSandbox`: `"bypassPermissions"` => `true` (the bypass
+flag present — YOLO); any other value (`"default"`/`"acceptEdits"`/
+`"plan"`/`"auto"`) => `false` (manual approval). Since `permissionMode` is a
+REQUIRED field on every `SessionDefinition` (`sessionDefinitionProblems`
+rejects it absent), this means **every existing `vendor: "codex"` managed
+session that does not literally say `permissionMode: "bypassPermissions"`
+flips from unattended (bypass) to manual approval the moment this ships** —
+audit your manifests before upgrading if you have Codex managed sessions
+relying on the old silently-ignored behaviour. An explicit `permissionMode`
+also wins over both the `jira-project` rule-engine default and `lizardMode`
+below, in both directions — see "Lizard mode" below for how the two
+interact.
 
 `strictMcpConfig` reaches a **Claude** launch's `ClaudeAgentLaunch.strictMcpConfig`
 verbatim (Drovr >= 0.14.0, `@brooswit/drovr`; also validated at our layer —
 a non-boolean value fails at manifest-load time). **Codex** has no
-strict-MCP-config concept either, but is treated DIFFERENTLY from
-`permissionMode` above: a `vendor: "codex"` definition setting
+strict-MCP-config concept either: a `vendor: "codex"` definition setting
 `strictMcpConfig` (to any value, including `false`) is **REJECTED at
 manifest load** (`sessionDefinitionProblems`,
 `src/resources/session-definition.ts`) rather than silently validated,
-stored, and dropped. This is a deliberate departure from `permissionMode`'s
-own precedent, not an oversight: a silently-ignored `permissionMode` leaves
-a Codex operator with a cosmetic surprise (their manifest's wish is a
-no-op), but a silently-ignored `strictMcpConfig` would leave them believing
-they have an MCP-isolation security property they do not — the exact
+stored, and dropped. This is deliberate, not an oversight: a
+silently-ignored `strictMcpConfig` would leave an operator believing they
+have an MCP-isolation security property they do not — the exact
 silent-loss-of-isolation failure mode BUTCHR-453 exists to close in the
-first place. `test/unit/session-definition.test.ts` proves the rejection.
+first place. (`permissionMode` used to be cited here as this field's
+silent-ignore precedent; FACTORY-577 removed that precedent — see
+`permissionMode` above, which is no longer silently dropped for Codex
+either — so `strictMcpConfig`'s REJECT-at-load behaviour now stands on its
+own reasoning rather than by contrast.) `test/unit/session-definition.test.ts`
+proves the rejection.
 
-`lizardMode` is **NOT** `strictMcpConfig`'s precedent (FACTORY-108,
-superseding an earlier draft of this doc that said otherwise): a
-`vendor: "codex"` definition CAN set `lizardMode` — it is validated and
-stored like any other field, never rejected at manifest load. An explicit
-`true` reaches `SpawnSpec.lizardMode` and, via `agentLaunchConfig`'s Codex
-branch (`src/agents/argv.ts`), drops `--dangerously-bypass-approvals-and-sandbox`
-from the launch argv so drovr's Codex approval-answering (its own
-Codex-specific dialog recognition, not `classifyPermissionPrompt`, which
-stays Claude-only) has a dialog to see and answer. See the "Codex
-eligibility for SCANNING vs. LAUNCH" table above for the full
-absent/`true`/`false` matrix, which differs from `permissionMode`'s
-Claude-only default specifically because Codex's own launch condition is
-explicit-`true`-only, not "absent means eligible".
+`lizardMode`: a `vendor: "codex"` definition CAN set `lizardMode` — it is
+validated and stored like any other field, never rejected at manifest load.
+An explicit `true` reaches `SpawnSpec.lizardMode` and, via
+`agentLaunchConfig`'s Codex branch (`src/agents/argv.ts`), drops
+`--dangerously-bypass-approvals-and-sandbox` from the launch argv — but
+ONLY when the same definition's `permissionMode` is absent from the spec at
+that point (never true for a `SessionDefinition`, since `permissionMode` is
+required there; this absent case is for rule-engine/jira agents, which
+never set `spec.permissionMode`) — so drovr's Codex approval-answering (its
+own Codex-specific dialog recognition, not `classifyPermissionPrompt`,
+which stays Claude-only) has a dialog to see and answer. FACTORY-577: an
+explicit `permissionMode` wins over `lizardMode` in both directions —
+`permissionMode: "bypassPermissions"` still bypasses even with
+`lizardMode: true` set, and any other explicit `permissionMode` still means
+manual even with `lizardMode` absent/`false`. See the "Codex eligibility
+for SCANNING vs. LAUNCH" table above for the full absent/`true`/`false`
+matrix for SCANNING eligibility specifically, which is unaffected by any of
+this — `permissionMode` only ever changes LAUNCH argv, never scanning
+eligibility.
 
 ## Not in this version
 
@@ -1355,6 +1396,19 @@ managed-session agent does its own Jira/Confluence work (if any) directly
 through an operator-configured Atlassian MCP connection, never through
 butchr's `jira_*`/`confluence_*` tools or the boss verbs — butchr's
 hierarchy verbs are for jira-work ticket agents (Epic/Story/Task) only.
+
+**One narrow, named exception (FACTORY-996, story FACTORY-993):**
+`get_my_confluence_page`/`get_my_confluence_page_comments` (`src/tools/
+defs.ts`) let a managed-session agent read — never write — its OWN
+resource page's body and comments through butchr's own MCP, but ONLY when
+that agent's own resource genuinely IS a Confluence page (a `confluence-page`
+ResourceType instance, FACTORY-992, not yet shipped as of this story) — the
+page id comes exclusively from the caller's own `x-issue`, never an
+argument, so this cannot be used to reach any OTHER page nor does it open a
+general Jira/Confluence integration for an arbitrary filesystem-backed
+managed-session agent. Every other managed-session agent (one whose
+resource is an ordinary file) still gets a refusal from both verbs, same as
+before this story — the paragraph above is otherwise unchanged.
 
 ## Escalating an unanswerable startup dialog (FACTORY-45)
 
@@ -1455,12 +1509,43 @@ anything beyond the plain log line happen:
    still up. Accepted deliberately, given this ticket's reduced scope — a
    duplicate journal line costs nothing a Jira rate cap would need to guard
    against.
-4. **Resolution**: when the herd no longer reports the pane blocked AT ALL
-   (`Escalator.onPoll`'s existing per-tick reset, which already ends every
-   other debounce/episode tracker in this module the same way), the entry is
-   removed from `managedSessionEscalations()` and one more
-   `[managed-escalation] ... no longer blocked — clearing stalled mark` line
-   is logged. The SAME fingerprint reappearing after a genuine clear is
+4. **Resolution, with a DISTINCT, ATTRIBUTABLE tag per clearing path**
+   (FACTORY-581 SAFETY GUARD 3, butchr's half — FACTORY-460's diagnosis
+   finding (c): "GUARD 3 spans two repos", drovr's own half being its JSONL
+   audit's `recognizedVia`/`operator`/`outcome` attribution,
+   `docs/permission-approval.md` GUARD 3/7 in `@brooswit/drovr`). A reader
+   greps `[managed-escalation] pane <id> no longer blocked` and the
+   parenthesized suffix (if any) says WHICH path cleared it:
+   - **`no longer blocked (answered: recognizedVia=<value>)`** —
+     `Escalator.onPermissionAnswered`, fired from drovr's own standalone
+     lizard-mode pass (`src/agents/permission-answer-loop.ts`'s
+     `runPermissionAnswerTick`, via its `deps.onAnswered`) actually
+     PRESSING a tool-permission dialog. `<value>` is drovr's own
+     `PermissionPrompt["recognizedVia"]` verbatim — `"separator"`,
+     `"no-separator-mcp-tool"`, `"no-separator-bash"`, or (`@brooswit/drovr`
+     >= 0.16.8, FACTORY-580/586/587) `"no-separator-file-edit"` for the new
+     file-edit/create fallback this release adds — composing directly with
+     drovr's own audit grep string (`grep
+     '"recognizedVia":"no-separator-file-edit"'`) rather than inventing a
+     second, contradicting tag.
+   - **`no longer blocked (drovr)`** — `Escalator.onDrovrDialogResolved`, an
+     ESCALATED/unknown dialog's own resolution (a human, or the dialog
+     disappearing some other way) — never butchr's own answer pass, which
+     by construction can only auto-answer a dialog this hook would NOT have
+     escalated in the first place (`escalationPayload`'s own
+     `optionFor(...) < 0` gate, `@brooswit/drovr`).
+   - **`no longer blocked`** (bare, no parenthesized reason) —
+     `Escalator.onPoll`'s existing per-tick reset, now the LAST-RESORT,
+     UNATTRIBUTED fallback: it only ever fires for a pane neither of the
+     two tagged paths above already cleared (both call
+     `clearManagedSessionStalled` directly, which is a no-op the second
+     time), so it means something this detector's own callbacks did not
+     observe — typically a human typing directly into the pane.
+
+   Whichever path fires, the entry is removed from
+   `managedSessionEscalations()` and exactly one
+   `[managed-escalation] ... no longer blocked ... — clearing stalled mark`
+   line is logged. The SAME fingerprint reappearing after a genuine clear is
    treated as a fresh episode (it escalates and logs again), never silently
    suppressed.
 5. **A durable pane-text capture** (FACTORY-50 Part C) — see "Pane-text
@@ -1570,3 +1655,245 @@ reply is (there is no ticket to reply on). If the SAME definition keeps
 re-blocking on the SAME dialog shape, that is exactly the signal to file it
 against FACTORY-46 (or whatever succeeds it) for drovr to learn to
 recognize.
+
+### Reaching a human: tiered Rocket.Chat escalation (FACTORY-607/FACTORY-609)
+
+Everything above (the journal line, the `/health` mark, the pane-text
+capture) is observational — it tells an operator who already knows to look.
+FACTORY-369 added a Rocket.Chat post so a human doesn't have to be looking:
+on top of the journal line, a NEW, separate credential (never the account-
+management `rocketchat` config — see `Config.managedEscalationRocketChat`'s
+own doc comment in `src/config/config.ts` for why) posts a message
+mentioning whoever should answer. FACTORY-607/FACTORY-609 then added
+mention/markup neutralisation (a precondition for turning this on at all)
+and tiered re-escalation (0/10/20 minutes) on top of that single post.
+
+**Credential**: `BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL` / `_USER_ID` /
+`_TOKEN_FILE`, all-or-nothing — any one missing means the feature is
+entirely disabled and every managed-session escalation behaves exactly as
+the section above describes, PLUS the new tier journal lines (below).
+Never a crash, never a silent drop either way. The SAME credential posts to
+every room this feature uses — there is only one bot account, never one
+per room (`RocketChatPoster.postMessage(channel, text)`,
+`src/resources/rocketchat.ts`, already takes the room per call).
+
+**Operational prerequisite before enabling (FACTORY-611).** The
+`butchr-escalation` bot account MUST be a member of BOTH `#team-admin` and
+`#team-engineering` with post rights in each, before the credential is
+configured. A room the bot cannot post to is NOT detected up front — a
+refused post there currently fails and is retried on the usual schedule
+(see "Retry, never latch on failure" below) exactly like a transient
+transport failure, which reads as a hung/flaky feature rather than a
+missing room membership. Do a one-time manual smoke post from the bot
+account to each room before turning this on in production.
+
+**Mention/markup neutralisation (FACTORY-607 comment 28781, hardened by
+FACTORY-611 against agentsafety's independent probe of 8f4242d).**
+Everything quoted from the pane — the dialog's question, every option, the
+fingerprint, the capture path, and the session/pane identifiers — is
+NEVER trusted and is neutralised before being posted:
+
+- Every quoted field goes inside ONE fenced code block per message, at a
+  FIXED 3-backtick fence. Only the message's HEADER line (the real,
+  intended `@mention` of whoever should answer, and the session's display
+  name) sits outside it — the session name is itself derived from the
+  managed session's DEFINITION FILENAME, which this module cannot assume is
+  attacker-free (a definition named e.g. `@all.json`), so it is run through
+  the SAME neutralisation pipeline as every quoted field even though it
+  sits outside the block. Nothing else is allowed to sit outside the
+  block, so a multi-line question cannot inject a header-looking line or a
+  bare `@mention` that reads as a second, unintended ping.
+- **The fence is a FIXED 3 backticks — never widened.** FACTORY-611
+  corrects a real bug in the original (FACTORY-607) design: Rocket.Chat
+  8.8's own parser (`@rocket.chat/message-parser` 0.32.0) recognizes ONLY a
+  3-backtick fence, so widening the fence past the content's longest
+  backtick run (what originally shipped) did nothing to stop a quoted run
+  of 3+ backticks from ending the block early, or preventing it from
+  forming a code block at all — RC never treats a wider fence as special.
+  Every run of 3 or more backticks inside quoted content is instead BROKEN,
+  by interleaving a zero-width space (U+200B) between each backtick — a run
+  of any length stops being something RC's parser could ever read as a
+  fence, while staying visually identical to a human skimming the post.
+  Every generated post is verified through the real parser in this repo's
+  own tests (a pinned `0.32.0` dev dependency), asserting exactly one
+  `CODE` node and no stray mention/link/channel/emoji node outside it.
+- Every `@` inside the block ALSO has a zero-width space (U+200B) inserted
+  right after it — `@all`, `@here`, `@admin-assembly`, or any other handle,
+  can never resolve as a real mention, while remaining visually identical
+  to a human skimming the post. Kept as defence in depth even once the
+  fence itself provably holds (via the real-parser test above): a quoted
+  field also appears in the header-adjacent session name, which sits
+  OUTSIDE the fenced block by design.
+- Every `://` inside the block is defanged the same way (a zero-width space
+  after the colon) — this breaks both a bare URL and a markdown
+  `[text](url)` link without visually mangling the text. (Choice: defang
+  `://` rather than attempt to prove Rocket.Chat won't autolink it — the
+  latter isn't something this repo's test suite can exercise without a live
+  Rocket.Chat instance.)
+- `\r` is stripped outright (never folded into `\n`); every other C0
+  control character and DEL is stripped too, along with bidi-control
+  characters (U+202A-202E, U+2066-2069, U+200E, U+200F, U+061C) and the
+  Unicode line/paragraph separators (U+2028, U+2029, U+0085 NEL).
+- **Every quoted field is flattened to a single visible line** (FACTORY-611):
+  an embedded newline is replaced with a visible ` ⏎ ` marker rather than
+  kept literal. This closes a real spoofing gap the original design left
+  open: confinement inside the fenced block stops Rocket.Chat's OWN
+  renderer from treating an embedded newline as a real line break, but it
+  does nothing to stop a multi-line question from putting, say,
+  `fingerprint: deadbeef` on its own line where a HUMAN skimming the
+  labelled lines inside the block could mistake it for the real one.
+  Flattening every field to one line makes that impossible regardless of
+  content.
+- Truncation never cuts in the middle of a UTF-16 surrogate pair (the cut
+  point backs up by one code unit rather than risk an unpaired surrogate
+  reaching the post).
+- Each quoted field is normally capped at 2000 characters, with an explicit
+  `... [truncated N chars]` marker when it was cut. The options list is
+  separately capped at 10 options, with a `[N more option(s) omitted]`
+  marker when there were more. **The question and options are also
+  redacted** (the same `redact()` the Jira escalation path already uses)
+  **before truncation**, so a credential-shaped substring is masked rather
+  than posted, and can never straddle the truncation cut.
+- **The capture file path is quoted as its BASENAME only** (FACTORY-611) —
+  the full path embeds the operator's home directory layout and the
+  managed session's own definition path, neither of which belongs in a
+  Rocket.Chat room; the filename alone is still enough for an operator to
+  locate the file.
+- **The whole composed message (header, fences, every field) is budgeted to
+  ~4,500 characters** against Rocket.Chat's 5,000-character
+  `Message_MaxAllowedSize` (FACTORY-611) — if the normal 2000-char field
+  caps would produce an over-budget post (e.g. a very long question plus
+  several long options), the question's and each option's own cap is
+  shrunk proportionally (with the same truncation-marker mechanism) until
+  the whole message fits, rather than risk Rocket.Chat refusing an
+  oversized post outright.
+- The `[managed-escalation]` journal line that always fires (see "Not
+  configured" below) interpolates the dialog's raw question/options into a
+  single log line — these are sanitized (control characters stripped,
+  embedded newlines flattened) the same way, so a newline or ESC byte in
+  the pane text cannot forge an extra journal line.
+
+This applies to EVERY message this feature posts — the per-tier escalation
+below, and the clear-up follow-up once the dialog resolves.
+
+**Routing and tiers (FACTORY-609; the episode/tier-clock definition
+corrected by FACTORY-611 below).** An episode (first mark until the pane
+clears — see "Tier clock is keyed to blocked-since" below for why this is
+no longer "...or the fingerprint changes") can reach up to three tiers,
+each posted AT MOST ONCE per episode:
+
+| Tier | When | Ordinary managed session | admin-assembly's own pane |
+| --- | --- | --- | --- |
+| 1 | immediately, on the episode's first mark | `normalMention` in `normalRoom` | `assemblyMention` in `assemblyRoom` |
+| 2 | `tier2Minutes` after tier 1, same episode | `normalMention` in `normalRoom` | `assemblyMention` in `assemblyRoom` |
+| 3 | `tier3Minutes` after tier 1, same episode | `directorMention` in `directorRoom` | `directorMention` in `directorRoom` |
+
+All six values (two mentions, two rooms, two delays — `directorMention`/
+`directorRoom` apply to every session, so there are six distinct knobs, not
+eight) come from config, defaulting to the director's own routing
+(FACTORY-607 comment 28688; `MANAGED_ESCALATION_DEFAULTS`,
+`src/agents/escalation-helper.ts` — the single place these defaults are
+written down, read by both `src/config/config.ts`'s env-var parser and
+`src/agents/escalation-loop.ts`'s own fallback):
+
+| Env var | Default |
+| --- | --- |
+| `BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION` | `@admin-assembly` |
+| `BUTCHR_TEAM_ADMIN_ROOM` (shared with FACTORY-369's own room config) | `team-admin` |
+| `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION` | `@manager-factory` |
+| `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM` | `team-engineering` |
+| `BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION` | `@director` |
+| `BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM` | `team-engineering` |
+| `BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES` | `10` |
+| `BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES` | `20` |
+
+**DELIBERATE BEHAVIOUR CHANGE from what FACTORY-369 shipped**: admin-
+assembly's own pane used to route to `@director` in `#team-admin` for its
+one post. It now routes to `@manager-factory` in `#team-engineering` for
+tiers 1-2 (and to the director, same as any other session, for tier 3) —
+the director's comment 28688 reassigned this case. An operator who relied
+on the old `@director`/`#team-admin` behaviour for this one pane should
+watch `#team-engineering` instead, or override `BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION`/`_ROOM`
+back to the old values if they genuinely need to keep it.
+
+**Tier clock is keyed to blocked-since, not fingerprint (FACTORY-611).**
+Tiers are keyed to a `blocked-since` instant for the PANE, reset ONLY when
+the pane actually clears — never by a text/fingerprint change while still
+blocked. This corrects a real bug in the original (FACTORY-609) design:
+every fingerprint change previously started a brand-new episode with a
+fresh tier clock and fresh per-tier latches, so a pane blocked 40 minutes
+on a dialog whose text flipped every minute produced 40 tier-1 posts and
+zero tier 2/3 — the director was never reached, however long the pane
+stayed stuck. A fingerprint change within an ALREADY-tracked episode now
+only updates that episode's own quoted text in place (logged once, tier
+clock and latches untouched); only a pane the herd stops reporting blocked
+at all ends the episode.
+
+**Rate cap interaction.** The existing per-pane hourly cap (3 posts/hour,
+`MANAGED_TEAM_ADMIN_MAX_PER_HOUR`) is consulted and consumed ONLY by a
+genuinely NEW episode's tier-1 mark (i.e. a pane that was not already
+tracked — see the tier-clock correction above for what no longer counts as
+"new") — never by tier 2 or tier 3 of an already-marked episode, and never
+by a retry of a tier that already failed once. This is a deliberate
+decision, not an oversight: the cap's job is bounding how many DISTINCT
+episodes (the pane actually clearing and re-blocking repeatedly) can post
+per pane per hour — exempting tiers 2/3 means one long episode's own three
+tiers can never exhaust a pane's entire budget and silently swallow a
+LATER, unrelated episode's tiers within the same hour.
+
+**A rate-capped episode is journal-only for its entire lifetime
+(FACTORY-611).** A real bug in the original design let a capped episode's
+own LATER repeat polls post anyway: the cap denied only the very first
+poll's own attempt, left that tier unlatched, and the next poll of the SAME
+(now-tracked) episode retried it with no cap check at all — measured at up
+to 360 posts/hour for a pane whose fingerprint drifted every 2nd poll. A
+denied episode is now flagged and never posts to Rocket.Chat again for its
+whole lifetime, however many times it is re-evaluated; one clear WARNING
+line fires when the cap is first hit for a pane, not one per poll.
+
+**Retry, never latch on failure — but backed off (FACTORY-611).** Each
+tier's post is tracked independently (its own `tierNNotifiedAt` slot) — a
+transport failure for one tier is logged and retried on the next
+qualifying poll, and never blocks or is blocked by another tier's own
+attempt. A failed (or not-yet-attempted) tier is now retried, and its own
+WARNING re-logged, no more than once per ~60 seconds — a persistently
+refusing poster previously cost an attempt and a WARNING line on every
+single poll (measured: 361 of each in 30 minutes at 5s polls, across two
+tiers). The clear-up follow-up, once the dialog resolves, is replayed to
+every ROOM the episode actually reached (a normal episode that escalated
+past tier 2 into tier 3 reaches both `#team-admin` and `#team-engineering`,
+and gets its "no longer blocked" notice in both).
+
+**Whole-message size budget (FACTORY-611).** The composed message — header,
+fences, and every labelled field — is budgeted to ~4,500 characters against
+Rocket.Chat's 5,000-character `Message_MaxAllowedSize`, leaving headroom
+this module cannot predict exactly (multi-code-unit characters, routing
+quirks). If the normal per-field caps would produce an over-budget post,
+the question's and each option's own cap shrinks proportionally (with the
+same `... [truncated N chars]` marker) until the whole message fits.
+
+**Not configured.** With the three credential env vars unset, this whole
+feature is off: no Rocket.Chat post at any tier, ever — but each tier STILL
+logs its own `[managed-escalation] tier <N> due for ... (elapsed <M>m) —
+intended <mention> in #<room>` journal line, exactly once per tier per
+episode, on top of the existing detector-mark line. This is deliberate
+(director's acceptance criterion (g)): a complete journal trail of what
+WOULD have been posted, and to where, must exist whether or not posting
+itself is configured — an operator reading the journal alone (not
+Rocket.Chat) can still see that a pane crossed the 10- and 20-minute
+thresholds and who would have been pinged.
+
+**Which path drives tier re-evaluation.** Elapsed time is only checked when
+something calls back into `markManagedSessionStalled` for an
+already-tracked PANE (FACTORY-611: keyed by pane, not by (pane,
+fingerprint) — see "Tier clock is keyed to blocked-since" above) —
+Butchr's own poll (`handleManagedSessionBlocked`, via `onBlocked`) does
+this on every qualifying poll while the pane stays blocked, so for THAT
+detector tiers 2/3 fire on schedule regardless of anything else. Drovr's
+own hook (`onDrovrUnknownDialog`) is, by its own package's contract, called
+at most ONCE per (pane, fingerprint) episode — so if a dialog is recognized
+ONLY by drovr's detector and never by Butchr's own parser for the same
+pane, that episode's tier 2/3 re-evaluation depends on Butchr's own poll
+having ALSO marked it (which, per "Two detectors, one mark" above, happens
+whenever both detectors see the same episode) rather than on drovr
+re-calling its hook.

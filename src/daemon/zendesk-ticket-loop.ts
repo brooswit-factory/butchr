@@ -16,6 +16,7 @@ import { resourceKeyOf } from "../agents/workspace.js";
 import type { ZendeskTicketClient } from "../resources/zendesk-ticket.js";
 import type { NotifyReason } from "../resources/types.js";
 import { createZendeskTicketResourceType, ownsZendeskTicketAgent, type ZendeskTicketStaffing } from "../rules/zendesk-ticket-type.js";
+import type { Rule } from "../rules/rules.js";
 import type { Stop } from "@brooswit/sundry";
 import { runResourceLoop } from "./loop.js";
 
@@ -23,7 +24,20 @@ import { runResourceLoop } from "./loop.js";
 export const ZENDESK_TICKET_POLL_MS = 60_000;
 
 export interface ZendeskTicketLoopDeps {
+  /** The one-time startup staffing decision (risk ack, subdomain/token, query validity) — still gates whether this loop ever searches at all; see `rules` below for what changes afterward. */
   staffing: ZendeskTicketStaffing;
+  /**
+   * FACTORY-657: the LIVE rules array (the same reference `RulesHolder`
+   * hands out and mutates in place on a reload) — read fresh on every poll
+   * instead of `staffing.rules` (a filtered COPY, frozen at the moment
+   * `staffing` was computed; recomputing `zendeskTicketStaffing` itself
+   * every poll would also re-read the OAuth token file every poll, which
+   * this deliberately avoids — credentials don't change via a rules
+   * reload). Optional and defaulting to `staffing.rules` so a caller that
+   * never reloads rules (every existing test) is unaffected; a real daemon
+   * always passes it.
+   */
+  rules?: readonly Rule[];
   client: Pick<ZendeskTicketClient, "searchAll" | "comments">;
   herd: Herd;
   /** Deliver one message to one agent (channel push and pane prompt). */
@@ -54,7 +68,7 @@ export interface ZendeskTicketLoopDeps {
 export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
   if (!deps.staffing.run && deps.staffing.reason) deps.log(`WARNING: ${deps.staffing.reason}`);
   const type = createZendeskTicketResourceType({
-    rules: deps.staffing.run ? deps.staffing.rules : [],
+    rules: deps.staffing.run ? (deps.rules ?? deps.staffing.rules) : [],
     search: (query) => deps.client.searchAll(query),
     comments: (ref) => deps.client.comments(ref),
     ...(deps.suppress ? { suppress: deps.suppress } : {}),

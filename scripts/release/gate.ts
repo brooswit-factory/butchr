@@ -18,13 +18,19 @@ export interface Facts {
   schemaChanged: boolean;
   /** changelog.d/*.md fragments added by this branch (new files, not present at the merge-base) */
   newFragments: Fragment[];
+  /** Public surface under src/ (HTTP routes, BUTCHR_* env names) added/removed vs the merge-base. Absent = not measured. */
+  surface?: { added: string[]; removed: string[] };
   today: string; // YYYY-MM-DD, informational only now — no longer used to date a branch's entry
 }
 
 export interface Verdict { ok: boolean; reason: string }
 export interface GateResult { required: boolean; bump: Bump | null; verdicts: Verdict[]; ok: boolean }
 
-const GATED = [/^src\//, /^schema\//, /^package\.json$/, /^briefs\//];
+// `hooks/` joins the gated paths for the same reason `briefs/` is here: its
+// contents are EMBEDDED into the built binary at build time (FACTORY-625,
+// src/agents/claude-hooks.ts imports hooks/file-execution-veto.py as text), so
+// a change to it ships real behaviour with no src/ diff to notice it by.
+const GATED = [/^src\//, /^schema\//, /^package\.json$/, /^briefs\//, /^hooks\//];
 export const requiresRelease = (files: string[]) => files.some((f) => GATED.some((r) => r.test(f)));
 
 /** Every changelog entry version in `changelog` that isn't already in `base` — i.e. a heading this branch added. */
@@ -38,6 +44,17 @@ export function evaluate(f: Facts): GateResult {
   const verdicts: Verdict[] = [];
   const v = (ok: boolean, reason: string) => verdicts.push({ ok, reason });
   const versionChanged = f.version !== f.baseVersion;
+
+  // Unrecognised headings are checked unconditionally, before the `!required` early return:
+  // a fragment can be ADDED by a PR that doesn't itself touch a gated path (e.g. a scripts/
+  // change, or a fragment-only diff) and still be picked up by `computeRelease` at a later
+  // tag — fragments aren't required outside a gated PR, but one that IS present must not be
+  // allowed to carry a heading whose bullets would be silently dropped or misattributed.
+  for (const frag of f.newFragments) {
+    v(frag.unknownHeadings.length === 0, frag.unknownHeadings.length === 0
+      ? `${frag.path} has no unrecognised headings`
+      : `${frag.path} has unrecognised heading(s) ${frag.unknownHeadings.map((h) => `"### ${h}"`).join(", ")} — bullets under these are silently dropped; use one of ${SECTIONS.join("/")}`);
+  }
 
   if (!required) {
     const to = parse(f.version);
@@ -68,6 +85,7 @@ export function evaluate(f: Facts): GateResult {
     : `gated files changed but no changelog.d/ fragment was added — create changelog.d/<TICKET>.md starting with "bump: major|minor|patch" on its own line, followed by "### Added"/"### Fixed"/etc. bullets (see changelog.d/README.md)`);
 
   // 5. per-fragment: a valid declared level, at least one bullet, and BREAKING <=> major.
+  // (unrecognised-heading check already ran above, unconditionally, before the `!required` return.)
   for (const frag of f.newFragments) {
     v(frag.bump !== null, frag.bump !== null
       ? `${frag.path} declares bump: ${frag.bump}`
@@ -88,6 +106,24 @@ export function evaluate(f: Facts): GateResult {
     v(highest !== null && highest !== "patch", highest !== null && highest !== "patch"
       ? `schema/herdr-api.schema.json changed and fragments declare at least minor (${highest})`
       : `schema/herdr-api.schema.json changed: that requires at least a MINOR bump — declare "bump: minor" or higher in a changelog.d/ fragment`);
+  }
+
+  // 6. public-surface drift ⇒ a minimum declared bump. Removing a route or env var breaks callers (major);
+  //    adding one is new capability (minor). Measured as a set diff over all of src/, so a move or rename
+  //    inside src/ that keeps the name is neutral, while a rename shows as a removal plus an addition.
+  if (f.surface && f.newFragments.length > 0) {
+    const highest = highestBump(f.newFragments);
+    const list = (xs: string[]) => xs.join(", ");
+    if (f.surface.removed.length > 0) {
+      v(highest === "major", highest === "major"
+        ? `public surface removed (${list(f.surface.removed)}) and fragments declare bump: major`
+        : `public surface removed (${list(f.surface.removed)}): that breaks callers and requires "bump: major" with a ### BREAKING section (highest declared: ${highest ?? "none"})`);
+    } else if (f.surface.added.length > 0) {
+      const ok = highest === "minor" || highest === "major";
+      v(ok, ok
+        ? `public surface added (${list(f.surface.added)}) and fragments declare at least minor (${highest})`
+        : `public surface added (${list(f.surface.added)}): that requires at least "bump: minor" (highest declared: ${highest ?? "none"})`);
+    }
   }
 
   return { required, bump: highestBump(f.newFragments), verdicts, ok: verdicts.every((x) => x.ok) };

@@ -1,64 +1,47 @@
 import type { AgentCapacityRole } from "./admission.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
-import { isIssueKey, isProjectId } from "../resources/id.js";
+import { isProjectId } from "../resources/id.js";
 
 /**
- * BUTCHR-422 (Brooswit, 2026-09-25; interim until query-based resources
- * replace these tiers): the fleet agent cap counts only LEAF work — Task
- * and Sub-task agents. Project agents, and Epic, Story and Bug agents, are
- * never counted toward `maxAgents` and never withheld.
+ * FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding,
+ * epic FACTORY-748): whether an agent counts toward `BUTCHR_MAX_AGENTS` is
+ * decided SOLELY by its own rule's `role` field (via `ruleRoleOf`) — never
+ * by the issue type of the ticket it is working. `role` already defaults
+ * to `"worker"` (src/rules/rules.ts), so a rule silent on capacity is
+ * counted: capacity is a per-query decision, made in the rules file, not a
+ * Jira-issue-type special case layered on top of it. This is a deliberate
+ * behaviour change for any `epics`/`stories`/`bugs`-shaped rule that relied
+ * on the old hardcoding instead of setting `role: "sentinel"` itself — see
+ * `docs/execution-modes.md`'s "Fleet capacity role" section.
  *
- * FACTORY-39 (FACTORY-37) moved Bug from the counted set to here: a Bug is
- * now a BOSS, the same tier as an Epic — it idles while its Stories run,
- * exactly like an Epic idles while its Stories run, so it must be exempt
- * from the cap the same way, or an idling Bug could hold a slot and cause
- * admission to withhold it at the cap. BUTCHR-422's original listing of Bug
- * as leaf work was correct only while a Bug fixed the code itself; it no
- * longer does.
+ * Two agent shapes are not rule-matched resources at all, so there is no
+ * rule to ask for a `role` — both stay `"sentinel"` BY CONSTRUCTION, never
+ * via `ruleRoleOf`, and this is the one piece of the old per-provider
+ * special-casing that survives on purpose:
+ * - A bare project-tier id (`isProjectId`, e.g. `BUTCHR`) — the project-wide
+ *   agent, never produced by any rule's query match, so it has no rule to
+ *   be driven by.
+ * - Every `jira-project` agent (BUTCHR-425), regardless of its own rule's
+ *   `role` — an operator-directed project manager, not an admission-capped
+ *   worker; Codey runs dozens of them and none may ever consume
+ *   `BUTCHR_MAX_AGENTS`. Keeping this as a construction-level exemption
+ *   (rather than requiring every live `jira-project` rule to add
+ *   `role: "sentinel"` itself) is what keeps this change migration-free,
+ *   per this ticket's own definition of done.
  *
- * Built on BUTCHR-398's capacity role instead of a second admission
- * mechanism: an uncounted agent is classified `"sentinel"`, which admission
- * already leaves out of residency and never withholds. Keyed on the agent's
- * kind and its issue's type — NOT on a rule-file flag — so it applies to
- * every deployed daemon's existing rules with no config change.
+ * Everything else — every Jira work-item issue type (Epic, Story, Bug, Task,
+ * Sub-task alike), every GitHub issue/PR, every Zendesk ticket, every
+ * filesystem resource, every provider there is or ever will be — goes
+ * through the exact same path: `ruleRoleOf(id) ?? "worker"`. No provider
+ * branch, no issue-type lookup, one decision for every resource type.
+ *
+ * Fails safe: an id whose rule cannot be resolved (`ruleRoleOf` returns
+ * `undefined` — a legacy/bare-issue agent, or a rule since removed) is a
+ * worker. An agent is only ever released from the cap by its own rule's
+ * explicit `role`, never by guessing from its ticket.
  */
-export const UNCOUNTED_ISSUE_TYPES: ReadonlySet<string> = new Set(["epic", "story", "bug"]);
-
-const isUncountedIssueType = (issuetype: string | undefined): boolean =>
-  issuetype !== undefined && UNCOUNTED_ISSUE_TYPES.has(issuetype.trim().toLowerCase());
-
-/**
- * The capacity role of one running or candidate agent id.
- *
- * - A project-tier agent (its id is a bare project key, e.g. `BUTCHR`) →
- *   `"sentinel"`.
- * - An agent for a Jira issue whose type is Epic, Story or Bug → `"sentinel"`.
- *   This covers `jira-work` rule agents (`jira-work:<rule>:<KEY>`) and bare
- *   issue-key agents. The type comes from `issuetypeOf`, the daemon's own
- *   record of what its latest searches returned for that key.
- * - A `jira-project` rule agent (free-form Jira project resource, BUTCHR-425)
- *   → always `"sentinel"`, regardless of its rule's own `role` field. These
- *   are operator-directed project managers, not admission-capped workers —
- *   Codey runs dozens of them, and none may consume `BUTCHR_MAX_AGENTS`.
- *   Checked unconditionally (never falls through to `ruleRoleOf`) so a rule
- *   file that omits `role` entirely (every live `jira-project` rule does —
- *   see the deploy-hazard regression test) still never counts as a worker.
- * - Everything else keeps its rule's role (BUTCHR-398), via `ruleRoleOf`,
- *   defaulting to `"worker"`.
- *
- * Fails safe: an issue whose type is not (yet) known keeps its rule role or
- * `"worker"`. An agent is only released from the cap on positive evidence,
- * never by guessing.
- */
-export function capacityRoleFor(
-  id: string,
-  ruleRoleOf: (id: string) => AgentCapacityRole | undefined,
-  issuetypeOf: (issueKey: string) => string | undefined,
-): AgentCapacityRole {
+export function capacityRoleFor(id: string, ruleRoleOf: (id: string) => AgentCapacityRole | undefined): AgentCapacityRole {
   if (isProjectId(id)) return "sentinel";
-  if (isIssueKey(id)) return isUncountedIssueType(issuetypeOf(id)) ? "sentinel" : (ruleRoleOf(id) ?? "worker");
-  const decoded = decodeAnyAgentKey(id);
-  if (decoded?.resourceProvider === "jira-project") return "sentinel";
-  if (decoded?.kind === "resource" && decoded.resourceProvider === "jira-work" && isUncountedIssueType(issuetypeOf(decoded.resourceId))) return "sentinel";
+  if (decodeAnyAgentKey(id)?.resourceProvider === "jira-project") return "sentinel";
   return ruleRoleOf(id) ?? "worker";
 }

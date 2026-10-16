@@ -1,7 +1,15 @@
+import { basename } from "node:path";
 import { parsePrompt, keysToSelect, type Prompt } from "./prompt.js";
 import { fingerprint, escalationComment, parseDirective, freeTextOption, MARKER, type Directive } from "./escalate.js";
 import type { CaptureSink } from "./session-limit-watch.js";
-import { findMarked, RateCap, HOUR_MS } from "./escalation-helper.js";
+import { findMarked, RateCap, HOUR_MS, MANAGED_ESCALATION_DEFAULTS, type ManagedEscalationRouting } from "./escalation-helper.js";
+// FACTORY-630: the hardened-post text pipeline these posts have always used,
+// now shared with the ops-alert route (`./ops-alert.ts`) instead of being
+// module-private here — a behaviour-preserving move, see that module's own
+// header. The option-count cap and the question/options whole-message shrink
+// below stay HERE: both are specific to a dialog's question-and-options
+// shape, which no other poster has.
+import { quoteField, quotedBlock, sanitizeForJournal, QUOTE_FIELD_CHAR_CAP, WHOLE_MESSAGE_BUDGET } from "./rocketchat-text.js";
 import type { CoverageRecorder } from "../daemon/coverage.js";
 import { managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 
@@ -26,6 +34,66 @@ export interface CommentRow { id: string; body: string; created: string }
  * `watchPrompts` already decided it cannot auto-answer.
  */
 export const MANAGED_ESCALATION_MARKER = "[managed-escalation]";
+
+/**
+ * FACTORY-811: journal-line marker for the KEYED-or-not path's own
+ * `onNoPrompt`, distinct from the plain "blocked with no parseable dialog"
+ * line it sits beside. That plain line cannot tell a real permission dialog
+ * the parser rejected (a defect — a worker is stuck on a real prompt) from a
+ * pane that is simply busy with no dialog at all (normal); measured, 40/40
+ * such lines in a 6h window showed ordinary scrollback, none a dialog
+ * (FACTORY-774/811). This marker is emitted ONLY when the screen contains a
+ * `Do you want to ...?` line the parser still rejected, so `journalctl
+ * --user -u <unit> | grep -F '[unrecognized-dialog]'` finds exactly the
+ * defect case and nothing else.
+ */
+export const UNRECOGNIZED_DIALOG_MARKER = "[unrecognized-dialog]";
+
+/**
+ * FACTORY-811: a real Claude Code / drovr permission dialog always poses its
+ * question as a line of exactly this shape (every captured fixture in this
+ * repo and in FACTORY-774/809's measurements — "Do you want to proceed?").
+ * Anchored to the whole line (optional leading whitespace, nothing after the
+ * `?`) for the same reason `prompt.ts`'s own `FOOTER` is anchored: matching
+ * the phrase merely occurring somewhere lets an agent's own narration about a
+ * dialog (not a dialog itself) trigger the defect marker.
+ */
+const DIALOG_QUESTION_LINE = /^\s*Do you want to .+\?\s*$/m;
+
+/**
+ * FACTORY-811: how many characters of the screen, counted from the matched
+ * `DIALOG_QUESTION_LINE` onward, go into the journal when that line is
+ * present. Tail-oriented on purpose — "Do you want to...?" is always
+ * followed immediately by the option list and the footer, which is the part
+ * a reader needs to identify the dialog, never the scrollback above it. 400
+ * chars comfortably covers every captured fixture's question + full option
+ * list + footer (the FACTORY-774/809 "Nor you" renders are both well under
+ * 200) while bounding what a pane's own output — which can carry secrets or
+ * customer content — pushes into the shared journal; this is a tail window,
+ * never a screen dump.
+ */
+const UNRECOGNIZED_DIALOG_WINDOW_CHARS = 400;
+
+/**
+ * FACTORY-811: build the journal line for a blocked pane whose text did not
+ * parse as a dialog. Two distinct cases, per FACTORY-811 AC 1-3:
+ *  - the screen contains a `DIALOG_QUESTION_LINE` the parser nonetheless
+ *    rejected: a real, greppable defect signal (`UNRECOGNIZED_DIALOG_MARKER`)
+ *    carrying the bounded tail window starting at that line, so the cause is
+ *    identifiable from the journal alone without reproducing it.
+ *  - no such line: the ordinary busy/no-dialog case, which stays exactly the
+ *    short, un-markered line it always was — clearly not a defect signal.
+ * `sanitizeForJournal` (newline-flatten + control-char strip, FACTORY-611
+ * item 6(d)) is applied to the captured window so pane text can never forge
+ * an extra marker-looking journal line (BUTCHR-343/346's own concern about
+ * this exact log site).
+ */
+function formatUnparseableLine(paneId: string, text: string): string {
+  const matchIdx = text.search(DIALOG_QUESTION_LINE);
+  if (matchIdx === -1) return `${paneId} blocked with no parseable dialog: "${sanitizeForJournal(text.trim().slice(0, 60))}"`;
+  const window = text.slice(matchIdx, matchIdx + UNRECOGNIZED_DIALOG_WINDOW_CHARS);
+  return `${UNRECOGNIZED_DIALOG_MARKER} ${paneId} blocked on an unrecognized dialog (parser rejected a real "Do you want to...?" prompt): "${sanitizeForJournal(window).trim()}"`;
+}
 
 /**
  * FACTORY-45: a keyless pane's managed-session identity, resolved fresh on
@@ -193,8 +261,29 @@ export interface EscalatorDeps {
    * routing is not configured, and every managed-session escalation stays
    * exactly what it already was before this ticket — a loud, complete
    * `[managed-escalation]` journal line, nothing else (AC 6).
+   *
+   * FACTORY-609 (Part B): now takes the ROOM per call — there is a second
+   * room (`#team-engineering`, the tier-3/assembly-pane destination) and no
+   * second credential; `RocketChatPoster.postMessage(channel, text)`
+   * (src/resources/rocketchat.ts) already accepts a channel per call, so
+   * this dep's own signature is the only thing that needed to widen. A
+   * caller that built this closure over a single hard-coded room (this
+   * ticket's own "before" state) is exactly the bug FACTORY-607 comment
+   * 28784 item 4 found.
    */
-  teamAdminNotify?: (text: string) => Promise<void>;
+  teamAdminNotify?: (room: string, text: string) => Promise<void>;
+  /**
+   * FACTORY-609 (Part B): rooms, mentions and the 10/20-minute tier delays —
+   * "config, not literals" per the director's spec. Optional: absent means
+   * `MANAGED_ESCALATION_DEFAULTS` (escalation-helper.ts), which already
+   * encode the director's own defaults — so a test (or a caller) that omits
+   * this dep gets correct production-shaped routing, not a stripped-down
+   * test-only behaviour. In production this is always populated by
+   * `src/daemon/index.ts` from `Config.managedEscalationRouting`, which
+   * itself defaults to the SAME constant — one literal, never two that
+   * could drift apart.
+   */
+  managedEscalationRouting?: ManagedEscalationRouting;
 }
 
 interface PaneState {
@@ -263,6 +352,34 @@ export interface Escalator {
    */
   onDrovrUnknownDialog: (escalation: { paneId: string; question: string; options: readonly string[]; fingerprint: string }) => Promise<void>;
   onDrovrDialogResolved: (resolved: { paneId: string; fingerprint: string }) => void;
+  /**
+   * FACTORY-581 SAFETY GUARD 3 (butchr's half — see FACTORY-460's diagnosis
+   * comment (c): "GUARD 3 spans two repos"): the third, previously
+   * unattributed way a managed session's pane can clear — `@brooswit/drovr`
+   * >= 0.16.8's own standalone lizard-mode pass
+   * (`src/agents/permission-answer-loop.ts`'s `runPermissionAnswerTick`,
+   * wired via its `deps.onAnswered`) PRESSING a tool-permission dialog,
+   * distinct from both `onDrovrDialogResolved` above (an ESCALATED/unknown
+   * dialog's own resolution — a human or something else, never butchr's own
+   * answer pass) and the generic `onPoll` fallback below (a pane that simply
+   * stopped being reported blocked, with neither of the other two
+   * explaining why). Called for EVERY answered pane, managed session or
+   * not — `clearManagedSessionStalled` is already a no-op for a `paneId`
+   * with no tracked entry, so this costs nothing for a non-managed-session
+   * pane and needs no identity check of its own.
+   *
+   * `recognizedVia` is threaded straight through from drovr's own
+   * `AutoAnswerPermissionResult` (`PermissionPrompt["recognizedVia"]`:
+   * `"separator" | "no-separator-mcp-tool" | "no-separator-bash" |
+   * "no-separator-file-edit"`) rather than invented here — it is ALREADY the
+   * distinct, attributable tag per drovr matcher (including the new
+   * FACTORY-580/586/587 file-edit fallback), and reusing it is what makes
+   * this line compose with drovr's own JSONL audit attribution
+   * (`grep '"recognizedVia":"<value>"'`, `docs/permission-approval.md`
+   * GUARD 3/7) instead of duplicating or contradicting it — the composition
+   * FACTORY-460's diagnosis required.
+   */
+  onPermissionAnswered: (paneId: string, recognizedVia: string) => void;
 }
 
 /** Cheap FNV-1a 32-bit hash, for de-duplicating repeated unparseable text without storing it. */
@@ -506,6 +623,85 @@ async function captureManagedSessionEscalationText(deps: EscalatorDeps, paneId: 
   return result;
 }
 
+// ===========================================================================
+// FACTORY-607 comment 28781 (Part A): quoted-content neutralisation for the
+// managed-session escalation posts — `teamAdminMessage`/`tierMessage` and
+// their clear-up siblings, below. The PIPELINE itself (`quoteField`,
+// `quotedBlock`, the control/bidi stripping, the surrogate-safe cap, the
+// fence/mention/link neutralisation) now lives in `./rocketchat-text.ts`,
+// shared with FACTORY-630's ops-alert route — moved verbatim, see that
+// module's own header for why those rules are properties of Rocket.Chat's
+// parser rather than of any one butchr feature. What stays HERE is only
+// what is specific to a DIALOG's question-and-options shape: the
+// option-count cap, the options line, and the proportional whole-message
+// shrink.
+//
+// Still deliberately NOT applied to this file's Jira-shaped comments
+// (`escalationComment` in escalate.ts, `unresponsiveComment` above): the
+// director's requirement (comment 28781) is scoped to the NEW
+// butchr-escalation bot account posting a pane's LIVE, attacker-reachable
+// text into Rocket.Chat, where an unneutralised `@all`/`@here` would ping
+// real people FROM that bot account — a Jira comment is posted by butchr's
+// OWN existing account under its OWN existing notification rules, a
+// different exposure this ticket was never asked to change, and the scope
+// fence (FACTORY-607/comment 28784, "managed sessions only") forbids
+// touching that path regardless.
+// ===========================================================================
+
+/** Comment 28781's "a cap on the number of options quoted" — options beyond this are omitted with a count, never silently dropped without saying so. */
+const QUOTE_OPTIONS_CAP = 10;
+
+/** The options line, capped on COUNT (comment 28781's "a cap on options quoted"), each option individually redacted (FACTORY-611 item 2: options carry pane text exactly like the question does) and neutralised via `quoteField`. `cap`, when given, overrides `QUOTE_FIELD_CHAR_CAP` per option — the whole-message budget's own shrink (see `fitTierMessage`). */
+function quoteOptionsLine(options: readonly string[], cap?: number): string {
+  if (!options.length) return "(none)";
+  const capped = options.slice(0, QUOTE_OPTIONS_CAP);
+  const line = capped.map((o, i) => `${i + 1}. ${quoteField(o, { cap, redactSecrets: true })}`).join(" | ");
+  const omitted = options.length - capped.length;
+  return omitted > 0 ? `${line} ... [${omitted} more option(s) omitted]` : line;
+}
+
+/** Floors for the iterative shrink below — a field is never reduced to the point of being useless, even for a pathological worst case; see `fitWholeMessageBudget`'s own doc comment for why staying under budget is still guaranteed in practice despite these floors. */
+const WHOLE_MESSAGE_MIN_QUESTION_CAP = 50;
+const WHOLE_MESSAGE_MIN_OPTION_CAP = 20;
+
+/**
+ * FACTORY-611 item 5(a): shrink the question's and each option's own quote
+ * cap PROPORTIONALLY to how much each is actually over-contributing, so the
+ * whole composed message never exceeds `WHOLE_MESSAGE_BUDGET` — "shrink the
+ * question and options (proportionally, with the existing truncation
+ * markers)" per the director's spec. `build(qCap, oCap)` must compose the
+ * full message using `qCap` for the question's own `quoteField` cap and
+ * `oCap` for every option's (see `tierMessage`'s own `build` closure).
+ *
+ * Iterative, not closed-form: the truncation marker's own length
+ * (`... [truncated N chars]`) changes slightly as `N` changes, so an exact
+ * one-shot calculation would still need a correction pass. A handful of
+ * iterations converges well before the floors above are ever reached for
+ * every shape this ticket's own tests exercise (measured: the worst case —
+ * a 5,000-character question plus 12 x 5,000-character options — overshoots
+ * safely under budget after its very first shrink, since the fixed
+ * overhead this module emits is tiny next to that much raw content).
+ */
+function fitWholeMessageBudget(build: (qCap: number, oCap: number) => string, questionLen: number, optionLens: readonly number[]): string {
+  let qCap = QUOTE_FIELD_CHAR_CAP;
+  let oCap = QUOTE_FIELD_CHAR_CAP;
+  let msg = build(qCap, oCap);
+  for (let i = 0; i < 8 && msg.length > WHOLE_MESSAGE_BUDGET && (qCap > WHOLE_MESSAGE_MIN_QUESTION_CAP || oCap > WHOLE_MESSAGE_MIN_OPTION_CAP); i++) {
+    const over = msg.length - WHOLE_MESSAGE_BUDGET;
+    const qContent = Math.min(questionLen, qCap);
+    const oContent = optionLens.reduce((sum, l) => sum + Math.min(l, oCap), 0);
+    const totalContent = qContent + oContent || 1;
+    const qShrink = Math.max(1, Math.ceil(over * (qContent / totalContent)));
+    qCap = Math.max(WHOLE_MESSAGE_MIN_QUESTION_CAP, qCap - qShrink);
+    if (optionLens.length) {
+      const oShrinkTotal = Math.max(optionLens.length, over - qShrink);
+      oCap = Math.max(WHOLE_MESSAGE_MIN_OPTION_CAP, oCap - Math.ceil(oShrinkTotal / optionLens.length));
+    }
+    msg = build(qCap, oCap);
+  }
+  return msg;
+}
+
 /**
  * The blocked-prompt escalation state machine: fingerprint a dialog, debounce
  * a transient block, escalate once per fingerprint to the blocked agent's own
@@ -694,20 +890,75 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     fp: string;
     /** ISO timestamp of this episode's first escalated poll — carried into `ManagedSessionEscalation.since`. */
     since: string;
-    /** The dialog's question — `"(sustained unparseable pane — no recognized dialog)"` for the onNoPrompt path (FACTORY-369 AC 2), which has no parsed question at all. Retained (not just used once) so a #team-admin retry attempt on a LATER poll can recompose the exact same message without re-reading the pane. */
+    /** Same instant as `since`, pre-parsed to milliseconds — the elapsed-time evaluation every repeat poll now does (FACTORY-609 Part B) needs this on every call, and re-`Date.parse`-ing `since` each time would be both wasteful and, in principle, lossier than keeping the number `deps.now()` already gave us. */
+    sinceMs: number;
+    /** The dialog's question — `"(sustained unparseable pane — no recognized dialog)"` for the onNoPrompt path (FACTORY-369 AC 2), which has no parsed question at all. Retained (not just used once) so a retry or a later tier on a LATER poll can recompose the exact same message without re-reading the pane. */
     question: string;
     options: readonly string[];
     /** `null` when no capture sink is wired, or the capture itself failed/timed out — see `captureManagedSessionEscalationText`. Never re-captured on a retry: the pane's live text may have already moved on. */
     capturePath: string | null;
-    /** Set once `deps.teamAdminNotify` has been called and RESOLVED for this exact episode — AC 4/AC 7: a `undefined` value here (not "no notifier configured") is exactly what makes a retry attempt next poll, never a second attempt for an already-delivered post. */
-    notifiedAt?: number;
+    /**
+     * FACTORY-609 (Part B): one slot per tier, each set once `deps.
+     * teamAdminNotify` has been called and RESOLVED for that tier in THIS
+     * episode — mirrors FACTORY-369's original single `notifiedAt`, split
+     * three ways because each tier is now its own independent post (its own
+     * room/mention, its own retry-until-success). An `undefined` slot is
+     * exactly what makes `attemptTierNotify` retry that tier next
+     * qualifying poll, never a second attempt for an already-delivered one.
+     */
+    tier1NotifiedAt?: number;
+    tier2NotifiedAt?: number;
+    tier3NotifiedAt?: number;
+    /** Every room a tier of THIS episode was actually delivered to — the clear-up follow-up (FACTORY-369 AC 5) replays to each of them, since a human may be watching any one of the rooms this episode actually reached. Empty means nothing was ever delivered (not configured, or every attempt so far failed) — no clear-up is owed for an episode nobody was told about. */
+    notifiedRooms: Set<string>;
+    /**
+     * PR #610 review (blocking finding 1): which tiers have already written
+     * their OWN once-per-episode `[managed-escalation]` journal line — the
+     * director's acceptance (g) requires a complete tier line "whether or
+     * not posting is configured", so this cannot reuse `tierNNotifiedAt`
+     * (which only ever gets set when `deps.teamAdminNotify` exists AND
+     * resolves — with no notifier configured it would stay `undefined`
+     * forever, so a gate on it would make the unconfigured case re-log
+     * every single poll instead of exactly once). This is the dedicated
+     * latch for the LOGGING side, entirely independent of whether the
+     * ROCKET.CHAT POST itself ever succeeds, is retried, or never happens
+     * at all.
+     */
+    loggedTiers: Set<1 | 2 | 3>;
+    /**
+     * FACTORY-611 item 3: set true the moment this episode's OWN tier-1
+     * creation lost `managedTeamAdminCap` — once true, this episode never
+     * posts to Rocket.Chat at all (any tier), for its ENTIRE remaining
+     * lifetime, journal-only (see `markManagedSessionStalled`'s repeat-poll
+     * branch). This is what makes a capped episode's own later repeat polls
+     * safe: before this field existed, a repeat poll of the SAME
+     * fingerprint called `attemptTierNotify` unconditionally, which posted
+     * anyway because `tier1NotifiedAt` was still `undefined` (the cap denial
+     * never got to set it) — the cap bounded only the FIRST poll of a new
+     * episode, not any of its successors (measured: a fingerprint changing
+     * every 2nd poll produced 360 posts/hour, comment 28784 item 3).
+     */
+    capped: boolean;
+    /**
+     * FACTORY-611 item 5(b): wall-clock time of this episode's last ATTEMPT
+     * (not success) to post tier N, keyed by tier — `attemptTierNotify`
+     * refuses to retry a tier within `TIER_RETRY_BACKOFF_MS` of its own last
+     * attempt, whether that attempt failed or is merely in flight. Without
+     * this, a persistently refusing poster was retried (and its own WARNING
+     * logged) on every single qualifying poll — measured at 361 attempts and
+     * 361 warnings in 30 minutes at 5s polls, doubled by two tiers.
+     */
+    tierLastAttemptAt: Partial<Record<1 | 2 | 3, number>>;
   }
   const managedSessionStalled = new Map<string, ManagedSessionEntry>();
   // FACTORY-369: mirrors `inFlight`/`unresponsiveInFlight`'s own guard —
   // `deps.teamAdminNotify` is awaited, and this file's callers are
   // fire-and-forget on a timer, so two overlapping polls for the same pane
-  // must never both be mid-POST at once (which could double-post if the
-  // first's failure/success races the second's read of `notifiedAt`).
+  // must never both be mid-POST for the SAME TIER at once (which could
+  // double-post if the first's failure/success races the second's read of
+  // that tier's own `*NotifiedAt` slot). FACTORY-609: keyed by `pane:tier`,
+  // not bare pane — the three tiers of one episode are independent posts
+  // (own room, own retry) and must never block each other's concurrency.
   const teamAdminInFlight = new Set<string>();
   /**
    * FACTORY-369 (AC 4 extension, FACTORY-367 comment 26602/26603): a
@@ -724,84 +975,192 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * which by construction only ever fires once each). This is NOT a fix for
    * the underlying recognizer instability (FACTORY-146/FACTORY-359's job) —
    * it only bounds the blast radius if that instability is present.
+   *
+   * FACTORY-609 (Part B) CAP DECISION — stated here, and in the PR
+   * description: this cap is consulted and recorded ONLY for a genuinely
+   * NEW episode's mark (tier 1's own creation, below) — never for tier 2 or
+   * tier 3, and never for a retry of an already-marked episode's tier 1
+   * either (that path never reached the cap check to begin with; see
+   * `markManagedSessionStalled`'s repeat-fp branch). Reasoning: today's cap
+   * is 3 posts/hour/PANE, recorded only on a new mark — if tiers 2/3
+   * consumed it too, one long episode (3 tiers) would spend a pane's ENTIRE
+   * hourly budget on itself, silently starving a second, later episode on
+   * the SAME pane within that hour of its own tiers. Exempting tiers 2/3
+   * makes each of them behave exactly like FACTORY-369's original single
+   * post always did (uncapped once the episode itself was allowed to
+   * start) while the cap still does its original job: bounding how many
+   * DISTINCT episodes (new fingerprints) a drifting recognizer can ring up
+   * per pane per hour (see the "fingerprint drifts every poll" test below).
    */
   const MANAGED_TEAM_ADMIN_MAX_PER_HOUR = 3;
   const managedTeamAdminCap = new RateCap(MANAGED_TEAM_ADMIN_MAX_PER_HOUR, HOUR_MS);
   const managedTeamAdminCappedLogged = new Set<string>();
 
   /**
-   * FACTORY-369 AC 3/AC 10: `@admin-assembly` normally, `@director` when the
-   * STUCK SESSION IS admin-assembly itself (the routing spec's own
-   * self-reference case, binding per FACTORY-358 comment 26435/FACTORY-367).
-   * `sessionName` is the managed session's own bare display name
-   * (`managedSessionShortDisplayId`, e.g. `"admin-assembly"` from
-   * `.../admin-assembly.json`) — the same short id already shown in every
-   * other managed-session surface (herdr labels, `/health`), so a reader
-   * recognizes it without needing to know this ticket's internal `agentKey`
-   * encoding.
+   * FACTORY-369 AC 3/AC 10, routing extended for FACTORY-609 (Part B): tier
+   * 3 always goes to the director's room/mention, for EVERY managed
+   * session including admin-assembly's own pane. Tiers 1-2 go to
+   * `routing.assemblyMention`/`assemblyRoom` when the STUCK SESSION IS
+   * admin-assembly itself (the routing spec's own self-reference case,
+   * binding per FACTORY-358 comment 26435/FACTORY-367, now reassigned to
+   * `@manager-factory`/`#team-engineering` by the director's comment 28688
+   * — see `MANAGED_ESCALATION_DEFAULTS`'s own doc comment for why this is a
+   * deliberate behaviour change from what FACTORY-369 shipped), or
+   * `routing.normalMention`/`normalRoom` otherwise. `sessionName` is the
+   * managed session's own bare display name (`managedSessionShortDisplayId`,
+   * e.g. `"admin-assembly"` from `.../admin-assembly.json`).
    */
-  function teamAdminMention(sessionName: string): string {
-    return sessionName === "admin-assembly" ? "@director" : "@admin-assembly";
+  function routingFor(sessionName: string, tier: 1 | 2 | 3, routing: ManagedEscalationRouting): { mention: string; room: string } {
+    if (tier === 3) return { mention: routing.directorMention, room: routing.directorRoom };
+    return sessionName === "admin-assembly"
+      ? { mention: routing.assemblyMention, room: routing.assemblyRoom }
+      : { mention: routing.normalMention, room: routing.normalRoom };
   }
 
   /**
-   * FACTORY-369 AC 10: the post's text must stand alone for a HUMAN reading
-   * #team-admin — legible without an agent to interpret it, because the
-   * mentioned agent may be down for the same reason the session is (see
-   * this file's own header note on AC 10, and FACTORY-367's "LATE-ARRIVING
-   * REQUIREMENT" section). Every field the routing spec requires is a
-   * labeled line: session name, pane id, the dialog's question and options,
-   * the fingerprint, and the capture file path — never packed into prose a
-   * reader has to parse.
+   * FACTORY-369 AC 10 / FACTORY-607 comment 28781 (Part A): the post's text
+   * must stand alone for a HUMAN reading the room — legible without an
+   * agent to interpret it, because the mentioned agent may be down for the
+   * same reason the session is. Every field the routing spec requires is a
+   * labeled line inside the SAME fenced code block (`quotedBlock`): session
+   * name, pane id, the tier and elapsed time, the dialog's question and
+   * options, the fingerprint, and the capture file path. Only the header
+   * line (the real, intended `@mention`) sits outside the block — comment
+   * 28781 is explicit that the header may keep mentioning the intended
+   * answerer and nothing else should change about it.
    */
-  function teamAdminMessage(target: ManagedSessionTarget, paneId: string, question: string, options: readonly string[], fp: string, capturePath: string | null): string {
+  function tierMessage(
+    tier: 1 | 2 | 3,
+    mention: string,
+    target: ManagedSessionTarget,
+    paneId: string,
+    question: string,
+    options: readonly string[],
+    fp: string,
+    capturePath: string | null,
+    elapsedMinutes: number,
+  ): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
-    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
-    return [
-      `${teamAdminMention(sessionName)} managed session **${sessionName}** is blocked and cannot answer for itself — it has no Jira ticket, so it cannot escalate the way a normal agent would.`,
-      "",
-      `session: ${sessionName}`,
-      `pane: ${paneId}`,
-      `question: ${question}`,
-      `options: ${optionsLine}`,
-      `fingerprint: ${fp}`,
-      `capture: ${capturePath ?? "(none)"}`,
-    ].join("\n");
+    const tierLabel = tier === 1 ? "first escalation" : tier === 2 ? "re-escalation (10 min)" : "director escalation (20 min)";
+    // FACTORY-611 item 2: the capture path embeds the OPERATOR'S home
+    // directory layout and the definition's own path — quoting only the
+    // basename (never the full path) still lets a human locate the file on
+    // the known capture directory without leaking either into a Rocket.Chat
+    // room (CHOICE, stated in the PR description: basename, not omission —
+    // the filename alone is still useful evidence and carries none of the
+    // path's own sensitivity).
+    const captureBase = capturePath ? basename(capturePath) : null;
+    const countedOptions = options.slice(0, QUOTE_OPTIONS_CAP);
+    const build = (qCap: number, oCap: number): string => {
+      // PR #610 review: sessionName is derived from the DEFINITION FILENAME,
+      // which this module cannot assume is attacker-free (comment 28781's
+      // own "session/pane fields if attacker-influenced") — a definition
+      // named e.g. `@all.json` would otherwise ping from the header, which
+      // sits OUTSIDE the quoted block by design (only the real, intended
+      // mention belongs there). Quoted here too, same pipeline as every
+      // other field.
+      const header = `${mention} managed session **${quoteField(sessionName)}** is blocked and cannot answer for itself (tier ${tier}: ${tierLabel}) — it has no Jira ticket, so it cannot escalate the way a normal agent would.`;
+      const block = quotedBlock([
+        `session: ${quoteField(sessionName)}`,
+        `pane: ${quoteField(paneId)}`,
+        `tier: ${tier}`,
+        `elapsed: ${elapsedMinutes}m`,
+        // FACTORY-611 item 2: redact() BEFORE truncation (quoteField's own
+        // pipeline order) so a secret straddling the cut is never half-posted.
+        `question: ${quoteField(question, { cap: qCap, redactSecrets: true })}`,
+        `options: ${quoteOptionsLine(options, oCap)}`,
+        `fingerprint: ${quoteField(fp)}`,
+        `capture: ${captureBase ? quoteField(captureBase) : "(none)"}`,
+      ]);
+      return [header, "", block].join("\n");
+    };
+    return fitWholeMessageBudget(
+      build,
+      question.length,
+      countedOptions.map((o) => o.length),
+    );
   }
 
-  /** The clear-up follow-up — FACTORY-369 AC 5, posted once when a dialog a notice was already sent about clears. */
-  function teamAdminClearedMessage(target: ManagedSessionTarget, paneId: string, fp: string): string {
+  /** The clear-up follow-up — FACTORY-369 AC 5, posted once (per room this episode actually reached) when a dialog a notice was already sent about clears. */
+  function tierClearedMessage(target: ManagedSessionTarget, paneId: string, fp: string): string {
     const sessionName = managedSessionShortDisplayId(target.definitionPath);
-    return `managed session **${sessionName}** (pane ${paneId}, fingerprint ${fp}) is no longer blocked — the dialog above has cleared.`;
+    const block = quotedBlock([`session: ${quoteField(sessionName)}`, `pane: ${quoteField(paneId)}`, `fingerprint: ${quoteField(fp)}`]);
+    // PR #610 review: same reasoning as tierMessage's header above — this
+    // header line also sits outside the quoted block, so sessionName must
+    // be quoted here too.
+    return [`managed session **${quoteField(sessionName)}** is no longer blocked — the dialog above has cleared.`, "", block].join("\n");
   }
 
   /**
-   * FACTORY-369: attempts the #team-admin post for `entry`'s CURRENT episode
-   * — called both right after a fresh mark (AC 1/2) and, harmlessly, on
-   * every repeat poll of an already-marked episode whose post has not yet
-   * SUCCEEDED (AC 7's retry). A no-op the moment `entry.notifiedAt` is set
-   * (delivered — never re-posted, AC 4) or `deps.teamAdminNotify` is absent
-   * (not configured — AC 6 is already satisfied by the journal line
-   * `markManagedSessionStalled` always writes regardless of this function).
-   * FAILS OPEN and NEVER THROWS: a rejected post is logged and left
-   * unlatched (`entry.notifiedAt` stays `undefined`) so the NEXT qualifying
-   * poll retries — mirrors `escalateUnresponsive`'s own null-means-retry
-   * discipline for the Jira path (AC 7).
+   * FACTORY-611 item 5(b): "back off about 60 seconds per tier after a
+   * refusal" — a failed (or in-flight, or not-yet-attempted) tier is not
+   * retried more often than this, which also caps how often its own WARNING
+   * line can repeat (both gated by the same `tierLastAttemptAt` check in
+   * `attemptTierNotify`). Deliberately per TIER, not per episode: each
+   * tier's post is independent (own room/mention/retry per FACTORY-609), so
+   * a tier-2 due-check happening every 5s poll must not be throttled by
+   * tier 1's own backoff clock, and vice versa.
    */
-  async function attemptTeamAdminNotify(paneId: string, entry: ManagedSessionEntry): Promise<void> {
-    if (entry.notifiedAt !== undefined) return;
+  const TIER_RETRY_BACKOFF_MS = 60_000;
+
+  /**
+   * FACTORY-369/FACTORY-609: attempts ONE tier's post for `entry`'s CURRENT
+   * episode — called both right after that tier becomes due (fresh mark for
+   * tier 1; the elapsed-time evaluation in `markManagedSessionStalled`'s
+   * repeat-poll branch for tiers 2/3) and, harmlessly, on every later
+   * repeat poll of an already-due tier whose post has not yet SUCCEEDED
+   * (AC 7's retry).
+   *
+   * PR #610 review (blocking finding 1): the director's acceptance (g)
+   * requires a COMPLETE `[managed-escalation]` journal line for every tier
+   * "whether or not posting is configured" — this function now writes that
+   * line FIRST, unconditionally, latched per-tier via `entry.loggedTiers`
+   * (see that field's own doc comment for why it cannot reuse
+   * `*NotifiedAt`). Only AFTER that does it attempt the actual Rocket.Chat
+   * post, which stays gated exactly as before: a no-op once this tier's own
+   * `*NotifiedAt` slot is set (delivered — never re-posted, AC 4) or
+   * `deps.teamAdminNotify` is absent (not configured). FAILS OPEN and NEVER
+   * THROWS: a rejected post is logged and left unlatched so the NEXT
+   * qualifying poll retries — mirrors `escalateUnresponsive`'s own
+   * null-means-retry discipline for the Jira path (AC 7).
+   */
+  async function attemptTierNotify(paneId: string, entry: ManagedSessionEntry, tier: 1 | 2 | 3, elapsedMinutes: number): Promise<void> {
+    const sessionName = managedSessionShortDisplayId(entry.target.definitionPath);
+    const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
+    const { mention, room } = routingFor(sessionName, tier, routing);
+
+    if (!entry.loggedTiers.has(tier)) {
+      entry.loggedTiers.add(tier);
+      deps.log(
+        `${MANAGED_ESCALATION_MARKER} tier ${tier} due for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (elapsed ${elapsedMinutes}m) — intended ${mention} in #${room}`,
+      );
+    }
+
+    const alreadyNotifiedAt = tier === 1 ? entry.tier1NotifiedAt : tier === 2 ? entry.tier2NotifiedAt : entry.tier3NotifiedAt;
+    if (alreadyNotifiedAt !== undefined) return;
     if (!deps.teamAdminNotify) return;
-    if (teamAdminInFlight.has(paneId)) return;
-    teamAdminInFlight.add(paneId);
+    // FACTORY-611 item 5(b): a tier that already failed recently is not
+    // retried (and does not re-warn) until the backoff elapses — see
+    // `TIER_RETRY_BACKOFF_MS`'s own doc comment on `ManagedSessionEntry`.
+    const lastAttemptAt = entry.tierLastAttemptAt[tier];
+    if (lastAttemptAt !== undefined && deps.now() - lastAttemptAt < TIER_RETRY_BACKOFF_MS) return;
+    const inFlightKey = `${paneId}:${tier}`;
+    if (teamAdminInFlight.has(inFlightKey)) return;
+    teamAdminInFlight.add(inFlightKey);
+    entry.tierLastAttemptAt[tier] = deps.now();
     try {
-      const text = teamAdminMessage(entry.target, paneId, entry.question, entry.options, entry.fp, entry.capturePath);
-      await deps.teamAdminNotify(text);
-      entry.notifiedAt = deps.now();
-      deps.log(`${MANAGED_ESCALATION_MARKER} posted to #team-admin for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}`);
+      const text = tierMessage(tier, mention, entry.target, paneId, entry.question, entry.options, entry.fp, entry.capturePath, elapsedMinutes);
+      await deps.teamAdminNotify(room, text);
+      const notifiedAt = deps.now();
+      if (tier === 1) entry.tier1NotifiedAt = notifiedAt;
+      else if (tier === 2) entry.tier2NotifiedAt = notifiedAt;
+      else entry.tier3NotifiedAt = notifiedAt;
+      entry.notifiedRooms.add(room);
+      deps.log(`${MANAGED_ESCALATION_MARKER} posted to #${room} (tier ${tier}) for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}`);
     } catch (e) {
-      deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} — will retry next qualifying poll: ${(e as Error)?.message ?? e}`);
+      deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #${room} post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp} (tier ${tier}) — will retry no sooner than ${Math.round(TIER_RETRY_BACKOFF_MS / 1000)}s from now: ${(e as Error)?.message ?? e}`);
     } finally {
-      teamAdminInFlight.delete(paneId);
+      teamAdminInFlight.delete(inFlightKey);
     }
   }
 
@@ -812,70 +1171,143 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
    * `createBlockingEscalationWatcher` hook, src/daemon/index.ts), and
    * (FACTORY-369) `handleManagedSessionUnresponsive` (the sustained-
    * unparseable path, onNoPrompt below) all funnel into — three detectors,
-   * one mark. A NO-OP whenever the TRACKED fingerprint for this pane is
-   * unchanged (dedupe is the in-memory map itself, never a re-read of
-   * anything external: there is no comment channel to adopt from, unlike
-   * `escalate`/`escalateUnresponsive` above, so a daemon restart mid-episode
-   * simply re-logs once — acceptable per this ticket's own reduced scope,
-   * unlike the Jira flow's restart-safe adoption) EXCEPT that it still
-   * retries the #team-admin post if that post has not yet succeeded
-   * (FACTORY-369 AC 7) — the journal mark and the RC delivery are tracked
-   * independently for exactly this reason. KNOWN, ACCEPTED RESIDUAL:
-   * Butchr's own parser and drovr's may derive slightly different
-   * fingerprints for the SAME real dialog (different text-extraction), so
-   * the two detectors racing the same episode can each log once under their
-   * own fingerprint — an extra journal line, never a functional miss, and
-   * the mark still reads "stalled" correctly either way.
+   * one mark. A NO-OP (for the journal line and the capture) whenever the
+   * TRACKED fingerprint for this pane is unchanged (dedupe is the in-memory
+   * map itself, never a re-read of anything external: there is no comment
+   * channel to adopt from, unlike `escalate`/`escalateUnresponsive` above,
+   * so a daemon restart mid-episode simply re-logs once — acceptable per
+   * this ticket's own reduced scope, unlike the Jira flow's restart-safe
+   * adoption) EXCEPT that it still evaluates elapsed time and retries
+   * whichever tier is due or still pending (FACTORY-609 Part B) — the
+   * journal mark and the RC delivery are tracked independently for exactly
+   * this reason. KNOWN, ACCEPTED RESIDUAL: Butchr's own parser and drovr's
+   * may derive slightly different fingerprints for the SAME real dialog
+   * (different text-extraction), so the two detectors racing the same
+   * episode can each log once under their own fingerprint — an extra
+   * journal line, never a functional miss, and the mark still reads
+   * "stalled" correctly either way.
    *
    * FACTORY-50 (Part C): also durably captures the pane's full text via
    * `captureManagedSessionEscalationText` for a genuinely NEW episode
    * (never on a no-op re-entry) — the state map entry above is set BEFORE
    * that await, so an overlapping synchronous re-entry for the same fp
    * still short-circuits on the guard above and never double-captures.
+   *
+   * FACTORY-611 item 4 (supersedes the FACTORY-609 paragraph this replaces):
+   * "episode" is no longer "from the first mark until the pane clears OR THE
+   * FINGERPRINT CHANGES" — it is now keyed to a `blocked-since` instant for
+   * the PANE, reset ONLY when the pane actually clears
+   * (`clearManagedSessionStalled`), never by a fingerprint/text change while
+   * still blocked. Before this fix, EVERY fingerprint change started a
+   * brand-new episode with a fresh `sinceMs` and fresh per-tier latches —
+   * measured live: a pane blocked 40 minutes on a dialog whose text flipped
+   * every minute produced 40 tier-1 posts and zero tier 2/3, because the
+   * tier clock was reset every single minute and never accumulated past
+   * tier 1's own 0-minute due-ness (FACTORY-607 comment 28784 item 4). A
+   * fingerprint change within an ALREADY-tracked pane now only updates the
+   * entry's own `fp`/`question`/`options` in place (logged once) — the
+   * `since`/`sinceMs`/tier latches are untouched, so tier 2/3 still become
+   * due at the ORIGINAL blocked-since instant regardless of how many times
+   * the quoted text itself changes in between.
+   *
+   * FACTORY-611 item 3: a NEW episode (pane not already tracked) that loses
+   * `managedTeamAdminCap` is marked `capped: true` and NEVER posts for its
+   * own lifetime (see `ManagedSessionEntry.capped`'s own doc comment for the
+   * bug this closes) — a journal line still fires unconditionally either
+   * way (AC 6), and the cap itself is consulted and recorded ONLY here, on
+   * a genuinely new episode's own creation (see `managedTeamAdminCap`'s
+   * doc comment on why tiers 2/3 of an ALLOWED episode stay uncapped, and
+   * why keying the cap on "new episode" rather than "new fingerprint" is
+   * now also what "bound NEW blocked episodes" in the director's own words
+   * actually means once item 4 stops a fingerprint change from creating a
+   * new episode at all).
    */
   async function markManagedSessionStalled(paneId: string, target: ManagedSessionTarget, question: string, options: readonly string[], fp: string): Promise<void> {
+    const routing = deps.managedEscalationRouting ?? MANAGED_ESCALATION_DEFAULTS;
     const prior = managedSessionStalled.get(paneId);
-    if (prior?.fp === fp) {
-      await attemptTeamAdminNotify(paneId, prior); // already logged + marked this episode — only a pending RC retry remains to attempt
+    if (prior) {
+      if (prior.fp !== fp) {
+        deps.log(
+          `${MANAGED_ESCALATION_MARKER} ${target.agentKey} pane ${paneId} fingerprint changed (${prior.fp} -> ${fp}) while still blocked since ${prior.since} — updating quoted text in place, tier clock unchanged`,
+        );
+        prior.fp = fp;
+        prior.question = question;
+        prior.options = options;
+      }
+      if (prior.capped) return; // FACTORY-611 item 3: a capped episode never posts, for its whole lifetime
+      const elapsedMinutes = Math.floor((deps.now() - prior.sinceMs) / 60_000);
+      // Each tier is attempted independently and only once due-ness is
+      // reached — tier 1 may still need a retry (AC 7) at the same time
+      // tier 2 or 3 become newly due; none of these gate one another.
+      await attemptTierNotify(paneId, prior, 1, elapsedMinutes);
+      if (elapsedMinutes >= routing.tier2Minutes) await attemptTierNotify(paneId, prior, 2, elapsedMinutes);
+      if (elapsedMinutes >= routing.tier3Minutes) await attemptTierNotify(paneId, prior, 3, elapsedMinutes);
       return;
     }
-    const since = new Date(deps.now()).toISOString();
+    const nowMs = deps.now();
+    const since = new Date(nowMs).toISOString();
     const capturePath = await captureManagedSessionEscalationText(deps, paneId, target, fp);
-    const entry: ManagedSessionEntry = { target, fp, since, question, options, capturePath };
+    const entry: ManagedSessionEntry = {
+      target,
+      fp,
+      since,
+      sinceMs: nowMs,
+      question,
+      options,
+      capturePath,
+      notifiedRooms: new Set(),
+      loggedTiers: new Set(),
+      capped: false,
+      tierLastAttemptAt: {},
+    };
     managedSessionStalled.set(paneId, entry);
-    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${o}`).join(" | ") : "(none)";
+    // FACTORY-611 item 6(d): the dialog's raw question/options are
+    // interpolated into this ONE journal line verbatim — a newline or ESC
+    // in the pane text would otherwise be able to forge an extra
+    // `[managed-escalation]`-looking line in the journal. Sanitized here
+    // with `sanitizeForJournal` (strip control chars, flatten embedded
+    // newlines to a visible marker — same technique as `flattenNewlines`,
+    // kept separate because this is a plain log line, not a quoted field
+    // going through the full `quoteField` pipeline) rather than left raw.
+    const optionsLine = options.length ? options.map((o, i) => `${i + 1}. ${sanitizeForJournal(o)}`).join(" | ") : "(none)";
     // AC 6: this line fires unconditionally, whether or not #team-admin
     // routing is configured — a loud, complete journal line is the
     // not-configured fallback, and a diagnostic record either way.
-    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${question}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
-    // AC 4 extension: the journal line above always fires (it's this
-    // ticket's not-configured fallback, AC 6) — only the #team-admin POST
-    // is capped, and only per-PANE, so a genuinely stable fleet (one real
-    // dialog, one fingerprint) never comes near this and a drifting one is
-    // bounded rather than unbounded.
+    deps.log(`${MANAGED_ESCALATION_MARKER} ${target.agentKey} (definition: ${target.definitionPath}) pane ${paneId} blocked on an unrecognized dialog and has no issue to escalate to — marked stalled. question: "${sanitizeForJournal(question)}" options: ${optionsLine} fingerprint: ${fp}${capturePath ? ` capture: ${capturePath}` : ""}`);
+    // AC 4 extension / FACTORY-611 item 3: the journal line above always
+    // fires (it's this ticket's not-configured fallback, AC 6) — only a NEW
+    // episode's tier-1 POST is capped, and only per-PANE (see the cap
+    // decision on `managedTeamAdminCap`'s own doc comment above), so a
+    // genuinely stable fleet (one real dialog, one fingerprint) never comes
+    // near this and a drifting one is bounded rather than unbounded. A
+    // denied episode is flagged `capped` and stays journal-only for its
+    // entire lifetime (FACTORY-611 item 3) — see `ManagedSessionEntry.capped`.
     if (!managedTeamAdminCap.allow(paneId, deps.now())) {
+      entry.capped = true;
       if (!managedTeamAdminCappedLogged.has(paneId)) {
         managedTeamAdminCappedLogged.add(paneId);
-        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin rate cap reached (${MANAGED_TEAM_ADMIN_MAX_PER_HOUR}/hour) for pane ${paneId} — further managed-session dialogs on this pane are being logged only until the cap frees up`);
+        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin rate cap reached (${MANAGED_TEAM_ADMIN_MAX_PER_HOUR}/hour) for pane ${paneId} — this and further managed-session episodes on this pane are journal-only until the cap frees up`);
       }
       return;
     }
     managedTeamAdminCappedLogged.delete(paneId);
     managedTeamAdminCap.record(paneId, deps.now());
-    await attemptTeamAdminNotify(paneId, entry);
+    await attemptTierNotify(paneId, entry, 1, 0);
   }
 
-  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. FACTORY-369 AC 5: fires the clear-up follow-up post once, but only for an episode that was actually delivered to #team-admin (`notifiedAt` set) — an episode nobody was ever told about needs no "never mind". */
+  /** The clear/resolve half of `markManagedSessionStalled` — a no-op if nothing is currently marked for `paneId`. FACTORY-369 AC 5: fires the clear-up follow-up post once per room this episode actually reached (FACTORY-609: could be #team-admin, #team-engineering, or both, depending which tiers fired) — an episode nobody was ever told about needs no "never mind". */
   function clearManagedSessionStalled(paneId: string, reason: string): void {
     const entry = managedSessionStalled.get(paneId);
     if (!entry) return;
     managedSessionStalled.delete(paneId);
     deps.log(`${MANAGED_ESCALATION_MARKER} pane ${paneId} ${reason} — clearing stalled mark`);
-    if (entry.notifiedAt !== undefined && deps.teamAdminNotify) {
-      const text = teamAdminClearedMessage(entry.target, paneId, entry.fp);
-      void deps.teamAdminNotify(text).catch((e) =>
-        deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #team-admin clear-up post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}: ${(e as Error)?.message ?? e}`),
-      );
+    if (entry.notifiedRooms.size && deps.teamAdminNotify) {
+      const text = tierClearedMessage(entry.target, paneId, entry.fp);
+      for (const room of entry.notifiedRooms) {
+        void deps.teamAdminNotify(room, text).catch((e) =>
+          deps.log(`WARNING: ${MANAGED_ESCALATION_MARKER} #${room} clear-up post failed for ${entry.target.agentKey} pane ${paneId} fingerprint ${entry.fp}: ${(e as Error)?.message ?? e}`),
+        );
+      }
     }
   }
 
@@ -914,6 +1346,11 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const prior = managedSessionStalled.get(resolved.paneId);
     if (!prior || prior.fp !== resolved.fingerprint) return;
     clearManagedSessionStalled(resolved.paneId, "no longer blocked (drovr)");
+  }
+
+  /** See `Escalator.onPermissionAnswered`'s own doc comment. */
+  function onPermissionAnswered(paneId: string, recognizedVia: string): void {
+    clearManagedSessionStalled(paneId, `no longer blocked (answered: recognizedVia=${recognizedVia})`);
   }
 
   /** Every managed session CURRENTLY marked stalled — see `Escalator.managedSessionEscalations`'s own doc comment. */
@@ -1282,6 +1719,20 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     // `handleManagedSessionBlocked` itself (a new fp simply overwrites the
     // old entry and re-logs, satisfying "a new fingerprint escalates
     // again" without needing a separate clear step here).
+    //
+    // FACTORY-581 SAFETY GUARD 3: this is the LAST-RESORT, UNATTRIBUTED
+    // path — it only ever fires for a pane neither `onDrovrDialogResolved`
+    // (an escalated dialog's own resolution) nor `onPermissionAnswered`
+    // (drovr's lizard-mode pass pressing a tool-permission dialog, tagged
+    // with its own `recognizedVia`) already cleared: both of those call
+    // `clearManagedSessionStalled` directly and it is a no-op the second
+    // time (the entry is already gone), so a pane they attributed never
+    // reaches this untagged branch at all. What DOES reach it: a human
+    // typing directly into the pane, or any other clearing this detector's
+    // own callbacks do not observe. Left bare (no parenthesized reason) on
+    // purpose, so a reader can tell "attributed" from "not" at a glance —
+    // see the two other call sites of `clearManagedSessionStalled` for the
+    // attributed tags.
     for (const [paneId] of managedSessionStalled) {
       if (!blocked.has(paneId)) clearManagedSessionStalled(paneId, "no longer blocked");
     }
@@ -1314,11 +1765,19 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     u.lastPollSeq = pollSeq;
     managedUnresponsive.set(paneId, u);
 
-    if (u.escalatedAt !== undefined) return; // this episode already handled
     const elapsedMinutes = Math.floor((deps.now() - u.firstObservedAt) / 60_000);
     if (elapsedMinutes < deps.unresponsiveMinutes) return; // not sustained long enough yet — the gate AC 2 requires
     if (managedUnresponsiveInFlight.has(paneId)) return;
 
+    // FACTORY-609 (Part B): unlike before this ticket, this is NOT gated on
+    // `u.escalatedAt` any more — markManagedSessionStalled's own repeat-fp
+    // branch is what now evaluates whether tier 2/3 are due, and that
+    // evaluation must happen on every qualifying poll for the episode's
+    // whole lifetime, not just its first. `markManagedSessionStalled` is
+    // cheap to re-enter for an unchanged fingerprint (an in-memory map
+    // lookup plus, at most, a tier attempt already gated by its own
+    // `*NotifiedAt` slot), so repeating it here costs nothing extra once
+    // the episode is no longer fresh.
     managedUnresponsiveInFlight.add(paneId);
     void (async () => {
       try {
@@ -1351,7 +1810,7 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     const h = hashText(text);
     if (lastUnparseableHash.get(paneId) !== h) {
       lastUnparseableHash.set(paneId, h);
-      log(`${paneId} blocked with no parseable dialog: "${text.trim().slice(0, 60)}"`);
+      log(formatUnparseableLine(paneId, text));
     }
 
     // FACTORY-369 AC 2: a keyless pane widens to the SAME managed-session
@@ -1405,5 +1864,5 @@ export function createEscalator(deps: EscalatorDeps): Escalator {
     })();
   }
 
-  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved };
+  return { onBlocked, onPoll, onNoPrompt, managedSessionEscalations, onDrovrUnknownDialog, onDrovrDialogResolved, onPermissionAnswered };
 }

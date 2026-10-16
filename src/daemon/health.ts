@@ -194,6 +194,97 @@ export interface HealthStatus {
    * report" convention `managedSessionEscalations` above already uses.
    */
   codexUnrecognisedDialogSightings?: CodexDialogSighting[];
+  /**
+   * FACTORY-647: whether the dashboard-app's Vite build is actually present
+   * on disk (see `dashboardAppStatus`, src/web/static-assets.ts) — a SEVENTH
+   * sibling, same "additive, never flips `ok`" reasoning as `build`/
+   * `coverage`/`admission`/`currency`/`managedSessionEscalations`/
+   * `credentialDeathAlert` above: `ok` is the AND over liveness
+   * `components[]` on purpose, and a missing web build is a DEPLOY gap, not
+   * a liveness failure of this daemon's own poll loops — this daemon serves
+   * the old server-rendered pages (`/`, `/configurations`) just fine without
+   * it. This is the status SURFACE an operator or an uptime checker finds
+   * the gap on; the startup log's own `[butchr:dashboard-app]` line (see
+   * src/daemon/index.ts) is the other half of "fail loudly", for whoever is
+   * watching the journal instead of curling `/health`. Absent entirely when
+   * the caller doesn't pass one to `combineHealth` (e.g. every existing test
+   * fixture in this file's own test suite, unaffected by this addition).
+   */
+  dashboardApp?: { built: boolean; path: string };
+  /**
+   * FACTORY-772: per-loop restart history recorded by the issue-loop
+   * watchdog (src/daemon/loop-watchdog.ts) — an EIGHTH sibling, same
+   * "additive, never flips `ok`" reasoning as every sibling above: a
+   * restart already having happened is reported here for an operator to
+   * SEE, but `ok` must keep meaning only "is a loop currently fresh" —
+   * folding a past restart into that AND would make a daemon that has
+   * already self-healed read as unhealthy forever, which is backwards (the
+   * whole point of the watchdog is that it fixes the problem, not merely
+   * flags it). This is the surface that answers "did this restart silently
+   * and come back, with no trace?" — the failure mode `ComponentHealth`'s
+   * `state` flipping from `"stale"` back to `"ok"` on its own cannot answer,
+   * since a bare `"ok"` looks identical whether the loop was always healthy
+   * or was just force-restarted a moment ago. ABSENT (no key at all), never
+   * an empty array, when no watchdog is wired in (e.g. every existing test
+   * fixture in this file's own test suite, unaffected by this addition).
+   */
+  loopWatchdog?: LoopWatchdogReport[];
+  /**
+   * FACTORY-922 (implementing story FACTORY-921): how many times
+   * `createIssueEventRules`'s `decide()` (src/resources/issue.ts) could not
+   * confirm whether a pure `updated` bump was a real change — its comment
+   * fetch was skipped under load or failed outright — and chose not to
+   * notify rather than guess (see that module's own §3D fallback comment).
+   * A NINTH sibling, same "additive, never flips `ok`" reasoning as every
+   * sibling above: a skipped comment check is an EXTERNAL Atlassian
+   * degradation (or load-shedding), already logged
+   * (`skippedCommentCheckLine`, src/jira-watch/skipped-comment-check-log.ts)
+   * — not a liveness failure of this daemon's own poll loop, which keeps
+   * ticking fine; the retained snapshot means the diff simply re-fires on a
+   * later poll, no change lost. Monotonically increasing for the daemon's
+   * lifetime (never reset), same convention as every other lifetime count
+   * in this codebase (e.g. `AdmissionSnapshot`'s own counters) — a consumer
+   * graphing this over time watches its RATE, not its absolute value.
+   * Absent entirely when the caller doesn't pass one to `combineHealth`
+   * (e.g. every existing test fixture in this file's own test suite,
+   * unaffected by this addition).
+   */
+  commentChecksSkipped?: number;
+  /**
+   * FACTORY-972 (story FACTORY-971, item 5): lifetime count of DELIVERED
+   * `agent:stalled` boss wakes (`createIssueEventRules`'s `decide()`,
+   * src/resources/issue.ts) — a TENTH sibling, same "additive, never flips
+   * `ok`" shape `commentChecksSkipped` above already is. Monotonically
+   * increasing for the daemon's lifetime, same convention as every other
+   * lifetime count here — watch its RATE, not its absolute value. Absent
+   * entirely when the caller doesn't pass one to `combineHealth`.
+   */
+  stalledWakes?: number;
+  /**
+   * FACTORY-972 (item 4/5): lifetime count of `agent:stalled` wakes the
+   * per-recipient hourly rate cap REJECTED — counted and logged, never
+   * delivered, so this counter and `stalledWakes` above never double-count
+   * the same event. Same lifetime-monotonic, additive-only shape.
+   */
+  stalledWakesCapped?: number;
+}
+
+/**
+ * FACTORY-772: one named loop's restart history, as tracked by
+ * `createLoopWatchdog` (src/daemon/loop-watchdog.ts). `restartCount` and
+ * `lastRestartAt` are watchdog-forced restarts ONLY — an ordinary successful
+ * poll never touches either field, so a reader can tell "healthy the whole
+ * time" (`restartCount` 0) apart from "healthy again, but only because the
+ * watchdog intervened" (`restartCount` > 0) — the exact distinction a bare
+ * `ComponentHealth.state` of `"ok"` cannot make on its own.
+ */
+export interface LoopWatchdogReport {
+  /** The `ComponentHealth.name` this restart history is for (e.g. "pollLoop", "notify"). */
+  name: string;
+  /** How many times the watchdog has forced a restart of this loop since the daemon started. */
+  restartCount: number;
+  /** ISO timestamp of the most recent watchdog-forced restart, or null if it has never fired. */
+  lastRestartAt: string | null;
 }
 
 export interface ResourceLoopReport extends ComponentHealth {
@@ -257,6 +348,11 @@ export const combineHealth = (
   managedSessionEscalations?: readonly ManagedSessionEscalation[],
   credentialDeathAlert?: CredentialDeathAlert,
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
+  dashboardApp?: { built: boolean; path: string },
+  loopWatchdog?: readonly LoopWatchdogReport[],
+  commentChecksSkipped?: number,
+  stalledWakes?: number,
+  stalledWakesCapped?: number,
 ): HealthStatus => {
   const statuses = components.map((c) => c.status());
   return {
@@ -273,6 +369,11 @@ export const combineHealth = (
     ...(codexUnrecognisedDialogSightings && codexUnrecognisedDialogSightings.length
       ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }
       : {}),
+    ...(dashboardApp ? { dashboardApp } : {}),
+    ...(loopWatchdog && loopWatchdog.length ? { loopWatchdog: [...loopWatchdog] } : {}),
+    ...(commentChecksSkipped !== undefined ? { commentChecksSkipped } : {}),
+    ...(stalledWakes !== undefined ? { stalledWakes } : {}),
+    ...(stalledWakesCapped !== undefined ? { stalledWakesCapped } : {}),
   };
 };
 
@@ -329,6 +430,81 @@ export function createLoopHealth(opts: LoopHealthOptions): LoopHealth {
     stop() {
       clearInterval(timer);
     },
+  };
+}
+
+/**
+ * FACTORY-752 (FACTORY-746 (c)): a liveness component — same `components[]`
+ * AND-gating contract as `createLoopHealth` — that ALSO distinguishes a tick
+ * that REJECTED from one that simply completed with nothing to do.
+ *
+ * EXPLICIT DESIGN DECISION (argued here, restated in the PR description):
+ * this rides in `components[]`, NOT in the `resourceLoops[]` sibling array
+ * `createResourceLoopHealth` already feeds. `createResourceLoopHealth`
+ * tracks the identical recordSuccess/recordError pair, but its own doc
+ * comment on `HealthStatus.resourceLoops` explains why THOSE stay siblings:
+ * a GitHub/Jira/Zendesk poll failing is an EXTERNAL degradation, already
+ * logged, that a daemon restart cannot fix — folding it into `ok` would
+ * make an uptime checker cry "restart me" for a condition restarting does
+ * nothing about. The permission-answer tick is a different case: FACTORY-746's
+ * 10-08 incident was precisely a LIVENESS blind spot of this daemon's own —
+ * a wedged in-process loop going unnoticed for ~50 minutes, the same class
+ * of failure `pollLoop`/`notify` already gate `ok` on. So this component
+ * asserts the permission-answer tick IS a liveness signal of the daemon,
+ * joining the AND, same as its two `components[]` siblings — not an
+ * external-degradation sibling like the resource loops.
+ *
+ * `recordSuccess()` must be called once per tick that COMPLETED, whether or
+ * not it found anything eligible — an idle tick is exactly the case this
+ * exists to make indistinguishable from "stale" only once it has genuinely
+ * been too long (`thresholdMs`), never on every idle pass. `recordError()`
+ * is called once per tick that REJECTED (e.g. the `agent.list()` failure
+ * path in `runPermissionAnswerTick`, src/agents/permission-answer-loop.ts) —
+ * it does NOT advance `lastSuccessAt`/`staleForMs` on its own (a run of
+ * rejections alone still goes stale on schedule, which is the point), it
+ * only records `lastErrorAt`/`consecutiveFailures` so a reader can tell "has
+ * not ticked in a while, and the last attempt rejected" apart from "has not
+ * ticked in a while, with no rejection ever logged" (the original incident's
+ * own silence: two rejections, THEN nothing at all — this field is what
+ * would have let a reader tell those two shapes of silence apart).
+ */
+export interface TickHealthReport extends ComponentHealth {
+  /** ISO timestamp of the most recent tick that REJECTED, or null if none ever has. */
+  lastErrorAt: string | null;
+  /** Ticks that have rejected since the last success (reset to 0 by `recordSuccess()`, same convention as `ResourceLoopReport.consecutiveFailures`). */
+  consecutiveFailures: number;
+}
+
+export interface TickHealth extends LoopHealth {
+  /** Call once per tick that rejected (e.g. a failed `agent.list()`) — distinct from, and never a substitute for, `recordSuccess()`. */
+  recordError(error: unknown): void;
+  status(): { ok: boolean; components: TickHealthReport[] };
+}
+
+export function createTickHealth(opts: LoopHealthOptions): TickHealth {
+  const heartbeat = createLoopHealth(opts);
+  const now = opts.now ?? Date.now;
+  let lastErrorAt: number | null = null;
+  let consecutiveFailures = 0;
+  return {
+    recordSuccess() {
+      consecutiveFailures = 0;
+      heartbeat.recordSuccess();
+    },
+    recordError(_error: unknown) {
+      consecutiveFailures++;
+      lastErrorAt = now();
+    },
+    status() {
+      const [component] = heartbeat.status().components;
+      const report: TickHealthReport = {
+        ...component!,
+        lastErrorAt: lastErrorAt === null ? null : new Date(lastErrorAt).toISOString(),
+        consecutiveFailures,
+      };
+      return { ok: report.ok, components: [report] };
+    },
+    stop: () => heartbeat.stop(),
   };
 }
 

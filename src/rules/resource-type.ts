@@ -24,6 +24,7 @@ import { capLinkedItems, discoverLinkedItems } from "../resources/linked-discove
 import type { EventPoll, EventRules, NotifyReason, PollSnapshot, RelatedResource, ResourceType } from "../resources/types.js";
 import { createLinkedDiscoveryTracker, formatLinkedDiscoveryLines } from "../jira-watch/linked-discovery-log.js";
 import { createLinkedEventingState, effectiveMaxLinkedItems, type LinkedEventingDeps, type LinkedEventingState } from "../jira-watch/linked-eventing.js";
+import { topologySuppressedLine } from "../jira-watch/suppressed-log.js";
 import { decodeAgentKey, decodeAnyAgentKey, encodeAgentKey, encodeQueryAgentKey } from "./agent-key.js";
 import { groupExecutionUnits, logExecutionModeSwitches, mergeRelated, resourceMatches, scopeRelatedResources, unitAgentKey, type ExecutionUnit } from "./execution.js";
 import type { Rule } from "./rules.js";
@@ -43,6 +44,8 @@ export interface RuleResourceDeps {
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   comments?: IssueResourceDeps["comments"];
   log?: (line: string) => void;
+  /** FACTORY-922: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onCommentCheckSkipped`'s own doc comment. */
+  onCommentCheckSkipped?: IssueResourceDeps["onCommentCheckSkipped"];
   /**
    * BUTCHR-398: this provider's own currently-running herd ids (already
    * scoped — a caller passes `herd.runningIssues()` filtered by
@@ -92,6 +95,16 @@ export interface RuleResourceDeps {
    * above; omitted, no managed link is ever reconciled into a watcher.
    */
   linkStore?: LinkedEventingDeps["linkStore"];
+  /** FACTORY-949: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
+  blockedWakeDebounceMinutes?: IssueResourceDeps["blockedWakeDebounceMinutes"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.stalledWakeDebounceMinutes`'s own doc comment. */
+  stalledWakeDebounceMinutes?: IssueResourceDeps["stalledWakeDebounceMinutes"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.stalledWakeMaxPerHour`'s own doc comment. */
+  stalledWakeMaxPerHour?: IssueResourceDeps["stalledWakeMaxPerHour"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onStalledWake`'s own doc comment. */
+  onStalledWake?: IssueResourceDeps["onStalledWake"];
+  /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onStalledWakeCapped`'s own doc comment. */
+  onStalledWakeCapped?: IssueResourceDeps["onStalledWakeCapped"];
 }
 
 /**
@@ -200,11 +213,35 @@ export async function searchRules(deps: Pick<RuleResourceDeps, "rules" | "search
  * BUTCHR-390: that tiebreak is arbitrary and only becomes visible the day a
  * fleet runs overlapping rules; it is tracked there, not settled here.
  */
+/**
+ * FACTORY-947/952: a Task-tier implementer's `Implements` link must stop at
+ * its immediate boss (a Story) — it may never be routed straight to an
+ * Epic, two tiers up by this fleet's Epic->Story->Task convention. Measured
+ * live on this fleet (FACTORY-955's own ticket comment carries the journal
+ * line): a Task adopted directly by an Epic via `adopt_worker`, because the
+ * Task had no Story boss to adopt it, produces EXACTLY the same link shape
+ * as a genuine mislink — `implementsEdge` below cannot (and is not asked to)
+ * tell the two apart, and rejects both the same way, by design: whatever
+ * created the link, an Epic hearing a Task's routine/marker events directly
+ * is the two-hop leak this ticket exists to close.
+ *
+ * Deliberately NARROW, not a general N-tier hierarchy validator: Jira's own
+ * `hierarchyLevel` cannot distinguish Story from Task (both report `0` on
+ * this fleet's issue types; only Epic reports `1`), so this checks the
+ * issue-type NAME directly, and only for the one pair FACTORY-947 actually
+ * measured. A Bug or Sub-task implementing anything, or a Story/Epic pair,
+ * is untouched — out of this ticket's scope, not evaluated here either way.
+ */
+function isStrayTaskToEpic(implementerType: string, bossType: string): boolean {
+  return implementerType === "Task" && bossType === "Epic";
+}
+
 export function relatedForRules(
   rules: readonly Rule[],
   matches: readonly RuleMatch[],
   active: readonly string[],
   foreign: readonly JiraIssue[] = [],
+  log?: (line: string) => void,
 ): RelatedResource<RuleMatch>[] {
   const activeSet = new Set(active);
   const byId = new Map(rules.map((r) => [r.id, r]));
@@ -243,6 +280,13 @@ export function relatedForRules(
     }];
   };
   const out = new Map<string, { issue: RuleMatch; watchers: Set<string> }>();
+  // FACTORY-952: the SAME (sourceKey, listenerKey) edge is reached from BOTH
+  // ends' own issuelinks scan below (the implementer's inward link and the
+  // boss's outward link name the identical pair) — `record`'s own `watchers`
+  // Set already absorbs that duplication for a delivered edge; a REJECTED
+  // one has no Set to land in, so this dedupes the log line the same way,
+  // by (sourceKey, live watcher key), not per scan.
+  const loggedTopologyRejections = new Set<string>();
   // BUTCHR-406: takes the WATCHER'S KEY directly (already resolved to the
   // live agent key by the caller), not a `RuleMatch` — `record` no longer
   // decides which key names the listener, `implementsEdge`/`relatesEdge` do.
@@ -271,7 +315,21 @@ export function relatedForRules(
     for (const listener of byIssue.get(listenerKey) ?? []) {
       const live = liveAgentKeyFor(listener);
       if (!activeSet.has(listener.agentKey) && !activeSet.has(live)) continue;
-      for (const source of sourcesFor(sourceKey, listener)) record(sourceKey, live, source);
+      for (const source of sourcesFor(sourceKey, listener)) {
+        // FACTORY-952: one-hop-only boss routing — see isStrayTaskToEpic's
+        // own doc comment. Rejected, not silently dropped: logged so the
+        // mislink/stray-adoption is visible rather than indistinguishable
+        // from "nothing changed".
+        if (isStrayTaskToEpic(source.issue.issuetype, listener.issue.issuetype)) {
+          const dedupeKey = `${sourceKey}|${live}`;
+          if (!loggedTopologyRejections.has(dedupeKey)) {
+            loggedTopologyRejections.add(dedupeKey);
+            log?.(topologySuppressedLine(sourceKey, live, source.issue.issuetype, listener.issue.issuetype));
+          }
+          continue;
+        }
+        record(sourceKey, live, source);
+      }
     }
   };
   /** `Relates` is symmetric in Jira, so ONLY configuration decides direction across it — unchanged (BUTCHR-406: same live-key fix as `implementsEdge` above). */
@@ -343,6 +401,16 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     ...(rule.mcpServers ? { mcpServers: rule.mcpServers } : {}),
     ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
     ...(rule.lizardMode ? { lizardMode: true } : {}),
+    // FACTORY-916: unlike the booleans above, `resumeOnRespawn` is
+    // absent-means-ON (no tri-state — `Rule.resumeOnRespawn`'s own doc
+    // comment), so an explicit `false` must still be forwarded; a truthy
+    // check here would silently drop it. `ticketStatus`/`ticketLabels` are
+    // this already-fetched `issue`'s own fields, carried through so the
+    // spawn decision's `classifyStop` call needs no Jira fetch of its own.
+    ...(rule.resumeOnRespawn !== undefined ? { resumeOnRespawn: rule.resumeOnRespawn } : {}),
+    ...(rule.resumeContextCutoff !== undefined ? { resumeContextCutoff: rule.resumeContextCutoff } : {}),
+    ticketStatus: issue.status,
+    ticketLabels: issue.labels,
   };
 }
 
@@ -408,6 +476,12 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
         ...(deps.suppress ? { suppress: (key: string, updated: string, watcher: string) => deps.suppress!(key, updated, agentOf(watcher)) } : {}),
         ...(deps.comments ? { comments: deps.comments } : {}),
         ...(deps.log ? { log: deps.log } : {}),
+        ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+        ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
+        ...(deps.stalledWakeDebounceMinutes !== undefined ? { stalledWakeDebounceMinutes: deps.stalledWakeDebounceMinutes } : {}),
+        ...(deps.stalledWakeMaxPerHour !== undefined ? { stalledWakeMaxPerHour: deps.stalledWakeMaxPerHour } : {}),
+        ...(deps.onStalledWake ? { onStalledWake: deps.onStalledWake } : {}),
+        ...(deps.onStalledWakeCapped ? { onStalledWakeCapped: deps.onStalledWakeCapped } : {}),
       });
       inner.set(rule.id, rules);
     }
@@ -417,6 +491,8 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     ...(deps.suppress ? { suppress: deps.suppress } : {}),
     ...(deps.comments ? { comments: deps.comments } : {}),
     ...(deps.log ? { log: deps.log } : {}),
+    ...(deps.onCommentCheckSkipped ? { onCommentCheckSkipped: deps.onCommentCheckSkipped } : {}),
+    ...(deps.blockedWakeDebounceMinutes !== undefined ? { blockedWakeDebounceMinutes: deps.blockedWakeDebounceMinutes } : {}),
   });
   const asIssues = (related: readonly RelatedResource<ExecutionUnit<RuleMatch>>[]) =>
     related.filter((r) => r.issue.kind === "resource").map((r) => ({ issue: (r.issue as { kind: "resource"; match: RuleMatch }).match.issue, watchers: r.watchers }));
@@ -426,7 +502,19 @@ export function createRuleEventRules(deps: Omit<RuleResourceDeps, "search">): Ev
     async poll(prev: PollSnapshot<ExecutionUnit<RuleMatch>>, next: PollSnapshot<ExecutionUnit<RuleMatch>>): Promise<EventPoll> {
       const polls = new Map<string, EventPoll>();
       const changed: string[] = [];
-      for (const rule of deps.rules) {
+      // FACTORY-657, agentsafety review R1: snapshot BEFORE iterating — this
+      // loop awaits per rule (`innerFor(rule).poll`), and `deps.rules` is
+      // the daemon's own LIVE `RulesHolder` array, whose contents a
+      // concurrent SIGHUP's `setRules` splices IN PLACE between awaits. A
+      // bare `for (const rule of deps.rules)` reads index-by-index off that
+      // same mutating array, so a splice landing mid-loop can skip (or
+      // revisit) a rule — e.g. removing rule "a" while this loop sits on
+      // index 1 shifts rule "c" into index 1, and the loop's next step
+      // reads index 2, never visiting "c" this poll. Copying once, up
+      // front, means this poll's own rule list is fixed for its whole
+      // duration regardless of what lands mid-poll — exactly the "read
+      // once per poll" contract the rest of this file already documents.
+      for (const rule of [...deps.rules]) {
         const before = issuesFor(prev.primary, rule.id);
         const after = issuesFor(next.primary, rule.id);
         if (!before.length && !after.length && !inner.has(rule.id)) continue;
@@ -524,7 +612,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
             deps.log?.(`  WARNING: [related] cross-rule fetch failed for ${wanted.length} key(s), hearing same-rule tickets only this poll: ${(e as Error)?.message ?? e}`);
           }
         }
-        const crossRule = relatedForRules(deps.rules, latest, active, foreign);
+        const crossRule = relatedForRules(deps.rules, latest, active, foreign, deps.log);
         const wrap = (rs: readonly RelatedResource<RuleMatch>[]): RelatedResource<ExecutionUnit<RuleMatch>>[] =>
           rs.map((r) => ({ issue: { kind: "resource" as const, match: r.issue }, watchers: r.watchers }));
         // BUTCHR-436: linked-change eventing runs here — AFTER `reconcileNow`
@@ -571,7 +659,18 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   };
 }
 
-/** Each distinct Jira issue across `units`' `"resource"`-kind (swarm) matches once — for the label/detector layer, which works per ticket. A `singleton`/`persistent` rule's own query-level unit carries no single issue and is not represented here (BUTCHR-398): label sync, parked- and abandoned-worker detection stay per-resource concepts. */
+/** Labels are shared per ticket: the longest explicit matching timeout wins.
+ * Rebuild per poll so disabled/removed rules cannot leave stale overrides. */
+export function stalledMinutesForIssues(units: readonly ExecutionUnit<RuleMatch>[]): ReadonlyMap<string, number> {
+  const result = new Map<string, number>();
+  for (const { rule, issue } of resourceMatches(units)) {
+    if (!rule.enabled || rule.stalledMinutes === undefined) continue;
+    result.set(issue.key, Math.max(result.get(issue.key) ?? 0, rule.stalledMinutes));
+  }
+  return result;
+}
+
+/** Each distinct Jira issue from resource-kind (swarm) units, for per-ticket detectors. */
 export function uniqueIssues(units: readonly ExecutionUnit<RuleMatch>[]): JiraIssue[] {
   const byKey = new Map<string, JiraIssue>();
   for (const m of resourceMatches(units)) if (!byKey.has(m.issue.key)) byKey.set(m.issue.key, m.issue);

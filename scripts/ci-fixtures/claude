@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# FACTORY-892 (4): stand-in for the real Claude Code CLI in the `spawn-smoke`
+# CI job (.github/workflows/ci.yml) — CI has no Claude account to sign in
+# with, and this smoke test only needs herdr to accept and start a real
+# process with butchr's real kickoff argv, never a real agent session. It
+# ignores every argument (so a future control-character regression in that
+# argv still reaches herdr's own validation, unmunged).
+#
+# FACTORY-891 review (PR #722): "a foreground process exists" is not
+# falsifiable — a pty-backed pane's own interactive shell already satisfies
+# that, whether or not herdr ever actually spawned this stub. Touch a
+# sentinel FILE instead, which proves THIS process specifically ran, and
+# poll for that from scripts/verify-ci-spawn-smoke.ts.
+: > "${BUTCHR_CI_SPAWN_SMOKE_SENTINEL:?BUTCHR_CI_SPAWN_SMOKE_SENTINEL must be set}"
+sleep 60

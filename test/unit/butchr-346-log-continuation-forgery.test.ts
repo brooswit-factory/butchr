@@ -103,26 +103,31 @@ describe("BUTCHR-346: a raw newline in captured pane text must not survive to be
     }
   });
 
-  test("evidence for the record: WITHOUT the sink, at this head, the same pane text still reaches the writer with its raw newline intact, and journald's own per-physical-line prefixing lets the forged fragment parse as a genuine outcome record", () => {
+  test("FACTORY-834: even WITHOUT the sink, the no-dialog branch now sanitizes at the source — the forged fragment's raw newline no longer survives to reach the writer at all", () => {
+    // Before FACTORY-834, this test documented the opposite: bypassing the
+    // sink reproduced the defect, because formatUnparseableLine's no-dialog
+    // return only `trim()`+`slice()`d the quoted text, leaving an interior
+    // newline intact. FACTORY-834 wrapped that same quote in
+    // `sanitizeForJournal` (the marker branch already did), so the
+    // defence no longer depends on the sink for THIS call site — belt and
+    // suspenders, not belt-only. installLogSink remains the backstop for
+    // every other log line this daemon ever writes.
     const written: string[] = [];
     const { forgedFragment } = driveEscalatorOnNoPrompt((line) => written.push(`  ${line}`));
 
-    const emitted = written.find((l) => l.includes(forgedFragment))!;
+    const emitted = written.find((l) => l.includes("blocked with no parseable dialog"))!;
     expect(emitted).toBeDefined();
-    expect(emitted).toContain("\n");
+    expect(emitted).not.toContain("\n");
 
+    // The forged fragment's distinguishing tag text must not appear intact
+    // either — `sanitizeForJournal` flattens the newline that separated it
+    // from the fragment before it, so it cannot stand on its own as a
+    // parseable physical line.
     const physicalLines = emitted.split("\n").map((l) => `${JOURNALD_SHORT_PREFIX}${l}`);
-    expect(physicalLines.length).toBeGreaterThan(1);
-    const forgedPhysicalLine = physicalLines.find((l) => l.includes(forgedFragment))!;
-    expect(forgedPhysicalLine).toBeDefined();
-
-    // THE DEFECT: the forged fragment's own physical line parses as a
-    // genuine [tools2] success record for a caller (A-1) who never called
-    // anything — the real caller of this pane's own tool calls, if any, is
-    // whoever owns pane w71:p1, never A-1.
-    const parsed = parseOutcomeLine(forgedPhysicalLine);
-    expect(parsed).not.toBeNull();
-    expect(parsed?.caller).toBe("A-1");
-    expect(parsed?.outcome).toBe("ok");
+    expect(physicalLines).toHaveLength(1);
+    for (const line of physicalLines) {
+      expect(parseOutcomeLine(line)).toBeNull();
+      expect(parseAliasAuditLine(line)).toBeNull();
+    }
   });
 });
