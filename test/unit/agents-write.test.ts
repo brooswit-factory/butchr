@@ -164,6 +164,31 @@ describe("agents-write — FACTORY-666", () => {
       expect(world.issues.get("FACTORY-1")?.status).toBe("To Do"); // never transitioned while still unassigned
       expect(world.calls).toEqual([]);
     });
+
+    // FACTORY-829 review (47205): distinct from the no-role-configured case
+    // above — a role IS configured here, `assign` is actually attempted,
+    // and the WRITE ITSELF fails (a real Jira error). Outcome must still be
+    // "never transitioned", surfaced as a clean refusal through this route,
+    // not a misleading `ok: true` on a ticket that is now active and
+    // unassigned.
+    test("FACTORY-829: when the role-based assign write itself fails, this refuses and never transitions", async () => {
+      const world = makeOps();
+      world.addIssue("FACTORY-1", { issuetype: "Task", bossKey: "FACTORY-BOSS" }); // no assignee
+      world.addIssue("FACTORY-BOSS", { issuetype: "Story" });
+      const { herd } = makeHerd();
+      const brokenAssign: AgentWriteDeps = {
+        ops: { ...world.ops, assign: async () => { throw new Error("403 Jira refused the assignment"); } },
+        herd,
+        roles: { story: "acct-story", task: "acct-task", epic: "acct-epic" },
+      };
+      const outcome = await doAgentStart(brokenAssign, "FACTORY-1");
+      expect(outcome.ok).toBe(false);
+      if (!outcome.ok) {
+        expect(outcome.error).toContain("403 Jira refused the assignment");
+      }
+      expect(world.issues.get("FACTORY-1")?.status).toBe("To Do");
+      expect(world.calls.some((c) => c.startsWith("transition:"))).toBe(false);
+    });
   });
 
   describe("planAgentStop / doAgentStop", () => {

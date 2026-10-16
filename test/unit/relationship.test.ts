@@ -1933,6 +1933,31 @@ describe("FACTORY-849/FACTORY-852: stop-cause write sites, driven through the re
     expect(workspaceStopCause(dir)).toBeUndefined(); // superseded by reactivation
   });
 
+  // FACTORY-829 review (47205): the actual assign REJECTION, distinct from
+  // "no role configured" (relationship.test.ts's own FACTORY-829 describe
+  // block covers that half, where `ops.assign` is never even called). Here
+  // a role IS configured — `ops.assign` is called, but the write itself
+  // fails (a real Jira error, e.g. a permission or network problem). Proves
+  // the failure propagates before either of start_worker's OTHER writes:
+  // no transition (the ticket must not end up "active" while still
+  // unassigned — the exact undiscoverable state this fix exists to close),
+  // and no stop-cause clear (a stale marker from a prior stop survives a
+  // failed reactivation attempt, since this one never actually reactivated
+  // anything).
+  test("FACTORY-829: when the role-based assign ITSELF rejects, the failure propagates before the transition or the stop-cause clear", async () => {
+    const { ops, addIssue, issues } = makeWorld();
+    addIssue("BUTCHR-1", { issuetype: "Epic", project: "BUTCHR" });
+    addIssue("BUTCHR-2", { issuetype: "Story", project: "BUTCHR", bossKey: "BUTCHR-1", status: "To Do" }); // no assignee
+    const dir = wsDir("BUTCHR-2");
+    mkdirSync(dir, { recursive: true });
+    persistIntentionalStop(dir, "submit_to_boss");
+    const broken: AtlassianOps = { ...ops, assign: async () => { throw new Error("403 Jira refused the assignment"); } };
+    await expect(startWorker(broken, ROLES, "BUTCHR-1", "BUTCHR-2")).rejects.toThrow(/403 Jira refused the assignment/);
+    expect(issues.get("BUTCHR-2")!.status).toBe("To Do"); // never transitioned
+    expect(issues.get("BUTCHR-2")!.assignee).toBeUndefined(); // never considered assigned
+    expect(workspaceStopCause(dir)).not.toBeUndefined(); // the prior stop marker survives — nothing here actually reactivated it
+  });
+
   test("adoptWorker(kind: \"start\") clears a prior stop-cause marker on the ticket it adopts-and-starts", async () => {
     const { ops, addIssue, issues, setProjectProperty } = makeWorld();
     setProjectProperty("BUTCHR", BUTCHR_PROPERTY);
