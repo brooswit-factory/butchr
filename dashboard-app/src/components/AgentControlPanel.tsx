@@ -15,8 +15,8 @@
  *
  * AC5/AC6: every successful action re-fetches the snapshot (`load()`) so
  * the panel always shows CURRENT state; `start`'s own note below states
- * explicitly that admission into a running agent still goes through the
- * daemon's capacity-capped reconcile poll, not this call.
+ * explicitly that turning a ticket into a running agent still goes through
+ * the daemon's own reconcile poll, not this call.
  */
 import { useState } from "react";
 import { Button } from "@launchpad-ui/components";
@@ -148,7 +148,7 @@ export function AgentControlPanel({ api, canWrite }: AgentControlPanelProps) {
                 start
               </Button>
               <p data-testid="agent-control-start-note">
-                starting only marks the ticket ready — the daemon picks it up on its next reconcile poll, subject to the fleet-wide agent cap
+                starting only marks the ticket ready — the daemon picks it up on its next reconcile poll
               </p>
             </div>
           )}

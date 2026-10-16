@@ -181,7 +181,6 @@ export function defaultSettingsFixture(): SettingsResponse {
       { key: "ATLASSIAN_EMAIL", value: "butchr@example.com", source: "environment", restartNeeded: true, secret: false, editable: false, description: "The Atlassian account email used for basic-auth API calls." },
       { key: "ATLASSIAN_TOKEN", set: true, source: "environment", restartNeeded: true, secret: true, editable: false, description: "The Atlassian API token, used directly." },
       { key: "BUTCHR_PORT", value: "7717", source: "environment", restartNeeded: true, secret: false, editable: false, description: "The TCP port this daemon's MCP endpoint and dashboard listen on." },
-      { key: "BUTCHR_MAX_AGENTS", value: null, source: "default", restartNeeded: true, secret: false, editable: true, description: "Fixed cap on agents this daemon keeps resident at once." },
       { key: "BUTCHR_AGENT_PROVIDER", value: "claude", source: "environment", restartNeeded: true, secret: false, editable: true, description: "Default agent provider used when no per-role override is set." },
       { key: "BUTCHR_POLL_STALE_MS", value: "60000", source: "file", restartNeeded: true, secret: false, editable: true, description: "Milliseconds /health tolerates the poll loop going without a completed cycle before reporting stale." },
       { key: "GITHUB_TOKEN_FILE", set: false, source: "default", restartNeeded: true, secret: true, editable: false, description: "Path to a file holding the GitHub token." },

@@ -2,7 +2,7 @@
  * FACTORY-614: typed polling hook for the EXISTING `GET /config-inventory`
  * JSON endpoint (`src/web/view.ts`, backed by
  * `src/agents/query-agent-inventory.ts`) — no new server API. This
- * response has no live/withheld distinction of its own to poll faster or
+ * response has no freshness distinction of its own to poll faster or
  * slower for, so it reuses the SAME cadence `/dashboard` already polls at
  * (`use-dashboard.ts`'s `DASHBOARD_POLL_INTERVAL_MS`) rather than inventing
  * a second number — one less thing for a reader of both hooks to reconcile.

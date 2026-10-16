@@ -15,9 +15,6 @@
   border-radius: var(--lp-border-radius-medium);
 }
 
-.dashboard-row--withheld {
-  border-style: dashed;
-}
 
 .dashboard-row__key {
   min-width: 90px;
@@ -58,9 +55,4 @@
 .dashboard-row__freshness--stale {
   color: var(--lp-color-text-feedback-warning);
   font-weight: 600;
-}
-
-.dashboard-row__na {
-  color: var(--lp-color-text-ui-secondary);
-  font-style: italic;
 }

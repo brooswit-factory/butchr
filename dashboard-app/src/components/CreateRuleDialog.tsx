@@ -29,12 +29,11 @@ import { useEffect, useState } from "react";
 import { Button, Dialog, Modal, ModalOverlay, Switch } from "@launchpad-ui/components";
 import { AGENT_EFFORTS, type AgentEffort } from "../../../src/resources/power-scale.js";
 // Imported from the LEAF module, never `../../../src/rules/rules.js` directly — see `FirstRuleSetup.tsx`'s own top comment for why a VALUE import from that module breaks the Vite client bundle.
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
+import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePermissionMode } from "../../../src/rules/agent-harness.js";
 import type { ResourceProvider } from "../../../src/rules/agent-key.js";
 import {
   RESOURCE_PROVIDERS,
   type RuleAgentPreferencePatch,
-  type RuleCapacityRolesCatalog,
   type RuleCreateDraft,
   type RuleCreatePlanResult,
   type RuleFormCatalogEntry,
@@ -74,7 +73,6 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
   const [setPreference, setSetPreference] = useState(false);
   const [permissionMode, setPermissionMode] = useState<RulePermissionMode | "">("");
   const [lizardMode, setLizardMode] = useState(false);
-  const [role, setRole] = useState<AgentRole>("worker");
   const [busy, setBusy] = useState(false);
   /** A genuine refusal (collision, unmeasurable scope, rate limit, a lost race, ...) — NEVER the ordinary "please confirm" step, which only ever sets `pendingPlan` below. See `RuleCreateOutcome`'s own doc comment (`../api/rules.js`) for how the two are told apart. */
   const [error, setError] = useState<string | null>(null);
@@ -91,15 +89,11 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
   const [pendingPlan, setPendingPlan] = useState<RuleCreatePlanResult | null>(null);
   const [created, setCreated] = useState<RuleWriteResult | null>(null);
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
-  const [capacityRoles, setCapacityRoles] = useState<RuleCapacityRolesCatalog | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     void api.getCatalog().then((c) => {
       if (!cancelled) setCatalog(c);
-    });
-    void api.getCapacityRoles().then((c) => {
-      if (!cancelled) setCapacityRoles(c);
     });
     return () => {
       cancelled = true;
@@ -118,7 +112,6 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
     const draft: RuleCreateDraft = { id: id.trim(), resourceProvider, query: query.trim() };
     if (permissionMode) draft.permissionMode = permissionMode;
     if (lizardMode) draft.lizardMode = lizardMode;
-    if (role !== "worker") draft.role = role;
     if (setPreference) {
       const entry: RuleAgentPreferencePatch & { harness: AgentHarness } = { harness };
       if (model) entry.model = model;
@@ -359,20 +352,6 @@ export function CreateRuleDialog({ api, canWrite, stale, onChanged, onClose }: C
             aria-label="lizard mode"
             onChange={(isSelected) => setLizardMode(isSelected)}
           />
-
-          <label htmlFor="create-rule-capacity-toggle">Included in capacity</label>
-          <Switch
-            id="create-rule-capacity-toggle"
-            data-testid="create-rule-capacity-toggle"
-            isSelected={role === "worker"}
-            isDisabled={disabled || resourceProvider === "jira-project"}
-            switchLabels={false}
-            aria-label="Included in capacity"
-            onChange={(isSelected) => setRole(isSelected ? "worker" : "sentinel")}
-          />
-          {capacityRoles && (
-            <p data-testid="create-rule-capacity-default-hint">butchr's own default is "{capacityRoles.default}" (counted)</p>
-          )}
 
           {pendingPlan !== null && (
             <div className="rules-view__cnc" data-testid="create-rule-confirm">

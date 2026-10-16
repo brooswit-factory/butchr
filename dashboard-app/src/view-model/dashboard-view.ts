@@ -9,18 +9,19 @@
  * behaviour from (not markup — see that module's own header for why it is a
  * separate, pure module in the first place).
  *
- * THE THREE ABSENCES THIS VIEW-MODEL MUST NEVER CONFLATE (carried forward
+ * THE TWO ABSENCES THIS VIEW-MODEL MUST NEVER CONFLATE (carried forward
  * verbatim from `dashboard-page.ts`'s own framing):
  *   - KNOWN: the value is there.
  *   - COULD NOT CHECK: a read failed, was untrusted, or has never happened —
  *     `cnc: true` somewhere in the relevant view, and the literal words
  *     "could not check" in its text, never styled like a known value.
- *   - NOT APPLICABLE: there is no agent for a withheld row — rendered via
- *     `WithheldRowView.notApplicableReason`, never the `cnc` shape.
- * A single withheld row can carry a could-not-check `tier` AND a
- * not-applicable agent-fields marker at once — see `withheldRowView`.
+ *
+ * FACTORY-1013 removed the capacity admission system, and with it this
+ * module's third absence (NOT APPLICABLE — "there is no agent for a withheld
+ * row"): there is no withheld row kind and no admission panel any more, so
+ * every row this view-model builds is an agent row that really has an agent.
  */
-import type { AdmissionView, AgentDashboardRow, DashboardResponse, TierField, WithheldDashboardRow } from "../../../src/agents/dashboard.js";
+import type { AgentDashboardRow, DashboardResponse, TierField } from "../../../src/agents/dashboard.js";
 import { humanDuration, type StatusFloor } from "../../../src/agents/status-floor.js";
 import type { CurrencyReport } from "../../../src/daemon/currency.js";
 import { decodeAnyAgentKey } from "./agent-key-display.js";
@@ -135,9 +136,6 @@ export function configBackLinkHref(resourceKey: string, opts: Pick<DashboardView
   return opts.configLinkHref ? opts.configLinkHref(anchor) : `/configurations#${anchor}`;
 }
 
-/** `WithheldRowView.notApplicableReason`'s own label — the NOT-APPLICABLE marker's fixed text, deliberately never the could-not-check wording (nothing failed; see this module's header). */
-export const NOT_APPLICABLE_LABEL = "no agent — n/a";
-
 export interface AgentRowView {
   kind: "agent";
   anchorId: string;
@@ -173,70 +171,15 @@ function agentRowView(row: AgentDashboardRow, stale: boolean, opts: DashboardVie
   };
 }
 
-export interface WithheldRowView {
-  kind: "withheld";
-  resourceKey: string;
-  tier: TierView;
-  floor: FloorView;
-  freshness: FreshnessView;
-  notApplicableReason: string;
-  resourceHref: string;
-  source: string;
-}
-
 /**
- * `sourceDeclined`: whether THIS ROW's OWN `source` currently reports
- * `census.checked === false` on `response.admission` (see
- * `buildDashboardViewModel`'s own `declinedSources` set) — never the
- * response-level `checked` flag, which is a DIFFERENT signal. See
- * `dashboard-page.ts`'s own `renderWithheldRow` doc comment for the full
- * reasoning this ports verbatim.
+ * Mirrors the server's own `DashboardRow = AgentDashboardRow`
+ * (`src/agents/dashboard.ts`): a `kind`-tagged union of one. FACTORY-1013
+ * removed the second member (`WithheldRowView`, the capacity cap's
+ * matched-but-not-started row) along with the cap itself; the alias stays so a
+ * consumer switching on `row.kind` keeps working if a genuinely different
+ * (non-capacity) row kind is ever added.
  */
-function withheldRowView(row: WithheldDashboardRow, opts: DashboardViewOpts, sourceDeclined: boolean): WithheldRowView {
-  return {
-    kind: "withheld",
-    resourceKey: row.resourceKey,
-    tier: tierView(row.tier),
-    floor: floorView(row.waiting, opts.now, "withheld"),
-    freshness: freshnessView(row.confirmedAt, opts.now, sourceDeclined, "observed"),
-    notApplicableReason: row.agentFields.reason,
-    resourceHref: opts.resourceLinkHref(row.resourceKey),
-    source: row.source,
-  };
-}
-
-export type DashboardRowView = AgentRowView | WithheldRowView;
-
-export interface AdmissionSourceView {
-  source: string;
-  checked: boolean;
-  text: string;
-}
-
-export interface AdmissionViewModel {
-  cap: number;
-  residencyKnown: boolean;
-  residencyText: string;
-  sentinelsKnown: boolean;
-  sentinelsText: string;
-  sources: AdmissionSourceView[];
-}
-
-/** The admission panel: cap, residency, and EACH source's census state ON ITS OWN (requirement 4) — deliberately no aggregate "census OK" boolean, mirroring `AdmissionView`'s own doc comment. */
-export function admissionView(admission: AdmissionView, now: number): AdmissionViewModel {
-  return {
-    cap: admission.cap,
-    residencyKnown: admission.residency !== null,
-    residencyText: admission.residency === null ? "could not check (no trusted census yet)" : String(admission.residency),
-    sentinelsKnown: admission.sentinels !== null,
-    sentinelsText: admission.sentinels === null ? "?" : String(admission.sentinels),
-    sources: admission.sources.map((s) =>
-      s.census.checked
-        ? { source: s.source, checked: true, text: `${s.source}: checked (confirmed ${ageText(s.census.confirmedAt, now)} ago)` }
-        : { source: s.source, checked: false, text: `${s.source}: COULD NOT CHECK — ${s.census.reason} (as of ${ageText(s.census.declinedAt, now)} ago)` },
-    ),
-  };
-}
+export type DashboardRowView = AgentRowView;
 
 export interface BuildHeaderViewModel {
   buildText: string;
@@ -318,7 +261,6 @@ export function pageBannerView(response: DashboardResponse, now: number): PageBa
 export interface DashboardViewModel {
   buildHeader: BuildHeaderViewModel;
   banner: PageBannerViewModel;
-  admission: AdmissionViewModel;
   rows: DashboardRowView[];
   configurationsHref: string;
 }
@@ -331,18 +273,10 @@ export interface DashboardViewModel {
  */
 export function buildDashboardViewModel(response: DashboardResponse, opts: DashboardViewOpts): DashboardViewModel {
   const stale = !response.checked;
-  // Which sources currently report `census.checked === false` — a withheld
-  // row's OWN freshness badge goes stale in lockstep with its own source's
-  // panel entry, never any other source's, and never the whole-response
-  // `checked` flag (see `withheldRowView`'s own doc comment).
-  const declinedSources = new Set(response.admission.sources.filter((s) => !s.census.checked).map((s) => s.source));
-  const rows: DashboardRowView[] = response.rows.map((row) =>
-    row.kind === "agent" ? agentRowView(row, stale, opts) : withheldRowView(row, opts, declinedSources.has(row.source)),
-  );
+  const rows: DashboardRowView[] = response.rows.map((row) => agentRowView(row, stale, opts));
   return {
     buildHeader: buildHeaderView(opts.header, opts.now),
     banner: pageBannerView(response, opts.now),
-    admission: admissionView(response.admission, opts.now),
     rows,
     configurationsHref: "/configurations",
   };

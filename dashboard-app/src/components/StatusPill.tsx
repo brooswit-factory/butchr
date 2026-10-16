@@ -1,6 +1,6 @@
 /**
  * FACTORY-615: the status pill — `dashboard-page.ts`'s own `.st` badge
- * (agent status / "waiting for a slot"), ported to a LaunchPad-tokened
+ * (agent status), ported to a LaunchPad-tokened
  * component. There is no dedicated pill/badge/lozenge component in this
  * version of `@launchpad-ui/components` (0.25.0 — see the PR description's
  * component-mapping table), so this wraps `Text` with a small, local,
@@ -15,7 +15,7 @@ import "./StatusPill.css";
 export interface StatusPillProps {
   /** Already sanitized via `safeClass` (`view-model/dashboard-view.ts`) — never raw, untrusted text used as a class name. */
   statusClass: string;
-  /** The literal label to show — the raw `agentStatus`, or "waiting for a slot" for a withheld row. */
+  /** The literal label to show — the raw `agentStatus`. */
   label: string;
 }
 

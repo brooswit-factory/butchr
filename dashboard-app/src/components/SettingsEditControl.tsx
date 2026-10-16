@@ -1,9 +1,12 @@
 /**
  * FACTORY-665 — the inline edit control for ONE editable settings.json
  * row: a text input pre-filled with the row's current raw value, a Save
- * button, and (only when the write is refused with `needsConfirm: true` —
- * e.g. BUTCHR_MAX_AGENTS above its confirm ceiling) a confirm dialog that
- * re-submits the SAME value with `confirm: true`. Every value is plain JSX
+ * button, and (only when the write is refused with `needsConfirm: true`) a
+ * confirm dialog that re-submits the SAME value with `confirm: true`. The
+ * confirm mechanism itself is generic and stays: FACTORY-1013 removed the
+ * one allowlisted key that used to fire it (BUTCHR_MAX_AGENTS, above its
+ * confirm ceiling) along with the capacity admission system, so no shipped
+ * key triggers it today. Every value is plain JSX
  * text/input content — no `dangerouslySetInnerHTML` anywhere in this file.
  */
 import { useState } from "react";
