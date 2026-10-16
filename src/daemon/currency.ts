@@ -3,7 +3,7 @@ import type { CurrencyVerdict } from "../agents/build-currency.js";
 /**
  * BUTCHR-329: caches a build-currency verdict (`src/agents/build-currency.ts`
  * — reused here, not reimplemented) for `/health`, as a FOURTH sibling
- * alongside `build`/`coverage`/`admission` (see `combineHealth`,
+ * alongside `build`/`coverage` (see `combineHealth`,
  * src/daemon/health.ts).
  *
  * WHY A CACHE AT ALL: `computeBuildCurrency` shells out to `git` several

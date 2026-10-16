@@ -379,88 +379,35 @@ export interface ReconcileOptions {
    * src/agents/residency-census.ts for the full mechanism (why a second,
    * live source of truth closes the cold-start case a steady-state
    * transition guard cannot). Called with `(plan.spawn, [...desired.keys()])`
-   * IMMEDIATELY AFTER `planReconcile` — before `opts.admission` below, before
-   * `checkCrashLoop`, and before the spawn loop — and its return value
-   * REPLACES `plan.spawn` for every one of them, same "consulted for control
-   * flow, not merely observed" shape `opts.admission` uses. THE REASON THIS
-   * RUNS FIRST (write the reason here, not an ordering rule that could go
-   * stale — see this ticket's own report): a spawn candidate that already
-   * has a live agent must be removed from the list before anything
-   * downstream rations or counts against that list, because rationing
-   * (`opts.admission`) a list that contains phantoms under-delivers real
-   * work by exactly the number of phantoms it admits, and counting
-   * (`checkCrashLoop`) a withheld phantom as a genuine attempt manufactures
-   * a false complaint on a resource that was never in trouble. Never
-   * shrinks `desired` — a withheld id is offered again next poll exactly
-   * like an ordinary `plan.spawn` candidate not yet reached (the BUTCHR-218
-   * liveness trap this ticket's own DoD names explicitly). Optional;
-   * omitted (every caller before this ticket, and any direct `reconcileNow`
-   * caller that doesn't opt in), the value handed to `opts.admission` and
-   * `checkCrashLoop` is `plan.spawn` itself, unchanged — today's exact
-   * behaviour.
+   * IMMEDIATELY AFTER `planReconcile` — before `checkCrashLoop` and before
+   * the spawn loop — and its return value REPLACES `plan.spawn` for both:
+   * unlike most other hooks on this interface, this one is consulted for
+   * control flow, not merely observed. THE REASON THIS RUNS FIRST (written
+   * as a reason, not an ordering rule that could go stale — see this
+   * ticket's own report): a spawn candidate that ALREADY HAS a live agent
+   * must be removed from the list before anything downstream counts against
+   * that list, because counting (`checkCrashLoop`) a skipped phantom as a
+   * genuine attempt manufactures a false complaint on a resource that was
+   * never in trouble.
+   *
+   * THIS IS THE IDEMPOTENCY GUARD — exactly one active owner per matched
+   * resource — and it is NOT capacity admission. FACTORY-1013 removed the
+   * capacity admission system (fleet cap, per-rule `maxNewPerTick`/
+   * `minSecondsBetweenAdmissions` pacing, the waiting/withholding queue and
+   * its fairness ledger) in full; this hook survived it because it answers a
+   * different question. It never rations, never queues, never paces and never
+   * decides "not now, the fleet is full" — it only ever drops a candidate
+   * that already has its own agent, so a repeated poll cannot spawn a
+   * duplicate. Never shrinks `desired` — a skipped id is offered again next
+   * poll exactly like an ordinary `plan.spawn` candidate not yet reached (the
+   * BUTCHR-218 liveness trap this ticket's own DoD names explicitly).
+   * Optional; omitted (any direct `reconcileNow` caller that doesn't opt in),
+   * the value handed to `checkCrashLoop` and the spawn loop is `plan.spawn`
+   * itself, unchanged.
    */
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
-  /**
-   * BUTCHR-284: fleet-wide admission control — see src/agents/admission.ts
-   * for the full mechanism (why a count cap, the two Trap-2 failure shapes,
-   * the bounded-mistrust window). Called with `(plan.spawn, plan.stop)`
-   * BEFORE `checkCrashLoop` and the spawn loop below, and its return value
-   * REPLACES its input for BOTH — unlike most other hooks in this
-   * interface, this one is consulted for control flow, not merely observed.
-   * `plan.stop`/`plan.respawn` are never touched: only the spawn candidate
-   * list is admission-controlled (criterion 4 on the ticket — a respawn
-   * never consumes budget). READS FROM `checkResidency`'s output above
-   * (BUTCHR-287), not `plan.spawn` directly: a spawn candidate that already
-   * has a live agent must be removed from the list before anything rations
-   * that list, because rationing a list that contains phantoms under-
-   * delivers real work — see `checkResidency`'s own doc comment. Optional;
-   * omitted (every caller before this ticket, and any direct `reconcileNow`
-   * caller that doesn't opt in), `admitted` below is that same input
-   * unchanged (which is itself `plan.spawn` when `checkResidency` is ALSO
-   * omitted) — today's exact behaviour either way.
-   */
-  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  /**
-   * BUTCHR-297 (§B4): reports which of THIS poll's admitted candidates
-   * actually SUCCEEDED their spawn — see src/agents/admission.ts's own top-
-   * comment B4 addendum for why admission and running are different events
-   * and why the admission controller must never clear a wait counter on
-   * admission itself. Called ONCE per poll, AFTER the spawn `Promise.all`
-   * below has settled, with `admitted` minus the ids `failures` recorded at
-   * `stage: "spawn"` (a `"respawn"`-staged failure is a different code path
-   * and can never appear here). A SIBLING optional hook to `admission`
-   * above, deliberately, rather than a change to `admission`'s own
-   * signature — widening that signature would churn every existing caller
-   * and test that already builds a bare `(candidates, stopping) =>
-   * Promise<readonly string[]>` (this file's own admission.test.ts
-   * included), matching the house pattern (`checkCrashLoop`,
-   * `checkReconcileFailure`, `checkReap`, `onRespawn`, `onSuppressed` are
-   * all separate optional callbacks on this same interface, not parameters
-   * threaded onto an existing one). Optional, independent of `admission`
-   * above (checked separately, same as every other hook in this
-   * interface); omitted, no success signal is reported (every caller before
-   * this ticket, and any caller with nothing to clear).
-   */
-  onAdmitted?: (succeeded: readonly string[]) => void;
   /** Successful stop hook; never gates reconciliation. */
   onStopped?: (id: string) => Promise<void>;
-  /**
-   * Holds ids against the shared admission cap while their spawn is in
-   * flight — `AdmissionController.reserve`. Called for each respawn before
-   * its stop, so another loop's admission cannot fill the slot the stop
-   * frees before the replacement lands. `admission` reserves what it admits
-   * itself. Optional; omitted, nothing is held.
-   */
-  reserveAdmission?: (ids: readonly string[]) => void;
-  /**
-   * Drops ids from the shared admission cap's reservations —
-   * `AdmissionController.release`. Called for each admitted id and each
-   * respawn as soon as its spawn settles, whatever the outcome (a spawn can
-   * return with no agent when every provider is out of quota), and for every
-   * admitted id still held if this round throws before its spawns run.
-   * Optional; omitted, reservations last until the source's next admission.
-   */
-  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /**
    * BUTCHR-305/BUTCHR-238: audible-only detection of a resource pinned
    * `"active"` by an agent that has stopped acting — see
@@ -476,7 +423,7 @@ export interface ReconcileOptions {
    * of the `atRest`-gated hooks can reach). Its return value is `void` and is
    * NEVER consulted here: like `checkCrashLoop`/`checkReconcileFailure`, it
    * only observes and speaks, never gates or retries anything — `plan`,
-   * `atRest`, `desired`, `running` and `admitted` are all untouched by
+   * `atRest`, `desired`, `running` and `live` are all untouched by
    * whatever this hook does. Optional; omitted, no pinned-active detection
    * runs (every caller before this ticket, and any caller with nothing to
    * report through).
@@ -484,9 +431,9 @@ export interface ReconcileOptions {
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
   /**
    * BUTCHR-412: Rocket.Chat account lifecycle, independent of every hook
-   * above (residency/admission/crash-loop/etc. all still run exactly as
+   * above (residency/crash-loop/etc. all still run exactly as
    * before — this only decides what `ensureAccount`/`releaseAccount` see, and
-   * WITHHOLDS a spawn `admitted`/`plan.respawn` would otherwise have made,
+   * can REFUSE a spawn `live`/`plan.respawn` would otherwise have made,
    * never adds one). See `../agents/account-lifecycle.ts` for the hook
    * contract and why its two call sites below are exactly the boundary the
    * account manager's own token-rotation contract needs. Optional; omitted,
@@ -623,125 +570,91 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   }
   const plan = planReconcile(desired.keys(), running, staleByIssue.keys(), atRest);
   // BUTCHR-287: a spawn candidate that already has a live agent must be
-  // removed from the list before anything downstream rations or counts
-  // against that list — see ReconcileOptions.checkResidency's own doc
-  // comment for the full reasoning (written as a REASON here deliberately,
-  // not an ordering rule: once a future admission cap consumes this census
-  // as its own residency input rather than a preceding filter, there is no
-  // longer a "before" for a rule to name, but the reason stays true either
-  // way). `live` — never `plan.spawn` directly — is what both `opts.admission`
-  // and `checkCrashLoop` below actually see. Omitted, `live` is `plan.spawn`
-  // itself (the same array), so every existing caller and test is unaffected.
-  let live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
-  // BUTCHR-284: admission control runs BEFORE crash-loop detection and the
-  // spawn loop below, and is the ONE hook in this function that actually
-  // replaces its input rather than merely observing it — see
-  // ReconcileOptions.admission's own doc comment and src/agents/admission.ts
-  // for the full mechanism. `admitted` (never `plan.spawn`/`live` directly)
-  // is what actually gets attempted below: a withheld candidate was never
-  // really spawned this poll, so it must not count toward `checkCrashLoop`'s
-  // own rolling window either — only a GENUINE attempt should. Reads from
-  // `live` (BUTCHR-287's own residency filter, immediately above) rather
-  // than `plan.spawn`, for the same reason stated there. Omitted, `admitted`
-  // is `live` itself, so every existing caller and test (including
-  // crash-loop.test.ts's own pinned "checkCrashLoop receives exactly
-  // plan.spawn" assertions, and admission.test.ts's own reconcileNow
-  // integration tests) is unaffected.
-  const admitted = opts.admission ? await opts.admission(live, plan.stop) : live;
-  // Every admitted id's reservation is released as its own spawn settles
-  // below; this `finally` releases whatever is still held if anything
-  // between here and there throws, so no reservation outlives this round.
-  const held = new Set(admitted);
-  const release = async (ids: readonly string[]) => {
-    if (!opts.releaseAdmission || !ids.length) return;
-    for (const id of ids) held.delete(id);
-    await opts.releaseAdmission(ids);
-  };
-  try {
-    // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
-    // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
-    // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
-    // (not `plan.spawn`) is what the detector prunes its own tracking against —
-    // the pruning trap that module's top comment names.
-    if (opts.checkCrashLoop) await opts.checkCrashLoop(admitted, [...desired.keys()]);
-    // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
-    // freed THIS poll is available to THIS poll's spawns rather than sitting
-    // idle an extra cycle. This ordering is not what makes an in-flight spawn
-    // safe, though — a workspace `spawn()` just created (pane up, agent not
-    // registered yet) would look exactly like a stranded slot to `checkReap`
-    // for the first several seconds either way. What actually protects it is
-    // `ReapGuard`'s own grace period (reap.ts: 2 observations AND >= 60s),
-    // which comfortably outlasts `KICKOFF_VERIFY_MS` (12s, herd.ts) — the
-    // ordering here is purely a throughput optimization, never a safety
-    // mechanism.
-    if (opts.checkReap) await opts.checkReap();
-    // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
-    // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
-    // burst of N new spawns (e.g. several stories activating in one poll)
-    // would stall this ENTIRE poll — label sync and every ticket's
-    // notifications included — for N times that wait. Each issue's spawn is
-    // independent (its own workspace directory, its own pane), so nothing
-    // requires them to run one after another.
-    //
-    // BUTCHR-147: each mapped async function catches its OWN rejection — the
-    // outer `Promise.all` therefore never rejects on a bad spawn, unlike
-    // before this ticket. One resource's `workspace.create`/`agent.start`
-    // failure is recorded into `failures` and never touches any other
-    // resource's spawn this same `Promise.all`.
-    await Promise.all(admitted.map(async (issue) => {
-      try {
-        const spec = desired.get(issue)!;
-        // BUTCHR-412: `ensure` runs BEFORE herd.spawn, and only ever for an
-        // id `admitted` (never one already resident — BUTCHR-287's own
-        // residency filter already removed those from `live`/`admitted`
-        // upstream of this point) — see AccountLifecycleHooks' own doc
-        // comment for why that boundary is exactly what the account
-        // manager's token-rotation contract needs.
-        const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
-        if (toSpawn === null) {
-          // A real refusal, already logged (and, where wired, posted) by
-          // `ensure` itself — recorded here as an ordinary "spawn" failure so
-          // it shares checkReconcileFailure's existing audible-failure route
-          // and is excluded from `onAdmitted` below, same as any other failed
-          // spawn attempt.
-          failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
-        } else {
-          await herd.spawn(toSpawn);
-          // FACTORY-916: THE primary case this story exists for — `issue`
-          // was `desired` but not `running` at all (this `admitted`/
-          // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
-          // below, which only ever sees an agent that WAS running) —
-          // i.e. exactly the "daemon respawns a worker after an
-          // unintended stop" shape FACTORY-843's outcome describes. Same
-          // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
-          // callback the stale-argv loop below also consults — see that
-          // loop's own comment for the full contract. Without this read
-          // HERE too, a genuine crash-respawn that resumed would get NO
-          // ticket notice at all: this loop never calls `opts.onRespawn`
-          // in the first place (a brand-new "first ever spawn" needs no
-          // "your session was X" notice), so there is no existing call
-          // this piggybacks on the way the stale-argv loop's does.
-          if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
-        }
-      } catch (e) {
-        failures.push({ id: issue, stage: "spawn", error: e });
+  // removed from the list before anything downstream counts against that
+  // list — see ReconcileOptions.checkResidency's own doc comment for the
+  // full reasoning, and for why that idempotency guard is NOT the capacity
+  // admission system FACTORY-1013 deleted. `live` — never `plan.spawn`
+  // directly — is what both `checkCrashLoop` and the spawn loop below
+  // actually see: a candidate skipped because it ALREADY HAS an agent was
+  // never really spawned this poll, so it must not count toward
+  // `checkCrashLoop`'s own rolling window either — only a GENUINE attempt
+  // should. Omitted, `live` is `plan.spawn` itself (the same array), so
+  // every existing caller and test is unaffected.
+  //
+  // FACTORY-1013: there is no admission/rationing step between here and the
+  // spawn loop any more. EVERY eligible match in `live` is reconciled into
+  // its agent on this very poll — no cap, no queue, no fairness ordering, no
+  // pacing. Nothing here may reintroduce one under another name.
+  const live = opts.checkResidency ? await opts.checkResidency(plan.spawn, [...desired.keys()]) : plan.spawn;
+  // BUTCHR-141: crash-loop detection runs BEFORE the spawn loop below, and
+  // never affects `plan` or gates a spawn — see ReconcileOptions.checkCrashLoop's
+  // own doc comment and src/agents/crash-loop.ts for why. `[...desired.keys()]`
+  // (not `plan.spawn`) is what the detector prunes its own tracking against —
+  // the pruning trap that module's top comment names.
+  if (opts.checkCrashLoop) await opts.checkCrashLoop(live, [...desired.keys()]);
+  // BUTCHR-245: reclamation runs BEFORE the spawn loop below too, so a slot
+  // freed THIS poll is available to THIS poll's spawns rather than sitting
+  // idle an extra cycle. This ordering is not what makes an in-flight spawn
+  // safe, though — a workspace `spawn()` just created (pane up, agent not
+  // registered yet) would look exactly like a stranded slot to `checkReap`
+  // for the first several seconds either way. What actually protects it is
+  // `ReapGuard`'s own grace period (reap.ts: 2 observations AND >= 60s),
+  // which comfortably outlasts `KICKOFF_VERIFY_MS` (12s, herd.ts) — the
+  // ordering here is purely a throughput optimization, never a safety
+  // mechanism.
+  if (opts.checkReap) await opts.checkReap();
+  // Concurrent, not serial (PR #68 review): HerdrHerd.spawn() now waits out
+  // KICKOFF_VERIFY_MS (KAN-804/807) before returning, so a serial loop over a
+  // burst of N new spawns (e.g. several stories activating in one poll)
+  // would stall this ENTIRE poll — label sync and every ticket's
+  // notifications included — for N times that wait. Each issue's spawn is
+  // independent (its own workspace directory, its own pane), so nothing
+  // requires them to run one after another.
+  //
+  // BUTCHR-147: each mapped async function catches its OWN rejection — the
+  // outer `Promise.all` therefore never rejects on a bad spawn, unlike
+  // before this ticket. One resource's `workspace.create`/`agent.start`
+  // failure is recorded into `failures` and never touches any other
+  // resource's spawn this same `Promise.all`.
+  await Promise.all(live.map(async (issue) => {
+    try {
+      const spec = desired.get(issue)!;
+      // BUTCHR-412: `ensure` runs BEFORE herd.spawn, and only ever for an
+      // id in `live` (never one already resident — BUTCHR-287's own
+      // residency filter already removed those upstream of this point)
+      // — see AccountLifecycleHooks' own doc
+      // comment for why that boundary is exactly what the account
+      // manager's token-rotation contract needs.
+      const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
+      if (toSpawn === null) {
+        // A real refusal, already logged (and, where wired, posted) by
+        // `ensure` itself — recorded here as an ordinary "spawn" failure so
+        // it shares checkReconcileFailure's existing audible-failure route,
+        // same as any other failed spawn attempt. This is an ACCOUNT-policy
+        // refusal (a real external constraint), never capacity admission.
+        failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; not started without it") });
+      } else {
+        await herd.spawn(toSpawn);
+        // FACTORY-916: THE primary case this story exists for — `issue`
+        // was `desired` but not `running` at all (this `live`/
+        // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
+        // below, which only ever sees an agent that WAS running) —
+        // i.e. exactly the "daemon respawns a worker after an
+        // unintended stop" shape FACTORY-843's outcome describes. Same
+        // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
+        // callback the stale-argv loop below also consults — see that
+        // loop's own comment for the full contract. Without this read
+        // HERE too, a genuine crash-respawn that resumed would get NO
+        // ticket notice at all: this loop never calls `opts.onRespawn`
+        // in the first place (a brand-new "first ever spawn" needs no
+        // "your session was X" notice), so there is no existing call
+        // this piggybacks on the way the stale-argv loop's does.
+        if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
       }
-      await release([issue]);
-    }));
-  } finally {
-    await release([...held]);
-  }
-  // BUTCHR-297 (§B4): report which of THIS poll's admitted candidates
-  // actually succeeded their spawn — see ReconcileOptions.onAdmitted's own
-  // doc comment for why this must be `admitted` minus only the `"spawn"`-
-  // staged failures just collected above (never a `"respawn"`-staged one,
-  // which is a different code path entirely, appended to `failures` further
-  // below). Only computed when `opts.onAdmitted` is actually present —
-  // there is no ledger anywhere to report to otherwise.
-  if (opts.onAdmitted) {
-    const failedSpawnIds = new Set(failures.filter((f) => f.stage === "spawn").map((f) => f.id));
-    opts.onAdmitted(admitted.filter((id) => !failedSpawnIds.has(id)));
-  }
+    } catch (e) {
+      failures.push({ id: issue, stage: "spawn", error: e });
+    }
+  }));
   // BUTCHR-147: sequential, same as before (stop has no documented wait to
   // parallelize against) — but each iteration's rejection is now caught so
   // one bad `herd.stop` no longer aborts the REST of this loop (every other
@@ -863,9 +776,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // until it is freshly spawned and found stale again; it falls into the
     // ORDINARY `spawn` list on the very next poll instead, unaffected by
     // this guard window at all).
-    // Held from before the stop until the replacement settles, so another
-    // loop's admission never reads the stopped agent's slot as free.
-    opts.reserveAdmission?.([issue]);
     try {
       const spec = desired.get(issue)!;
       // BUTCHR-412: `ensure` runs BEFORE the interim `herd.stop` below —
@@ -901,8 +811,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       // so there is nothing to notify about.
       failures.push({ id: issue, stage: "respawn", error: e });
       continue;
-    } finally {
-      await opts.releaseAdmission?.([issue]);
     }
     // BUTCHR-147 §7: only reached when BOTH herd.stop and herd.spawn above
     // succeeded — `opts.onRespawn` (the daemon's `[butchr:respawn]` Jira
@@ -1137,20 +1045,12 @@ export interface GenericLoopDeps<T> {
   checkReconcileFailure?: (failures: readonly ReconcileFailure[], desired: readonly string[], running: readonly string[]) => Promise<void>;
   /** BUTCHR-245: see `ReconcileOptions.checkReap`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `Reaper` instance, same reasoning as `checkCrashLoop`/`checkReconcileFailure` above. Optional; omitted, no reclamation runs. */
   checkReap?: () => Promise<void>;
-  /** BUTCHR-287: see `ReconcileOptions.checkResidency`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `HerdrHerd.residency()`-backed census (no per-loop state to keep, unlike `checkCrashLoop`/`checkReap` — the census is a live read every call). Optional; omitted, no residency guard runs (plan.spawn reaches `opts.admission`/`checkCrashLoop` in full, today's exact behaviour). */
+  /** BUTCHR-287: see `ReconcileOptions.checkResidency`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts), each with its own `HerdrHerd.residency()`-backed census (no per-loop state to keep, unlike `checkCrashLoop`/`checkReap` — the census is a live read every call). Optional; omitted, no residency guard runs (plan.spawn reaches `checkCrashLoop` and the spawn loop in full). */
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
-  /** BUTCHR-284: see `ReconcileOptions.admission`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController` instance (unlike `checkCrashLoop`/`checkReconcileFailure`/`checkReap`, which each get their own per-loop instance) — see src/agents/admission.ts's own top comment for why the cap must be fleet-wide, not per-tier. Optional; omitted, no admission control runs (plan.spawn is admitted in full, today's exact behaviour). */
-  admission?: (candidates: readonly string[], stopping: readonly string[]) => Promise<readonly string[]>;
-  /** BUTCHR-297: see `ReconcileOptions.onAdmitted`'s doc comment — threaded straight through to `reconcileNow` below. Wired into BOTH the issue and project loops (src/daemon/index.ts) as the SAME shared `AdmissionController.recordSpawned`, same reasoning as `admission` above (one ledger, not one per tier). Optional; omitted, no success signal is reported. */
-  onAdmitted?: (succeeded: readonly string[]) => void;
   onStopped?: (id: string) => Promise<void>;
-  /** See `ReconcileOptions.reserveAdmission` — threaded straight through to `reconcileNow` below. */
-  reserveAdmission?: (ids: readonly string[]) => void;
-  /** See `ReconcileOptions.releaseAdmission` — threaded straight through to `reconcileNow` below. */
-  releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
-  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment — threaded straight through to `reconcileNow` below. Wired into every rule loop (src/daemon/index.ts) as the SAME shared `AccountLifecycleHooks` instance (one account manager/store, not one per tier — mirrors `admission` above). Optional; omitted, no account lifecycle runs (every caller before this ticket). */
+  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment — threaded straight through to `reconcileNow` below. Wired into every rule loop (src/daemon/index.ts) as the SAME shared `AccountLifecycleHooks` instance (one account manager/store, not one per tier). Optional; omitted, no account lifecycle runs (every caller before this ticket). */
   account?: AccountLifecycleHooks;
   log?: (line: string) => void;
   intervalMs: number;
@@ -1245,11 +1145,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.checkReconcileFailure ? { checkReconcileFailure: deps.checkReconcileFailure } : {}),
         ...(deps.checkReap ? { checkReap: deps.checkReap } : {}),
         ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
-        ...(deps.admission ? { admission: deps.admission } : {}),
-        ...(deps.onAdmitted ? { onAdmitted: deps.onAdmitted } : {}),
         ...(deps.onStopped ? { onStopped: deps.onStopped } : {}),
-        ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
-        ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
         ...(deps.account ? { account: deps.account } : {}),
         atRest,

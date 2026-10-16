@@ -1,6 +1,5 @@
 import type { BuildReport } from "../agents/build-identity.js";
 import type { DetectorCoverage } from "./coverage.js";
-import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
 import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
@@ -59,24 +58,10 @@ export interface HealthStatus {
    */
   coverage?: DetectorCoverage[];
   /**
-   * BUTCHR-284: the admission cap and current fleet-wide residency — a THIRD
-   * sibling, alongside `build`/`coverage`, for the same reason those two
-   * are: `ok` is the AND over liveness `components[]` on purpose, and
-   * sitting AT the cap is a normal, healthy state — it must never be able
-   * to flip `ok` red (see src/agents/admission.ts for the full mechanism).
-   * `residency` is `null` before this daemon has taken any TRUSTED census
-   * yet (see `AdmissionController.snapshot`) — never a bare `0`, which would
-   * be indistinguishable from "checked, genuinely empty". Absent entirely
-   * when the caller doesn't pass one to `combineHealth` (e.g. every existing
-   * test fixture in this file's own test suite, unaffected by this
-   * addition).
-   */
-  admission?: AdmissionSnapshot;
-  /**
    * BUTCHR-329: this daemon's own build-currency verdict (whether its
    * running build matches `refs/remotes/origin/main` — see
    * src/agents/build-currency.ts) — a FOURTH sibling, alongside
-   * `build`/`coverage`/`admission`, for the same reason those three are:
+   * `build`/`coverage`, for the same reason those two are:
    * `ok` is the AND over liveness `components[]` on purpose, and a daemon
    * running STALE code is not thereby *unhealthy* in the liveness sense —
    * it is stale, which is a different claim, and conflating the two is the
@@ -151,7 +136,7 @@ export interface HealthStatus {
    * "stalled" — an escalated (logged), not-yet-resolved unanswerable dialog
    * on a filesystem-provider `managed-sessions` agent (see
    * docs/managed-sessions.md). A SIBLING field, same "additive, never flips
-   * `ok`" pattern `admission`/`coverage`/`unresolvedRelationships` above
+   * `ok`" pattern `coverage`/`unresolvedRelationships` above
    * already use: a stalled managed session is a real problem for an
    * OPERATOR to act on, but it is not a liveness failure of THIS daemon's
    * own poll loops, so it must never trip the 503 contract `ok` drives.
@@ -198,7 +183,7 @@ export interface HealthStatus {
    * FACTORY-647: whether the dashboard-app's Vite build is actually present
    * on disk (see `dashboardAppStatus`, src/web/static-assets.ts) — a SEVENTH
    * sibling, same "additive, never flips `ok`" reasoning as `build`/
-   * `coverage`/`admission`/`currency`/`managedSessionEscalations`/
+   * `coverage`/`currency`/`managedSessionEscalations`/
    * `credentialDeathAlert` above: `ok` is the AND over liveness
    * `components[]` on purpose, and a missing web build is a DEPLOY gap, not
    * a liveness failure of this daemon's own poll loops — this daemon serves
@@ -332,16 +317,15 @@ export interface LoopHealth {
  * contract untouched (BUTCHR-18/BUTCHR-6's callers, and any test built on
  * that shape, are unaffected); a caller with more than one liveness signal to
  * report (the poll loop, the notify stage) calls each instance's `status()`
- * and combines the results here instead. `build` (BUTCHR-54), `coverage`
- * (BUTCHR-179), and `admission` (BUTCHR-284) all ride along as sibling
- * fields on the returned `HealthStatus` — see each type's own doc comment
- * for why none of them is ever folded into `components[]`.
+ * and combines the results here instead. `build` (BUTCHR-54) and `coverage`
+ * (BUTCHR-179) both ride along as sibling fields on the returned
+ * `HealthStatus` — see each type's own doc comment for why neither of them
+ * is ever folded into `components[]`.
  */
 export const combineHealth = (
   components: readonly LoopHealth[],
   build?: BuildReport,
   coverage?: readonly DetectorCoverage[],
-  admission?: AdmissionSnapshot,
   currency?: CurrencyReport,
   resourceLoops?: readonly ResourceLoopHealth[],
   unresolvedRelationships?: readonly UnresolvedRelationship[],
@@ -360,7 +344,6 @@ export const combineHealth = (
     components: statuses.flatMap((s) => s.components),
     ...(build ? { build } : {}),
     ...(coverage ? { coverage: [...coverage] } : {}),
-    ...(admission ? { admission } : {}),
     ...(currency ? { currency } : {}),
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
