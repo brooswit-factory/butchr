@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gatherFacts } from "../../scripts/release/facts.js";
@@ -145,4 +145,23 @@ describe("surfaceAt / gatherFacts surface (FACTORY-624)", () => {
       expect(f.surface).toEqual({ added: ["env BUTCHR_FRESH", "route /fresh/:id"], removed: ["env BUTCHR_GONE", "route /gone"] });
     } finally { process.chdir(cwd); }
   });
+});
+
+describe("gatherFacts base ref is never shell-interpolated (FACTORY-637)", () => {
+  test("a base ref carrying shell metacharacters is treated as a plain (invalid) ref — it fails cleanly and runs nothing", () => {
+    const d = mkdtempSync(join(tmpdir(), "facts-injection-")); const sh = (c: string) => execSync(c, { cwd: d, stdio: "ignore" });
+    sh("git init -q -b main && git config user.email t@t && git config user.name t");
+    writeFileSync(join(d, "package.json"), JSON.stringify({ name: "@probe/none-such-pkg-zz", version: "0.1.0" }));
+    writeFileSync(join(d, "CHANGELOG.md"), "# C\n");
+    sh("git add -A && git commit -qm base");
+    const marker = join(d, "injected");
+    // If this ever reached a real shell, `; touch <marker>` would run as a second command.
+    // Through execFileSync argv it is just one (nonexistent) ref string — git rejects it.
+    const hostileBase = `main; touch ${marker}`;
+    const cwd = process.cwd(); process.chdir(d);
+    try {
+      expect(() => gatherFacts(hostileBase)).toThrow();
+      expect(existsSync(marker)).toBe(false);
+    } finally { process.chdir(cwd); }
+  }, 20_000);
 });
