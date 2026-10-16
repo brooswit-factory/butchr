@@ -1018,12 +1018,14 @@ export function createLinkedEventingState(): LinkedEventingState {
         // ELSE an owner's tick does (the pre-existing, still-covered
         // contract — see linked-eventing-project.test.ts's own "fails open
         // ... without blocking ... member discovery" case), just not for a
-        // claim this tick cannot actually back up. `watchSets` below still
-        // advances to this tick's (fetch-failure-shrunk) `kept` regardless
-        // — delayed, not lost: once the fetch recovers, the target simply
-        // reappears in `kept` next tick with its baseline intact (never
-        // deleted, since no removal event ever fired for it), so no
-        // spurious "re-added" fires either.
+        // claim this tick cannot actually back up. `watchSets` below is ALSO
+        // left untouched for this owner this tick (see `advance()`'s own
+        // comment further down) rather than advanced to this tick's
+        // fetch-failure-shrunk `kept` — delayed, not lost: once the fetch
+        // recovers, the target simply reappears in `kept` with its baseline
+        // intact (never deleted, since no removal event ever fired for it),
+        // so no spurious "re-added" fires either, and a removal that
+        // genuinely happened during the failed tick is still caught then.
         if (linkFetchFailedOwners.has(entry.agentKey)) continue;
         const prevSet = watchSets.get(entry.agentKey);
         if (!prevSet) continue;
