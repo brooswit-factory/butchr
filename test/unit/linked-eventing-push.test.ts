@@ -560,4 +560,51 @@ describe("FACTORY-137 review round 2 (P2): an on-demand pass over a project MEMB
     const events = (notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } }).linked.events;
     expect(events.some((e) => e.target === "BUTCHR-1" && e.detail.includes("In Progress"))).toBe(true);
   });
+
+  test("review round 3 (P2, continued): a dirty project member that Jira's search now OMITS (deleted/unreadable) still reports exactly one unreadable transition, not a silently-stale 'unchanged'", async () => {
+    const projRule: Rule = parseRules({ rules: [{ id: "mgrs", resourceProvider: "jira-project", query: '{"keys":["BUTCHR"]}', brief: "manage it", linkedEventing: true }] })[0]!;
+    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do", updated: "2026-10-01T00:00:00.000+0000" }) };
+    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
+    const state = createLinkedEventingState();
+    const { push } = fakePush();
+    const searchCalls: string[] = [];
+    const notified: Array<{ reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        searchCalls.push(jql);
+        const keyIn = KEY_IN_RE.exec(jql);
+        if (keyIn) return keyIn[1]!.split(",").map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+        const proj = PROJECT_JQL_RE.exec(jql);
+        if (proj) return (membersByProject[proj[1]!] ?? []).map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+        throw new Error(`fakeDeps: unexpected JQL ${JSON.stringify(jql)}`);
+      },
+      notify: async (_a, _b, reason) => { notified.push({ reason }); },
+      push,
+    };
+    const pm: ProjectLinkedEventingMatch = { agentKey: "jira-project:mgrs:BUTCHR", rule: projRule, projectKey: "BUTCHR" };
+
+    await state.runTick([], deps, [pm]); // seeds watermark
+    membersByProject.BUTCHR = ["BUTCHR-1"];
+    await state.runTick([], deps, [pm]); // member discovered fresh, reported once, cached in THIS tick's memberFetchedByKey
+    expect(notified).toHaveLength(1);
+
+    // The member is deleted (or becomes unreadable) with NO further regular
+    // tick — Jira's batched `key in (...)` silently omits it rather than
+    // erroring. A push notification still marks it dirty.
+    membersByProject.BUTCHR = [];
+    delete world["BUTCHR-1"];
+    state.markDirty("jira:BUTCHR-1");
+    notified.length = 0;
+    await state.runDirtyPass();
+
+    expect(notified).toHaveLength(1); // exactly one unreadable transition
+    const events = (notified[0]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } }).linked.events;
+    expect(events).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: "unreadable" }]);
+
+    // Still unreadable, nothing newly dirty -> no repeat of the transition.
+    state.markDirty("jira:BUTCHR-1");
+    notified.length = 0;
+    await state.runDirtyPass();
+    expect(notified).toHaveLength(0);
+  });
 });
