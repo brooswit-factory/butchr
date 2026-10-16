@@ -1,0 +1,50 @@
+# butchr escalation capture (real, FACTORY-486 fixture)
+# issue: BUTCHR-438
+# pane: w64:p1
+# captured-at: 2026-09-26T08:23:23.554Z
+# provenance: copied verbatim from this daemon's own BUTCHR_CAPTURE_DIR corpus
+# (.captures/BUTCHR-438-escalation-20260926T082323Z.txt) — a tab-choice dialog
+# shape distinct from pane-cap-weekly-limit-real.txt: a header/checkbox line
+# ("☐ BUTCHR-438 staffing") sits between the frame's opening rule and the
+# real (multi-line) question, itself separated from the options by a blank
+# line, same as every other real dialog capture in the corpus.
+# --- pane text follows verbatim (ANSI already stripped, UNREDACTED — local disk only) ---
+
+
+  I checked where that queue actually stands right now:
+  - BUTCHR-421, 425, 432 → Done
+  - BUTCHR-433 and BUTCHR-434 → still To Do, both explicitly marked "Planning only. Do not
+    start."
+
+  So the approved queue hasn't reached 438 yet — two items ahead of it haven't even started.
+  Yet BUTCHR-438 is currently In Progress (staffed) with no release comment recorded anywhere
+  on the ticket.
+
+  A prior session of this same agent already spotted this and asked exactly this question in a
+  comment on BUTCHR-438 (comment 24214), then stopped rather than decompose against an
+  explicit "don't staff it" directive. The only reply since then was an automated
+  [butchr:stall] nag telling the agent to "act" — not an actual answer from the director.
+
+  Given that, I'm not going to decompose this into stories — doing so would override a
+  standing directive with no evidence it was lifted.
+──────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ BUTCHR-438 staffing
+
+│ BUTCHR-438 says "Capture only, don't staff it" and is queued behind BUTCHR-433/434, which
+│ are still To Do and unstarted. It's currently In Progress with no recorded release from the
+│ director. How should I proceed?
+
+❯ 1. Shelve it back to To Do (Recommended)
+     Move it back to To Do until 433/434 finish and a real release is recorded — matches the
+     ticket's own explicit instruction and the unresolved queue.
+  2. Treat it as released now
+     You (or the director) are confirming this was deliberately released early — I'll record
+     that on the ticket and proceed to decompose it into stories per the brief.
+  3. Wait for the director to answer on the ticket
+     Leave it exactly as-is, post another explicit ask, and stand_down until an actual
+     human/director response lands as a comment.
+  4. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
