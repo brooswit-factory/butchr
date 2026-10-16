@@ -9,14 +9,12 @@ import { OUTCOME_TAG } from "../../src/tools/outcome.js";
 import { workspaceStopCause } from "../../src/agents/stop-cause.js";
 
 /** Defaults for the get_doc/set_doc ops (BUTCHR-33), the label/delete ops (BUTCHR-35) and correctText (BUTCHR-60) shared by every rig() below; override per test as needed. */
-function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "getPageLabels" | "createPageWithLabel" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
+function fakeDocOps(overrides: Partial<Pick<AtlassianOps, "getProjectProperty" | "getRemoteLink" | "upsertRemoteLink" | "getChildPages" | "addLabels" | "removeLabels" | "deleteIssue" | "correctText">> = {}) {
   return {
     getProjectProperty: async () => ({ space: { key: "KAN" }, rootDoc: { id: "1" } }),
     getRemoteLink: async () => null,
     upsertRemoteLink: async () => ({ id: 1 }),
     getChildPages: async () => ({ results: [] }),
-    getPageLabels: async () => [],
-    createPageWithLabel: async () => ({ id: "999", title: "t", url: "https://x/999" }),
     addLabels: async () => ({ ok: true }),
     removeLabels: async () => ({ ok: true }),
     deleteIssue: async () => ({ ok: true }),
@@ -767,12 +765,10 @@ describe("get_doc / set_doc (BUTCHR-33): x-issue wiring", () => {
     expect(seen).toEqual(["KAN-9"]);
   });
 
-  test("get_doc never creates: a miss returns { found: false } without ever calling createPageWithLabel", async () => {
-    let createCalled = false;
-    const { tools } = customRig({ createPageWithLabel: async () => { createCalled = true; return { id: "1", title: "t", url: "https://x/1" }; } });
+  test("get_doc never creates: a miss returns { found: false }", async () => {
+    const { tools } = customRig();
     const result = await tools.get_doc!.handler({}, { headers: { "x-issue": "KAN-7" } } as any);
     expect(result).toEqual({ found: false });
-    expect(createCalled).toBe(false);
   });
 
   test("get_doc refuses when the connection has no x-issue", async () => {
@@ -1579,8 +1575,6 @@ describe("check_in (BUTCHR-67/BUTCHR-81: the project agent's own watermark check
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
@@ -1757,8 +1751,6 @@ describe("stand_down (BUTCHR-307: the issue tier's own last-act sleep declaratio
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
@@ -1914,8 +1906,6 @@ describe('get_doc_comments (BUTCHR-107/BUTCHR-109: "a project is talked to by co
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
@@ -2112,8 +2102,6 @@ describe("get_my_confluence_page / get_my_confluence_page_comments (FACTORY-996)
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
@@ -2258,8 +2246,6 @@ describe("list_peers (BUTCHR-184/BUTCHR-188: enumerate the other eligible projec
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),
@@ -2433,8 +2419,6 @@ describe("tell_peer (BUTCHR-185/BUTCHR-215: post a prefixed peer message onto a 
       getRemoteLink: async () => null,
       upsertRemoteLink: async () => ({ ok: true }),
       getChildPages: async () => ({ results: [] }),
-      getPageLabels: async () => [],
-      createPageWithLabel: async () => ({ id: "x", title: "x", url: "x" }),
       addLabels: async () => ({ ok: true }),
       removeLabels: async () => ({ ok: true }),
       deleteIssue: async () => ({ ok: true }),

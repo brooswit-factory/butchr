@@ -1080,3 +1080,85 @@ but it visibly trades against "a director is woken when anything in its
 project changes." The knob to loosen this for a managed session does not
 exist yet (see follow-ups above). Once deployed, rate-capped lines appear
 in the journal for managed sessions for the first time.
+
+## Decision 10 — Link identity and transition timestamps in the delivered notice (FACTORY-833)
+
+FACTORY-833's filer flagged two usability gaps in the coalesced
+`linkedChangeNudge` message (`src/agents/change-nudge.ts`): a line like
+`FACTORY-18 (jira-key): no longer linked` names the linked TARGET but not
+WHICH of that target's own links is meant (a ticket can sit in more than
+one chain), and a status-change line like `status changed from "Backlog"
+to "Done"` carries no indication of WHEN that transition actually
+happened, so a transition detected late (a rate-capped tick, a slow poll
+cycle) reads exactly like one that just happened. Two review rounds (PR
+#800) progressively tightened both halves of this past their first-pass
+implementation; this section describes the shipped shape.
+
+**Link identity.** `LinkedItem` (`src/resources/linked-discovery.ts`) and
+`LinkedChangeEvent` (`src/resources/types.ts`) both gained an optional
+`linkId` — the PROVIDER's own id for that specific link
+(`IssueLink.id`/`JiraRemoteLink.id`, both already present on Jira's raw
+payload, previously discarded by `parseIssueLinks` and, for a remote
+link, by `jiraKindLinkedItems`'s own `remoteKeyItems` construction — round
+1 wired the parser, round 2 caught that the actual runtime path never
+called it for remote links and fixed that separately). A kind with no
+comparable provider id (`parent`, `jira-key` member discovery, a managed
+link, any BUTCHR-437 external kind) simply never carries one —
+`linkedChangeNudge` renders `(${kind} ${linkId})` only when present,
+`(${kind})` otherwise, so every existing caller/test that never sees a
+`linkId` is unaffected.
+
+**Per-link removal, not just per-target (round 2).** `discoverLinkedItems`
+still collapses two distinct native issuelinks sharing the same `target`
+to ONE `LinkedItem` for status-diffing/fetching purposes (first
+occurrence's kind/id wins, unchanged) — a target's status is one fact
+regardless of how many links point at it. But round 1's `watchSets`
+(target → `{kind, linkId?}`) could only ever see whichever single link
+survived that collapse, so removing ONE of two distinct links to the same
+target while the other remained produced NO event (the target was still
+in `kept`), and removing both at once reported only one id. `runTick` now
+also builds `issuelinkIdsThisTick` (per issue owner, straight from
+`m.issue.issuelinks`, never from the already-collapsed `kept`) and
+persists it as `issuelinkMembership`, diffed independently by linkId —
+see that map's own doc comment in `linked-eventing.ts`. A removed-but-id-
+tracked issuelink is reported by THIS mechanism, one line per vanished
+id; the generic target-level `watchSets` removal line is suppressed only
+for an issuelink that HAD a linkId (an issuelink with none — a provider
+payload gap, or a legacy test fixture — still falls back to the generic
+line, so removal is never silently lost either way). Scoped to native
+issuelinks only: a managed link's identity is its (owner, target) pair in
+the link store, which already IS unique per target by construction, so
+this gap never existed there.
+
+**Transition timestamps (tightened in round 2).** `changeDetail`
+(`src/jira-watch/linked-eventing.ts`) names WHEN the reported field
+actually moved — not simply `after.updated`, Jira's own single field
+bumped by ANY change: round 1's first pass used it directly, which round
+2 found lets a LATER, unrelated edit (a comment or label landing while an
+earlier status transition is still held by the rate cap) overwrite the
+displayed timestamp with its own unrelated time, falsely implying the
+transition is as recent as that later edit. `runTick` now tracks
+`observedAt` per (owner, target) — THREE independent timestamps
+(`statusAt`/`summaryAt`/`commentAt`), each frozen at the tick its OWN
+field was last seen to differ from the previously observed value for
+that same field, updated immediately every tick regardless of
+rate-capping (the same "delayed, not lost" exception `lastExternalPollAt`
+already documents for a different field). `changeDetail` picks whichever
+one matches the branch that actually fires; the generic "updated" fallback
+(none of status/summary/comment differ from the baseline) has no specific
+field to shadow and uses `after.updated` directly, since that generic
+bump IS the only fact being reported. Chosen over suppressing a stale
+transition outright: suppression risks silently dropping a real,
+still-unread change a rate-capped or slow-polling owner genuinely needs
+to hear about, which this module already treats as unacceptable elsewhere
+(see the "DELAYED, NOT LOST" discipline in `linked-eventing.ts`'s own top
+comment).
+
+**Not done here:** per-link identity for a MANAGED link or a `jira-key`
+project member was not pursued — neither has a provider-issued id
+comparable to a Jira issuelink's, and both are already unique per
+(owner, target) by construction (see above), so the ambiguity this
+ticket describes does not apply to them. Whether the 2026-10-08
+observation that prompted this ticket came from a daemon running code
+older than FACTORY-9's fix (merged 2026-09-26) remains unverified — no
+fleet/daemon access from this work.

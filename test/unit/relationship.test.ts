@@ -36,7 +36,6 @@ const ROLES = { story: "acct-story", task: "acct-task", epic: "acct-epic" };
  */
 function makeWorld() {
   let nextIssueId = 100;
-  let nextPageId = 900;
   const issues = new Map<
     string,
     {
@@ -67,9 +66,6 @@ function makeWorld() {
   }
   function setProjectProperty(projectKey: string, value: unknown) {
     projectProperties.set(projectKey, value);
-  }
-  function pageUrl(id: string) {
-    return `https://fake.atlassian.net/wiki/pages/${id}`;
   }
   function requireIssue(key: string) {
     const i = issues.get(key);
@@ -199,14 +195,6 @@ function makeWorld() {
       const all = [...pages.entries()].filter(([, p]) => p.parentId === parentId).map(([id]) => id);
       const start = cursor ? Number(cursor) : 0;
       return { results: all.slice(start).map((id) => ({ id, title: pages.get(id)!.title })) };
-    },
-    getPageLabels: async (pageId: string) => pages.get(pageId)?.labels ?? [],
-    createPageWithLabel: async (p) => {
-      const titleTaken = [...pages.values()].some((pg) => pg.title === p.title);
-      if (titleTaken) throw new Error("title collision");
-      const id = String(nextPageId++);
-      pages.set(id, { parentId: p.parentId, title: p.title, body: p.body, labels: [p.label], version: 1 });
-      return { id, title: p.title, url: pageUrl(id) };
     },
     addLabels: async (key: string, labels: readonly string[]) => {
       const i = requireIssue(key);
