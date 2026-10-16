@@ -5,7 +5,7 @@ import { AGENT_HARNESSES as RULES_AGENT_HARNESSES, RULE_PERMISSION_MODES as RULE
 describe("src/rules/agent-harness.ts", () => {
   test("AGENT_HARNESSES/RULE_PERMISSION_MODES are the expected constants", () => {
     expect(AGENT_HARNESSES).toEqual(["claude", "codex", "agy"]);
-    expect(RULE_PERMISSION_MODES).toEqual(["default", "acceptEdits", "bypassPermissions", "plan", "auto"]);
+    expect(RULE_PERMISSION_MODES).toEqual(["default", "manual", "acceptEdits", "bypassPermissions", "plan", "auto"]);
   });
 
   // FACTORY-729: `rules.ts` re-exports these two constants unchanged — this
