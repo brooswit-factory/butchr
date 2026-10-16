@@ -69,10 +69,13 @@ export type SessionDefinitionVendor = (typeof SESSION_DEFINITION_VENDORS)[number
  * describes it as "Use a model classifier to approve/deny permission
  * prompts", a real per-prompt judgment, NOT a synonym for `bypassPermissions`
  * skipping every check unconditionally) — this union does not alias it to
- * anything else, and this ticket does not touch `agentLaunchConfig`'s
- * separate, pre-existing unconditional `permissionMode: "auto"` for
- * `jira-project` agents (src/agents/argv.ts) at all; that hardcode is
- * FACTORY-129's own ticket. `"bypassPermissions"` is the mode with no
+ * anything else. `agentLaunchConfig`'s own unconditional `permissionMode:
+ * "auto"` override for `jira-project` agents (src/agents/argv.ts) is
+ * already gone as of FACTORY-129 — jira-project agents now inherit
+ * `DEFAULT_PERMISSION_MODE` (`acceptEdits`) like every other agent, unless
+ * an explicit `spec.permissionMode` overrides it — this ticket does not
+ * touch that removal at all; it was FACTORY-129's own ticket.
+ * `"bypassPermissions"` is the mode with no
  * human-facing rename here either — its wire value is unchanged for
  * back-compat — but see docs/managed-sessions.md for the friendlier
  * operator-facing name ("unattended mode") this ticket gives it in prose,
