@@ -443,4 +443,40 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     }
     expect(delivered).toEqual(["jira-work:epics:" + bossKey]);
   });
+
+  test("FACTORY-488: a managed-tracked child adopted via a native Implements link produces no false 'no longer linked' — on adoption, on a later Done transition with the link intact, but a genuine subscription removal still reports removal", async () => {
+    const ownerRef = ref("jira-work-item:BUTCHR-1");
+    const targetRef = ref("jira-work-item:BUTCHR-2");
+    const store = fakeLinkStore();
+    await addLink(store, ownerRef, targetRef); // e.g. adopt_worker's own add_link, ahead of the native link landing
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world, { linkStore: store });
+
+    // Before adoption: owner has no issuelinks yet, BUTCHR-2 is managed-only.
+    const ownerBeforeAdoption = issue("BUTCHR-1");
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), ownerBeforeAdoption)], deps); // seed
+    expect(notified).toHaveLength(0);
+
+    // Adoption: Jira now carries a native Implements/outward link BUTCHR-1 -> BUTCHR-2
+    // (the boss's own implementer), with no other change to BUTCHR-2 itself.
+    const ownerAfterAdoption = issue("BUTCHR-1", { issuelinks: [{ type: "Implements", otherEnd: "outward", key: "BUTCHR-2" } as IssueLink] });
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), ownerAfterAdoption)], deps);
+    expect(notified).toHaveLength(0); // no false "no longer linked" on adoption itself
+
+    // The child transitions to Done; the Implements link stays intact.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), ownerAfterAdoption)], deps);
+    expect(notified).toHaveLength(1);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "To Do" to "Done"' }]); // reported as a status change, never "no longer linked"
+
+    // A genuine subscription removal (the Implements link is still intact in
+    // Jira) DOES still report removal — this mechanism is the only thing
+    // watching BUTCHR-2's own changes for this owner, so dropping it is a
+    // real loss of coverage, correctly surfaced.
+    await removeLink(store, ownerRef, targetRef);
+    await state.runTick([match("jira-work:task:BUTCHR-1", rule(), ownerAfterAdoption)], deps);
+    expect(notified).toHaveLength(2);
+    expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: "no longer linked" }]);
+  });
 });

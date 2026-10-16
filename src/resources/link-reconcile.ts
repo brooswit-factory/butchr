@@ -46,6 +46,7 @@
  * arrays with no duplicate watcher for the same target.
  */
 import type { JiraIssue } from "../atlassian/types.js";
+import { watchedKeys } from "../jira-watch/routes.js";
 import { isIssueKey } from "./id.js";
 import type { LinkedItem, LinkedItemKind } from "./linked-discovery.js";
 import { mergeEffectiveLinks } from "./managed-links.js";
@@ -84,12 +85,33 @@ export function jiraProjectOwnerRef(key: string): ResourceRef {
  * those are opt-in, cost-gated features of `jiraKindLinkedItems`/
  * `descriptionLinkedItems` (`src/jira-watch/linked-eventing.ts`), not
  * unconditional "native" discovery in FACTORY-4's sense (provider-native
- * structural links a search already returns for free). A key not shaped
+ * structural links a search already returns for free).
+ *
+ * FACTORY-488: an `Implements` link with `otherEnd === "outward"` (the
+ * other end on the implementer side — `watchedKeys`, src/jira-watch/
+ * routes.ts) is excluded here too, even though it is as structural as any
+ * other issuelink. `jiraKindLinkedItems` deliberately never emits a
+ * `LinkedItem` for that same link (it is routed to the boss via the
+ * separate Implements/related chain instead — see its own `routedByRelated`
+ * comment), so this module's "native/both is already represented by
+ * jiraKindLinkedItems's own output" invariant (this file's own top comment)
+ * would otherwise be false for exactly this link kind: a managed-tracked
+ * child that then gets natively Implements-linked (e.g. on adoption) would
+ * flip from "managed"-origin to "both"-origin with NEITHER side emitting a
+ * `LinkedItem` for it, vanishing from `perOwnerItems` and firing a false
+ * "no longer linked" removal event even though the link never moved.
+ * Excluding it from `nativeRefs` keeps such a target "managed"-origin
+ * forever (so `managedLinkedItems` keeps emitting it), exactly as if the
+ * native Implements link never existed for THIS module's purposes. A key not shaped
  * like a Jira issue key (defensive; Jira's own data is always well-formed)
  * is silently skipped, never thrown.
  */
 export function nativeJiraRefs(issue: Pick<JiraIssue, "key" | "issuelinks" | "parent">): ResourceRef[] {
-  const keys: string[] = [...(issue.issuelinks ?? []).map((l) => l.key), ...(issue.parent ? [issue.parent] : [])];
+  const routedByRelated = new Set(watchedKeys(issue.issuelinks ?? []));
+  const keys: string[] = [
+    ...(issue.issuelinks ?? []).map((l) => l.key).filter((k) => !routedByRelated.has(k)),
+    ...(issue.parent ? [issue.parent] : []),
+  ];
   const out: ResourceRef[] = [];
   const seen = new Set<string>();
   for (const key of keys) {
