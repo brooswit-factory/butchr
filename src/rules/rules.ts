@@ -98,6 +98,15 @@ export { AGENT_EFFORTS, type AgentEffort };
  * and a rule that falls back to Agy still gets the same silent no-op an
  * absent `permissionMode` always gave that branch. `Rule.lizardMode` below
  * is a DIFFERENT case as of FACTORY-108 — see its own doc comment.
+ *
+ * FACTORY-275: `"manual"` added alongside `"default"`, not in place of it —
+ * see `SESSION_PERMISSION_MODES`'s own doc comment
+ * (src/resources/session-definition.ts) for the full reproduction (real
+ * `claude` invocations, not `--version`/`--help`) establishing that
+ * `default` is the launcher's real canonical value and `manual` its own
+ * `--help`-advertised alias, and for why `"auto"` and `"bypassPermissions"`
+ * are deliberately left with their existing, distinct meanings here. The
+ * constant itself is edited in `./agent-harness.ts`, not here.
  */
 export { RULE_PERMISSION_MODES, type RulePermissionMode };
 

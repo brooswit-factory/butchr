@@ -33,7 +33,7 @@ const USAGE = `usage: butchr session list [--archived]
        butchr session show <name>
        butchr session create <name> --working-directory <dir> --brief <text>
                              --vendor claude|codex --tier tier1..tier5
-                             --permission-mode default|acceptEdits|bypassPermissions|plan|auto
+                             --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
                              [--role worker|sentinel] [--frozen]
