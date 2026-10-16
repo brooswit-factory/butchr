@@ -78,8 +78,12 @@ result would falsify the claim. Review the actual diff and relevant tests at
 the current commit; inspect regressions, removed assertions, data integrity and
 partial failure behavior. Reuse active reviewers rather than duplicating work.
 Test assertion counts can be non-deterministic. This inspection command yields
-a candidate to read, not a verdict:
-`git diff <base>...<head> -- test/ | grep '^-.*expect(' || true`
+a candidate to read, not a verdict — it does not assume `expect(` is the
+assertion syntax in use, and does not assume tests live under `test/`:
+`git diff <base>...<head> -- test/ tests/ '*.test.*' '**/__tests__/**' | grep -E '^-[^-]' || true`
+An empty result means no line under those paths was removed at all — verify
+the pathspec actually matched files in this diff before reading that as
+"nothing was removed"; it is not a verdict about any one assertion library.
 See docs/expect-tally-non-determinism.md for the measured limits.
 
 When assigned a review, record a substantive verdict on the explicit issue:

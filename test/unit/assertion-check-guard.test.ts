@@ -125,7 +125,17 @@ function docExists(): boolean {
 // names the diff-based check WITHOUT this exact trailing guard has
 // reintroduced the trap this ticket closed, even if the rest of the
 // sentence is intact.
-const SAFE_COMMAND = "git diff <base>...<head> -- test/ | grep '^-.*expect(' || true";
+//
+// FACTORY-901: the pathspec and grep pattern changed from the original
+// `-- test/ | grep '^-.*expect('`. That form was found to ALWAYS report
+// "clean", two independent ways, on a repo whose tests are colocated (not
+// under `test/`) and/or do not use an `expect(...)`-shaped assertion
+// library (e.g. node:assert) — an empty match from "nothing removed" and
+// an empty match from "the check doesn't apply here" are indistinguishable
+// under the old command, and it silently reports the reassuring one. The
+// replacement widens the pathspec and drops the library-specific pattern
+// in favor of listing every removed line under the matched paths.
+const SAFE_COMMAND = "git diff <base>...<head> -- test/ tests/ '*.test.*' '**/__tests__/**' | grep -E '^-[^-]' || true";
 
 // The two claims the guidance must make alongside the command — that the
 // tally is not safe to compare, and that the command's output is a prompt
