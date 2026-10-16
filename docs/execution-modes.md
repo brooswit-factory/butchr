@@ -582,8 +582,7 @@ single poll. These two fields are that per-rule throttle:
   (`LEDGER_UNSEEN_EVICTION_CALLS`) cap-withholding already relies on. But a
   rate-deferred id is explicitly EXCLUDED (PR #734 review) from every one of
   the cap's own reporting surfaces — `/health`'s `longestWait`, the
-  per-source admission census bucket (and so the `admission:withheld` Jira
-  label it feeds), and the `[admission2] cap=... withheld N/M wanted: ...`
+  per-source admission census bucket, and the `[admission2] cap=... withheld N/M wanted: ...`
   line's own count and id list — because it was never withheld BY THE CAP
   (it may have had cap headroom to spare). Those three only ever report a
   candidate the SHARED CAP actually ran out on; a rate limiter's own

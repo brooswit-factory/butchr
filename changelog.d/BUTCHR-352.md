@@ -1,5 +1,7 @@
 bump: minor
 
+Historical entry: FACTORY-1011 removes the admission-label behavior described below. Capacity admission remains independent; current worker staffing and stall remediation no longer read an admission label.
+
 ### Added
 - **`check_worker` gains a fourth staffing verdict, `"withheld"` — admission control is holding this worker at the fleet-wide agent cap, correctly, and will admit it when a slot frees (BUTCHR-352).** Previously a ticket withheld at capacity was indistinguishable from one about to be spawned or silently never spawned at all — all three read as `"not-staffed"`, and only the daemon journal (which no boss reads) separated them. The information already existed: admission control's own census already computes it every poll.
 - **Carried on a NEW, SEPARATE `admission:withheld` label — deliberately NOT a new `agent:*` value.** The fleet's daemons deploy independently, so a new-build daemon can write a new state while an old-build `checkWorker` is still reading it; a new `agent:*` value would map to a confident, wrong `"staffed"` on every not-yet-upgraded reader (any label other than `agent:none` already reads as running). A wholly separate, non-`agent:`-prefixed marker is structurally invisible to that same old code, so an unupgraded reader instead degrades to today's honest, incomplete `"not-staffed"` — never a confident wrong answer. `admission:withheld` is layered ALONGSIDE `agent:none`, never in place of it, and never alongside any other `agent:*` value.
