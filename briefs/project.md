@@ -79,9 +79,15 @@ result would falsify the claim. Review the actual diff and relevant tests at
 the current commit; inspect regressions, removed assertions, data integrity and
 partial failure behavior. Reuse active reviewers rather than duplicating work.
 Test assertion counts can be non-deterministic. This inspection command yields
-a candidate to read, not a verdict:
-`git diff <base>...<head> -- test/ | grep '^-.*expect(' || true`
-See docs/expect-tally-non-determinism.md for the measured limits.
+a candidate to read, not a verdict — it does not assume `expect(` is the
+assertion syntax in use, and it does not restrict to any test-file naming
+convention or directory (a pathspec enumerating `test/`/`tests/`/`*.test.*`
+was tried and found to still miss a mixed `.test.ts`/`.spec.ts` suite):
+`git diff <base>...<head> | grep -E '^-[^-]' || true`
+Every line it prints, including in non-test files, is a candidate to read
+by eye, not a verdict — diffs under review are small enough that reading
+the full set is cheap and reliable, unlike guessing a repo's test-file
+convention. See docs/expect-tally-non-determinism.md for the measured limits.
 
 When assigned a review, record a substantive verdict on the explicit issue:
 `[review] APPROVED <pr-url> @ <full 40-char sha>` or
