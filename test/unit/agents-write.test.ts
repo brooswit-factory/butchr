@@ -65,8 +65,6 @@ function makeOps() {
     getRemoteLink: async () => null,
     upsertRemoteLink: notImplemented("upsertRemoteLink"),
     getChildPages: notImplemented("getChildPages"),
-    getPageLabels: notImplemented("getPageLabels"),
-    createPageWithLabel: notImplemented("createPageWithLabel"),
     addLabels: async (key: string, labels: readonly string[]) => { calls.push(`addLabels:${key}:${labels.join(",")}`); const i = requireIssue(key); i.labels = [...new Set([...i.labels, ...labels])]; return { ok: true }; },
     removeLabels: async (key: string, labels: readonly string[]) => { calls.push(`removeLabels:${key}:${labels.join(",")}`); const i = requireIssue(key); const r = new Set(labels); i.labels = i.labels.filter((l) => !r.has(l)); return { ok: true }; },
     deleteIssue: notImplemented("deleteIssue"),
