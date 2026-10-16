@@ -46,7 +46,6 @@ takes effect on restart, not live), like every other provider's query.
   "permissionMode": "default",
   "execution": "swarm",
   "account": "none",
-  "role": "worker",
   "frozen": false,
   "mcpServers": [
     { "name": "mud-bridge", "type": "http", "url": "https://mud.internal/mcp", "headersEnvVar": "MUD_BRIDGE_HEADERS", "channel": true }
@@ -73,7 +72,6 @@ DEPRECATED `tier` field — e.g. `"tier": "tier1"` in place of
 | `lizardMode` | no | DROVR-42/FACTORY-67/FACTORY-138/FACTORY-108. Boolean, accepted at manifest load for BOTH vendors (no vendor rejection here, unlike `strictMcpConfig`, which is still rejected for `vendor: "codex"`). Absent → ELIGIBLE for a `vendor: "claude"` definition (the FACTORY-138 default, `lizardMode ?? (vendor === "claude")`); a `vendor: "codex"` definition stays NOT eligible when absent — the default applies to Claude only. Explicit `false` always means never scanned or touched, for either vendor. `true` turns on drovr's unattended tool-permission auto-answer (DROVR-37) for this agent's pane — see "Lizard mode" below. **For `vendor: "claude"`:** never reaches `SpawnSpec` or the launched process's argv, whether from an explicit `true` or the FACTORY-138 default — read live, every poll, by the daemon's separate permission-answer timer. **For `vendor: "codex"` (FACTORY-108):** the opposite — only an EXPLICIT `true` reaches `SpawnSpec.lizardMode` and the launch argv (dropping `--dangerously-bypass-approvals-and-sandbox` so drovr's Codex approval-answering has a dialog to see); since Codex is never eligible by default, there is no default-driven argv change to worry about. See "Codex support" below for the full asymmetry. |
 | `execution` | no | Reuses `Rule`'s `ExecutionMode` type/validation VERBATIM (`"swarm"` default). Stored, surfaced — NOT acted on by this ticket; see "Not in this version". |
 | `account` | no | Reuses `Rule`'s `AccountPolicy` type/validation verbatim (`"none"` default). BUTCHR-460: wired, same as every other provider's rule-level `account` — a `"temporary"`/`"permanent"` definition gets a Rocket.Chat account provisioned at spawn and released on stop/archive; see `docs/rocketchat-accounts.md`'s "Wiring" section. |
-| `role` | no | Reuses `Rule`'s `AgentRole` type/validation verbatim (`"worker"` default, `"sentinel"` for fleet-cap-exempt agents — e.g. Candlestix directors, MUD players). Read by the fleet-cap admission classifier — see "role -> fleet-capacity admission" below. |
 | `frozen` | no | `false` default. A frozen definition is a VALID one that simply runs no agent — see "Eligible = valid, not frozen" below. |
 | `mcpServers` | no | Additional MCP servers this agent may connect to, beyond butchr's own — see "`mcpServers`: additional MCP server bindings" below. |
 | `freezeControllers` | no | OTHER definitions (by file name, with or without `.json`) whose agent may call the butchr `freeze_session` MCP tool against THIS one. Absent/empty means nobody may. See "Delegated freeze/unfreeze" below. |
@@ -262,37 +260,6 @@ grounds to fix this table, not to distrust the reporter.
 verified read of the live file ever disagrees — nothing else in this
 codebase encodes tier names.
 
-## role -> fleet-capacity admission
-
-A definition's own `role` actually exempts its agent from the fleet
-capacity cap — a `role: "sentinel"` manifest (every Bakr/Candlestix
-definition in the S5 mapping) is not withheld by, and does not count
-toward, the admission limit, same as a rule-level `role: "sentinel"`
-already did before this ticket.
-
-Butchr's existing fleet-cap classifier, `roleOfAgent` (`src/daemon/index.ts`,
-BUTCHR-398), resolves a role from a `Rule` — but the built-in
-managed-sessions rule is ONE shared `Rule` for every heterogeneous
-definition file, so a per-file role needs a different hook than a
-per-rule lookup. That hook is `managedSessionRoles`, a
-`Map<agentKey, AgentRole>` the managed-sessions loop rebuilds every poll
-from that poll's eligible (valid, not frozen) matches — cleared and
-refilled, never merged, so a definition that goes ineligible (removed,
-edited invalid, frozen) stops being sentinel-exempt the SAME poll it drops
-out. `roleOfAgent` consults this map first for any managed-session agent
-id, before falling back to its ordinary rule-level lookup (which — for the
-built-in rule specifically — is always `"worker"`, since that rule's own
-`role` never reflects a per-file value; see
-`builtinManagedSessionsRule`'s own doc comment).
-
-**Before this loop's first poll after a daemon restart** (e.g. an
-already-running sentinel agent whose definition has not been read again
-yet), the map has no entry, and `roleOfAgent` falls back to `"worker"` —
-the SAME fail-safe default it already documents for any id it cannot
-resolve. This is a brief, one-poll-cycle window (`MANAGED_SESSIONS_POLL_MS`
-= 15s, and the loop's own fetch runs immediately on start, not only after
-the first interval), not a persistent gap.
-
 ## Eligible = valid, not frozen
 
 The built-in query's own definition of "eligible" (the ticket's own words),
@@ -368,7 +335,7 @@ usage: butchr session list [--archived]
                              --permission-mode default|manual|acceptEdits|bypassPermissions|plan|auto
                              [--execution swarm|singleton|persistent]
                              [--account none|temporary|permanent]
-                             [--role worker|sentinel] [--frozen]
+                             [--frozen]
                              [--mcp-servers <json array>]
                              [--freeze-controllers <comma-separated names>]
                              [--unfreeze-controllers <comma-separated names>]
@@ -394,7 +361,7 @@ archive directory instead (see "Archive/unarchive" below).
   shows an archived definition — pass `--archived` for that (see
   "Archive/unarchive" below).
 - **`show <name>`** is one `list` row's full detail: parsed
-  vendor/tier/role/execution (when valid; every collected problem
+  vendor/tier/execution (when valid; every collected problem
   otherwise), the resolved filesystem agent key, both freeze gates, and
   both delegated-freeze grants.
 - **`create <name> ...`** validates through `sessionDefinitionProblems` —
@@ -435,7 +402,7 @@ Butchr already had a freeze mechanism before this ticket:
 `instanceFreezeStore`, keyed `` `butchr:<agentKey>` ``; `reconcileNow`
 (`src/daemon/loop.ts`) drops a frozen id from `desired` before BOTH its
 spawn and its stop decision, unconditionally — an explicit freeze wins
-over `execution: "persistent"`/`role: "sentinel"` with no special case
+over `execution: "persistent"` with no special case
 needed there (proven at the reconcile level, not just by asserting the
 store's own value, in `test/unit/session-freeze.test.ts`). This is the
 SAME store the daemon already reads; `butchr session freeze`/`unfreeze`
@@ -915,7 +882,7 @@ neither round 1 nor round 2's own tests exercised (both tested
    agent id via `agentIdOfWorkspacePath`, which assumes the fixed
    `workspaceDirFor` 1-or-3-deep layout; a pane at an arbitrary operator
    directory returns `null` there. `runningIssues()` is what
-   `scopedHerd`/admission residency/every rule loop's own reconciliation
+   `scopedHerd`/every rule loop's own reconciliation
    is built on — a managed-session agent whose pane cwd diverged would be
    PERMANENTLY invisible to it, breaking "never run two owners for the
    same managed agent" (this ticket's own explicit requirement), not just
@@ -1008,8 +975,7 @@ expressing BOTH properties in one manifest:
   "vendor": "claude",
   "tier": "tier2",
   "permissionMode": "auto",
-  "strictMcpConfig": true,
-  "role": "sentinel"
+  "strictMcpConfig": true
 }
 ```
 
@@ -1018,10 +984,7 @@ expressing BOTH properties in one manifest:
 `strictMcpConfig: true` additionally emits `--strict-mcp-config` alongside
 `--mcp-config`, so Claude Code loads ONLY the servers in this agent's own
 `mcp.json` (butchr's own server plus any `mcpServers` this definition binds)
-— no project- or user-level `.mcp.json` discovered on top of it. `role:
-"sentinel"` is unrelated to either field but part of the directors' real
-shape (fleet-cap-exempt) — included here so the example is the complete
-faithful migration, not just the MCP/permission slice of it.
+— no project- or user-level `.mcp.json` discovered on top of it.
 
 **How this relates to `assertNoInheritedMcpConfig` (direction 2, above):**
 the two are complementary, not redundant. `assertNoInheritedMcpConfig` is
@@ -1072,8 +1035,8 @@ about a second of going `blocked` (a herdr push subscription, not just the
 itself, and everything below about the opt-in gate, is unchanged. The
 scan is still NOT a blanket sweep over every pane — the scan's own
 `eligiblePanes` hook resolves, fresh every tick, which panes are currently
-eligible (via the SAME live `managedSessionLizardModes` map BUTCHR-408's
-`roles`/BUTCHR-460's `accountPolicies` maps already established the pattern
+eligible (via the SAME live `managedSessionLizardModes` map BUTCHR-460's
+`accountPolicies` map already established the pattern
 for — rebuilt every managed-sessions poll from each eligible definition's own
 manifest, never persisted or acted on stale). Since FACTORY-138, a `vendor:
 "claude"` definition that doesn't set the field at all is ELIGIBLE by default
@@ -1492,7 +1455,7 @@ anything beyond the plain log line happen:
 2. **A "stalled" mark on `/health`**: every currently-stalled managed
    session appears in a `managedSessionEscalations` array (a SIBLING field
    on the `/health` response, the same "additive, never flips `ok`" pattern
-   `admission`/`coverage`/`unresolvedRelationships` already use —
+   `coverage`/`unresolvedRelationships` already use —
    `src/daemon/health.ts`) — `{ agentKey, definitionPath, paneId,
    fingerprint, since }` per entry. This is the status SURFACE an operator
    finds a blocked managed session on without grepping the journal first;

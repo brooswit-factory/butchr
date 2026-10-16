@@ -371,17 +371,6 @@ account for an in-place resume was never built and isn't a mechanical
 extension (see Finding 4). **C, if/when this gap is ever closed; today,
 neither.**
 
-### `role` — **A**
-
-**Evidence: source reading**, `src/rules/session-definition-type.ts`
-(`ManagedSessionResourceDeps.roles`, `discovery.search`'s fill site) and
-`src/daemon/index.ts` (`managedSessionRoles` map, `roleOfAgent`'s
-consultation of it). Rebuilt from scratch every poll from that poll's
-eligible matches; consulted only by the fleet-capacity admission classifier
-(`roleOfAgent`) to decide whether an agent counts against `config.maxAgents`.
-Never reaches argv, never persisted at spawn, no restart concept involved
-at all — a `role` edit changes admission-accounting on the very next poll.
-
 ### `frozen` — **not a restart at all; a stop (true) or a fresh spawn from cold (false)**
 
 **Evidence: source reading**, `src/rules/session-definition-type.ts`
@@ -564,21 +553,21 @@ piece of work than extending `resumeInPlace()` to more `checkArgv` reasons.
 
 Genuinely no restart, ever, for this field alone: **`lizardMode`,
 `execution`** (inert rather than meaningfully hot-reloaded — see its own
-row), **`role`, `freezeControllers`, `unfreezeControllers`,
+row), **`freezeControllers`, `unfreezeControllers`,
 `linkedEventingProjects`, `workingDirectory`, `brief`** (the last two with
 the stated "detected only as a generic nudge, not automatically applied"
 caveat).
 
-That is **8 of 17 fields** — the honest answer here is not "none," but it
+That is **7 of 16 fields** — the honest answer here is not "none," but it
 is also not "every field behaves like a true, actively-applied hot-reload":
-two of the eight (`workingDirectory`, `brief`) are A only in the narrow
+two of the seven (`workingDirectory`, `brief`) are A only in the narrow
 sense that they never force a restart; a live agent does not actually
 *receive* the new value without noticing a generic nudge and re-reading its
 own definition file itself, which the daemon does not verify happens. One
 more (`execution`) is A only because nothing reads the field yet, not
 because a live update mechanism exists. Genuinely, unconditionally
-"applied live, no restart, no caveat" is a five-field subset: `lizardMode`,
-`role`, `freezeControllers`, `unfreezeControllers`, `linkedEventingProjects`.
+"applied live, no restart, no caveat" is a four-field subset: `lizardMode`,
+`freezeControllers`, `unfreezeControllers`, `linkedEventingProjects`.
 
 ## Required finding 4: ordering/risk note for generalizing class B
 
@@ -646,7 +635,6 @@ each one actually needs closed:
 | `lizardMode` | A | A | source reading (doc comments + read site) |
 | `execution` | A (inert) | A (inert) | source reading (unread field) |
 | `account` | undetected/inert (would be C) | undetected/inert (would be C) | source reading (`account-lifecycle.ts`) |
-| `role` | A | A | source reading (`roleOfAgent` map) |
 | `frozen` | stop (true) / fresh spawn (false), not "a restart" | same | source reading (`session-freeze.ts`, `reconcileNow`) |
 | `freezeControllers` | A | A | source reading (`docs/managed-sessions.md`, tool auth check) |
 | `unfreezeControllers` | A | A | source reading (same as above) |

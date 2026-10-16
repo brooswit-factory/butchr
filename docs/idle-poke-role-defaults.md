@@ -125,7 +125,7 @@ neither existing stall mechanism is wired into the managed-sessions loop.
   .checkPinnedActive`'s doc comments (`src/daemon/loop.ts`), "Wired into
   the PROJECT loop ONLY". Also never passed to `startManagedSessionsLoop`.
 - `startManagedSessionsLoop`'s own call site and `ManagedSessionsLoopDeps`
-  (`src/daemon/session-definitions-loop.ts`) carry admission, crash-loop,
+  (`src/daemon/session-definitions-loop.ts`) carry residency, crash-loop,
   resume-waiting/resume-preserved and restored-pane-escalation hooks —
   no stall/poke hook of any kind.
 

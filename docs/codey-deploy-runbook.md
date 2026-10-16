@@ -568,34 +568,9 @@ confirmed you don't need it.
 
 ## 8. Restart-and-recovery verification (Part B step 5)
 
-Confirms: **sentinel-role agents are unaffected by the admission cap**,
-**workers are still capped**, and **agents recover with no duplicates**.
+Confirms: **agents recover with no duplicates**.
 
-### 8.1 Admission snapshot
-
-```
-curl -sf "http://127.0.0.1:$PORT/health" | jq '{cap: .admission.cap, residency: .admission.residency, sentinels: .admission.sentinels}'
-```
-
-**Expected output:** `cap` matches your `BUTCHR_MAX_AGENTS` config (check
-the unit's `Environment=` if unsure); `residency` and `sentinels` are BOTH
-non-null integers (`null` on either means no trusted census has completed
-yet post-restart — re-run after a few seconds rather than treating a
-transient `null` as a failure) and `sentinels` is reported **separately**
-from `residency` — this is BUTCHR-398's whole point: a full complement of
-sentinel agents (Nexus, the 3 directors, the MUD players once unfrozen)
-must never show up inside the capped `residency` count. **If a definition
-you know to be `role: "sentinel"` is instead inflating `residency`, STOP —
-that is exactly the regression this check exists to catch, not a fleet
-issue to route around.**
-
-**Rollback:** this alone is not a deploy-failure signal in the sense
-§3/§7 mean (nothing here justifies a code rollback) — but it IS a signal
-this deploy did not achieve what BUTCHR-396 needs; escalate rather than
-declare Part B done.
-**Evidence:** the jq output.
-
-### 8.2 No duplicate agents
+### 8.1 No duplicate agents
 
 ```
 herdr agent list --json | jq -r '.agents[].name' | sort | uniq -d
@@ -614,31 +589,6 @@ exists.
 **Evidence:** the full command output (even though expected-empty, paste
 the empty result explicitly — "I ran it and it was empty" is the evidence,
 not its absence from your report).
-
-### 8.3 Workers still capped, sentinels are not
-
-If any `role: "sentinel"` definitions are already staffed on Codey at this
-point (before BUTCHR-466's cutover work lands, likely none yet — this
-sub-step is for whenever sentinels DO exist there): confirm via
-`journalctl --user -u butchr.service` (per your OWN discovered unit name,
-`--user` always — see the trap named at the top of this document) for the
-startup line each rule logs its `role`/capacity setting at, per BUTCHR-396's
-own acceptance requirement ("a loud warning for an unflagged ticket-worker
-rule" — its absence for your rules files is itself the expected, healthy
-case).
-
-```
-journalctl --user -u butchr.service --since "-5 minutes" | grep -i "role\|sentinel\|capacity"
-```
-
-**Expected output:** no loud warnings about an unflagged ticket-worker rule
-losing its cap; any startup lines naming `role` match what each rules
-file / session definition actually declares.
-
-**Rollback:** N/A — observational.
-**Evidence:** the matched journal lines (or explicit confirmation none
-matched, if that's the correct expectation for this Codey deploy's current
-rules/definitions).
 
 ---
 
@@ -774,6 +724,3 @@ actually has to run in.
    duplicate-agent/recovery risk as any other restart for zero benefit.
    Confirmed by this document, not yet confirmed by BUTCHR-396's own
    description one way or the other.
-5. **`BUTCHR_MAX_AGENTS` on Codey's unit** — needed to sanity-check §8.1's
-   `admission.cap` reading against configuration rather than only against
-   itself.

@@ -6,7 +6,6 @@
   "permissionMode": "auto",
   "execution": "persistent",
   "account": "none",
-  "role": "sentinel",
   "frozen": true,
   "mcpServers": [
     {

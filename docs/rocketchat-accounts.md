@@ -410,8 +410,7 @@ as two hooks, `ensure`/`release`, added to `ReconcileOptions.account` and
 threaded through every rule loop (`src/daemon/index.ts`: jira-work,
 github-issue, jira-idea, zendesk-ticket, AND — BUTCHR-460 — the built-in
 managed-sessions loop) as ONE shared instance, over ONE shared
-`AccountManager` — same "fleet-wide, not per-tier" discipline
-`admissionController` already has, and for the same reason: one Rocket.Chat
+`AccountManager` — fleet-wide, not per-tier, for one reason: one Rocket.Chat
 seat budget, one store file.
 
 **Managed sessions get the identical `ensure`/`release` contract described
@@ -421,8 +420,9 @@ A managed-session definition's own `account` field (validated the same way a
 `releaseAccount` exactly like any other provider's rule-level `account` does;
 `accountPolicyOf` (`src/daemon/index.ts`) resolves it from the per-poll
 `managedSessionAccountPolicies` map (rebuilt every poll from each eligible
-definition's own `account` field — the same seam `managedSessionRoles`
-already uses for `role`) rather than from a `Rule`, since the built-in
+definition's own `account` field — the same seam
+`managedSessionLizardModes` already uses for `lizardMode`) rather than from
+a `Rule`, since the built-in
 managed-sessions rule is ONE shared `Rule` (fixed `account: "none"`) for
 every heterogeneous definition file.
 
@@ -460,9 +460,9 @@ withheld definition is picked up the FIRST poll after a restart with valid
 config, never by a later poll of the SAME still-running process.
 
 **`ensure(spec)`** runs for exactly the ids about to be spawned — the
-ordinary spawn loop's `admitted` set (already excludes every resident agent,
-BUTCHR-287) and the respawn loop's stale-argv replacement — NEVER for an
-already-running agent. `ensure` resolves to the `SpawnSpec` to actually hand
+ordinary spawn loop's own set (the residency guard already excludes every
+resident agent, BUTCHR-287) and the respawn loop's stale-argv replacement —
+NEVER for an already-running agent. `ensure` resolves to the `SpawnSpec` to actually hand
 to `herd.spawn`, augmented with `spec.rocketchatAccount` (the agent's own,
 non-secret Rocket.Chat account NAME — never a credential; see "Credential
 design, corrected" below) when the id's rule wants an account — or `null` to
@@ -817,7 +817,7 @@ reaches.
 
 ## Concurrency: both caps are check-and-reserve, not check-then-create (BUTCHR-412 review round 3, blocking)
 
-`reconcileNow` runs `ensure` for every admitted agent under ONE `Promise.all`
+`reconcileNow` runs `ensure` for every agent it is about to spawn under ONE `Promise.all`
 (`src/daemon/loop.ts`) — DIFFERENT agent keys, so `ensureAccount`'s own
 per-agent-key lock (`makeKeyedLock`) does nothing to protect a cap check
 shared ACROSS keys. A bare "read the count, compare to the threshold, then

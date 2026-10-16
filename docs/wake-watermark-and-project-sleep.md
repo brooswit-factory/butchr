@@ -548,7 +548,7 @@ net after fifteen minutes is a different sentence.
 An earlier version said a project that cannot sleep "holds its pane" from a pool
 that is the binding constraint. **Corrected: the pane is held ~15 minutes per
 wake, then reclaimed by the safety net.** Panes do come back. That materially
-changes the fleet-capacity argument in the tier's favour.
+changes the resource-footprint argument in the tier's favour.
 
 ## A watermark REGRESSION, observed
 
@@ -648,8 +648,8 @@ Separated into OBSERVED / MEANING, per this page's own convention.
 - Of every hook `ReconcileOptions` (`src/daemon/loop.ts`) already exposed,
   none had a candidate set that could ever contain this shape:
   `checkFrozenAsleep`/`checkDeclaredDone` only ever see `atRest`, which an
-  `"active"` verdict is never a member of; `checkCrashLoop`/`admission` only
-  ever see `plan.spawn`; `checkReconcileFailure` only ever sees a rejected
+  `"active"` verdict is never a member of; `checkCrashLoop` only
+  ever sees `plan.spawn`; `checkReconcileFailure` only ever sees a rejected
   operation; `checkReap` only ever sees ids with no agent at all.
 - The issue tier already had a mechanism that CAN see this shape —
   `src/agents/stalled.ts` (the idle-streak floor) paired with
@@ -699,7 +699,7 @@ permanent loss of coverage — the module's own top comment in
 `src/agents/pinned-active.ts` records the reasoning in full.
 
 **Idle does not mean stuck, and this module cannot tell the difference.** An
-agent correctly waiting on a review or a queued admission slot is, from the
+agent correctly waiting on a review is, from the
 outside, indistinguishable from one that is genuinely stuck — there is no
 signal available to build an "is it correctly waiting?" predicate from, and
 this module does not attempt one. It will sometimes speak to a healthy agent.

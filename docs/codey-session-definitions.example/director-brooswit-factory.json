@@ -7,7 +7,6 @@
   "strictMcpConfig": true,
   "execution": "persistent",
   "account": "permanent",
-  "role": "sentinel",
   "frozen": false,
   "mcpServers": [
     {

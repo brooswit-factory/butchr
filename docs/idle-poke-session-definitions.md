@@ -109,7 +109,6 @@ Worked example for a director-shaped definition:
   "permissionMode": "auto",
   "execution": "persistent",
   "account": "permanent",
-  "role": "sentinel",
   "frozen": false,
   "idlePokeMinutes": 1440
 }
@@ -126,7 +125,6 @@ Worked example for an advisor-shaped definition:
   "permissionMode": "auto",
   "execution": "persistent",
   "account": "none",
-  "role": "sentinel",
   "frozen": false,
   "idlePokeMinutes": 120
 }
@@ -143,7 +141,6 @@ Worked example for an admin-shaped definition:
   "permissionMode": "auto",
   "execution": "persistent",
   "account": "permanent",
-  "role": "sentinel",
   "frozen": false,
   "idlePokeMinutes": 240
 }
@@ -163,7 +160,6 @@ persisting by accident:
   "permissionMode": "auto",
   "execution": "persistent",
   "account": "none",
-  "role": "sentinel",
   "frozen": false,
   "idlePokeEnabled": false
 }

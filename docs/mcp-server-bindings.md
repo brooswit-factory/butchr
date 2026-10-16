@@ -277,8 +277,8 @@ string) => readonly McpServerBinding[] | undefined`. `HerdrHerd` is one flat
 instance shared by every rule of every provider (`src/daemon/index.ts`), so
 it cannot hold per-rule state itself; the caller resolves an issue id to its
 rule's current `mcpServers`. `src/daemon/index.ts` wires this exactly the
-way `roleOfAgent` (BUTCHR-398, same file) already resolves a different
-rule-level field from a running id: decode the agent key, look up the rule
+way it already resolves another rule-level field (`lizardMode`) from a
+running id: decode the agent key, look up the rule
 by `(ruleId, resourceProvider)` in the loaded `rules`, return
 `rule?.mcpServers`.
 

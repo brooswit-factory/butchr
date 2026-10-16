@@ -209,7 +209,7 @@ The instructions each agent receives (the rule's `brief`) are edited in the rule
 
 ## 6. Settings
 
-The **Settings** page shows each setting and where its value comes from: the environment, `settings.json`, or the default. You can edit a few from the page: the maximum number of agents at once (`BUTCHR_MAX_AGENTS`), the default agent provider and provider order, the default model, and the poll-staleness tolerance. Changes are written to `settings.json` and take effect after a restart (the page has a **Restart** control that works when butchr runs under its service manager). A setting that an environment variable already sets cannot be changed here, since the environment wins. The fleet cap has a hard maximum of 100.
+The **Settings** page shows each setting and where its value comes from: the environment, `settings.json`, or the default. You can edit a few from the page: the default agent provider and provider order, the default model, and the poll-staleness tolerance. Changes are written to `settings.json` and take effect after a restart (the page has a **Restart** control that works when butchr runs under its service manager). A setting that an environment variable already sets cannot be changed here, since the environment wins.
 
 ## Troubleshooting
 

@@ -40,23 +40,6 @@ existing agents running. Archived projects are excluded. The rule owns only
 Workspaces use `<BUTCHR_WORKSPACES>/jira-project/<rule>/<project>`. Open the
 agent from butchr's existing live view to chat interactively.
 
-Every `jira-project` agent is a fleet capacity **sentinel** (see
-`docs/execution-modes.md`'s `role` section): it never counts toward
-`BUTCHR_MAX_AGENTS` and is never withheld, regardless of the rule's own
-`role` field (which a `jira-project` rule need not set at all). This is a
-construction-level exception, kept deliberately — FACTORY-757 removed the
-equivalent issue-type hardcoding for `jira-work` rules (Epic/Story/Bug now
-count by default, like any other rule), but left this one in place so no
-live `jira-project` rule needs a config change to keep its current
-behaviour. A `jira-work` rule is not so lucky — an `epics`/`stories`/`bugs`-
-shaped one that relied on the old issue-type exemption DOES need an explicit
-`role: "sentinel"` now, which is exactly what FACTORY-810's upgrade-time
-migration writes once, automatically, for any such EXISTING rule it can
-recognise (never for a `jira-project` rule — this migration only ever
-classifies `jira-work` rules, since `jira-project`'s `role` is never read
-to begin with). See `docs/execution-modes.md`'s "Upgrade migration" section
-for exactly what it migrates and what it leaves alone.
-
 ## Optional external tools and messages
 
 An operator can set `mcpConfigFile` on a project rule to an absolute path such as

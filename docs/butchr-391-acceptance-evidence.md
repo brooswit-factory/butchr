@@ -12,6 +12,18 @@ a different checkout should re-run them rather than trust the pasted numbers
 verbatim (this repo's own house convention — see this repo's `CLAUDE.md`/task
 briefs on not asserting facts a reader can't verify from their own checkout).
 
+> **Historical record — the capacity half no longer exists (FACTORY-1013).**
+> This page is a dated record of BUTCHR-464's own acceptance run and is kept
+> as written, not rewritten. FACTORY-1013 removed the whole capacity
+> admission system — the fleet-wide agent cap (`BUTCHR_MAX_AGENTS`), the
+> admission controller and its withholding queue, and the per-rule `role`
+> (`worker`/`sentinel`) field. So the "Sentinel/worker role-field tests"
+> section, its mutation testing, the `role` axis of the 3x3x2 matrix, and
+> every mention of a cap or a withheld agent below describe code and tests
+> that are gone; the files and line numbers they name will not match a
+> current checkout. The `execution`/`account` half of this page (criteria 1-7
+> below, minus their `role` axis) is unaffected.
+
 ## Brief acceptance criteria (Confluence 36896769) and epic BUTCHR-391 description
 
 | # | Criterion (brief / epic) | Owning work | Evidence | Command run | Result |

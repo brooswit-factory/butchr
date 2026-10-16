@@ -83,9 +83,9 @@ Both forms answer with the same response shape (both `resource` and
 - `agents` is sorted deterministically by `ruleId` — the dropdown's own
   render order must not depend on this daemon's internal row order.
 - `label` is `<ruleId>:<resourceId>` — no title fetch, ever.
-- `live: false` (with `pane: null`) means the admission cap is currently
-  withholding this agent (BUTCHR-332) — matched and (at least intended to
-  be) staffed, but nothing is actually running yet to attach a terminal to.
+- `live` is always `true` today, and `pane` is always a real pane: the only
+  `DashboardRow` kind left is a running agent. The field is kept in the
+  response shape for callers that already read it.
 
 ### URL → resource matching
 

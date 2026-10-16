@@ -32,8 +32,6 @@ Shared (every provider):
   repo, and read once at startup (edits need a restart).
 - `BUTCHR_WORKSPACES` (default `~/butchr-workspaces`), `BUTCHR_PORT`
   (default in `.env.example`: `7717`), `HERDR_SOCKET` if not herdr's default.
-- `BUTCHR_MAX_AGENTS`: set to `1` for validation. The cap is shared across
-  every rule loop.
 - Agent provider settings as in [`agent-providers.md`](agent-providers.md).
 
 Per provider:
@@ -90,7 +88,6 @@ Startup log:
   `state: "ok"`, `consecutiveFailures: 0`, `lastError: null`. Other entries
   `enabled: false` with a `disabledReason`. `github-issue` and
   `zendesk-ticket` poll every 60 s, `jira-idea` every 15 s.
-- `admission.residency` at most `1`.
 - No `unresolvedRelationships` key and no matching startup `WARNING:` — expected
   for any rules file that loaded at all: a `childRule`/`inwardConnectionRules`
   naming an id missing from the same file is a startup load error, not a

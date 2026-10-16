@@ -346,9 +346,8 @@ sessions of two different shapes:
 - **A persistent, singleton query-agent session** — a long-lived agent that
   mostly answers questions or triages incoming work, rather than driving a
   ticket to completion. Its `workingDirectory` would typically be a WSL-home
-  path (fast I/O, no Windows-tool consumer), `role: "sentinel"` (fleet-cap
-  exempt, per `docs/managed-sessions.md`'s "role -> fleet-capacity
-  admission" section), and whatever `execution`/`permissionMode` shape a
+  path (fast I/O, no Windows-tool consumer), and whatever
+  `execution`/`permissionMode` shape a
   persistent query agent needs — **verify the exact field names/values
   against this repo's own schema doc before writing a real manifest; nothing
   here invents a value not already in that schema.**
@@ -359,8 +358,7 @@ sessions of two different shapes:
     "brief": "<placeholder: the query-agent's role>",
     "vendor": "claude",
     "tier": "tier2",
-    "permissionMode": "default",
-    "role": "sentinel"
+    "permissionMode": "default"
   }
   ```
 
