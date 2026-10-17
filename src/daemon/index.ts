@@ -162,6 +162,22 @@ if (process.argv[2] === "rules") {
   process.exit(await runRulesCli(process.argv.slice(3)));
 }
 
+// local/ui: `butchr link` and `butchr session` went with managed links and
+// managed sessions. They, and any other unknown subcommand, are refused here,
+// before any startup side effect: the daemon takes no arguments, so without
+// this `butchr link list` would start it (or collide with a running one's port).
+const REMOVED_SUBCOMMANDS: Readonly<Record<string, string>> = { link: "managed links", session: "managed sessions" };
+const unknownSubcommand = process.argv[2];
+if (unknownSubcommand !== undefined && !unknownSubcommand.startsWith("-")) {
+  const removedWith = REMOVED_SUBCOMMANDS[unknownSubcommand];
+  console.error(
+    removedWith
+      ? `butchr ${unknownSubcommand}: removed along with ${removedWith}.`
+      : `butchr: unknown command "${unknownSubcommand}". Run butchr with no arguments to start the daemon, or butchr rules check [file].`,
+  );
+  process.exit(2);
+}
+
 // BUTCHR-346: installed before anything else in this file ever logs — every
 // `log:`/`deps.log` seam below that defaults to or directly calls
 // `console.error` resolves that reference at CALL time, so this single

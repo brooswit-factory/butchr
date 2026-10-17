@@ -89,6 +89,16 @@ export function rulesPageReducer(state: RulesPageState | null, action: RulesPage
   }
 }
 
+/**
+ * An unsaved draft outlives this page while the app stays open. Going to
+ * another page (the nav, or Back/Forward) unmounts this route, and the draft
+ * would otherwise go with it. Keyed by the rules API it was made against, so
+ * each test, and each reload, starts clean. A reload or closing the tab is
+ * covered by the beforeunload warning instead. Kept only while there are
+ * unsaved changes, with the cards that were open.
+ */
+const keptDrafts = new WeakMap<RulesApi, { page: RulesPageState; modes: Record<string, RuleCardMode> }>();
+
 /** Why Review and save can't be pressed right now, or `null`. */
 export function saveBlockedReason(summary: DraftSummary, opts: { canWrite: boolean; reloadPending: boolean }): string | null {
   if (!summary.dirty) return "Make a change to save.";
@@ -135,8 +145,8 @@ export function RulesTargetingRoute({ api = rulesApi }: RulesTargetingRouteProps
   const poll = useRules(api);
   const [capabilitiesChecked, setCapabilitiesChecked] = useState(false);
   const [catalog, setCatalog] = useState<readonly RuleFormCatalogEntry[] | null>(null);
-  const [page, dispatchPage] = useReducer(rulesPageReducer, null);
-  const [modes, setModes] = useState<Record<string, RuleCardMode>>({});
+  const [page, dispatchPage] = useReducer(rulesPageReducer, null, () => keptDrafts.get(api)?.page ?? null);
+  const [modes, setModes] = useState<Record<string, RuleCardMode>>(() => keptDrafts.get(api)?.modes ?? {});
   const [allCollapsed, setAllCollapsed] = useState(false);
   const [justAdded, setJustAdded] = useState<string | null>(null);
   const [discardKey, setDiscardKey] = useState<string | null>(null);
@@ -196,6 +206,11 @@ export function RulesTargetingRoute({ api = rulesApi }: RulesTargetingRouteProps
 
   const summary = useMemo(() => (page ? summarizeDraft(page.draft) : null), [page]);
   const dirty = summary?.dirty ?? false;
+
+  useEffect(() => {
+    if (page && dirty) keptDrafts.set(api, { page, modes });
+    else keptDrafts.delete(api);
+  }, [api, page, modes, dirty]);
 
   useEffect(() => {
     if (!dirty) return;

@@ -195,6 +195,23 @@ const PULL_ACTIVITY_PREFIX = "pr-activity/1";
 
 /** How many submitted reviews one request reads — far more than any one PR collects, so a new one always changes the count. */
 const PULL_REVIEWS_PER_PAGE = 100;
+/** The most review pages followed one `next` at a time, when GitHub sends no `rel="last"` link to jump to. */
+const PULL_REVIEW_PAGE_CAP = 50;
+
+/** A `Link` header's URLs by rel (`next`, `last`, …). */
+function parseLinkHeader(header: string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(",")) {
+    const m = /<([^>]+)>\s*;\s*rel="([^"]+)"/.exec(part.trim());
+    if (m) for (const rel of m[2]!.split(/\s+/)) out[rel] = m[1]!;
+  }
+  return out;
+}
+
+/** Pagination links are only followed back to the GitHub API itself. */
+function isGithubApiUrl(url: string): boolean {
+  try { return new URL(url).origin === "https://api.github.com"; } catch { return false; }
+}
 
 /** A ticket PR's comparable activity: conversation comments, inline review comments and submitted reviews, plus the ETag the next conditional GET sends. */
 export interface PullActivity {
@@ -262,21 +279,46 @@ export async function pollGithubPullActivity(target: string, priorFingerprint: s
     return { status: "error" };
   }
   if (!isCount(pull.comments) || !isCount(pull.review_comments)) return { status: "error" };
-  let reviewsRes: Response;
-  try {
-    reviewsRes = await get(`${base}/reviews?per_page=${PULL_REVIEWS_PER_PAGE}`);
-  } catch {
-    return { status: "error" };
+  const readReviews = async (url: string): Promise<{ count: number; links: Record<string, string> } | null> => {
+    let r: Response;
+    try {
+      r = await get(url);
+    } catch {
+      return null;
+    }
+    if (!r.ok) { await drain(r); return null; }
+    let body: unknown;
+    try {
+      body = await r.json();
+    } catch {
+      return null;
+    }
+    return Array.isArray(body) ? { count: body.length, links: parseLinkHeader(r.headers.get("link")) } : null;
+  };
+  // GitHub lists reviews oldest first, PULL_REVIEWS_PER_PAGE to a page, so all
+  // of them are counted, or the 101st would never register. The last page is
+  // enough (the full pages before it are numbered); without a `rel="last"`
+  // link, follow `next`.
+  const first = await readReviews(`${base}/reviews?per_page=${PULL_REVIEWS_PER_PAGE}`);
+  if (!first) return { status: "error" };
+  let reviews = first.count;
+  const lastUrl = first.links.last;
+  const lastPage = lastUrl && isGithubApiUrl(lastUrl) ? Number(new URL(lastUrl).searchParams.get("page")) : Number.NaN;
+  if (Number.isInteger(lastPage) && lastPage > 1) {
+    const last = await readReviews(lastUrl!);
+    if (!last) return { status: "error" };
+    reviews = (lastPage - 1) * PULL_REVIEWS_PER_PAGE + last.count;
+  } else {
+    let next = first.links.next;
+    for (let pages = 1; next; pages++) {
+      if (pages >= PULL_REVIEW_PAGE_CAP || !isGithubApiUrl(next)) return { status: "error" };
+      const page = await readReviews(next);
+      if (!page) return { status: "error" };
+      reviews += page.count;
+      next = page.links.next;
+    }
   }
-  if (!reviewsRes.ok) { await drain(reviewsRes); return { status: "error" }; }
-  let reviews: unknown;
-  try {
-    reviews = await reviewsRes.json();
-  } catch {
-    return { status: "error" };
-  }
-  if (!Array.isArray(reviews)) return { status: "error" };
-  return { status: "ok", fingerprint: formatPullActivityFingerprint({ comments: pull.comments, reviewComments: pull.review_comments, reviews: reviews.length, etag }) };
+  return { status: "ok", fingerprint: formatPullActivityFingerprint({ comments: pull.comments, reviewComments: pull.review_comments, reviews, etag }) };
 }
 
 // ---------------------------------------------------------------------------

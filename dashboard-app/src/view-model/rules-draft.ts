@@ -26,7 +26,7 @@ export interface PreferenceDraft {
 }
 
 export interface RuleDraft {
-  /** Stable client key: the saved rule's id, or `draft-<n>` for a rule that only exists in this draft. */
+  /** Stable client key: the saved rule's id, or `new:<n>` for a rule that only exists in this draft (a colon can't appear in a rule id, so the two never collide). */
   key: string;
   isNew: boolean;
   id: string;
@@ -118,7 +118,8 @@ const EDITABLE_FIELDS: readonly EditableField[] = [
 export const BUILTIN_BRIEF_PREFIX = "@builtin:";
 export const DEFAULT_BRIEF = "@builtin:task";
 
-export const DRAFT_KEY_PREFIX = "draft-";
+/** `:` is outside the rule-id alphabet (`isRuleId`), so a new rule's key can never equal a saved rule's id (which is its key). */
+export const DRAFT_KEY_PREFIX = "new:";
 
 /** Same rule as the server's `isRuleId` (`src/rules/agent-key.ts`), restated because that module's value imports reach `node:path`, which the browser bundle cannot load. */
 const RULE_ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

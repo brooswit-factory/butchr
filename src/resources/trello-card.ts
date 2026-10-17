@@ -40,6 +40,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import type { FetchLike } from "../labels/pr.js";
+import { expandHomePath } from "../config/home-path.js";
 import { formatTrelloCardRef, isTrelloId, type TrelloCardRef } from "./trello-card-ref.js";
 
 export interface TrelloCard {
@@ -117,9 +118,11 @@ export function loadTrelloAuth(env: TrelloAuthEnv, io: TrelloCredentialFileIo = 
   const boardId = env.TRELLO_BOARD_ID?.trim();
   if (!boardId) return { ok: false, reason: "set TRELLO_BOARD_ID" };
   if (!isTrelloId(boardId)) return { ok: false, reason: `TRELLO_BOARD_ID must be a 24-character Trello board id, got ${JSON.stringify(boardId)}` };
-  const key = readCredentialFile("TRELLO_API_KEY_FILE", env.TRELLO_API_KEY_FILE?.trim(), io);
+  // `~/` expanded, the same paths Settings writes the key and token to (`resolveCredentialTarget`).
+  const fileOf = (raw: string | undefined) => { const p = raw?.trim(); return p ? expandHomePath(p, env) : undefined; };
+  const key = readCredentialFile("TRELLO_API_KEY_FILE", fileOf(env.TRELLO_API_KEY_FILE), io);
   if (!key.ok) return { ok: false, reason: key.reason };
-  const token = readCredentialFile("TRELLO_TOKEN_FILE", env.TRELLO_TOKEN_FILE?.trim(), io);
+  const token = readCredentialFile("TRELLO_TOKEN_FILE", fileOf(env.TRELLO_TOKEN_FILE), io);
   if (!token.ok) return { ok: false, reason: token.reason };
   return { ok: true, boardId, apiKey: key.value, token: token.value };
 }

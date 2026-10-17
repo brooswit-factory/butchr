@@ -132,6 +132,21 @@ describe("opsAlertLine (FACTORY-630) — one safe journal line", () => {
     expect(opsAlertLine(noRemedy, "servyboi")).toInclude("remedy: (none stated)");
   });
 
+  // Synthetic values only. A credential split across a line break must be redacted whole: redaction runs before newlines become the ⏎ marker.
+  for (const [label, text, secret] of [
+    ["a Bearer token on the next line", "refresh failed: Authorization: Bearer\nc2VjcmV0MTIz", "c2VjcmV0MTIz"],
+    ["a KEY= value on the next line", "env dump: API_TOKEN=\nshortsecret", "shortsecret"],
+  ] as const) {
+    test(`alert reason and recovery note: ${label} never reaches the line, and the line stays one line`, () => {
+      const alert = opsAlertLine({ ...ALERT, reason: text }, "servyboi");
+      const cleared = opsRecoveryLine({ key: "k", condition: "c", subject: "s", note: text }, "servyboi");
+      for (const line of [alert, cleared]) {
+        expect(line).not.toInclude(secret);
+        expect(line).not.toInclude("\n");
+      }
+    });
+  }
+
   test("the cleared line is short and redacts its note too", () => {
     const line = opsRecoveryLine({ key: "k", condition: "c", subject: "s", note: "token ghp_FAKESECRETTOKENabcdef1234567890 rotated" }, "servyboi");
     expect(line).not.toInclude("ghp_FAKESECRETTOKENabcdef1234567890");

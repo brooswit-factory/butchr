@@ -60,6 +60,21 @@ describe("Settings: grouped daemon settings", () => {
     expect(view.getByTestId("cr-restart-banner").textContent).toContain("You changed the agent cap.");
   });
 
+  test("after a save, putting the old value back can be saved too (the daemon still reports its startup value until a restart)", async () => {
+    const { view, writes } = mount();
+    const input = await view.findByTestId("sg-input-BUTCHR_POLL_STALE_MS");
+    const save = view.getByTestId("sg-save-BUTCHR_POLL_STALE_MS") as HTMLButtonElement;
+    setText(input, "70000");
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(view.getByTestId("sg-result-BUTCHR_POLL_STALE_MS").textContent).toContain("Saved."));
+    await waitFor(() => expect(save.disabled).toBe(true)); // 70000 is now the saved value
+    setText(input, "60000");
+    await waitFor(() => expect(save.disabled).toBe(false));
+    fireEvent.click(save);
+    await waitFor(() => expect(writes).toEqual([["BUTCHR_POLL_STALE_MS", "70000", false], ["BUTCHR_POLL_STALE_MS", "60000", false]]));
+  });
+
   test("a value past the daemon's safety ceiling asks to save anyway, then saves with the confirm", async () => {
     const { view, writes } = mount({ nextWriteError: new SettingsWriteRefusedError("BUTCHR_MAX_AGENTS above 32 needs a confirm", true) });
     setText(await view.findByTestId("sg-input-BUTCHR_MAX_AGENTS"), "40");

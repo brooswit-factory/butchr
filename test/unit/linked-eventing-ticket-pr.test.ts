@@ -37,14 +37,20 @@ const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
 const match = (r: Rule, i: JiraIssue): LinkedEventingMatch => ({ agentKey: `jira-work:task:${i.key}`, rule: r, issue: i });
 
 /** A controllable GitHub PR: its activity counts, current ETag (304 when the request's If-None-Match matches), or a forced status. */
-function fakePrApi(state: { comments: number; reviewComments: number; reviews: number; etag: string; status?: number; reviewsStatus?: number }) {
+function fakePrApi(state: { comments: number; reviewComments: number; reviews: number; etag: string; status?: number; reviewsStatus?: number; links?: "last" | "next-only"; linkOrigin?: string }) {
   const calls: Array<{ url: string; ifNoneMatch: string | undefined }> = [];
   const fetchImpl: FetchLike = async (url, init) => {
     const ifNoneMatch = (init?.headers as Record<string, string> | undefined)?.["if-none-match"];
     calls.push({ url, ifNoneMatch });
     if (url.includes("/reviews?")) {
       if (state.reviewsStatus && state.reviewsStatus !== 200) return new Response("x", { status: state.reviewsStatus });
-      return new Response(JSON.stringify(Array.from({ length: state.reviews }, (_, id) => ({ id }))), { status: 200 });
+      // Pages of 100, oldest first, with GitHub's Link header (rel="next", and rel="last" unless "next-only").
+      const page = Number(new URL(url).searchParams.get("page") ?? "1");
+      const pages = Math.max(1, Math.ceil(state.reviews / 100));
+      const items = Array.from({ length: Math.max(0, Math.min(100, state.reviews - (page - 1) * 100)) }, (_, i) => ({ id: (page - 1) * 100 + i }));
+      const at = (n: number) => `${state.linkOrigin ?? "https://api.github.com"}/repos/example-org/widgets/pulls/547/reviews?per_page=100&page=${n}`;
+      const links = page < pages ? [`<${at(page + 1)}>; rel="next"`, ...(state.links === "next-only" ? [] : [`<${at(pages)}>; rel="last"`])] : [];
+      return new Response(JSON.stringify(items), { status: 200, headers: links.length ? { link: links.join(", ") } : {} });
     }
     if (state.status && state.status !== 200) return new Response("x", { status: state.status });
     if (ifNoneMatch === state.etag) return new Response(null, { status: 304 });
@@ -261,6 +267,24 @@ describe("pollGithubPullActivity", () => {
     expect(v.status).toBe("ok");
     expect(parsePullActivityFingerprint(v.status === "ok" ? v.fingerprint : "")).toEqual({ comments: 4, reviewComments: 2, reviews: 3, etag: '"e"' });
     expect(pr.calls.map((c) => c.url)).toEqual([`https://api.github.com/repos/example-org/widgets/pulls/547`, `https://api.github.com/repos/example-org/widgets/pulls/547/reviews?per_page=100`]);
+  });
+  test("counts reviews past the first page: 100 -> 101 is one new review (two reads: page 1, then the last page)", async () => {
+    const pr = fakePrApi({ comments: 0, reviewComments: 0, reviews: 101, etag: '"e2"' });
+    const v = await pollGithubPullActivity(TARGET, null, pr.deps);
+    expect(v.status === "ok" && parsePullActivityFingerprint(v.fingerprint)?.reviews).toBe(101);
+    expect(pr.calls.filter((c) => c.url.includes("/reviews?")).map((c) => c.url)).toEqual([
+      "https://api.github.com/repos/example-org/widgets/pulls/547/reviews?per_page=100",
+      "https://api.github.com/repos/example-org/widgets/pulls/547/reviews?per_page=100&page=2",
+    ]);
+    const before = formatPullActivityFingerprint({ comments: 0, reviewComments: 0, reviews: 100, etag: '"e1"' });
+    expect(ticketPullRequestActivityDetail(TARGET, before, v.status === "ok" ? v.fingerprint : "")).toContain("got 1 new review");
+  });
+  test("without a rel=last link it follows rel=next, and a link off api.github.com is never followed", async () => {
+    const v = await pollGithubPullActivity(TARGET, null, fakePrApi({ comments: 0, reviewComments: 0, reviews: 250, etag: '"e"', links: "next-only" }).deps);
+    expect(v.status === "ok" && parsePullActivityFingerprint(v.fingerprint)?.reviews).toBe(250);
+    const elsewhere = fakePrApi({ comments: 0, reviewComments: 0, reviews: 150, etag: '"e"', links: "next-only", linkOrigin: "https://example.com" });
+    expect(await pollGithubPullActivity(TARGET, null, elsewhere.deps)).toEqual({ status: "error" });
+    expect(elsewhere.calls.some((c) => c.url.startsWith("https://example.com"))).toBe(false);
   });
   test("conditional on the prior ETag: 304 is not-modified", async () => {
     const pr = fakePrApi({ comments: 0, reviewComments: 0, reviews: 0, etag: '"e"' });

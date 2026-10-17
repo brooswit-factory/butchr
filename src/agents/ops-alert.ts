@@ -21,7 +21,7 @@
  */
 import { redact } from "./escalate.js";
 import { RateCap, HOUR_MS } from "./escalation-helper.js";
-import { sanitizeForJournal, truncateField } from "./journal-text.js";
+import { flattenNewlines, stripControlChars, truncateField } from "./journal-text.js";
 
 /** Greppable prefix for every journal line this module writes — distinct from `[butchr:credential-dead]` (the CONDITION's own line, written by the detector). */
 export const OPS_ALERT_MARKER = "[butchr:ops-alert]";
@@ -93,10 +93,16 @@ const REASON_CAP = 2000;
 const REMEDY_CAP = 400;
 const NOTE_CAP = 600;
 
-/** One field, made safe for a single journal line: control characters stripped, newlines flattened (so a field can't forge a second marker line), secrets redacted where asked, then capped. */
+/**
+ * One field, made safe for a single journal line, in this order: control
+ * characters stripped; secrets redacted where asked, BEFORE newlines are
+ * flattened, so a credential split across a line break (`Bearer\n<token>`)
+ * is still caught whole; newlines flattened, so a field can't forge a second
+ * marker line; then capped.
+ */
 function field(raw: string, cap: number, redactSecrets = false): string {
-  const flat = sanitizeForJournal(raw);
-  return truncateField(redactSecrets ? redact(flat) : flat, cap);
+  const stripped = stripControlChars(raw);
+  return truncateField(flattenNewlines(redactSecrets ? redact(stripped) : stripped), cap);
 }
 
 /** The alert line. Exported for the tests, which assert on the exact text that would be logged. */

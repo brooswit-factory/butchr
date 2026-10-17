@@ -1018,6 +1018,21 @@ describe("planRuleWrite (report-only)", () => {
     expect(plan.ok).toBe(false);
   });
 
+  test("local/ui: a dry run that edits the placeholder query AND turns the rule on plans the rule as it would be: allowed, and measured on the new query", async () => {
+    seed([{ ...UI_RULE, enabled: false, query: PLACEHOLDER_QUERY }]);
+    const asked: string[] = [];
+    const plan = await planRuleWrite("ui-first-rule", { query: "project = NEW", enabled: true }, false, async (_id, q) => { asked.push(q); return 3; }, { env: env() });
+    expect(plan.ok).toBe(true);
+    if (plan.ok) {
+      expect(plan.spawned).toBe(1);
+      expect(plan.scope).toBe(3);
+    }
+    expect(asked).toEqual(["project = NEW"]);
+    // Turning it on while the edit still leaves the placeholder is refused as before.
+    const still = await planRuleWrite("ui-first-rule", { query: PLACEHOLDER_QUERY, enabled: true }, false, async () => 1, { env: env() });
+    expect(still.ok).toBe(false);
+  });
+
   // FACTORY-730: planning (and, per the other tests in this file, applying)
   // a write to a non-`ui-` rule id is accepted — the route-level prefix
   // gate is retired. `managers` is seeded `enabled: true`, so a `query`

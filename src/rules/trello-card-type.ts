@@ -184,6 +184,8 @@ export function specForTrelloCard({ agentKey, rule, card }: TrelloCardMatch): Sp
     parent: null,
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -196,6 +198,8 @@ export function specForTrelloCardQuery(rule: Rule, agentKey: string): SpawnSpec 
     parent: null,
     brief: rule.brief,
     ...(rule.agentPreferences ? { agents: rule.agentPreferences } : {}),
+    ...(rule.permissionMode ? { permissionMode: rule.permissionMode } : {}),
+    ...(rule.lizardMode ? { lizardMode: true } : {}),
   };
 }
 
@@ -267,7 +271,8 @@ export function createTrelloCardEventRules(deps: Pick<TrelloCardResourceDeps, "c
           const pair = relatedDiff.pairFor(key);
           const entry = relatedEntry(key);
           if (!pair || !entry?.watchers.includes(watcher)) return { deliver: false };
-          return decideTrelloCard(pair.from.card, pair.to.card, deps, key);
+          // The query agent watching this card: its own comment was recorded under its own key, not the card's.
+          return decideTrelloCard(pair.from.card, pair.to.card, deps, watcher);
         },
       };
     },

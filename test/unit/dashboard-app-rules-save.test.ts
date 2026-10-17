@@ -4,7 +4,7 @@
  * fixtures API, which replays the real server's plan/confirm gates.
  */
 import { describe, expect, test } from "bun:test";
-import { createFixturesRulesApi, RateLimitError, type RuleDto, type RulePlanResponse } from "../../dashboard-app/src/api/rules.js";
+import { createFixturesRulesApi, PLACEHOLDER_QUERY, RateLimitError, type RuleDto, type RulePlanResponse } from "../../dashboard-app/src/api/rules.js";
 import { computeRuleChanges, initialDraftState, newDraftKey, rulesDraftReducer, type RulesDraftAction, type RulesDraftState } from "../../dashboard-app/src/view-model/rules-draft.js";
 import { changeTitle, describeError, impactText, needsAttention, planDrift, reviewChanges, saveChanges, savedBriefs } from "../../dashboard-app/src/view-model/rules-save.js";
 
@@ -41,6 +41,23 @@ async function setup(rules: RuleDto[], actions: RulesDraftAction[], opts: Parame
 }
 
 describe("reviewChanges", () => {
+  test("an edited rule's enable is reviewed against its new query: a placeholder rule given a real query and turned on can be saved, and the save doesn't drift", async () => {
+    const { api, state, etag } = await setup(
+      [rule({ query: PLACEHOLDER_QUERY })],
+      [{ type: "edit", key: "triage", changes: { query: "project = B", enabled: true } }],
+      { previews: { triage: { total: 4, tickets: [] } as never }, previewsByQuery: { "triage:project = B": { total: 4, tickets: [] } as never } },
+    );
+    const changes = computeRuleChanges(state);
+    expect(changes.map((c) => c.kind)).toEqual(["update", "enable"]);
+    const reviewed = await reviewChanges(api, changes);
+    const enable = reviewed.find((r) => r.change.kind === "enable")!;
+    expect(enable.error).toBeUndefined();
+    expect(enable.plan?.scopeCount).toBe(4);
+    const outcome = await saveChanges(api, reviewed, etag);
+    expect(outcome.steps.map((s) => [s.change.kind, s.status, s.error ?? null])).toEqual([["update", "saved", null], ["enable", "saved", null]]);
+    expect(outcome.allSaved).toBe(true);
+  });
+
   test("dry-runs every step without writing anything", async () => {
     const { api, state } = await setup(
       [rule(), rule({ id: "old" })],

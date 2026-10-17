@@ -19,8 +19,11 @@ import {
   TRELLO_RISK_ACK_VALUE,
   trelloCardStaffing,
   trelloRuleQueryProblems,
+  specForTrelloCard,
+  specForTrelloCardQuery,
   type TrelloCardMatch,
 } from "../../src/rules/trello-card-type.js";
+import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { Refusal } from "../../src/tools/outcome.js";
 import { trelloCardTools } from "../../src/tools/trello-card.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
@@ -121,6 +124,19 @@ describe("trello-card change notices", () => {
     expect(await decide(card(), card({ updated: "2026-10-16T11:00:00.000Z" }), [{ id: "c0", created: "2026-10-16T09:00:00.000Z" }])).toEqual({ deliver: false });
   });
 
+  test("the query agent watching a card isn't nudged about its own comment: suppression checks the watcher, not the card's key", async () => {
+    const QUERY = "trello-card:ready:%40query";
+    const relSnap = (c: TrelloCard) => ({ primary: [], related: [{ issue: unit(c), watchers: [QUERY] }] });
+    const writers: string[] = [];
+    const rulesForEvents = createTrelloCardEventRules({
+      comments: async () => [{ id: "c9", created: "2026-10-16T10:59:00.000Z", authorId: null, body: "[butchr ready] done" }],
+      suppress: (_ref, _updated, writer) => { writers.push(writer); return writer === QUERY; },
+    });
+    const poll = await rulesForEvents.poll(relSnap(card()), relSnap(card({ updated: "2026-10-16T11:00:00.000Z" })));
+    expect(await poll.decide(key, QUERY, "related")).toEqual({ deliver: false });
+    expect(writers).toEqual([QUERY]);
+  });
+
   test("the nudge names the tool and never a list name", () => {
     expect(trelloCardNudge(REF, { status: { from: READY, to: DOING } })).toBe(`[butchr] Trello card ${REF} moved to another list — re-read it with trello_get_card.`);
     expect(trelloCardNudge(REF, { summary: true })).toBe(`[butchr] Trello card ${REF} had its name edited — re-read it with trello_get_card.`);
@@ -170,6 +186,30 @@ describe("trello-card agents", () => {
     const archived = tools({ closed: true });
     await expect(archived.t.trello_add_comment!.handler({ text: "x" }, caller as never)).rejects.toBeInstanceOf(Refusal);
     expect(archived.posted).toEqual([]);
+  });
+});
+
+describe("trello-card spawn specs keep the rule's permission settings", () => {
+  const [strict] = parseRules({ rules: [{ id: "strict", resourceProvider: "trello-card", query: "docs", brief: "b", permissionMode: "plan", lizardMode: true }] });
+  const cardKey = encodeAgentKey({ resourceProvider: "trello-card", ruleId: "strict", resourceId: REF });
+  const specs = {
+    card: specForTrelloCard({ agentKey: cardKey, rule: strict!, card: card() }),
+    query: specForTrelloCardQuery(strict!, "trello-card:strict:%40query"),
+  };
+
+  for (const [kind, spec] of Object.entries(specs)) {
+    test(`${kind} agent: permissionMode and lizardMode reach the spec and the launch, never the more permissive default`, () => {
+      expect(spec).toMatchObject({ permissionMode: "plan", lizardMode: true });
+      expect(agentLaunchConfig(spec, "/w", "pane", "worker", { provider: "claude" })).toMatchObject({ permissionMode: "plan" });
+      expect(agentLaunchConfig(spec, "/w", "pane", "worker", { provider: "codex" })).toMatchObject({ bypassApprovalsAndSandbox: false });
+    });
+  }
+
+  test("a rule that sets neither leaves both out, so butchr's launch defaults apply", () => {
+    const [plain] = parseRules({ rules: [{ id: "plain", resourceProvider: "trello-card", query: "docs", brief: "b" }] });
+    const spec = specForTrelloCardQuery(plain!, "trello-card:plain:%40query");
+    expect(spec.permissionMode).toBeUndefined();
+    expect(spec.lizardMode).toBeUndefined();
   });
 });
 

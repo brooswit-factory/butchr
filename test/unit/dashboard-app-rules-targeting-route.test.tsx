@@ -5,7 +5,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { EditorView } from "@codemirror/view";
-import { MemoryRouter } from "react-router";
+import { Link, MemoryRouter, Route, Routes, useNavigate } from "react-router";
 import { withDom } from "../setup/happy-dom.js";
 import { createFixturesRulesApi, FIXTURE_BUILTIN_BRIEFS, type RuleDto } from "../../dashboard-app/src/api/rules.js";
 import { RulesTargetingRoute, rulesPageReducer, saveBlockedReason, type RulesPageState } from "../../dashboard-app/src/routes/RulesTargetingRoute.js";
@@ -91,6 +91,43 @@ describe("RulesTargetingRoute", () => {
     expect(live.getByText("lizard mode")).toBeTruthy();
     expect(view.getByTestId("rules-save-bar").textContent).toContain("No unsaved changes");
     expect((view.getByTestId("rules-review-save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("unsaved edits survive going to another page and coming back, through a nav link and through Back", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0 });
+    function BackButton() {
+      const navigate = useNavigate();
+      return <button type="button" data-testid="go-back" onClick={() => void navigate(-1)}>Back</button>;
+    }
+    const view = render(
+      <MemoryRouter initialEntries={["/rules"]}>
+        <nav>
+          <Link to="/agents" data-testid="nav-agents">Agents</Link>
+          <Link to="/rules" data-testid="nav-rules">Rules</Link>
+          <BackButton />
+        </nav>
+        <Routes>
+          <Route path="/rules" element={<RulesTargetingRoute api={api} />} />
+          <Route path="/agents" element={<p data-testid="agents-page">agents</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const card = await cardFor(view, "triage");
+    await waitFor(() => expect((card.getByTestId("rule-edit") as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(card.getByTestId("rule-edit"));
+    await setQuery(card, "project = KEPT");
+    await waitFor(() => expect(card.getByTestId("rule-status-tag").textContent).toBe("Modified"));
+
+    fireEvent.click(view.getByTestId("nav-agents"));
+    await view.findByTestId("agents-page");
+    fireEvent.click(view.getByTestId("nav-rules"));
+    await waitFor(() => expect(view.getByTestId("rules-save-bar").textContent).toContain("1 rule with unsaved changes (1 edited)"));
+    expect((await cardFor(view, "triage")).getByTestId("rule-status-tag").textContent).toBe("Modified");
+
+    fireEvent.click(view.getByTestId("nav-agents"));
+    await view.findByTestId("agents-page");
+    fireEvent.click(view.getByTestId("go-back"));
+    await waitFor(() => expect(view.getByTestId("rules-save-bar").textContent).toContain("1 rule with unsaved changes (1 edited)"));
   });
 
   test("edit a query inline, review what it matches, and save it", async () => {

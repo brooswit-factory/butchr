@@ -48,6 +48,11 @@ async function staffingKeys(api: RulesApi, ruleId: string, plan: RulePlanRespons
 /** Sequential on purpose: these are cheap, and it keeps the rate limiter out of the way. */
 export async function reviewChanges(api: RulesApi, changes: readonly RuleChange[], signal?: AbortSignal): Promise<ReviewedChange[]> {
   const reviewed: ReviewedChange[] = [];
+  // An enable is saved after the same rule's field update, so it's reviewed
+  // against the rule as that update leaves it (its new query, above all), not
+  // the file as it is now. That's also what the enable's own plan sees at save
+  // time, so the review and the save agree.
+  const pendingPatch = new Map(changes.flatMap((c) => (c.kind === "update" ? [[c.ruleId, c.patch] as const] : [])));
   for (const change of changes) {
     if (signal?.aborted) break;
     try {
@@ -61,8 +66,9 @@ export async function reviewChanges(api: RulesApi, changes: readonly RuleChange[
         }
         case "enable":
         case "disable": {
-          const plan = await api.planRule(change.ruleId, { enabled: change.kind === "enable" }, false, signal);
-          const ticketKeys = change.kind === "enable" ? await staffingKeys(api, change.ruleId, plan) : undefined;
+          const pending = change.kind === "enable" ? pendingPatch.get(change.ruleId) : undefined;
+          const plan = await api.planRule(change.ruleId, { ...pending, enabled: change.kind === "enable" }, false, signal);
+          const ticketKeys = change.kind === "enable" ? await staffingKeys(api, change.ruleId, plan, pending?.query) : undefined;
           reviewed.push({ change, plan, ...(ticketKeys ? { ticketKeys } : {}) });
           break;
         }

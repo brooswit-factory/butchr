@@ -813,8 +813,13 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   }
   const etag = rulesEtag(env, deps.io);
   const wasEnabled = current.enabled === true;
+  // local/ui: a dry run that both edits the query and turns the rule on (the
+  // Rules page reviews an edited rule's enable this way) checks and measures
+  // the rule as it would be: the new query, not the one still in the file.
+  // Real writes never send both, so nothing else changes.
+  const queryAfter = patch.query !== undefined ? patch.query : current.query;
 
-  if (patch.enabled === true && !wasEnabled && current.query === PLACEHOLDER_QUERY) {
+  if (patch.enabled === true && !wasEnabled && queryAfter === PLACEHOLDER_QUERY) {
     return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder` };
   }
 
@@ -834,7 +839,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   let scope: number | null = null;
   let scopeUnmeasurable = false;
   if (counts.spawned > 0) {
-    const rawScope = await scopeOf(id, String(current.query ?? ""));
+    const rawScope = await scopeOf(id, String(queryAfter ?? ""));
     if (Number.isFinite(rawScope)) {
       scope = rawScope;
     } else {

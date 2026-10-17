@@ -91,6 +91,16 @@ describe("rulesDraftReducer", () => {
     expect(s.nextDraftNo).toBe(3);
   });
 
+  test("a new rule's key never collides with a saved rule's id, even a saved rule named draft-1", () => {
+    let s = apply(initialDraftState([rule({ id: "draft-1" }), rule({ id: "triage" })], "e"), { type: "duplicate", key: "triage" });
+    const copy = s.rules[2]!;
+    expect(copy.key).not.toBe("draft-1");
+    expect(new Set(s.rules.map((d) => d.key)).size).toBe(3);
+    s = apply(s, { type: "edit", key: copy.key, changes: { query: "project = COPY" } });
+    expect(s.rules.find((d) => d.id === "draft-1")!.query).toBe(rule().query);
+    expect(computeRuleChanges(s).map((c) => [c.kind, c.ruleId])).toEqual([["create", "triage-copy"]]);
+  });
+
   test("duplicate makes an off copy with a unique -copy id and default idle-poke settings", () => {
     const s = apply(
       initialDraftState([rule({ enabled: true, idlePokeMinutes: 10 }), rule({ id: "factory-triage-copy" })], "e"),

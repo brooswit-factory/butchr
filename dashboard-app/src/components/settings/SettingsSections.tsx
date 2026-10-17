@@ -19,7 +19,15 @@ const typed = (fn: (value: string) => void) => ({ onInput: (e: FormEvent<HTMLInp
 type SaveState = { kind: "idle" } | { kind: "saving" } | { kind: "saved" } | { kind: "confirm"; message: string } | { kind: "error"; message: string };
 
 function SettingField({ item, onSave }: { item: SettingItem; onSave: (key: string, value: string, confirm: boolean) => Promise<void> }) {
-  const saved = item.rawValue ?? "";
+  // The value saved last. The daemon keeps reporting its startup value until a
+  // restart, so a successful save moves this on locally; a new value from the
+  // daemon (after a restart) replaces it.
+  const [saved, setSaved] = useState(item.rawValue ?? "");
+  const [reported, setReported] = useState(item.rawValue);
+  if (item.rawValue !== reported) {
+    setReported(item.rawValue);
+    setSaved(item.rawValue ?? "");
+  }
   const [value, setValue] = useState(saved);
   const [state, setState] = useState<SaveState>({ kind: "idle" });
   const trimmed = value.trim();
@@ -32,6 +40,7 @@ function SettingField({ item, onSave }: { item: SettingItem; onSave: (key: strin
     setState({ kind: "saving" });
     try {
       await onSave(item.key, trimmed, confirm);
+      setSaved(trimmed);
       setState({ kind: "saved" });
     } catch (e) {
       if (e instanceof SettingsWriteRefusedError && e.needsConfirm) setState({ kind: "confirm", message: e.message });

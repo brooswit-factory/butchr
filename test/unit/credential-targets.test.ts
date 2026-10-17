@@ -12,6 +12,8 @@ import { expandHomePath } from "../../src/config/home-path.js";
 import { loadConfig } from "../../src/config/config.js";
 import { resolveEffectiveGithubEnv } from "../../src/config/effective-env.js";
 import { checkSecretDestination, resolveCredentialTarget, type SecretDestinationIo } from "../../src/setup/secret-target.js";
+import { loadZendeskAuth } from "../../src/resources/zendesk-ticket.js";
+import { loadTrelloAuth } from "../../src/resources/trello-card.js";
 import { githubTokenFilePath, testCandidateGithubToken, writeGithubToken } from "../../src/setup/github-token-write.js";
 import type { FetchLike } from "../../src/setup/jira-token-write.js";
 import { handleJiraTokenWrite, isTokenLiteralFromEnvironment } from "../../src/web/setup-api.js";
@@ -218,5 +220,30 @@ describe("resolveEffectiveGithubEnv", () => {
     expect(resolveEffectiveGithubEnv(env(), { managedTokenFileExists: (p) => p === managed })).toEqual({ XDG_CONFIG_HOME: dir, GITHUB_TOKEN_FILE: managed });
     expect(resolveEffectiveGithubEnv(env(), { managedTokenFileExists: () => false })).toEqual({ XDG_CONFIG_HOME: dir });
     expect(resolveEffectiveGithubEnv(env({ GITHUB_TOKEN_FILE: "/env/gh" }), { managedTokenFileExists: () => true })).toEqual({ XDG_CONFIG_HOME: dir, GITHUB_TOKEN_FILE: "/env/gh" });
+  });
+});
+
+describe("a ~/ token file path: Settings writes it and the daemon reads it at the same place", () => {
+  // Fake file io: every stat/read is recorded, and each path holds a placeholder value, never a real credential.
+  function io() {
+    const opened: string[] = [];
+    const st = { isFile: () => true, mode: 0o100600, uid: 501 };
+    return { opened, io: { stat: (p: string) => { opened.push(p); return st; }, readFile: (p: string) => { opened.push(p); return "placeholder-value"; }, uid: 501 } };
+  }
+
+  test("Zendesk: the loader opens the expanded path resolveCredentialTarget writes", () => {
+    const env = { HOME: "/home/someone", ZENDESK_SUBDOMAIN: "acme", ZENDESK_OAUTH_TOKEN_FILE: "~/zendesk-token" };
+    const { opened, io: fileIo } = io();
+    expect(loadZendeskAuth(env, fileIo as never)).toMatchObject({ ok: true, subdomain: "acme" });
+    expect(new Set<string | null>(opened)).toEqual(new Set([resolveCredentialTarget("zendesk", env, () => true).path]));
+    expect(opened[0]).toBe("/home/someone/zendesk-token");
+  });
+
+  test("Trello: both the key and the token files are opened at their expanded paths", () => {
+    const env = { HOME: "/home/someone", TRELLO_BOARD_ID: "0123456789abcdef01234567", TRELLO_API_KEY_FILE: "~/trello-key", TRELLO_TOKEN_FILE: "~/trello-token" };
+    const { opened, io: fileIo } = io();
+    expect(loadTrelloAuth(env, fileIo as never)).toMatchObject({ ok: true });
+    expect(new Set<string | null>(opened)).toEqual(new Set([resolveCredentialTarget("trello-key", env, () => true).path, resolveCredentialTarget("trello-token", env, () => true).path]));
+    expect(new Set(opened)).toEqual(new Set(["/home/someone/trello-key", "/home/someone/trello-token"]));
   });
 });

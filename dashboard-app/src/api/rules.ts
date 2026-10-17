@@ -1115,7 +1115,8 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       // placeholder-query refusal happens BEFORE any confirm/scope logic is
       // even computed, so a still-placeholder enable refuses plainly rather
       // than showing a confirm dialog for a write that can never succeed.
-      if (patch.enabled === true && !rule.enabled && rule.query === PLACEHOLDER_QUERY) {
+      // local/ui: like the server, a dry run that also edits the query checks the edited one.
+      if (patch.enabled === true && !rule.enabled && (patch.query ?? rule.query) === PLACEHOLDER_QUERY) {
         throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
       }
       const counts = computeLocalPlanCounts(rule.enabled, patch);
@@ -1128,7 +1129,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       // local/ui: mirrors the server's `isSwarmSwitch` (`src/rules/rules-write.ts`).
       const swarmSwitch = rule.enabled && patch.execution === "swarm" && rule.execution !== "swarm";
       const scopeCount = counts.spawned > 0
-        ? opts.previews?.[ruleId]?.total ?? 0
+        ? (patch.query !== undefined ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total : undefined) ?? opts.previews?.[ruleId]?.total ?? 0
         : queryChanged
           ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0
           : swarmSwitch
