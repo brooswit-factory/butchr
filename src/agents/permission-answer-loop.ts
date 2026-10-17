@@ -151,10 +151,11 @@ export interface RuleLizardModeDeps {
  * looked up against `deps.rules` — a rule is loaded once at daemon startup
  * (no per-rule live poll the way a managed-session definition file gets
  * one), so there is nothing to rebuild here. FACTORY-138 (operator
- * decision, FACTORY-67 director comment 2026-09-26 22:24Z): a rule that IS
- * found and never sets `lizardMode` is now eligible too — only an explicit
- * `false` opts out — the `!== false` shape below (rather than the old
- * `=== true`) is what flips that default while leaving `id` decoding to
+ * decision, FACTORY-67 director comment 2026-09-26 22:24Z) made a rule that
+ * IS found and never sets `lizardMode` eligible too. A rule is off again by
+ * default: only an explicit `true` opts it in (the `=== true` shape below),
+ * which is what the dashboard has always shown for an absent value. That
+ * leaves `id` decoding to
  * nothing, or a rule not found at all (a legacy/bare-issue agent, garbage,
  * or a rule since removed), at `false`: those cases mean "butchr does not
  * own this agent" and must never become eligible no matter which way the
@@ -176,7 +177,7 @@ export function ruleLizardModeOf(id: string, deps: RuleLizardModeDeps): boolean 
   if (deps.isManagedSessionAgent(id)) return deps.managedSessionLizardModes.get(id) === true;
   const rule = deps.rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   if (!rule) return false;
-  return rule.lizardMode !== false;
+  return rule.lizardMode === true;
 }
 
 /**

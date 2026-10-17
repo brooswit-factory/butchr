@@ -113,7 +113,7 @@ export interface RuleDto {
   agentPreferences: RuleAgentPreferenceDto[];
   /** FACTORY-729 — `null` when absent (butchr's own launch default applies; see `Rule.permissionMode`'s own doc comment, `../../../src/rules/rules.js`). */
   permissionMode: RulePermissionMode | null;
-  /** FACTORY-729 — `null` when absent (the "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment). */
+  /** FACTORY-729 — `null` when absent (off, not scanned — see `Rule.lizardMode`'s own doc comment). */
   lizardMode: boolean | null;
   /** FACTORY-851 — `null` when absent; means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`). Display-only in this slice, same as `account`/`role` above. */
   resumeOnRespawn: boolean | null;

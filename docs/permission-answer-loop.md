@@ -135,13 +135,15 @@ rule-engine agent id (FACTORY-87/FACTORY-76 — a `jira-work`, `jira-project`,
 id's own `Rule.lizardMode`, looked up against the daemon's already-loaded
 `rules` list (see `docs/execution-modes.md`'s "`permissionMode` and
 `lizardMode`" section for why a rule needs no live poll the way a
-managed-session definition does). Since FACTORY-138, "never set the field"
-resolves ELIGIBLE for a rule (`ruleLizardModeOf`: `rule.lizardMode !== false`,
-unconditionally — no vendor gate at this layer, since a `Rule` has no fixed
-vendor) and for a `vendor: "claude"` managed session (`lizardMode ?? (vendor
+managed-session definition does). A rule is eligible only when it sets
+`lizardMode: true` (`ruleLizardModeOf`: `rule.lizardMode === true`, with no
+vendor gate at this layer, since a `Rule` has no fixed vendor; FACTORY-138
+had made an absent value eligible, which the dashboard never showed). Since
+FACTORY-138, "never set the field" resolves ELIGIBLE for a `vendor: "claude"`
+managed session (`lizardMode ?? (vendor
 === "claude")`); only an explicit `lizardMode: false`, a Codex/agy-resolved
-launch, a legacy/bare-issue agent, or a managed session not yet observed this
-daemon's lifetime is excluded. A tick with nothing eligible still costs
+launch, a legacy/bare-issue agent, a rule without `lizardMode: true`, or a
+managed session not yet observed this daemon's lifetime is excluded. A tick with nothing eligible still costs
 exactly one `agent.list()` call and nothing else (see
 `runPermissionAnswerTick`'s own doc comment) — that call-count property is
 unchanged by the default flip.
@@ -330,7 +332,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only lizard-eligible panes (`lizardMode: true`, or absent and defaulting eligible since FACTORY-138 — see "The opt-in gate" above) | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only lizard-eligible panes (`lizardMode: true`, or for a `vendor: "claude"` managed session absent and defaulting eligible since FACTORY-138 — see "The opt-in gate" above) | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall

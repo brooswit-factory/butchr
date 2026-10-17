@@ -74,7 +74,7 @@ export interface RulesApiRuleEntry {
    * matched (defensive, never thrown).
    */
   permissionMode: RulePermissionMode | null;
-  /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (today's "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts` — not necessarily `false`). */
+  /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (off, not scanned — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts`). */
   lizardMode: boolean | null;
   /** FACTORY-907: read-only for now (see `Rule.maxNewPerTick`'s own doc comment, `../rules/rules.ts`) — same "read off the raw `Rule`, `null` when absent/unmatched" shape `permissionMode`/`lizardMode` already use; never added to the web write surface this Story. */
   maxNewPerTick: number | null;

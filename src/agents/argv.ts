@@ -90,12 +90,13 @@ export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md. ${KICKOFF_REMINDER}
  * ONLY inside `agentLaunchConfig` below — see that function's own doc
  * comment for why nowhere else is the right place. `acceptEdits` auto-
  * accepts file edits only; Bash/MCP tool-permission prompts still fire,
- * which is why this default NEVER ships without `lizardMode` also
- * defaulting to eligible (see `ruleLizardModeOf`,
- * src/agents/permission-answer-loop.ts, and the managed-session
- * `lizardModes` map fill, src/rules/session-definition-type.ts) — the
- * DROVR-37 freeze incident is what an accept-edits agent with no lizard
- * coverage looks like.
+ * which is why a `vendor: "claude"` managed session also defaults to
+ * lizard-eligible (the `lizardModes` map fill,
+ * src/rules/session-definition-type.ts) — the DROVR-37 freeze incident is
+ * what an accept-edits agent with no lizard coverage looks like. A rule is
+ * lizard-eligible only when it sets `lizardMode: true` (`ruleLizardModeOf`,
+ * src/agents/permission-answer-loop.ts), so a rule that wants unattended
+ * prompt-clearing turns it on.
  */
 export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;

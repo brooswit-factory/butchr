@@ -3255,9 +3255,9 @@ codexDialogSightingsTimer.unref?.();
 // (`managedSessionLizardModes`'s live poll for a managed session,
 // `Rule.lizardMode` for everything else — FACTORY-87). FACTORY-138 (operator
 // decision, FACTORY-67 director comment 2026-09-26 22:24Z): a managed
-// session (vendor "claude") or rule that never sets the field is now
-// eligible BY DEFAULT — only an explicit `lizardMode: false` resolves
-// `false`. A legacy/bare-issue agent, a managed session not yet observed
+// session (vendor "claude") that never sets the field is eligible BY
+// DEFAULT — only an explicit `lizardMode: false` resolves `false`. A rule
+// is eligible only with an explicit `lizardMode: true`. A legacy/bare-issue agent, a managed session not yet observed
 // this daemon's lifetime, or a `vendor: "codex"` managed session (which
 // cannot set this field at all) still resolves `false` and is never
 // touched — see `ruleLizardModeOf`'s own doc comment

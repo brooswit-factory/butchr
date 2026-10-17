@@ -412,15 +412,15 @@ export interface Rule {
    * 2026-09-26 22:24Z): butchr's own launch default is now `permissionMode:
    * "acceptEdits"` + this field eligible together — an accept-edits agent
    * still gets Bash/MCP tool-permission prompts, so it needs the same
-   * unattended-clearing this field always provided for manual mode. Absent
-   * now means ELIGIBLE FOR SCANNING (a rule that IS found and never sets this
-   * field is scanned/touched by that timer, regardless of vendor); only an
-   * EXPLICIT `false` opts a rule's panes out of scanning — that
-   * absent-vs-false distinction is unchanged, only which one means "on" has
-   * flipped. The timer's own scanning-eligibility gate is resolved live from
-   * the loaded `rules` list (`ruleLizardModeOf`, an exported pure function in
+   * unattended-clearing this field always provided for manual mode. That
+   * made absent mean ELIGIBLE FOR SCANNING, while the dashboard showed an
+   * absent value as off and saved an unticked box as absent. Absent now
+   * means off again: only an EXPLICIT `true` opts a rule's panes into
+   * scanning, so a rule that wants unattended prompt-clearing turns it on.
+   * The timer's own scanning-eligibility gate is resolved live from the
+   * loaded `rules` list (`ruleLizardModeOf`, an exported pure function in
    * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
-   * it to its own live state) as `rule.lizardMode !== false`, regardless of
+   * it to its own live state) as `rule.lizardMode === true`, regardless of
    * vendor — unchanged by FACTORY-108.
    *
    * FACTORY-108: unlike scanning eligibility just described, this field is
