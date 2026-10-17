@@ -63,7 +63,7 @@ export interface SyncDeps {
    * since `syncLabels` itself only ever sees de-duplicated issues, not the
    * (rule, issue) matches that produced them. Returning `undefined` means
    * no enabled rule carries an override for this ticket; `idlePoke.check`
-   * then falls back to its own global default and `idlePokeEnabled ?? true`.
+   * then pokes nothing (idle pokes are opt-in per rule).
    * Never called when `idlePoke` itself is omitted.
    */
   idlePokeRuleConfig?: (issue: string) => IdlePokeRuleConfig | undefined;

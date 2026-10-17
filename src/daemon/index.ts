@@ -1938,9 +1938,10 @@ const stallRemediation = config.stallRemediationMode === "off" ? undefined : cre
 // deliberately discards rule identity), so this is the one place that
 // association is still available. A ticket matched by more than one
 // enabled rule resolves by the most conservative reading per field,
-// independently: ANY matching rule's explicit `idlePokeEnabled: false`
-// disables the poke outright (an opt-out from one rule should never be
-// overridden by another rule's silence); among rules that leave it
+// independently: ANY matching rule with `idlePokeEnabled` off disables the
+// poke outright (off is the default, so only rules that turn it on count as
+// on; an opt-out from one rule should never be overridden by another rule's
+// opt-in); among rules that leave it
 // enabled, the SMALLEST explicit `idlePokeMinutes` wins (the more urgent
 // configured interval, never the global, never an unset rule's silence);
 // the first matching rule's explicit `idlePokeMessage` wins (arbitrary but
@@ -1953,7 +1954,7 @@ function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): v
   for (const m of resourceMatches(units)) {
     if (!m.rule.enabled) continue;
     const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
-    if (m.rule.idlePokeEnabled === false) {
+    if (m.rule.idlePokeEnabled !== true) {
       idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
       continue;
     }

@@ -181,7 +181,7 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       idlePokeMinutes: raw?.idlePokeMinutes ?? null,
       stalledMinutes: raw?.stalledMinutes ?? null,
       idlePokeMessage: raw?.idlePokeMessage ?? null,
-      idlePokeEnabled: raw?.idlePokeEnabled ?? true,
+      idlePokeEnabled: raw?.idlePokeEnabled ?? false,
       notifyDeliveryMode: raw?.notifyDeliveryMode ?? null,
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,

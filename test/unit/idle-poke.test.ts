@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { createIdlePokeEngine, renderIdlePokeNudge, idlePokeComment, MARKER } from "../../src/agents/idle-poke.js";
 
 const MIN = 60_000;
+/** Idle pokes are off unless a matching rule turns them on, so the engine tests below run as a ticket whose rule did. */
+const ON = { idlePokeEnabled: true } as const;
 
 function makeDeps(overrides: Partial<Parameters<typeof createIdlePokeEngine>[0]> = {}) {
   const log: string[] = [];
@@ -38,7 +40,7 @@ describe("createIdlePokeEngine: the timer", () => {
   test("under threshold: not a candidate, no poke", async () => {
     const { deps, addComments } = makeDeps({ dryRun: false, now: () => 5 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("not-a-candidate");
     expect(addComments.length).toBe(0);
   });
@@ -46,7 +48,7 @@ describe("createIdlePokeEngine: the timer", () => {
   test("at/over threshold: pokes", async () => {
     const { deps, addComments, delivered } = makeDeps({ dryRun: false, now: () => 10 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
     expect(addComments.length).toBe(1);
     expect(delivered.length).toBe(1);
@@ -85,6 +87,15 @@ describe("createIdlePokeEngine: guard 5 — enabled:false pokes nothing", () => 
     expect(out.kind).toBe("skipped");
     expect(addComments.length).toBe(0);
   });
+
+  test("a ticket no enabled rule turned pokes on for (no ruleConfig) never pokes — idle pokes are opt-in", async () => {
+    const { deps, addComments, delivered } = makeDeps({ dryRun: false, now: () => 60 * MIN });
+    const engine = createIdlePokeEngine(deps);
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    expect(out).toEqual({ kind: "skipped", issue: "KAN-1", reason: "no enabled rule turns idle pokes on" });
+    expect(addComments.length).toBe(0);
+    expect(delivered.length).toBe(0);
+  });
 });
 
 describe("createIdlePokeEngine: guard 1 — once per idle episode", () => {
@@ -92,10 +103,10 @@ describe("createIdlePokeEngine: guard 1 — once per idle episode", () => {
     let now = 10 * MIN;
     const { deps, addComments } = makeDeps({ dryRun: false, now: () => now });
     const engine = createIdlePokeEngine(deps);
-    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(first.kind).toBe("poked");
     now = 11 * MIN;
-    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(second.kind).toBe("suppressed");
     expect(addComments.length).toBe(1);
   });
@@ -104,11 +115,11 @@ describe("createIdlePokeEngine: guard 1 — once per idle episode", () => {
     let now = 10 * MIN;
     const { deps, addComments } = makeDeps({ dryRun: false, now: () => now });
     const engine = createIdlePokeEngine(deps);
-    await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     // agent took a turn (streak broke), then went idle again, long after
     // the daemon-start/reconnect suppression window that opened at t=0.
     now = 40 * MIN;
-    const out = await engine.check("KAN-1", { streakStart: 30 * MIN, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 30 * MIN, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
     expect(addComments.length).toBe(2);
   });
@@ -118,7 +129,7 @@ describe("createIdlePokeEngine: guard 3 — In Review waiting on a human", () =>
   test("In Review is skipped even past threshold", async () => {
     const { deps, addComments } = makeDeps({ dryRun: false, now: () => 20 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Review" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Review", ruleConfig: ON });
     expect(out.kind).toBe("skipped");
     expect(addComments.length).toBe(0);
   });
@@ -136,7 +147,7 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
       comments: async () => [{ id: "c1", body: "[KAN-1] status: done, links, left, next owner", created: new Date(0).toISOString() }],
     });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("skipped");
     expect((out as { reason: string }).reason).toContain("own-identity");
     expect(addComments.length).toBe(0);
@@ -149,7 +160,7 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
       comments: async () => [{ id: "c1", body: "[KAN-1] an old report", created: new Date(-5 * MIN).toISOString() }],
     });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
     expect(addComments.length).toBe(1);
   });
@@ -161,7 +172,7 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
       comments: async () => [{ id: "c1", body: "[OTHER-9] sideways note", created: new Date(5 * MIN).toISOString() }, { id: "c2", body: "[butchr:stall] daemon chatter", created: new Date(5 * MIN).toISOString() }],
     });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
   });
 
@@ -182,11 +193,11 @@ describe("createIdlePokeEngine: guard 6 — the own-identity negative gate (FACT
       },
     });
     const engine = createIdlePokeEngine(deps);
-    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(first.kind).toBe("skipped");
     expect(calls).toBe(1);
     now = 12 * MIN;
-    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(second.kind).toBe("skipped");
     expect((second as { reason: string }).reason).toContain("cached");
     expect(calls).toBe(1);
@@ -210,10 +221,10 @@ describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
     // restart and re-arm the suppression it's trying to disprove.
     for (let t = 0; t < 20 * MIN; t += 15_000) {
       now = t;
-      await engine.check("KAN-1", { streakStart: t < 15 * MIN ? null : 15 * MIN, status: "In Progress" });
+      await engine.check("KAN-1", { streakStart: t < 15 * MIN ? null : 15 * MIN, status: "In Progress", ruleConfig: ON });
     }
     now = 20 * MIN;
-    const out = await engine.check("KAN-1", { streakStart: 15 * MIN, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 15 * MIN, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
   });
 
@@ -225,11 +236,11 @@ describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
     // window — this is the exact hazard FACTORY-845's ticket calls "the
     // 90-second trap", generalised to this module's own 5-minute window.
     now = 0;
-    await engine.check("KAN-1", { streakStart: null, status: "In Progress" });
+    await engine.check("KAN-1", { streakStart: null, status: "In Progress", ruleConfig: ON });
     now = 30 * MIN;
-    await engine.check("KAN-1", { streakStart: 0, status: "In Progress" }); // this call itself re-measures the gap and marks a fresh discontinuity
+    await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON }); // this call itself re-measures the gap and marks a fresh discontinuity
     now = 60 * MIN;
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("suppressed");
     expect((out as { reason: string }).reason).toContain("daemon start/herdr-reconnect");
   });
@@ -241,9 +252,9 @@ describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
     const { deps } = makeDeps({ dryRun: false, now: () => now, suppressMinutes: 5, globalMinutes: 1 });
     const engine = createIdlePokeEngine(deps);
     now = 0;
-    await engine.check("KAN-1", { streakStart: null, status: "In Progress" }); // daemon start
+    await engine.check("KAN-1", { streakStart: null, status: "In Progress", ruleConfig: ON }); // daemon start
     now = 2 * MIN;
-    const early = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" }); // within suppressMinutes of start
+    const early = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON }); // within suppressMinutes of start
     expect(early.kind).toBe("suppressed");
     // Keep polling at a realistic ~15s cadence right up to the window's
     // edge — guard 4 only reads a gap between CONSECUTIVE invocations
@@ -252,10 +263,10 @@ describe("createIdlePokeEngine: guard 4 and the 90-second trap", () => {
     // itself look like a second restart and re-arm the suppression.
     for (let t = 2 * MIN + 15_000; t <= 5 * MIN; t += 15_000) {
       now = t;
-      await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+      await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     }
     now = 5 * MIN + 15_000; // just past the window
-    const later = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" }); // past the window now
+    const later = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON }); // past the window now
     expect(later.kind).toBe("poked");
   });
 });
@@ -267,7 +278,7 @@ describe("createIdlePokeEngine: the first-enable burst — a fleet-wide per-poll
     engine.beginPoll();
     const outcomes = [];
     for (const key of ["A-1", "A-2", "A-3", "A-4", "A-5"]) {
-      outcomes.push(await engine.check(key, { streakStart: 0, status: "In Progress" }));
+      outcomes.push(await engine.check(key, { streakStart: 0, status: "In Progress", ruleConfig: ON }));
     }
     const poked = outcomes.filter((o) => o.kind === "poked");
     expect(poked.length).toBe(3);
@@ -281,13 +292,13 @@ describe("createIdlePokeEngine: the first-enable burst — a fleet-wide per-poll
     const { deps } = makeDeps({ dryRun: false, now: () => now, maxPokesPerPoll: 1 });
     const engine = createIdlePokeEngine(deps);
     engine.beginPoll();
-    const first = await engine.check("A-1", { streakStart: 0, status: "In Progress" });
+    const first = await engine.check("A-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(first.kind).toBe("poked");
-    const second = await engine.check("A-2", { streakStart: 10 * MIN, status: "In Progress" });
+    const second = await engine.check("A-2", { streakStart: 10 * MIN, status: "In Progress", ruleConfig: ON });
     expect(second.kind).toBe("suppressed");
     now = 90 * MIN;
     engine.beginPoll();
-    const third = await engine.check("A-2", { streakStart: 10 * MIN, status: "In Progress" });
+    const third = await engine.check("A-2", { streakStart: 10 * MIN, status: "In Progress", ruleConfig: ON });
     expect(third.kind).toBe("poked");
   });
 });
@@ -296,7 +307,7 @@ describe("createIdlePokeEngine: dry-run", () => {
   test("ACCEPTANCE 4 — sends nothing (no comment, no deliver) but logs a decision on every outcome, and does not disable the suppressed/skipped logging either", async () => {
     const { deps, addComments, delivered, log } = makeDeps({ dryRun: true, now: () => 10 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("suppressed");
     expect((out as { reason: string }).reason).toBe("dry-run");
     expect(addComments.length).toBe(0);
@@ -307,7 +318,7 @@ describe("createIdlePokeEngine: dry-run", () => {
   test("dry-run still reports guard outcomes (In Review) distinctly from a would-poke decision", async () => {
     const { deps, log } = makeDeps({ dryRun: true, now: () => 10 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Review" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Review", ruleConfig: ON });
     expect(out.kind).toBe("skipped");
     expect(log.some((l) => l.includes("would poke"))).toBe(false);
   });
@@ -320,10 +331,10 @@ describe("createIdlePokeEngine: dry-run", () => {
     let now = 10 * MIN;
     const { deps, log } = makeDeps({ dryRun: true, now: () => now });
     const engine = createIdlePokeEngine(deps);
-    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const first = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(first.kind).toBe("suppressed");
     now = 11 * MIN;
-    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const second = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(second.kind).toBe("suppressed");
     expect(log.filter((l) => l.includes("[idle-poke] would poke KAN-1")).length).toBe(1);
   });
@@ -334,7 +345,7 @@ describe("createIdlePokeEngine: acceptance 9 — never drops a poke on an unavai
     const { deps, setDeliverVia } = makeDeps({ dryRun: false, now: () => 10 * MIN });
     setDeliverVia("prompt");
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
     expect((out as { via: string }).via).toBe("prompt");
   });
@@ -346,7 +357,7 @@ describe("createIdlePokeEngine: acceptance 9 — never drops a poke on an unavai
       deliver: async () => { throw new Error("mcp handle unavailable"); },
     });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: 0, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("poked");
     expect((out as { via: string }).via).toBe("prompt");
     expect(addComments.length).toBe(1);
@@ -357,7 +368,7 @@ describe("createIdlePokeEngine: guard 2 is satisfied by construction (streakStar
   test("a null streakStart (e.g. the caller's own stalled-tracker streak reset by a blocked/permission-dialog observation) is never a candidate", async () => {
     const { deps, addComments } = makeDeps({ dryRun: false, now: () => 60 * MIN });
     const engine = createIdlePokeEngine(deps);
-    const out = await engine.check("KAN-1", { streakStart: null, status: "In Progress" });
+    const out = await engine.check("KAN-1", { streakStart: null, status: "In Progress", ruleConfig: ON });
     expect(out.kind).toBe("not-a-candidate");
     expect(addComments.length).toBe(0);
   });

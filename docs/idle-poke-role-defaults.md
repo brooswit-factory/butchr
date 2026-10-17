@@ -3,7 +3,8 @@
 Builds on the idle-poke config surface FACTORY-844/846 added to `Rule`
 (`src/rules/rules.ts`): `idlePokeMinutes` (number, optional, no resolved
 default), `idlePokeMessage` (string, optional, non-empty when present), and
-`idlePokeEnabled` (boolean, always resolved, defaults to `true`). This ticket
+`idlePokeEnabled` (boolean, always resolved, defaults to `false`: idle
+pokes are opt-in per rule). This ticket
 is CONFIG ONLY — nothing in the daemon reads these fields yet
 (`src/agents/stall-remediation.ts` is unchanged); the engine is FACTORY-845.
 
@@ -53,8 +54,8 @@ this proven directly against `parseRules`.
 | Bug | `bugs` | 30 | not named by the epic's role list — carries the epic-wide default (`DEFAULT_IDLE_POKE_MINUTES`) explicitly, same reasoning as the "absent" section above: leaving it absent would mean 10 (the global), not the epic's declared baseline |
 | Sub-task | `subtasks` | 30 | same reasoning as Bug |
 
-All five keep `idlePokeEnabled` at its default (`true`, on) — nothing in
-the epic's role list asks for any of these off. Verify directly against
+All five leave `idlePokeEnabled` unset, so they don't poke until a rule
+turns it on; the minutes above apply from then. Verify directly against
 `docs/rules.example.json` and `test/unit/rules-example.test.ts` at your own
 base commit — do not trust this table over the file itself if they ever
 disagree.

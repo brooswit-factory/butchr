@@ -165,8 +165,8 @@ describe("buildRulesApiResponse", () => {
     });
     expect(r.rules[0]!.idlePokeMinutes).toBeNull();
     expect(r.rules[0]!.idlePokeMessage).toBeNull();
-    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null.
-    expect(r.rules[0]!.idlePokeEnabled).toBe(true);
+    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null (false when absent).
+    expect(r.rules[0]!.idlePokeEnabled).toBe(false);
   });
   test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({

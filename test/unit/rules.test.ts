@@ -21,8 +21,8 @@ import { agentIdOfWorkspacePath, workspaceDirFor } from "../../src/agents/worksp
 
 const minimal = { id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "triage it" };
 const parsedMinimal = { ...minimal, enabled: true };
-/** FACTORY-846: idlePokeMinutes/idlePokeMessage stay absent unless a rule sets them; only idlePokeEnabled always resolves (to true). */
-const idlePokeDefaults = { idlePokeEnabled: true };
+/** FACTORY-846: idlePokeMinutes/idlePokeMessage stay absent unless a rule sets them; only idlePokeEnabled always resolves (to false: idle pokes are opt-in). */
+const idlePokeDefaults = { idlePokeEnabled: false };
 
 describe("rulesPath", () => {
   test("explicit override wins over XDG", () => {
@@ -86,7 +86,7 @@ describe("parseRules", () => {
       { ...other, enabled: true, execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
   });
-  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker; idlePokeEnabled defaults to on, but idlePokeMinutes/idlePokeMessage stay absent (the true fallback is today's existing global stalledMinutes/wake text, unchanged)", () => {
+  test("omitted optionals stay absent; enabled/execution/account/role default to true/swarm/none/worker; idlePokeEnabled defaults to off, and idlePokeMinutes/idlePokeMessage stay absent (the true fallback is today's existing global stalledMinutes/wake text, unchanged)", () => {
     const [r] = parseRules({ rules: [minimal] });
     expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.enabled).toBe(true);
@@ -95,7 +95,7 @@ describe("parseRules", () => {
     expect(r!.role).toBe("worker");
     expect(r!.idlePokeMinutes).toBeUndefined();
     expect(r!.idlePokeMessage).toBeUndefined();
-    expect(r!.idlePokeEnabled).toBe(true);
+    expect(r!.idlePokeEnabled).toBe(false);
   });
   test("rejects a non-document", () => {
     for (const doc of [null, [], {}, { rules: {} }]) expect(() => parseRules(doc)).toThrow('"rules" array');
@@ -649,19 +649,19 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
 // comment for why: resolving to DEFAULT_IDLE_POKE_MINUTES (30) here would be
 // the "silently change every install's stall threshold from 10 to 30"
 // outcome the epic explicitly rules out. idlePokeEnabled is the one
-// exception and always resolves (to `true`), since "on" is already today's
-// unconditional behaviour for every rule.
+// exception and always resolves (to `false`, so idle pokes are opt-in per
+// rule).
 describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour change)", () => {
   test("a valid override on each field is accepted and kept", () => {
     const [r] = parseRules({ rules: [{ ...minimal, idlePokeMinutes: 45, idlePokeMessage: " go check your ticket ", idlePokeEnabled: false }] });
     expect(r).toMatchObject({ idlePokeMinutes: 45, idlePokeMessage: "go check your ticket", idlePokeEnabled: false });
   });
 
-  test("omitted idlePokeMinutes/idlePokeMessage stay absent — the true fallback is the existing global stalledMinutes, unchanged; only idlePokeEnabled resolves, to true", () => {
+  test("omitted idlePokeMinutes/idlePokeMessage stay absent — the true fallback is the existing global stalledMinutes, unchanged; only idlePokeEnabled resolves, to false", () => {
     const [r] = parseRules({ rules: [minimal] });
     expect(r!.idlePokeMinutes).toBeUndefined();
     expect(r!.idlePokeMessage).toBeUndefined();
-    expect(r!.idlePokeEnabled).toBe(true);
+    expect(r!.idlePokeEnabled).toBe(false);
   });
 
   test("DEFAULT_IDLE_POKE_MINUTES/DEFAULT_IDLE_POKE_MESSAGE are the epic's own declared seed values, for callers like the rules API/dashboard-app that want a concrete display default — not what parseRules resolves an absent field to", () => {
@@ -669,9 +669,9 @@ describe("idle poke knobs (FACTORY-846 — config surface only, no behaviour cha
     expect(DEFAULT_IDLE_POKE_MESSAGE).toBe("You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down");
   });
 
-  test("idlePokeEnabled: false is accepted and kept — same as omitted-defaults-to-true, just explicit", () => {
-    const [r] = parseRules({ rules: [{ ...minimal, idlePokeEnabled: false }] });
-    expect(r!.idlePokeEnabled).toBe(false);
+  test("idlePokeEnabled: true and false are both kept — omitted means false, so true is the opt-in", () => {
+    expect(parseRules({ rules: [{ ...minimal, idlePokeEnabled: false }] })[0]!.idlePokeEnabled).toBe(false);
+    expect(parseRules({ rules: [{ ...minimal, idlePokeEnabled: true }] })[0]!.idlePokeEnabled).toBe(true);
   });
 
   test("rejects a non-positive or non-finite idlePokeMinutes", () => {
@@ -804,7 +804,7 @@ describe("per-role idle-poke defaults (FACTORY-842 — config/resolution only, n
   test("a jira-project (project/manager) rule example carries idlePokeMinutes=720 (12h), parses cleanly — inert until FACTORY-845", () => {
     const projectManagerExample = { id: "project-managers", resourceProvider: "jira-project" as const, query: '{"leadAccountId":"me"}', brief: "@builtin:project", idlePokeMinutes: 720 };
     const [r] = parseRules({ rules: [projectManagerExample] });
-    expect(r).toMatchObject({ resourceProvider: "jira-project", idlePokeMinutes: 720, idlePokeEnabled: true });
+    expect(r).toMatchObject({ resourceProvider: "jira-project", idlePokeMinutes: 720, idlePokeEnabled: false });
   });
 });
 

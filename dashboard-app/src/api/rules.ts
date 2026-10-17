@@ -1227,7 +1227,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         resumeContextCutoff: null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
-        idlePokeEnabled: true,
+        idlePokeEnabled: false,
         notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled",

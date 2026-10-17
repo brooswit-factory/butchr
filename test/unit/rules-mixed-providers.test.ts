@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadRules, parseRules } from "../../src/rules/rules.js";
 
-/** FACTORY-846: idlePokeMinutes/idlePokeMessage stay absent unless a rule sets them; only idlePokeEnabled always resolves (to true). */
-const idlePokeDefaults = { idlePokeEnabled: true };
+/** FACTORY-846: idlePokeMinutes/idlePokeMessage stay absent unless a rule sets them; only idlePokeEnabled always resolves (to false: idle pokes are opt-in). */
+const idlePokeDefaults = { idlePokeEnabled: false };
 
 /**
  * FACTORY-57 requirement 6: "a rules file containing no `github-pr` rules

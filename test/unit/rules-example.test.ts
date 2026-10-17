@@ -76,7 +76,7 @@ describe("docs/rules.example.json", () => {
     // Not named by the epic's role list — carries the epic-wide default explicitly (see doc comment above).
     expect(byId.get("bugs")!.idlePokeMinutes).toBe(30);
     expect(byId.get("subtasks")!.idlePokeMinutes).toBe(30);
-    // idlePokeEnabled always resolves (parseRules `?? true`); every shipped role rule stays on.
-    for (const rule of rules) expect(rule.idlePokeEnabled).toBe(true);
+    // idlePokeEnabled always resolves (parseRules `?? false`); the shipped role rules leave it unset, so they're off until a rule turns pokes on.
+    for (const rule of rules) expect(rule.idlePokeEnabled).toBe(false);
   });
 });

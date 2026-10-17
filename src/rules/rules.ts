@@ -592,11 +592,11 @@ export interface Rule {
    * per-rule read into that path — `agent:stalled` detection itself
    * (src/agents/stalled.ts) is untouched either way, since this is CONFIG
    * SURFACE for the REMEDIATION (delivery) half, not a second detector.
-   * Defaults to `true` (on) when absent — unlike `idlePokeMinutes`/
-   * `idlePokeMessage` above, "on" is already today's unconditional
-   * behaviour for every rule, so resolving this to `true` here changes
-   * nothing for an install that sets nothing, and `parseRules` always
-   * resolves it to an explicit boolean rather than leaving it absent.
+   * Defaults to `false` (off) when absent: idle pokes are opt-in per
+   * rule, so a rule that never mentions them never pokes, the same
+   * off-unless-asked shape BUTCHR_STALL_REMEDIATION_MODE gives the global
+   * stall wake. `parseRules` always resolves it to an explicit boolean
+   * rather than leaving it absent.
    *
    * Still typed OPTIONAL on `Rule` itself, same as `execution`/`account`/
    * `role` (which `parseRules` ALSO always resolves): this interface
@@ -604,8 +604,8 @@ export interface Rule {
    * codebase (tests, fixtures) that build a `Rule` directly without going
    * through `parseRules`, and a required field here would force every one
    * of those to pick a value. A caller that needs the resolved,
-   * always-true-when-absent reading does `rule.idlePokeEnabled ?? true`,
-   * same as `../web/rules-api.ts`.
+   * off-when-absent reading does `rule.idlePokeEnabled ?? false`, same as
+   * `../web/rules-api.ts`.
    */
   idlePokeEnabled?: boolean;
   /**
@@ -899,7 +899,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // exactly the "silently change every install" conflict FACTORY-844
     // calls out (see Rule.idlePokeMinutes/idlePokeMessage's own doc
     // comments). idlePokeEnabled DOES get an always-resolved default
-    // (true), because "on" is already today's unconditional behaviour.
+    // (false: idle pokes are opt-in per rule).
     const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
     const { stalledMinutes } = raw;
     if (stalledMinutes !== undefined && (typeof stalledMinutes !== "number" || !Number.isFinite(stalledMinutes) || stalledMinutes <= 0)) errors.push(`${at}.stalledMinutes must be a positive number`);
@@ -949,7 +949,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
       ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
       ...(notifyDeliveryMode !== undefined ? { notifyDeliveryMode: notifyDeliveryMode as NotifyDeliveryMode } : {}),
-      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
+      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? false,
     });
   });
   for (const { at, id, provider } of refs) {
