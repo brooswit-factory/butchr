@@ -46,8 +46,6 @@ export interface RuleDraft {
   idlePokeEnabled: boolean;
   execution: ExecutionMode;
   resumeOnRespawn: boolean;
-  /** Kept as text; `""` = the daemon's default cutoff. */
-  resumeContextCutoff: string;
   /** `""` = butchr's default: the MCP channel, falling back to a direct prompt. */
   notifyDeliveryMode: NotifyDeliveryMode | "";
   /** Kept as text; `""` = the daemon's default stall threshold. */
@@ -79,7 +77,6 @@ export type EditableField =
   | "idlePokeEnabled"
   | "execution"
   | "resumeOnRespawn"
-  | "resumeContextCutoff"
   | "notifyDeliveryMode"
   | "stalledMinutes"
   | "linkedEventing"
@@ -106,7 +103,6 @@ const EDITABLE_FIELDS: readonly EditableField[] = [
   "idlePokeEnabled",
   "execution",
   "resumeOnRespawn",
-  "resumeContextCutoff",
   "notifyDeliveryMode",
   "stalledMinutes",
   ...LINKED_FIELDS,
@@ -146,7 +142,6 @@ export function draftFromRule(rule: RuleDto, briefs: Readonly<Record<string, str
     idlePokeEnabled: rule.idlePokeEnabled ?? false,
     execution: rule.execution,
     resumeOnRespawn: rule.resumeOnRespawn !== false,
-    resumeContextCutoff: rule.resumeContextCutoff != null ? String(rule.resumeContextCutoff) : "",
     notifyDeliveryMode: rule.notifyDeliveryMode ?? "",
     stalledMinutes: rule.stalledMinutes != null ? String(rule.stalledMinutes) : "",
     linkedEventing: rule.linkedEventing === true,
@@ -289,7 +284,6 @@ export function rulesDraftReducer(state: RulesDraftState, action: RulesDraftActi
         idlePokeEnabled: false,
         execution: "swarm",
         resumeOnRespawn: true,
-        resumeContextCutoff: "",
         notifyDeliveryMode: "",
         stalledMinutes: "",
         linkedEventing: false,
@@ -431,7 +425,6 @@ const FIELD_LABELS: Record<EditableField, string> = {
   idlePokeEnabled: "Idle poke",
   execution: "Execution",
   resumeOnRespawn: "Resume on respawn",
-  resumeContextCutoff: "Resume context cutoff",
   notifyDeliveryMode: "Notification delivery",
   stalledMinutes: "Stall threshold",
   linkedEventing: "Linked-change events",
@@ -480,8 +473,6 @@ function fieldText(field: EditableField, d: RuleDraft): string {
       return d.execution;
     case "resumeOnRespawn":
       return d.resumeOnRespawn ? "on" : "off";
-    case "resumeContextCutoff":
-      return d.resumeContextCutoff || "default";
     case "notifyDeliveryMode":
       return notifyDeliveryText(d.notifyDeliveryMode);
     case "stalledMinutes":
@@ -505,7 +496,7 @@ function fieldText(field: EditableField, d: RuleDraft): string {
 export function diffRule(base: RuleDraft | undefined, draft: RuleDraft): FieldChange[] {
   if (draft.deleted) return [];
   if (!base) {
-    const shown: EditableField[] = ["id", "resourceProvider", "query", "preference", "permissionMode", "lizardMode", "role", "execution", "resumeOnRespawn", "resumeContextCutoff", "notifyDeliveryMode", "stalledMinutes", ...(draft.linkedEventing ? LINKED_FIELDS : []), "brief"];
+    const shown: EditableField[] = ["id", "resourceProvider", "query", "preference", "permissionMode", "lizardMode", "role", "execution", "resumeOnRespawn", "notifyDeliveryMode", "stalledMinutes", ...(draft.linkedEventing ? LINKED_FIELDS : []), "brief"];
     return shown.map((field) => ({ field, label: FIELD_LABELS[field], from: "", to: fieldText(field, draft) }));
   }
   return EDITABLE_FIELDS.filter((f) => !sameValue(base[f], draft[f])).map((field) => ({ field, label: FIELD_LABELS[field], from: fieldText(field, base), to: fieldText(field, draft) }));
@@ -540,9 +531,6 @@ export function validateRule(draft: RuleDraft, base: RuleDraft | undefined, all:
   }
   if (base && base.idlePokeMessage !== "" && draft.idlePokeMessage === "") {
     issues.push({ field: "idlePokeMessage", level: "invalid", message: "Going back to the default message isn't supported here yet." });
-  }
-  if (draft.resumeContextCutoff !== "" && !/^[1-9]\d*$/.test(draft.resumeContextCutoff)) {
-    issues.push({ field: "resumeContextCutoff", level: "invalid", message: "Use a whole number, 1 or more, or leave it empty for the default." });
   }
   if (draft.stalledMinutes !== "" && !(Number.isFinite(Number(draft.stalledMinutes)) && Number(draft.stalledMinutes) > 0)) {
     issues.push({ field: "stalledMinutes", level: "invalid", message: "Use a number of minutes above 0, or leave it empty for butchr's default." });
@@ -651,8 +639,6 @@ export function buildFieldPatch(base: RuleDto, draft: RuleDraft, baseBrief: stri
   }
   if (draft.execution !== base.execution) patch.execution = draft.execution;
   if (draft.resumeOnRespawn !== (base.resumeOnRespawn !== false)) patch.resumeOnRespawn = draft.resumeOnRespawn;
-  const baseCutoff = base.resumeContextCutoff != null ? String(base.resumeContextCutoff) : "";
-  if (draft.resumeContextCutoff !== baseCutoff) patch.resumeContextCutoff = draft.resumeContextCutoff === "" ? null : Number(draft.resumeContextCutoff);
   // Both clear back to butchr's default with `null`, which the server supports for these two.
   if (draft.notifyDeliveryMode !== (base.notifyDeliveryMode ?? "")) patch.notifyDeliveryMode = draft.notifyDeliveryMode || null;
   const baseStalled = base.stalledMinutes != null ? String(base.stalledMinutes) : "";
@@ -677,7 +663,6 @@ export function buildCreateDraft(draft: RuleDraft): RuleCreateDraft {
   if (draft.brief !== null && draft.brief !== DEFAULT_BRIEF) create.brief = draft.brief;
   if (draft.execution !== "swarm") create.execution = draft.execution;
   if (!draft.resumeOnRespawn) create.resumeOnRespawn = false;
-  if (draft.resumeContextCutoff !== "") create.resumeContextCutoff = Number(draft.resumeContextCutoff);
   if (draft.notifyDeliveryMode) create.notifyDeliveryMode = draft.notifyDeliveryMode;
   if (draft.stalledMinutes !== "") create.stalledMinutes = Number(draft.stalledMinutes);
   for (const field of ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const) if (draft[field]) create[field] = true;

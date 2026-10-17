@@ -31,7 +31,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeContextCutoff: null,
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,
@@ -336,10 +335,6 @@ describe("RulesTargetingRoute", () => {
     fireEvent.click(card.getByTestId("rule-edit"));
     await choose(view, card, "rule-execution-select", /^Swarm/);
     await waitFor(() => expect(card.getByText(/Changing execution restarts/)).toBeTruthy());
-    setText(card.getByTestId("rule-resume-cutoff-input"), "0");
-    await waitFor(() => expect(view.getByTestId("rules-save-blocked").textContent).toContain("Fix the errors"));
-    setText(card.getByTestId("rule-resume-cutoff-input"), "50000");
-    await waitFor(() => expect(view.queryByTestId("rules-save-blocked")).toBeNull());
 
     fireEvent.click(view.getByTestId("rules-review-save"));
     const dialog = within(await view.findByTestId("rules-review-dialog"));

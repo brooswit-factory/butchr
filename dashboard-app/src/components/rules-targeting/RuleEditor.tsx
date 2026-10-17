@@ -443,17 +443,6 @@ export function RuleEditor({ row, baseRule, catalog, disabled, onChange, onTestQ
               A respawned agent picks up its previous session instead of starting over.
             </Text>
           </div>
-          <TextField
-            className="rt-field"
-            value={draft.resumeContextCutoff}
-            onChange={(v) => onChange({ resumeContextCutoff: v.trim() })}
-            isDisabled={disabled || !draft.resumeOnRespawn}
-            isInvalid={issueFor(issues, "resumeContextCutoff")?.level === "invalid"}
-          >
-            <Label>Resume context cutoff</Label>
-            <Input inputMode="numeric" placeholder="butchr's default" data-testid="rule-resume-cutoff-input" {...typed((v) => onChange({ resumeContextCutoff: v.trim() }))} />
-            <IssueText issue={issueFor(issues, "resumeContextCutoff")} />
-          </TextField>
         </div>
       </section>
 
@@ -633,7 +622,6 @@ const EDITED_HERE = new Set([
   "permissionMode",
   "lizardMode",
   "resumeOnRespawn",
-  "resumeContextCutoff",
   "idlePokeMinutes",
   "idlePokeMessage",
   "idlePokeEnabled",
@@ -641,8 +629,8 @@ const EDITED_HERE = new Set([
   "stalledMinutes",
 ]);
 
-/** Keys butchr still accepts in rules.json but ignores, so they aren't shown: `account` was the Rocket.Chat account policy, and Rocket.Chat support is gone. */
-const IGNORED_LEGACY = new Set(["account"]);
+/** Keys butchr still accepts in rules.json but ignores, so they aren't shown: `account` was the Rocket.Chat account policy (Rocket.Chat support is gone); `resumeContextCutoff` (FACTORY-1018) was the transcript-size resume cutoff, removed entirely. */
+const IGNORED_LEGACY = new Set(["account", "resumeContextCutoff"]);
 
 /** The rule fields that can only be changed in rules.json for now, listed even when unset so it's clear they exist. */
 export const NOT_EDITABLE_YET: readonly { key: string; label: string }[] = [

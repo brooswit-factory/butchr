@@ -17,8 +17,9 @@
  * top-level fields — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
  *
  * local/ui widens the row once more, for the dashboard's inline rule editor:
- * `execution`, `resumeOnRespawn`, `resumeContextCutoff` and `brief` become
- * editable (and settable on create). The legacy Rocket.Chat `account` key is
+ * `execution`, `resumeOnRespawn` and `brief` become
+ * editable (and settable on create). FACTORY-1018 removed `resumeContextCutoff`
+ * entirely — it is no longer part of this row. The legacy Rocket.Chat `account` key is
  * refused like any other unknown field. `mcpServers`,
  * `mcpConfigFile` and `relationships` stay file-only, refused by the same
  * default-deny mechanism described below.
@@ -99,7 +100,6 @@ export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = [
   // local/ui — see this file's header.
   "execution",
   "resumeOnRespawn",
-  "resumeContextCutoff",
   "brief",
   "linkedEventing",
   "linkedPollIntervalMs",
@@ -272,8 +272,6 @@ export interface RuleFieldPatch {
   execution?: ExecutionMode;
   /** local/ui — whether a respawned agent resumes its previous session. Config surface only. */
   resumeOnRespawn?: boolean;
-  /** local/ui — `null` clears it back to the daemon's default cutoff. Config surface only. */
-  resumeContextCutoff?: number | null;
   /** local/ui — the agent's brief: `@builtin:<type>` or literal text. On an enabled rule a change counts as a restart, like a query change. */
   brief?: string;
   /** local/ui — linked-change eventing (`LINKED_BOOLEAN_FIELDS`/`LINKED_COUNT_FIELDS` above). Config surface only. */
@@ -352,10 +350,6 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (typeof b.resumeOnRespawn !== "boolean") return { ok: false, error: "resumeOnRespawn must be a boolean" };
     patch.resumeOnRespawn = b.resumeOnRespawn;
   }
-  if ("resumeContextCutoff" in b) {
-    if (b.resumeContextCutoff !== null && !isPositiveInteger(b.resumeContextCutoff)) return { ok: false, error: "resumeContextCutoff must be a positive integer or null (the default)" };
-    patch.resumeContextCutoff = b.resumeContextCutoff as number | null;
-  }
   if ("brief" in b) {
     const parsed = validateBrief(b.brief);
     if (!parsed.ok) return parsed;
@@ -385,7 +379,6 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     "notifyDeliveryMode",
     "execution",
     "resumeOnRespawn",
-    "resumeContextCutoff",
     "brief",
     ...LINKED_BOOLEAN_FIELDS,
     ...LINKED_COUNT_FIELDS,
@@ -423,7 +416,6 @@ export interface RuleCreateInput {
   brief?: string;
   execution?: ExecutionMode;
   resumeOnRespawn?: boolean;
-  resumeContextCutoff?: number;
   /** local/ui — same values the PUT path accepts, minus its `null` clear (a new rule has nothing to clear). */
   stalledMinutes?: number;
   notifyDeliveryMode?: NotifyDeliveryMode;
@@ -506,10 +498,6 @@ export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleC
     if (typeof b.resumeOnRespawn !== "boolean") return { ok: false, error: "resumeOnRespawn must be a boolean" };
     input.resumeOnRespawn = b.resumeOnRespawn;
   }
-  if ("resumeContextCutoff" in b) {
-    if (!isPositiveInteger(b.resumeContextCutoff)) return { ok: false, error: "resumeContextCutoff must be a positive integer" };
-    input.resumeContextCutoff = b.resumeContextCutoff;
-  }
   if ("stalledMinutes" in b) {
     if (typeof b.stalledMinutes !== "number" || !Number.isFinite(b.stalledMinutes) || b.stalledMinutes <= 0) return { ok: false, error: "stalledMinutes must be a positive number" };
     input.stalledMinutes = b.stalledMinutes;
@@ -539,7 +527,6 @@ export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleC
     "brief",
     "execution",
     "resumeOnRespawn",
-    "resumeContextCutoff",
     "stalledMinutes",
     "notifyDeliveryMode",
     ...LINKED_BOOLEAN_FIELDS,

@@ -478,31 +478,12 @@ export interface Rule {
    * schema, validation, and surfacing (this ticket, FACTORY-851) — nothing
    * in this daemon reads it yet. Actually wiring resume-on-respawn into the
    * spawn path (classifying intentional-vs-unintended per FACTORY-849, then
-   * honouring this flag and `resumeContextCutoff` below) is FACTORY-850, which
+   * honouring this flag) is FACTORY-850, which
    * this ticket's scope guard explicitly forbids touching: do not change
    * spawn, respawn, stale-argv, `resumeInPlace`, the `BUTCHR_RESTORED_RESUME`
    * policy, or the session-id store from here.
    */
   resumeOnRespawn?: boolean;
-  /**
-   * FACTORY-851 (epic FACTORY-843, story FACTORY-848) — the transcript-size
-   * cutoff (in tokens) above which `resumeOnRespawn` is skipped even though
-   * it would otherwise apply, falling back to a fresh start (FACTORY-850's
-   * concern, not this ticket's). Bounds the token/memory cost an unattended
-   * respawn can incur resuming a large transcript. Absent means
-   * `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see that constant's own doc
-   * comment for why 100,000 was chosen). Validated as a positive integer —
-   * 0, negative, non-integer, and NaN are all rejected, same `isPositiveInt`
-   * every other token/count field in this file already uses. Like
-   * `resumeOnRespawn` above, this field is schema/validation/surfacing only;
-   * nothing reads it yet (FACTORY-850). Named `...ContextCutoff`, not the
-   * more obvious `...TokenCutoff`: the rules API response (`../web/rules-api.ts`)
-   * applies a defensive, repo-wide redaction to any key matching
-   * `/token|secret|password|authorization/i`, and a literal `TokenCutoff`
-   * key was silently rewritten to `"[redacted]"` there — caught by this
-   * ticket's own API tests, not by inspection.
-   */
-  resumeContextCutoff?: number;
   /**
    * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY —
    * this EXTENDS the existing global `stalledMinutes` (src/config/config.ts,
@@ -609,21 +590,6 @@ export const NOTIFY_DELIVERY_MODES = ["channel", "prompt"] as const;
 export type { NotifyDeliveryMode };
 
 /**
- * FACTORY-851 — default `Rule.resumeContextCutoff` when a rule leaves it
- * unset. Chosen to bound the token/memory cost a respawn can incur resuming
- * a large transcript (the reason this cutoff exists at all — see
- * `Rule.resumeContextCutoff`'s own doc comment and epic FACTORY-843) while
- * staying large enough that an ORDINARY worker session — the common case
- * this mechanism must not needlessly defeat — still resumes: 100,000 tokens
- * is well under a Claude context window (200,000 tokens on every model this
- * codebase launches today, per `../resources/power-scale.ts`'s model
- * tables), leaving headroom for the system prompt, tool definitions, and
- * fresh conversation after a resume, while comfortably covering a typical
- * ticket's working transcript.
- */
-export const DEFAULT_RESUME_CONTEXT_CUTOFF = 100_000;
-
-/**
  * FACTORY-846: the epic's own declared idle-poke interval (30 minutes) — NOT
  * the value `Rule.idlePokeMinutes` silently resolves to when a rule sets
  * nothing (see that field's own doc comment above: resolving to this here
@@ -667,14 +633,20 @@ const LEGACY_REASON = "ignored: Rocket.Chat support was removed";
  * motivated its removal rather than a repair. Parsed into nothing, read by
  * nothing, surfaced nowhere. This set is a MIGRATION AFFORDANCE ONLY: never
  * add a new key here, and never read one of these back out.
+ *
+ * FACTORY-1018: `resumeContextCutoff` joins this set — the transcript-size
+ * resume cutoff is removed entirely (see `decideRespawnResume`,
+ * src/agents/respawn.ts). An already-deployed value is accepted so the file
+ * still loads, parsed into nothing, read by nothing, surfaced nowhere; it
+ * has no behavioral effect on resume.
  */
-const REMOVED_RULE_FIELDS: readonly string[] = ["maxLinkedTurnsPerHour"];
+const REMOVED_RULE_FIELDS: readonly string[] = ["maxLinkedTurnsPerHour", "resumeContextCutoff"];
 
 const RULE_FIELDS = new Set([
   ...LEGACY_RULE_FIELDS.keys(),
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "linkedRemoteLinks", "linkedDescriptionLinks",
-  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
+  "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
   "notifyDeliveryMode",
   ...REMOVED_RULE_FIELDS,
 ]);
@@ -875,9 +847,9 @@ export function parseRules(doc: unknown, origin = "rules", warnings: string[] = 
     if (maxNewPerTick !== undefined && !isPositiveInt(maxNewPerTick)) errors.push(`${at}.maxNewPerTick must be a positive integer`);
     if (minSecondsBetweenAdmissions !== undefined && !isPositiveInt(minSecondsBetweenAdmissions)) errors.push(`${at}.minSecondsBetweenAdmissions must be a positive integer`);
     // FACTORY-851: independent of every field above, same house style — no tri-state for `resumeOnRespawn` (absent or `true` both mean on; only explicit `false` means off).
-    const { resumeOnRespawn, resumeContextCutoff } = raw;
+    // FACTORY-1018: `resumeContextCutoff` is REMOVED from this destructure — see `REMOVED_RULE_FIELDS`'s own doc comment above; an already-deployed value is accepted (RULE_FIELDS) but parsed into nothing.
+    const { resumeOnRespawn } = raw;
     if (resumeOnRespawn !== undefined && typeof resumeOnRespawn !== "boolean") errors.push(`${at}.resumeOnRespawn must be a boolean`);
-    if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
     // FACTORY-846: idlePokeMinutes/idlePokeMessage stay OPTIONAL — same
     // absent-means-absent style as permissionMode/lizardMode immediately
     // above, deliberately NOT the always-defaulted execution/role
@@ -928,7 +900,6 @@ export function parseRules(doc: unknown, origin = "rules", warnings: string[] = 
       ...(maxNewPerTick !== undefined ? { maxNewPerTick: maxNewPerTick as number } : {}),
       ...(minSecondsBetweenAdmissions !== undefined ? { minSecondsBetweenAdmissions: minSecondsBetweenAdmissions as number } : {}),
       ...(resumeOnRespawn !== undefined ? { resumeOnRespawn: resumeOnRespawn as boolean } : {}),
-      ...(resumeContextCutoff !== undefined ? { resumeContextCutoff: resumeContextCutoff as number } : {}),
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes: idlePokeMinutes as number } : {}),
       ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
       ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),

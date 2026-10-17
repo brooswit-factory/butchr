@@ -1529,8 +1529,8 @@ export class HerdrHerd implements Herd {
     if (preference?.effort) selected.effort = preference.effort;
     const dir = buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
     // FACTORY-916 review fix: `prepareWorkspace`/`home` MUST resolve before
-    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`/
-    // `estimateTranscriptTokens` (src/agents/workspace.ts) both resolve
+    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`
+    // (src/agents/workspace.ts) resolves
     // Claude's per-cwd project folder under `home` (defaulting to
     // `homedir()` when absent), the SAME override `startProviders`'s own
     // `prepare()` already threads through for its own post-launch
@@ -1545,7 +1545,6 @@ export class HerdrHerd implements Herd {
     const decision = decideRespawnResume({
       dir,
       ...(spec.resumeOnRespawn !== undefined ? { resumeOnRespawn: spec.resumeOnRespawn } : {}),
-      ...(spec.resumeContextCutoff !== undefined ? { resumeContextCutoff: spec.resumeContextCutoff } : {}),
       ...(spec.ticketStatus !== undefined ? { ticketStatus: spec.ticketStatus } : {}),
       ...(spec.ticketLabels !== undefined ? { ticketLabels: spec.ticketLabels } : {}),
       ...(home !== undefined ? { home } : {}),
