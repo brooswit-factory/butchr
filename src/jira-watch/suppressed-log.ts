@@ -65,7 +65,7 @@ import { JOURNALD_PREFIX_SRC } from "../tools/journald-prefix.js";
 /** The one tag every line this module emits carries — a NEW class, never previously written, so no existing reader can be confused by it (see AC4's own reasoning in the PR for why no *separate* tag per arm is warranted here either). */
 export const SUPPRESSED_TAG = "[notify-suppressed]";
 
-export type SuppressedArm = "agent-fold" | "stand-down" | "rate-capped" | "topology";
+export type SuppressedArm = "agent-fold" | "stand-down" | "topology";
 
 /**
  * (B): the own-write ledger's AGENT arm (KAN-838) suppressed `key`'s own
@@ -116,26 +116,16 @@ export function standDownSuppressedLine(key: string, watcher: string, totalComme
 }
 
 /**
- * BUTCHR-436 (epic BUTCHR-421, story 2/4): the linked-change eventing rate
- * cap (`maxLinkedTurnsPerHour`, src/jira-watch/linked-eventing.ts) dropped a
- * coalesced tick for `watcher` — its sliding window already held `count`
- * turns against a `max`-per-hour budget. Unconditional on its own trigger
- * (every capped tick logs exactly one line), same discipline as
- * `standDownSuppressedLine` above — this arm has no lossy-fold blind spot
- * to caveat: the tick that would have fired is fully known to the caller,
- * never partially observed. DROPS the tick rather than queuing it — the
- * next allowed tick re-detects whatever is still outstanding (the
- * coalescer's own per-target baseline is left unadvanced on a capped tick;
- * see linked-eventing.ts), so this is a DELAY, not a loss. `key` is the
- * owning resource's own Jira key (there is no single "changed" key to name
- * here — a capped tick may cover several).
+ * FACTORY-252: this module ONCE also emitted an `arm=rate-capped` line
+ * (`rateCappedSuppressedLine`) whenever the linked-change eventing hourly
+ * turn-rate cap (`maxLinkedTurnsPerHour`) dropped a coalesced tick. That cap
+ * is REMOVED (src/jira-watch/linked-eventing.ts no longer withholds a
+ * linked-change notify for any reason this module would log) — removed
+ * here too, not merely disabled, so no new code should ever emit
+ * `arm=rate-capped` again. `parseSuppressedLine` below stays generic over
+ * `arm` (any string), so a historical journal line with this arm still
+ * parses; nothing in this codebase produces one going forward.
  */
-export function rateCappedSuppressedLine(key: string, watcher: string, count: number, max: number): string {
-  return (
-    `${SUPPRESSED_TAG} key=${key} watcher=${watcher} arm=rate-capped count=${count} max=${max}` +
-    ` msg=linked-change notify dropped this tick — sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick`
-  );
-}
 
 /**
  * FACTORY-952: `relatedForRules`'s (src/rules/resource-type.ts) tier guard on
@@ -147,8 +137,8 @@ export function rateCappedSuppressedLine(key: string, watcher: string, count: nu
  * bossless Task directly by an Epic (see FACTORY-955's own ticket comment
  * for a live example of the latter — this guard rejects it either way, by
  * design: the Epic is never one hop from a Task). Unconditional on its own
- * trigger, same discipline as `standDownSuppressedLine`/`rateCappedSuppressedLine`
- * above: every stray edge this guard sees logs exactly one line, every poll
+ * trigger, same discipline as `standDownSuppressedLine` above: every
+ * stray edge this guard sees logs exactly one line, every poll
  * it is still present — NOT aggregated/deduped across polls, a deliberate,
  * stated scope limit (this guard is a pure, stateless check over one poll's
  * snapshot, same as `relatedForRules` itself), acceptable because a stray

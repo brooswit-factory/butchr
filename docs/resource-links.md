@@ -562,8 +562,15 @@ effective links, reconciling them into watchers, caching snapshots, and
 emitting change events (comments included) via the EXISTING BUTCHR-436/437
 linked-eventing notify path (`src/jira-watch/linked-eventing.ts`). No second
 notification mechanism was built; every piece below extends that module's
-existing coalescer, per-(owner,target) baseline store, and
-`maxLinkedTurnsPerHour` rate cap in place.
+existing coalescer and per-(owner,target) baseline store.
+**FACTORY-252 UPDATE:** the `maxLinkedTurnsPerHour` hourly turn-rate cap
+this section and several below originally described is REMOVED entirely —
+see "FACTORY-252: the hourly turn-rate cap is removed" near the end of this
+document for what changed and why. Every mention of that cap below (and of
+`[notify-suppressed] arm=rate-capped`) describes HISTORICAL behavior from
+before that removal, kept for the design rationale it still carries (the
+coalescer, baseline, and "delayed, not lost" discipline it motivated all
+survive unchanged), not current enforcement.
 
 **Polling is not the only mode.** FACTORY-137 (story FACTORY-22) added an
 OPT-IN push mode on top of this exact same pipeline — a Catamorbius webhook
@@ -650,22 +657,27 @@ never a new call) — every existing test that doesn't set it is unaffected.
 **The FACTORY-1 regression class, re-proven for this new path.** FACTORY-1
 (investigated, not reproducible — see that ticket) already established that
 the `related:` (Implements-chain boss/worker) notify path is architecturally
-independent of `linked:`'s rate cap: `discovery.related()`'s return value is
-built from `relatedForRules` BEFORE `linkedEventingState.runTick` ever runs,
-and `runTick` only ever performs its OWN `deps.notify` call under its OWN
-`turns` budget. This story doesn't touch `related()`/`relatedForRules` at
-all — only `runTick`'s item-gathering — so that independence holds for the
-managed-link path unchanged, structurally, by construction. Re-proven with a
-dedicated test (`test/unit/linked-eventing-managed-links.test.ts`,
-"FACTORY-9 / FACTORY-1 regression class") that exhausts an owner's
-`maxLinkedTurnsPerHour` budget with unrelated MANAGED-link churn (not
-native/description churn, which FACTORY-1's own test already covers) and
-then shows: (a) a rate-capped managed-link change is retried on the next
-allowed tick, never silently dropped (the pre-existing "advance only on
-success" discipline, unchanged, now also covering managed items), and (b) a
-cross-daemon Epic still receives exactly one `related:` notify for its
-Story's move to In Review, the instant it happens, budget exhaustion
-notwithstanding.
+independent of `linked:`: `discovery.related()`'s return value is built from
+`relatedForRules` BEFORE `linkedEventingState.runTick` ever runs, and
+`runTick` only ever performs its OWN `deps.notify` call, keyed by the owning
+resource's own agent key. This story doesn't touch `related()`/`relatedForRules`
+at all — only `runTick`'s item-gathering — so that independence holds for
+the managed-link path unchanged, structurally, by construction. Re-proven
+with a dedicated test (`test/unit/linked-eventing-managed-links.test.ts`,
+"FACTORY-9 / FACTORY-1 regression class") that drives unrelated MANAGED-link
+churn (not native/description churn, which FACTORY-1's own test already
+covers) alongside a cross-daemon Epic's `related:` wake and shows: (a)
+repeated managed-link changes all deliver, never silently dropped (the
+pre-existing "advance only on success" discipline, unchanged, now also
+covering managed items), and (b) the cross-daemon Epic still receives
+exactly one `related:` notify for its Story's move to In Review, the
+instant it happens, unrelated managed-link activity notwithstanding.
+(FACTORY-252: this paragraph originally also proved the independence held
+even while `linked:`'s own hourly turn-rate cap was genuinely EXHAUSTED by
+that managed-link churn. That cap is removed entirely — see the
+"FACTORY-252 UPDATE" note under "Linked-change eventing: defaults, caps and
+known behaviour" — so there is no budget left to exhaust; the independence
+proof is unaffected and, if anything, now simpler.)
 
 **Wiring.** `src/daemon/index.ts` passes `linkStore: createLinkStore(defaultLinksStorePath())`
 (the same local store `resourceLinkTools` already exposes as MCP tools — a
@@ -684,8 +696,8 @@ Widens FACTORY-9's scope note above: `jira-project` now has a live owner
 `src/rules/jira-project-type.ts`), so the "future `jira-project` owner"
 FACTORY-9 anticipated is this ticket. Two item sources feed a
 `linkedEventing`-opted project owner's watch, both delivered through the
-EXACT SAME `runTick` (coalescer, per-(owner,target) baseline, rate cap,
-notify) FACTORY-9 describes above — no forked delivery path, no second
+EXACT SAME `runTick` (coalescer, per-(owner,target) baseline, notify)
+FACTORY-9 describes above — no forked delivery path, no second
 notification mechanism:
 
 1. **Member discovery**: `project = <key> AND updated >= "-<N>m" ORDER BY
@@ -697,8 +709,8 @@ notification mechanism:
    (first tick, or after any daemon restart — this state is in-memory only)
    seeds the watermark to "now" and searches nothing that tick, so there is
    no historical flood. The watermark only advances once a tick's events are
-   genuinely delivered or safely consumed, never on a rate-capped tick, a
-   failed search, or a tick where `maxLinkedItems` capped a member away
+   genuinely delivered or safely consumed, never on a failed search or a
+   tick where `maxLinkedItems` capped a member away
    (fails open, logged, this owner's managed-link source unaffected).
    **A member's first appearance IS the change** (review round 1 fix): this
    window search only ever returns a target whose `updated` is at or after
@@ -799,17 +811,19 @@ Wires a managed-session definition's `linkedEventingProjects` field
 `docs/managed-sessions.md`'s own section on it) into the EXACT SAME
 `jira-project` owner machinery the BUTCHR-469 section above describes:
 member discovery, the project's own managed-link collection, the coalescer,
-the per-agent rate cap, and delivery all reuse `runTick`
-(`src/jira-watch/linked-eventing.ts`) unchanged. No second watcher, no
-separate/looser rate cap.
+and delivery all reuse `runTick` (`src/jira-watch/linked-eventing.ts`)
+unchanged. No second watcher. (FACTORY-252: the per-agent turn-rate cap
+this section once also named here is removed entirely — see the
+"FACTORY-252 UPDATE" note under "Linked-change eventing: defaults, caps
+and known behaviour" above.)
 
 **The one new seam.** A `jira-project` rule owner's `ProjectLinkedEventingMatch.agentKey`
 is both the state-owning identity `runTick`'s own `agentKey`-keyed maps use
 AND the real agent `deps.notify` delivers to — true 1:1 for a rule-owned
 project. A managed session breaks that 1:1: `linkedEventingProjects` is an
 array, so ONE session may opt into SEVERAL projects, but `runTick`'s
-internal maps (baselines, watch sets, the rate-cap `turns` window, the
-per-project member watermark, ...) are all keyed by `agentKey` alone —
+internal maps (baselines, watch sets, the per-project member watermark,
+...) are all keyed by `agentKey` alone —
 feeding two matches that both used the session's own real agent key as
 `agentKey` would let the second project's per-tick state silently overwrite
 the first's, permanently losing that project's watch. `ProjectLinkedEventingMatch`
@@ -822,12 +836,12 @@ already forbids NUL bytes) so their state stays independent, and sets
 `runTick`'s delivery call now targets (`entry.notifyAgentKey`, defaulting to
 `entry.agentKey` for every existing caller — byte-identical to the
 pre-FACTORY-71 `deps.notify(entry.agentKey, entry.agentKey, ...)` call for
-a `jira-project` owner and for an issue owner alike). One practical
-consequence: a session opted into N projects gets N independent rate-cap
-buckets (each keyed by its own synthetic `agentKey`), all funneling to the
-SAME real agent — not one shared per-session budget. This is the SAME
-mechanism `jira-project` owners already use (an independent bucket per
-watched project), reused rather than replaced, not a new cap.
+a `jira-project` owner and for an issue owner alike). (FACTORY-252: the
+"N independent rate-cap buckets" consequence this paragraph once also
+named here no longer applies — there is no rate-cap bucket of any kind any
+more. The independent-state reasoning above, for `baselines`/`watchSets`/
+the per-project member watermark, is unaffected and still exactly why
+`notifyAgentKey` exists.)
 
 **The opt-in gate, reused rather than generalised.** `runTick` filters
 `projectMatches` on `m.rule.linkedEventing === true`, unchanged. A managed
@@ -836,31 +850,32 @@ project in `linkedEventingProjects` already IS the per-project opt-in — so
 `sessionDefinitionProjectMatches` hands every match a fixed, shared,
 never-user-editable `Rule`-shaped value (`MANAGED_SESSION_LINKED_EVENTING_RULE`)
 that always carries `linkedEventing: true`. Every other linked-eventing knob
-on it (`maxLinkedItems`, `maxLinkedTurnsPerHour`, `linkedRemoteLinks`,
-`linkedDescriptionLinks`) is left absent.
+on it (`maxLinkedItems`, `linkedRemoteLinks`, `linkedDescriptionLinks`) is
+left absent. (FACTORY-252: `maxLinkedTurnsPerHour` no longer exists as a
+knob at all, on this rule or any other.)
 
-**BUTCHR-471: no longer uncapped.** Previously, because
-`MANAGED_SESSION_LINKED_EVENTING_RULE` never set `maxLinkedTurnsPerHour` or
-`maxLinkedItems`, a managed session's linked-eventing nudges were uncapped by
-default in production, and a managed-session definition had no schema field
-to configure one (tracked as a deliberately-deferred gap, FACTORY-78). That
-gap is closed at the ENFORCEMENT site, not by adding a field: `runTick`
-(`src/jira-watch/linked-eventing.ts`) now applies `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`
-(2) / `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedTurnsPerHour`/
-`effectiveMaxLinkedItems` whenever a rule leaves either field absent — this
-rule included, no owner kind exempted. A managed session still has no
-per-definition override (that remains FACTORY-78's residue and is now its
-own tracked follow-up — see the BUTCHR-471 section below), so today every
-opted-in session gets exactly the shared default, per (session, project)
-bucket. `test/unit/session-definition-linked-eventing.test.ts`'s own
-"rate-cap MECHANISM" tests prove the underlying BUTCHR-469 cap logic still
-works correctly once a match's state-owning `agentKey` differs from its
-`notifyAgentKey` (that test hand-sets `maxLinkedTurnsPerHour` on its own
-fixture, bypassing `sessionDefinitionProjectMatches` entirely, deliberately —
-see BUTCHR-471's own test for the REAL, end-to-end wiring instead); a
-separate test in the same file pins that `sessionDefinitionProjectMatches`'
-own output still carries no cap field — that assertion stays true (the
-default lives at enforcement, not on the produced rule), only its title
+**BUTCHR-471: item count no longer uncapped (FACTORY-252: the companion
+turn-rate cap this section once also described is removed entirely).**
+Previously, because `MANAGED_SESSION_LINKED_EVENTING_RULE` never set
+`maxLinkedItems`, a managed session's linked-eventing item count was
+uncapped by default in production, and a managed-session definition had no
+schema field to configure one (tracked as a deliberately-deferred gap,
+FACTORY-78). That gap is closed at the ENFORCEMENT site, not by adding a
+field: `runTick` (`src/jira-watch/linked-eventing.ts`) now applies
+`DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedItems` whenever a
+rule leaves the field absent — this rule included, no owner kind exempted.
+A managed session still has no per-definition override (that remains
+FACTORY-78's residue and is now its own tracked follow-up — see the
+BUTCHR-471 section below), so today every opted-in session gets exactly the
+shared default, per (session, project) bucket.
+`test/unit/session-definition-linked-eventing.test.ts`'s own "delivery
+targeting" test (FACTORY-252; formerly "rate-cap MECHANISM") proves
+delivery still correctly targets `notifyAgentKey`, never the synthetic
+`agentKey`, across repeated real changes for the same synthetic-keyed
+match; a separate test in the same file pins that
+`sessionDefinitionProjectMatches`' own output still carries no
+`maxLinkedItems` of its own — that assertion stays true (the default lives
+at enforcement, not on the produced rule), only its title
 changed to stop claiming production is uncapped.
 
 **Frozen sessions.** `herd.nudge`'s own `assertRunnable` freeze check
@@ -914,6 +929,33 @@ wherever it is left unset, which every `jira-project` caller does.
   90% line/function minimum.
 
 ## Linked-change eventing: defaults, caps and known behaviour (BUTCHR-471)
+
+> **FACTORY-252 UPDATE — the turn-rate cap this entire section describes is
+> REMOVED.** Everything below, through the "Deploy note" paragraph at the
+> end of this section, is a HISTORICAL RECORD of the BUTCHR-471 decision
+> (why a 2/hour default was chosen, what it cost, what it measured) — kept
+> for its own evidentiary value, not rewritten, per this repo's house
+> convention for a superseded decision (see `docs/butchr-391-acceptance-evidence.md`
+> for the same pattern applied elsewhere). As of FACTORY-252:
+> `maxLinkedTurnsPerHour`, `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`,
+> `effectiveMaxLinkedTurnsPerHour`, and the `[notify-suppressed]
+> arm=rate-capped` log line are ALL REMOVED from `src/jira-watch/linked-eventing.ts`
+> and `src/jira-watch/suppressed-log.ts` — a linked-change notify is now
+> delivered every time a genuine diff is found, with no turn-rate budget at
+> all. `maxLinkedItems`/`DEFAULT_MAX_LINKED_ITEMS`/`effectiveMaxLinkedItems`
+> (the ITEM-COUNT cap, a different knob) are UNCHANGED and still enforced
+> exactly as described below — only the turn-rate half of this section is
+> obsolete. An already-deployed rule carrying the old `maxLinkedTurnsPerHour`
+> field still loads (migration-only, via `REMOVED_RULE_FIELDS` in
+> `src/rules/rules.ts`) but the field is parsed into nothing and never
+> throttles anything. The motivating reason for the removal: the historical
+> BUTCHR-430/439/421 deploy verification once observed a rate-capped linked
+> change never get caught up once its window freed (see FACTORY-252's own
+> ticket) — investigation found the CURRENT code's "delayed, not lost"
+> catch-up discipline (described below) working correctly in regression
+> tests, but the operator decided to remove the cap outright rather than
+> keep carrying that risk, superseding the "preserve the cap" direction an
+> earlier comment on the same ticket had given.
 
 **The two defaults, where they live.** `runTick`
 (`src/jira-watch/linked-eventing.ts`) is the ONE place both defaults are
@@ -1099,10 +1141,18 @@ FACTORY-833's filer flagged two usability gaps in the coalesced
 WHICH of that target's own links is meant (a ticket can sit in more than
 one chain), and a status-change line like `status changed from "Backlog"
 to "Done"` carries no indication of WHEN that transition actually
-happened, so a transition detected late (a rate-capped tick, a slow poll
-cycle) reads exactly like one that just happened. Two review rounds (PR
-#800) progressively tightened both halves of this past their first-pass
-implementation; this section describes the shipped shape.
+happened, so a transition detected late (a slow poll cycle, or — at the
+time this was written — a rate-capped tick) reads exactly like one that
+just happened. Two review rounds (PR #800) progressively tightened both
+halves of this past their first-pass implementation; this section
+describes the shipped shape. (FACTORY-252 note: the mechanism below —
+`observedAt`'s three independent per-field timestamps — is UNCHANGED and
+still exactly this correct; only the specific example of WHAT held a
+transition's delivery has changed, since the hourly turn-rate cap this
+section originally cited as the example is removed. The remaining
+mechanism that can still hold a tick's advance is a failed batched search
+— see this module's own "ADVANCE STATE ONLY ONCE GENUINELY CONSUMED" top
+comment.)
 
 **Link identity.** `LinkedItem` (`src/resources/linked-discovery.ts`) and
 `LinkedChangeEvent` (`src/resources/types.ts`) both gained an optional
@@ -1145,22 +1195,23 @@ this gap never existed there.
 actually moved — not simply `after.updated`, Jira's own single field
 bumped by ANY change: round 1's first pass used it directly, which round
 2 found lets a LATER, unrelated edit (a comment or label landing while an
-earlier status transition is still held by the rate cap) overwrite the
+earlier status transition's delivery is still held) overwrite the
 displayed timestamp with its own unrelated time, falsely implying the
 transition is as recent as that later edit. `runTick` now tracks
 `observedAt` per (owner, target) — THREE independent timestamps
 (`statusAt`/`summaryAt`/`commentAt`), each frozen at the tick its OWN
 field was last seen to differ from the previously observed value for
-that same field, updated immediately every tick regardless of
-rate-capping (the same "delayed, not lost" exception `lastExternalPollAt`
+that same field, updated immediately every tick a fetch for that target
+actually succeeds (the same "delayed, not lost" exception `lastExternalPollAt`
 already documents for a different field). `changeDetail` picks whichever
 one matches the branch that actually fires; the generic "updated" fallback
 (none of status/summary/comment differ from the baseline) has no specific
 field to shadow and uses `after.updated` directly, since that generic
 bump IS the only fact being reported. Chosen over suppressing a stale
 transition outright: suppression risks silently dropping a real,
-still-unread change a rate-capped or slow-polling owner genuinely needs
-to hear about, which this module already treats as unacceptable elsewhere
+still-unread change a slow-polling owner, or one whose tick was held by a
+fetch failure, genuinely needs to hear about, which this module already
+treats as unacceptable elsewhere
 (see the "DELAYED, NOT LOST" discipline in `linked-eventing.ts`'s own top
 comment).
 

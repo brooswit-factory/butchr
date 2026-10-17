@@ -572,19 +572,18 @@ describe("mcpServers bindings (BUTCHR-411 — bind any MCP channel server to a r
 });
 
 describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default inert)", () => {
-  test("all five are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
+  test("all four are absent when omitted — unlike execution/account/role, there is no defaulted value", () => {
     const [r] = parseRules({ rules: [minimal] });
     expect(Object.keys(r!).sort()).toEqual(["account", "brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.linkedEventing).toBeUndefined();
     expect(r!.linkedPollIntervalMs).toBeUndefined();
     expect(r!.maxLinkedItems).toBeUndefined();
-    expect(r!.maxLinkedTurnsPerHour).toBeUndefined();
     expect(r!.linkedRemoteLinks).toBeUndefined();
   });
 
   test("each is accepted when valid, independent of the others and of every other field", () => {
-    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true }] });
-    expect(r).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: true });
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, linkedRemoteLinks: true }] });
+    expect(r).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 300_000, maxLinkedItems: 25, linkedRemoteLinks: true });
   });
 
   test("linkedEventing: false is accepted and kept (distinct from omitted, even though both are inert today)", () => {
@@ -595,7 +594,7 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
   // BUTCHR-436: linkedRemoteLinks is NOT inert — a resource whose rule sets
   // it fetches remote links (src/jira-watch/linked-eventing.ts) — but its
   // OWN validation/plumbing is exactly this same additive, independently-
-  // optional shape, so it is tested alongside its four siblings here rather
+  // optional shape, so it is tested alongside its three siblings here rather
   // than in a separate describe block.
   test("linkedRemoteLinks: false is accepted and kept, distinct from omitted", () => {
     const [r] = parseRules({ rules: [{ ...minimal, linkedRemoteLinks: false }] });
@@ -605,8 +604,8 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
   test("every valid value is accepted for every provider — provider-generic, like execution/account/role", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
-      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true }] });
-      expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, maxLinkedTurnsPerHour: 1, linkedRemoteLinks: true });
+      const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, linkedRemoteLinks: true }] });
+      expect(r).toMatchObject({ resourceProvider, linkedEventing: true, linkedPollIntervalMs: 1, maxLinkedItems: 1, linkedRemoteLinks: true });
     }
   });
 
@@ -616,28 +615,45 @@ describe("linked-eventing knobs (BUTCHR-429/BUTCHR-436 — additive, default ine
   });
 
   test("rejects a non-positive-integer for each numeric knob, naming the rule and field", () => {
-    for (const field of ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const) {
+    for (const field of ["linkedPollIntervalMs", "maxLinkedItems"] as const) {
       for (const bad of [0, -1, 1.5, "5", null]) {
         expect(() => parseRules({ rules: [{ ...minimal, [field]: bad }] }, "f.json")).toThrow(`f.json: rules[0].${field} must be a positive integer`);
       }
     }
   });
 
-  test("all five bad at once are all reported together", () => {
+  test("all four bad at once are all reported together", () => {
     let msg = "";
-    try { parseRules({ rules: [{ ...minimal, linkedEventing: 1, linkedPollIntervalMs: 0, maxLinkedItems: -5, maxLinkedTurnsPerHour: "many", linkedRemoteLinks: "no" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
+    try { parseRules({ rules: [{ ...minimal, linkedEventing: 1, linkedPollIntervalMs: 0, maxLinkedItems: -5, linkedRemoteLinks: "no" }] }, "f.json"); } catch (e) { msg = (e as Error).message; }
     expect(msg).toContain("f.json: rules[0].linkedEventing must be a boolean");
     expect(msg).toContain("f.json: rules[0].linkedPollIntervalMs must be a positive integer");
     expect(msg).toContain("f.json: rules[0].maxLinkedItems must be a positive integer");
-    expect(msg).toContain("f.json: rules[0].maxLinkedTurnsPerHour must be a positive integer");
     expect(msg).toContain("f.json: rules[0].linkedRemoteLinks must be a boolean");
   });
 
-  test("a pre-change rules document (none of the five set) loads unchanged — no existing rules file needs to opt in", () => {
+  test("a pre-change rules document (none of the four set) loads unchanged — no existing rules file needs to opt in", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", account: "none", role: "worker", ...idlePokeDefaults },
     ] as never);
+  });
+});
+
+// FACTORY-252: `maxLinkedTurnsPerHour` configured the hourly linked-notify
+// rate cap (src/jira-watch/linked-eventing.ts), now removed entirely. It
+// stays in `REMOVED_RULE_FIELDS` (rules.ts) purely as a migration
+// affordance — an already-deployed rules.json still loads instead of
+// failing every rule with "unknown field" — but is parsed into nothing.
+describe("maxLinkedTurnsPerHour (FACTORY-252: removed, migration-only)", () => {
+  test("an already-deployed rule carrying the old field loads without error and the field does not appear on the parsed Rule", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, linkedEventing: true, maxLinkedTurnsPerHour: 2 }] });
+    expect(r).toBeDefined();
+    expect((r as unknown as Record<string, unknown>).maxLinkedTurnsPerHour).toBeUndefined();
+  });
+
+  test("an old deployed value of any shape (even one that used to be rejected) does not throw — it is never validated any more", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, maxLinkedTurnsPerHour: "garbage" }] })).not.toThrow();
+    expect(() => parseRules({ rules: [{ ...minimal, maxLinkedTurnsPerHour: -5 }] })).not.toThrow();
   });
 });
 

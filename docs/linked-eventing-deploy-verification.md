@@ -1,5 +1,23 @@
 # Linked-change eventing deploy verification (BUTCHR-439, story BUTCHR-430, epic BUTCHR-421)
 
+> **Historical record — the hourly rate cap this document describes is
+> removed (FACTORY-252).** This page is a dated record of BUTCHR-439's own
+> deploy verification and is KEPT, not rewritten (this repo's house
+> convention for a superseded decision — see `docs/butchr-391-acceptance-evidence.md`
+> for the same pattern applied elsewhere). Every mention below of
+> `maxLinkedTurnsPerHour`, a "rate-cap complication," or a capped/suppressed
+> tick describes behavior from a mechanism that NO LONGER EXISTS in
+> `src/jira-watch/linked-eventing.ts` as of FACTORY-252 — a linked-change
+> notify is now delivered every time a genuine diff is found, with no
+> turn-rate budget at all. This document's own §4's unresolved observation
+> (a rate-capped change that never caught up once its window freed) was the
+> motivating evidence for FACTORY-252's investigation; that investigation
+> found the then-CURRENT code's catch-up discipline working correctly in
+> regression tests, but the operator decided to remove the cap outright
+> rather than keep carrying the risk the original incident raised. See
+> `docs/resource-links.md`'s own "FACTORY-252 UPDATE" note for the full
+> removal record.
+
 **STATUS: Steps A-E complete and PASS. Step F (revert) is DONE except for
 deletion of the throwaway tickets BUTCHR-441/442, which were closed to Done
 rather than deleted — see §6.**

@@ -88,46 +88,39 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(reason.linked.events.map((e) => e.target).sort()).toEqual(["BUTCHR-2", "BUTCHR-3", "BUTCHR-4"]);
   });
 
-  test("the rate cap suppresses beyond the max and logs [notify-suppressed] rate-capped; a suppressed change is still detected and delivered on the next allowed tick", async () => {
+  // FACTORY-252: this test ONCE proved the hourly turn-rate cap suppressed a
+  // delivery beyond its own max and caught it up once the window froze —
+  // that cap (and the `[notify-suppressed] arm=rate-capped` line it logged)
+  // is REMOVED entirely. Replaced with the DoD's own acceptance shape: more
+  // deliveries than the former limit ever allowed, in the same hour, every
+  // one delivered immediately with no suppression line at all.
+  test("FACTORY-252: no turn-rate cap — three real changes to the same linked target in one hour all deliver immediately, with no [notify-suppressed] rate-capped line", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
     const state = createLinkedEventingState();
     const now = { value: 0 };
     const { deps, notified, logs } = fakeDeps(world, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner); // no maxLinkedTurnsPerHour knob exists any more
 
     await state.runTick([m], deps); // seed
     expect(notified).toHaveLength(0);
 
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
-    await state.runTick([m], deps); // uses the one allowed turn this hour
-    expect(notified).toHaveLength(1);
-
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
-    await state.runTick([m], deps); // capped — dropped, not delivered
-    expect(notified).toHaveLength(1); // still just the one from before
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes("watcher=jira-work:task:BUTCHR-1"))).toBe(true);
-
-    now.value += 61 * 60_000; // roll the sliding window over
-    await state.runTick([m], deps); // the same outstanding change (Done, never delivered) is re-detected and delivered
-    expect(notified).toHaveLength(2);
-    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
+    for (const status of ["In Progress", "In Review", "Done"]) {
+      world["BUTCHR-2"] = issue("BUTCHR-2", { status });
+      now.value += 1_000; // all well within the same hour
+      await state.runTick([m], deps);
+    }
+    expect(notified).toHaveLength(3); // every single one delivered, none withheld
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   // FACTORY-252: reproduction sketch from the historical BUTCHR-430/439/421
-  // verification report — maxLinkedTurnsPerHour: 2, two earlier real
-  // deliveries use both slots, further real changes to the (still linked)
-  // targets are rate-capped on every tick while genuinely outstanding
-  // (mirroring the observed ~15s repeated [notify-suppressed] lines), then
-  // NO further changes are made and the clock advances past the 1-hour
-  // sliding window so both used slots age out. Expected per this module's
-  // own "DELAYED, NOT LOST" contract: the FIRST tick after the window frees
-  // re-detects the still-outstanding diff against its still-unadvanced
-  // baseline and delivers a coalesced catch-up notify — WITHOUT any new
-  // change having landed at that tick.
-  test("FACTORY-252: a rate-capped change that stops recurring is still caught up once the hourly window frees, with no new event needed", async () => {
+  // verification report, re-run against current code to confirm the
+  // specific scenario it described — two real deliveries, then a further
+  // real change, then NO further changes, then an hour passes — no longer
+  // involves any cap/window/catch-up at all: the further change simply
+  // delivers on the very next tick, immediately.
+  test("FACTORY-252: the historical repro's own further change (after two earlier real deliveries) now delivers on the very next tick, no window wait needed", async () => {
     const owner = issue("BUTCHR-1", {
       issuelinks: [
         { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
@@ -141,52 +134,30 @@ describe("BUTCHR-436: linked-change eventing", () => {
     const state = createLinkedEventingState();
     const now = { value: 0 };
     const { deps, notified, logs } = fakeDeps(world, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 2 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner); // no maxLinkedTurnsPerHour knob exists any more
 
     await state.runTick([m], deps); // seed both baselines
     expect(notified).toHaveLength(0);
 
-    // Two real changes, each on its own tick, use both of the hour's slots.
+    // The two changes that, under the former cap, would have used both slots.
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
     now.value += 11_000;
     await state.runTick([m], deps);
     world["BUTCHR-3"] = issue("BUTCHR-3", { status: "In Progress" });
     now.value += 11_000;
     await state.runTick([m], deps);
-    expect(notified).toHaveLength(2); // both slots now used
+    expect(notified).toHaveLength(2);
 
-    // The genuinely outstanding change: BUTCHR-2 moves again while capped.
+    // The further change that, under the former cap, would have been held.
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
     now.value += 20_000;
-    await state.runTick([m], deps); // capped — held, not delivered
-    expect(notified).toHaveLength(2);
-    const suppressedCount = () => logs.filter((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped")).length;
-    expect(suppressedCount()).toBeGreaterThan(0);
-
-    // A few more ticks while STILL capped and the diff is STILL outstanding
-    // — the suppression line fires every time, matching the historical
-    // report's "every ~15s while something is actively pending".
-    for (let i = 0; i < 3; i++) {
-      now.value += 15_000;
-      await state.runTick([m], deps);
-    }
-    expect(notified).toHaveLength(2); // still never delivered
-    const suppressedBeforeQuiet = suppressedCount();
-    expect(suppressedBeforeQuiet).toBeGreaterThan(1); // fired on every one of those ticks too
-
-    // Now NO further changes land on either target — just the clock running
-    // until both used slots age out of the sliding hour.
-    now.value += 61 * 60_000 - 42_000; // past both turns' one-hour mark
-    await state.runTick([m], deps);
-
-    // The still-outstanding BUTCHR-2 diff (never delivered) must be caught
-    // up now, coalesced into exactly one notify, with no new change at all.
+    await state.runTick([m], deps); // delivered immediately — no cap to hold it
     expect(notified).toHaveLength(3);
     const reason = notified[2]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
     expect(reason.linked.events).toEqual([
       { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' },
     ]);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   test("an agent's own edit to a linked ticket does not notify itself (own-write echo)", async () => {
@@ -338,73 +309,72 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "Backlog" to "Done" (as of t2)' }]);
   });
 
-  test("FACTORY-833: a rate-capped target that keeps changing status while held reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
+  // FACTORY-252: these two tests ONCE held delivery with the hourly
+  // turn-rate cap (now removed). The underlying mechanism they pin —
+  // `observedAt`'s per-field frozen timestamps surviving a tick whose
+  // delivery is held for some OTHER reason — is still load-bearing (see
+  // this module's own "ADVANCE STATE ONLY ONCE GENUINELY CONSUMED" top
+  // comment), so they now hold delivery via a failing batched search
+  // instead (the one other mechanism that still defers a tick's advance).
+  test("FACTORY-833: a target that keeps changing status while its tick's search fails reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
     const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const { deps, notified, logs } = fakeDeps(world, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    let failSearch = false;
+    const logs: string[] = [];
+    const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        if (failSearch) throw new Error("transient");
+        const m = /^key in \((.*)\)$/.exec(jql);
+        const keys = m ? m[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (agent, about, reason) => { notified.push({ agent, about, reason }); },
+      log: (l) => logs.push(l),
+    };
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
 
     await state.runTick([m], deps); // seed
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
-    await state.runTick([m], deps); // uses the one allowed turn
+    await state.runTick([m], deps); // delivered immediately
     expect(notified).toHaveLength(1);
 
-    // Two further real transitions land WHILE capped — delayed, not lost;
-    // the diff this module coalesces is against the LAST delivered
-    // baseline, so the eventual delivery reports the NET transition
-    // (before -> final), with the FINAL transition's own timestamp, never
-    // the intermediate "t3" or a fabricated "right now".
+    // Two further real transitions land WHILE this tick's search is failing
+    // — delayed, not lost; the diff this module coalesces is against the
+    // LAST delivered baseline, so the eventual delivery reports the NET
+    // transition (before -> final), with the FINAL transition's own
+    // timestamp, never the intermediate "t3" or a fabricated "right now".
+    failSearch = true;
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Review", updated: "t3" });
-    await state.runTick([m], deps); // capped
+    await state.runTick([m], deps); // search fails — whole tick skipped
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t4" });
-    await state.runTick([m], deps); // still capped
+    await state.runTick([m], deps); // still failing
     expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("batched linked-item fetch failed"))).toBe(true);
 
-    now.value += 61 * 60_000;
+    failSearch = false;
     await state.runTick([m], deps); // delivered now
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
     expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t4)' }]);
   });
 
-  test("FACTORY-833 (review round 2, PR #800): a status transition held by the rate cap keeps ITS OWN timestamp even after a later unrelated summary-only edit lands before delivery", async () => {
-    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
-    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", summary: "s0", updated: "t1" }) };
-    const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const { deps, notified, logs } = fakeDeps(world, { now });
-    // maxLinkedTurnsPerHour: 1, exhausted by a throwaway change first, so
-    // the real status transition below lands already-capped.
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
-
-    await state.runTick([m], deps); // seed
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", summary: "s0", updated: "t2" }); // consumes the one allowed turn
-    await state.runTick([m], deps);
-    expect(notified).toHaveLength(1);
-
-    // The real status transition this test cares about, landing already capped.
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s0", updated: "t3" });
-    await state.runTick([m], deps); // capped — "Done" transition held, dated t3 internally
-    expect(notified).toHaveLength(1);
-
-    // A LATER unrelated edit: summary changes, status stays "Done". Must not
-    // overwrite the already-frozen status-transition timestamp (t3) with t4.
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s1", updated: "t4" });
-    await state.runTick([m], deps); // still capped
-    expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
-
-    now.value += 61 * 60_000;
-    await state.runTick([m], deps); // delivered — status wins over summary in changeDetail's own priority, dated to its OWN t3, not the later t4
-    expect(notified).toHaveLength(2);
-    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' }]);
-  });
+  // FACTORY-252: the ORIGINAL version of this test (PR #800 review round 2)
+  // relied on the hourly rate cap updating `observedAt` every tick while
+  // STILL withholding delivery across several ticks, so a status
+  // transition's own frozen timestamp could be shown to survive a LATER
+  // unrelated edit landing before eventual delivery. With the cap removed,
+  // the only remaining mechanism that defers a tick's advance (a failing
+  // batched search) ALSO skips observing anything that tick at all (see
+  // "SEARCH FAILURE SKIPS THE WHOLE TICK" in this module's own top
+  // comment) — so there is no longer any reachable path where a genuine
+  // Jira-kind field change is observed on one tick, held, and then
+  // overtaken by a DIFFERENT field's later edit before delivery. That
+  // specific nuance test is therefore removed rather than approximated;
+  // `changeDetail`'s own status-over-summary priority is still covered by
+  // the FACTORY-833 (ask #3) test above and by the single-jump case in the
+  // test immediately above this comment.
 
   test("FACTORY-833: two DISTINCT issuelinks (different relationship types) to the SAME target collapse to one watched item (existing dedup-by-target contract) and carry the FIRST link's own id, never a fabricated or merged one", async () => {
     const owner = issue("BUTCHR-1", {

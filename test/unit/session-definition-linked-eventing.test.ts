@@ -108,10 +108,9 @@ describe("sessionDefinitionProjectMatches (pure)", () => {
     expect(matches.every((x) => x.notifyAgentKey === m.agentKey)).toBe(true);
   });
 
-  test("PR review (FACTORY-71), corrected by BUTCHR-471: the produced rule still carries no maxLinkedTurnsPerHour/maxLinkedItems of its own — there is still no per-definition or shared-constant cap value baked into this rule, and a real per-definition override remains a known, deliberately-deferred gap (FACTORY-78). What changed is that absent no longer means UNCAPPED: BUTCHR-471 moved the default (2 turns/hour, 25 items) to the ENFORCEMENT site (`effectiveMaxLinkedTurnsPerHour`/`effectiveMaxLinkedItems`, src/jira-watch/linked-eventing.ts), which reads this same absent-field rule, so a managed session is capped by the shared default exactly like an unconfigured jira-project rule now is — see test/unit/linked-eventing-default-caps.test.ts for that enforcement proof.", () => {
+  test("PR review (FACTORY-71), corrected by BUTCHR-471/FACTORY-252: the produced rule still carries no maxLinkedItems of its own — there is still no per-definition or shared-constant cap value baked into this rule, and a real per-definition override remains a known, deliberately-deferred gap (FACTORY-78). BUTCHR-471 moved the item-cap default (25) to the ENFORCEMENT site (`effectiveMaxLinkedItems`, src/jira-watch/linked-eventing.ts), which reads this same absent-field rule, so a managed session is capped by the shared default exactly like an unconfigured jira-project rule now is — see test/unit/linked-eventing-default-caps.test.ts for that enforcement proof. FACTORY-252 removed the companion hourly turn-rate cap entirely (`maxLinkedTurnsPerHour` no longer exists on `Rule` at all), so there is no analogous turn-cap default to check here any more.", () => {
     const m = match(absPath("defs", "a.json"), { linkedEventingProjects: ["jira-project:BUTCHR"] });
     const [matched] = sessionDefinitionProjectMatches(m);
-    expect(matched!.rule.maxLinkedTurnsPerHour).toBeUndefined();
     expect(matched!.rule.maxLinkedItems).toBeUndefined();
   });
 });
@@ -221,26 +220,22 @@ describe("createManagedSessionResourceType: linked-eventing wiring (FACTORY-53/F
 });
 
 /**
- * PR review (FACTORY-71): this describe block proves the BUTCHR-469 rate-cap
- * MECHANISM works correctly when a match's state-owning `agentKey` differs
- * from its `notifyAgentKey` — it does NOT prove managed sessions are
- * rate-capped in production via THIS rule shape. The match below hand-sets
- * `rule.maxLinkedTurnsPerHour: 1` directly, bypassing
- * `sessionDefinitionProjectMatches` entirely: that function never produces a
- * rule with this field set (see "the produced rule still carries no
- * maxLinkedTurnsPerHour" above). Production coverage for the case where the
- * rule leaves it absent — closed by BUTCHR-471's enforcement-site default,
- * `effectiveMaxLinkedTurnsPerHour` — lives in
- * test/unit/linked-eventing-default-caps.test.ts, through the real
- * `createManagedSessionResourceType` wiring; a per-definition override
- * remains a known, deliberately-deferred gap (FACTORY-78).
+ * FACTORY-252: this describe block ONCE proved the BUTCHR-469 rate-cap
+ * mechanism works correctly when a match's state-owning `agentKey` differs
+ * from its `notifyAgentKey` — that cap (and its own sliding-window
+ * suppress/retry behaviour) is REMOVED entirely from `runTick`. What
+ * survives and is still worth pinning here: delivery is keyed by
+ * `notifyAgentKey`, never the synthetic `agentKey`, across MULTIPLE
+ * successive genuine changes for the SAME synthetic-keyed match — nothing
+ * about removing the cap should make `runTick` start delivering to the
+ * wrong agent, or coalesce/drop a second real change just because the
+ * first one already fired this "session".
  */
-describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window logic runTick already has still works correctly when keyed by a synthetic state-owning agentKey and delivered to a different notifyAgentKey", () => {
-  test("a capped tick is suppressed and retried later, and every delivered notify still targets notifyAgentKey, never the synthetic agentKey", async () => {
+describe("delivery targeting (not rate-cap mechanism, removed FACTORY-252): every notify still targets notifyAgentKey, never the synthetic agentKey, across repeated real changes with no cap involved", () => {
+  test("two independent real changes to the same synthetic-keyed project owner each deliver immediately, both to notifyAgentKey", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const now = { value: 0 };
     const notified: Array<{ agent: string; about: string }> = [];
     const deps: LinkedEventingDeps = {
       search: async (jql) => {
@@ -251,28 +246,23 @@ describe("rate-cap MECHANISM (not production defaults): the SAME sliding-window 
         throw new Error(`unexpected JQL ${jql}`);
       },
       notify: async (agent, about) => { notified.push({ agent, about }); },
-      now: () => now.value,
     };
     const realSessionAgent = sessionAgentKey(absPath("defs", "a.json"));
     const m: ProjectLinkedEventingMatch = {
       agentKey: `${realSessionAgent}\0linked:jira-project:BUTCHR`,
-      rule: { id: "x", enabled: true, resourceProvider: "filesystem", query: "{}", brief: "b", execution: "swarm", account: "none", role: "worker", linkedEventing: true, maxLinkedTurnsPerHour: 1 },
+      rule: { id: "x", enabled: true, resourceProvider: "filesystem", query: "{}", brief: "b", execution: "swarm", account: "none", role: "worker", linkedEventing: true },
       projectKey: "BUTCHR",
       notifyAgentKey: realSessionAgent,
     };
 
     await state.runTick([], deps, [m]); // seed watermark
     membersByProject.BUTCHR = ["BUTCHR-1"];
-    await state.runTick([], deps, [m]); // first appearance — uses the one allowed turn
+    await state.runTick([], deps, [m]); // first appearance — delivered immediately, no cap
     expect(notified).toHaveLength(1);
     expect(notified[0]!.agent).toBe(realSessionAgent); // delivered to the REAL agent, never the synthetic state key
 
     world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" });
-    await state.runTick([], deps, [m]); // capped — dropped this tick, not lost
-    expect(notified).toHaveLength(1);
-
-    now.value += 61 * 60_000;
-    await state.runTick([], deps, [m]); // the same outstanding change is re-detected and delivered
+    await state.runTick([], deps, [m]); // a SECOND real change — also delivered immediately, no cap to hold it
     expect(notified).toHaveLength(2);
     expect(notified[1]!.agent).toBe(realSessionAgent);
   });
