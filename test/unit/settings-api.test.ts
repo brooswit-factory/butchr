@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
+import { buildCurrentSettingsApiResponse, buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
 
 /** FACTORY-694 item 4: every definition that is actually secret, reviewed and hardcoded by hand — NOT derived from `SECRET_KEY_RE` or any other rule. Adding a new `SETTINGS_DEFINITIONS` entry without updating this set (when it should be secret) is caught by the "every definition's secret flag is deliberate" test below. */
 const EXPECTED_SECRET_KEYS = new Set([
@@ -254,5 +254,21 @@ describe("redactUrlUserinfo: a password that itself contains '@' leaves no remai
   test("a plain URL without userinfo, and a path containing '@', are untouched", () => {
     expect(redactUrlUserinfo("https://chat.example.com/a@b")).toBe("https://chat.example.com/a@b");
     expect(redactUrlUserinfo("https://chat.example.com")).toBe("https://chat.example.com");
+  });
+});
+
+describe("buildCurrentSettingsApiResponse (local/ui)", () => {
+  test("reads settings.json as it is at each call: a value saved after startup reads back as saved, and the environment still wins", async () => {
+    let file: Record<string, string> = {};
+    const read = () => ({ values: file });
+    const statFn = async () => { throw Object.assign(new Error("absent"), { code: "ENOENT" }); };
+    const row = async (key: string, env: Record<string, string | undefined> = {}) =>
+      (await buildCurrentSettingsApiResponse(env, read, { statFn: statFn as never })).settings.find((e) => e.key === key);
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: null, source: "default" });
+    file = { BUTCHR_MAX_AGENTS: "20" };
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: "20", source: "file" });
+    file = { BUTCHR_MAX_AGENTS: "10" };
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: "10", source: "file" });
+    expect(await row("BUTCHR_MAX_AGENTS", { BUTCHR_MAX_AGENTS: "4" })).toMatchObject({ value: "4", source: "environment" });
   });
 });

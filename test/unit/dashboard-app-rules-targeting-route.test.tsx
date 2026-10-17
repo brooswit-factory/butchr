@@ -8,13 +8,16 @@ import { EditorView } from "@codemirror/view";
 import { Link, MemoryRouter, Route, Routes, useNavigate } from "react-router";
 import { withDom } from "../setup/happy-dom.js";
 import { createFixturesRulesApi, FIXTURE_BUILTIN_BRIEFS, type RuleDto } from "../../dashboard-app/src/api/rules.js";
-import { RulesTargetingRoute, rulesPageReducer, saveBlockedReason, type RulesPageState } from "../../dashboard-app/src/routes/RulesTargetingRoute.js";
+import { forgetKeptRulesDrafts, RulesTargetingRoute, rulesPageReducer, saveBlockedReason, type RulesPageState } from "../../dashboard-app/src/routes/RulesTargetingRoute.js";
 import { unstaffedReason } from "../../dashboard-app/src/components/rules-targeting/RuleCard.js";
 import { describeDraft } from "../../dashboard-app/src/components/rules-targeting/SaveBar.js";
 import { newDraftKey, summarizeDraft } from "../../dashboard-app/src/view-model/rules-draft.js";
 
 withDom();
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  forgetKeptRulesDrafts();
+});
 
 function rule(overrides: Partial<RuleDto> = {}): RuleDto {
   return {
@@ -91,6 +94,62 @@ describe("RulesTargetingRoute", () => {
     expect(live.getByText("lizard mode")).toBeTruthy();
     expect(view.getByTestId("rules-save-bar").textContent).toContain("No unsaved changes");
     expect((view.getByTestId("rules-review-save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  test("the leave-page warning stays on from another page while the kept draft is unsaved, and goes once it's saved or discarded", async () => {
+    const api = createFixturesRulesApi({ initial: { rules: [rule()], errors: [] }, latencyMs: 0, previewsByQuery: { "triage:project = B": { ruleId: "triage", total: 1, tickets: [] } } });
+    const view = render(
+      <MemoryRouter initialEntries={["/rules"]}>
+        <nav>
+          <Link to="/agents" data-testid="nav-agents">Agents</Link>
+          <Link to="/rules" data-testid="nav-rules">Rules</Link>
+        </nav>
+        <Routes>
+          <Route path="/rules" element={<RulesTargetingRoute api={api} />} />
+          <Route path="/agents" element={<p data-testid="agents-page">agents</p>} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const leaveIsBlocked = () => {
+      const ev = new Event("beforeunload", { cancelable: true });
+      window.dispatchEvent(ev);
+      return ev.defaultPrevented;
+    };
+    const edit = async (query: string) => {
+      const card = await cardFor(view, "triage");
+      await waitFor(() => expect((card.getByTestId("rule-edit") as HTMLButtonElement).disabled).toBe(false));
+      fireEvent.click(card.getByTestId("rule-edit"));
+      await setQuery(card, query);
+      await waitFor(() => expect(card.getByTestId("rule-status-tag").textContent).toBe("Modified"));
+    };
+    const toAgents = async () => {
+      fireEvent.click(view.getByTestId("nav-agents"));
+      await view.findByTestId("agents-page");
+    };
+    const toRules = async () => {
+      fireEvent.click(view.getByTestId("nav-rules"));
+      await view.findByTestId("rules-save-bar");
+    };
+
+    expect(leaveIsBlocked()).toBe(false);
+    await edit("project = B");
+    await toAgents();
+    expect(leaveIsBlocked()).toBe(true); // the Rules page is gone, its unsaved draft isn't
+
+    await toRules();
+    fireEvent.click(view.getByTestId("rules-undo-all"));
+    fireEvent.click(within(await view.findByTestId("rules-discard-dialog")).getByTestId("rules-discard-confirm"));
+    await waitFor(() => expect(view.getByTestId("rules-save-bar").textContent).toContain("No unsaved changes"));
+    await toAgents();
+    expect(leaveIsBlocked()).toBe(false);
+
+    await toRules();
+    await edit("project = B");
+    fireEvent.click(view.getByTestId("rules-review-save"));
+    fireEvent.click(within(await view.findByTestId("rules-review-dialog")).getByTestId("rules-save-confirm"));
+    await waitFor(() => expect(view.getByTestId("rules-save-bar").textContent).toContain("No unsaved changes"));
+    await toAgents();
+    expect(leaveIsBlocked()).toBe(false);
   });
 
   test("unsaved edits survive going to another page and coming back, through a nav link and through Back", async () => {

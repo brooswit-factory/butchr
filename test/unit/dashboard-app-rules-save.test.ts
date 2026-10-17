@@ -41,6 +41,19 @@ async function setup(rules: RuleDto[], actions: RulesDraftAction[], opts: Parame
 }
 
 describe("reviewChanges", () => {
+  test("a disabled singleton rule edited to swarm and turned on is reviewed as a swarm enable, so the save confirms it instead of stopping halfway", async () => {
+    const { api, state, etag } = await setup(
+      [rule({ execution: "singleton" })],
+      [{ type: "edit", key: "triage", changes: { execution: "swarm", enabled: true } }],
+      { previews: { triage: { total: 3, tickets: [] } as never } },
+    );
+    const reviewed = await reviewChanges(api, computeRuleChanges(state));
+    const enable = reviewed.find((r) => r.change.kind === "enable")!;
+    expect([enable.plan?.requiresConfirm, enable.plan?.confirmReason]).toEqual([true, "swarm-enable"]);
+    const outcome = await saveChanges(api, reviewed, etag);
+    expect(outcome.steps.map((s) => [s.change.kind, s.status, s.error ?? null])).toEqual([["update", "saved", null], ["enable", "saved", null]]);
+  });
+
   test("an edited rule's enable is reviewed against its new query: a placeholder rule given a real query and turned on can be saved, and the save doesn't drift", async () => {
     const { api, state, etag } = await setup(
       [rule({ query: PLACEHOLDER_QUERY })],

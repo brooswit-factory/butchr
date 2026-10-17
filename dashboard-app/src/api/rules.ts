@@ -1138,7 +1138,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       // Mirrors `src/rules/rules-write.ts`'s own `planRuleWrite` gate order
       // (FACTORY-685, item 2): a swarm enable needs confirm at ANY scope,
       // not only above the ceiling.
-      const rawSwarmEnable = (counts.spawned > 0 && rule.execution === "swarm") || swarmSwitch;
+      const rawSwarmEnable = (counts.spawned > 0 && (patch.execution ?? rule.execution) === "swarm") || swarmSwitch;
       const rawOverCeiling = (counts.spawned > 0 || swarmSwitch) && scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
       // FACTORY-730: raw/unconditional, same discipline as the gates above.
       const rawQueryChange = queryChanged;

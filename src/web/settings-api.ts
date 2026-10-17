@@ -28,7 +28,7 @@
  */
 import { constants as fsConstants } from "node:fs";
 import { stat } from "node:fs/promises";
-import { isAllowlistedSettingsKey } from "../settings/settings-file.js";
+import { effectiveSettingsEnv, isAllowlistedSettingsKey } from "../settings/settings-file.js";
 import type { CredentialsSummary } from "./credentials-api.js";
 import { PROVIDER_ENABLED_ENV_VAR } from "../rules/provider-enablement.js";
 
@@ -293,6 +293,23 @@ export async function buildAtlassianTokenFileStatus(env: Readonly<Record<string,
  * when the caller has one; `src/daemon/index.ts` is the one production
  * caller that does.
  */
+/**
+ * local/ui — the response for settings.json as it is right now. Both
+ * `GET /api/settings` and the reply to a `PUT` are built from it, so a value
+ * saved from the Settings page reads back as saved (`source: "file"`) until
+ * the restart that applies it, even after leaving the page or reloading.
+ * Upstream's GET served the startup snapshot instead, so the page went back to
+ * showing the old value.
+ */
+export async function buildCurrentSettingsApiResponse(
+  rawEnv: Readonly<Record<string, string | undefined>>,
+  readSettingsFile: () => { values: Readonly<Record<string, string>> },
+  deps: { statFn?: (path: string) => Promise<StatResult>; unitHint?: () => Promise<UnitHint | undefined> } = {},
+): Promise<SettingsApiResponse> {
+  const values = readSettingsFile().values;
+  return buildSettingsApiResponse(effectiveSettingsEnv(rawEnv as Record<string, string | undefined>, values as Record<string, string>), { ...deps, rawEnv, settingsFileValues: values });
+}
+
 export async function buildSettingsApiResponse(env: Readonly<Record<string, string | undefined>>, deps: { statFn?: (path: string) => Promise<StatResult>; unitHint?: () => Promise<UnitHint | undefined>; rawEnv?: Readonly<Record<string, string | undefined>>; settingsFileValues?: Readonly<Record<string, string>> } = {}): Promise<SettingsApiResponse> {
   const [atlassianTokenFile, unitHint] = await Promise.all([
     buildAtlassianTokenFileStatus(env, deps.statFn),

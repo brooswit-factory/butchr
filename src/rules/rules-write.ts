@@ -813,11 +813,13 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   }
   const etag = rulesEtag(env, deps.io);
   const wasEnabled = current.enabled === true;
-  // local/ui: a dry run that both edits the query and turns the rule on (the
-  // Rules page reviews an edited rule's enable this way) checks and measures
-  // the rule as it would be: the new query, not the one still in the file.
-  // Real writes never send both, so nothing else changes.
+  // local/ui: a dry run that both edits fields and turns the rule on (the
+  // Rules page reviews an edited rule's enable this way) checks, measures and
+  // classifies the rule as it would be after the edit: its new query and its
+  // new execution, not the ones still in the file. Real writes never send
+  // both, so nothing else changes.
   const queryAfter = patch.query !== undefined ? patch.query : current.query;
+  const executionAfter = patch.execution !== undefined ? patch.execution : current.execution;
 
   if (patch.enabled === true && !wasEnabled && queryAfter === PLACEHOLDER_QUERY) {
     return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder` };
@@ -864,7 +866,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   // so `confirmReason` can classify the gate even on a call that already
   // supplied `confirm: true`.
   // local/ui: switching an enabled rule to swarm is gated like enabling one.
-  const rawSwarmEnable = (counts.spawned > 0 && executionOf(current.execution) === "swarm") || swarmSwitch;
+  const rawSwarmEnable = (counts.spawned > 0 && executionOf(executionAfter) === "swarm") || swarmSwitch;
   const rawOverCeiling = (counts.spawned > 0 || swarmSwitch) && scope !== null && scope > ENABLE_SCOPE_CEILING;
   // FACTORY-730: raw/unconditional, same discipline as the three gates
   // above — `queryChanged` alone is the gate (there is no "ceiling" for a

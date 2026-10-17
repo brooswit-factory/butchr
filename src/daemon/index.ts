@@ -142,7 +142,7 @@ import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache, createRule, planRuleCreate } from "../rules/rules-write.js";
-import { buildSettingsApiResponse } from "../web/settings-api.js";
+import { buildCurrentSettingsApiResponse } from "../web/settings-api.js";
 import { createCachedUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
 import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
@@ -1376,8 +1376,12 @@ const { app, mcp } = buildApp({
   // was built from are passed through too, so `buildSettingEntries` can
   // report `source: "environment" | "file" | "default"` correctly for
   // every allowlisted key — see that function's own doc comment.
+  // local/ui: read from settings.json as it is now, the same as the PUT reply
+  // below (`buildCurrentSettingsApiResponse`), so a value saved from the
+  // Settings page still reads back as saved after leaving the page or
+  // reloading, until the restart that applies it.
   settings: async () => ({
-    ...(await buildSettingsApiResponse(effectiveEnv, { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values })),
+    ...(await buildCurrentSettingsApiResponse(process.env as Record<string, string | undefined>, () => loadSettingsFile(process.env), { unitHint: () => cachedUnitHint() })),
     credentials: await credentialsSummary(),
   }),
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
@@ -1400,9 +1404,8 @@ const { app, mcp } = buildApp({
   // needed" badge has an accurate current/pending value to show it against).
   settingsWrite: async (key, value, confirm) => {
     writeSetting(key, value, confirm);
-    const fresh = loadSettingsFile(process.env);
     return {
-      ...(await buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values })),
+      ...(await buildCurrentSettingsApiResponse(process.env as Record<string, string | undefined>, () => loadSettingsFile(process.env), { unitHint: () => cachedUnitHint() })),
       credentials: await credentialsSummary(),
     };
   },

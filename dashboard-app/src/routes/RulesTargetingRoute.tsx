@@ -93,11 +93,33 @@ export function rulesPageReducer(state: RulesPageState | null, action: RulesPage
  * An unsaved draft outlives this page while the app stays open. Going to
  * another page (the nav, or Back/Forward) unmounts this route, and the draft
  * would otherwise go with it. Keyed by the rules API it was made against, so
- * each test, and each reload, starts clean. A reload or closing the tab is
- * covered by the beforeunload warning instead. Kept only while there are
- * unsaved changes, with the cards that were open.
+ * each test, and each reload, starts clean. Kept only while there are unsaved
+ * changes, with the cards that were open.
+ *
+ * The leave-page (beforeunload) warning lives here too, for as long as any
+ * kept draft is unsaved, so a reload or closing the tab from another page
+ * still warns; saving or discarding the draft removes it.
  */
-const keptDrafts = new WeakMap<RulesApi, { page: RulesPageState; modes: Record<string, RuleCardMode> }>();
+const keptDrafts = new Map<RulesApi, { page: RulesPageState; modes: Record<string, RuleCardMode> }>();
+
+function warnBeforeUnload(e: BeforeUnloadEvent): void {
+  e.preventDefault();
+  e.returnValue = "";
+}
+
+function keepDraft(api: RulesApi, kept: { page: RulesPageState; modes: Record<string, RuleCardMode> } | null): void {
+  if (kept) keptDrafts.set(api, kept);
+  else keptDrafts.delete(api);
+  if (typeof window === "undefined") return;
+  // Adding the same listener twice is a no-op, so this stays at one.
+  if (keptDrafts.size > 0) window.addEventListener("beforeunload", warnBeforeUnload);
+  else window.removeEventListener("beforeunload", warnBeforeUnload);
+}
+
+/** For tests: forget every kept draft, and with them the leave-page warning. */
+export function forgetKeptRulesDrafts(): void {
+  for (const api of [...keptDrafts.keys()]) keepDraft(api, null);
+}
 
 /** Why Review and save can't be pressed right now, or `null`. */
 export function saveBlockedReason(summary: DraftSummary, opts: { canWrite: boolean; reloadPending: boolean }): string | null {
@@ -207,20 +229,10 @@ export function RulesTargetingRoute({ api = rulesApi }: RulesTargetingRouteProps
   const summary = useMemo(() => (page ? summarizeDraft(page.draft) : null), [page]);
   const dirty = summary?.dirty ?? false;
 
+  // Kept (with the leave-page warning) while unsaved; never cleared on unmount, so it survives going to another page.
   useEffect(() => {
-    if (page && dirty) keptDrafts.set(api, { page, modes });
-    else keptDrafts.delete(api);
+    keepDraft(api, page && dirty ? { page, modes } : null);
   }, [api, page, modes, dirty]);
-
-  useEffect(() => {
-    if (!dirty) return;
-    const warn = (e: BeforeUnloadEvent) => {
-      e.preventDefault();
-      e.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [dirty]);
 
   const canWrite = capabilitiesChecked && api.capabilities.write;
   const reloadPending = data?.stale ?? false;

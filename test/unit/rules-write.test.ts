@@ -1028,6 +1028,11 @@ describe("planRuleWrite (report-only)", () => {
       expect(plan.scope).toBe(3);
     }
     expect(asked).toEqual(["project = NEW"]);
+    // And the execution it would have: a disabled singleton edited to swarm and turned on is a swarm enable.
+    seed([{ ...UI_RULE, enabled: false, query: "project = A", execution: "singleton" }]);
+    const toSwarm = await planRuleWrite("ui-first-rule", { execution: "swarm", enabled: true }, false, async () => 3, { env: env() });
+    expect(toSwarm.ok && [toSwarm.requiresConfirm, toSwarm.confirmReason]).toEqual([true, "swarm-enable"]);
+    seed([{ ...UI_RULE, enabled: false, query: PLACEHOLDER_QUERY }]);
     // Turning it on while the edit still leaves the placeholder is refused as before.
     const still = await planRuleWrite("ui-first-rule", { query: PLACEHOLDER_QUERY, enabled: true }, false, async () => 1, { env: env() });
     expect(still.ok).toBe(false);

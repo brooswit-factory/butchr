@@ -75,6 +75,30 @@ describe("Settings: grouped daemon settings", () => {
     await waitFor(() => expect(writes).toEqual([["BUTCHR_POLL_STALE_MS", "70000", false], ["BUTCHR_POLL_STALE_MS", "60000", false]]));
   });
 
+  test("the saved value is still the baseline after leaving Settings and coming back (the daemon reads settings.json fresh)", async () => {
+    const base = createFixturesSettingsApi({ response: localUiSettingsFixture() });
+    const writes: unknown[][] = [];
+    const api: SettingsApi = { ...base, writeSetting: async (key, value, confirm) => { writes.push([key, value, confirm]); return base.writeSetting(key, value, confirm); } };
+    const page = () => render(<SettingsRoute api={api} setupApi={createFixturesSetupApi({ status: { configured: true } })} />);
+    const first = page();
+    setText(await first.findByTestId("sg-input-BUTCHR_POLL_STALE_MS"), "70000");
+    const save1 = first.getByTestId("sg-save-BUTCHR_POLL_STALE_MS") as HTMLButtonElement;
+    await waitFor(() => expect(save1.disabled).toBe(false));
+    fireEvent.click(save1);
+    await waitFor(() => expect(first.getByTestId("sg-result-BUTCHR_POLL_STALE_MS").textContent).toContain("Saved."));
+    first.unmount();
+
+    const again = page();
+    const input = (await again.findByTestId("sg-input-BUTCHR_POLL_STALE_MS")) as HTMLInputElement;
+    await waitFor(() => expect(input.value).toBe("70000"));
+    const save2 = again.getByTestId("sg-save-BUTCHR_POLL_STALE_MS") as HTMLButtonElement;
+    expect(save2.disabled).toBe(true);
+    setText(input, "60000");
+    await waitFor(() => expect(save2.disabled).toBe(false));
+    fireEvent.click(save2);
+    await waitFor(() => expect(writes).toEqual([["BUTCHR_POLL_STALE_MS", "70000", false], ["BUTCHR_POLL_STALE_MS", "60000", false]]));
+  });
+
   test("a value past the daemon's safety ceiling asks to save anyway, then saves with the confirm", async () => {
     const { view, writes } = mount({ nextWriteError: new SettingsWriteRefusedError("BUTCHR_MAX_AGENTS above 32 needs a confirm", true) });
     setText(await view.findByTestId("sg-input-BUTCHR_MAX_AGENTS"), "40");
