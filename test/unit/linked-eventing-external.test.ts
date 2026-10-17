@@ -8,11 +8,13 @@ import type { FetchLike } from "../../src/labels/pr.js";
 /**
  * BUTCHR-437 (epic BUTCHR-421, story 3/4): the three NEW pollers this story
  * adds — Confluence page, GitHub issue/PR, general webpage — driven through
- * `linked-eventing.ts`'s own `runTick`, the SAME coalescer/rate-cap/delivery
- * story 2 already built and tests in test/unit/linked-eventing.test.ts. This
- * file only covers what THIS story added: description-derived discovery
- * gated by `linkedDescriptionLinks`, the three pollers' change/unreadable/
- * no-change/transient outcomes, and the shared caps across every kind.
+ * `linked-eventing.ts`'s own `runTick`, the SAME coalescer/delivery story 2
+ * already built and tests in test/unit/linked-eventing.test.ts. This file
+ * only covers what THIS story added: description-derived discovery gated
+ * by `linkedDescriptionLinks`, the three pollers' change/unreadable/
+ * no-change/transient outcomes, and the shared item cap across every kind
+ * (FACTORY-252: the hourly turn-rate cap this comment once also named is
+ * removed entirely — `maxLinkedItems` is the only cap left to share).
  */
 
 const CONF_URL = "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/12484678/Some+Page";
@@ -111,12 +113,9 @@ describe("BUTCHR-437: Confluence page poller", () => {
     const confState = { value: 1 as number | "404" | "403" | "error" };
     const conf = fakeConfluence(confState);
     const deps: LinkedEventingDeps = { ...base, confluenceVersion: conf.getVersion };
-    // BUTCHR-471: this test's own intent is the Confluence poll lifecycle
-    // (seed/change/unreadable/recovery), not the rate cap — it fires 3
-    // notifies with no clock advance, which the BUTCHR-471 default
-    // (2/hour) would now legitimately start rate-capping. An explicit,
-    // generous override preserves this test's original intent.
-    const m = match("jira-work:task:BUTCHR-1", rule({ maxLinkedTurnsPerHour: 1000 }), owner);
+    // FACTORY-252: no turn-rate cap exists any more, so this test's 3
+    // notifies with no clock advance need no override to avoid being capped.
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
 
     await state.runTick([m], deps); // seed, version 1
     expect(notified).toHaveLength(0);
@@ -295,7 +294,12 @@ describe("BUTCHR-437: shared caps across every link kind", () => {
     expect(gh.calls).toHaveLength(0); // capped out (3rd of 3) — never fetched at all
   });
 
-  test("mixed-kind tick: a Jira change and a Confluence change in the SAME tick coalesce into exactly ONE notify, and the rate cap is shared across kinds", async () => {
+  // FACTORY-252: this test ONCE proved the hourly turn-rate cap was SHARED
+  // across Jira-kind and external-kind items for the same owner (one budget,
+  // not two). That cap is removed entirely — replaced with coverage that
+  // repeated mixed-kind changes across several ticks ALL coalesce and
+  // deliver immediately, with no cap of any kind holding either item back.
+  test("mixed-kind tick: a Jira change and a Confluence change in the SAME tick coalesce into exactly ONE notify; repeated mixed-kind changes across further ticks all deliver immediately too, with no cap of any kind", async () => {
     const owner = issue("BUTCHR-1", {
       issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
       description: `${CONF_URL}`,
@@ -311,7 +315,7 @@ describe("BUTCHR-437: shared caps across every link kind", () => {
     };
     const confState = { value: 1 as number | "404" | "403" | "error" };
     const conf = fakeConfluence(confState);
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const r = rule();
     const deps: LinkedEventingDeps = { ...base, search, confluenceVersion: conf.getVersion };
     const m = match("jira-work:task:BUTCHR-1", r, owner);
 
@@ -320,20 +324,18 @@ describe("BUTCHR-437: shared caps across every link kind", () => {
 
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
     confState.value = 2;
-    await state.runTick([m], deps); // both changed in the same tick — ONE coalesced notify, uses the one allowed turn
+    now.value += 1_000;
+    await state.runTick([m], deps); // both changed in the same tick — ONE coalesced notify
     expect(notified).toHaveLength(1);
     expect(linkedEvents(notified[0]!.reason).map((e) => e.target).sort()).toEqual(["BUTCHR-2", CONF_URL]);
 
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
     confState.value = 3;
-    await state.runTick([m], deps); // rate-capped — dropped, not delivered
-    expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.includes("arm=rate-capped"))).toBe(true);
-
-    now.value += 61 * 60_000; // roll the window
-    await state.runTick([m], deps); // both still-outstanding changes re-detect and deliver together
+    now.value += 1_000;
+    await state.runTick([m], deps); // delivered immediately too — no cap of any kind holds it
     expect(notified).toHaveLength(2);
     expect(linkedEvents(notified[1]!.reason).map((e) => e.target).sort()).toEqual(["BUTCHR-2", CONF_URL]);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   test("PR #401 review round 1: a hung webpage poll for one owner does not stall another owner's tick — the other owner still polls and notifies within the tick", async () => {

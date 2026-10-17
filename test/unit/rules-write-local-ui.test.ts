@@ -308,17 +308,24 @@ describe("measuring a new rule's scope (create dry run)", () => {
 
 describe("linked-change eventing fields", () => {
   test("PUT accepts the switches and counts, and null clears a count", () => {
-    expect(validateRuleFieldPatch({ linkedEventing: true, linkedRemoteLinks: false, maxLinkedTurnsPerHour: 4, linkedPollIntervalMs: null })).toEqual({
+    expect(validateRuleFieldPatch({ linkedEventing: true, linkedRemoteLinks: false, maxLinkedItems: 4, linkedPollIntervalMs: null })).toEqual({
       ok: true,
-      patch: { linkedEventing: true, linkedRemoteLinks: false, maxLinkedTurnsPerHour: 4, linkedPollIntervalMs: null },
+      patch: { linkedEventing: true, linkedRemoteLinks: false, maxLinkedItems: 4, linkedPollIntervalMs: null },
     });
+  });
+
+  test("FACTORY-252: maxLinkedTurnsPerHour went with the hourly cap, so a PUT or a create carrying it is refused", () => {
+    const put = validateRuleFieldPatch({ maxLinkedTurnsPerHour: 4 });
+    expect(put.ok ? "" : put.error).toContain('unknown field "maxLinkedTurnsPerHour"');
+    const create = validateRuleCreateInput({ id: "linky", resourceProvider: "jira-work", query: "project = C", maxLinkedTurnsPerHour: 4 });
+    expect(create.ok).toBe(false);
   });
 
   test.each([
     [{ linkedEventing: "yes" }, "linkedEventing must be a boolean"],
     [{ linkedDescriptionLinks: null }, "linkedDescriptionLinks must be a boolean"],
     [{ maxLinkedItems: 0 }, "maxLinkedItems must be a positive integer"],
-    [{ maxLinkedTurnsPerHour: 1.5 }, "maxLinkedTurnsPerHour must be a positive integer"],
+    [{ linkedPollIntervalMs: 1.5 }, "linkedPollIntervalMs must be a positive integer"],
   ])("PUT rejects %j", (body, message) => {
     const r = validateRuleFieldPatch(body);
     expect(r.ok ? "" : r.error).toContain(message);
@@ -333,15 +340,15 @@ describe("linked-change eventing fields", () => {
 
   test("applying sets the switches, a null count removes its key, and none of it restarts an agent", () => {
     const text = JSON.stringify({ rules: [{ ...SWARM_OFF, maxLinkedItems: 9, linkedPollIntervalMs: 60000 }] });
-    const next = JSON.parse(applyRuleFieldPatch(text, "quiet", { linkedEventing: true, linkedDescriptionLinks: true, maxLinkedItems: null, maxLinkedTurnsPerHour: 3 })).rules[0];
-    expect(next).toMatchObject({ linkedEventing: true, linkedDescriptionLinks: true, maxLinkedTurnsPerHour: 3, linkedPollIntervalMs: 60000 });
+    const next = JSON.parse(applyRuleFieldPatch(text, "quiet", { linkedEventing: true, linkedDescriptionLinks: true, maxLinkedItems: null, linkedPollIntervalMs: 30000 })).rules[0];
+    expect(next).toMatchObject({ linkedEventing: true, linkedDescriptionLinks: true, linkedPollIntervalMs: 30000 });
     expect("maxLinkedItems" in next).toBe(false);
-    expect(computeLocalPlanCounts(true, { linkedEventing: true, maxLinkedTurnsPerHour: 3 }).restarted).toBe(0);
+    expect(computeLocalPlanCounts(true, { linkedEventing: true, linkedPollIntervalMs: 30000 }).restarted).toBe(0);
   });
 
   test("an enabled rule's linked settings write without confirm; a create writes them too", async () => {
     seed([SINGLETON_ON]);
-    const patch: RuleFieldPatch = { linkedEventing: true, linkedRemoteLinks: true, maxLinkedTurnsPerHour: 5 };
+    const patch: RuleFieldPatch = { linkedEventing: true, linkedRemoteLinks: true, maxLinkedItems: 5 };
     const plan = await planned("triage", patch);
     expect((await writeRuleFields("triage", patch, plan.etag, false, plan.planHash, async () => 0, deps())).ok).toBe(true);
     const input = { id: "linky", resourceProvider: "jira-work" as const, query: "project = Z", linkedEventing: true, linkedPollIntervalMs: 120000 };
@@ -349,7 +356,7 @@ describe("linked-change eventing fields", () => {
     if (!createPlan.ok) throw new Error(createPlan.error);
     expect((await createRule(input, true, createPlan.planHash, async () => 0, deps())).ok).toBe(true);
     const [triage, linky] = readRules();
-    expect(triage).toMatchObject({ linkedEventing: true, linkedRemoteLinks: true, maxLinkedTurnsPerHour: 5, enabled: true });
+    expect(triage).toMatchObject({ linkedEventing: true, linkedRemoteLinks: true, maxLinkedItems: 5, enabled: true });
     expect(linky).toMatchObject({ linkedEventing: true, linkedPollIntervalMs: 120000, enabled: false });
   });
 
@@ -358,7 +365,7 @@ describe("linked-change eventing fields", () => {
     const entry: RuleInventoryEntry = { kind: "rule", id: "triage", resourceProvider: "jira-work", query: "project = A", enabled: true, execution: "swarm", role: "worker", agentPreferences: [], linkedEventing: true, mcpServerNames: [], staffed: true, reason: null };
     const build = (rule: Rule) => buildRulesApiResponse({ rulesFile: { path: "/rules.json", rules: [rule], error: null }, mtime: null, sourceEtag: "e", fileEtag: "e", ruleInventory: [entry] }).rules[0]!;
     const plain = build(base);
-    for (const k of ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks"]) expect(plain).not.toHaveProperty(k);
-    expect(build({ ...base, linkedEventing: true, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: false } as Rule)).toMatchObject({ linkedEventing: true, maxLinkedTurnsPerHour: 4, linkedRemoteLinks: false });
+    for (const k of ["linkedPollIntervalMs", "maxLinkedItems", "linkedRemoteLinks", "linkedDescriptionLinks"]) expect(plain).not.toHaveProperty(k);
+    expect(build({ ...base, linkedEventing: true, maxLinkedItems: 4, linkedRemoteLinks: false } as Rule)).toMatchObject({ linkedEventing: true, maxLinkedItems: 4, linkedRemoteLinks: false });
   });
 });

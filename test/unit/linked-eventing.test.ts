@@ -88,32 +88,76 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(reason.linked.events.map((e) => e.target).sort()).toEqual(["BUTCHR-2", "BUTCHR-3", "BUTCHR-4"]);
   });
 
-  test("the rate cap suppresses beyond the max and logs [notify-suppressed] rate-capped; a suppressed change is still detected and delivered on the next allowed tick", async () => {
+  // FACTORY-252: this test ONCE proved the hourly turn-rate cap suppressed a
+  // delivery beyond its own max and caught it up once the window froze —
+  // that cap (and the `[notify-suppressed] arm=rate-capped` line it logged)
+  // is REMOVED entirely. Replaced with the DoD's own acceptance shape: more
+  // deliveries than the former limit ever allowed, in the same hour, every
+  // one delivered immediately with no suppression line at all.
+  test("FACTORY-252: no turn-rate cap — three real changes to the same linked target in one hour all deliver immediately, with no [notify-suppressed] rate-capped line", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
     const state = createLinkedEventingState();
     const now = { value: 0 };
     const { deps, notified, logs } = fakeDeps(world, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner); // no maxLinkedTurnsPerHour knob exists any more
 
     await state.runTick([m], deps); // seed
     expect(notified).toHaveLength(0);
 
+    for (const status of ["In Progress", "In Review", "Done"]) {
+      world["BUTCHR-2"] = issue("BUTCHR-2", { status });
+      now.value += 1_000; // all well within the same hour
+      await state.runTick([m], deps);
+    }
+    expect(notified).toHaveLength(3); // every single one delivered, none withheld
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
+  });
+
+  // FACTORY-252: reproduction sketch from the historical BUTCHR-430/439/421
+  // verification report, re-run against current code to confirm the
+  // specific scenario it described — two real deliveries, then a further
+  // real change, then NO further changes, then an hour passes — no longer
+  // involves any cap/window/catch-up at all: the further change simply
+  // delivers on the very next tick, immediately.
+  test("FACTORY-252: the historical repro's own further change (after two earlier real deliveries) now delivers on the very next tick, no window wait needed", async () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-3" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }),
+      "BUTCHR-3": issue("BUTCHR-3", { status: "To Do" }),
+    };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, { now });
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner); // no maxLinkedTurnsPerHour knob exists any more
+
+    await state.runTick([m], deps); // seed both baselines
+    expect(notified).toHaveLength(0);
+
+    // The two changes that, under the former cap, would have used both slots.
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
-    await state.runTick([m], deps); // uses the one allowed turn this hour
-    expect(notified).toHaveLength(1);
-
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
-    await state.runTick([m], deps); // capped — dropped, not delivered
-    expect(notified).toHaveLength(1); // still just the one from before
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes("watcher=jira-work:task:BUTCHR-1"))).toBe(true);
-
-    now.value += 61 * 60_000; // roll the sliding window over
-    await state.runTick([m], deps); // the same outstanding change (Done, never delivered) is re-detected and delivered
+    now.value += 11_000;
+    await state.runTick([m], deps);
+    world["BUTCHR-3"] = issue("BUTCHR-3", { status: "In Progress" });
+    now.value += 11_000;
+    await state.runTick([m], deps);
     expect(notified).toHaveLength(2);
-    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
+
+    // The further change that, under the former cap, would have been held.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    now.value += 20_000;
+    await state.runTick([m], deps); // delivered immediately — no cap to hold it
+    expect(notified).toHaveLength(3);
+    const reason = notified[2]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' },
+    ]);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   test("an agent's own edit to a linked ticket does not notify itself (own-write echo)", async () => {
@@ -265,72 +309,110 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "Backlog" to "Done" (as of t2)' }]);
   });
 
-  test("FACTORY-833: a rate-capped target that keeps changing status while held reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
+  // FACTORY-252: these two tests ONCE held delivery with the hourly
+  // turn-rate cap (now removed). The underlying mechanism they pin —
+  // `observedAt`'s per-field frozen timestamps surviving a tick whose
+  // delivery is held for some OTHER reason — is still load-bearing (see
+  // this module's own "ADVANCE STATE ONLY ONCE GENUINELY CONSUMED" top
+  // comment), so they now hold delivery via a failing batched search
+  // instead (the one other mechanism that still defers a tick's advance).
+  test("FACTORY-833: a target that keeps changing status while its tick's search fails reports the FINAL transition's own timestamp on delivery, not the first missed one", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
     const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const { deps, notified, logs } = fakeDeps(world, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    let failSearch = false;
+    const logs: string[] = [];
+    const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        if (failSearch) throw new Error("transient");
+        const m = /^key in \((.*)\)$/.exec(jql);
+        const keys = m ? m[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (agent, about, reason) => { notified.push({ agent, about, reason }); },
+      log: (l) => logs.push(l),
+    };
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
 
     await state.runTick([m], deps); // seed
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
-    await state.runTick([m], deps); // uses the one allowed turn
+    await state.runTick([m], deps); // delivered immediately
     expect(notified).toHaveLength(1);
 
-    // Two further real transitions land WHILE capped — delayed, not lost;
-    // the diff this module coalesces is against the LAST delivered
-    // baseline, so the eventual delivery reports the NET transition
-    // (before -> final), with the FINAL transition's own timestamp, never
-    // the intermediate "t3" or a fabricated "right now".
+    // Two further real transitions land WHILE this tick's search is failing
+    // — delayed, not lost; the diff this module coalesces is against the
+    // LAST delivered baseline, so the eventual delivery reports the NET
+    // transition (before -> final), with the FINAL transition's own
+    // timestamp, never the intermediate "t3" or a fabricated "right now".
+    failSearch = true;
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Review", updated: "t3" });
-    await state.runTick([m], deps); // capped
+    await state.runTick([m], deps); // search fails — whole tick skipped
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", updated: "t4" });
-    await state.runTick([m], deps); // still capped
+    await state.runTick([m], deps); // still failing
     expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("batched linked-item fetch failed"))).toBe(true);
 
-    now.value += 61 * 60_000;
+    failSearch = false;
     await state.runTick([m], deps); // delivered now
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
     expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t4)' }]);
   });
 
-  test("FACTORY-833 (review round 2, PR #800): a status transition held by the rate cap keeps ITS OWN timestamp even after a later unrelated summary-only edit lands before delivery", async () => {
+  // FACTORY-252: the ORIGINAL version of this test (PR #800 review round 2)
+  // relied on the hourly rate cap updating `observedAt` every tick while
+  // STILL withholding delivery across several ticks. The cap itself is
+  // gone, but `observedAt`'s per-field frozen timestamps are NOT dead code
+  // — a tick can still observe a change and then fail to advance for an
+  // UNRELATED reason: `deps.notify` throwing propagates out of `runTick`
+  // (the per-owner loop has no try/catch around it) before `advance()`
+  // runs for that owner, even though `observedAt` was already updated
+  // earlier in the same pass, before any delivery decision. This
+  // reproduces the held-then-overtaken scenario via that path instead of
+  // the removed cap.
+  test("FACTORY-833: a status transition held by a failed delivery keeps ITS OWN timestamp even after a later unrelated summary-only edit lands before the retried delivery", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
-    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", summary: "s0", updated: "t1" }) };
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
     const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const { deps, notified, logs } = fakeDeps(world, { now });
-    // maxLinkedTurnsPerHour: 1, exhausted by a throwaway change first, so
-    // the real status transition below lands already-capped.
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    let failNotify = false;
+    const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        const m = /^key in \((.*)\)$/.exec(jql);
+        const keys = m ? m[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (agent, about, reason) => {
+        if (failNotify) throw new Error("nudge failed");
+        notified.push({ agent, about, reason });
+      },
+      log: () => {},
+    };
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
 
     await state.runTick([m], deps); // seed
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", summary: "s0", updated: "t2" }); // consumes the one allowed turn
-    await state.runTick([m], deps);
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps); // delivered immediately
     expect(notified).toHaveLength(1);
 
-    // The real status transition this test cares about, landing already capped.
+    // The real transition to "Done" happens at t3, but delivery fails —
+    // observedAt already moved to t3 before notify was attempted, and
+    // advance() never ran, so the baseline stays at "In Progress".
+    failNotify = true;
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s0", updated: "t3" });
-    await state.runTick([m], deps); // capped — "Done" transition held, dated t3 internally
+    await expect(state.runTick([m], deps)).rejects.toThrow("nudge failed");
     expect(notified).toHaveLength(1);
 
-    // A LATER unrelated edit: summary changes, status stays "Done". Must not
-    // overwrite the already-frozen status-transition timestamp (t3) with t4.
+    // A LATER, unrelated summary-only edit lands before the retry succeeds.
+    failNotify = false;
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s1", updated: "t4" });
-    await state.runTick([m], deps); // still capped
-    expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
-
-    now.value += 61 * 60_000;
-    await state.runTick([m], deps); // delivered — status wins over summary in changeDetail's own priority, dated to its OWN t3, not the later t4
+    await state.runTick([m], deps);
     expect(notified).toHaveLength(2);
     const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
-    expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' }]);
+    expect(reason.linked.events).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' },
+    ]);
   });
 
   test("FACTORY-833: two DISTINCT issuelinks (different relationship types) to the SAME target collapse to one watched item (existing dedup-by-target contract) and carry the FIRST link's own id, never a fabricated or merged one", async () => {

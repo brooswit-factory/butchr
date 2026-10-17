@@ -27,7 +27,7 @@ const PR_URL = "https://github.com/example-org/widgets/pull/547";
 const PR_REF = { owner: "example-org", repo: "widgets", number: 547 };
 
 const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
-  parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "do it", linkedEventing: true, maxLinkedTurnsPerHour: 1000, ...over }] })[0]!;
+  parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "do it", linkedEventing: true, ...over }] })[0]!;
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
   key, status: "In Progress", summary: `summary of ${key}`, issuetype: "Task", assignee: null, parent: null,
@@ -176,10 +176,10 @@ describe("a ticket's own PR wakes its agent", () => {
     expect(notified).toHaveLength(0);
   });
 
-  test("the turn cap delays a burst rather than dropping it", async () => {
+  test("FACTORY-252: no hourly cap — each burst of PR activity wakes the agent right away, even with an old maxLinkedTurnsPerHour left in the rule", async () => {
     const now = { value: 1_000_000 };
     const state = createLinkedEventingState();
-    const { base, notified, logs } = fakeBase({ now });
+    const { base, notified } = fakeBase({ now });
     const s = { comments: 0, reviewComments: 0, reviews: 0, etag: '"a"' };
     const pr = fakePrApi(s);
     const deps: LinkedEventingDeps = { ...base, github: pr.deps };
@@ -188,15 +188,10 @@ describe("a ticket's own PR wakes its agent", () => {
     await state.runTick([m], deps); // seed
     Object.assign(s, { comments: 1, etag: '"b"' });
     await state.runTick([m], deps);
-    expect(notified).toHaveLength(1);
     Object.assign(s, { comments: 3, etag: '"c"' });
     now.value += 60_000;
     await state.runTick([m], deps);
-    expect(notified).toHaveLength(1); // capped: 1 per hour
-    expect(logs.some((l) => l.includes("KAN-3020"))).toBe(true);
-    now.value += 60 * 60_000;
-    await state.runTick([m], deps);
-    expect(notified).toHaveLength(2); // delivered once the window allows — nothing lost
+    expect(notified).toHaveLength(2);
     expect(linkedEvents(notified[1]!.reason)[0]!.detail).toContain("got 2 new comments");
   });
 

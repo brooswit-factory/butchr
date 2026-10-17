@@ -108,7 +108,6 @@ export interface RulesApiRuleEntry {
   /** local/ui — the linked-eventing knobs besides `linkedEventing`, read off the raw `Rule`. Each is present only when the rule sets it, so a rule that sets none keeps exactly upstream's shape. */
   linkedPollIntervalMs?: number;
   maxLinkedItems?: number;
-  maxLinkedTurnsPerHour?: number;
   linkedRemoteLinks?: boolean;
   linkedDescriptionLinks?: boolean;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
@@ -189,7 +188,6 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       notifyDeliveryMode: raw?.notifyDeliveryMode ?? null,
       ...(raw?.linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: raw.linkedPollIntervalMs } : {}),
       ...(raw?.maxLinkedItems !== undefined ? { maxLinkedItems: raw.maxLinkedItems } : {}),
-      ...(raw?.maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: raw.maxLinkedTurnsPerHour } : {}),
       ...(raw?.linkedRemoteLinks !== undefined ? { linkedRemoteLinks: raw.linkedRemoteLinks } : {}),
       ...(raw?.linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: raw.linkedDescriptionLinks } : {}),
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),

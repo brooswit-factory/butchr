@@ -8,7 +8,7 @@ import { createLinkedEventingState, type LinkedEventingDeps, type ProjectLinkedE
  * BUTCHR-469: linked-eventing for `jira-project` owners — one member-
  * discovery watch (`project = <key> AND updated >= "-<N>m" ORDER BY updated
  * ASC`, a per-project watermark), delivered through the EXACT SAME
- * coalescer/rate-cap/notify `test/unit/linked-eventing.test.ts` already
+ * coalescer/notify `test/unit/linked-eventing.test.ts` already
  * covers for an issue owner — that machinery is reused UNCHANGED here,
  * never re-tested. (local/ui: a project's managed links, its second source,
  * are gone with managed links.)
@@ -223,29 +223,30 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     expect(linkedEvents(notified[0]!.reason).map((e) => e.target).sort()).toEqual(["BUTCHR-1", "BUTCHR-2", "BUTCHR-3"]);
   });
 
-  test("rate cap: a capped project-owner tick is retried (delayed, not lost) on the next allowed tick", async () => {
+  // FACTORY-252: this test ONCE proved a project-owner tick capped by the
+  // hourly turn-rate cap was retried once the window freed. That cap is
+  // removed entirely — replaced with coverage that repeated real member
+  // changes for the same project owner all deliver immediately.
+  test("FACTORY-252: no turn-rate cap — two real member changes to the same project owner both deliver immediately, with no [notify-suppressed] rate-capped line", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const now = { value: 0 };
     const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const r = rule();
     const m = projectMatch("jira-project:mgrs:BUTCHR", r, "BUTCHR");
 
     await state.runTick([], deps, [m]); // seed watermark
     membersByProject.BUTCHR = ["BUTCHR-1"];
-    await state.runTick([], deps, [m]); // first appearance — uses the one allowed turn
+    await state.runTick([], deps, [m]); // first appearance — delivered immediately
     expect(notified).toHaveLength(1);
 
+    now.value += 1_000;
     world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" }); // BUTCHR-1 already has a baseline now, so this is a normal diff
-    await state.runTick([], deps, [m]); // capped — dropped this tick, not lost; watermark held (advance() never runs on a capped tick)
-    expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes("BUTCHR"))).toBe(true);
-
-    now.value += 61 * 60_000;
-    await state.runTick([], deps, [m]); // the same outstanding change is re-detected (BUTCHR-1 still in the held window) and delivered
+    await state.runTick([], deps, [m]); // delivered immediately too — no cap to hold it
     expect(notified).toHaveLength(2);
     expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: 'status changed from "To Do" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   test("review round 1 regression: a member dropped by maxLinkedItems holds this owner's ENTIRE watermark — the capped member is retried, not lost, once room exists", async () => {

@@ -104,7 +104,6 @@ export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = [
   "linkedEventing",
   "linkedPollIntervalMs",
   "maxLinkedItems",
-  "maxLinkedTurnsPerHour",
   "linkedRemoteLinks",
   "linkedDescriptionLinks",
 ];
@@ -117,7 +116,8 @@ export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = [
  * removes the key, back to butchr's default.
  */
 export const LINKED_BOOLEAN_FIELDS = ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const;
-export const LINKED_COUNT_FIELDS = ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const;
+// FACTORY-252: maxLinkedTurnsPerHour is gone with the hourly linked-notify cap it set.
+export const LINKED_COUNT_FIELDS = ["linkedPollIntervalMs", "maxLinkedItems"] as const;
 
 /** local/ui — the longest brief text the write path accepts (a sanity bound, not a product limit). */
 export const BRIEF_MAX_LENGTH = 200_000;
@@ -282,7 +282,6 @@ export interface RuleFieldPatch {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number | null;
   maxLinkedItems?: number | null;
-  maxLinkedTurnsPerHour?: number | null;
 }
 
 /** `patch`'s own shape, independent of what the CURRENT rule looks like (that comparison — e.g. the length match above — happens where the current rule is in hand, in `./write-rules.ts`'s caller). `__proto__`/prototype-pollution bodies are rejected here: a `JSON.parse`'d `__proto__` key never becomes an OWN enumerable property, so `Object.keys`/`in` checks below never see it either way, but every value is read by EXPLICIT key name below, never spread or `Object.assign`-merged onto a trusted object, which is what actually matters for this module's own output never carrying one. */
@@ -433,7 +432,6 @@ export interface RuleCreateInput {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number;
   maxLinkedItems?: number;
-  maxLinkedTurnsPerHour?: number;
 }
 
 /**

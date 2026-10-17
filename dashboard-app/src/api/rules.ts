@@ -152,7 +152,6 @@ export interface RuleDto {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number;
   maxLinkedItems?: number;
-  maxLinkedTurnsPerHour?: number;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
@@ -264,7 +263,6 @@ export interface RuleFieldPatch {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number | null;
   maxLinkedItems?: number | null;
-  maxLinkedTurnsPerHour?: number | null;
   /** local/ui — see `src/rules/rules-write-registry.ts`. On an enabled rule a change counts as a restart; switching to `"swarm"` is confirmed like a swarm enable. */
   execution?: ExecutionMode;
   /** local/ui — config surface only. */
@@ -309,7 +307,6 @@ export interface RuleCreateDraft {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number;
   maxLinkedItems?: number;
-  maxLinkedTurnsPerHour?: number;
 }
 
 /**
@@ -654,7 +651,6 @@ interface ServerRuleEntry {
   linkedDescriptionLinks?: boolean;
   linkedPollIntervalMs?: number;
   maxLinkedItems?: number;
-  maxLinkedTurnsPerHour?: number;
   staffed: boolean | null;
   whyUnstaffed: string | null;
   briefExcerpt?: string;
@@ -689,7 +685,6 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       ...(r.linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: r.linkedDescriptionLinks } : {}),
       ...(r.linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: r.linkedPollIntervalMs } : {}),
       ...(r.maxLinkedItems !== undefined ? { maxLinkedItems: r.maxLinkedItems } : {}),
-      ...(r.maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: r.maxLinkedTurnsPerHour } : {}),
       staffed: r.staffed,
       reason: r.whyUnstaffed,
       // A real brief is never empty, so an empty excerpt carries nothing worth keeping.
@@ -1377,7 +1372,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
 
 /** local/ui — the linked-eventing fields, restated from `src/rules/rules-write-registry.ts` (a value import from there would pull `node:` builtins into the browser bundle). */
 const LINKED_BOOLEAN_KEYS = ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const;
-const LINKED_COUNT_KEYS = ["linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour"] as const;
+const LINKED_COUNT_KEYS = ["linkedPollIntervalMs", "maxLinkedItems"] as const;
 
 /** Applies a patch's or create body's linked-eventing fields the way the server does: a count's `null` removes it. */
 function applyLinkedFields(target: RuleDto, source: RuleFieldPatch | RuleCreateDraft): void {

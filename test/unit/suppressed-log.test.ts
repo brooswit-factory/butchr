@@ -3,7 +3,6 @@ import {
   SUPPRESSED_TAG,
   agentFoldSuppressedLine,
   parseSuppressedLine,
-  rateCappedSuppressedLine,
   standDownSuppressedLine,
 } from "../../src/jira-watch/suppressed-log.js";
 import { OUTCOME_TAG } from "../../src/tools/outcome.js";
@@ -208,50 +207,9 @@ describe("parseSuppressedLine: pinned against the REAL production emitter path �
     expect(parsed?.arm).toBe("agent-fold");
   });
 });
-
-describe("rateCappedSuppressedLine: exact shape, round-trip, and the NUL-byte hazard (BUTCHR-471)", () => {
-  test("pins the exact rendered line", () => {
-    expect(rateCappedSuppressedLine("BUTCHR-9", "jira-work:task:BUTCHR-9", 2, 2)).toBe(
-      "[notify-suppressed] key=BUTCHR-9 watcher=jira-work:task:BUTCHR-9 arm=rate-capped count=2 max=2" +
-        " msg=linked-change notify dropped this tick — sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick",
-    );
-  });
-
-  test("round-trips through parseSuppressedLine", () => {
-    const line = rateCappedSuppressedLine("BUTCHR-9", "jira-work:task:BUTCHR-9", 3, 2);
-    expect(parseSuppressedLine(line)).toEqual({
-      key: "BUTCHR-9",
-      watcher: "jira-work:task:BUTCHR-9",
-      arm: "rate-capped",
-      fields: { count: "3", max: "2" },
-      message: "linked-change notify dropped this tick — sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick",
-    });
-  });
-
-  // C0 controls minus \t/\n/\r (already flattened elsewhere by the log
-  // sink's own `flattenNewlines`) -- NUL (\x00) is the one this ticket closes.
-  const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
-
-  test("a NUL byte in watcher -- the shape linked-eventing.ts MUST NEVER pass here -- would forge a second journal entry: confirmed live via a systemd-cat/journalctl -o json round-trip, a bare NUL in a journal write splits it into two separate MESSAGE entries, not one line with an embedded byte carried through", () => {
-    // A synthetic, NUL-separated per-(owner, project) linked-eventing state
-    // key -- the shape this ticket's fix stops passing here.
-    const syntheticStateKey = "codey:some-director\0linked:jira-project:FACTORY";
-    expect(syntheticStateKey).toMatch(CONTROL_CHAR_RE); // sanity: the fixture itself really does carry the hazard
-    const unfixedLine = rateCappedSuppressedLine("FACTORY", syntheticStateKey, 2, 2);
-    expect(unfixedLine).toMatch(CONTROL_CHAR_RE); // demonstrates the hazard exists in the primitive
-  });
-
-  test("the line this ticket's fixed call site actually emits -- notifyAgentKey, the real agent, never the synthetic state key -- carries no control characters at all and round-trips cleanly", () => {
-    const realAgentKey = "codey:some-director";
-    const fixedLine = rateCappedSuppressedLine("FACTORY", realAgentKey, 2, 2);
-    expect(fixedLine).not.toMatch(CONTROL_CHAR_RE);
-    const parsed = parseSuppressedLine(fixedLine);
-    expect(parsed).toEqual({
-      key: "FACTORY",
-      watcher: "codey:some-director",
-      arm: "rate-capped",
-      fields: { count: "2", max: "2" },
-      message: "linked-change notify dropped this tick \u2014 sliding-window cap reached; still-outstanding changes re-detect and deliver on the next allowed tick",
-    });
-  });
-});
+// FACTORY-252: `rateCappedSuppressedLine` (and its own NUL-byte-hazard
+// coverage, BUTCHR-471) is REMOVED along with the hourly linked-eventing
+// turn-rate cap it logged -- see suppressed-log.ts's own doc comment at
+// the removal site. `parseSuppressedLine` stays generic over `arm`, so a
+// historical `arm=rate-capped` journal line still parses; nothing in this
+// codebase emits one going forward.

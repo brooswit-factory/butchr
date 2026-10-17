@@ -54,7 +54,6 @@ export interface RuleDraft {
   stalledMinutes: string;
   /** Linked-change eventing (jira-work and jira-project rules, `supportsLinkedEvents`). The counts are kept as text; `""` = butchr's default. */
   linkedEventing: boolean;
-  maxLinkedTurnsPerHour: string;
   maxLinkedItems: string;
   linkedRemoteLinks: boolean;
   linkedDescriptionLinks: boolean;
@@ -84,7 +83,6 @@ export type EditableField =
   | "notifyDeliveryMode"
   | "stalledMinutes"
   | "linkedEventing"
-  | "maxLinkedTurnsPerHour"
   | "maxLinkedItems"
   | "linkedRemoteLinks"
   | "linkedDescriptionLinks"
@@ -92,7 +90,7 @@ export type EditableField =
   | "brief";
 
 /** The linked-eventing fields, in display order. */
-const LINKED_FIELDS: readonly EditableField[] = ["linkedEventing", "maxLinkedTurnsPerHour", "maxLinkedItems", "linkedRemoteLinks", "linkedDescriptionLinks", "linkedPollIntervalMs"];
+const LINKED_FIELDS: readonly EditableField[] = ["linkedEventing", "maxLinkedItems", "linkedRemoteLinks", "linkedDescriptionLinks", "linkedPollIntervalMs"];
 
 const EDITABLE_FIELDS: readonly EditableField[] = [
   "id",
@@ -152,7 +150,6 @@ export function draftFromRule(rule: RuleDto, briefs: Readonly<Record<string, str
     notifyDeliveryMode: rule.notifyDeliveryMode ?? "",
     stalledMinutes: rule.stalledMinutes != null ? String(rule.stalledMinutes) : "",
     linkedEventing: rule.linkedEventing === true,
-    maxLinkedTurnsPerHour: rule.maxLinkedTurnsPerHour != null ? String(rule.maxLinkedTurnsPerHour) : "",
     maxLinkedItems: rule.maxLinkedItems != null ? String(rule.maxLinkedItems) : "",
     linkedRemoteLinks: rule.linkedRemoteLinks === true,
     linkedDescriptionLinks: rule.linkedDescriptionLinks === true,
@@ -296,7 +293,6 @@ export function rulesDraftReducer(state: RulesDraftState, action: RulesDraftActi
         notifyDeliveryMode: "",
         stalledMinutes: "",
         linkedEventing: false,
-        maxLinkedTurnsPerHour: "",
         maxLinkedItems: "",
         linkedRemoteLinks: false,
         linkedDescriptionLinks: false,
@@ -439,7 +435,6 @@ const FIELD_LABELS: Record<EditableField, string> = {
   notifyDeliveryMode: "Notification delivery",
   stalledMinutes: "Stall threshold",
   linkedEventing: "Linked-change events",
-  maxLinkedTurnsPerHour: "Linked wakes per hour",
   maxLinkedItems: "Linked items watched",
   linkedRemoteLinks: "Follow remote links",
   linkedDescriptionLinks: "Follow description links",
@@ -447,8 +442,7 @@ const FIELD_LABELS: Record<EditableField, string> = {
   brief: "Brief",
 };
 
-/** butchr's own defaults for a rule with linked-change events on (`DEFAULT_MAX_LINKED_TURNS_PER_HOUR`/`DEFAULT_MAX_LINKED_ITEMS`, `src/jira-watch/linked-eventing.ts`), restated for the browser bundle. */
-export const DEFAULT_LINKED_TURNS_PER_HOUR = 2;
+/** butchr's own default for a rule with linked-change events on (`DEFAULT_MAX_LINKED_ITEMS`, `src/jira-watch/linked-eventing.ts`), restated for the browser bundle. */
 export const DEFAULT_LINKED_ITEMS = 25;
 
 /** How butchr sends this rule's agents ticket updates (`Rule.notifyDeliveryMode`, FACTORY-1010). */
@@ -494,8 +488,6 @@ function fieldText(field: EditableField, d: RuleDraft): string {
       return d.stalledMinutes ? `${d.stalledMinutes} min` : "butchr's default";
     case "linkedEventing":
       return d.linkedEventing ? "on" : "off";
-    case "maxLinkedTurnsPerHour":
-      return `${d.maxLinkedTurnsPerHour || `${DEFAULT_LINKED_TURNS_PER_HOUR} (default)`} per hour`;
     case "maxLinkedItems":
       return d.maxLinkedItems || `${DEFAULT_LINKED_ITEMS} (default)`;
     case "linkedRemoteLinks":
@@ -555,7 +547,7 @@ export function validateRule(draft: RuleDraft, base: RuleDraft | undefined, all:
   if (draft.stalledMinutes !== "" && !(Number.isFinite(Number(draft.stalledMinutes)) && Number(draft.stalledMinutes) > 0)) {
     issues.push({ field: "stalledMinutes", level: "invalid", message: "Use a number of minutes above 0, or leave it empty for butchr's default." });
   }
-  for (const field of ["maxLinkedTurnsPerHour", "maxLinkedItems", "linkedPollIntervalMs"] as const) {
+  for (const field of ["maxLinkedItems", "linkedPollIntervalMs"] as const) {
     if (draft[field] !== "" && !/^[1-9]\d*$/.test(draft[field])) {
       issues.push({ field, level: "invalid", message: "Use a whole number, 1 or more, or leave it empty for butchr's default." });
     }
@@ -668,7 +660,7 @@ export function buildFieldPatch(base: RuleDto, draft: RuleDraft, baseBrief: stri
   for (const field of ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const) {
     if (draft[field] !== (base[field] === true)) patch[field] = draft[field];
   }
-  for (const field of ["maxLinkedTurnsPerHour", "maxLinkedItems", "linkedPollIntervalMs"] as const) {
+  for (const field of ["maxLinkedItems", "linkedPollIntervalMs"] as const) {
     const baseValue = base[field] != null ? String(base[field]) : "";
     if (draft[field] !== baseValue) patch[field] = draft[field] === "" ? null : Number(draft[field]);
   }
@@ -689,7 +681,7 @@ export function buildCreateDraft(draft: RuleDraft): RuleCreateDraft {
   if (draft.notifyDeliveryMode) create.notifyDeliveryMode = draft.notifyDeliveryMode;
   if (draft.stalledMinutes !== "") create.stalledMinutes = Number(draft.stalledMinutes);
   for (const field of ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const) if (draft[field]) create[field] = true;
-  for (const field of ["maxLinkedTurnsPerHour", "maxLinkedItems", "linkedPollIntervalMs"] as const) if (draft[field] !== "") create[field] = Number(draft[field]);
+  for (const field of ["maxLinkedItems", "linkedPollIntervalMs"] as const) if (draft[field] !== "") create[field] = Number(draft[field]);
   return create;
 }
 

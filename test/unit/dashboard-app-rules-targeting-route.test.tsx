@@ -380,20 +380,21 @@ describe("RulesTargetingRoute", () => {
     const card = await cardFor(view, "triage");
     await waitFor(() => expect((card.getByTestId("rule-edit") as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(card.getByTestId("rule-edit"));
-    expect(((await card.findByTestId("rule-linked-turns-input")) as HTMLInputElement).disabled).toBe(true);
+    expect(((await card.findByTestId("rule-linked-items-input")) as HTMLInputElement).disabled).toBe(true);
     expect(card.getByText(/Also its pull request \(branch KEY or KEY-…\)/)).toBeTruthy();
     fireEvent.click(card.getByRole("switch", { name: /Wake agents when linked items change/ }));
-    await waitFor(() => expect((card.getByTestId("rule-linked-turns-input") as HTMLInputElement).disabled).toBe(false));
-    setText(card.getByTestId("rule-linked-turns-input"), "4");
+    await waitFor(() => expect((card.getByTestId("rule-linked-items-input") as HTMLInputElement).disabled).toBe(false));
+    setText(card.getByTestId("rule-linked-items-input"), "13");
     fireEvent.click(card.getByRole("switch", { name: /Follow Jira remote links/ }));
 
     fireEvent.click(view.getByTestId("rules-review-save"));
     const dialog = within(await view.findByTestId("rules-review-dialog"));
-    await waitFor(() => expect(dialog.getByText("4 per hour")).toBeTruthy());
+    await waitFor(() => expect(dialog.getByText("13")).toBeTruthy());
     fireEvent.click(dialog.getByTestId("rules-save-confirm"));
     await waitFor(() => expect(view.getByTestId("rules-save-result").textContent).toContain("Saved 1 change."));
     const saved = (await api.listRules()).rules[0]!;
-    expect([saved.linkedEventing, saved.maxLinkedTurnsPerHour, saved.linkedRemoteLinks, saved.linkedDescriptionLinks]).toEqual([true, 4, true, undefined]);
+    expect([saved.linkedEventing, saved.maxLinkedItems, saved.linkedRemoteLinks, saved.linkedDescriptionLinks]).toEqual([true, 13, true, undefined]);
+    expect(card.queryByText("Wakes per hour, at most")).toBeNull(); // FACTORY-252: the hourly cap is gone
   });
 
   test("other providers get no linked-change section, and a linked field set there is listed as unused", async () => {

@@ -6,7 +6,6 @@ import type { NotifyReason } from "../../src/resources/types.js";
 import {
   createLinkedEventingState,
   DEFAULT_MAX_LINKED_ITEMS,
-  DEFAULT_MAX_LINKED_TURNS_PER_HOUR,
   type LinkedEventingDeps,
   type LinkedEventingMatch,
 } from "../../src/jira-watch/linked-eventing.js";
@@ -15,12 +14,15 @@ import { createJiraProjectResourceType } from "../../src/rules/jira-project-type
 /**
  * BUTCHR-451/BUTCHR-471: no linked-eventing owner kind (jira-work, jira-project)
  * can end up on and
- * uncapped, whether or not a rule sets its own maxLinkedTurnsPerHour/
- * maxLinkedItems. Each owner kind below is exercised through its REAL
- * production wiring (real rule parsing / real resource-type constructor),
- * never a hand-built match or a fixture that hand-sets a cap it wouldn't
- * actually carry in production — the point is to prove the ENFORCEMENT
- * SITE'S default covers every owner kind, not just the mechanism.
+ * uncapped on linked ITEM COUNT, whether or not a rule sets its own
+ * maxLinkedItems — this file's item-cap coverage below is UNCHANGED by
+ * FACTORY-252. FACTORY-252 removed the companion hourly TURN-RATE cap
+ * (`maxLinkedTurnsPerHour`/`DEFAULT_MAX_LINKED_TURNS_PER_HOUR`/
+ * `effectiveMaxLinkedTurnsPerHour`) entirely, not merely defaulted — the
+ * turn-cap describe blocks that once lived in this file are replaced below
+ * with coverage proving no owner kind is throttled by turn rate any more,
+ * including an owner whose rule still carries the old, now-ignored field
+ * from before the cap was removed.
  */
 
 const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
@@ -28,7 +30,9 @@ const issue = (key: string, over: Partial<JiraIssue> = {}): JiraIssue => ({
   updated: "2026-09-16T00:00:00.000+0000", labels: [], ...over,
 });
 
-describe("BUTCHR-471: default turn cap (2/hr) — jira-work owner, real rule parsing, no explicit cap", () => {
+const FORMER_DEFAULT_MAX_LINKED_TURNS_PER_HOUR = 2; // the removed cap's own former default (BUTCHR-471) — a literal here, not an import, since the constant no longer exists
+
+describe("FACTORY-252: the former hourly turn-rate cap is gone — jira-work owner, real rule parsing", () => {
   const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
     parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "do it", linkedEventing: true, ...over }] })[0]!;
   const match = (agentKey: string, r: Rule, i: JiraIssue): LinkedEventingMatch => ({ agentKey, rule: r, issue: i });
@@ -51,33 +55,45 @@ describe("BUTCHR-471: default turn cap (2/hr) — jira-work owner, real rule par
     return { deps, notified, logs, searchCalls };
   }
 
-  test("a rule with linkedEventing:true and NO maxLinkedTurnsPerHour delivers exactly DEFAULT_MAX_LINKED_TURNS_PER_HOUR turns/hour, suppresses the next with a [notify-suppressed] rate-capped line, then delivers the still-outstanding change once the window slides (delayed, not lost)", async () => {
-    expect(DEFAULT_MAX_LINKED_TURNS_PER_HOUR).toBe(2);
+  test("more real changes in one hour than the former default (2/hr) ever allowed all deliver immediately, with no [notify-suppressed] rate-capped line at all", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
     const state = createLinkedEventingState();
     const now = { value: 0 };
     const { deps, notified, logs } = fakeDeps(world, now);
-    const r = rule(); // absent maxLinkedTurnsPerHour — the whole point
+    const r = rule(); // no maxLinkedTurnsPerHour knob exists any more
     const m = () => match("jira-work:task:BUTCHR-1", r, owner);
 
     await state.runTick([m()], deps); // seed
     expect(notified).toHaveLength(0);
 
-    for (let i = 0; i < DEFAULT_MAX_LINKED_TURNS_PER_HOUR; i++) {
+    const beyondFormerLimit = FORMER_DEFAULT_MAX_LINKED_TURNS_PER_HOUR + 3;
+    for (let i = 0; i < beyondFormerLimit; i++) {
       world["BUTCHR-2"] = issue("BUTCHR-2", { status: `s${i}` });
+      now.value += 1_000; // all well within the same hour
       await state.runTick([m()], deps);
     }
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR); // both allowed turns delivered
+    expect(notified).toHaveLength(beyondFormerLimit); // every single one delivered, none withheld for a window to free
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
+  });
 
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "still-outstanding" });
-    await state.runTick([m()], deps); // one turn beyond the default — must be capped
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR); // not delivered
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(`max=${DEFAULT_MAX_LINKED_TURNS_PER_HOUR}`))).toBe(true);
+  test("an already-deployed rule still carrying the old maxLinkedTurnsPerHour field (migration-only, parsed into nothing) is NOT throttled by it — old cap values must not silently keep throttling delivery", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, now);
+    const r = rule({ maxLinkedTurnsPerHour: 1 }); // old persisted value — still loads (REMOVED_RULE_FIELDS), but means nothing now
+    const m = () => match("jira-work:task:BUTCHR-1", r, owner);
 
-    now.value += 61 * 60_000; // roll the sliding window over
-    await state.runTick([m()], deps); // the outstanding change is re-detected and delivered, never lost
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR + 1);
+    await state.runTick([m()], deps); // seed
+    for (let i = 0; i < 5; i++) {
+      world["BUTCHR-2"] = issue("BUTCHR-2", { status: `s${i}` });
+      now.value += 1_000;
+      await state.runTick([m()], deps);
+    }
+    expect(notified).toHaveLength(5); // far beyond the old field's own value of 1 — it is never read any more
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 });
 
@@ -111,63 +127,10 @@ describe("BUTCHR-471: default item cap (25) — jira-work owner, real rule parsi
   });
 });
 
-describe("BUTCHR-471: overrides always win over the default, in both directions", () => {
+describe("BUTCHR-471: maxLinkedItems overrides always win over the default, in both directions", () => {
   const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
     parseRules({ rules: [{ id: "task", resourceProvider: "jira-work", query: "q", brief: "do it", linkedEventing: true, ...over }] })[0]!;
   const match = (agentKey: string, r: Rule, i: JiraIssue): LinkedEventingMatch => ({ agentKey, rule: r, issue: i });
-
-  test("an explicit maxLinkedTurnsPerHour BELOW the default (1) caps tighter than the default would", async () => {
-    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
-    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
-    const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const notified: unknown[] = [];
-    const deps: LinkedEventingDeps = {
-      search: async (jql) => {
-        const m = /^key in \((.*)\)$/.exec(jql);
-        const keys = m ? m[1]!.split(",") : [];
-        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
-      },
-      notify: async (...args) => { notified.push(args); },
-      now: () => now.value,
-    };
-    const r = rule({ maxLinkedTurnsPerHour: 1 }); // below DEFAULT_MAX_LINKED_TURNS_PER_HOUR (2)
-    const m = () => match("jira-work:task:BUTCHR-1", r, owner);
-
-    await state.runTick([m()], deps); // seed
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "s1" });
-    await state.runTick([m()], deps); // uses the one allowed turn
-    expect(notified).toHaveLength(1);
-    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "s2" });
-    await state.runTick([m()], deps); // would be allowed under the default (2/hr) but the explicit 1 caps it
-    expect(notified).toHaveLength(1);
-  });
-
-  test("an explicit maxLinkedTurnsPerHour ABOVE the default (4) allows more than the default would", async () => {
-    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
-    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
-    const state = createLinkedEventingState();
-    const now = { value: 0 };
-    const notified: unknown[] = [];
-    const deps: LinkedEventingDeps = {
-      search: async (jql) => {
-        const m = /^key in \((.*)\)$/.exec(jql);
-        const keys = m ? m[1]!.split(",") : [];
-        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
-      },
-      notify: async (...args) => { notified.push(args); },
-      now: () => now.value,
-    };
-    const r = rule({ maxLinkedTurnsPerHour: 4 }); // above DEFAULT_MAX_LINKED_TURNS_PER_HOUR (2)
-    const m = () => match("jira-work:task:BUTCHR-1", r, owner);
-
-    await state.runTick([m()], deps); // seed
-    for (let i = 0; i < 4; i++) {
-      world["BUTCHR-2"] = issue("BUTCHR-2", { status: `s${i}` });
-      await state.runTick([m()], deps);
-    }
-    expect(notified).toHaveLength(4); // more than the default (2) would ever allow in one hour
-  });
 
   test("an explicit maxLinkedItems above and below the default is honoured", async () => {
     const owner = issue("BUTCHR-1", {
@@ -197,10 +160,7 @@ describe("BUTCHR-471: overrides always win over the default, in both directions"
   });
 });
 
-describe("BUTCHR-471: default caps for a jira-project owner, through createJiraProjectResourceType (the way the daemon actually builds it)", () => {
-  const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
-    parseRules({ rules: [{ id: "mgrs", resourceProvider: "jira-project", query: '{"keys":["BUTCHR"]}', brief: "manage", linkedEventing: true, ...over }] })[0]!;
-
+describe("FACTORY-252/BUTCHR-471: default caps for a jira-project owner, through createJiraProjectResourceType (the way the daemon actually builds it)", () => {
   function wire(rules: Rule[], world: Record<string, JiraIssue>, membersByProject: Record<string, string[]>, now: { value: number }) {
     const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
     const logs: string[] = [];
@@ -222,7 +182,7 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     return { type, notified, logs };
   }
 
-  test("no explicit maxLinkedTurnsPerHour: exactly DEFAULT_MAX_LINKED_TURNS_PER_HOUR deliveries per hour, then rate-capped, then delivered once the window slides", async () => {
+  test("no turn-rate cap: more deliveries than the former default (2/hr) ever allowed, all in the same hour, with no rate-capped suppression line", async () => {
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const now = { value: 0 };
@@ -231,24 +191,16 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     await type.discovery.search();
     await type.discovery.related!([]); // seeds the watermark
 
-    for (let i = 0; i < DEFAULT_MAX_LINKED_TURNS_PER_HOUR; i++) {
-      membersByProject.BUTCHR = [`BUTCHR-${i === 0 ? 1 : "1"}`]; // BUTCHR-1 changes each round
+    const beyondFormerLimit = FORMER_DEFAULT_MAX_LINKED_TURNS_PER_HOUR + 3;
+    for (let i = 0; i < beyondFormerLimit; i++) {
+      membersByProject.BUTCHR = ["BUTCHR-1"];
       world["BUTCHR-1"] = issue("BUTCHR-1", { status: `s${i}` });
+      now.value += 1_000;
       await type.discovery.search();
       await type.discovery.related!([]);
     }
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR);
-
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "still-outstanding" });
-    await type.discovery.search();
-    await type.discovery.related!([]); // one turn beyond the default — capped
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(`max=${DEFAULT_MAX_LINKED_TURNS_PER_HOUR}`))).toBe(true);
-
-    now.value += 61 * 60_000;
-    await type.discovery.search();
-    await type.discovery.related!([]); // re-detected and delivered, not lost
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR + 1);
+    expect(notified).toHaveLength(beyondFormerLimit);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
   test("no explicit maxLinkedItems: more than DEFAULT_MAX_LINKED_ITEMS members changing in one window keeps only the default and logs the effective value (never 'undefined')", async () => {
@@ -273,7 +225,7 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     expect(logs.some((l) => l.includes("maxLinkedItems (undefined)"))).toBe(false); // never print the literal absence
   });
 
-  test("an explicit maxLinkedTurnsPerHour still overrides the default for a jira-project owner", async () => {
+  test("an old persisted maxLinkedTurnsPerHour on a jira-project rule (migration-only) no longer throttles delivery at all", async () => {
     const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
     const membersByProject: Record<string, string[]> = { BUTCHR: [] };
     const now = { value: 0 };
@@ -283,12 +235,13 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     await type.discovery.related!([]); // seed
     membersByProject.BUTCHR = ["BUTCHR-1"];
     await type.discovery.search();
-    await type.discovery.related!([]); // uses the one allowed turn
+    await type.discovery.related!([]);
     expect(notified).toHaveLength(1);
 
     world["BUTCHR-1"] = issue("BUTCHR-1", { status: "Done" });
+    now.value += 1_000;
     await type.discovery.search();
-    await type.discovery.related!([]); // the default (2) would allow this; the explicit 1 caps it
-    expect(notified).toHaveLength(1);
+    await type.discovery.related!([]); // the old field's own value of 1 would have capped this; it no longer does
+    expect(notified).toHaveLength(2);
   });
 });

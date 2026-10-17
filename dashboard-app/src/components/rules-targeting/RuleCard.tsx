@@ -13,7 +13,7 @@ import { useEffect, useRef } from "react";
 import { Button, IconButton, Menu, MenuItem, MenuTrigger, Popover, Separator, Switch, Text } from "@launchpad-ui/components";
 import { Icon } from "@launchpad-ui/icons";
 import { PLACEHOLDER_QUERY, type BuiltinBrief, type RuleDto, type RuleFormCatalogEntry } from "../../api/rules.js";
-import { briefText, DEFAULT_LINKED_TURNS_PER_HOUR, deleteBlockedReason, executionText, idlePokeText, notifyDeliveryText, permissionText, preferenceText, type EditableField, type RuleCardStatus, type RuleDraft, type RuleRowState } from "../../view-model/rules-draft.js";
+import { briefText, deleteBlockedReason, executionText, idlePokeText, notifyDeliveryText, permissionText, preferenceText, type EditableField, type RuleCardStatus, type RuleDraft, type RuleRowState } from "../../view-model/rules-draft.js";
 import { canPreview, providerInfo, supportsLinkedEvents } from "../../view-model/rule-providers.js";
 import { ruleAnchorId } from "../../view-model/config-links.js";
 import { RuleEditor, type QueryTestResult } from "./RuleEditor.js";
@@ -107,7 +107,7 @@ function RuleSummary({ draft, baseRule, live }: { draft: RuleDraft; baseRule: Ru
   runs.push({ text: `idle poke: ${idlePokeText(draft)}` });
   if (draft.notifyDeliveryMode) runs.push({ text: `updates: ${notifyDeliveryText(draft.notifyDeliveryMode)}` });
   if (draft.stalledMinutes) runs.push({ text: `stalled after ${draft.stalledMinutes} min` });
-  if (draft.linkedEventing && supportsLinkedEvents(draft.resourceProvider)) runs.push({ text: `linked-change events (up to ${draft.maxLinkedTurnsPerHour || DEFAULT_LINKED_TURNS_PER_HOUR} wakes/hour)` });
+  if (draft.linkedEventing && supportsLinkedEvents(draft.resourceProvider)) runs.push({ text: "linked-change events" });
   // The list only carries an excerpt; that's enough to name a built-in or show custom text's first line.
   const brief = draft.brief ?? baseRule?.briefExcerpt ?? null;
   return (

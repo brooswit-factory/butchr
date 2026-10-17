@@ -36,7 +36,7 @@ import { AGENT_HARNESSES, RULE_PERMISSION_MODES, type AgentHarness, type RulePer
 import type { ResourceProvider } from "../../../../src/rules/agent-key.js";
 import type { ExecutionMode } from "../../../../src/rules/rules.js";
 import { PLACEHOLDER_QUERY, type BuiltinBrief, type NotifyDeliveryMode, type RuleDto, type RuleFormCatalogEntry } from "../../api/rules.js";
-import { BUILTIN_BRIEF_PREFIX, builtinBriefName, DEFAULT_LINKED_ITEMS, DEFAULT_LINKED_TURNS_PER_HOUR, permissionDescription, type EditableField, type RuleDraft, type RuleIssue, type RuleRowState } from "../../view-model/rules-draft.js";
+import { BUILTIN_BRIEF_PREFIX, builtinBriefName, DEFAULT_LINKED_ITEMS, permissionDescription, type EditableField, type RuleDraft, type RuleIssue, type RuleRowState } from "../../view-model/rules-draft.js";
 import { ADDABLE_PROVIDERS, providerInfo, supportsLinkedEvents } from "../../view-model/rule-providers.js";
 import { formatJql, isJqlProvider } from "../../view-model/jql.js";
 
@@ -535,7 +535,7 @@ export function RuleEditor({ row, baseRule, catalog, disabled, onChange, onTestQ
   );
 }
 
-type CountFieldKey = "maxLinkedTurnsPerHour" | "maxLinkedItems" | "linkedPollIntervalMs";
+type CountFieldKey = "maxLinkedItems" | "linkedPollIntervalMs";
 
 function CountField({ draft, field, issues, label, placeholder, description, testId, isDisabled, onChange }: {
   draft: RuleDraft;
@@ -577,17 +577,6 @@ function LinkedEventsSection({ draft, issues, disabled, onChange }: { draft: Rul
             {draft.resourceProvider === "jira-work" && " Also its pull request (branch KEY or KEY-…): new comments and reviews. Needs GitHub set up in Settings."}
           </Text>
         </div>
-        <CountField
-          draft={draft}
-          field="maxLinkedTurnsPerHour"
-          issues={issues}
-          label="Wakes per hour, at most"
-          placeholder={`butchr's default (${DEFAULT_LINKED_TURNS_PER_HOUR})`}
-          description="Caps how often linked changes can wake one agent."
-          testId="rule-linked-turns-input"
-          isDisabled={knobsDisabled}
-          onChange={onChange}
-        />
         <CountField
           draft={draft}
           field="maxLinkedItems"
@@ -667,7 +656,6 @@ export const NOT_EDITABLE_YET: readonly { key: string; label: string }[] = [
 /** Edited above for providers that run linked-change eventing; for any other provider, listed only when the rule sets them, since they do nothing there. */
 const LINKED_READONLY: readonly { key: string; label: string }[] = [
   { key: "linkedEventing", label: "Linked-change events (unused for this provider)" },
-  { key: "maxLinkedTurnsPerHour", label: "Linked wakes per hour (unused for this provider)" },
   { key: "maxLinkedItems", label: "Linked items watched (unused for this provider)" },
   { key: "linkedRemoteLinks", label: "Follow remote links (unused for this provider)" },
   { key: "linkedDescriptionLinks", label: "Follow description links (unused for this provider)" },

@@ -436,23 +436,22 @@ describe("notification delivery and stall threshold", () => {
 
 describe("linked-change events", () => {
   test("draftFromRule maps them; absent means off and butchr's defaults", () => {
-    expect(draftFromRule(rule({ linkedEventing: true, maxLinkedTurnsPerHour: 4, maxLinkedItems: 10, linkedRemoteLinks: true, linkedPollIntervalMs: 60000 }))).toMatchObject({
+    expect(draftFromRule(rule({ linkedEventing: true, maxLinkedItems: 10, linkedRemoteLinks: true, linkedPollIntervalMs: 60000 }))).toMatchObject({
       linkedEventing: true,
-      maxLinkedTurnsPerHour: "4",
       maxLinkedItems: "10",
       linkedRemoteLinks: true,
       linkedDescriptionLinks: false,
       linkedPollIntervalMs: "60000",
     });
-    expect(draftFromRule(rule())).toMatchObject({ linkedEventing: false, maxLinkedTurnsPerHour: "", maxLinkedItems: "", linkedRemoteLinks: false, linkedDescriptionLinks: false, linkedPollIntervalMs: "" });
+    expect(draftFromRule(rule())).toMatchObject({ linkedEventing: false, maxLinkedItems: "", linkedRemoteLinks: false, linkedDescriptionLinks: false, linkedPollIntervalMs: "" });
   });
 
   test("patches send changed switches as booleans and cleared counts as null", () => {
     const plain = rule();
-    expect(buildFieldPatch(plain, { ...draftFromRule(plain), linkedEventing: true, maxLinkedTurnsPerHour: "4", linkedDescriptionLinks: true })).toEqual({
+    expect(buildFieldPatch(plain, { ...draftFromRule(plain), linkedEventing: true, linkedPollIntervalMs: "60000", linkedDescriptionLinks: true })).toEqual({
       linkedEventing: true,
       linkedDescriptionLinks: true,
-      maxLinkedTurnsPerHour: 4,
+      linkedPollIntervalMs: 60000,
     });
     const set = rule({ linkedEventing: true, maxLinkedItems: 10, linkedRemoteLinks: true });
     expect(buildFieldPatch(set, { ...draftFromRule(set), linkedEventing: false, linkedRemoteLinks: false, maxLinkedItems: "" })).toEqual({ linkedEventing: false, linkedRemoteLinks: false, maxLinkedItems: null });
@@ -460,8 +459,8 @@ describe("linked-change events", () => {
   });
 
   test("counts must be whole numbers, 1 or more", () => {
-    const d = { ...draftFromRule(rule()), linkedEventing: true, maxLinkedTurnsPerHour: "0", maxLinkedItems: "2.5", linkedPollIntervalMs: "soon" };
-    expect(validateRule(d, draftFromRule(rule()), [d]).map((i) => `${i.field}:${i.level}`)).toEqual(["maxLinkedTurnsPerHour:invalid", "maxLinkedItems:invalid", "linkedPollIntervalMs:invalid"]);
+    const d = { ...draftFromRule(rule()), linkedEventing: true, maxLinkedItems: "2.5", linkedPollIntervalMs: "0" };
+    expect(validateRule(d, draftFromRule(rule()), [d]).map((i) => `${i.field}:${i.level}`)).toEqual(["maxLinkedItems:invalid", "linkedPollIntervalMs:invalid"]);
   });
 
   test("a new rule lists them only when it turns them on, and sends only what it sets", () => {
@@ -470,7 +469,6 @@ describe("linked-change events", () => {
     const on = { ...d, id: "n", query: "q", linkedEventing: true, maxLinkedItems: "5" };
     expect(diffRule(undefined, on).map((c) => [c.label, c.to]).filter(([label]) => String(label).startsWith("Linked"))).toEqual([
       ["Linked-change events", "on"],
-      ["Linked wakes per hour", "2 (default) per hour"],
       ["Linked items watched", "5"],
       ["Linked poll interval", "every poll (default)"],
     ]);
