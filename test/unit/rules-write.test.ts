@@ -315,9 +315,10 @@ describe("writeRuleFields (PUT)", () => {
   // a legitimate `query`-only edit through this path leaves every one of
   // them byte-for-byte untouched, for a non-`ui-` rule exactly as it always
   // did for `ui-first-rule`.
-  test("FACTORY-730: fixed template fields (execution/account/role/brief) stay untouched by a write to a non-ui- rule", async () => {
-    // `account`/`role` kept to their real schema's valid values (`rules.ts`'s
-    // own `AccountPolicy`/`AgentRole`) — `mcpServers`/`mcpConfigFile` are
+  test("FACTORY-730: fixed template fields (execution/role/brief, and the legacy account key) stay untouched by a write to a non-ui- rule", async () => {
+    // `role` kept to its real schema's valid values (`rules.ts`'s own
+    // `AgentRole`); `account` is the legacy Rocket.Chat key an older file can
+    // still carry, which a write must leave in place — `mcpServers`/`mcpConfigFile` are
     // deliberately NOT exercised here (each carries its own much stricter
     // sub-schema — an absolute path, `jira-project`-only, a structured
     // server-binding shape — unrelated to what this test means to prove)
@@ -1350,7 +1351,6 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
       query: "project = BUTCHR",
       brief: "do the thing",
       execution: "swarm",
-      account: "none",
       role: "worker",
       ...overrides,
     } as Rule;
@@ -1600,7 +1600,7 @@ describe("N1 (FACTORY-678): plan-then-apply does not trip the previewer's own 2s
     });
 
     test("end-to-end repro (the ticket's own acceptance test): plan on a 3-ticket query, widen to 40, plan again WITHIN the TTL — scope is 40, and ceiling/confirm logic applies to 40", async () => {
-      const rule = { id: "ui-first-rule", enabled: false, resourceProvider: "jira-work" as const, query: "project = A", brief: "do the thing", execution: "swarm" as const, account: "none" as const, role: "worker" as const };
+      const rule = { id: "ui-first-rule", enabled: false, resourceProvider: "jira-work" as const, query: "project = A", brief: "do the thing", execution: "swarm" as const, role: "worker" as const };
       seed([rule]);
       const deps = { env: env() };
       let now = 0;
@@ -1723,10 +1723,10 @@ describe("createRule", () => {
     expect(created.enabled).toBe(false);
     expect(created.resourceProvider).toBe("jira-work");
     expect(created.query).toBe("project = XYZ");
-    // File-only defaults (AC: brief/execution/account are never client-settable here).
+    // The defaults when the create body leaves them out; no legacy Rocket.Chat `account` key is written.
     expect(created.brief).toBe("@builtin:task");
     expect(created.execution).toBe("swarm");
-    expect(created.account).toBe("none");
+    expect(created).not.toHaveProperty("account");
   });
 
   test("refuses an id collision, writes nothing", async () => {

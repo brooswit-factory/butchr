@@ -11,7 +11,6 @@ function rule(overrides: Partial<Rule> = {}): Rule {
     query: "project = FACTORY",
     brief: "a".repeat(300),
     execution: "swarm",
-    account: "none",
     role: "worker",
     ...overrides,
   } as Rule;
@@ -25,7 +24,6 @@ function entry(overrides: Partial<RuleInventoryEntry> = {}): RuleInventoryEntry 
     query: "project = FACTORY",
     enabled: true,
     execution: "swarm",
-    account: "none",
     role: "worker",
     agentPreferences: [],
     linkedEventing: false,
@@ -78,7 +76,7 @@ describe("buildRulesApiResponse", () => {
     expect(out.id).toBe("triage");
     expect(out.resourceProvider).toBe("jira-work");
     expect(out.execution).toBe("swarm");
-    expect(out.account).toBe("none");
+    expect(out).not.toHaveProperty("account");
     expect(out.role).toBe("worker");
     expect(out.staffed).toBe(true);
     expect(out.whyUnstaffed).toBeNull();
@@ -165,8 +163,8 @@ describe("buildRulesApiResponse", () => {
     });
     expect(r.rules[0]!.idlePokeMinutes).toBeNull();
     expect(r.rules[0]!.idlePokeMessage).toBeNull();
-    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null.
-    expect(r.rules[0]!.idlePokeEnabled).toBe(true);
+    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null (local/ui: false when absent).
+    expect(r.rules[0]!.idlePokeEnabled).toBe(false);
   });
   test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({

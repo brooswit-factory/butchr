@@ -2,14 +2,10 @@
  * FACTORY-615: a BROWSER-SAFE copy of `agentRowAnchorId`/`configAnchorForResourceKey`
  * from `src/agents/config-inventory-links.ts` — same algorithm, verbatim,
  * not a re-invention (see that module's own doc comment for the full
- * reasoning this reuses). It is a COPY rather than an import for one
- * reason only: that module also exports `agentRowsForRule`, which imports
- * `MANAGED_SESSIONS_RULE_ID` from `src/rules/session-definition-type.ts` —
- * a module that reaches `node:fs/promises` directly and, transitively,
- * `src/agents/workspace.ts`'s own `*.md` brief imports, which Vite's
- * browser build cannot parse (`briefs/*.md` is not valid JS) and fails
- * `vite build` outright the moment anything in `dashboard-app/` imports
- * that chain, even for an unrelated, pure export of the same file.
+ * reasoning this reuses). It is a COPY rather than an import because that
+ * module imports the real `decodeAnyAgentKey` (`src/rules/agent-key.ts`) at
+ * runtime, which `vite build` cannot bundle for the browser (see the last
+ * paragraph below).
  *
  * Importing ONLY the type-only pieces was not an option here: `agentRowAnchorId`/
  * `configAnchorForResourceKey` are real runtime functions this view-model
@@ -27,9 +23,6 @@
  */
 import { decodeAnyAgentKey, type ResourceProvider } from "./agent-key-display.js";
 
-/** Verbatim copy of `MANAGED_SESSIONS_RULE_ID` (`src/rules/session-definition-type.ts`) — a reserved rule id, never loaded from `rules.json`; see that module's own doc comment for why this sentinel check is airtight without an inventory lookup. */
-const MANAGED_SESSIONS_RULE_ID = "managed-sessions";
-
 /** Verbatim copy of `anchorToken` (`src/agents/config-inventory-links.ts`). */
 const anchorToken = (...parts: string[]): string => parts.map(encodeURIComponent).join("--");
 
@@ -37,17 +30,12 @@ const anchorToken = (...parts: string[]): string => parts.map(encodeURIComponent
 export const agentRowAnchorId = (resourceKey: string): string => `agent-${anchorToken(resourceKey)}`;
 
 /** Verbatim copy of `ruleAnchorId` (`src/agents/config-inventory-links.ts`). */
-const ruleAnchorId = (resourceProvider: ResourceProvider, ruleId: string): string => `rule-${anchorToken(resourceProvider, ruleId)}`;
-
-/** Verbatim copy of `sessionAnchorId` (`src/agents/config-inventory-links.ts`). */
-const sessionAnchorId = (agentKey: string): string => `session-${anchorToken(agentKey)}`;
+/** local/ui: exported so the Rules page can give each rule card this id, the one an agent row's "config" link points at. */
+export const ruleAnchorId = (resourceProvider: ResourceProvider, ruleId: string): string => `rule-${anchorToken(resourceProvider, ruleId)}`;
 
 /** Verbatim copy of `configAnchorForResourceKey` (`src/agents/config-inventory-links.ts`). */
 export function configAnchorForResourceKey(resourceKey: string): string | null {
   const decoded = decodeAnyAgentKey(resourceKey);
   if (!decoded) return null;
-  if (decoded.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID) {
-    return sessionAnchorId(resourceKey);
-  }
   return ruleAnchorId(decoded.resourceProvider, decoded.ruleId);
 }

@@ -15,7 +15,7 @@
  * keeps `assertOnlyChanged`'s allowlist (scoped to "any rule", in the
  * abstract) from actually reaching any rule but this one in practice.
  */
-import { EDITABLE_AGENT_PREFERENCE_LEAVES, EDITABLE_TOP_LEVEL_FIELDS, type RuleFieldPatch } from "./rules-write-registry.js";
+import { EDITABLE_AGENT_PREFERENCE_LEAVES, EDITABLE_TOP_LEVEL_FIELDS, LINKED_BOOLEAN_FIELDS, LINKED_COUNT_FIELDS, type RuleFieldPatch } from "./rules-write-registry.js";
 
 export class RuleWriteApplyError extends Error {}
 
@@ -171,6 +171,17 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   // FACTORY-1010: same null-means-remove precedent as `stalledMinutes` above.
   if (patch.notifyDeliveryMode === null) delete next.notifyDeliveryMode;
   else if (patch.notifyDeliveryMode !== undefined) next.notifyDeliveryMode = patch.notifyDeliveryMode;
+  // local/ui — see `rules-write-registry.ts`'s header for these.
+  if (patch.execution !== undefined) next.execution = patch.execution;
+  if (patch.resumeOnRespawn !== undefined) next.resumeOnRespawn = patch.resumeOnRespawn;
+  if (patch.resumeContextCutoff === null) delete next.resumeContextCutoff;
+  else if (patch.resumeContextCutoff !== undefined) next.resumeContextCutoff = patch.resumeContextCutoff;
+  if (patch.brief !== undefined) next.brief = patch.brief;
+  for (const k of LINKED_BOOLEAN_FIELDS) if (patch[k] !== undefined) next[k] = patch[k];
+  for (const k of LINKED_COUNT_FIELDS) {
+    if (patch[k] === null) delete next[k];
+    else if (patch[k] !== undefined) next[k] = patch[k];
+  }
   if (patch.agentPreferences !== undefined) {
     const currentPrefs = Array.isArray(current.agentPreferences) ? (current.agentPreferences as Record<string, unknown>[]) : [];
     if (patch.agentPreferences.length !== currentPrefs.length) {

@@ -1,0 +1,57 @@
+/*
+ * local/ui — the Agents page's row actions and dialogs. Public LaunchPad
+ * tokens only; a static stylesheet, since butchr's CSP (style-src 'self')
+ * blocks runtime <style> injection.
+ */
+
+/* Upstream's row, then our actions at its end. */
+.ag-row {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+}
+
+.ag-row > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+
+.ag-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--lp-size-4);
+}
+
+.ag-form {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--lp-size-8);
+}
+
+.ag-form--row {
+  flex-direction: row;
+  align-items: flex-end;
+  width: 100%;
+}
+
+.ag-form__grow {
+  flex: 1;
+}
+
+.ag-start {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-12);
+}
+
+.ag-start p {
+  margin: 0;
+}
+
+/* Plain paragraphs in the dialogs: a LaunchPad <Text> there needs a slot. */
+.ag-note {
+  margin: 0;
+  font: var(--lp-text-body-2-regular);
+}

@@ -547,43 +547,16 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker — FACTORY-65
     });
   });
 
-  describe("group 3 — add-rocketr-account.sh appending to secrets.env, by basename only", () => {
-    const script = (dir: string) =>
-      fixture(
-        dir,
-        "add-rocketr-account.sh",
-        "#!/bin/bash\n" +
-          "set -e\n" +
-          'echo "ROCKETR_ACCOUNTS=$1" >> ~/.config/rocketchat/secrets.env\n' +
-          "systemctl --user restart rocketr.service || true\n",
-      );
-
-    test("bash add-rocketr-account.sh ... is allowed", () => {
+  describe("group 3 — no script may append to a sensitive config path (the old Rocket.Chat account-script allowance is gone)", () => {
+    test("the former add-rocketr-account.sh shape now blocks like any other script", () => {
       const { dir, home, mode } = setup();
-      const f = script(dir);
-      expect(check(`bash ${f} director "Director" --no-restart`, { cwd: dir, mode, home }).code).toBe(0);
+      const f = fixture(dir, "add-rocketr-account.sh", 'echo "ACCOUNTS=$1" >> ~/.config/rocketchat/secrets.env\n');
+      expect(check(`bash ${f} director`, { cwd: dir, mode, home }).code).toBe(2);
     });
 
-    test("./add-rocketr-account.sh ... is allowed", () => {
+    test("a direct append to that path still blocks", () => {
       const { dir, home, mode } = setup();
-      script(dir);
-      expect(check(`cd ${dir} && ./add-rocketr-account.sh manager-goodknight "GoodKnight Manager"`, { cwd: dir, mode, home }).code).toBe(0);
-    });
-
-    test("negative: a general append to secrets.env, not via that script, still blocks", () => {
-      const { dir, home, mode } = setup();
-      expect(check(">> ~/.config/rocketchat/secrets.env", { cwd: dir, mode, home }).code).toBe(2);
       expect(check("echo x >> ~/.config/rocketchat/secrets.env", { cwd: dir, mode, home }).code).toBe(2);
-    });
-
-    test("negative: a DIFFERENTLY NAMED copy of the script still blocks", () => {
-      const { dir, home, mode } = setup();
-      const f = fixture(
-        dir,
-        "add-account-other.sh",
-        'echo "x" >> ~/.config/rocketchat/secrets.env\n',
-      );
-      expect(check(`bash ${f}`, { cwd: dir, mode, home }).code).toBe(2);
     });
   });
 
@@ -592,7 +565,7 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker — FACTORY-65
       const { dir, home, mode } = setup();
       const cmd =
         "cat >> ~/.config/butchr-new/managed-sessions.env <<'EOF'\n" +
-        'AGENT_DIALOG_MONITOR_ROCKETR_HEADERS=\'{"x-rocketr-account":"agent-dialog-monitor"}\'\n' +
+        'AGENT_DIALOG_MONITOR_MCP_HEADERS=\'{"x-agent":"agent-dialog-monitor"}\'\n' +
         "EOF";
       expect(check(cmd, { cwd: dir, mode, home }).code).toBe(0);
     });

@@ -136,7 +136,8 @@ id's own `Rule.lizardMode`, looked up against the daemon's already-loaded
 `rules` list (see `docs/execution-modes.md`'s "`permissionMode` and
 `lizardMode`" section for why a rule needs no live poll the way a
 managed-session definition does). Since FACTORY-138, "never set the field"
-resolves ELIGIBLE for a rule (`ruleLizardModeOf`: `rule.lizardMode !== false`,
+resolves ELIGIBLE for a rule (`ruleLizardModeOf`: `rule.lizardMode !== false`;
+local/ui: `rule.lizardMode === true`, so lizard mode is off unless a rule turns it on,
 unconditionally — no vendor gate at this layer, since a `Rule` has no fixed
 vendor) and for a `vendor: "claude"` managed session (`lizardMode ?? (vendor
 === "claude")`); only an explicit `lizardMode: false`, a Codex/agy-resolved
@@ -330,7 +331,7 @@ Three independent pane-scanning timers now run in `src/daemon/index.ts`:
 | --- | --- | --- | --- |
 | `watchPrompts` (`src/agents/prompt-watch.ts`) | 5s | every pane | startup dialogs, via `chooseStartupAnswer` (trust, Bypass-Permissions first-run, fullscreen-renderer, settings warning/recommendation, resume-from-summary) |
 | `blockingEscalationTimer` (drovr's `createBlockingEscalationWatcher`) | 5s | every pane | nothing — detects and escalates unknown dialogs only, `sendKeys` is a permanent no-op (see `docs/managed-sessions.md`'s "Two detectors, one mark") |
-| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only lizard-eligible panes (`lizardMode: true`, or absent and defaulting eligible since FACTORY-138 — see "The opt-in gate" above) | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
+| **permission-answer loop / lizard mode** (this ticket) | 20s scan, plus an event-driven fast path (~1s) since FACTORY-98 — see "Event-driven: the fast path" below | only lizard-eligible panes (`lizardMode: true`, or absent and defaulting eligible since FACTORY-138 — see "The opt-in gate" above; local/ui: `lizardMode: true` only) | the tool-permission dialog only, pressing plain "Yes" (allow once), via `autoAnswerPermissions` |
 
 Each is deliberately separate: a Jira reconcile failure must never stall
 permission-answering, a wedged permission-approve attempt must never stall

@@ -7,7 +7,6 @@ import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
 import type { SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
-import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
 export type { NotifyReason } from "../resources/types.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -482,18 +481,6 @@ export interface ReconcileOptions {
    * report through).
    */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
-  /**
-   * BUTCHR-412: Rocket.Chat account lifecycle, independent of every hook
-   * above (residency/admission/crash-loop/etc. all still run exactly as
-   * before — this only decides what `ensureAccount`/`releaseAccount` see, and
-   * WITHHOLDS a spawn `admitted`/`plan.respawn` would otherwise have made,
-   * never adds one). See `../agents/account-lifecycle.ts` for the hook
-   * contract and why its two call sites below are exactly the boundary the
-   * account manager's own token-rotation contract needs. Optional; omitted,
-   * no account lifecycle runs (every caller before this ticket) — every
-   * `SpawnSpec` reaches `herd.spawn` exactly as `desired` provided it.
-   */
-  account?: AccountLifecycleHooks;
 }
 
 /**
@@ -543,13 +530,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const frozen = new Set(herd.frozen ? await herd.frozen([...desired.keys()]) : []);
   desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
   const failures: ReconcileFailure[] = [];
-  // BUTCHR-412: drain any release `AccountLifecycleHooks.release` could not
-  // complete on an earlier poll (the manager call itself threw, after
-  // herd.stop had already succeeded) BEFORE anything else this poll — see
-  // that hook's own doc comment for why this is the only retry path such a
-  // failure ever gets (the id is no longer running, so it can never land in
-  // a future plan.stop on its own).
-  if (opts.account) await opts.account.retryPendingReleases();
   if (herd.recoverQuota) {
     await Promise.all([...desired.values()].map(async (spec) => {
       try {
@@ -690,39 +670,22 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // resource's spawn this same `Promise.all`.
     await Promise.all(admitted.map(async (issue) => {
       try {
-        const spec = desired.get(issue)!;
-        // BUTCHR-412: `ensure` runs BEFORE herd.spawn, and only ever for an
-        // id `admitted` (never one already resident — BUTCHR-287's own
-        // residency filter already removed those from `live`/`admitted`
-        // upstream of this point) — see AccountLifecycleHooks' own doc
-        // comment for why that boundary is exactly what the account
-        // manager's token-rotation contract needs.
-        const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
-        if (toSpawn === null) {
-          // A real refusal, already logged (and, where wired, posted) by
-          // `ensure` itself — recorded here as an ordinary "spawn" failure so
-          // it shares checkReconcileFailure's existing audible-failure route
-          // and is excluded from `onAdmitted` below, same as any other failed
-          // spawn attempt.
-          failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
-        } else {
-          await herd.spawn(toSpawn);
-          // FACTORY-916: THE primary case this story exists for — `issue`
-          // was `desired` but not `running` at all (this `admitted`/
-          // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
-          // below, which only ever sees an agent that WAS running) —
-          // i.e. exactly the "daemon respawns a worker after an
-          // unintended stop" shape FACTORY-843's outcome describes. Same
-          // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
-          // callback the stale-argv loop below also consults — see that
-          // loop's own comment for the full contract. Without this read
-          // HERE too, a genuine crash-respawn that resumed would get NO
-          // ticket notice at all: this loop never calls `opts.onRespawn`
-          // in the first place (a brand-new "first ever spawn" needs no
-          // "your session was X" notice), so there is no existing call
-          // this piggybacks on the way the stale-argv loop's does.
-          if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
-        }
+        await herd.spawn(desired.get(issue)!);
+        // FACTORY-916: THE primary case this story exists for — `issue`
+        // was `desired` but not `running` at all (this `admitted`/
+        // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
+        // below, which only ever sees an agent that WAS running) —
+        // i.e. exactly the "daemon respawns a worker after an
+        // unintended stop" shape FACTORY-843's outcome describes. Same
+        // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
+        // callback the stale-argv loop below also consults — see that
+        // loop's own comment for the full contract. Without this read
+        // HERE too, a genuine crash-respawn that resumed would get NO
+        // ticket notice at all: this loop never calls `opts.onRespawn`
+        // in the first place (a brand-new "first ever spawn" needs no
+        // "your session was X" notice), so there is no existing call
+        // this piggybacks on the way the stale-argv loop's does.
+        if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
       } catch (e) {
         failures.push({ id: issue, stage: "spawn", error: e });
       }
@@ -750,19 +713,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     try {
       await herd.stop(issue);
       await opts.onStopped?.(issue);
-      // BUTCHR-412: released only AFTER a successful stop — if herd.stop
-      // itself threw, the agent may still be running, and releasing its
-      // account out from under a still-live agent would be wrong; a
-      // throwing herd.stop instead falls to the catch below and is retried
-      // as an ordinary stop failure next poll (plan.stop recomputes every
-      // poll from scratch). `release` ITSELF never throws past this point —
-      // see AccountLifecycleHooks.release's own doc comment: once herd.stop
-      // has succeeded, the id is no longer running and so can never again
-      // land in plan.stop on its own, which is exactly why a release
-      // failure here is queued internally and drained every poll by
-      // `retryPendingReleases` (above, top of this function) instead of
-      // being left to a retry path that does not actually exist for it.
-      if (opts.account) await opts.account.release(issue, "stop");
     } catch (e) {
       failures.push({ id: issue, stage: "stop", error: e });
     }
@@ -868,27 +818,12 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     opts.reserveAdmission?.([issue]);
     try {
       const spec = desired.get(issue)!;
-      // BUTCHR-412: `ensure` runs BEFORE the interim `herd.stop` below —
-      // deliberately: this is a "same agent identity coming back" launch
-      // (`docs/rocketchat-accounts.md`), so a refused account should leave
-      // the existing (stale-argv, but otherwise working) agent running
-      // rather than stop it with no replacement over an account hiccup.
-      // `release(issue, "respawn")` is a documented no-op for a temporary
-      // account either way — called for the same reason `ensureAccount`'s
-      // own "respawn never unprovisions" contract is exercised through real
-      // code here rather than assumed.
-      const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
-      if (toSpawn === null) {
-        failures.push({ id: issue, stage: "respawn", error: new Error("account policy refused this launch — see the [account] log line above; stale agent left running rather than stopped with no replacement") });
-        continue;
-      }
-      if (opts.account) await opts.account.release(issue, "respawn");
       await herd.stop(issue);
       // FACTORY-1001: a respawn is also a real lifecycle stop. Purge the
       // stopped pane's agent labels before the replacement is launched so a
       // failed/restarted pane cannot leave stale ownership behind.
       await opts.onStopped?.(issue);
-      await herd.spawn(toSpawn, "respawn");
+      await herd.spawn(spec, "respawn");
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
       // is unaffected. If `stop` succeeded but `spawn` then threw, `issue`
@@ -959,15 +894,6 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // own try/catch here is ever removed or narrowed, this call site becomes
   // exactly that same hazard and should be wrapped too.
   if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
-  // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): called ONCE,
-  // at the very end of this poll, after every `ensure`/`release` call above
-  // (spawn loop, stop loop, respawn loop) has run — never per-id. A poll
-  // that provisioned or released nothing this round is a no-op here (see
-  // `AccountLifecycleHooks.publishBatch`'s own doc comment, `../agents/account-lifecycle.ts`,
-  // for the dirty-tracking that makes that true); one that did publishes the
-  // Nexus hand-off manifest exactly once, regardless of how many ids this
-  // poll's spawn/respawn/stop loops touched.
-  if (opts.account) await opts.account.publishBatch();
 }
 
 /**
@@ -1150,8 +1076,6 @@ export interface GenericLoopDeps<T> {
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
-  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment — threaded straight through to `reconcileNow` below. Wired into every rule loop (src/daemon/index.ts) as the SAME shared `AccountLifecycleHooks` instance (one account manager/store, not one per tier — mirrors `admission` above). Optional; omitted, no account lifecycle runs (every caller before this ticket). */
-  account?: AccountLifecycleHooks;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
@@ -1251,7 +1175,6 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
         ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
-        ...(deps.account ? { account: deps.account } : {}),
         atRest,
       });
       // BUTCHR-307 REVIEW FIX: `atRest` ids are unioned in here, not just

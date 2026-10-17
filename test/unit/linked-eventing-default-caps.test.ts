@@ -11,14 +11,10 @@ import {
   type LinkedEventingMatch,
 } from "../../src/jira-watch/linked-eventing.js";
 import { createJiraProjectResourceType } from "../../src/rules/jira-project-type.js";
-import { builtinManagedSessionsRule, createManagedSessionResourceType } from "../../src/rules/session-definition-type.js";
-import { encodeAgentKey } from "../../src/rules/agent-key.js";
-import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
-import type { FilesystemResource } from "../../src/resources/filesystem.js";
 
 /**
- * BUTCHR-451/BUTCHR-471: no linked-eventing owner kind (jira-work, jira-project,
- * a managed session opted in via linkedEventingProjects) can end up on and
+ * BUTCHR-451/BUTCHR-471: no linked-eventing owner kind (jira-work, jira-project)
+ * can end up on and
  * uncapped, whether or not a rule sets its own maxLinkedTurnsPerHour/
  * maxLinkedItems. Each owner kind below is exercised through its REAL
  * production wiring (real rule parsing / real resource-type constructor),
@@ -294,101 +290,5 @@ describe("BUTCHR-471: default caps for a jira-project owner, through createJiraP
     await type.discovery.search();
     await type.discovery.related!([]); // the default (2) would allow this; the explicit 1 caps it
     expect(notified).toHaveLength(1);
-  });
-});
-
-describe("BUTCHR-471: default caps for a managed session, through createManagedSessionResourceType with discovery.search then discovery.related (the way FACTORY-53/71 actually wires it) — NOT a hand-built ProjectLinkedEventingMatch, NOT a fixture that hand-sets a cap", () => {
-  const goodDef = (over: Record<string, unknown> = {}) => ({
-    workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default",
-    frozen: false, execution: "swarm", account: "none", role: "worker", ...over,
-  });
-
-  function fakeFiles(files: Record<string, string>) {
-    const list = async (_q: FilesystemQuery): Promise<FilesystemResource[]> =>
-      Object.keys(files).map((path) => ({ path, kind: "file" as const, name: path.split("/").pop()!, size: 10, mtimeMs: 1000 }));
-    const read = async (path: string): Promise<string> => {
-      if (!(path in files)) throw new Error(`ENOENT: no such file ${path}`);
-      return files[path]!;
-    };
-    return { list, read };
-  }
-
-  const sessionAgentKey = (path: string) => encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: path });
-
-  function wire(files: Record<string, string>, world: Record<string, JiraIssue>, membersByProject: Record<string, string[]>, now: { value: number }) {
-    const { list, read } = fakeFiles(files);
-    const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
-    const logs: string[] = [];
-    const searchIssues = async (jql: string): Promise<JiraIssue[]> => {
-      const keyIn = /^key in \((.*)\)$/.exec(jql);
-      if (keyIn) return keyIn[1]!.split(",").map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
-      const proj = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updated ASC$/.exec(jql);
-      if (proj) return (membersByProject[proj[1]!] ?? []).map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
-      throw new Error(`unexpected JQL ${jql}`);
-    };
-    const type = createManagedSessionResourceType({
-      rule: builtinManagedSessionsRule("/defs"),
-      list, read, searchIssues,
-      notify: async (agent, about, reason) => { notified.push({ agent, about, reason }); },
-      log: (l) => logs.push(l),
-      now: () => now.value,
-    });
-    return { type, notified, logs };
-  }
-
-  test("a definition naming linkedEventingProjects, with no per-definition cap field at all (none exists), delivers at most DEFAULT_MAX_LINKED_TURNS_PER_HOUR turns/hour and defers the rest — the MANAGED_SESSION_LINKED_EVENTING_RULE gap this ticket closes", async () => {
-    const files = { "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) };
-    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
-    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const now = { value: 0 };
-    const { type, notified, logs } = wire(files, world, membersByProject, now);
-
-    await type.discovery.search();
-    await type.discovery.related?.([]); // seeds the watermark
-
-    for (let i = 0; i < DEFAULT_MAX_LINKED_TURNS_PER_HOUR; i++) {
-      world["BUTCHR-1"] = issue("BUTCHR-1", { status: `s${i}` });
-      membersByProject.BUTCHR = ["BUTCHR-1"];
-      await type.discovery.search();
-      await type.discovery.related?.([]);
-    }
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR);
-    expect(notified.every((n) => n.agent === sessionAgentKey("/defs/a.json"))).toBe(true);
-
-    world["BUTCHR-1"] = issue("BUTCHR-1", { status: "still-outstanding" });
-    await type.discovery.search();
-    await type.discovery.related?.([]); // one turn beyond the default — MUST be capped, unlike before this ticket
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR);
-    // The emitted suppressed line must carry the REAL session agent, never the synthetic NUL-bearing state key (BUTCHR-471 item 6).
-    const suppressedLine = logs.find((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"));
-    expect(suppressedLine).toBeDefined();
-    expect(suppressedLine).toContain(`watcher=${sessionAgentKey("/defs/a.json")}`);
-    expect(suppressedLine).not.toMatch(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/); // no NUL byte, no control character
-
-    now.value += 61 * 60_000;
-    await type.discovery.search();
-    await type.discovery.related?.([]); // delayed, not lost
-    expect(notified).toHaveLength(DEFAULT_MAX_LINKED_TURNS_PER_HOUR + 1);
-  });
-
-  test("a definition naming linkedEventingProjects with more than DEFAULT_MAX_LINKED_ITEMS members changing in one window keeps only the default", async () => {
-    const files = { "/defs/a.json": JSON.stringify(goodDef({ linkedEventingProjects: ["jira-project:BUTCHR"] })) };
-    const total = DEFAULT_MAX_LINKED_ITEMS + 1;
-    const world: Record<string, JiraIssue> = {};
-    for (let i = 0; i < total; i++) world[`BUTCHR-${i + 1}`] = issue(`BUTCHR-${i + 1}`, { status: "To Do" });
-    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const now = { value: 0 };
-    const { type, notified } = wire(files, world, membersByProject, now);
-
-    await type.discovery.search();
-    await type.discovery.related?.([]); // seed
-
-    membersByProject.BUTCHR = Object.keys(world);
-    await type.discovery.search();
-    await type.discovery.related?.([]);
-
-    expect(notified).toHaveLength(1);
-    const events = (notified[0]!.reason as { linked: { events: readonly { target: string }[] } }).linked.events;
-    expect(events).toHaveLength(DEFAULT_MAX_LINKED_ITEMS);
   });
 });

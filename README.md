@@ -111,13 +111,6 @@ Predecessor (300 releases of history) preserved at [`brooswit/butchr-legacy`](ht
 Free-form project resource agents are available through `jira-project` rules;
 see [project selection, interactive use, and optional MCP connections](docs/project-agents.md).
 
-A resource agent (or an operator, via `butchr link list|add|remove`) can
-maintain its own butchr-managed sensor set — typed references across seven
-provider kinds (`jira-work-item`, `jira-project`, `confluence-page`,
-`github-issue`, `github-pr`, `filesystem`, `webpage`) — independent of any
-provider-native links a future adapter may merge in; see
-[`ResourceRef`, the managed-link collection, and the merge contract](docs/resource-links.md).
-
 A resource's provider can be asked which capability categories it actually
 supports today (`query`, `read`, `snapshot`, `comments`, `links`,
 `createTask`) via `supports`/`capabilitiesOf`

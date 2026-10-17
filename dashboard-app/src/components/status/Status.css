@@ -1,0 +1,312 @@
+/*
+ * local/ui — the Status page, in the Settings cards' style. Public LaunchPad
+ * tokens only; a static stylesheet, since butchr's CSP (style-src 'self')
+ * blocks runtime <style> injection.
+ */
+
+.st-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-16);
+  padding-bottom: var(--lp-size-32);
+}
+
+.st-page__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--lp-size-16);
+}
+
+.st-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--lp-size-12);
+}
+
+.st-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+  align-items: start;
+  gap: var(--lp-size-16);
+}
+
+@media (max-width: 960px) {
+  .st-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.st-grid__side,
+.st-grid__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-16);
+  min-width: 0;
+}
+
+.st-card {
+  min-width: 0;
+  border: 1px solid var(--lp-color-border-ui-secondary);
+  border-radius: var(--lp-border-radius-medium);
+  background: var(--lp-color-bg-ui-primary);
+}
+
+.st-card__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--lp-size-8);
+  padding: var(--lp-size-12) var(--lp-size-16);
+  border-bottom: 1px solid var(--lp-color-border-ui-secondary);
+}
+
+.st-card__title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+  margin: 0;
+  font: var(--lp-text-heading-3-semibold);
+}
+
+.st-card__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-12);
+  padding: var(--lp-size-16);
+}
+
+.st-card__body--flush {
+  padding: 0;
+}
+
+.st-card__body p {
+  margin: 0;
+}
+
+.st-muted {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.st-ok {
+  color: var(--lp-color-text-feedback-success);
+}
+
+.st-error {
+  color: var(--lp-color-text-feedback-error);
+}
+
+.st-warning {
+  color: var(--lp-color-text-feedback-warning);
+}
+
+.st-pad {
+  padding: var(--lp-size-12) var(--lp-size-16);
+}
+
+/* LaunchPad's StatusIcon picks the shape; the colour is ours. */
+.st-icon--ok {
+  fill: var(--lp-color-fill-feedback-success);
+}
+
+.st-icon--bad {
+  fill: var(--lp-color-fill-feedback-error);
+}
+
+.st-empty {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+/* The build facts: label column, value column. */
+.st-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: var(--lp-size-4) var(--lp-size-16);
+  margin: 0;
+}
+
+.st-facts > div {
+  display: contents;
+}
+
+.st-facts dt {
+  color: var(--lp-color-text-ui-secondary);
+  font: var(--lp-text-label-1-regular);
+}
+
+.st-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.st-facts code,
+.st-card__header code {
+  font-family: var(--lp-font-family-monospace);
+  font-size: 0.92em;
+}
+
+.st-group__title {
+  margin: 0 0 var(--lp-size-8);
+  color: var(--lp-color-text-ui-secondary);
+  font: var(--lp-text-label-1-semibold);
+}
+
+/* One loop per line: icon, name, then its state pushed to the right. */
+.st-chips {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-8);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.st-chip {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+}
+
+.st-chip__state {
+  margin-left: auto;
+  color: var(--lp-color-text-ui-secondary);
+  font: var(--lp-text-body-2-regular);
+  text-align: right;
+}
+
+.st-chip--bad .st-chip__state {
+  color: var(--lp-color-text-feedback-error);
+}
+
+.st-details {
+  margin-top: var(--lp-size-8);
+  font: var(--lp-text-body-2-regular);
+}
+
+.st-details summary {
+  cursor: pointer;
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.st-plain-list {
+  margin: var(--lp-size-8) 0 0;
+  padding-left: var(--lp-size-20);
+}
+
+.st-plain-list li + li {
+  margin-top: var(--lp-size-4);
+}
+
+.st-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Upstream's agent control panel keeps its own markup; this gives it the page's look. */
+.st-card--control {
+  padding: var(--lp-size-12) var(--lp-size-16) var(--lp-size-16);
+}
+
+.st-card--control h3 {
+  margin: 0 0 var(--lp-size-12);
+  font: var(--lp-text-heading-3-semibold);
+}
+
+.st-card--control label {
+  margin-right: var(--lp-size-8);
+  color: var(--lp-color-text-ui-secondary);
+  font: var(--lp-text-label-1-regular);
+}
+
+.st-card--control input[type="text"] {
+  box-sizing: border-box;
+  height: var(--lp-size-32);
+  margin-right: var(--lp-size-8);
+  padding: 0 var(--lp-size-8);
+  border: 1px solid var(--lp-color-border-field-base);
+  border-radius: var(--lp-border-radius-regular);
+  background: var(--lp-color-bg-field-base);
+  color: inherit;
+  font: inherit;
+}
+
+.st-card--control p {
+  margin: var(--lp-size-8) 0 0;
+}
+
+/* The Coming soon page: one row per item, what it is on the left, where it lives today on the right. */
+.cs-page {
+  max-width: var(--lp-size-1200);
+}
+
+.cs-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cs-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 40%);
+  align-items: start;
+  gap: var(--lp-size-4) var(--lp-size-24);
+  padding: var(--lp-size-12) var(--lp-size-16);
+}
+
+.cs-item + .cs-item {
+  border-top: 1px solid var(--lp-color-border-ui-secondary);
+}
+
+.cs-item p {
+  margin: 0;
+}
+
+.cs-item__title {
+  font: var(--lp-text-label-1-semibold);
+}
+
+.cs-item__today code {
+  font-family: var(--lp-font-family-monospace);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .cs-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.cs-card--muted {
+  background: var(--lp-color-bg-ui-secondary);
+}
+
+/* The log tail: monospace, scrolls inside the card, newest line at the bottom. */
+.st-log {
+  max-height: 360px;
+  margin: 0;
+  padding: var(--lp-size-12) var(--lp-size-16);
+  overflow: auto;
+  border-radius: 0 0 var(--lp-border-radius-medium) var(--lp-border-radius-medium);
+  background: var(--lp-color-bg-ui-secondary);
+  font-family: var(--lp-font-family-monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Beside the health card, the tail fills the rest of the window instead. */
+.st-log--tall {
+  height: calc(100vh - 220px);
+  min-height: 320px;
+  max-height: none;
+}
+
+.st-log:focus-visible {
+  outline: 2px solid var(--lp-color-border-field-focus, currentColor);
+  outline-offset: -2px;
+}

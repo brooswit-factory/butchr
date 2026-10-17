@@ -349,19 +349,17 @@ describe("FACTORY-137 D3/D6: on-demand pass via runDirtyPass", () => {
     expect(state.stats().onDemandPasses).toBe(0);
   });
 
-  test("D3: an on-demand pass does not re-run discovery — no managed-link/remote-links call", async () => {
+  test("D3: an on-demand pass does not re-run discovery — no remote-links call (local/ui: managed links are gone)", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
     const state = createLinkedEventingState();
     const { push } = fakePush({ debounceMs: 0 });
     let remoteLinksCalls = 0;
-    let linkStoreCalls = 0;
     const { deps, notified } = fakeDeps(world, { push });
     const m = match("jira-work:task:BUTCHR-1", rule({ linkedRemoteLinks: true }), owner);
     const depsWithRemote: LinkedEventingDeps = {
       ...deps,
       remoteLinks: async () => { remoteLinksCalls += 1; return []; },
-      linkStore: { get: async () => { linkStoreCalls += 1; return []; }, set: async () => {} } as never,
     };
     await state.runTick([m], depsWithRemote);
     expect(remoteLinksCalls).toBe(1);
@@ -371,7 +369,6 @@ describe("FACTORY-137 D3/D6: on-demand pass via runDirtyPass", () => {
     await state.runDirtyPass();
     expect(notified).toHaveLength(1); // the change WAS delivered
     expect(remoteLinksCalls).toBe(1); // but no fresh discovery call was made
-    expect(linkStoreCalls).toBe(0);
   });
 });
 

@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, m
 import { join, resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, MANAGED_SESSION_TOOLS_NOTE, mcpIdentityHeaders, resolveAccountHeader, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
@@ -130,12 +130,11 @@ describe("FACTORY-118 Addenda A2/A3/A4/A6: leaf validation, sticky naming, slug 
   });
 });
 
-// FACTORY-570: on win32 a managed-session definition's resourceId is a
-// backslash-separated, drive-lettered Windows path
-// (`C:\Users\broos\...\codex-test.json`) — `managedSessionShortDisplayId`
-// (src/rules/session-definition-type.ts) looks for the LAST `/` to find the
-// bare definition name, finds none, and returns almost the whole raw path as
-// its "short id". Before this ticket, `isValidLeaf` accepted that string
+// FACTORY-570: on win32 a filesystem resourceId is a backslash-separated,
+// drive-lettered Windows path (`C:\Users\broos\...\codex-test.json`) — a
+// short id that splits on `/` (`filesystemShortDisplayId`,
+// src/rules/filesystem-type.ts) finds no separator and returns the whole raw
+// path as its "short id". Before this ticket, `isValidLeaf` accepted that string
 // verbatim (it only ever rejected `/`, never `:`/`\`), so it was joined
 // straight onto the workspace root — exactly the shape of butchr's own
 // reported failure: `ENOENT: no such file or directory, mkdir
@@ -148,7 +147,7 @@ describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspac
   const WIN_ROOT = "C:\\Users\\broos\\butchr-workspaces";
   const WIN_RESOURCE_ID = "C:\\Users\\broos\\butchr\\config\\session-definitions\\codex-test.json";
 
-  test("isValidLeaf: `:` and `\\` are rejected on platform win32 (the hostile shape managedSessionShortDisplayId can produce for a Windows path), but stay valid on posix — Addendum A2's own permissive half, unchanged", () => {
+  test("isValidLeaf: `:` and `\\` are rejected on platform win32 (the hostile shape a `/`-splitting short id produces for a Windows path), but stay valid on posix — Addendum A2's own permissive half, unchanged", () => {
     // Unchanged, default-platform (posix in this suite) behaviour — the
     // existing Addendum A2 pin above already covers `isValidLeaf(":")` at
     // the default, but restated here as the explicit contrast this ticket's
@@ -161,8 +160,8 @@ describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspac
     expect(isValidLeaf("codex-test", "win32")).toBe(true); // an ordinary bare name is still fine on win32
   });
 
-  test("newLayoutDirFor: a managed-session Windows resourceId falls back to the flat, fully percent-encoded legacy leaf — never the raw drive path with its `:`/`\\` intact", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+  test("newLayoutDirFor: a Windows filesystem resourceId falls back to the flat, fully percent-encoded legacy leaf — never the raw drive path with its `:`/`\\` intact", () => {
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: WIN_RESOURCE_ID }, "win32");
     const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
     const leaf = dir.split(/[\\/]/).pop()!; // last path segment, either separator (this host's real path.join picks one)
     expect(leaf).toBe(encodeURIComponent(WIN_RESOURCE_ID));
@@ -173,7 +172,7 @@ describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspac
 
   test("UNC ids get the same flat treatment as a drive-letter id", () => {
     const uncId = "\\\\server\\share\\defs\\x.json";
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: uncId }, "win32");
     const dir = newLayoutDirFor(key, WIN_ROOT, "win32");
     const leaf = dir.split(/[\\/]/).pop()!;
     expect(leaf).toBe(encodeURIComponent(uncId));
@@ -182,35 +181,22 @@ describe("FACTORY-570: Windows filesystem resourceIds get a flat, valid workspac
   });
 
   test("round trip holds on win32: encode -> workspaceDirFor -> agentIdOfWorkspacePath decodes back to the exact original key, for a drive-letter id", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: WIN_RESOURCE_ID }, "win32");
     const dir = workspaceDirFor(key, WIN_ROOT, "win32");
     expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
   });
 
   test("round trip holds on win32 for a UNC id too", () => {
     const uncId = "\\\\server\\share\\defs\\x.json";
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: uncId }, "win32");
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: uncId }, "win32");
     const dir = workspaceDirFor(key, WIN_ROOT, "win32");
     expect(agentIdOfWorkspacePath(dir, WIN_ROOT, "win32")).toBe(key);
-  });
-
-  test("posix behaviour is byte-identical: a managed session still gets its short, bare definition name, never the flat encoded slug", () => {
-    // `platform` (pinned to "linux" here, never this suite's real
-    // `process.platform`) governs only the id/leaf VALIDITY logic
-    // (isValidLeaf/candidateLeaf/isResourceId) — `node:path`'s `join` inside
-    // `workspaceDirFor` itself always uses the REAL host's separator
-    // (backslash on the `windows` CI job), so the leaf — the one thing this
-    // ticket's fix actually changes — is asserted on its own, split on
-    // either separator, rather than against one hardcoded full path.
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/brooswit/.config/butchr/session-definitions/admin-assembly.json" }, "linux");
-    const dir = workspaceDirFor(key, "/root/butchr-workspaces", "linux");
-    expect(dir.split(/[\\/]/).pop()).toBe("admin-assembly");
   });
 
   test("real mkdir + rmdir under a temp root: ensureWorkspaceDir actually creates the leaf this fix computes, and the created directory's own basename carries no `:`/`\\`/`/` — the assertion the windows CI job proves on real NTFS, since there `platform: win32` is also this run's real `process.platform`", () => {
     const root = mkdtempSync(join(tmpdir(), "butchr-570-mkdir-"));
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: WIN_RESOURCE_ID }, "win32");
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: WIN_RESOURCE_ID }, "win32");
       const dir = ensureWorkspaceDir(key, root, "win32");
       expect(existsSync(dir)).toBe(true);
       const basename = dir.split(/[\\/]/).pop()!;
@@ -355,7 +341,9 @@ describe("briefFor / modelFor", () => {
   test("bundled workflows use explicit targets and preserve review, hold and completion evidence", () => {
     for (const type of ["Epic", "Story", "Task", "Bug", "project", "unknown"]) {
       const brief = briefFor(type);
-      for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "jira_update_issue", "add_link"]) expect(brief).toContain(verb);
+      for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "jira_update_issue"]) expect(brief).toContain(verb);
+      // local/ui: managed links are gone, and with them the briefs' Subscriptions section.
+      expect(brief).not.toMatch(/\b(list_links|add_link|remove_link)\b/);
       expect(brief).toContain("Hierarchy and review assignments are process conventions, not tool permissions");
       expect(brief).toContain("Keep cancellations cancelled, freezes frozen");
       expect(brief).toContain("not proof that the requested behavior works");
@@ -381,7 +369,7 @@ describe("interpolate", () => {
   });
 });
 describe("buildWorkspace", () => {
-  // Reused across several managed-session fixtures below — one canonical filesystem resourceId.
+  // Reused across several filesystem fixtures below — one canonical filesystem resourceId.
   const ETC_DEFS_A_JSON = absPath("etc", "defs", "a.json");
   // Reused across several "never throws for a missing workspace dir" fixtures below.
   const DOES_NOT_EXIST = absPath("does", "not", "exist");
@@ -439,8 +427,8 @@ describe("buildWorkspace", () => {
     const real = mkdtempSync(join(tmpdir(), "bw-real-cwd-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
-      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: real };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: ETC_DEFS_A_JSON });
+      const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "b", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp");
       expect(dir).toBe(workspaceDirFor(key, root));
       expect(dir).not.toBe(real);
@@ -459,25 +447,17 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("BUTCHR-456: a managed-session agent's brief gets MANAGED_SESSION_TOOLS_NOTE, never the generic FILESYSTEM_TOOLS_NOTE — a plain filesystem/BUTCHR-407 agent gets the reverse", () => {
+  test("BUTCHR-456: a plain filesystem/BUTCHR-407 agent's brief gets the generic FILESYSTEM_TOOLS_NOTE", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-tools-note-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const managedKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
-      const managedSpec: SpawnSpec = { key: managedKey, issuetype: "managed-session", summary: "s", parent: null, brief: "Tend it." };
-      const managedDir = buildWorkspace(managedSpec, "http://x/mcp");
-      const managedBrief = readFileSync(join(managedDir, "brief.md"), "utf8");
-      expect(managedBrief).toContain(MANAGED_SESSION_TOOLS_NOTE);
-      expect(managedBrief).not.toContain(FILESYSTEM_TOOLS_NOTE);
-      expect(managedBrief).toContain("freeze_session");
-
       const plainKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: absPath("repo", "a.md") });
       const plainSpec: SpawnSpec = { key: plainKey, issuetype: "filesystem", summary: "s", parent: null, brief: "Keep it current." };
       const plainDir = buildWorkspace(plainSpec, "http://x/mcp");
       const plainBrief = readFileSync(join(plainDir, "brief.md"), "utf8");
       expect(plainBrief).toContain(FILESYSTEM_TOOLS_NOTE);
-      expect(plainBrief).not.toContain(MANAGED_SESSION_TOOLS_NOTE);
+      expect(plainBrief).not.toContain("freeze_session");
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -486,9 +466,9 @@ describe("buildWorkspace", () => {
   });
 
   test("PR #394 review fix (round 3): agentLaunchConfig keeps the launched PROCESS at the bookkeeping dir even when spec.cwd is set — see SpawnSpec.cwd's own doc comment (Drovr's launch.cwd===workspace.cwd invariant) — while mcp config stays anchored there too, for both vendors", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
-    const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "b", cwd: absPath("repo", "some-project") };
-    const bookkeepingDir = absPath("butchr-workspaces", "filesystem", "managed-sessions", "%2Fetc%2Fdefs%2Fa.json");
+    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: ETC_DEFS_A_JSON });
+    const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "b", cwd: absPath("repo", "some-project") };
+    const bookkeepingDir = absPath("butchr-workspaces", "filesystem", "repos", "%2Fetc%2Fdefs%2Fa.json");
     const claudeLaunch = agentLaunchConfig(spec, bookkeepingDir, "pane-1", "name", { provider: "claude" });
     expect(claudeLaunch.cwd).toBe(bookkeepingDir);
     expect(claudeLaunch.cwd).not.toBe(absPath("repo", "some-project"));
@@ -513,8 +493,8 @@ describe("buildWorkspace", () => {
     writeFileSync(join(real, "mcp.json"), ownMcpJson);
     try {
       for (const provider of ["claude", "codex"] as const) {
-        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: absPath("etc", "defs", `${provider}.json`) });
-        const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
+        const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: absPath("etc", "defs", `${provider}.json`) });
+        const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "Do the work.", cwd: real };
         const dir = buildWorkspace(spec, "http://x/mcp", provider);
         const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider });
         expect(launch.cwd).toBe(dir); // the process launches at the bookkeeping dir, not `real`
@@ -600,14 +580,14 @@ describe("buildWorkspace", () => {
   // FACTORY-43: `permissionMode`/`strictMcpConfig` are persisted at build
   // time and read back the same way `mcpServers` is above — staleIssues()
   // (src/agents/herd.ts) previously had no way to recover either field,
-  // which respawn-looped every managed session launched with a non-default
-  // permission mode (or strictMcpConfig) forever.
+  // which respawn-looped every agent launched with a non-default permission
+  // mode (or strictMcpConfig) forever.
   test("workspacePermissionMode/workspaceStrictMcpConfig round-trip what buildWorkspace persisted", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-permission-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, permissionMode: "auto", strictMcpConfig: true }, "http://x/mcp");
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "task", summary: "s", parent: null, permissionMode: "auto", strictMcpConfig: true }, "http://x/mcp");
       expect(readFileSync(join(dir, ".butchr-permission-mode.json"), "utf8")).toBe(JSON.stringify("auto"));
       expect(readFileSync(join(dir, ".butchr-strict-mcp-config.json"), "utf8")).toBe(JSON.stringify(true));
       expect(workspacePermissionMode(dir)).toBe("auto");
@@ -646,10 +626,10 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-lizard-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, lizardMode: true }, "http://x/mcp");
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "task", summary: "s", parent: null, lizardMode: true }, "http://x/mcp");
       expect(readFileSync(join(dir, ".butchr-lizard-mode.json"), "utf8")).toBe(JSON.stringify(true));
       expect(workspaceLizardMode(dir)).toBe(true);
-      const falseDir = buildWorkspace({ key: "KAN-10", issuetype: "managed-session", summary: "s", parent: null, lizardMode: false }, "http://x/mcp");
+      const falseDir = buildWorkspace({ key: "KAN-10", issuetype: "task", summary: "s", parent: null, lizardMode: false }, "http://x/mcp");
       expect(readFileSync(join(falseDir, ".butchr-lizard-mode.json"), "utf8")).toBe(JSON.stringify(false));
       expect(workspaceLizardMode(falseDir)).toBe(false);
     } finally {
@@ -685,7 +665,7 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-model-effort-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const dir = buildWorkspace({ key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }] }, "http://x/mcp", "claude");
+      const dir = buildWorkspace({ key: "KAN-9", issuetype: "task", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }] }, "http://x/mcp", "claude");
       expect(readFileSync(join(dir, ".butchr-model.json"), "utf8")).toBe(JSON.stringify("fable"));
       expect(readFileSync(join(dir, ".butchr-effort.json"), "utf8")).toBe(JSON.stringify("xhigh"));
       expect(workspaceModel(dir)).toBe("fable");
@@ -702,7 +682,7 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-model-effort-provider-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const spec: SpawnSpec = { key: "KAN-9", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }, { harness: "codex", model: "gpt-6-astra" }] };
+      const spec: SpawnSpec = { key: "KAN-9", issuetype: "task", summary: "s", parent: null, agents: [{ harness: "claude", model: "fable", effort: "xhigh" }, { harness: "codex", model: "gpt-6-astra" }] };
       const dirCodex = buildWorkspace(spec, "http://x/mcp", "codex");
       expect(workspaceModel(dirCodex)).toBe("gpt-6-astra");
       expect(workspaceEffort(dirCodex)).toBeUndefined();
@@ -935,15 +915,15 @@ describe("buildWorkspace", () => {
   // already writes `approval_policy`/`sandbox_mode` into (see
   // `codexReasoningEffortFlag`'s own doc comment, src/resources/power-scale.ts,
   // for how the config key itself was confirmed and its caveats).
-  test("a codex managed-session launch with a resolved effort gets .codex/config.toml's model_reasoning_effort — a tier-based (back-compat) launch, which never resolves an effort, gets no such file at all", () => {
+  test("a codex launch with a resolved effort gets .codex/config.toml's model_reasoning_effort — a tier-based (back-compat) launch, which never resolves an effort, gets no such file at all", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-codex-effort-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      const withEffort = buildWorkspace({ key: "KAN-10", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-6-astra", effort: "xhigh" }] }, "http://x/mcp", "codex");
+      const withEffort = buildWorkspace({ key: "KAN-10", issuetype: "task", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-6-astra", effort: "xhigh" }] }, "http://x/mcp", "codex");
       const configToml = readFileSync(join(withEffort, ".codex/config.toml"), "utf8");
       expect(configToml).toBe('model_reasoning_effort = "xhigh"\n'); // live-verified passthrough — see codexReasoningEffortFlag's own doc comment.
-      const tierBased = buildWorkspace({ key: "KAN-11", issuetype: "managed-session", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-5.6-luna" }] }, "http://x/mcp", "codex");
+      const tierBased = buildWorkspace({ key: "KAN-11", issuetype: "task", summary: "s", parent: null, agents: [{ harness: "codex", model: "gpt-5.6-luna" }] }, "http://x/mcp", "codex");
       expect(existsSync(join(tierBased, ".codex", "config.toml"))).toBe(false);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
@@ -965,7 +945,7 @@ describe("buildWorkspace", () => {
     for (const l of logs) { expect(l).toContain("mud-bridge"); expect(l).toContain("MUD_BRIDGE_HEADERS"); }
   });
 
-  test("BUTCHR-408 / Nexus MCP isolation constraint, direction 1: a managed-session agent's launched cwd never becomes the operator's own workingDirectory, and butchr never reads/writes/touches a .mcp.json there — a pre-existing one stays byte-identical (does NOT by itself prove Claude Code can't discover it; see 'PR #394 review round 2' below for the direction that guarantees the property regardless of Claude Code's own undocumented discovery behaviour)", () => {
+  test("BUTCHR-408 / Nexus MCP isolation constraint, direction 1: an agent's launched cwd never becomes the operator's own workingDirectory, and butchr never reads/writes/touches a .mcp.json there — a pre-existing one stays byte-identical (does NOT by itself prove Claude Code can't discover it; see 'PR #394 review round 2' below for the direction that guarantees the property regardless of Claude Code's own undocumented discovery behaviour)", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-nexus-"));
     const real = mkdtempSync(join(tmpdir(), "bw-nexus-real-"));
@@ -976,8 +956,8 @@ describe("buildWorkspace", () => {
     const evilDotMcpJson = JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } });
     writeFileSync(join(real, ".mcp.json"), evilDotMcpJson);
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
-      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: real };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: ETC_DEFS_A_JSON });
+      const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "Do the work.", cwd: real };
       const dir = buildWorkspace(spec, "http://x/mcp", "claude");
       const launch = agentLaunchConfig(spec, dir, "pane-1", "name", { provider: "claude" });
       // The launched process's OWN cwd is the bookkeeping dir, never `real` —
@@ -1001,7 +981,7 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("PR #394 review round 2, direction 2 — the guarantee: a .mcp.json in ANY ancestor of the launched cwd (workspaceDirFor(spec.key)), not just workingDirectory, refuses the spawn outright rather than asserting Claude Code won't discover it — a managed-session agent's launched cwd is always workspaceDirFor(spec.key), which Claude's --mcp-config is additive to, not exclusive of (no --strict-mcp-config anywhere in this codebase or @brooswit/drovr)", () => {
+  test("PR #394 review round 2, direction 2 — the guarantee: a .mcp.json in ANY ancestor of the launched cwd (workspaceDirFor(spec.key)), not just workingDirectory, refuses the spawn outright rather than asserting Claude Code won't discover it — an agent's launched cwd is always workspaceDirFor(spec.key), which Claude's --mcp-config is additive to, not exclusive of (no --strict-mcp-config anywhere in this codebase or @brooswit/drovr)", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-nexus-ancestor-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -1011,8 +991,8 @@ describe("buildWorkspace", () => {
     const ancestorMcpJson = join(root, ".mcp.json");
     writeFileSync(ancestorMcpJson, JSON.stringify({ mcpServers: { "evil-server": { type: "http", url: "https://not-butchr.test" } } }));
     try {
-      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: ETC_DEFS_A_JSON });
-      const spec: SpawnSpec = { key, issuetype: "managed-session", summary: "s", parent: null, brief: "Do the work.", cwd: absPath("repo", "some-project") };
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: ETC_DEFS_A_JSON });
+      const spec: SpawnSpec = { key, issuetype: "task", summary: "s", parent: null, brief: "Do the work.", cwd: absPath("repo", "some-project") };
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(/would inherit/);
       expect(() => buildWorkspace(spec, "http://x/mcp", "claude")).toThrow(ancestorMcpJson);
       // Nothing was written before the guard fired — refuse-before-write, not partial-then-fail.
@@ -1029,7 +1009,7 @@ describe("buildWorkspace", () => {
     const root = mkdtempSync(join(tmpdir(), "bw-nexus-clean-"));
     process.env.BUTCHR_WORKSPACES = root;
     try {
-      expect(() => assertNoInheritedMcpConfig(join(root, "filesystem", "managed-sessions", "a"))).not.toThrow();
+      expect(() => assertNoInheritedMcpConfig(join(root, "filesystem", "repos", "a"))).not.toThrow();
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
@@ -1037,7 +1017,7 @@ describe("buildWorkspace", () => {
     }
   });
 
-  test("a spec WITHOUT cwd (every non-managed-session provider) is never guarded — byte-for-byte unchanged behaviour, even with a .mcp.json sitting in an ancestor", () => {
+  test("a spec WITHOUT cwd (every rule provider's own spec builder) is never guarded — byte-for-byte unchanged behaviour, even with a .mcp.json sitting in an ancestor", () => {
     const previous = process.env.BUTCHR_WORKSPACES;
     const root = mkdtempSync(join(tmpdir(), "bw-nexus-unguarded-"));
     process.env.BUTCHR_WORKSPACES = root;
@@ -1137,25 +1117,6 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
     });
   });
 
-  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): spec.rocketchatAccount +
-  // a binding's accountHeader reach Claude's mcp.json too, not just Codex's
-  // argv — the SAME non-secret value on both surfaces (boundCodexServers,
-  // src/agents/argv.ts, and argv.test.ts's own coverage for that half).
-  test("spec.rocketchatAccount + a binding's accountHeader land in Claude's mcp.json", () => {
-    withRoot(() => {
-      const dir = buildWorkspace({ key: "KAN-29", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
-      const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
-      expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp", headers: { "x-rocketr-account": "butchr_acct_1" } });
-    });
-  });
-
-  test.skipIf(process.platform === "win32")("an account header ALONE (no headersEnvVar) never triggers the 0600 tightening — only an actual secret does", () => {
-    withRoot(() => {
-      const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...mud, accountHeader: "x-rocketr-account" }], rocketchatAccount: "butchr_acct_1" }, "http://x/mcp");
-      expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
-    });
-  });
-
   test.skipIf(process.platform === "win32")("rebuilding an EXISTING workspace still tightens permissions on the rewrite (chmod, not just the create-time mode)", () => {
     withRoot(() => {
       const spec = { key: "KAN-28", issuetype: "Task", summary: "s", parent: null };
@@ -1167,77 +1128,6 @@ describe("buildWorkspace — MCP server bindings (BUTCHR-411)", () => {
         expect(mode(join(dir, "mcp.json"))).toBe(0o600);
       } finally { delete process.env.BUTCHR_TEST_WS_PERM_HEADERS2; }
     });
-  });
-
-  // BUTCHR-412 (BUTCHR-391 comment 24007): the corrected Rocket.Chat
-  // credential design — an agent never holds a credential; its MCP binding
-  // carries only its own (non-secret) account name, via `accountHeader`.
-  describe("accountHeader / spec.rocketchatAccount (BUTCHR-412)", () => {
-    const rocketr = { name: "rocketr", type: "http" as const, url: "https://rocketr.internal/mcp", accountHeader: "x-rocketr-account", channel: true };
-
-    test("spec.rocketchatAccount is injected under the binding's accountHeader name — never anywhere else", () => {
-      withRoot(() => {
-        const dir = buildWorkspace({ key: "KAN-30", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_jira-work-triage-kan-30_deadbeef00" }, "http://x/mcp");
-        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
-        expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "x-rocketr-account": "butchr_jira-work-triage-kan-30_deadbeef00" } });
-        for (const f of ["CLAUDE.md", "brief.md", "ENVIRONMENT.md"]) {
-          expect(readFileSync(join(dir, f), "utf8")).not.toContain("butchr_jira-work-triage-kan-30_deadbeef00");
-        }
-        // No token, no credential file of any kind — the account name is the ONLY thing that ever moves.
-        expect(existsSync(join(dir, ".butchr-rocketchat.json"))).toBe(false);
-      });
-    });
-
-    test.skipIf(process.platform === "win32")("an account name (never secret) does NOT by itself tighten mcp.json's permissions", () => {
-      withRoot(() => {
-        const dir = buildWorkspace({ key: "KAN-31", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr], rocketchatAccount: "butchr_x" }, "http://x/mcp");
-        expect(mode(join(dir, "mcp.json"))).not.toBe(0o600);
-      });
-    });
-
-    test("no rocketchatAccount on the spec (account policy \"none\", or ensureAccount hasn't run): the header is simply omitted", () => {
-      withRoot(() => {
-        const dir = buildWorkspace({ key: "KAN-32", issuetype: "Task", summary: "s", parent: null, mcpServers: [rocketr] }, "http://x/mcp");
-        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
-        expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp" });
-      });
-    });
-
-    test("a binding with no accountHeader ignores spec.rocketchatAccount entirely", () => {
-      withRoot(() => {
-        const dir = buildWorkspace({ key: "KAN-33", issuetype: "Task", summary: "s", parent: null, mcpServers: [mud], rocketchatAccount: "butchr_x" }, "http://x/mcp");
-        const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
-        expect(mcp.mcpServers.mud).toEqual({ type: "http", url: "https://mud.example/mcp" });
-      });
-    });
-
-    test("accountHeader and headersEnvVar combine on the SAME binding — the secret one still tightens permissions, the account name doesn't need to", () => {
-      withRoot(() => {
-        process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS = JSON.stringify({ "X-Extra": "v" });
-        try {
-          const dir = buildWorkspace({ key: "KAN-34", issuetype: "Task", summary: "s", parent: null, mcpServers: [{ ...rocketr, headersEnvVar: "BUTCHR_TEST_WS_ROCKETR_HEADERS" }], rocketchatAccount: "butchr_x" }, "http://x/mcp");
-          const mcp = JSON.parse(readFileSync(join(dir, "mcp.json"), "utf8"));
-          expect(mcp.mcpServers.rocketr).toEqual({ type: "http", url: "https://rocketr.internal/mcp", headers: { "X-Extra": "v", "x-rocketr-account": "butchr_x" } });
-          // FACTORY-569: NTFS has no POSIX permission bits.
-          if (process.platform !== "win32") expect(mode(join(dir, "mcp.json"))).toBe(0o600); // the headersEnvVar half is still treated as potentially secret
-        } finally { delete process.env.BUTCHR_TEST_WS_ROCKETR_HEADERS; }
-      });
-    });
-  });
-});
-
-describe("resolveAccountHeader (BUTCHR-412)", () => {
-  const rocketr = { name: "rocketr", type: "http" as const, url: "https://rocketr.internal/mcp", accountHeader: "x-rocketr-account", channel: true };
-  const mud = { name: "mud", type: "http" as const, url: "https://mud.example/mcp", channel: true };
-
-  test("binding names accountHeader and an account is present -> resolves that one header", () => {
-    expect(resolveAccountHeader(rocketr, "butchr_x")).toEqual({ "x-rocketr-account": "butchr_x" });
-  });
-  test("binding names accountHeader but no account (undefined) -> undefined, never an empty-string header", () => {
-    expect(resolveAccountHeader(rocketr, undefined)).toBeUndefined();
-  });
-  test("no accountHeader on the binding -> undefined regardless of account", () => {
-    expect(resolveAccountHeader(mud, "butchr_x")).toBeUndefined();
   });
 });
 

@@ -1161,22 +1161,17 @@ describe("rule workspaces", () => {
 });
 
 // BUTCHR-411 / CNDLX-45: the ticket's own concrete case — the Candlestix MUD
-// players' shared `mud-mcp` HTTP bridge, account policy `none` (no
-// Rocket.Chat account is provisioned for them; that's a sibling task, S4, on
-// a parallel branch). Event-driven Claude delivery from that non-RC MCP
-// server must be preserved end to end: the rule's own binding, through
-// specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's channel
-// flag.
-describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind a non-Rocket.Chat MCP channel server", () => {
+// players' shared `mud-mcp` HTTP bridge. Event-driven Claude delivery from
+// that MCP server must be preserved end to end: the rule's own binding,
+// through specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's
+// channel flag.
+describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind an MCP channel server", () => {
   const mudBinding = { name: "mud-mcp", type: "http" as const, url: "https://mud.example/mcp", channel: true };
 
-  test("the binding path never reads Rule.account — account: none still gets full channel delivery", () => {
+  test("a rule still carrying the legacy account: none key gets full channel delivery", () => {
     const [rule] = rules({ id: "mud", query: "project = CNDLX", account: "none", mcpServers: [mudBinding] });
-    expect(rule!.account).toBe("none"); // the sibling RC-lifecycle task's own field — set, but untouched below
+    expect(rule).not.toHaveProperty("account"); // the legacy key is ignored by the loader
     const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
-    // SpawnSpec has no `account` field at all: agentLaunchConfig's channel wiring
-    // (argv.ts) has no way to consult account policy even if it wanted to —
-    // structural independence, not just an untested code path.
     expect(spec).not.toHaveProperty("account");
     expect(spec.mcpServers).toEqual([mudBinding]);
     const launch = agentLaunchConfig(spec, "/d", "p", "n", { provider: "claude" });

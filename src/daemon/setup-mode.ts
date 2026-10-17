@@ -41,7 +41,6 @@ import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup
 import { jiraTokenFilePath, type FetchLike } from "../setup/jira-token-write.js";
 import { rulesPath } from "../rules/rules.js";
 import { join, dirname } from "node:path";
-import { hostname } from "node:os";
 
 export interface SetupModeDeps {
   env?: ConfigEnv & Record<string, string | undefined>;
@@ -74,11 +73,8 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
 
   // Same audit-log destination/filename the real daemon uses (`index.ts`) —
   // one shared file under the XDG config dir, alongside everything else.
-  // `postAlert` is omitted: setup mode has no Rocket.Chat credential loaded
-  // (that requires the very configuration this mode exists to not require
-  // yet) — the audit file and journal `log` line still happen either way.
   const auditLogPath = join(dirname(rulesPath(env)), WEB_WRITE_AUDIT_LOG_BASENAME);
-  const auditWrite = createAuditLogger({ append: fileAuditAppend(auditLogPath), host: hostname(), log });
+  const auditWrite = createAuditLogger({ append: fileAuditAppend(auditLogPath), log });
 
   const unused = (): never => { throw new Error("unused in setup mode"); };
   const viewDeps: ViewDeps = {
@@ -89,7 +85,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     dashboard: async () => ({ checked: false, declinedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
     header: () => ({ build: null }),
     resourceLink: async () => ({ ok: false, error: "not configured (setup mode)" }),
-    configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
+    configInventory: async () => ({ rules: [], errors: [] }),
 
     dashboardOriginGuard,
     peerUidCheck,

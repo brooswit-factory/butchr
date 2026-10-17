@@ -2,11 +2,10 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decideRespawnResume } from "./respawn.js";
 import { clearStopCause, persistIntentionalStop, workspaceStopCause } from "./stop-cause.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
 import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig, type AgentProvider, type RestoredResumePolicy } from "./argv.js";
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
@@ -512,11 +511,10 @@ export function isHerdrRestoredPane(observedArgv: readonly string[], persistedSe
  * behaviour, unconditionally); `"all"` enables it regardless of
  * `agentName`; a `ReadonlySet` (the parsed comma-separated list,
  * `loadConfig`, src/config/config.ts) enables it only when `agentName` is
- * both defined and a member. `agentName` is `undefined` for a non-managed-
- * session agent (an ordinary rule-engine task/story/epic worker has no
- * stable name to gate on — see `isHerdrRestoredPane`'s own callsite in
- * `staleIssues()` for how it's derived), which this never enables under
- * `"off"`/a named list — only `"all"` ever widens to those.
+ * both defined and a member. `agentName` is `undefined` for a rule-engine
+ * agent (a task/story/epic worker has no stable name to gate on — see
+ * `isHerdrRestoredPane`'s own callsite in `staleIssues()`), which this never
+ * enables under `"off"`/a named list — only `"all"` ever widens to those.
  */
 export function restoredResumeEnabledFor(policy: RestoredResumePolicy, agentName: string | undefined): boolean {
   if (policy === "off") return false;
@@ -739,41 +737,22 @@ export class HerdrHerd implements Herd {
      */
     private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
     /**
-     * BUTCHR-413 — same shape and same reason as `mcpBindingsOf` immediately
-     * above, one field over: this issue's own non-secret account-identifying
-     * name for `McpServerBinding.accountHeader` (`spec.rocketchatAccount`, see
-     * that field's own doc comment, src/agents/workspace.ts), or `undefined`
-     * for none (an `account: "none"` rule, or no Rocket.Chat configured at
-     * all). Called from BOTH `spawnExclusive` (augments the real spec before
-     * `buildWorkspace`/`agentLaunchConfig`) and `staleIssues()` (augments the
-     * reconstructed comparison spec) — the SAME callback both times, so a
-     * value that is deterministic in its caller (as `rcUsernameFor(issue)`
-     * is, src/accounts/identity.ts) can never drift between what an agent
-     * was actually launched with and what a later poll expects, with no
-     * persistence required. Optional and defaulting to "no account name for
-     * anyone" keeps a daemon with no Rocket.Chat configured, or a rule with
-     * no `accountHeader` binding, at byte-identical expected argv to before
-     * this field existed.
-     */
-    private readonly accountNameOf?: (issue: string) => string | undefined,
-    /**
      * FACTORY-75 — this issue's CURRENTLY resolved `(model, effort)` pair
      * for the given provider, from the `modelPower`/`effort` two-axis
-     * mechanism (src/resources/power-scale.ts): a managed-session
-     * definition's own field, or a rule's `agentPreferences` entry
-     * (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
+     * mechanism (src/resources/power-scale.ts): a rule's `agentPreferences`
+     * entry (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
      * own doc comment, src/rules/rules.ts, for why nothing downstream of
      * that needed to change). `undefined` for anything this daemon cannot
-     * resolve (a legacy/bare-issue id, a rule/definition since removed, or
+     * resolve (a legacy/bare-issue id, a rule since removed, or
      * one that sets neither `model`/`modelPower` nor `effort`/`effortPower`
      * for this provider) — `staleIssues()` below then skips the
      * comparison entirely, the same fail-safe "nothing to compare, so
      * nothing is stale" shape `mcpBindingsOf`'s own absence already has.
      * Called ONLY from `staleIssues()`, never from `spawn()` — a real
      * launch already gets its resolved agent straight from `spec.agents`
-     * (`specForSessionDefinition`/`rule.agentPreferences`), so this seam
-     * exists purely for the comparison side, unlike `mcpBindingsOf`/
-     * `accountNameOf` above (which augment a real spawn too).
+     * (`rule.agentPreferences`), so this seam
+     * exists purely for the comparison side, unlike `mcpBindingsOf` above
+     * (which augments a real spawn too).
      */
     private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
   ) {}
@@ -973,36 +952,20 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      // BUTCHR-408/BUTCHR-411: two independent sources feed a spec's
-      // mcpServers, kept apart by POPULATION so neither shadows the other's
-      // staleness signal. A managed-session agent (filesystem provider,
-      // MANAGED_SESSIONS_RULE_ID, BUTCHR-408) has no entry in `rules` at
-      // all, so `mcpBindingsOf` could only ever answer "no bindings" for
-      // it — its real mcpServers is whatever buildWorkspace last persisted
-      // for this workspace (workspaceMcpServers, src/agents/workspace.ts,
-      // the SAME read-the-workspace-back shape externalMcpServers below
-      // already uses). A rule-engine agent's mcpServers (BUTCHR-411), by
-      // contrast, must come from the RULE's CURRENT config, not a persisted
-      // file, or an admin removing a binding from rules.json would never
-      // read as stale — see the constructor's own doc comment on
-      // mcpBindingsOf for why this lookup exists instead of caching the
-      // original spawn's SpawnSpec.
-      const isManagedSession = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID;
-      const mcpServers = isManagedSession ? (workspaceMcpServers(cwd) ?? []) : this.mcpBindingsOf?.(issue);
-      // BUTCHR-413: same `accountNameOf` callback `spawn()` itself uses —
-      // see that constructor param's own doc comment for why recomputing it
-      // fresh here, rather than caching the original spawn's spec, is what
-      // keeps this comparison from drifting.
-      const accountName = this.accountNameOf?.(issue);
-      // FACTORY-43: `spec.permissionMode`/`spec.strictMcpConfig` are the two
-      // OTHER fields a managed-session spawn actually carries
-      // (specForSessionDefinition, src/rules/session-definition-type.ts)
-      // that this reconstruction used to drop entirely — leaving every
-      // managed session launched with a non-default permission mode (or
-      // strictMcpConfig) permanently stale. Same read-the-workspace-back
-      // shape as `mcpServers`/`externalMcpServers` above: whatever
-      // buildWorkspace persisted at the real spawn is what "expected" means
-      // here, never a value recomputed independently of that spawn.
+      // BUTCHR-411: a rule-engine agent's mcpServers must come from the
+      // RULE's CURRENT config, not a persisted file, or an admin removing a
+      // binding from rules.json would never read as stale — see the
+      // constructor's own doc comment on mcpBindingsOf for why this lookup
+      // exists instead of caching the original spawn's SpawnSpec.
+      const mcpServers = this.mcpBindingsOf?.(issue);
+      // FACTORY-43: `spec.permissionMode`/`spec.strictMcpConfig` are two
+      // OTHER fields a spawn can carry that this reconstruction used to drop
+      // entirely — leaving an agent launched with a non-default permission
+      // mode (or strictMcpConfig) permanently stale. Same
+      // read-the-workspace-back shape `externalMcpServers` (in `expected`
+      // below) uses: whatever buildWorkspace persisted at the real spawn is
+      // what "expected" means here, never a value recomputed independently
+      // of that spawn.
       const permissionMode = workspacePermissionMode(cwd);
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
       // FACTORY-108: same read-the-workspace-back shape as permissionMode/
@@ -1012,7 +975,7 @@ export class HerdrHerd implements Herd {
       // would forever mismatch a naively-recomputed "expected" argv that
       // still assumes the bypass flag, respawn-looping it forever.
       const lizardMode = workspaceLizardMode(cwd);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) {
         // FACTORY-470/472: a herdr-restored pane (this file's own
@@ -1034,16 +997,13 @@ export class HerdrHerd implements Herd {
         //
         // FACTORY-491 (director item 5): gated behind the
         // `BUTCHR_RESTORED_RESUME` canary/kill switch — `restoredResumeEnabledFor`'s
-        // own doc comment has the full policy. `agentName` is this issue's
-        // managed-session bare definition name (`managedSessionShortDisplayId`)
-        // when it is one, `undefined` otherwise (an ordinary rule-engine
-        // agent has no stable name to gate on, so only an "all" policy ever
-        // reaches it).
-        const agentName = isManagedSession ? managedSessionShortDisplayId(decoded!.resourceId) : undefined;
+        // own doc comment has the full policy. A rule-engine agent has no
+        // stable name to gate on (`undefined` below), so only an "all" policy
+        // ever reaches it.
         if (
           provider === "claude" &&
           !launchPending &&
-          restoredResumeEnabledFor(this.agent.restoredResume ?? new Set(), agentName) &&
+          restoredResumeEnabledFor(this.agent.restoredResume ?? new Set(), undefined) &&
           isHerdrRestoredPane(proc.argv, workspaceSessionId(cwd))
         ) {
           // FACTORY-491 (director item 1): log the observed argv on every
@@ -1198,21 +1158,7 @@ export class HerdrHerd implements Herd {
    * reach zero lines on a rejecting `agent.list()`, at this method's
    * pre-fix shape, before this fix landed.
    */
-  async spawn(specIn: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
-    // BUTCHR-413: a fallback fill only, never an overwrite — BUTCHR-412's
-    // own `account-lifecycle.ts` `ensure()` already sets `rocketchatAccount`
-    // on `desired`/`toSpawn` BEFORE `herd.spawn` is ever called, from the
-    // REAL `ensureAccount` outcome for this launch (respecting a cap
-    // refusal, a not-managed collision, etc. — cases where `ensure` instead
-    // returns `null` and this method is never reached at all). Both
-    // producers derive the identical value from the same agent key
-    // (`rcUsernameFor`, src/accounts/identity.ts), so this is never a
-    // disagreement — only a fallback for a launch path that never went
-    // through `ensure` at all (no accountLifecycle wired, e.g. RC not
-    // configured for any rule). See `staleIssues()` below for the SAME
-    // callback used to keep its own reconstruction in sync.
-    const accountName = specIn.rocketchatAccount ?? this.accountNameOf?.(specIn.key);
-    const spec: SpawnSpec = accountName ? { ...specIn, rocketchatAccount: accountName } : specIn;
+  async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
     return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
   }
 
@@ -1251,7 +1197,7 @@ export class HerdrHerd implements Herd {
       // `spec.ticketStatus` is present, i.e. this is a ticket-backed
       // jira-work-shaped spawn at all (`SpawnSpec.ticketStatus`'s own doc
       // comment, src/agents/workspace.ts, names this exact discriminator).
-      // Without this second half, a managed-session or query-level agent —
+      // Without this second half, a query-level agent —
       // every `spec` throughout this codebase's EXISTING test suite
       // included, none of which ever had a reason to set `ticketStatus` —
       // would pay `tryClaudeResume`'s own `decideRespawnResume` call and,

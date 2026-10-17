@@ -12,6 +12,7 @@ const SAMPLE_RESOURCE_IDS: Record<(typeof RESOURCE_PROVIDERS)[number], string> =
   filesystem: "/abs/path",
   "confluence-page": "123456",
   "jira-component": "FACTORY:10000",
+  "trello-card": "0123456789abcdef01234567#89abcdef0123456789abcdef",
 };
 
 describe("dashboard-app/view-model/agent-key-display: parity with the real src/rules/agent-key.ts decodeAnyAgentKey (drift guard)", () => {

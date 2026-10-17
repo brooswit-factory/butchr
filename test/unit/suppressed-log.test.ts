@@ -233,13 +233,11 @@ describe("rateCappedSuppressedLine: exact shape, round-trip, and the NUL-byte ha
   const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 
   test("a NUL byte in watcher -- the shape linked-eventing.ts MUST NEVER pass here -- would forge a second journal entry: confirmed live via a systemd-cat/journalctl -o json round-trip, a bare NUL in a journal write splits it into two separate MESSAGE entries, not one line with an embedded byte carried through", () => {
-    // A managed session's synthetic, NUL-separated per-(session, project)
-    // state key (`managedSessionProjectWatchKey`, src/rules/
-    // session-definition-type.ts) -- the exact shape `entry.agentKey` has for
-    // that owner kind, and exactly what this ticket's fix stops passing here.
-    const managedSessionStateKey = "codey:some-director\0linked:jira-project:FACTORY";
-    expect(managedSessionStateKey).toMatch(CONTROL_CHAR_RE); // sanity: the fixture itself really does carry the hazard
-    const unfixedLine = rateCappedSuppressedLine("FACTORY", managedSessionStateKey, 2, 2);
+    // A synthetic, NUL-separated per-(owner, project) linked-eventing state
+    // key -- the shape this ticket's fix stops passing here.
+    const syntheticStateKey = "codey:some-director\0linked:jira-project:FACTORY";
+    expect(syntheticStateKey).toMatch(CONTROL_CHAR_RE); // sanity: the fixture itself really does carry the hazard
+    const unfixedLine = rateCappedSuppressedLine("FACTORY", syntheticStateKey, 2, 2);
     expect(unfixedLine).toMatch(CONTROL_CHAR_RE); // demonstrates the hazard exists in the primitive
   });
 

@@ -348,8 +348,7 @@ exactly this, not a bug in this install.
 ## Networking: WSL2 is NAT, not mirrored
 
 Per the zippy report: WSL2 networking here is **NAT mode**, so a
-Windows-side `127.0.0.1` service (the zippy report specifically names the
-"rocketr bridges") is **not reachable from inside WSL**, and — the direction
+Windows-side `127.0.0.1` service is **not reachable from inside WSL**, and — the direction
 that matters for this doc — a WSL-internal `127.0.0.1:<port>` is not
 generally reachable from Windows either, without extra port-forwarding this
 install does not set up. This is why the health check design above never

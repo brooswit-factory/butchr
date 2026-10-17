@@ -10,7 +10,7 @@
  *
  * SPEC CHANGE (a), agentsafety review 2026-10-05: no `title`/`maxAgents`
  * field — neither exists on `Rule`. The real fields are `execution`,
- * `account`, `role`, `agentPreferences`, `linkedEventing`, `mcpServerNames`
+ * `role`, `agentPreferences`, `linkedEventing`, `mcpServerNames`
  * — copied verbatim from `RuleInventoryEntry`, never invented.
  *
  * BRIEF HANDLING: the ticket's own instruction — never the full `brief`
@@ -41,7 +41,7 @@ export function briefExcerpt(brief: string, max: number = BRIEF_EXCERPT_MAX): st
  */
 const SECRET_KEY_RE = /token|secret|password|authorization/i;
 
-function redactSecretLike<T>(value: T): T {
+export function redactSecretLike<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => redactSecretLike(v)) as unknown as T;
   if (value !== null && typeof value === "object") {
     const out: Record<string, unknown> = {};
@@ -59,7 +59,6 @@ export interface RulesApiRuleEntry {
   query: string;
   enabled: boolean;
   execution: RuleInventoryEntry["execution"];
-  account: RuleInventoryEntry["account"];
   role: RuleInventoryEntry["role"];
   agentPreferences: RuleInventoryEntry["agentPreferences"];
   linkedEventing: boolean;
@@ -74,7 +73,7 @@ export interface RulesApiRuleEntry {
    * matched (defensive, never thrown).
    */
   permissionMode: RulePermissionMode | null;
-  /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (today's "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts` — not necessarily `false`). */
+  /** FACTORY-729: see `permissionMode` immediately above for why this is read the same way. `null` when absent (local/ui: off, not scanned — see `Rule.lizardMode`'s own doc comment, `../rules/rules.ts`). */
   lizardMode: boolean | null;
   /** FACTORY-907: read-only for now (see `Rule.maxNewPerTick`'s own doc comment, `../rules/rules.ts`) — same "read off the raw `Rule`, `null` when absent/unmatched" shape `permissionMode`/`lizardMode` already use; never added to the web write surface this Story. */
   maxNewPerTick: number | null;
@@ -106,6 +105,12 @@ export interface RulesApiRuleEntry {
   idlePokeEnabled: boolean;
   /** FACTORY-1010: read off the raw `Rule` the same way as `permissionMode`/`lizardMode` above. `null` when absent — means today's channel-first/prompt-fallback `deliverNotice` behaviour, never necessarily `"channel"`. */
   notifyDeliveryMode: NotifyDeliveryMode | null;
+  /** local/ui — the linked-eventing knobs besides `linkedEventing`, read off the raw `Rule`. Each is present only when the rule sets it, so a rule that sets none keeps exactly upstream's shape. */
+  linkedPollIntervalMs?: number;
+  maxLinkedItems?: number;
+  maxLinkedTurnsPerHour?: number;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
   /** First 200 chars of `Rule.brief` — never the full text. `""` if this rule's own brief could not be matched (should not happen for a rule `loadRulesFileState` itself produced; defensive, never thrown). */
   briefExcerpt: string;
   /** Verbatim `RuleInventoryEntry.staffed` — see that field's own doc comment for the full tri-state contract. */
@@ -167,7 +172,6 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       query: entry.query,
       enabled: entry.enabled,
       execution: entry.execution,
-      account: entry.account,
       role: entry.role,
       agentPreferences: entry.agentPreferences,
       linkedEventing: entry.linkedEventing,
@@ -181,8 +185,13 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       idlePokeMinutes: raw?.idlePokeMinutes ?? null,
       stalledMinutes: raw?.stalledMinutes ?? null,
       idlePokeMessage: raw?.idlePokeMessage ?? null,
-      idlePokeEnabled: raw?.idlePokeEnabled ?? true,
+      idlePokeEnabled: raw?.idlePokeEnabled ?? false,
       notifyDeliveryMode: raw?.notifyDeliveryMode ?? null,
+      ...(raw?.linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: raw.linkedPollIntervalMs } : {}),
+      ...(raw?.maxLinkedItems !== undefined ? { maxLinkedItems: raw.maxLinkedItems } : {}),
+      ...(raw?.maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: raw.maxLinkedTurnsPerHour } : {}),
+      ...(raw?.linkedRemoteLinks !== undefined ? { linkedRemoteLinks: raw.linkedRemoteLinks } : {}),
+      ...(raw?.linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: raw.linkedDescriptionLinks } : {}),
       briefExcerpt: briefExcerpt(briefs.get(briefKey(entry.resourceProvider, entry.id)) ?? ""),
       staffed: entry.staffed,
       whyUnstaffed: entry.reason,

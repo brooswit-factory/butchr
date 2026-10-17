@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import { agentRowAnchorId as realAgentRowAnchorId, configAnchorForResourceKey as realConfigAnchorForResourceKey } from "../../src/agents/config-inventory-links.js";
-import { MANAGED_SESSIONS_RULE_ID } from "../../src/rules/session-definition-type.js";
 import { agentRowAnchorId, configAnchorForResourceKey } from "../../dashboard-app/src/view-model/config-links.js";
 import { encodeAgentKey, encodeQueryAgentKey, RESOURCE_PROVIDERS } from "../../src/rules/agent-key.js";
 
@@ -14,6 +13,7 @@ const SAMPLE_RESOURCE_IDS: Record<(typeof RESOURCE_PROVIDERS)[number], string> =
   filesystem: "/abs/path",
   "confluence-page": "123456",
   "jira-component": "FACTORY:10000",
+  "trello-card": "0123456789abcdef01234567#89abcdef0123456789abcdef",
 };
 
 describe("dashboard-app/view-model/config-links: parity with the real src/agents/config-inventory-links.ts (drift guard)", () => {
@@ -31,12 +31,6 @@ describe("dashboard-app/view-model/config-links: parity with the real src/agents
       expect(configAnchorForResourceKey(key)).toBe(realConfigAnchorForResourceKey(key));
     });
   }
-
-  test("the reserved managed-sessions rule id takes the session-anchor branch on both — real sentinel value, not a guessed copy", () => {
-    const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: MANAGED_SESSIONS_RULE_ID, resourceId: "/abs/some/path" });
-    expect(configAnchorForResourceKey(key)).toBe(realConfigAnchorForResourceKey(key));
-    expect(configAnchorForResourceKey(key)).toMatch(/^session-/);
-  });
 
   test("an undecodable key yields null on both", () => {
     expect(configAnchorForResourceKey("not-a-real-key")).toBeNull();

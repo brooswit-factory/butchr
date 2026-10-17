@@ -11,5 +11,5 @@ import type { QueryAgentInventory } from "../../../src/agents/query-agent-invent
 import { known, type Availability } from "./availability.js";
 
 export function configInventoryEntryCount(inventory: QueryAgentInventory): Availability<number> {
-  return known(inventory.rules.length + inventory.sessionDefinitions.length);
+  return known(inventory.rules.length);
 }

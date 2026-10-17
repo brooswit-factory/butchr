@@ -15,10 +15,10 @@
  * longer what decides what `buildSettingEntries` actually hides: a future
  * key with a genuinely secret VALUE and a non-matching name is only ever
  * hidden because someone explicitly wrote `secret: true` for it here, the
- * same way `ROCKETCHAT_TOKEN_DIR` (a directory path, not a secret value,
- * but named like one) is explicitly `secret: true` below even though
- * nothing about its actual value needs hiding — the explicit flag is
- * reviewed per-key, not inferred either direction.
+ * same way `GITHUB_TOKEN_FILE` (a file path, not a secret value, but named
+ * like one) is explicitly `secret: true` below even though nothing about its
+ * actual value needs hiding — the explicit flag is reviewed per-key, not
+ * inferred either direction.
  *
  * A `secret: true` definition NEVER reports a value — only `{set: boolean}`.
  * `ATLASSIAN_TOKEN_FILE` is the one deliberate exception, pulled out of the
@@ -29,6 +29,7 @@
 import { constants as fsConstants } from "node:fs";
 import { stat } from "node:fs/promises";
 import { isAllowlistedSettingsKey } from "../settings/settings-file.js";
+import type { CredentialsSummary } from "./credentials-api.js";
 import { PROVIDER_ENABLED_ENV_VAR } from "../rules/provider-enablement.js";
 
 export const SECRET_KEY_RE = /token|secret|password|key/i;
@@ -50,28 +51,15 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   { key: "BUTCHR_TERMINAL", description: "Terminal-emulator command prefix for opening an agent shell; auto-detected when unset.", secret: false },
   { key: "GITHUB_TOKEN_FILE", description: "Path to a file holding the GitHub token used for pr:* discovery and the github-issue/github-pr rule providers.", secret: true },
   { key: "BUTCHR_GITHUB_ORGS", description: "Comma-separated GitHub organizations the GitHub integration is scoped to.", secret: false },
-  { key: "ROCKETCHAT_URL", description: "Rocket.Chat server URL for account-management (BUTCHR-395/S4).", secret: false },
-  { key: "ROCKETCHAT_ADMIN_USER_ID", description: "Rocket.Chat admin user id for account-management calls.", secret: false },
-  { key: "ROCKETCHAT_ADMIN_TOKEN_FILE", description: "Path to a file holding the Rocket.Chat admin token for account-management.", secret: true },
-  { key: "ROCKETCHAT_USER_CAP_THRESHOLD", description: "Guardrail: refuse new Rocket.Chat accounts at/above this many total users. Default 45.", secret: false },
-  { key: "ROCKETCHAT_TEMPORARY_CAP_THRESHOLD", description: "Cap on concurrently-existing temporary Rocket.Chat accounts. Default 8.", secret: false },
-  { key: "ROCKETCHAT_TOKEN_DIR", description: "Directory each managed account's 0600 token file is written into.", secret: true },
-  { key: "ROCKETCHAT_NEXUS_MANIFEST_FILE", description: "Path the batched Nexus hand-off manifest is published to.", secret: false },
-  { key: "ROCKETCHAT_MANAGED_PREFIX", description: "Naming prefix override for Rocket.Chat managed accounts.", secret: false },
-  { key: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL", description: "Rocket.Chat server URL for the managed-session escalation poster (separate identity from account-management).", secret: false },
-  { key: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID", description: "Rocket.Chat user id for the managed-session escalation poster.", secret: false },
-  { key: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE", description: "Path to a file holding the Rocket.Chat token for the managed-session escalation poster.", secret: true },
-  { key: "BUTCHR_TEAM_ADMIN_ROOM", description: "Rocket.Chat room managed-session escalations (and ordinary tier 1/2 routing) post to. Default team-admin.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION", description: "Mention text used for a normal-tier managed-session escalation.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION", description: "Mention text used for an assembly-tier managed-session escalation.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM", description: "Rocket.Chat room an assembly-tier managed-session escalation posts to.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION", description: "Mention text used for a director-tier managed-session escalation.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM", description: "Rocket.Chat room a director-tier managed-session escalation posts to.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES", description: "Minutes before a managed-session escalation advances to tier 2.", secret: false },
-  { key: "BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES", description: "Minutes before a managed-session escalation advances to tier 3.", secret: false },
-  { key: "BUTCHR_OPS_ALERT_ROOM", description: "Rocket.Chat room generic ops-alert conditions (e.g. a dead credential) post to.", secret: false },
-  { key: "BUTCHR_OPS_ALERT_MENTION", description: "Mention prepended to an ops-alert post. Literal 'none' posts with no mention.", secret: false },
-  { key: "BUTCHR_OPS_ALERT_DEDUP_MINUTES", description: "Dedup window, in minutes: at most one ops-alert post per condition in this window.", secret: false },
+  // local/ui: the Zendesk and Trello credentials the Settings page's cards manage (read by their providers, not `loadConfig`).
+  { key: "ZENDESK_SUBDOMAIN", description: "The Zendesk subdomain zendesk-ticket rules and the agents' Zendesk tools use (acme for acme.zendesk.com).", secret: false },
+  { key: "ZENDESK_OAUTH_TOKEN_FILE", description: "Path to a file holding the Zendesk OAuth access token (owner-only, chmod 600).", secret: true },
+  { key: "BUTCHR_ZENDESK_ACCEPT_SHELL_CREDENTIAL_RISK", description: "Must be agents-can-read-the-zendesk-token to turn Zendesk on: agents run shell commands as butchr's user, so they can read the token file.", secret: false },
+  { key: "TRELLO_BOARD_ID", description: "The one Trello board trello-card resources are scoped to (24-character id).", secret: false },
+  { key: "TRELLO_API_KEY_FILE", description: "Path to a file holding the Trello API key.", secret: true },
+  { key: "TRELLO_TOKEN_FILE", description: "Path to a file holding the Trello API token.", secret: true },
+  { key: "BUTCHR_TRELLO_ACCEPT_SHELL_CREDENTIAL_RISK", description: "Must be agents-can-read-the-trello-credentials to turn trello-card rules on: agents run shell commands as butchr's user, so they can read the key and token files.", secret: false },
+  { key: "BUTCHR_OPS_ALERT_DEDUP_MINUTES", description: "Dedup window, in minutes: at most one [butchr:ops-alert] journal line per condition in this window.", secret: false },
   { key: "BUTCHR_STALLED_MINUTES", description: "Minutes an active ticket's agent must sit idle before it's surfaced as agent:stalled.", secret: false },
   { key: "BUTCHR_ABANDONED_MINUTES", description: "Minutes a worker sits ABANDONED before the abandoned-worker escalation fires.", secret: false },
   { key: "BUTCHR_ATREST_MINUTES", description: "Minutes a resource may read asleep-with-agent-running before the frozen-asleep detector fires.", secret: false },
@@ -113,6 +101,8 @@ export const SETTINGS_DEFINITIONS: ReadonlyArray<{ key: string; description: str
   // exists only to keep `SETTINGS_ALLOWLIST` in sync with
   // `PROVIDER_ENABLED_ENV_VAR`, which is total over `ResourceProvider`.
   { key: PROVIDER_ENABLED_ENV_VAR["jira-component"], description: "Independent on/off switch for the jira-component rule provider. Default enabled. Currently inert: no agent can be staffed by this provider yet.", secret: false },
+  // local/ui: our trello-card rule type has the same switch.
+  { key: PROVIDER_ENABLED_ENV_VAR["trello-card"], description: "Independent on/off switch for the trello-card rule provider. Default enabled.", secret: false },
 ];
 
 /**
@@ -173,6 +163,8 @@ export interface SettingsApiResponse {
   settings: SettingEntry[];
   atlassianTokenFile: AtlassianTokenFileStatus;
   unitHint?: UnitHint;
+  /** local/ui — the Settings page's credential cards (`./credentials-api.ts`); added by the daemon, never by `buildSettingsApiResponse`. */
+  credentials?: CredentialsSummary;
 }
 
 /** FACTORY-694 item 4: a type alias for one `SETTINGS_DEFINITIONS` entry — exported so a test can build an injectable definitions list (see `buildSettingEntries`'s own `definitions` parameter) without duplicating the shape. */
@@ -193,11 +185,11 @@ function sourceOf(rawEnvValue: string | undefined, fileHasKey: boolean): "enviro
 
 /**
  * A non-secret setting's value can still be a URL carrying embedded
- * credentials (`scheme://user:pass@host`, e.g. `ROCKETCHAT_URL`) — those
+ * credentials (`scheme://user:pass@host`, e.g. `ATLASSIAN_SITE`) — those
  * are a secret in disguise, not covered by `SECRET_KEY_RE` (which matches
  * on the ENV VAR NAME, not the value's own shape). Applied to every
  * non-secret value this module ever returns, regardless of which key it
- * came from — never only `ROCKETCHAT_URL` by name, since the shape, not
+ * came from — never only `ATLASSIAN_SITE` by name, since the shape, not
  * the name, is the thing that leaks. Matches any `scheme://user:pass@`
  * (or `scheme://user@`) prefix, case-insensitively, and replaces the
  * userinfo with `[redacted]` — the host/path/query after `@` is untouched.

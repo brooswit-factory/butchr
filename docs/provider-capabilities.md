@@ -1,5 +1,7 @@
 # Provider capabilities: declaration mechanism, the comments capability, and the 9×6 inventory (8×6 before FACTORY-57 added github-pr)
 
+> **local/ui:** butchr-managed links (the link store, `list_links`/`add_link`/`remove_link`, `butchr link` and the dashboard's Links page) are removed on this branch. The `links` capability is now true only for `jira-work-item`, whose own Jira issue links linked-change events read; read the `links` column and the link-store references below with that in mind.
+
 FACTORY-996 (implementing story FACTORY-993, epic FACTORY-348) does NOT
 change this doc's matrix — `confluence-page`'s `read` cell stays `false`,
 deliberately. It adds a narrower, THIRD reader entirely outside this

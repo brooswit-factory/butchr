@@ -4,7 +4,42 @@
 Jira and Confluence providers — it replaces neither, and this first version
 changes no other provider's behavior.
 
-## Scope of this first version
+## local/ui: `trello-card` rules
+
+Our branch adds the rule type upstream left out (see the next section for
+upstream's original scope). It follows `docs/zendesk-ticket.md` closely.
+
+- **Rules.** `"resourceProvider": "trello-card"`. Each open card the query
+  matches on the configured board gets one agent per rule, keyed
+  `trello-card:<ruleId>:<boardId>#<cardId>`. A card leaving the query (moved
+  out of the rule's list, archived, relabelled) stops its agent.
+- **Queries.** Free text is matched as one phrase against the card's name and
+  description (case-insensitive). Two qualifiers narrow that:
+  `list:<name>` (the card is in one of the named lists) and `label:<name>`
+  (the card has every named label). Quote names with spaces:
+  `list:"Ready for agent" label:bug login`. An empty query matches every open
+  card. Parentheses and `AND`/`OR`/`NOT` in the free text are refused when the
+  rules file loads.
+- **Off until acknowledged.** Like Zendesk, agents run shell commands as the
+  daemon's user, so they can read the key and token files and call Trello
+  directly, as the token's account, on every board it can reach. No
+  `trello-card` rule runs until butchr's environment sets
+  `BUTCHR_TRELLO_ACCEPT_SHELL_CREDENTIAL_RISK=agents-can-read-the-trello-credentials`.
+  settings.json can't set it, and the Settings page only shows it.
+- **Tools.** `trello_get_card` (name, description, list, labels, due date, url
+  and every comment, oldest first) and `trello_add_comment` (one comment,
+  prefixed `[butchr <rule>]`; refused on an archived card). Every Trello comment
+  is visible to everyone who can see the board.
+- **Change notices.** An agent is nudged when its card moves to another list,
+  is renamed, has its description, labels or due date changed, or gets a new
+  comment. Nudges carry no card text. Its own comment isn't echoed back.
+- **Polling.** Once a minute, sharing the host admission cap, with no label
+  sync or stall detection. `/health` reports it under `resourceLoops`.
+- **Not verified live.** Everything is covered by unit tests against fakes
+  only (`test/unit/trello-card-rules.test.ts`); no live Trello board has been
+  run against yet.
+
+## Scope of upstream's first version
 
 This ships only `src/resources/trello-card-ref.ts` (resource identity) and
 `src/resources/trello-card.ts` (credential loading + REST client), wired into

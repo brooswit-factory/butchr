@@ -32,6 +32,8 @@
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isZendeskSubdomain } from "../resources/zendesk-ticket-ref.js";
+import { isTrelloId } from "../resources/trello-card-ref.js";
 import { PROVIDER_ENABLED_ENV_VAR } from "../rules/provider-enablement.js";
 
 export type SettingsFileEnv = Record<string, string | undefined> & { XDG_CONFIG_HOME?: string | undefined; HOME?: string | undefined; BUTCHR_SETTINGS_FILE?: string | undefined };
@@ -45,7 +47,12 @@ export function settingsFilePath(env: SettingsFileEnv = process.env): string {
 
 const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,63}$/;
 
-export type AllowlistKind = "provider" | "providerOrder" | "model" | "positiveIntWithCeiling" | "positiveMsWithFloor" | "boolean";
+export type AllowlistKind = "provider" | "providerOrder" | "model" | "positiveIntWithCeiling" | "positiveMsWithFloor" | "boolean" | "githubOrgs" | "zendeskSubdomain" | "trelloBoardId";
+
+/** local/ui — one GitHub organization name: a letter or digit, then up to 38 letters, digits or hyphens. */
+const GITHUB_ORG_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+/** local/ui — a sanity bound, not a GitHub limit. */
+export const GITHUB_ORGS_MAX = 20;
 
 export interface AllowlistKeyDef {
   key: string;
@@ -82,6 +89,11 @@ export const SETTINGS_ALLOWLIST: readonly AllowlistKeyDef[] = [
   { key: "BUTCHR_AGENT_PROVIDERS_TASK", kind: "providerOrder" },
   { key: "BUTCHR_AGENT_MODEL", kind: "model" },
   { key: "BUTCHR_POLL_STALE_MS", kind: "positiveMsWithFloor" },
+  // local/ui: the Settings page's GitHub card. A scope list, not an identity or a secret.
+  { key: "BUTCHR_GITHUB_ORGS", kind: "githubOrgs" },
+  // local/ui: the Zendesk and Trello cards. Where the provider lives, not who's calling it or a secret.
+  { key: "ZENDESK_SUBDOMAIN", kind: "zendeskSubdomain" },
+  { key: "TRELLO_BOARD_ID", kind: "trelloBoardId" },
   // FACTORY-66 review round 2: one independent on/off switch per
   // registered provider (`PROVIDER_ENABLED_ENV_VAR`,
   // `../rules/provider-enablement.ts` — the single source of truth for
@@ -148,6 +160,19 @@ export function validateSettingValue(key: string, rawValue: string, confirm = fa
       if (n < POLL_STALE_MS_FLOOR) return { ok: false, error: `${key}=${n} is below the floor (${POLL_STALE_MS_FLOOR}ms) — refusing a sub-second poll-staleness tolerance` };
       return { ok: true, normalized: String(n) };
     }
+    case "githubOrgs": {
+      const orgs = value.split(",").map((o) => o.trim());
+      if (orgs.some((o) => !GITHUB_ORG_RE.test(o))) return { ok: false, error: `${key} must be a comma-separated list of GitHub organization names (letters, digits and hyphens, up to 39 characters each)` };
+      if (orgs.length > GITHUB_ORGS_MAX) return { ok: false, error: `${key} lists ${orgs.length} organizations; at most ${GITHUB_ORGS_MAX} are allowed` };
+      if (new Set(orgs.map((o) => o.toLowerCase())).size !== orgs.length) return { ok: false, error: `${key} lists the same organization twice` };
+      return { ok: true, normalized: orgs.join(",") };
+    }
+    case "zendeskSubdomain":
+      if (!isZendeskSubdomain(value)) return { ok: false, error: `${key} must be the subdomain alone (e.g. acme for acme.zendesk.com)` };
+      return { ok: true, normalized: value };
+    case "trelloBoardId":
+      if (!isTrelloId(value)) return { ok: false, error: `${key} must be a 24-character Trello board id (lowercase hex)` };
+      return { ok: true, normalized: value };
     // FACTORY-66 review round 2: the per-provider switches. Deliberately
     // strict here — exactly "true"/"false" — unlike the lenient
     // "false"/"0"/"no"/"off" convention `parseProviderEnabledMap`

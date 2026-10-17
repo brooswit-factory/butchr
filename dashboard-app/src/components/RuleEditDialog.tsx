@@ -118,7 +118,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
   const [draftIdlePokeMinutes, setDraftIdlePokeMinutes] = useState(rule.idlePokeMinutes != null ? String(rule.idlePokeMinutes) : "");
   const [draftIdlePokeMessage, setDraftIdlePokeMessage] = useState(rule.idlePokeMessage ?? "");
   // `idlePokeEnabled` is never `null` on `RuleDto` (`parseRules` always resolves it) — no inherit-ambiguity to protect, same as `lizardMode`.
-  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule.idlePokeEnabled ?? true);
+  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule.idlePokeEnabled ?? false);
   // FACTORY-1010 — same empty-means-inherit contract as `draftPermissionMode`
   // above: `rule.notifyDeliveryMode` is nullable (`null` means today's
   // channel-first/prompt-fallback behaviour, not a concrete choice), so the
@@ -218,7 +218,7 @@ export function RuleEditDialog({ api, rule, sourceEtag, stale, canWrite, onChang
     if (draftIdlePokeMinutes !== currentIdlePokeMinutesStr && draftIdlePokeMinutes !== "") patch.idlePokeMinutes = Number(draftIdlePokeMinutes);
     const currentIdlePokeMessage = rule.idlePokeMessage ?? "";
     if (draftIdlePokeMessage !== currentIdlePokeMessage && draftIdlePokeMessage !== "") patch.idlePokeMessage = draftIdlePokeMessage;
-    if (draftIdlePokeEnabled !== (rule.idlePokeEnabled ?? true)) patch.idlePokeEnabled = draftIdlePokeEnabled;
+    if (draftIdlePokeEnabled !== (rule.idlePokeEnabled ?? false)) patch.idlePokeEnabled = draftIdlePokeEnabled;
     // FACTORY-1010: unlike `permissionMode` above (which has no server-side
     // clear path — see `RuleFieldPatch.notifyDeliveryMode`'s own doc comment,
     // `../api/rules.js`), reverting the draft to "" DOES send an explicit

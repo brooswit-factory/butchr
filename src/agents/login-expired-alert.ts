@@ -5,15 +5,11 @@
  * panes dead for 13-22 hours, twice, because every existing alarm is either
  * gated on `agent_status === "blocked"` (a login-expired pane reads
  * done/idle) or routed through `onNoPrompt`'s consecutive-poll debounce — see
- * FACTORY-357's diagnosis. This module is a THIRD, deliberately independent
+ * FACTORY-357's diagnosis. This module is a deliberately independent
  * consumer of drovr's escalation hooks, wired directly in `src/daemon/index.ts`
- * on its own poll loop — never through `createManagedSessionEscalationWatcher`
- * (`src/agents/managed-session-escalation-watcher.ts`), whose sink
- * (`escalator.onDrovrUnknownDialog`) is a deliberate no-op for a KEYED pane
- * (`deps.managedSessionOf(paneId)` resolving to `null`). Both real incidents
- * (FACTORY-314/w1T, FACTORY-324/w1V) were on keyed panes — routing through
- * that wrapper would have dropped exactly the panes this story exists to
- * catch. See `test/unit/login-expired-alert.test.ts`'s "keyed pane" test.
+ * on its own poll loop, and it reaches every pane drovr reports, keyed or
+ * not. Both real incidents (FACTORY-314/w1T, FACTORY-324/w1V) were on keyed
+ * panes. See `test/unit/login-expired-alert.test.ts`'s "keyed pane" test.
  *
  * There is no answer for an expired OAuth token, and every recovery lever
  * butchr already has (`[butchr:stall]`, `[butchr:unresponsive]`) is
@@ -28,7 +24,7 @@
  *      on open AND on clear (see `docs/credential-death-alert.md`).
  *   2. A sibling `/health` field (`credentialDeathAlert`, see
  *      `src/daemon/health.ts`), the same "additive, absent when nothing to
- *      report, never flips `ok`" pattern `managedSessionEscalations` already
+ *      report, never flips `ok`" pattern `unresolvedRelationships` already
  *      uses — a plain HTTP GET a human (or an uptime checker) can curl
  *      without any agent or Claude API call in the path.
  *
@@ -38,25 +34,17 @@
  * own doc comment on `CredentialDeathAlert` for why the SAME reasoning
  * applies to why this can never carry an `ANSWER`-parseable fingerprint.
  *
- * FACTORY-630 adds a THIRD channel, and the reason it had to is that the two
- * above are both PULL-only: they are correct, they survive the outage, and
- * they still reach nobody unless a human is already looking at the right
- * host's journal or curling `/health`. That is exactly what happened at
- * 18:37Z on 2026-10-02 — this alert fired as designed and nobody saw it.
- * The third channel is a PUSH to Rocket.Chat via the generic ops-alert
- * route (`./ops-alert.ts`, `CredentialDeathAlertDeps.opsAlert`), over the
- * FACTORY-369/609/611 poster's own credential, which is unrelated to the
- * Claude credential this condition kills and so survives the same outage.
- * It is optional and strictly additive: with `opsAlert` absent this module
- * behaves exactly as it did before, and the two pull channels above are
- * still what remains when Rocket.Chat itself is unreachable. It still
- * carries no `ANSWER`-shaped affordance — there is no answer to an expired
- * OAuth token except a human in a real browser.
+ * FACTORY-630 also raises it on the generic ops-alert route (`./ops-alert.ts`,
+ * `CredentialDeathAlertDeps.opsAlert`), which writes one deduplicated
+ * `[butchr:ops-alert]` journal line naming the remedy. It is optional and
+ * strictly additive: with `opsAlert` absent this module behaves exactly as
+ * it did before. It still carries no `ANSWER`-shaped affordance — there is
+ * no answer to an expired OAuth token except a human in a real browser.
  */
 import { hostname } from "node:os";
 import type { OpsAlertRouter } from "./ops-alert.js";
 
-/** The condition name this detector raises on the ops-alert route (FACTORY-630) — the same words as `CREDENTIAL_DEATH_MARKER`'s own suffix, so a human reading the room and a human grepping the journal are looking at one name. */
+/** The condition name this detector raises on the ops-alert route (FACTORY-630) — the same words as `CREDENTIAL_DEATH_MARKER`'s own suffix, so a human grepping either marker is looking at one name. */
 export const CREDENTIAL_DEATH_CONDITION = "credential-dead";
 
 /**
@@ -105,22 +93,15 @@ export interface CredentialDeathAlertDeps {
   /** Defaults to `node:os`'s `hostname()`; injectable for tests, never for production behaviour. */
   host?: string;
   /**
-   * FACTORY-630: the PUSH destination — `./ops-alert.ts`'s generic route,
-   * which posts to Rocket.Chat over a credential that has nothing to do with
-   * the Claude credential this condition kills. OPTIONAL and strictly
+   * FACTORY-630: `./ops-alert.ts`'s generic route. OPTIONAL and strictly
    * ADDITIVE: when absent, this tracker behaves EXACTLY as it did before
    * FACTORY-630 (journal line + `/health`, unchanged), which is also what
-   * every pre-existing test of this module exercises. The ticket this
-   * closes is that those two channels are both pull-only — the alert at
-   * 18:37Z on 2026-10-02 fired correctly into both and reached nobody.
+   * every pre-existing test of this module exercises.
    *
    * The router, not this tracker, owns the dedup window, which is why
    * `onLoginExpired` raises on EVERY call rather than only on the one that
-   * opens an episode: a raise that fails to post (Rocket.Chat down,
-   * credential rejected) is then genuinely retried by the next poll's raise,
-   * and nothing here has to grow a retry clock of its own. The JOURNAL
-   * line's own once-per-episode behaviour is untouched by this — see the
-   * ordering inside `onLoginExpired`.
+   * opens an episode. The JOURNAL line's own once-per-episode behaviour is
+   * untouched by this — see the ordering inside `onLoginExpired`.
    */
   opsAlert?: OpsAlertRouter;
 }
@@ -198,12 +179,10 @@ export function createCredentialDeathTracker(deps: CredentialDeathAlertDeps): Cr
     episode.detail = escalation.detail;
     episode.panes.add(escalation.paneId);
     // FACTORY-630: raised on EVERY call, not just the episode-opening one —
-    // the ops-alert router owns the once-per-hour dedup, so repeating here is
-    // what gives a failed post a retry (the next poll's raise) without this
-    // module growing a retry clock. Deliberately AFTER the journal line and
-    // the bookkeeping above: the push channel is additive, and the two
-    // pull channels must be correct and complete even if this throws, which
-    // it is documented never to do.
+    // the ops-alert router owns the once-per-hour dedup. Deliberately AFTER
+    // the journal line and the bookkeeping above: the ops alert is additive,
+    // and the two channels above must be correct and complete even if this
+    // throws, which it is documented never to do.
     deps.opsAlert?.raise({
       key: `${CREDENTIAL_DEATH_CONDITION}:${host}`,
       condition: CREDENTIAL_DEATH_CONDITION,
@@ -232,14 +211,13 @@ export function createCredentialDeathTracker(deps: CredentialDeathAlertDeps): Cr
       deps.log(`${CREDENTIAL_DEATH_MARKER} ${host}: cleared — credential recovered (reason: recovered), open for ${Math.round(openForMs / 1000)}s`);
       episode = undefined;
       // FACTORY-630: the director's "a later recovery gets one short
-      // recovered post". Reached ONLY on the one reason that can close this
+      // recovered line". Reached ONLY on the one reason that can close this
       // alert (see `onLoginExpiredResolved`'s own doc comment) — a
-      // `pane-gone` or `superseded` event never gets here, so the room can
-      // never be told the outage is over while it is still running, which is
-      // the same invariant the journal line has always had. The router
-      // additionally drops this if it never managed to post the alert
-      // itself, so a lone "recovered" can't appear for a condition the room
-      // never heard about.
+      // `pane-gone` or `superseded` event never gets here, so the ops-alert
+      // route can never report the outage over while it is still running.
+      // The router additionally drops this if it never logged the alert
+      // itself, so a lone "cleared" can't appear for a condition it never
+      // reported.
       deps.opsAlert?.recover({
         key: `${CREDENTIAL_DEATH_CONDITION}:${host}`,
         condition: CREDENTIAL_DEATH_CONDITION,

@@ -40,6 +40,7 @@ import { githubIssueQueryProblems } from "../resources/github-issue.js";
 import { githubPrQueryProblems } from "../resources/github-pr.js";
 import { parseProjectQuery } from "../resources/jira-project.js";
 import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
+import { trelloRuleQueryProblems } from "./trello-card-type.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
 import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
@@ -78,7 +79,7 @@ export { AGENT_EFFORTS, type AgentEffort };
  * permission-mode values `SessionDefinition.permissionMode` accepts
  * (`SESSION_PERMISSION_MODES`, src/resources/session-definition.ts), kept as
  * an INDEPENDENT copy of that constant (not imported FROM that module: it
- * already imports `ExecutionMode`/`AccountPolicy`/`AgentRole`/
+ * already imports `ExecutionMode`/`AgentRole`/
  * `McpServerBinding` FROM this file, so importing its
  * `SESSION_PERMISSION_MODES` back would cycle this file with it).
  * FACTORY-729: THIS copy's own value+type now live in `./agent-harness.ts`
@@ -124,19 +125,8 @@ export const EXECUTION_MODES = ["swarm", "singleton", "persistent"] as const;
 export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
 /**
- * Rocket.Chat account lifecycle for a rule's agent(s) (BUTCHR-392/BUTCHR-397),
- * independent of `execution`. `none` (the default) is today's behaviour
- * exactly — no account is created or managed. `temporary`/`permanent` are
- * accepted and plumbed onto `Rule` by this task only; the account lifecycle
- * itself (creating, attaching, tearing down a Rocket.Chat account) is a later
- * story (S4) and NOT implemented here.
- */
-export const ACCOUNT_POLICIES = ["none", "temporary", "permanent"] as const;
-export type AccountPolicy = (typeof ACCOUNT_POLICIES)[number];
-
-/**
  * Fleet capacity role (BUTCHR-391 epic decision, 2026-09-25T00:25Z, folded
- * into BUTCHR-398): independent of `execution`/`account`. `worker` (the
+ * into BUTCHR-398): independent of `execution`. `worker` (the
  * default) counts toward `BUTCHR_MAX_AGENTS` and is subject to admission
  * withholding exactly as every agent is today. `sentinel` opts a rule's
  * agent(s) OUT of the cap entirely — never withheld, never counted toward
@@ -198,8 +188,8 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * this server's push notifications — one more
  * `--dangerously-load-development-channels=server:<name>` entry, the exact
  * mechanism `server:butchr` already relies on (src/agents/argv.ts) — so
- * event-driven delivery from a non-Rocket.Chat MCP server (e.g. a MUD
- * bridge) needs no polling substitute. `channel: false` still reaches
+ * event-driven delivery from another MCP server (e.g. a MUD bridge) needs no
+ * polling substitute. `channel: false` still reaches
  * `mcp.json`/the Codex `mcpServers` config (tools work) but is never added
  * to the channel flag.
  *
@@ -219,44 +209,18 @@ export const RESERVED_MCP_SERVER_NAME = "butchr";
  * `headersEnvVar` (BUTCHR-408's own manifest doc calls this out for its
  * Codex example definitions too).
  *
- * Deliberately independent of `Rule.account`/`Rule.execution`: a binding (and
- * its `channel` flag) is wired into launch argv from this field alone, never
- * from account policy, so an `account: "none"` rule (no Rocket.Chat account
- * — e.g. Candlestix's MUD players) still gets full event-driven channel
- * delivery for a bound server.
+ * Deliberately independent of `Rule.execution`: a binding (and its
+ * `channel` flag) is wired into launch argv from this field alone.
  *
- * `accountHeader`, not a second binding mechanism (BUTCHR-412, BUTCHR-391
- * comment 24007): the corrected Rocket.Chat credential design has an agent's
- * MCP binding carry only its OWN (non-secret) account name, in a header —
- * `x-rocketr-account` for rocketr — which `headersEnvVar` above cannot
- * express: that resolves ONE static value per RULE from the daemon's own
- * env, while an account name is per-AGENT (this rule's every agent gets a
- * DIFFERENT one) and never secret to begin with (unlike a `headersEnvVar`
- * value, which is deliberately kept out of Codex argv entirely — see that
- * field's own doc comment; `accountHeader`'s value has no such restriction,
- * and BUTCHR-413 does resolve it for Codex, via `resolveAccountHeader`
- * reused directly in `boundCodexServers`, src/agents/argv.ts — the small,
- * explicit extension that review's finding 1 needed, proven by a test that
- * a Codex agent's own bound `rocketr` server carries its account name with
- * no secret ever alongside it). Set to the literal header NAME (e.g.
- * `"x-rocketr-account"`); the VALUE is resolved at launch time from
- * `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`, `src/agents/workspace.ts`)
- * — set only by `../agents/account-lifecycle.ts`'s `ensure`, after
- * `ensureAccount` actually provisioned this agent's account, never written
- * into a rules file or a managed-session definition itself. A binding with
- * `accountHeader` set but no `spec.rocketchatAccount` (this rule's `account`
- * policy is `"none"`, or `ensureAccount` hasn't run for this spec) simply
- * omits the header — same "absent means no extra header" discipline
- * `headersEnvVar` already has. Combines with `headersEnvVar` on the SAME
- * binding if both are set (rare, but not forbidden): the two are resolved
- * independently and merged.
+ * A binding in an older rules file may still carry `accountHeader` (the
+ * Rocket.Chat account-name header). Rocket.Chat support is gone, so
+ * `parseMcpServers` accepts that key, ignores it and warns.
  */
 export interface McpServerBinding {
   name: string;
   type: McpServerBindingType;
   url: string;
   headersEnvVar?: string;
-  accountHeader?: string;
   channel: boolean;
 }
 
@@ -303,9 +267,7 @@ export interface Rule {
   brief: string;
   /** How many agents this rule runs. Defaults to `"swarm"` (today's behaviour) when absent from the file. */
   execution: ExecutionMode;
-  /** Rocket.Chat account lifecycle, independent of `execution`. Defaults to `"none"` (today's behaviour, exactly) when absent from the file. */
-  account: AccountPolicy;
-  /** Fleet capacity role, independent of `execution`/`account`. Defaults to `"worker"` (today's behaviour, exactly) when absent from the file. */
+  /** Fleet capacity role, independent of `execution`. Defaults to `"worker"` (today's behaviour, exactly) when absent from the file. */
   role: AgentRole;
   /** Ranked, most preferred first. Absent means "use Butchr's global agent config". */
   agentPreferences?: AgentPreference[];
@@ -327,7 +289,7 @@ export interface Rule {
    * yet (that is stories 2/3), so no knob here changes any agent's behaviour
    * in this story. Kept as four independently optional fields, mirroring
    * `agentPreferences`/`relationships` above rather than `execution`/
-   * `account`/`role`'s always-defaulted style, because "absent" and "false"
+   * `role`'s always-defaulted style, because "absent" and "false"
    * are the same no-op here — there is no live default value to normalise
    * onto every rule for a mechanism that does not run yet.
    */
@@ -412,16 +374,16 @@ export interface Rule {
    * 2026-09-26 22:24Z): butchr's own launch default is now `permissionMode:
    * "acceptEdits"` + this field eligible together — an accept-edits agent
    * still gets Bash/MCP tool-permission prompts, so it needs the same
-   * unattended-clearing this field always provided for manual mode. Absent
-   * now means ELIGIBLE FOR SCANNING (a rule that IS found and never sets this
-   * field is scanned/touched by that timer, regardless of vendor); only an
-   * EXPLICIT `false` opts a rule's panes out of scanning — that
-   * absent-vs-false distinction is unchanged, only which one means "on" has
-   * flipped. The timer's own scanning-eligibility gate is resolved live from
-   * the loaded `rules` list (`ruleLizardModeOf`, an exported pure function in
-   * `src/agents/permission-answer-loop.ts` — `src/daemon/index.ts` just binds
-   * it to its own live state) as `rule.lizardMode !== false`, regardless of
-   * vendor — unchanged by FACTORY-108.
+   * unattended-clearing this field always provided for manual mode. Upstream,
+   * absent means ELIGIBLE FOR SCANNING; local/ui: the user asked for lizard
+   * mode to be off by default, so only an EXPLICIT `true` opts a rule's panes
+   * into scanning, and absent means off (matching what the dashboard always
+   * showed for an absent value). The timer's own scanning-eligibility gate is
+   * resolved live from the loaded `rules` list (`ruleLizardModeOf`, an
+   * exported pure function in `src/agents/permission-answer-loop.ts` —
+   * `src/daemon/index.ts` just binds it to its own live state) as
+   * `rule.lizardMode === true`, regardless of vendor — unchanged by
+   * FACTORY-108.
    *
    * FACTORY-108: unlike scanning eligibility just described, this field is
    * ALSO forwarded onto `SpawnSpec.lizardMode` by every `specFor*` builder
@@ -469,8 +431,8 @@ export interface Rule {
    * `github-pr`/`filesystem` (every `specFor*` builder forwards
    * `permissionMode`; `ruleLizardModeOf` covers every rule-engine agent id).
    * Both fields validate for `jira-idea`/`zendesk-ticket` rules too — same
-   * "every provider accepts every value" house style `execution`/`account`/
-   * `role` already use above — but neither is wired into
+   * "every provider accepts every value" house style `execution`/`role`
+   * already use above — but neither is wired into
    * `specForJiraIdea`/`specForZendeskTicket` yet, so setting them on one of
    * those two rule kinds is accepted at load and silently has no effect: a
    * deliberate, documented scope boundary, not an oversight.
@@ -481,7 +443,7 @@ export interface Rule {
    * admissions: at most this many NEW agents (desired but not yet running —
    * see `src/agents/admission.ts`'s own "WITHHOLDING, NOT DROPPING" header)
    * are admitted for THIS rule per `admit()` call. Independent of
-   * `resourceProvider`/`execution`/`account`/`role`, same house style as
+   * `resourceProvider`/`execution`/`role`, same house style as
    * every other independently-optional knob above. Absent: today's
    * behaviour exactly — unchanged, byte-for-byte, down to the log line (see
    * `minSecondsBetweenAdmissions` immediately below for the shared
@@ -553,7 +515,7 @@ export interface Rule {
    * remediation.ts) is FACTORY-845's job, which this ticket's text names
    * as the engine story reading these field names; this field only
    * describes what a rule WOULD want once that wiring exists. When
-   * ABSENT — unlike `execution`/`account`/`role` above — there is
+   * ABSENT — unlike `execution`/`role` above — there is
    * deliberately NO default resolved here: the rule simply inherits the
    * global `stalledMinutes` as it already does today, so an install that
    * configures nothing keeps its existing 10-minute threshold unchanged.
@@ -592,20 +554,19 @@ export interface Rule {
    * per-rule read into that path — `agent:stalled` detection itself
    * (src/agents/stalled.ts) is untouched either way, since this is CONFIG
    * SURFACE for the REMEDIATION (delivery) half, not a second detector.
-   * Defaults to `true` (on) when absent — unlike `idlePokeMinutes`/
-   * `idlePokeMessage` above, "on" is already today's unconditional
-   * behaviour for every rule, so resolving this to `true` here changes
-   * nothing for an install that sets nothing, and `parseRules` always
-   * resolves it to an explicit boolean rather than leaving it absent.
+   * local/ui: defaults to `false` (off) when absent — the user asked for
+   * idle pokes to be opt-in per rule (upstream defaults to `true`).
+   * `parseRules` always resolves it to an explicit boolean rather than
+   * leaving it absent.
    *
-   * Still typed OPTIONAL on `Rule` itself, same as `execution`/`account`/
-   * `role` (which `parseRules` ALSO always resolves): this interface
+   * Still typed OPTIONAL on `Rule` itself, same as `execution`/`role`
+   * (which `parseRules` ALSO always resolves): this interface
    * doubles as a literal-object shape at many call sites across the
    * codebase (tests, fixtures) that build a `Rule` directly without going
    * through `parseRules`, and a required field here would force every one
    * of those to pick a value. A caller that needs the resolved,
-   * always-true-when-absent reading does `rule.idlePokeEnabled ?? true`,
-   * same as `../web/rules-api.ts`.
+   * off-when-absent reading does `rule.idlePokeEnabled ?? false`, same as
+   * `../web/rules-api.ts`.
    */
   idlePokeEnabled?: boolean;
   /**
@@ -686,20 +647,30 @@ export const DEFAULT_IDLE_POKE_MINUTES = 30;
  */
 export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down";
 
+/**
+ * Keys older rules files may still carry for features butchr no longer has.
+ * They're accepted (so the file still loads) and ignored; any value other
+ * than the old default gets one warning. `account` was the Rocket.Chat
+ * account policy (default `"none"`).
+ */
+const LEGACY_RULE_FIELDS: ReadonlyMap<string, unknown> = new Map([["account", "none"]]);
+/** The binding-level legacy key: `accountHeader` named the Rocket.Chat account header. It has no default, so any value warns. */
+const LEGACY_MCP_SERVER_BINDING_FIELDS = new Set(["accountHeader"]);
+const LEGACY_REASON = "ignored: Rocket.Chat support was removed";
+
 const RULE_FIELDS = new Set([
-  "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
+  ...LEGACY_RULE_FIELDS.keys(),
+  "id", "enabled", "resourceProvider", "query", "brief", "execution", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
   "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
   "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
   "notifyDeliveryMode",
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
-const MCP_SERVER_BINDING_FIELDS = new Set(["name", "type", "url", "headersEnvVar", "accountHeader", "channel"]);
+const MCP_SERVER_BINDING_FIELDS = new Set([...LEGACY_MCP_SERVER_BINDING_FIELDS, "name", "type", "url", "headersEnvVar", "channel"]);
 /** Same shape `DisabledMcpServer.name` validation uses (see workspace.ts's `workspaceIsolation`) — kept consistent so an MCP server name is never valid in one place and rejected in the other. */
 const MCP_SERVER_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ENV_VAR_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
-/** RFC 7230 `field-name` (token charset), lowercased-or-not — an HTTP header name. */
-const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const nonEmpty = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
@@ -777,9 +748,11 @@ const isHttpUrl = (v: unknown): boolean => {
  * error text (e.g. `rules[2].mcpServers` or a session definition's own
  * `<path>.mcpServers`) — this function is deliberately caller/document
  * agnostic so both `Rule` and a session definition (BUTCHR-408) can share it
- * without either owning the other's shape.
+ * without either owning the other's shape. A legacy binding key
+ * (`LEGACY_MCP_SERVER_BINDING_FIELDS`) is ignored, with a line in
+ * `warnings`.
  */
-export function parseMcpServers(raw: unknown, at: string, errors: string[]): McpServerBinding[] | undefined {
+export function parseMcpServers(raw: unknown, at: string, errors: string[], warnings: string[] = []): McpServerBinding[] | undefined {
   if (!Array.isArray(raw) || raw.length === 0) { errors.push(`${at} must be a non-empty array`); return undefined; }
   const seen = new Set<string>();
   return raw.map((s, j) => {
@@ -795,13 +768,11 @@ export function parseMcpServers(raw: unknown, at: string, errors: string[]): Mcp
     if (!isHttpUrl(s.url)) errors.push(`${pat}.url must be an absolute http(s) URL`);
     const headersEnvVar = typeof s.headersEnvVar === "string" ? s.headersEnvVar.trim() : undefined;
     if (s.headersEnvVar !== undefined && (!nonEmpty(s.headersEnvVar) || !headersEnvVar || !ENV_VAR_NAME_RE.test(headersEnvVar))) errors.push(`${pat}.headersEnvVar must be an env var name (A-Z, 0-9, "_", not starting with a digit)`);
-    const accountHeader = typeof s.accountHeader === "string" ? s.accountHeader.trim() : undefined;
-    if (s.accountHeader !== undefined && (!nonEmpty(s.accountHeader) || !accountHeader || !HEADER_NAME_RE.test(accountHeader))) errors.push(`${pat}.accountHeader must be a valid HTTP header name`);
+    for (const k of LEGACY_MCP_SERVER_BINDING_FIELDS) if (s[k] !== undefined) warnings.push(`${pat}.${k} ${JSON.stringify(s[k])} is ${LEGACY_REASON}`);
     if (typeof s.channel !== "boolean") errors.push(`${pat}.channel must be a boolean`);
     return {
       name, type: s.type as McpServerBindingType, url: typeof s.url === "string" ? s.url.trim() : "",
       ...(headersEnvVar ? { headersEnvVar } : {}),
-      ...(accountHeader ? { accountHeader } : {}),
       channel: s.channel as boolean,
     };
   });
@@ -829,9 +800,11 @@ function parseRelationships(raw: unknown, at: string, errors: string[]): RuleRel
  * Collects every problem before throwing so one edit fixes the whole file.
  * Unknown fields are rejected — a typo'd optional setting must not silently
  * fall back to the default. Relationship ids must name rules in the same
- * document (a disabled rule is a valid target).
+ * document (a disabled rule is a valid target). A legacy key
+ * (`LEGACY_RULE_FIELDS`) is accepted and ignored; a non-default value adds a
+ * line to `warnings` instead of an error, so an older file still loads.
  */
-export function parseRules(doc: unknown, origin = "rules"): Rule[] {
+export function parseRules(doc: unknown, origin = "rules", warnings: string[] = []): Rule[] {
   if (!isObject(doc) || !Array.isArray(doc.rules)) throw new Error(`${origin}: expected an object with a "rules" array`);
   const errors: string[] = [];
   const seen = new Set<string>();
@@ -843,7 +816,8 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (!isObject(raw)) { errors.push(`${at} must be an object`); return; }
     const before = errors.length;
     unknownFields(raw, RULE_FIELDS, at, errors);
-    const { id, enabled, resourceProvider, query, brief, execution, account, role } = raw;
+    const { id, enabled, resourceProvider, query, brief, execution, role } = raw;
+    for (const [k, quiet] of LEGACY_RULE_FIELDS) if (raw[k] !== undefined && raw[k] !== quiet) warnings.push(`${at}.${k} ${JSON.stringify(raw[k])} is ${LEGACY_REASON}`);
     if (typeof id !== "string" || !isRuleId(id)) errors.push(`${at}.id must be a lowercase slug (a-z, 0-9, single hyphens, max ${RULE_ID_MAX})`);
     else if (seen.has(id)) errors.push(`${at}.id "${id}" is a duplicate`);
     else { seen.add(id); providerOf.set(id, resourceProvider); }
@@ -856,18 +830,17 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     else if (resourceProvider === "jira-project") { try { parseProjectQuery(query as string); } catch (e) { errors.push(`${at}.query: ${String(e)}`); } }
     else if (resourceProvider === "filesystem") for (const p of filesystemQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     else if (resourceProvider === "confluence-page") for (const p of confluencePageQueryProblems(query)) errors.push(`${at}.query: ${p}`);
+    else if (resourceProvider === "trello-card") for (const p of trelloRuleQueryProblems(query)) errors.push(`${at}.query: ${p}`);
     if (raw.mcpConfigFile !== undefined && (typeof raw.mcpConfigFile !== "string" || !isAbsolute(raw.mcpConfigFile))) errors.push(`${at}.mcpConfigFile must be an absolute path`);
     if (raw.mcpConfigFile !== undefined && resourceProvider !== "jira-project") errors.push(`${at}.mcpConfigFile is currently supported for jira-project only`);
     if (!nonEmpty(brief)) errors.push(`${at}.brief must be a non-empty string`);
     else { const problem = builtinBriefProblem(brief as string); if (problem) errors.push(`${at}.brief ${problem}`); }
-    // `execution` and `account` are independent of each other (any of the 9 combinations
-    // is valid) and, for now, of `resourceProvider` too: every provider accepts every mode
+    // `execution` is, for now, independent of `resourceProvider`: every provider accepts every mode
     // (see docs/execution-modes.md — BUTCHR-397 found no concrete provider-specific blocker).
     if (execution !== undefined && !oneOf(EXECUTION_MODES, execution)) errors.push(`${at}.execution must be one of ${EXECUTION_MODES.join(", ")}`);
-    if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
-    // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
+    // `role` (BUTCHR-398): independent of `execution` and of `resourceProvider` too — every provider accepts every role, same house style as the field above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
-    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution` and `role` alike, and of each other.
     const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
     if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
     if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
@@ -878,13 +851,13 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
     const { linkedDescriptionLinks } = raw;
     if (linkedDescriptionLinks !== undefined && typeof linkedDescriptionLinks !== "boolean") errors.push(`${at}.linkedDescriptionLinks must be a boolean`);
-    // FACTORY-87: independent of resourceProvider/execution/account/role/linked-eventing, same
+    // FACTORY-87: independent of resourceProvider/execution/role/linked-eventing, same
     // house style — see RULE_PERMISSION_MODES's own doc comment for why there is no Codex-vendor
     // rejection here, unlike SessionDefinition's own permissionMode/lizardMode fields.
     const { permissionMode, lizardMode } = raw;
     if (permissionMode !== undefined && !oneOf(RULE_PERMISSION_MODES, permissionMode)) errors.push(`${at}.permissionMode must be one of ${RULE_PERMISSION_MODES.join(", ")}`);
     if (lizardMode !== undefined && typeof lizardMode !== "boolean") errors.push(`${at}.lizardMode must be a boolean`);
-    // FACTORY-907: same independently-optional house style as every field above — independent of resourceProvider/execution/account/role/linked-eventing/permissionMode/lizardMode.
+    // FACTORY-907: same independently-optional house style as every field above — independent of resourceProvider/execution/role/linked-eventing/permissionMode/lizardMode.
     const { maxNewPerTick, minSecondsBetweenAdmissions } = raw;
     if (maxNewPerTick !== undefined && !isPositiveInt(maxNewPerTick)) errors.push(`${at}.maxNewPerTick must be a positive integer`);
     if (minSecondsBetweenAdmissions !== undefined && !isPositiveInt(minSecondsBetweenAdmissions)) errors.push(`${at}.minSecondsBetweenAdmissions must be a positive integer`);
@@ -894,12 +867,12 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (resumeContextCutoff !== undefined && !isPositiveInt(resumeContextCutoff)) errors.push(`${at}.resumeContextCutoff must be a positive integer`);
     // FACTORY-846: idlePokeMinutes/idlePokeMessage stay OPTIONAL — same
     // absent-means-absent style as permissionMode/lizardMode immediately
-    // above, deliberately NOT the always-defaulted execution/account/role
+    // above, deliberately NOT the always-defaulted execution/role
     // style, because resolving either to a brand-new default here would be
     // exactly the "silently change every install" conflict FACTORY-844
     // calls out (see Rule.idlePokeMinutes/idlePokeMessage's own doc
     // comments). idlePokeEnabled DOES get an always-resolved default
-    // (true), because "on" is already today's unconditional behaviour.
+    // (local/ui: false, so idle pokes are opt-in per rule; upstream: true).
     const { idlePokeMinutes, idlePokeMessage, idlePokeEnabled } = raw;
     const { stalledMinutes } = raw;
     if (stalledMinutes !== undefined && (typeof stalledMinutes !== "number" || !Number.isFinite(stalledMinutes) || stalledMinutes <= 0)) errors.push(`${at}.stalledMinutes must be a positive number`);
@@ -917,9 +890,9 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (notifyDeliveryMode !== undefined && !oneOf(NOTIFY_DELIVERY_MODES, notifyDeliveryMode)) errors.push(`${at}.notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}`);
     const agentPreferences = raw.agentPreferences === undefined ? undefined : parsePreferences(raw.agentPreferences, `${at}.agentPreferences`, errors);
     const relationships = raw.relationships === undefined ? undefined : parseRelationships(raw.relationships, `${at}.relationships`, errors);
-    const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors);
+    const mcpServers = raw.mcpServers === undefined ? undefined : parseMcpServers(raw.mcpServers, `${at}.mcpServers`, errors, warnings);
     if (errors.length !== before) return;
-    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem" || resourceProvider === "confluence-page") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
+    if ((resourceProvider === "github-issue" || resourceProvider === "github-pr" || resourceProvider === "zendesk-ticket" || resourceProvider === "jira-project" || resourceProvider === "filesystem" || resourceProvider === "confluence-page" || resourceProvider === "trello-card") && relationships) { errors.push(`${at}.relationships are not supported for ${resourceProvider} rules yet`); return; }
     if (resourceProvider === "jira-idea" && relationships?.childRule) { errors.push(`${at}.relationships.childRule is not supported for jira-idea rules; only inwardConnectionRules naming github-issue rules`); return; }
     if (relationships?.childRule) refs.push({ at: `${at}.relationships.childRule`, id: relationships.childRule, provider: resourceProvider as ResourceProvider });
     for (const r of relationships?.inwardConnectionRules ?? []) refs.push({ at: `${at}.relationships.inwardConnectionRules`, id: r, provider: resourceProvider as ResourceProvider });
@@ -927,7 +900,6 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       id: id as string, enabled: enabled !== false, resourceProvider: resourceProvider as ResourceProvider,
       query: (query as string).trim(), brief: brief as string,
       execution: (execution as ExecutionMode | undefined) ?? "swarm",
-      account: (account as AccountPolicy | undefined) ?? "none",
       role: (role as AgentRole | undefined) ?? "worker",
       ...(agentPreferences ? { agentPreferences } : {}),
       ...(relationships ? { relationships } : {}),
@@ -949,7 +921,7 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(stalledMinutes !== undefined ? { stalledMinutes: stalledMinutes as number } : {}),
       ...(typeof idlePokeMessage === "string" ? { idlePokeMessage: idlePokeMessage.trim() } : {}),
       ...(notifyDeliveryMode !== undefined ? { notifyDeliveryMode: notifyDeliveryMode as NotifyDeliveryMode } : {}),
-      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? true,
+      idlePokeEnabled: (idlePokeEnabled as boolean | undefined) ?? false,
     });
   });
   for (const { at, id, provider } of refs) {
@@ -991,11 +963,14 @@ const readIfExists: ReadRulesFile = (path) => {
  * calling `read`/`readFileSync` a second time, so the hash can never
  * disagree with what `parseRules` above actually validated (a second read
  * could race a concurrent write and hash different bytes than were parsed).
+ *
+ * `warnings`, present only when non-empty, names legacy keys the file still
+ * carries that butchr now ignores (see `parseRules`); the caller logs them.
  */
 /** The SAME `sha256(text ?? "")` convention `src/rules/write-rules.ts`'s `rulesEtag` uses, applied to `loadRules`' own `text` field — the one `sourceEtag` computation, shared by startup (`src/daemon/index.ts`) and `reloadRules` (`src/rules/reload.ts`), so the two can never drift to different hashes for the same bytes. */
 export const sourceEtagOf = (text: string | undefined): string => createHash("sha256").update(text ?? "", "utf8").digest("hex");
 
-export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined } {
+export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = readIfExists): { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined; warnings?: string[] } {
   const path = rulesPath(env);
   const text = read(path);
   if (text === undefined) {
@@ -1005,7 +980,9 @@ export function loadRules(env: RulesEnv = process.env, read: ReadRulesFile = rea
   let doc: unknown;
   try { doc = JSON.parse(text); }
   catch (e) { throw new Error(`${path}: invalid JSON: ${(e as Error).message}`); }
-  return { path, origin: "file", rules: parseRules(doc, path), text };
+  const warnings: string[] = [];
+  const rules = parseRules(doc, path, warnings);
+  return { path, origin: "file", rules, text, ...(warnings.length ? { warnings } : {}) };
 }
 
 /**

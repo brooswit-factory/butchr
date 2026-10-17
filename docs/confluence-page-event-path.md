@@ -121,11 +121,11 @@ watching it," not a structural event worth a notify.
   again next tick," the same fail-open posture `src/resources/project.ts`'s
   own version/comment reads already take.
 
-## Why polling, not a webhook or Rocket.Chat mention
+## Why polling, not a webhook or a chat mention
 
 Per FACTORY-991's spike (re-verified, not re-litigated here): no webhook
 receiver exists anywhere in this codebase today, and the epic's director
-addendum judged a Rocket.Chat-mention alternative unnecessary once a real
+addendum judged a chat-mention alternative unnecessary once a real
 poll-and-diff path (this module) was shown to generalize cleanly from the
 jira-work tier's own precedent. Building a webhook receiver and verifying
 Confluence's webhook delivery guarantees was out of scope for this story

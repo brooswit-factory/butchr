@@ -62,6 +62,9 @@ export interface TrelloCard {
 
 export interface TrelloComment { id: string; authorId: string | null; body: string; created: string }
 
+/** local/ui: one list on the configured board — what `trello-card` rules' `list:` qualifier and `trello_get_card` name a card's list by. */
+export interface TrelloList { id: string; name: string; closed: boolean }
+
 export class TrelloHttpError extends Error {
   constructor(readonly status: number, what: string) {
     super(`Trello ${what} failed: HTTP ${status}`);
@@ -201,6 +204,8 @@ export interface TrelloCardClient {
   get(ref: TrelloCardRef): Promise<TrelloCard>;
   /** Add a comment after `get` confirms the target is on the configured board. Every Trello comment is visible to the whole board — there is no private-note variant. */
   addComment(ref: TrelloCardRef, body: string): Promise<{ id: string; created: string | null }>;
+  /** local/ui: every list on the configured board, archived ones included, so a card sitting in an archived list still has a name. */
+  lists(): Promise<TrelloList[]>;
 }
 
 export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardClient {
@@ -242,6 +247,16 @@ export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardCl
         if (!card) continue;
         if (q && !card.name.toLowerCase().includes(q) && !card.desc.toLowerCase().includes(q)) continue;
         out.push(card);
+      }
+      return out;
+    },
+    async lists() {
+      const body = await request(`/boards/${deps.boardId}/lists`, "board lists", { filter: "all", fields: "id,name,closed" }) as unknown;
+      if (!Array.isArray(body)) throw new Error("Trello board lists returned an unexpected body");
+      const out: TrelloList[] = [];
+      for (const item of body as Array<Record<string, unknown>>) {
+        if (typeof item?.id !== "string" || !isTrelloId(item.id) || typeof item.name !== "string") continue;
+        out.push({ id: item.id, name: item.name, closed: item.closed === true });
       }
       return out;
     },

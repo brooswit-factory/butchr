@@ -11,16 +11,11 @@ import {
 } from "../../src/agents/dashboard.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
-import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
-import type { FilesystemResource } from "../../src/resources/filesystem.js";
-import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
-import { sessionAgentKey } from "../../src/resources/session-freeze.js";
-import { effectiveAgent } from "../../src/resources/session-definition.js";
 
 // ---- fixtures --------------------------------------------------------
 
 function rule(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
-  return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+  return { enabled: true, query: "q", brief: "b", execution: "swarm", role: "worker", ...over };
 }
 
 // FACTORY-340: every source a rule in THIS file's fixtures can be covered by
@@ -53,29 +48,7 @@ function withheldRow(resourceKey: string, source = "issue"): WithheldDashboardRo
   return { kind: "withheld", resourceKey, tier: { kind: "project" }, source, waiting: floor, confirmedAt: new Date(0).toISOString(), agentFields: { applicable: false, reason: "no agent: withheld by the admission cap" } };
 }
 
-const noRulesFile: RulesFileState = { path: "/rules.json", rules: [], error: null };
 const noConfigReason = () => null;
-
-function res(path: string, over: Partial<FilesystemResource> = {}): FilesystemResource {
-  return { path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000, ...over };
-}
-
-function fakeSessionDefinitions(byDir: Record<string, Record<string, string>>, frozenAgentKeys: Set<string> = new Set()) {
-  const list = async (q: FilesystemQuery): Promise<FilesystemResource[]> => Object.keys(byDir[q.root] ?? {}).map((p) => res(p));
-  const read = async (path: string): Promise<string> => {
-    for (const files of Object.values(byDir)) if (path in files) return files[path]!;
-    throw Object.assign(new Error(`ENOENT: no such file ${path}`), { code: "ENOENT" });
-  };
-  const store: SessionFreezeStore = {
-    async read(id) { return { frozen: frozenAgentKeys.has(id) }; },
-    async set(id, f) { if (f) frozenAgentKeys.add(id); else frozenAgentKeys.delete(id); },
-  };
-  return { activeDir: "/defs", archiveDir: "/defs-archive", list, read, store };
-}
-
-const goodDefinition = (over: Record<string, unknown> = {}) => JSON.stringify({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
-});
 
 // ---- ruleStaffingReason ------------------------------------------------
 
@@ -258,7 +231,6 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       rulesFile: { path: "/rules.json", rules, error: null },
       dashboard: checkedDashboard([agentRow(encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" }))]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     const byId = new Map(inventory.rules.map((r) => [r.id, r]));
     expect(byId.get("project-managers")).toMatchObject({ enabled: false, staffed: false, reason: "disabled" });
@@ -271,21 +243,19 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       id: "triage", resourceProvider: "jira-work",
       agentPreferences: [{ harness: "claude", model: "opus", effort: "high" }, { harness: "codex" }],
       linkedEventing: true,
-      mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/rocketr", headersEnvVar: "ROCKETR_SECRET_ENV", accountHeader: "x-rocketr-account", channel: true }],
+      mcpServers: [{ name: "chat", type: "http", url: "https://mcp.internal/chat", headersEnvVar: "CHAT_SECRET_ENV", channel: true }],
     });
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     const entry = inventory.rules[0]!;
     // Ranked order preserved; model/effort survive per-entry, absent where the rule never set one.
     expect(entry.agentPreferences).toEqual([{ harness: "claude", model: "opus", effort: "high" }, { harness: "codex" }]);
     expect(entry.linkedEventing).toBe(true);
-    expect(entry.mcpServerNames).toEqual(["rocketr"]);
-    expect(JSON.stringify(entry)).not.toContain("ROCKETR_SECRET_ENV");
-    expect(JSON.stringify(entry)).not.toContain("x-rocketr-account");
+    expect(entry.mcpServerNames).toEqual(["chat"]);
+    expect(JSON.stringify(entry)).not.toContain("CHAT_SECRET_ENV");
     expect(JSON.stringify(entry)).not.toContain("mcp.internal");
   });
 
@@ -299,7 +269,6 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
         agentRow(encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" })),
       ]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules.find((r) => r.id === "task")!.staffed).toBe(true);
     expect(inventory.rules.find((r) => r.id === "director")!.staffed).toBe(true);
@@ -321,7 +290,6 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
         // "watch" has NO agent for KAN-1 this poll — only "triage" does.
       ]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules.find((r) => r.id === "triage")).toMatchObject({ staffed: true, reason: null });
     expect(inventory.rules.find((r) => r.id === "watch")).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
@@ -333,7 +301,6 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard([withheldRow(encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "KAN-1" }))]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" });
   });
@@ -344,7 +311,6 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: uncheckedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).toContain("census unavailable");
@@ -355,183 +321,45 @@ describe("buildQueryAgentInventory — rules section (FACTORY-72)", () => {
       rulesFile: { path: "/rules.json", rules: [], error: { path: "/rules.json", message: "/rules.json: invalid JSON: Unexpected token o in JSON at position 1" } },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules).toEqual([]);
     expect(inventory.errors).toEqual([{ path: "/rules.json", message: "/rules.json: invalid JSON: Unexpected token o in JSON at position 1" }]);
   });
-});
 
-// ---- buildQueryAgentInventory: session definitions ----------------------
-
-describe("buildQueryAgentInventory — session-definitions section (FACTORY-72)", () => {
-  test("frozen (manifest) and archived state are both real, computed booleans, and the correlation identifier matches sessionAgentKey", async () => {
-    const activeDir = "/defs";
-    const archiveDir = "/defs-archive";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: { "/defs/live.json": goodDefinition() },
-      [archiveDir]: { "/defs-archive/old.json": goodDefinition({ frozen: true }) },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir },
-    });
-    const live = inventory.sessionDefinitions.find((e) => e.name === "live.json")!;
-    const archived = inventory.sessionDefinitions.find((e) => e.name === "old.json")!;
-    expect(live.archived).toBe(false);
-    expect(live.manifestFrozen).toBe(false);
-    expect(live.agentKey).toBe(sessionAgentKey("/defs/live.json"));
-    expect(archived.archived).toBe(true);
-    expect(archived.manifestFrozen).toBe(true);
-    // BUTCHR-455's own identity rule: an archived definition's agent key is derived from its ACTIVE path (where it would be restored to), not its current archive path.
-    expect(archived.agentKey).toBe(sessionAgentKey("/defs/old.json"));
-  });
-
-  test("an invalid (malformed) definition file is listed with its problems AND surfaces in top-level errors, without hiding a good file alongside it", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: {
-        "/defs/good.json": goodDefinition(),
-        "/defs/bad.json": "not json",
-      },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const good = inventory.sessionDefinitions.find((e) => e.name === "good.json")!;
-    const bad = inventory.sessionDefinitions.find((e) => e.name === "bad.json")!;
-    expect(good.valid).toBe(true);
-    expect(bad.valid).toBe(false);
-    expect(inventory.errors).toEqual([{ path: "/defs/bad.json", message: bad.problems.join("\n") }]);
-  });
-
-  test("no secret ever appears anywhere in the serialized inventory — a fake token, header value and env value, including inside MCP server config and inside a malformed file", async () => {
+  test("no secret ever appears anywhere in the serialized inventory — a fake env value inside a rule's MCP server binding, and a fake token inside a malformed rules file", async () => {
     const FAKE_TOKEN = "ghp_FAKESECRETTOKENabcdef1234567890";
-    const FAKE_HEADER_VALUE = "Bearer super-secret-header-value-xyz";
     const FAKE_ENV_VALUE = "SUPER_SECRET_ENV_VALUE_998877";
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: {
-        // A valid definition binding an MCP server — only its NAME may ever surface.
-        "/defs/bound.json": goodDefinition({
-          mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/rocketr", headersEnvVar: "ROCKETR_HEADERS_ENV", accountHeader: "x-rocketr-account", channel: true }],
-        }),
-        // A malformed definition whose raw, invalid content directly embeds fake secret-shaped strings —
-        // proves the validator's error message never echoes a VALUE, only field names.
-        "/defs/malformed.json": JSON.stringify({
-          workingDirectory: "/repo", brief: "b", vendor: "claude", tier: "tier1", permissionMode: "default",
-          unexpectedSecretField: FAKE_TOKEN,
-          mcpServers: [{ name: "x", type: "http", url: `https://example.invalid/${FAKE_HEADER_VALUE}`, headersEnvVar: FAKE_ENV_VALUE, channel: "not-a-boolean" }],
-        }),
-      },
-    });
     const rules = [rule({
       id: "bound-rule", resourceProvider: "jira-work",
-      mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/rocketr", headersEnvVar: FAKE_ENV_VALUE, accountHeader: FAKE_HEADER_VALUE, channel: true }],
+      mcpServers: [{ name: "chat", type: "http", url: "https://mcp.internal/chat", headersEnvVar: FAKE_ENV_VALUE, channel: true }],
     })];
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules, error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
     });
     const serialized = JSON.stringify(inventory);
-    expect(serialized).not.toContain(FAKE_TOKEN);
-    expect(serialized).not.toContain(FAKE_HEADER_VALUE);
     expect(serialized).not.toContain(FAKE_ENV_VALUE);
-    // Sanity: the malformed file's own problem list IS present (never swallowed) — just secret-free.
-    const malformed = inventory.sessionDefinitions.find((e) => e.name === "malformed.json")!;
-    expect(malformed.valid).toBe(false);
-    expect(malformed.problems.length).toBeGreaterThan(0);
-    expect(malformed.problems.some((p) => p.includes("unexpectedSecretField"))).toBe(true);
-  });
-
-  test("a misconfigured archive directory (inside the active one) is reported as one error, and never crashes the endpoint", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/a.json": goodDefinition() } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
+    expect(inventory.rules[0]!.mcpServerNames).toEqual(["chat"]);
+    // A malformed rules file whose raw content embeds a fake token: its error is
+    // present (never swallowed), names the bad field, and never echoes the value.
+    const malformedJson = JSON.stringify({
+      rules: [{ id: "x", resourceProvider: "jira-work", query: "q", brief: "A real brief sentence.", unexpectedSecretField: FAKE_TOKEN }],
+    });
+    const broken = await buildQueryAgentInventory({
+      rulesFile: loadRulesFileState({ BUTCHR_RULES_FILE: "/config/rules.json" }, () => malformedJson),
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs/nested-archive" },
     });
-    expect(inventory.errors.some((e) => e.path === "/defs/nested-archive")).toBe(true);
-    // The active directory's own good entry still comes through — one bad directory must not hide it.
-    expect(inventory.sessionDefinitions.some((e) => e.name === "a.json" && e.valid)).toBe(true);
+    expect(broken.errors).toHaveLength(1);
+    expect(broken.errors[0]!.message).toContain("unexpectedSecretField");
+    expect(JSON.stringify(broken)).not.toContain(FAKE_TOKEN);
   });
 });
 
 // ---- buildQueryAgentInventory: resolved model/effort (FACTORY-120) -----
 
 describe("buildQueryAgentInventory — resolved model/effort (FACTORY-120)", () => {
-  test("a modelPower/effort (two-axis) definition's resolved model/effort equal effectiveAgent()'s own return, with a literal spot-check against power-scale.ts's own table", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: { "/defs/two-axis.json": goodDefinition({ tier: undefined, modelPower: 70, effort: 65 }) },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const entry = inventory.sessionDefinitions.find((e) => e.name === "two-axis.json")!;
-    expect(entry.valid).toBe(true);
-    // Raw fields (already shipped, pre-FACTORY-120) are untouched.
-    expect(entry.modelPower).toBe(70);
-    expect(entry.effort).toBe(65);
-    // Reuses effectiveAgent() verbatim — never a second, independently-recomputed resolution.
-    const expected = effectiveAgent({ vendor: "claude", modelPower: 70, effort: 65 });
-    expect(entry.resolvedModel).toBe(expected.model);
-    expect(entry.resolvedEffort).toBe(expected.effort);
-    // Literal spot-check taken directly from power-scale.ts's own tables on this checkout:
-    // CLAUDE_MODEL_POWER_TABLE's 60-84 band is "opus"; EFFORT_TABLE's 60-79 band is "xhigh".
-    expect(entry.resolvedModel).toBe("opus");
-    expect(entry.resolvedEffort).toBe("xhigh");
-  });
-
-  test("a tier-based (deprecated) definition's resolved model equals effectiveAgent()'s own return, with NO resolved effort — by design, not a gap", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: { "/defs/tier-based.json": goodDefinition({ tier: "tier4" }) },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const entry = inventory.sessionDefinitions.find((e) => e.name === "tier-based.json")!;
-    expect(entry.valid).toBe(true);
-    expect(entry.tier).toBe("tier4");
-    const expected = effectiveAgent({ vendor: "claude", tier: "tier4" });
-    expect(entry.resolvedModel).toBe(expected.model);
-    expect(expected.effort).toBeUndefined();
-    // Literal spot-check from session-definition.ts's own CLAUDE_TIER_MODEL table: tier4 -> opus.
-    expect(entry.resolvedModel).toBe("opus");
-    expect(entry.resolvedEffort).toBeUndefined();
-  });
-
-  test("an INVALID definition never crashes buildQueryAgentInventory, and carries no resolved model/effort — calling effectiveAgent() on it would throw, so it must never be called here", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/bad-two-axis.json": "not json at all" } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: noRulesFile,
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const entry = inventory.sessionDefinitions.find((e) => e.name === "bad-two-axis.json")!;
-    expect(entry.valid).toBe(false);
-    expect(entry.resolvedModel).toBeUndefined();
-    expect(entry.resolvedEffort).toBeUndefined();
-  });
-
   test("a rule agentPreferences entry expressed via modelPower/effortPower, loaded through the REAL rules-file parse path, shows the resolved model/effort in the inventory", async () => {
     const rulesJson = JSON.stringify({
       rules: [
@@ -547,7 +375,6 @@ describe("buildQueryAgentInventory — resolved model/effort (FACTORY-120)", () 
       rulesFile,
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     const entry = inventory.rules.find((r) => r.id === "power-rule")!;
     // Resolved ONCE at rules-load time (parsePreferences, src/rules/rules.ts) — this module
@@ -598,7 +425,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).toContain("census unavailable");
@@ -616,7 +442,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(observedZero.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
 
@@ -628,7 +453,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(staleInventory.rules[0]!.staffed).toBeNull();
     const staleReason = staleInventory.rules[0]!.reason;
@@ -638,7 +462,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: initialDashboardSnapshot(() => 0, noWithholding().census()),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     // The exact wording this ticket's own DoD requires: identical whether
     // this daemon has never polled at all, or its most recent poll failed
@@ -658,7 +481,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(staffedNow.rules[0]).toMatchObject({ staffed: true, reason: null });
 
@@ -671,7 +493,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     // NOT staffed:null — a matching live (if stale) row wins over an
     // unavailable census, exactly as AC3 documents for the render layer.
@@ -685,13 +506,13 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
 
     now = 5000;
     await expect(f.poll(async () => { throw new Error("boom"); })).rejects.toThrow();
-    const unknown = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason, sessionDefinitions: fakeSessionDefinitions({}) });
+    const unknown = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason });
     expect(unknown.rules[0]!.staffed).toBeNull();
 
     now = 9000;
     await admission.admit([], [], "issue"); // the "issue" admission source itself also reports zero, same as a real daemon poll — BEFORE f.poll(), since `feed.snapshot()` only re-reads `admission.census()` at poll time, not live
     await f.poll(async () => ({ agents: [] })); // recovers — a genuine, observed zero
-    const recovered = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason, sessionDefinitions: fakeSessionDefinitions({}) });
+    const recovered = await buildQueryAgentInventory({ rulesFile: { path: "/rules.json", rules: [r], error: null }, dashboard: f.snapshot(), configReasonFor: noConfigReason });
     expect(recovered.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
   });
 
@@ -714,7 +535,6 @@ describe("buildQueryAgentInventory — the census-unavailable tri-state through 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "admission cap: matched resource(s) currently withheld by the fleet-wide agent cap" });
   });
@@ -760,7 +580,6 @@ describe("buildQueryAgentInventory — the admission-source-unavailable tri-stat
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).toContain("census unavailable");
@@ -783,7 +602,6 @@ describe("buildQueryAgentInventory — the admission-source-unavailable tri-stat
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).toContain("census unavailable");
@@ -810,7 +628,6 @@ describe("buildQueryAgentInventory — the admission-source-unavailable tri-stat
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).toContain("census unavailable");
@@ -832,7 +649,6 @@ describe("buildQueryAgentInventory — the admission-source-unavailable tri-stat
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]).toMatchObject({ staffed: false, reason: "no matching resources this poll" });
   });
@@ -873,7 +689,6 @@ describe("buildQueryAgentInventory — the admission-source-unavailable tri-stat
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: fakeSessionDefinitions({}),
     });
     expect(inventory.rules[0]!.staffed).toBe(false);
     expect(inventory.rules[0]!.reason).toContain("admission cap");

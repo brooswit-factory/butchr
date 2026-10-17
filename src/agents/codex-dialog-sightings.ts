@@ -18,20 +18,12 @@
  * to mirror, "dialog-watch" (admin-assembly side) and
  * "dialog-sightings.ndjson" (advisor-agentvelocity side). Neither name
  * appears anywhere in this repo — current tree, full-text grep, or
- * `git log --all -S` history search all came back empty. The closest actual
- * Claude-side precedent in butchr today is `escalation-loop.ts`'s
- * `markManagedSessionStalled`/`managedSessionStalled` map (FACTORY-45): it
- * dedupes a dialog to one log line per (pane, fingerprint) EPISODE, surfaced
- * via a `/health` sibling field (`managedSessionEscalations`) and a
- * greppable journal marker (`docs/managed-sessions.md`'s "Two detectors, one
- * mark"). That mechanism tracks CURRENT per-pane stall state, though — it has
- * no persistent per-fingerprint AGGREGATE count anywhere (its rate-cap
- * counter, `countedFingerprints` in the same file, is in-memory-only and
- * reset by nothing ever reading it back). So there was no existing
- * aggregate-count-by-fingerprint surface to converge with for EITHER vendor;
- * this file is a new one for Codex, built as closely as possible to the same
- * episode-dedup idea and the same `/health`-field + journal-marker surface
- * convention `managedSessionEscalations`/`credentialDeathAlert`
+ * `git log --all -S` history search all came back empty, and there was no
+ * existing aggregate-count-by-fingerprint surface to converge with for
+ * EITHER vendor (`escalation-loop.ts`'s `countedFingerprints` is an
+ * in-memory rate-cap backstop, never read back as a count). So this file is
+ * a new one for Codex, using the same `/health`-field + journal-marker
+ * surface convention `credentialDeathAlert`
  * (`src/agents/login-expired-alert.ts`) already established.
  *
  * EPISODE, NOT POLL: `scanPendingCodexApprovals` has no push/hook API the way
@@ -41,9 +33,7 @@
  * would count POLLS. Instead, `onScan` tracks the fingerprint each pane was
  * last seen showing and increments a fingerprint's aggregate count only when
  * a pane's tracked fingerprint actually CHANGES (no entry -> some fingerprint,
- * or fingerprint A -> fingerprint B) — the same "new episode" test
- * `markManagedSessionStalled` uses (`prior?.fp === fp` short-circuits a
- * repeat). A pane that stops appearing in `unrecognised` (dialog cleared,
+ * or fingerprint A -> fingerprint B). A pane that stops appearing in `unrecognised` (dialog cleared,
  * pane gone) has its tracked fingerprint forgotten, so the SAME fingerprint
  * reappearing later on that pane is correctly counted as a new episode, not
  * folded into the old one.
@@ -95,8 +85,7 @@ export function createCodexDialogSightingsTracker(deps: CodexDialogSightingsDeps
   // Which fingerprint each pane was last seen showing — the episode-dedup
   // state. A pane absent from this poll's `unrecognised` list is dropped
   // from this map at the end of `onScan`, so its next sighting (even of the
-  // SAME fingerprint) reads as a new episode, matching
-  // `managedSessionStalled`'s clear-then-remark behaviour.
+  // SAME fingerprint) reads as a new episode.
   const paneFingerprints = new Map<string, string>();
   // Persistent aggregate, keyed by fingerprint — never cleared by a pane
   // going away; this is the count itself.

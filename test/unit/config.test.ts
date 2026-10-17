@@ -94,7 +94,7 @@ describe("loadConfig", () => {
     expect(c.providerEnabled).toEqual({
       "jira-work": true, "jira-idea": true, "jira-project": true, "confluence-page": true,
       "github-issue": true, "github-pr": true, "zendesk-ticket": true, filesystem: true,
-      "jira-component": true,
+      "jira-component": true, "trello-card": true,
     });
   });
   test("FACTORY-66 review round 2: a provider can be individually disabled while its credentials, siblings and BUTCHR_ATLASSIAN_ENABLED all stay untouched — the gap a single combined flag left", () => {
@@ -530,163 +530,30 @@ describe("loadConfig", () => {
     expect(describeConfig(loadConfig(base, noRead))).toContain("maxAgents=8");
   });
 
-  // BUTCHR-395/S4: rocketchat is optional, same all-or-nothing shape as github.
-  test("rocketchat is absent when any of the three required settings is missing", () => {
-    expect(loadConfig(base, noRead).rocketchat).toBeUndefined();
-    expect(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x" }, noRead).rocketchat).toBeUndefined();
-    expect(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1" }, noRead).rocketchat).toBeUndefined();
-    expect(loadConfig({ ...base, ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" }, noRead).rocketchat).toBeUndefined();
-  });
-  test("rocketchat is populated when all three are set; adminTokenFile is the PATH, never file contents (loadConfig's readFile is never called for it)", () => {
-    const c = loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x/", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/etc/rc-token" }, noRead);
-    expect(c.rocketchat).toMatchObject({ url: "https://chat.x/", adminUserId: "a1", adminTokenFile: "/etc/rc-token", userCapThreshold: 45, temporaryAccountCapThreshold: 8 });
-    expect(c.rocketchat?.managedPrefix).toBeUndefined();
-    expect(c.rocketchat?.tokenDir).toEndWith(".butchr-rc-tokens");
-    expect(c.rocketchat?.nexusManifestFile).toEndWith(".butchr-rc-nexus-manifest.json");
-  });
-  test("userCapThreshold defaults to 45, honours ROCKETCHAT_USER_CAP_THRESHOLD, and rejects anything not a positive integer below 50", () => {
-    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
-    expect(loadConfig({ ...base, ...rc }, noRead).rocketchat?.userCapThreshold).toBe(45);
-    expect(loadConfig({ ...base, ...rc, ROCKETCHAT_USER_CAP_THRESHOLD: "30" }, noRead).rocketchat?.userCapThreshold).toBe(30);
-    for (const bad of ["0", "-1", "50", "51", "nope", "3.5"]) {
-      expect(() => loadConfig({ ...base, ...rc, ROCKETCHAT_USER_CAP_THRESHOLD: bad }, noRead)).toThrow(/ROCKETCHAT_USER_CAP_THRESHOLD/);
-    }
-  });
-  // BUTCHR-412 item 5 (BUTCHR-391 comment 23999): a separate, tighter cap on concurrently-existing TEMPORARY accounts alone.
-  test("temporaryAccountCapThreshold defaults to 8, honours ROCKETCHAT_TEMPORARY_CAP_THRESHOLD, and rejects a non-positive/non-integer value", () => {
-    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
-    expect(loadConfig({ ...base, ...rc }, noRead).rocketchat?.temporaryAccountCapThreshold).toBe(8);
-    expect(loadConfig({ ...base, ...rc, ROCKETCHAT_TEMPORARY_CAP_THRESHOLD: "3" }, noRead).rocketchat?.temporaryAccountCapThreshold).toBe(3);
-    for (const bad of ["0", "-1", "nope", "3.5"]) {
-      expect(() => loadConfig({ ...base, ...rc, ROCKETCHAT_TEMPORARY_CAP_THRESHOLD: bad }, noRead)).toThrow(/ROCKETCHAT_TEMPORARY_CAP_THRESHOLD/);
-    }
-  });
-  test("tokenDir/nexusManifestFile/managedPrefix are configurable and never crash when absent", () => {
-    const rc = { ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/t" };
-    const c = loadConfig({ ...base, ...rc, ROCKETCHAT_TOKEN_DIR: "/var/lib/butchr/rc-tokens", ROCKETCHAT_NEXUS_MANIFEST_FILE: "/var/lib/butchr/nexus.json", ROCKETCHAT_MANAGED_PREFIX: "acme_" }, noRead);
-    expect(c.rocketchat?.tokenDir).toBe("/var/lib/butchr/rc-tokens");
-    expect(c.rocketchat?.nexusManifestFile).toBe("/var/lib/butchr/nexus.json");
-    expect(c.rocketchat?.managedPrefix).toBe("acme_");
-  });
-  test("a stray ROCKETCHAT_USER_CAP_THRESHOLD never crashes a daemon that otherwise has no Rocket.Chat config", () => {
-    expect(() => loadConfig({ ...base, ROCKETCHAT_USER_CAP_THRESHOLD: "not-a-number-at-all" }, noRead)).not.toThrow();
-    expect(loadConfig({ ...base, ROCKETCHAT_USER_CAP_THRESHOLD: "not-a-number-at-all" }, noRead).rocketchat).toBeUndefined();
-  });
-  test("describeConfig reports rocketchat as disabled or its URL/admin id/thresholds, and never reads (or could leak) the token file", () => {
-    expect(describeConfig(loadConfig(base, noRead))).toContain("rocketchat=disabled");
-    const d = describeConfig(loadConfig({ ...base, ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/etc/rc-token" }, noRead));
-    expect(d).toContain("url=https://chat.x");
-    expect(d).toContain("userCapThreshold=45");
-    expect(d).toContain("temporaryAccountCapThreshold=8");
-    expect(d).toContain("adminTokenFile=/etc/rc-token");
-  });
-
-  // FACTORY-369: a SEPARATE identity from `rocketchat` above — same
-  // all-or-nothing shape, but its own env vars.
-  describe("managedEscalationRocketChat (FACTORY-369)", () => {
-    test("absent when any of the three required settings is missing", () => {
-      expect(loadConfig(base, noRead).managedEscalationRocketChat).toBeUndefined();
-      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x" }, noRead).managedEscalationRocketChat).toBeUndefined();
-      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1" }, noRead).managedEscalationRocketChat).toBeUndefined();
-    });
-    test("populated when all three are set; room defaults to team-admin", () => {
-      const c = loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token" }, noRead);
-      expect(c.managedEscalationRocketChat).toEqual({ url: "https://chat.x", adminUserId: "a1", adminTokenFile: "/etc/ta-token", room: "team-admin" });
-    });
-    test("BUTCHR_TEAM_ADMIN_ROOM overrides the default room", () => {
-      const c = loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token", BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead);
-      expect(c.managedEscalationRocketChat?.room).toBe("ops-alerts");
-    });
-    test("a stray BUTCHR_TEAM_ADMIN_ROOM never crashes a daemon that otherwise has no team-admin config", () => {
-      expect(() => loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead)).not.toThrow();
-      expect(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts" }, noRead).managedEscalationRocketChat).toBeUndefined();
-    });
-    test("describeConfig reports it disabled or its url/admin id/room, and never reads (or could leak) the token file", () => {
-      expect(describeConfig(loadConfig(base, noRead))).toContain("managedEscalationRocketChat=disabled");
-      const d = describeConfig(loadConfig({ ...base, BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token" }, noRead));
-      expect(d).toContain("url=https://chat.x");
-      expect(d).toContain("room=team-admin");
-      expect(d).toContain("adminTokenFile=/etc/ta-token");
-    });
-  });
-
-  // FACTORY-609 (Part B): always present, independent of the credential
-  // gate above — defaults to the director's own routing (FACTORY-607
-  // comment 28688), overridable per-value via env vars.
-  describe("managedEscalationRouting (FACTORY-609)", () => {
-    test("defaults match the director's routing (FACTORY-607 comment 28688) when nothing is set", () => {
-      const c = loadConfig(base, noRead);
-      expect(c.managedEscalationRouting).toEqual({
-        normalMention: "@admin-assembly", normalRoom: "team-admin",
-        assemblyMention: "@manager-factory", assemblyRoom: "team-engineering",
-        directorMention: "@director", directorRoom: "team-engineering",
-        tier2Minutes: 10, tier3Minutes: 20,
-      });
-    });
-
-    test("every value is independently overridable via its own env var", () => {
-      const c = loadConfig({
-        ...base,
-        BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION: "@custom-answerer",
-        BUTCHR_TEAM_ADMIN_ROOM: "custom-admin-room",
-        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION: "@custom-manager",
-        BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM: "custom-eng-room",
-        BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION: "@custom-director",
-        BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM: "custom-director-room",
-        BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "7",
-        BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "15",
-      }, noRead);
-      expect(c.managedEscalationRouting).toEqual({
-        normalMention: "@custom-answerer", normalRoom: "custom-admin-room",
-        assemblyMention: "@custom-manager", assemblyRoom: "custom-eng-room",
-        directorMention: "@custom-director", directorRoom: "custom-director-room",
-        tier2Minutes: 7, tier3Minutes: 15,
-      });
-    });
-
-    test("rejects a non-positive or non-numeric tier delay", () => {
-      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "0" }, noRead)).toThrow();
-      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "not-a-number" }, noRead)).toThrow();
-    });
-
-    test("rejects tier3 <= tier2 — the director's own ordering is a correctness constraint, not a style preference", () => {
-      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "20" }, noRead)).toThrow();
-      expect(() => loadConfig({ ...base, BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES: "20", BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES: "10" }, noRead)).toThrow();
-    });
-
-    test("describeConfig reports the full routing table", () => {
-      const d = describeConfig(loadConfig(base, noRead));
-      expect(d).toContain("managedEscalationRouting=");
-      expect(d).toContain("@admin-assembly");
-      expect(d).toContain("@manager-factory");
-      expect(d).toContain("@director");
-      expect(d).toContain("tier2Minutes=10");
-      expect(d).toContain("tier3Minutes=20");
-    });
+  // Rocket.Chat support is gone. Every variable it used to read is now
+  // ignored — including values that used to stop startup — so an older
+  // `.env` still starts the daemon unchanged.
+  test("the removed Rocket.Chat and ops-alert-room env vars are ignored, even with values that used to be refused", () => {
+    const legacy = {
+      ROCKETCHAT_URL: "https://chat.x", ROCKETCHAT_ADMIN_USER_ID: "a1", ROCKETCHAT_ADMIN_TOKEN_FILE: "/etc/rc-token",
+      ROCKETCHAT_USER_CAP_THRESHOLD: "not-a-number-at-all", ROCKETCHAT_TEMPORARY_CAP_THRESHOLD: "-1",
+      ROCKETCHAT_TOKEN_DIR: "/x", ROCKETCHAT_NEXUS_MANIFEST_FILE: "/y", ROCKETCHAT_MANAGED_PREFIX: "acme_",
+      BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL: "https://chat.x", BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID: "a1", BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE: "/etc/ta-token",
+      BUTCHR_TEAM_ADMIN_ROOM: "ops-alerts", BUTCHR_OPS_ALERT_ROOM: "team-engineering", BUTCHR_OPS_ALERT_MENTION: "@manager-factory",
+    };
+    const withLegacy = loadConfig({ ...base, ...legacy } as typeof base, noRead);
+    expect(withLegacy).toEqual(loadConfig(base, noRead));
+    expect(Object.keys(withLegacy)).not.toContain("rocketchat");
+    expect(Object.keys(withLegacy)).not.toContain("managedEscalationRocketChat");
   });
 
   describe("opsAlert (FACTORY-630)", () => {
-    test("defaults to the director's own room, mention and dedup window, with no env set at all", () => {
-      const c = loadConfig(base, noRead);
-      expect(c.opsAlert).toEqual({ room: "team-admin", mention: "@director", dedupMinutes: 60 });
+    test("defaults to the director's one-hour dedup window, with no env set at all", () => {
+      expect(loadConfig(base, noRead).opsAlert).toEqual({ dedupMinutes: 60 });
     });
 
-    test("is ALWAYS present, even with no Rocket.Chat posting credential — the [butchr:ops-alert] journal line needs these values regardless of whether posting is configured", () => {
-      const c = loadConfig(base, noRead);
-      expect(c.managedEscalationRocketChat).toBeUndefined();
-      expect(c.opsAlert.room).toBe("team-admin");
-    });
-
-    test("each value is overridable", () => {
-      const c = loadConfig({ ...base, BUTCHR_OPS_ALERT_ROOM: "team-engineering", BUTCHR_OPS_ALERT_MENTION: "@manager-factory", BUTCHR_OPS_ALERT_DEDUP_MINUTES: "15" }, noRead);
-      expect(c.opsAlert).toEqual({ room: "team-engineering", mention: "@manager-factory", dedupMinutes: 15 });
-    });
-
-    test("a literal `none` mention means post with NO mention — an empty env var cannot express that, since it is indistinguishable from unset", () => {
-      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "none" }, noRead).opsAlert.mention).toBe("");
-      // Empty/whitespace is UNSET, and so takes the default rather than
-      // silently producing an unmentioned room nobody asked for.
-      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_MENTION: "   " }, noRead).opsAlert.mention).toBe("@director");
+    test("the window is overridable", () => {
+      expect(loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "15" }, noRead).opsAlert).toEqual({ dedupMinutes: 15 });
     });
 
     test("rejects a non-positive or non-numeric dedup window rather than silently disabling dedup", () => {
@@ -695,11 +562,10 @@ describe("loadConfig", () => {
       expect(() => loadConfig({ ...base, BUTCHR_OPS_ALERT_DEDUP_MINUTES: "soon" }, noRead)).toThrow();
     });
 
-    test("describeConfig names the room, the mention, the window, and says when no posting credential exists", () => {
+    test("describeConfig names the window and nothing about Rocket.Chat", () => {
       const d = describeConfig(loadConfig(base, noRead));
-      expect(d).toContain("opsAlert=#team-admin");
-      expect(d).toContain("dedupMinutes=60");
-      expect(d).toContain("NO posting credential");
+      expect(d).toContain("opsAlertDedupMinutes=60");
+      for (const gone of ["rocketchat=", "managedEscalationRocketChat=", "team-admin", "@director", "posting credential"]) expect(d).not.toContain(gone);
     });
   });
 });

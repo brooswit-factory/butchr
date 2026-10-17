@@ -10,7 +10,6 @@
  * scopes itself to `jira-work` agents, so neither loop can stop the other's.
  */
 import type { Herd } from "../agents/herd.js";
-import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import { githubIssueNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { GithubIssueClient } from "../resources/github-issue.js";
@@ -45,8 +44,6 @@ export interface GithubIssueLoopDeps {
   reserveAdmission?: (ids: readonly string[]) => void;
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
-  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment (src/daemon/loop.ts) — threaded straight through. Optional; omitted, no account lifecycle runs. */
-  account?: AccountLifecycleHooks;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -98,7 +95,6 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
-    ...(deps.account ? { account: deps.account } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? GITHUB_ISSUE_POLL_MS,
     onError: (e) => {

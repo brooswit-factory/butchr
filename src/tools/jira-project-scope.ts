@@ -33,7 +33,7 @@ import { Refusal } from "./outcome.js";
 /**
  * The ONLY tool names a `jira-project` caller may ever reach. Every other
  * registered tool — `jira_create_issue`, `jira_assign`, `jira_set_priority`,
- * `jira_link_issues`, `add_link`, `remove_link`, `freeze_session`,
+ * `jira_link_issues`, `freeze_session`,
  * `confluence_create_page`, `confluence_update_page`, `set_doc`, every
  * boss/worker relationship verb, and anything added later — is refused for
  * this caller by `restrictJiraProjectManagers` below purely by NOT being in

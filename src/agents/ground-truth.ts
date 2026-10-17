@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
 import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import type { BuildIdentity } from "./build-identity.js";
 import { renderBuildCurrencyLines, type CurrencyVerdict } from "./build-currency.js";
 
@@ -18,13 +19,17 @@ import { renderBuildCurrencyLines, type CurrencyVerdict } from "./build-currency
  * narrows on `kind !== "none"` and reads `.unit`/`.journalctl` (`toBuildReport`,
  * `scripts/audit-alias-calls.ts`'s `journalInvocationFor`) keeps compiling
  * and behaving sensibly with no changes of its own.
- * `none` means neither a systemd unit nor a Windows scheduled task was
- * detected — an honest "no journal to read", never a guessed one.
+ * On macOS, `launchd` is the launchd job running this process (`unit` is
+ * its label, `journalctl` a `tail -f` of the job's log file), read back from
+ * launchd itself — see `parseLaunchdPrint`.
+ * `none` means none of these was detected — an honest "no journal to read",
+ * never a guessed one.
  */
 export type SystemdInfo =
   | { readonly kind: "user"; readonly unit: string; readonly journalctl: string }
   | { readonly kind: "system"; readonly unit: string; readonly journalctl: string }
   | { readonly kind: "windows-task"; readonly unit: string; readonly journalctl: string }
+  | { readonly kind: "launchd"; readonly unit: string; readonly journalctl: string }
   | { readonly kind: "none" };
 
 /**
@@ -70,6 +75,50 @@ export function parseWindowsTaskEnv(env: Readonly<Record<string, string | undefi
   return { kind: "windows-task", unit: taskName, journalctl: `Get-Content -Path "${logFile}" -Tail 200 -Wait` };
 }
 
+/** A launchd job label as launchd puts it in `XPC_SERVICE_NAME` (reverse-DNS style). */
+const LAUNCHD_LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/**
+ * Parse `launchctl print <domain>/<label>` into a `SystemdInfo`. Pure — takes
+ * the printed text — for the same testability reason as `parseCgroup`.
+ * launchd sets `XPC_SERVICE_NAME` to the job's label for every process the
+ * job starts, children included, so the label alone proves nothing: the
+ * job's top-level `pid = …` must be THIS process. Its log is the job's
+ * `stderr path` (where Bun writes `console.error`), else its `stdout path`.
+ * `journalctl` is built for a human tailing the log live, like the Windows
+ * case's `Get-Content … -Wait`; `readDaemonLogs` rebuilds a bounded one-shot
+ * read from the path inside it.
+ */
+export function parseLaunchdPrint(label: string, printed: string, ownPid: number): SystemdInfo {
+  if (!LAUNCHD_LABEL_RE.test(label)) return { kind: "none" };
+  const pid = /^\tpid = (\d+)\s*$/m.exec(printed)?.[1];
+  if (pid === undefined || Number(pid) !== ownPid) return { kind: "none" };
+  const path = (/^\tstderr path = (.+)$/m.exec(printed) ?? /^\tstdout path = (.+)$/m.exec(printed))?.[1]?.trim();
+  if (!path || !path.startsWith("/") || path === "/dev/null" || path.includes('"')) return { kind: "none" };
+  return { kind: "launchd", unit: label, journalctl: `tail -n 200 -f "${path}"` };
+}
+
+/** Asked once per process: the job running a process can't change under it. */
+let launchdInfo: SystemdInfo | undefined;
+
+function readLaunchdInfo(): SystemdInfo {
+  if (launchdInfo) return launchdInfo;
+  const label = process.env.XPC_SERVICE_NAME?.trim();
+  const uid = process.getuid?.();
+  launchdInfo = { kind: "none" };
+  // A process launchd didn't start as a job sees "0" here, or nothing.
+  if (!label || label === "0" || !LAUNCHD_LABEL_RE.test(label) || uid === undefined) return launchdInfo;
+  // A per-user agent lives in gui/<uid>; a LaunchDaemon in system/.
+  for (const target of [`gui/${uid}/${label}`, `system/${label}`]) {
+    try {
+      const printed = execFileSync("launchctl", ["print", target], { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] });
+      launchdInfo = parseLaunchdPrint(label, printed, process.pid);
+      if (launchdInfo.kind !== "none") break;
+    } catch { /* not a job in this domain */ }
+  }
+  return launchdInfo;
+}
+
 function readSystemdInfo(): SystemdInfo {
   // Windows has no cgroup to read at all — `readFileSync("/proc/self/cgroup", ...)`
   // would just throw ENOENT there, so branch explicitly rather than relying
@@ -77,6 +126,7 @@ function readSystemdInfo(): SystemdInfo {
   if (process.platform === "win32") {
     return parseWindowsTaskEnv(process.env);
   }
+  if (process.platform === "darwin") return readLaunchdInfo();
   try {
     return parseCgroup(readFileSync("/proc/self/cgroup", "utf8"));
   } catch {

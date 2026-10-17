@@ -35,6 +35,17 @@ export function isTokenProvidedByEnvironment(env: Record<string, string | undefi
   return !!env.ATLASSIAN_TOKEN?.trim() || !!env.ATLASSIAN_TOKEN_FILE?.trim();
 }
 
+/**
+ * local/ui — true iff the env supplies the token as a LITERAL value
+ * (`ATLASSIAN_TOKEN`, with no `ATLASSIAN_TOKEN_FILE`, which `loadConfig`
+ * would prefer). That is the one case rotation must refuse: nothing the web
+ * writes could take effect. A token FILE named by the env is rotated in
+ * place, since that file is exactly what the next start reads.
+ */
+export function isTokenLiteralFromEnvironment(env: Record<string, string | undefined>): boolean {
+  return !env.ATLASSIAN_TOKEN_FILE?.trim() && !!env.ATLASSIAN_TOKEN?.trim();
+}
+
 export interface JiraWriteDeps {
   setupCode: SetupCodeManager;
   io?: JiraTokenWriteIo;
@@ -45,6 +56,8 @@ export interface JiraWriteDeps {
   /** `../setup/jira-identity-file.ts`'s own IO — overridable for tests, same discipline as `io` above. */
   identityIo?: JiraIdentityFileIo;
   identityPath?: string;
+  /** local/ui — the destination safety check (`../setup/secret-target.ts`'s `checkSecretDestination`), run before the setup code is spent. The daemon always binds it. */
+  checkDestination?: (path: string) => { ok: true } | { ok: false; error: string };
 }
 
 /**
@@ -83,8 +96,9 @@ function outcomeToResponse(outcome: JiraTokenWriteOutcome, identity?: { persiste
 
 /**
  * The ONE entry point both routes call. `requireEnvCheck: true` (rotation)
- * also refuses with 409 when the daemon's own process env already supplies
- * the token — not the request's concern to override. `requireEnvCheck:
+ * also refuses with 409 when the daemon's own process env supplies the token
+ * as a literal (local/ui: an env-named token FILE is rotated in place) — not
+ * the request's concern to override. `requireEnvCheck:
  * false` (initial setup) skips that check entirely: setup mode exists
  * precisely because no env-provided token exists yet.
  */
@@ -93,9 +107,14 @@ export async function handleJiraTokenWrite(
   deps: JiraWriteDeps,
   opts: { requireEnvCheck: boolean; rateGate?: RateGate },
 ): Promise<JiraWriteRequestOutcome> {
-  if (opts.requireEnvCheck && isTokenProvidedByEnvironment(deps.env ?? {})) {
+  // local/ui: only a literal ATLASSIAN_TOKEN refuses; an env-named token file is rotated in place (see `isTokenLiteralFromEnvironment`).
+  if (opts.requireEnvCheck && isTokenLiteralFromEnvironment(deps.env ?? {})) {
     return { ok: false, status: 409, body: { error: "provided by environment" } };
   }
+
+  const path = deps.path ?? jiraTokenFilePath();
+  const destination = deps.checkDestination?.(path);
+  if (destination && !destination.ok) return { ok: false, status: 400, body: { error: destination.error } };
 
   const codeCheck = deps.setupCode.check(input.setupCode);
   if (!codeCheck.ok) {
@@ -116,7 +135,6 @@ export async function handleJiraTokenWrite(
     return { ok: false, status: 400, body: { error: "token is required" } };
   }
 
-  const path = deps.path ?? jiraTokenFilePath();
   const outcome = await writeJiraToken({ site: input.site, email: input.email, token: input.token }, path, deps.io, deps.fetchFn);
   if (!outcome.ok) return outcomeToResponse(outcome);
 

@@ -22,7 +22,7 @@ export interface BridgeOptions {
 export async function startBridge(url: URL, identity: string | undefined, options: BridgeOptions = {}) {
   if (!["http:", "https:"].includes(url.protocol)) throw new Error("MCP bridge requires an HTTP URL");
   if (identity === undefined) {
-    if (!/^(github-issue|github-pr|jira-idea|zendesk-ticket):/.test(options.agent ?? "")) throw new Error("MCP bridge requires an issue identity unless it bridges a github-issue, github-pr, jira-idea or zendesk-ticket agent");
+    if (!/^(github-issue|github-pr|jira-idea|zendesk-ticket|trello-card):/.test(options.agent ?? "")) throw new Error("MCP bridge requires an issue identity unless it bridges a github-issue, github-pr, jira-idea, trello-card or zendesk-ticket agent");
   } else if (!identity.trim() || identity !== identity.trim() || /[^\x21-\x7e]/.test(identity)) {
     throw new Error("MCP bridge requires a nonempty issue identity without whitespace");
   }

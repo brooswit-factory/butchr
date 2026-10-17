@@ -187,6 +187,99 @@ export async function pollGithubLink(item: { kind: "github-issue" | "github-pr";
 }
 
 // ---------------------------------------------------------------------------
+// local/ui — a ticket's own pull request
+// ---------------------------------------------------------------------------
+
+/** Starts every `pollGithubPullActivity` fingerprint, so a baseline some other poller left for the same target (a bare ETag) is never misread as one. */
+const PULL_ACTIVITY_PREFIX = "pr-activity/1";
+
+/** How many submitted reviews one request reads — far more than any one PR collects, so a new one always changes the count. */
+const PULL_REVIEWS_PER_PAGE = 100;
+
+/** A ticket PR's comparable activity: conversation comments, inline review comments and submitted reviews, plus the ETag the next conditional GET sends. */
+export interface PullActivity {
+  comments: number;
+  reviewComments: number;
+  reviews: number;
+  etag: string;
+}
+
+export function formatPullActivityFingerprint(a: PullActivity): string {
+  return [PULL_ACTIVITY_PREFIX, a.comments, a.reviewComments, a.reviews, a.etag].join("\t");
+}
+
+/** Inverse of `formatPullActivityFingerprint`; `null` for anything else (including a bare ETag from `pollGithubLink`). */
+export function parsePullActivityFingerprint(fingerprint: string | null | undefined): PullActivity | null {
+  if (!fingerprint) return null;
+  const parts = fingerprint.split("\t");
+  if (parts.length < 5 || parts[0] !== PULL_ACTIVITY_PREFIX) return null;
+  const [comments, reviewComments, reviews] = parts.slice(1, 4).map(Number) as [number, number, number];
+  if (![comments, reviewComments, reviews].every(isCount)) return null;
+  return { comments, reviewComments, reviews, etag: parts.slice(4).join("\t") };
+}
+
+function isCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * local/ui — polls a ticket's OWN pull request (a `LinkedItem` with
+ * `origin: "ticket-pr"`) for conversation activity. `GET pulls/{n}` goes out
+ * conditionally on the prior ETag, so an unchanged PR answers 304 and costs
+ * nothing against GitHub's rate limit; a 200 also reads the PR's submitted
+ * reviews. The fingerprint carries the PR's `comments` and
+ * `review_comments` counts and its review count, plus the ETag.
+ * Linked-change eventing compares only the counts: the ETag moves without
+ * anyone saying anything when GitHub recomputes `mergeable` after a push to
+ * the base branch, when the author pushes commits, or when a label changes,
+ * and those carry the ETag forward silently instead of waking the agent.
+ * Same verdict discipline as `pollGithubLink`: 304 not-modified, 404/403
+ * unreadable, a rate-limited 403 or anything transient `"error"`.
+ */
+export async function pollGithubPullActivity(target: string, priorFingerprint: string | null, deps: GithubConditionalDeps): Promise<PollVerdict> {
+  const ref = parseGithubIssueRef(target);
+  if (!ref) return { status: "unreadable" };
+  const base = `https://api.github.com/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`;
+  const priorEtag = parsePullActivityFingerprint(priorFingerprint)?.etag;
+  const timeoutMs = deps.timeoutMs ?? GITHUB_TIMEOUT_MS;
+  const get = (url: string, etag?: string): Promise<Response> =>
+    withTimeout(deps.fetchImpl(url, { headers: { ...ghHeaders(deps.token), ...(etag ? { "if-none-match": etag } : {}) }, signal: AbortSignal.timeout(timeoutMs) }), timeoutMs);
+  let res: Response;
+  try {
+    res = await get(base, priorEtag || undefined);
+  } catch {
+    return { status: "error" };
+  }
+  if (res.status === 304) { await drain(res); return { status: "not-modified" }; }
+  if (res.status === 403 && isGithubRateLimited(res)) { await drain(res); return { status: "error" }; }
+  if (res.status === 404 || res.status === 403) { await drain(res); return { status: "unreadable", httpStatus: res.status }; }
+  if (!res.ok) { await drain(res); return { status: "error" }; }
+  const etag = res.headers.get("etag") ?? "";
+  let pull: { comments?: unknown; review_comments?: unknown };
+  try {
+    pull = (await res.json()) as typeof pull;
+  } catch {
+    return { status: "error" };
+  }
+  if (!isCount(pull.comments) || !isCount(pull.review_comments)) return { status: "error" };
+  let reviewsRes: Response;
+  try {
+    reviewsRes = await get(`${base}/reviews?per_page=${PULL_REVIEWS_PER_PAGE}`);
+  } catch {
+    return { status: "error" };
+  }
+  if (!reviewsRes.ok) { await drain(reviewsRes); return { status: "error" }; }
+  let reviews: unknown;
+  try {
+    reviews = await reviewsRes.json();
+  } catch {
+    return { status: "error" };
+  }
+  if (!Array.isArray(reviews)) return { status: "error" };
+  return { status: "ok", fingerprint: formatPullActivityFingerprint({ comments: pull.comments, reviewComments: pull.review_comments, reviews: reviews.length, etag }) };
+}
+
+// ---------------------------------------------------------------------------
 // General webpage
 // ---------------------------------------------------------------------------
 

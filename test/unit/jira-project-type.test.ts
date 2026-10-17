@@ -4,7 +4,7 @@ import type { Rule } from "../../src/rules/rules.js";
 import type { JiraProject } from "../../src/resources/jira-project.js";
 
 function rule(over: Partial<Rule> & Pick<Rule, "id">): Rule {
-  return { enabled: true, resourceProvider: "jira-project", query: "{}", brief: "b", execution: "singleton", account: "none", role: "worker", ...over };
+  return { enabled: true, resourceProvider: "jira-project", query: "{}", brief: "b", execution: "singleton", role: "worker", ...over };
 }
 
 function project(key: string): JiraProject {

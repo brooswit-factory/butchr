@@ -11,7 +11,7 @@ import type { ResourcesForUrlResponse } from "../resources/resource-lookup.js";
 import { checkExtensionOrigin, preflightExtensionOrigin, type OriginGuardDeps } from "./origin-guard.js";
 import { createOriginGuardLogger, type OriginGuardLogger } from "./origin-guard-log.js";
 import { checkDashboardOrigin, type DashboardOriginGuardDeps } from "./dashboard-origin-guard.js";
-import { buildRulesApiResponse, type RulesApiResponse } from "./rules-api.js";
+import { buildRulesApiResponse, redactSecretLike, type RulesApiResponse } from "./rules-api.js";
 import type { RulesFileState } from "../agents/query-agent-inventory.js";
 import type { RulesPreviewResult } from "./rules-preview.js";
 import { checkWriteGuard, cappedReadText, BODY_CAP_BYTES, CSRF_HEADER, type WriteGuardDeps, type WriteGuardRequest } from "./write-guard.js";
@@ -20,10 +20,6 @@ import type { CsrfTokenIssuer } from "./csrf.js";
 import { validateRuleFieldPatch, validateRuleCreateInput, type RuleFieldPatch, type RuleCreateInput } from "../rules/rules-write-registry.js";
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, type RuleFormCatalogEntry } from "../rules/rule-form-catalog.js";
 import type { RulesWriteOutcome, RulesPlanOutcome } from "../rules/rules-write.js";
-import type { SessionDefinitionsWriteOutcome } from "../resources/session-definitions-write.js";
-import type { LinksWriteOutcome } from "../resources/links-write.js";
-import type { FileLinksEntry } from "../resources/link-store.js";
-import { formatResourceRef } from "../resources/resource-ref.js";
 import { ptyAttachRefusalMessage, type PtyAttachResolution } from "../terminal/pty-attach.js";
 import { parseClientFrame, ptyTick, PTY_CLOSED_REASON, type PtyTickState } from "../terminal/pty-bridge.js";
 import { resolveWebRoot, serveStaticAsset, dashboardAppStatus, dashboardAppMissingResponse } from "./static-assets.js";
@@ -35,6 +31,8 @@ import { SettingProvidedByEnvironmentError } from "../settings/write-settings.js
 import type { DaemonRestartOutcome } from "./daemon-restart.js";
 import type { DaemonLogsResult } from "./daemon-logs.js";
 import type { SetupStatusResponse, JiraWriteRequestOutcome, RateGate } from "./setup-api.js";
+import type { GithubTokenWriteRequestOutcome, ProviderConnectionTestResult, ProviderSecretWriteRequestOutcome } from "./credentials-api.js";
+import type { GithubTestResult } from "./github-connection-test.js";
 import { validateStopRequestBody, validateAdoptRequestBody, validatePrioritizeRequestBody, type AgentWriteOutcome, type AdoptInput } from "../agents/agents-write.js";
 
 const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[path]!, { headers: { "content-type": "image/png", "cache-control": "public, max-age=86400" } });
@@ -92,13 +90,11 @@ export interface ViewDeps {
    */
   resourceLink: (key: string) => Promise<{ ok: true; url: string } | { ok: false; error: string }>;
   /**
-   * FACTORY-72 — every configured query agent (rules + managed-session
-   * definitions), whether or not it currently has a running agent. See
-   * `../agents/query-agent-inventory.ts` for the full shape and the reuse
-   * it's built from. Async (unlike `dashboard`/`header`) because it reads
-   * the managed-session definitions directory fresh each call (local disk,
-   * not a network round trip) — see that module's own top comment for why
-   * that I/O is unavoidable and acceptable here.
+   * FACTORY-72 — every configured rule, whether or not it currently has a
+   * running agent. See `../agents/query-agent-inventory.ts` for the full
+   * shape and the reuse it's built from. Returns a Promise (unlike
+   * `dashboard`/`header`), though building it does no I/O of its own: the
+   * rules and the dashboard snapshot it reads are already in hand.
    */
   configInventory: () => Promise<QueryAgentInventory>;
   /**
@@ -241,6 +237,13 @@ export interface ViewDeps {
    */
   rulesCatalog?: () => readonly RuleFormCatalogEntry[];
   /**
+   * local/ui — the shipped `@builtin:<name>` briefs, each with its fully
+   * resolved text, served alongside the catalog so the dashboard's rule
+   * editor can offer and preview them. Pure constants, no I/O. Absent
+   * means the catalog simply carries no `briefs` list.
+   */
+  builtinBriefs?: () => readonly { name: string; text: string }[];
+  /**
    * FACTORY-660: `GET /api/rules/:id/preview`'s own dry-run
    * (`./rules-preview.ts`'s `createRulesPreviewer`, built once by the
    * caller so its per-rule rate-limit state persists across requests —
@@ -293,50 +296,6 @@ export interface ViewDeps {
     create?: (input: RuleCreateInput, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     /** FACTORY-927 — `POST /api/rules`'s own report-only dry-run (`planRuleCreate`), used identically to a plain request without `confirm: true`: never writes, returns the dry-run scope and a fresh `planHash` to echo back. Optional — see `create`'s own doc comment immediately above. */
     planCreate?: (input: RuleCreateInput, confirm: boolean) => Promise<RulesPlanOutcome>;
-  };
-  /**
-   * FACTORY-667 (epic FACTORY-659, slice D1) — the session-definitions
-   * write orchestration (`../resources/session-definitions-write.ts`). Same
-   * "one function per route, already does its own etag/allowlist/confirm
-   * checks, returns a tagged outcome this file maps straight to a status +
-   * body" discipline as `rulesWrite` above. Optional: an omitted value
-   * makes every `/api/session-definitions/*` write route answer 503, same
-   * "endpoint disabled: not configured" discipline every other optional
-   * `ViewDeps` write dependency already follows.
-   */
-  sessionDefinitionsWrite?: {
-    fields: (name: string, patch: Record<string, unknown>, ifMatch: string, confirm: boolean) => Promise<SessionDefinitionsWriteOutcome>;
-    frozen: (name: string, frozen: boolean, ifMatch: string) => Promise<SessionDefinitionsWriteOutcome>;
-    undo: (backupId: string) => SessionDefinitionsWriteOutcome;
-  };
-  /**
-   * FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`'s
-   * own read: every owner->targets entry in the butchr-managed FILE link
-   * store (`../resources/link-store.ts`'s `listAllFileLinks`), parsed to
-   * `ResourceRef`s. No secrets here (links are never secret-shaped), so
-   * unlike `settings` below this is never redacted — but a link entry can
-   * name a local filesystem path, so the ROUTE itself still sits behind the
-   * dashboard-origin + same-UID peer guard (review round 1: a config-read
-   * this sensitive never gets a looser check just because `configInventory`
-   * happens to have none). Read FRESH every request, same discipline as
-   * `configInventory`/`rulesFileState`. Optional: an omitted value makes
-   * `GET /api/links` answer 503, never open with an empty list (which
-   * would look identical to "no links exist" and silently hide a
-   * misconfiguration).
-   */
-  linksRead?: () => FileLinksEntry[];
-  /**
-   * FACTORY-962 — the links write orchestration
-   * (`../resources/links-write.ts`). Same "one function per route, already
-   * does its own validation/idempotency/lock checks, returns a tagged
-   * outcome this file maps straight to a status + body" discipline as
-   * `sessionDefinitionsWrite` above. Optional: an omitted value makes every
-   * `/api/links/*` write route answer 503.
-   */
-  linksWrite?: {
-    add: (resource: string, target: string) => Promise<LinksWriteOutcome>;
-    remove: (resource: string, target: string) => Promise<LinksWriteOutcome>;
-    undo: (backupId: string) => LinksWriteOutcome;
   };
   /**
    * FACTORY-662 — records one audit line (accepted or rejected) for every
@@ -488,6 +447,25 @@ export interface ViewDeps {
    * simple choice here. Optional: absent means no flood protection.
    */
   jiraTokenWriteRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /**
+   * local/ui — `PUT /api/settings/github/token` (`./credentials-api.ts`'s
+   * `handleGithubTokenWrite`): same setup-code requirement and the SAME two
+   * secret-write budgets as the Jira token route (`jiraRateGate`).
+   */
+  githubTokenWrite?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<GithubTokenWriteRequestOutcome>;
+  /** local/ui — `POST /api/settings/github/test`: the daemon's own loaded GitHub token, never anything from the request (`./github-connection-test.ts`). */
+  githubTest?: () => Promise<GithubTestResult>;
+  /** local/ui — the GitHub test's own budget, same shape as `jiraTestRateLimit`. */
+  githubTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
+  /** local/ui — `PUT /api/settings/zendesk/token` (`./credentials-api.ts`'s `handleZendeskTokenWrite`): the GitHub token route's discipline exactly. */
+  zendeskTokenWrite?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
+  /** local/ui — `PUT /api/settings/trello/credentials` (`handleTrelloCredentialsWrite`): the key and token, tested and written as a pair. */
+  trelloCredentialsWrite?: (input: { apiKey: string; token: string; setupCode: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
+  /** local/ui — `POST /api/settings/zendesk/test` / `POST /api/settings/trello/test`: the running daemon's own loaded credentials, never anything from the request. */
+  zendeskTest?: () => Promise<ProviderConnectionTestResult>;
+  trelloTest?: () => Promise<ProviderConnectionTestResult>;
+  /** local/ui — one shared budget for the Zendesk and Trello connection tests, same shape as `githubTestRateLimit`. */
+  providerTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
   /**
    * FACTORY-666 — the agent-control orchestration (`../agents/agents-write.ts`).
    * One function per action; each already does its own ownership/reason/
@@ -876,7 +854,36 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       // either (`AGENT_ROLES`/the `"worker"` default both come straight off
       // `../rules/rules.js`'s own `Rule.role` doc comment, never a second,
       // hand-maintained copy).
-      return { harnesses: deps.rulesCatalog(), capacityRoles: { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT } };
+      return { harnesses: deps.rulesCatalog(), capacityRoles: { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT }, ...(deps.builtinBriefs ? { briefs: deps.builtinBriefs() } : {}) };
+    })
+    // local/ui — one rule's full definition for the dashboard's inline rule
+    // editor: the FULL brief (`GET /api/rules` deliberately carries only
+    // `briefExcerpt`) plus every other field as parsed, so the editor can
+    // show the ones it can't edit yet. `fields` goes through the same
+    // key-based secret redaction as `GET /api/rules`; the brief is returned
+    // verbatim so saving it back can never write a redaction marker. Same
+    // guards as `GET /api/rules`, in the same order, before any I/O.
+    .get("/api/rules/:id/details", async ({ params, request, server, set }) => {
+      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+      if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const client = server?.requestIP(request);
+      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
+      if (!deps.rulesFileState) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      let id: string;
+      try {
+        id = decodeURIComponent(params.id);
+      } catch {
+        set.status = 400;
+        return { error: "malformed rule id" };
+      }
+      set.headers["cache-control"] = "no-store";
+      const rulesFile = await deps.rulesFileState();
+      const rule = (rulesFile.rules as unknown as readonly ({ id: string; brief: string } & Record<string, unknown>)[]).find((r) => r.id === id);
+      if (!rule) { set.status = 404; return { error: "rule not found" }; }
+      const { brief, ...fields } = rule;
+      return { id: rule.id, brief, fields: redactSecretLike(fields) };
     })
     // FACTORY-660 — the rules page's read-only dry-run preview. A GET that
     // DOES do outbound Jira reads (SPEC CHANGE (b): counts and ticket keys
@@ -1058,6 +1065,155 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
       return result.body;
+    })
+    // local/ui — `PUT /api/settings/github/token`: the Jira token route's
+    // exact discipline (full write guard, the shared secret-write budgets,
+    // a fixed audit action that never carries the body's token or code).
+    .put("/api/settings/github/token", async ({ set, request, server, body }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "PUT /api/settings/github/token", action: "set github token", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.githubTokenWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const clientKey = server?.requestIP(request)?.address ?? "unresolved";
+      const rateGate = jiraRateGate(deps, clientKey);
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+        set.status = 400;
+        return { error: "body must be { token: string, setupCode: string }" };
+      }
+      const result = await deps.githubTokenWrite({ token: b.token, setupCode: b.setupCode }, rateGate);
+      auditOutcome(deps, { route: "PUT /api/settings/github/token", action: "set github token", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
+      set.status = result.status;
+      if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
+      return result.body;
+    })
+    // local/ui — `POST /api/settings/github/test`: mirrors `POST
+    // /api/settings/jira/test` (full write guard, its own rate limit, the
+    // "test" audit kind, no body of its own).
+    .post("/api/settings/github/test", async ({ set, request, server, body }) => {
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route: "POST /api/settings/github/test", action: "github-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.githubTest) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route: "POST /api/settings/github/test", action: "github-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      if (deps.githubTestRateLimit) {
+        const result = deps.githubTestRateLimit(server?.requestIP(request)?.address ?? "unresolved");
+        if (!result.ok) {
+          const error = `rate limited: too many GitHub connection tests — retry after ${result.retryAfterSeconds}s`;
+          auditOutcome(deps, { route: "POST /api/settings/github/test", action: "github-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error });
+          set.status = 429;
+          set.headers["retry-after"] = String(result.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const result = await deps.githubTest();
+      auditOutcome(deps, { route: "POST /api/settings/github/test", action: "github-test", ids: [], origin: request.headers.get("origin"), kind: "test" }, result.ok ? { ok: true } : { ok: false, error: result.error ?? "failed" });
+      return result;
+    })
+    // local/ui — `PUT /api/settings/zendesk/token`: the GitHub token route's
+    // exact discipline (full write guard, the shared secret-write budgets, a
+    // fixed audit action that never carries the body's token or code).
+    .put("/api/settings/zendesk/token", async ({ set, request, server, body }) => {
+      const route = "PUT /api/settings/zendesk/token";
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route, action: "set zendesk token", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.zendeskTokenWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const rateGate = jiraRateGate(deps, server?.requestIP(request)?.address ?? "unresolved");
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+        set.status = 400;
+        return { error: "body must be { token: string, setupCode: string }" };
+      }
+      const result = await deps.zendeskTokenWrite({ token: b.token, setupCode: b.setupCode }, rateGate);
+      auditOutcome(deps, { route, action: "set zendesk token", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
+      set.status = result.status;
+      if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
+      return result.body;
+    })
+    // local/ui — `PUT /api/settings/trello/credentials`: the same, for the
+    // Trello API key and token, which are tested and written as a pair.
+    .put("/api/settings/trello/credentials", async ({ set, request, server, body }) => {
+      const route = "PUT /api/settings/trello/credentials";
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route, action: "set trello credentials", ids: [], origin: request.headers.get("origin") }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!deps.trelloCredentialsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const rateGate = jiraRateGate(deps, server?.requestIP(request)?.address ?? "unresolved");
+      const bad = bodyProblem(body);
+      if (bad) { set.status = bad.status; return { error: bad.error }; }
+      const b = body as Record<string, unknown>;
+      if (typeof b.apiKey !== "string" || typeof b.token !== "string" || typeof b.setupCode !== "string") {
+        set.status = 400;
+        return { error: "body must be { apiKey: string, token: string, setupCode: string }" };
+      }
+      const result = await deps.trelloCredentialsWrite({ apiKey: b.apiKey, token: b.token, setupCode: b.setupCode }, rateGate);
+      auditOutcome(deps, { route, action: "set trello credentials", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
+      set.status = result.status;
+      if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
+      return result.body;
+    })
+    // local/ui — `POST /api/settings/zendesk/test` and `POST
+    // /api/settings/trello/test`: mirror `POST /api/settings/github/test`
+    // (full write guard, a rate limit, the "test" audit kind, no body).
+    .post("/api/settings/:provider/test", async ({ params, set, request, server, body }) => {
+      const provider = params.provider;
+      const run = provider === "zendesk" ? deps.zendeskTest : provider === "trello" ? deps.trelloTest : undefined;
+      if (provider !== "zendesk" && provider !== "trello") { set.status = 404; return { error: "NOT_FOUND" }; }
+      const route = `POST /api/settings/${provider}/test`;
+      const action = `${provider}-test`;
+      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
+      if (!guard.ok) {
+        auditOutcome(deps, { route, action, ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: guard.reason });
+        set.status = guard.status;
+        return guard.body;
+      }
+      if (!run) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
+      const bad = bodyProblem(body);
+      if (bad) {
+        auditOutcome(deps, { route, action, ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error: bad.error });
+        set.status = bad.status;
+        return { error: bad.error };
+      }
+      if (deps.providerTestRateLimit) {
+        const limited = deps.providerTestRateLimit(server?.requestIP(request)?.address ?? "unresolved");
+        if (!limited.ok) {
+          const error = `rate limited: too many connection tests — retry after ${limited.retryAfterSeconds}s`;
+          auditOutcome(deps, { route, action, ids: [], origin: request.headers.get("origin"), kind: "test" }, { ok: false, error });
+          set.status = 429;
+          set.headers["retry-after"] = String(limited.retryAfterSeconds);
+          return { error };
+        }
+      }
+      const result = await run();
+      auditOutcome(deps, { route, action, ids: [], origin: request.headers.get("origin"), kind: "test" }, result.ok ? { ok: true } : { ok: false, error: result.error });
+      return result;
     })
     // FACTORY-662 item 1: `GET /api/session` — mints/hands out this
     // process's one CSRF token. The Origin/Host/peer-uid guard already ran
@@ -1314,169 +1470,6 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
       const outcome = deps.rulesWrite.undo(backupId);
       auditOutcome(deps, { route: "POST /api/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-667 (epic FACTORY-659, slice D1) — `POST
-    // /api/session-definitions/:name/fields`: the low-risk/risky-confirm-
-    // gated field patch (`modelPower`/`effort`/`permissionMode`/
-    // `lizardMode`). B1: own `checkWriteGuard` call, same discipline as
-    // every other write route in this file. A `requiresConfirm: true`
-    // outcome is returned VERBATIM, never audited — see `../resources/
-    // session-definitions-write.ts`'s own header for why (mirrors `POST
-    // /api/rules/plan`'s own "report-only, no audit" shape).
-    .post("/api/session-definitions/:name/fields", async ({ params, body, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const name = decodeURIComponent(params.name);
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const bad = bodyProblem(body);
-      if (bad) { set.status = bad.status; return { error: bad.error }; }
-      const b = body as Record<string, unknown>;
-      if (typeof b.ifMatch !== "string" || typeof b.patch !== "object" || b.patch === null || Array.isArray(b.patch)) {
-        const error = "body must be { patch: object, ifMatch: string, confirm?: boolean }";
-        auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: "fields", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
-        set.status = 400;
-        return { error };
-      }
-      const confirm = b.confirm === true;
-      const outcome = await deps.sessionDefinitionsWrite.fields(name, b.patch as Record<string, unknown>, b.ifMatch, confirm);
-      if (outcome.ok && outcome.requiresConfirm) return outcome;
-      auditOutcome(deps, { route: "POST /api/session-definitions/:name/fields", action: `patch ${Object.keys(b.patch as Record<string, unknown>).join(",")}`, ids: [name], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-667 — `POST /api/session-definitions/:name/frozen`: the two
-    // freeze gates (`../resources/session-freeze.ts`), through this ticket's
-    // own backed-up/locked/undoable write contract. B1: own
-    // `checkWriteGuard` call, same discipline as every other write route.
-    .post("/api/session-definitions/:name/frozen", async ({ params, body, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const name = decodeURIComponent(params.name);
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const bad = bodyProblem(body);
-      if (bad) { set.status = bad.status; return { error: bad.error }; }
-      const b = body as Record<string, unknown>;
-      if (typeof b.frozen !== "boolean" || typeof b.ifMatch !== "string") {
-        const error = "body must be { frozen: boolean, ifMatch: string }";
-        auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: "frozen", ids: [name], origin: request.headers.get("origin") }, { ok: false, error });
-        set.status = 400;
-        return { error };
-      }
-      const outcome = await deps.sessionDefinitionsWrite.frozen(name, b.frozen, b.ifMatch);
-      auditOutcome(deps, { route: "POST /api/session-definitions/:name/frozen", action: `frozen=${b.frozen}`, ids: [name], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-667 — `POST /api/session-definitions/undo/:backupId`: B2
-    // scoping (own process's last UI write only, own resulting etag only)
-    // — see `../resources/session-definitions-write.ts`'s own header.
-    .post("/api/session-definitions/undo/:backupId", async ({ params, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.sessionDefinitionsWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const backupId = decodeURIComponent(params.backupId);
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const outcome = deps.sessionDefinitionsWrite.undo(backupId);
-      auditOutcome(deps, { route: "POST /api/session-definitions/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-962 (epic FACTORY-659, slice D1 follow-up) — `GET /api/links`:
-    // every owner->targets entry in the butchr-managed link store. Same
-    // guard discipline as `GET /api/daemon/logs`/`GET /api/agents/:issue`
-    // above (dashboard-origin guard + same-UID peer check, checked BEFORE
-    // any work, `Cache-Control: no-store`) — a link entry can name a local
-    // filesystem path, so this read is at least as sensitive as those.
-    .get("/api/links", async ({ request, server, set }) => {
-      if (!deps.dashboardOriginGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.peerUidCheck) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const client = server?.requestIP(request);
-      if (!client || !(await deps.peerUidCheck(client))) { set.status = 403; return { error: "peer uid check failed" }; }
-      if (!deps.linksRead) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      set.headers["cache-control"] = "no-store";
-      return {
-        links: deps.linksRead().map((entry) => ({
-          owner: formatResourceRef(entry.owner),
-          targets: entry.targets.map((t) => formatResourceRef(t)),
-        })),
-      };
-    })
-    // FACTORY-962 — `POST /api/links/add`: adds `target` to `resource`'s
-    // managed link list. Full write guard chain + shared write rate limit,
-    // same discipline as every other write route in this file.
-    // `../resources/links-write.ts`'s `writeLinkAdd` owns reference
-    // validation, self-link refusal, the jira-project-owner refusal, and
-    // idempotency (already-present is reported, not audited as a
-    // rejected write — it never reaches the backup/lock/write path at all).
-    .post("/api/links/add", async ({ body, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const bad = bodyProblem(body);
-      if (bad) { set.status = bad.status; return { error: bad.error }; }
-      const b = body as Record<string, unknown>;
-      if (typeof b.resource !== "string" || typeof b.target !== "string") {
-        const error = "body must be { resource: string, target: string }";
-        auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-        set.status = 400;
-        return { error };
-      }
-      const outcome = await deps.linksWrite.add(b.resource, b.target);
-      auditOutcome(deps, { route: "POST /api/links/add", action: "add", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-962 — `POST /api/links/remove`: symmetric with `/add` above.
-    .post("/api/links/remove", async ({ body, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const bad = bodyProblem(body);
-      if (bad) { set.status = bad.status; return { error: bad.error }; }
-      const b = body as Record<string, unknown>;
-      if (typeof b.resource !== "string" || typeof b.target !== "string") {
-        const error = "body must be { resource: string, target: string }";
-        auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [], origin: request.headers.get("origin") }, { ok: false, error });
-        set.status = 400;
-        return { error };
-      }
-      const outcome = await deps.linksWrite.remove(b.resource, b.target);
-      auditOutcome(deps, { route: "POST /api/links/remove", action: "remove", ids: [b.resource, b.target], origin: request.headers.get("origin") }, outcome);
-      if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
-      return outcome;
-    })
-    // FACTORY-962 — `POST /api/links/undo/:backupId`: B2 scoping, same as
-    // `/api/session-definitions/undo/:backupId` above (own process's last
-    // UI write only, own resulting etag only) — see
-    // `../resources/links-write.ts`'s own header.
-    .post("/api/links/undo/:backupId", async ({ params, set, request, server }) => {
-      if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
-      if (!guard.ok) { set.status = guard.status; return guard.body; }
-      if (!deps.linksWrite) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
-      const backupId = decodeURIComponent(params.backupId);
-      const limited = checkWriteRateLimit(deps, server?.requestIP(request) ?? undefined, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") });
-      if (limited) { set.status = limited.status; set.headers["retry-after"] = String(limited.retryAfterSeconds); return limited.body; }
-      const outcome = deps.linksWrite.undo(backupId);
-      auditOutcome(deps, { route: "POST /api/links/undo/:backupId", action: "undo", ids: [backupId], origin: request.headers.get("origin") }, outcome);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       return outcome;
     })

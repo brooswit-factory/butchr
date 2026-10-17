@@ -190,6 +190,7 @@ export function journalInvocationFor(
   window: JournalWindow = { kind: "none" },
 ): JournalInvocation {
   if (systemd.kind === "none") return { command: "", note: "not running under a systemd unit — no journal to read" };
+  if (systemd.kind === "launchd") return { command: "", note: "running under launchd — no journal to read; its log file is in the job's stderr path" };
   if (targetUid === readerUid) {
     return { command: appendSinceWindow(systemd.journalctl, window), note: "own identity — using this unit's own recommended invocation" };
   }

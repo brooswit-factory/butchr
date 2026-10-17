@@ -48,6 +48,8 @@ export const PROVIDER_ENABLED_ENV_VAR: Record<ResourceProvider, string> = {
   // switch has no caller yet; it exists only to keep this map total over
   // ResourceProvider.
   "jira-component": "BUTCHR_PROVIDER_JIRA_COMPONENT_ENABLED",
+  // local/ui: our trello-card rule type gets the same switch as every other provider.
+  "trello-card": "BUTCHR_PROVIDER_TRELLO_CARD_ENABLED",
 };
 
 /**

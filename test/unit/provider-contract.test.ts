@@ -7,7 +7,6 @@ import { zendeskTicketTools } from "../../src/tools/zendesk-ticket.js";
 import { createGithubPrClient } from "../../src/resources/github-pr.js";
 import { createZendeskTicketClient } from "../../src/resources/zendesk-ticket.js";
 import { providerTarget } from "../../src/tools/provider-target.js";
-import { resourceLinkTools } from "../../src/tools/resource-links.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 
 const task = { headers: { "x-issue": "WORK-1", "x-butchr-agent": "jira-work:tasks:WORK-1" } };
@@ -71,15 +70,6 @@ describe("role-independent provider contract", () => {
     const tools = providerAtlassianTools({ transition: async () => { throw new Error("Atlassian 403"); } } as unknown as AtlassianOps, silent, (...args) => { writes.push(args); });
     await expect(call(tools, "jira_transition", { key: "OTHER-2", status: "Done" }, manager)).rejects.toThrow("Atlassian 403");
     expect(writes).toEqual([]);
-  });
-  test("managers manage idempotent observation links without creating workers", async () => {
-    const links = new Set<string>();
-    const tools = resourceLinkTools({ list: async () => [...links], add: async (_, t) => { const added = !links.has(t); links.add(t); return added; }, remove: async (_, t) => links.delete(t) }, silent);
-    const args = { resource: "jira-project:WORK", target: "jira-work-item:OTHER-3" };
-    expect(await call(tools, "add_link", args, manager)).toEqual({ added: true });
-    expect(await call(tools, "add_link", args, manager)).toMatchObject({ added: false });
-    expect(await call(tools, "list_links", { resource: args.resource }, query)).toMatchObject({ links: [args.target] });
-    expect(await call(tools, "remove_link", args, manager)).toEqual({ removed: true });
   });
   test("explicit GitHub PR targets work for managers and query agents; account scope and HTTP denial remain", async () => {
     const requests: string[] = [];

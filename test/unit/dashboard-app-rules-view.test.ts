@@ -9,7 +9,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     query: "project = X",
     enabled: true,
     execution: "swarm",
-    account: "none",
     role: "worker",
     agentPreferences: [],
     permissionMode: null,

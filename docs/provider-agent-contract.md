@@ -10,7 +10,6 @@ Butchr owns provider connections and credentials. Its MCP surface exposes operat
 - Jira Product Discovery: read, list linked GitHub issues and comment with optional `target: "PROJECT-123"`.
 - Zendesk: read and internal note with optional `target: "subdomain#number"`. There is no new public-reply operation. A missing privacy audit is reported as `confirmedPrivate: false, internal: null`.
 - Existing GitHub/idea linking tools accept an optional target for their formerly implicit side. Live resource checks and deterministic remote-link IDs remain; rule-match relationships are no longer tool authorization.
-- `list_links`, `add_link`, `remove_link` operate on explicit canonical resource IDs. They select observations, not workers or ownership.
 
 Omitting a provider target retains the existing own-resource default only when that provider/resource is present in the caller identity. Other callers, including query agents, must supply a target. Supplying a malformed target never falls back to the caller resource.
 
