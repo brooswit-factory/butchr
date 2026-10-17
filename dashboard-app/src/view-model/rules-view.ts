@@ -31,24 +31,20 @@ export interface RuleRowView {
   rule: RuleDto;
   staffed: StaffedView;
   preferencesText: string;
-  /** FACTORY-851: `Rule.resumeOnRespawn`/`Rule.resumeContextCutoff`, rendered — see `resumeText` below for the exact wording rule. */
+  /** FACTORY-851: `Rule.resumeOnRespawn`, rendered — see `resumeText` below for the exact wording rule. */
   resumeText: string;
 }
 
 /**
- * FACTORY-851 — `resumeOnRespawn`/`resumeContextCutoff`'s display wording:
- * `null` on either field means absent, which this ticket's own schema
- * defines as "resume on" / "the daemon's own default cutoff" respectively
- * (see `Rule.resumeOnRespawn`/`Rule.resumeContextCutoff`'s own doc comments,
- * `../../../src/rules/rules.js`) — never rendered as a literal number here,
- * since the actual default value lives server-side
- * (`DEFAULT_RESUME_CONTEXT_CUTOFF`) and this module must not hand-maintain a
- * second copy of it.
+ * FACTORY-851 — `resumeOnRespawn`'s display wording: `null` means absent,
+ * which this ticket's own schema defines as "resume on" (see
+ * `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`).
+ * FACTORY-1018 removed `resumeContextCutoff` entirely, so this no longer
+ * renders a cutoff.
  */
-export function resumeText(rule: Pick<RuleDto, "resumeOnRespawn" | "resumeContextCutoff">): string {
+export function resumeText(rule: Pick<RuleDto, "resumeOnRespawn">): string {
   const resume = rule.resumeOnRespawn === false ? "off" : "on";
-  const cutoff = rule.resumeContextCutoff === null ? "default" : String(rule.resumeContextCutoff);
-  return `resume: ${resume} (cutoff: ${cutoff})`;
+  return `resume: ${resume}`;
 }
 
 export interface RulesPageViewModel {

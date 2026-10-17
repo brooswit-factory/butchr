@@ -5,7 +5,6 @@ import { join, resolve } from "node:path";
 import { decideRespawnResume, RESUME_DECISION_REASON } from "../../src/agents/respawn.js";
 import { persistDiscoveredSessionId as persistSessionId, workspaceSessionId } from "../../src/agents/workspace.js";
 import { persistIntentionalStop, workspaceStopCause } from "../../src/agents/stop-cause.js";
-import { DEFAULT_RESUME_CONTEXT_CUTOFF } from "../../src/rules/rules.js";
 
 // FACTORY-916 (epic FACTORY-843, story FACTORY-850) — `decideRespawnResume`
 // (src/agents/respawn.ts) is the whole spawn-path decision this ticket adds,
@@ -13,9 +12,12 @@ import { DEFAULT_RESUME_CONTEXT_CUTOFF } from "../../src/rules/rules.js";
 // be tested directly, with no HerdrHerd/drovr/herdr plumbing — `dir` need
 // not be a REAL `workspaceDirFor` path; every function it calls
 // (`workspaceStopCause`/`clearStopCause`/`workspaceSessionId`/
-// `claudeTranscriptExists`/`estimateTranscriptTokens`/
-// `invalidatePersistedSessionId`) is a plain filesystem read/write relative
-// to whatever `dir` is handed in.
+// `claudeTranscriptExists`/`invalidatePersistedSessionId`) is a plain
+// filesystem read/write relative to whatever `dir` is handed in.
+//
+// FACTORY-1018 removed the transcript-size resume cutoff entirely — a valid
+// saved session is no longer vetoed merely because its transcript is large;
+// see the "transcript far larger than the former cutoff" test below.
 describe("FACTORY-916: decideRespawnResume", () => {
   let dir: string;
   let home: string;
@@ -83,29 +85,29 @@ describe("FACTORY-916: decideRespawnResume", () => {
     expect(workspaceSessionId(dir)).toBeUndefined(); // the stale id itself was invalidated, not just skipped
   });
 
-  test("unintended stop, transcript over the rule's own cutoff -> fresh, reason names the estimate and the cutoff", () => {
+  // FACTORY-1018: a valid saved session must not be discarded merely
+  // because its transcript is large — the former cutoff (100,000 estimated
+  // tokens, ~400,000 bytes) is gone; an even larger transcript still
+  // resumes with its exact session id.
+  test("unintended stop, transcript far larger than the former 100,000-token cutoff -> still resumes with the persisted session id", () => {
     persistSessionId(dir, "sess-1");
-    writeTranscript("sess-1", 40); // 40 bytes / 4 bytes-per-token = 10 estimated tokens
-    const decision = decideRespawnResume({ dir, resumeContextCutoff: 5, ticketStatus: "In Progress", ticketLabels: [], home });
-    expect(decision).toEqual({ reason: RESUME_DECISION_REASON.overCutoff(10, 5) });
-  });
-
-  test("unintended stop, transcript exactly at the rule's own cutoff -> resumes (the cutoff is inclusive)", () => {
-    persistSessionId(dir, "sess-1");
-    writeTranscript("sess-1", 40); // -> 10 estimated tokens
-    const decision = decideRespawnResume({ dir, resumeContextCutoff: 10, ticketStatus: "In Progress", ticketLabels: [], home });
+    writeTranscript("sess-1", 500_000); // ~125,000 estimated tokens under the old 4-bytes-per-token estimate
+    const decision = decideRespawnResume({ dir, ticketStatus: "In Progress", ticketLabels: [], home });
     expect(decision).toEqual({ resumeSessionId: "sess-1" });
   });
 
-  test("cutoff absent -> DEFAULT_RESUME_CONTEXT_CUTOFF applies, not Infinity", () => {
+  // Otherwise identical small and large transcripts produce the same resume decision.
+  test("otherwise identical small and large transcripts produce the same resume decision", () => {
     persistSessionId(dir, "sess-1");
-    // `estimateTranscriptTokens` is bytes / 4 (`BYTES_PER_TOKEN_ESTIMATE`,
-    // src/agents/workspace.ts) — one byte over `(cutoff + 1) * 4` estimates
-    // to exactly `cutoff + 1` tokens, one past the default.
-    writeTranscript("sess-1", (DEFAULT_RESUME_CONTEXT_CUTOFF + 1) * 4);
-    const decision = decideRespawnResume({ dir, ticketStatus: "In Progress", ticketLabels: [], home });
-    expect(decision.resumeSessionId).toBeUndefined();
-    expect(decision.reason).toContain("over cutoff");
+    writeTranscript("sess-1", 100);
+    const small = decideRespawnResume({ dir, ticketStatus: "In Progress", ticketLabels: [], home });
+
+    persistSessionId(dir, "sess-1");
+    writeTranscript("sess-1", 500_000);
+    const large = decideRespawnResume({ dir, ticketStatus: "In Progress", ticketLabels: [], home });
+
+    expect(small).toEqual({ resumeSessionId: "sess-1" });
+    expect(large).toEqual({ resumeSessionId: "sess-1" });
   });
 
   // FACTORY-916 DoD: "A worker that stopped INTENTIONALLY, was respawned,

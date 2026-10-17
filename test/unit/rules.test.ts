@@ -457,31 +457,21 @@ describe("maxNewPerTick/minSecondsBetweenAdmissions (FACTORY-907, epic FACTORY-9
   });
 });
 
-describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, story FACTORY-848 — config only, nothing reads these yet)", () => {
-  test("both absent when omitted — no default the way execution/role get one", () => {
+describe("resumeOnRespawn (FACTORY-851, epic FACTORY-843, story FACTORY-848)", () => {
+  test("absent when omitted — no default the way execution/role get one", () => {
     const [r] = parseRules({ rules: [minimal] });
     expect(Object.keys(r!).sort()).toEqual(["brief", "enabled", "execution", "id", "idlePokeEnabled", "query", "resourceProvider", "role"]);
     expect(r!.resumeOnRespawn).toBeUndefined();
-    expect(r!.resumeContextCutoff).toBeUndefined();
   });
 
-  test("both values and every provider accept the field, independent of execution/role/each other — same house style as permissionMode/lizardMode", () => {
+  test("both values and every provider accept the field, independent of execution/role — same house style as permissionMode/lizardMode", () => {
     for (const resourceProvider of RESOURCE_PROVIDERS) {
       const base = resourceProvider === "github-issue" ? "is:issue label:x" : resourceProvider === "zendesk-ticket" ? "status:open" : resourceProvider === "jira-project" ? '{"keys":["BUTCHR"]}' : resourceProvider === "filesystem" ? JSON.stringify({ root: "/tmp", kind: "file" }) : resourceProvider === "confluence-page" ? JSON.stringify({ ancestor: "123456" }) : minimal.query;
       for (const resumeOnRespawn of [true, false]) {
-        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, resumeOnRespawn, resumeContextCutoff: 50_000 }] });
-        expect(r).toMatchObject({ resourceProvider, resumeOnRespawn, resumeContextCutoff: 50_000 });
+        const [r] = parseRules({ rules: [{ ...minimal, resourceProvider, query: base, resumeOnRespawn }] });
+        expect(r).toMatchObject({ resourceProvider, resumeOnRespawn });
       }
     }
-  });
-
-  test("resumeContextCutoff may be set without resumeOnRespawn, and vice versa — the two fields are independent", () => {
-    const [onlyCutoff] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
-    expect(onlyCutoff!.resumeContextCutoff).toBe(1);
-    expect(onlyCutoff!.resumeOnRespawn).toBeUndefined();
-    const [onlyFlag] = parseRules({ rules: [{ ...minimal, resumeOnRespawn: false }] });
-    expect(onlyFlag!.resumeOnRespawn).toBe(false);
-    expect(onlyFlag!.resumeContextCutoff).toBeUndefined();
   });
 
   test("rejects a non-boolean resumeOnRespawn, naming the rule and field — no tri-state", () => {
@@ -489,21 +479,39 @@ describe("resumeOnRespawn/resumeContextCutoff (FACTORY-851, epic FACTORY-843, st
       .toThrow("f.json: rules[0].resumeOnRespawn must be a boolean");
   });
 
-  test.each([0, -1, 1.5, NaN, "100000", null])("rejects resumeContextCutoff %p as not a positive integer, naming the rule and field", (bad) => {
-    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: bad }] }, "f.json"))
-      .toThrow("f.json: rules[0].resumeContextCutoff must be a positive integer");
-  });
-
-  test("a positive integer resumeContextCutoff is accepted, including 1", () => {
-    const [r] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 1 }] });
-    expect(r!.resumeContextCutoff).toBe(1);
-  });
-
-  test("a pre-change rules document (neither field) loads unchanged — byte-for-byte the same shape as before this ticket", () => {
+  test("a pre-change rules document (field absent) loads unchanged — byte-for-byte the same shape as before this ticket", () => {
     const preChangeDoc = { rules: [{ id: "triage", resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it." }] };
     expect(parseRules(preChangeDoc)).toEqual([
       { id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = BUTCHR", brief: "Triage it.", execution: "swarm", role: "worker", ...idlePokeDefaults },
     ] as never);
+  });
+});
+
+// FACTORY-1018: `resumeContextCutoff` (FACTORY-851) is removed entirely —
+// the transcript-size resume cutoff feature it configured no longer
+// exists (`decideRespawnResume`, src/agents/respawn.ts). It stays in
+// `REMOVED_RULE_FIELDS` (rules.ts) purely as a migration affordance — same
+// "accepted, parsed into nothing" precedent `maxLinkedTurnsPerHour` already
+// uses below — so an already-deployed rules.json carrying the old field
+// still loads, and a legacy value has no behavioral effect on resume.
+describe("resumeContextCutoff (FACTORY-1018: removed, migration-only)", () => {
+  test("an already-deployed rule carrying the old field loads without error and the field does not appear on the parsed Rule", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, resumeContextCutoff: 50_000 }] });
+    expect(r).toBeDefined();
+    expect((r as unknown as Record<string, unknown>).resumeContextCutoff).toBeUndefined();
+  });
+
+  test("an old deployed value of any shape (even one that used to be rejected) does not throw — it is never validated any more", () => {
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: 0 }] })).not.toThrow();
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: -1 }] })).not.toThrow();
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: "100000" }] })).not.toThrow();
+    expect(() => parseRules({ rules: [{ ...minimal, resumeContextCutoff: null }] })).not.toThrow();
+  });
+
+  test("a legacy resumeContextCutoff does not limit resume — resumeOnRespawn is unaffected either way", () => {
+    const [r] = parseRules({ rules: [{ ...minimal, resumeOnRespawn: true, resumeContextCutoff: 1 }] });
+    expect(r!.resumeOnRespawn).toBe(true);
+    expect((r as unknown as Record<string, unknown>).resumeContextCutoff).toBeUndefined();
   });
 });
 

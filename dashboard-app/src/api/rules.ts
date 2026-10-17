@@ -120,8 +120,6 @@ export interface RuleDto {
   lizardMode: boolean | null;
   /** FACTORY-851 — `null` when absent; means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`). Display-only in this slice, same as `role` above. */
   resumeOnRespawn: boolean | null;
-  /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeContextCutoff`'s own doc comment). Display-only in this slice, same as `role` above. */
-  resumeContextCutoff: number | null;
   /**
    * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY
    * for the idle poke. `idlePokeMinutes`/`idlePokeMessage`, like
@@ -267,8 +265,6 @@ export interface RuleFieldPatch {
   execution?: ExecutionMode;
   /** local/ui — config surface only. */
   resumeOnRespawn?: boolean;
-  /** local/ui — `null` clears it back to the daemon's default. Config surface only. */
-  resumeContextCutoff?: number | null;
   /** local/ui — `@builtin:<name>` or literal text. On an enabled rule a change counts as a restart. */
   brief?: string;
 }
@@ -299,7 +295,6 @@ export interface RuleCreateDraft {
   brief?: string;
   execution?: ExecutionMode;
   resumeOnRespawn?: boolean;
-  resumeContextCutoff?: number;
   stalledMinutes?: number;
   notifyDeliveryMode?: NotifyDeliveryMode;
   linkedEventing?: boolean;
@@ -638,7 +633,6 @@ interface ServerRuleEntry {
   permissionMode: RulePermissionMode | null;
   lizardMode: boolean | null;
   resumeOnRespawn: boolean | null;
-  resumeContextCutoff: number | null;
   idlePokeMinutes: number | null;
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
@@ -673,7 +667,6 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       permissionMode: r.permissionMode,
       lizardMode: r.lizardMode,
       resumeOnRespawn: r.resumeOnRespawn,
-      resumeContextCutoff: r.resumeContextCutoff,
       idlePokeMinutes: r.idlePokeMinutes,
       idlePokeMessage: r.idlePokeMessage,
       idlePokeEnabled: r.idlePokeEnabled,
@@ -913,7 +906,6 @@ export function defaultRulesFixture(): RulesListResponse {
         permissionMode: null,
         lizardMode: null,
         resumeOnRespawn: null,
-        resumeContextCutoff: null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
@@ -933,7 +925,6 @@ export function defaultRulesFixture(): RulesListResponse {
         permissionMode: null,
         lizardMode: null,
         resumeOnRespawn: null,
-        resumeContextCutoff: null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
@@ -953,7 +944,6 @@ export function defaultRulesFixture(): RulesListResponse {
         permissionMode: "default",
         lizardMode: true,
         resumeOnRespawn: false,
-        resumeContextCutoff: 50_000,
         idlePokeMinutes: 15,
         idlePokeMessage: null,
         idlePokeEnabled: false,
@@ -973,7 +963,6 @@ export function defaultRulesFixture(): RulesListResponse {
         permissionMode: null,
         lizardMode: null,
         resumeOnRespawn: null,
-        resumeContextCutoff: null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: true,
@@ -1235,7 +1224,6 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         stalledMinutes: patch.stalledMinutes === null ? null : (patch.stalledMinutes ?? rule.stalledMinutes ?? null),
         execution: patch.execution ?? rule.execution,
         resumeOnRespawn: patch.resumeOnRespawn ?? rule.resumeOnRespawn,
-        resumeContextCutoff: patch.resumeContextCutoff === null ? null : (patch.resumeContextCutoff ?? rule.resumeContextCutoff),
         ...(patch.brief !== undefined ? { briefExcerpt: patch.brief.slice(0, 200) } : {}),
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
@@ -1294,7 +1282,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       const rule = findRule(ruleId);
       // The parsed-rule shape the real route returns: only fields that are set, nulls left out.
       const fields: Record<string, unknown> = {};
-      for (const key of ["id", "enabled", "resourceProvider", "query", "execution", "role", "agentPreferences", "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "notifyDeliveryMode", "stalledMinutes", ...LINKED_BOOLEAN_KEYS, ...LINKED_COUNT_KEYS] as const) {
+      for (const key of ["id", "enabled", "resourceProvider", "query", "execution", "role", "agentPreferences", "permissionMode", "lizardMode", "resumeOnRespawn", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "notifyDeliveryMode", "stalledMinutes", ...LINKED_BOOLEAN_KEYS, ...LINKED_COUNT_KEYS] as const) {
         const value = rule[key];
         if (value !== null && value !== undefined) fields[key] = value;
       }
@@ -1353,7 +1341,6 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         permissionMode: draft.permissionMode ?? null,
         lizardMode: draft.lizardMode ?? null,
         resumeOnRespawn: draft.resumeOnRespawn ?? null,
-        resumeContextCutoff: draft.resumeContextCutoff ?? null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
         idlePokeEnabled: false,

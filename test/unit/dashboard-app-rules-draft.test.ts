@@ -47,7 +47,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeContextCutoff: null,
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,
@@ -221,7 +220,6 @@ describe("diffRule and display text", () => {
       "Fleet capacity",
       "Execution",
       "Resume on respawn",
-      "Resume context cutoff",
       "Notification delivery",
       "Stall threshold",
       "Brief",
@@ -299,8 +297,8 @@ describe("computeRuleChanges / patches", () => {
 
 describe("execution, resume and brief", () => {
   test("draftFromRule maps them; a brief is null until loaded", () => {
-    const d = draftFromRule(rule({ execution: "singleton", resumeOnRespawn: false, resumeContextCutoff: 40000 }));
-    expect(d).toMatchObject({ execution: "singleton", resumeOnRespawn: false, resumeContextCutoff: "40000", brief: null });
+    const d = draftFromRule(rule({ execution: "singleton", resumeOnRespawn: false }));
+    expect(d).toMatchObject({ execution: "singleton", resumeOnRespawn: false, brief: null });
     expect(draftFromRule(rule(), { "factory-triage": "@builtin:bug" }).brief).toBe("@builtin:bug");
   });
 
@@ -327,16 +325,14 @@ describe("execution, resume and brief", () => {
     expect(summarizeDraft(s).dirty).toBe(false);
   });
 
-  test("patches carry only changed fields; a cleared cutoff is sent as null; an unloaded brief is never sent", () => {
-    const base = rule({ resumeContextCutoff: 9 });
+  test("patches carry only changed fields; an unloaded brief is never sent", () => {
+    const base = rule();
     const loaded = { ...draftFromRule(base, { "factory-triage": "@builtin:task" }) };
-    expect(buildFieldPatch(base, { ...loaded, execution: "persistent", resumeOnRespawn: false, resumeContextCutoff: "", brief: "@builtin:bug" }, "@builtin:task")).toEqual({
+    expect(buildFieldPatch(base, { ...loaded, execution: "persistent", resumeOnRespawn: false, brief: "@builtin:bug" }, "@builtin:task")).toEqual({
       execution: "persistent",
       resumeOnRespawn: false,
-      resumeContextCutoff: null,
       brief: "@builtin:bug",
     });
-    expect(buildFieldPatch(base, { ...draftFromRule(base), resumeContextCutoff: "12" })).toEqual({ resumeContextCutoff: 12 });
     expect(buildFieldPatch(base, draftFromRule(base))).toEqual({});
     const s = apply(initialDraftState([base], "e"), { type: "brief-loaded", id: "factory-triage", brief: "@builtin:task" }, { type: "edit", key: "factory-triage", changes: { brief: "x" } });
     expect(computeRuleChanges(s)).toEqual([{ kind: "update", key: "factory-triage", ruleId: "factory-triage", patch: { brief: "x" } }]);
@@ -345,22 +341,21 @@ describe("execution, resume and brief", () => {
   test("new rules start from the defaults and send only what differs", () => {
     const s = apply(initialDraftState([], "e"), { type: "add", resourceProvider: "jira-work" });
     const d = s.rules[0]!;
-    expect(d).toMatchObject({ brief: DEFAULT_BRIEF, execution: "swarm", resumeOnRespawn: true, resumeContextCutoff: "" });
+    expect(d).toMatchObject({ brief: DEFAULT_BRIEF, execution: "swarm", resumeOnRespawn: true });
     expect(buildCreateDraft({ ...d, id: "n", query: "q" })).toEqual({ id: "n", resourceProvider: "jira-work", query: "q" });
-    expect(buildCreateDraft({ ...d, id: "n", query: "q", brief: "@builtin:bug", execution: "singleton", resumeOnRespawn: false, resumeContextCutoff: "3" })).toEqual({
+    expect(buildCreateDraft({ ...d, id: "n", query: "q", brief: "@builtin:bug", execution: "singleton", resumeOnRespawn: false })).toEqual({
       id: "n",
       resourceProvider: "jira-work",
       query: "q",
       brief: "@builtin:bug",
       execution: "singleton",
       resumeOnRespawn: false,
-      resumeContextCutoff: 3,
     });
   });
 
-  test("validation: cutoff must be a positive whole number, and a loaded brief can't be empty", () => {
-    const d = { ...draftFromRule(rule()), resumeContextCutoff: "1.5", brief: "  " };
-    expect(validateRule(d, draftFromRule(rule()), [d]).map((i) => `${i.field}:${i.level}`)).toEqual(["resumeContextCutoff:invalid", "brief:invalid"]);
+  test("validation: a loaded brief can't be empty", () => {
+    const d = { ...draftFromRule(rule()), brief: "  " };
+    expect(validateRule(d, draftFromRule(rule()), [d]).map((i) => `${i.field}:${i.level}`)).toEqual(["brief:invalid"]);
   });
 
   test("duplicating copies the loaded brief; discard-all and restore keep loaded briefs", () => {

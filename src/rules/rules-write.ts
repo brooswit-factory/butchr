@@ -964,7 +964,6 @@ function buildNewRuleRecord(input: RuleCreateInput): Record<string, unknown> {
     execution: input.execution ?? "swarm",
   };
   if (input.resumeOnRespawn !== undefined) record.resumeOnRespawn = input.resumeOnRespawn;
-  if (input.resumeContextCutoff !== undefined) record.resumeContextCutoff = input.resumeContextCutoff;
   if (input.stalledMinutes !== undefined) record.stalledMinutes = input.stalledMinutes;
   if (input.notifyDeliveryMode !== undefined) record.notifyDeliveryMode = input.notifyDeliveryMode;
   for (const k of [...LINKED_BOOLEAN_FIELDS, ...LINKED_COUNT_FIELDS]) if (input[k] !== undefined) record[k] = input[k];

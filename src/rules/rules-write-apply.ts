@@ -174,8 +174,6 @@ export function applyRuleFieldPatch(currentText: string | undefined, id: string,
   // local/ui — see `rules-write-registry.ts`'s header for these.
   if (patch.execution !== undefined) next.execution = patch.execution;
   if (patch.resumeOnRespawn !== undefined) next.resumeOnRespawn = patch.resumeOnRespawn;
-  if (patch.resumeContextCutoff === null) delete next.resumeContextCutoff;
-  else if (patch.resumeContextCutoff !== undefined) next.resumeContextCutoff = patch.resumeContextCutoff;
   if (patch.brief !== undefined) next.brief = patch.brief;
   for (const k of LINKED_BOOLEAN_FIELDS) if (patch[k] !== undefined) next[k] = patch[k];
   for (const k of LINKED_COUNT_FIELDS) {

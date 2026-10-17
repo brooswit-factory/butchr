@@ -29,7 +29,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeContextCutoff: null,
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,

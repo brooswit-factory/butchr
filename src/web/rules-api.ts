@@ -81,8 +81,6 @@ export interface RulesApiRuleEntry {
   minSecondsBetweenAdmissions: number | null;
   /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../rules/rules.ts`), never necessarily `false`. */
   resumeOnRespawn: boolean | null;
-  /** FACTORY-851: read the same way as `permissionMode`/`lizardMode` above. `null` when absent — means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (see `Rule.resumeContextCutoff`'s own doc comment, `../rules/rules.ts`). */
-  resumeContextCutoff: number | null;
   /**
    * FACTORY-846: CONFIG SURFACE ONLY for the idle poke — read off the raw
    * `Rule` the SAME WAY as `permissionMode`/`lizardMode`/`resumeOnRespawn`
@@ -180,7 +178,6 @@ export function buildRulesApiResponse(args: BuildRulesApiResponseArgs): RulesApi
       maxNewPerTick: raw?.maxNewPerTick ?? null,
       minSecondsBetweenAdmissions: raw?.minSecondsBetweenAdmissions ?? null,
       resumeOnRespawn: raw?.resumeOnRespawn ?? null,
-      resumeContextCutoff: raw?.resumeContextCutoff ?? null,
       idlePokeMinutes: raw?.idlePokeMinutes ?? null,
       stalledMinutes: raw?.stalledMinutes ?? null,
       idlePokeMessage: raw?.idlePokeMessage ?? null,

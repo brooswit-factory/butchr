@@ -420,7 +420,6 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     // this already-fetched `issue`'s own fields, carried through so the
     // spawn decision's `classifyStop` call needs no Jira fetch of its own.
     ...(rule.resumeOnRespawn !== undefined ? { resumeOnRespawn: rule.resumeOnRespawn } : {}),
-    ...(rule.resumeContextCutoff !== undefined ? { resumeContextCutoff: rule.resumeContextCutoff } : {}),
     ticketStatus: issue.status,
     ticketLabels: issue.labels,
   };

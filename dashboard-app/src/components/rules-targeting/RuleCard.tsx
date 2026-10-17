@@ -103,7 +103,7 @@ function RuleSummary({ draft, baseRule, live }: { draft: RuleDraft; baseRule: Ru
   const runs: { text: string; tone?: "warning" }[] = [{ text: `permission: ${permissionText(draft.permissionMode)}`, ...(draft.permissionMode === "bypassPermissions" || draft.permissionMode === "auto" ? { tone: "warning" as const } : {}) }];
   if (draft.lizardMode) runs.push({ text: "lizard mode", tone: "warning" });
   runs.push({ text: draft.role === "worker" ? "counts toward the agent cap" : "not counted in the agent cap" });
-  runs.push({ text: draft.resumeOnRespawn ? `resume on respawn${draft.resumeContextCutoff ? ` (cutoff ${draft.resumeContextCutoff})` : ""}` : "no resume on respawn" });
+  runs.push({ text: draft.resumeOnRespawn ? "resume on respawn" : "no resume on respawn" });
   runs.push({ text: `idle poke: ${idlePokeText(draft)}` });
   if (draft.notifyDeliveryMode) runs.push({ text: `updates: ${notifyDeliveryText(draft.notifyDeliveryMode)}` });
   if (draft.stalledMinutes) runs.push({ text: `stalled after ${draft.stalledMinutes} min` });

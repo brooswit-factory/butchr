@@ -20,7 +20,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     permissionMode: null,
     lizardMode: null,
     resumeOnRespawn: null,
-    resumeContextCutoff: null,
     idlePokeMinutes: null,
     idlePokeMessage: null,
     idlePokeEnabled: true,
@@ -45,10 +44,10 @@ describe("RulesRoute — FACTORY-661: list", () => {
     expect(getByText(/execution: singleton/)).toBeTruthy();
     expect(getByText("UNSTAFFED: disabled")).toBeTruthy();
     expect(getByText(/COULD NOT CHECK: census unavailable/)).toBeTruthy();
-    // FACTORY-851: vip-zendesk's fixture entry sets resumeOnRespawn: false, resumeContextCutoff: 50_000 — the only row with this exact text, so a page-wide getByText is unambiguous.
-    expect(getByText("resume: off (cutoff: 50000)")).toBeTruthy();
-    // factory-triage's fixture entry leaves both fields absent (null) — but so do two OTHER rows (stale-github-prs, ui-first-rule), so this text is NOT unique page-wide; scope to factory-triage's own row (rows[0], same fixture order asserted above) rather than a bare getByText, which would throw on multiple matches.
-    expect(within(rows[0]!).getByText("resume: on (cutoff: default)")).toBeTruthy();
+    // FACTORY-851: vip-zendesk's fixture entry sets resumeOnRespawn: false — the only row with this exact text, so a page-wide getByText is unambiguous.
+    expect(getByText("resume: off")).toBeTruthy();
+    // factory-triage's fixture entry leaves resumeOnRespawn absent (null) — but so do two OTHER rows (stale-github-prs, ui-first-rule), so this text is NOT unique page-wide; scope to factory-triage's own row (rows[0], same fixture order asserted above) rather than a bare getByText, which would throw on multiple matches.
+    expect(within(rows[0]!).getByText("resume: on")).toBeTruthy();
   });
 
   test("a validation-problems banner renders when the rules file is invalid, independent of whether any rules also loaded", async () => {

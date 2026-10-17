@@ -1,8 +1,8 @@
 /**
  * local/ui — the rule fields the dashboard's inline editor made editable:
- * `execution`, `resumeOnRespawn`, `resumeContextCutoff`, `brief` (PUT and
+ * `execution`, `resumeOnRespawn`, `brief` (PUT and
  * create), plus `GET /api/rules/:id/details` and the catalog's
- * built-in brief list.
+ * built-in brief list. FACTORY-1018 removed `resumeContextCutoff` entirely.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -48,10 +48,9 @@ async function planned(id: string, patch: RuleFieldPatch, scope = 0) {
 }
 
 describe("validateRuleFieldPatch — the new fields", () => {
-  test("accepts valid values, including a null cutoff (back to the default)", () => {
-    const r = validateRuleFieldPatch({ execution: "persistent", resumeOnRespawn: false, resumeContextCutoff: null, brief: "@builtin:bug" });
-    expect(r).toEqual({ ok: true, patch: { execution: "persistent", resumeOnRespawn: false, resumeContextCutoff: null, brief: "@builtin:bug" } });
-    expect(validateRuleFieldPatch({ resumeContextCutoff: 40000, brief: "custom text for {{KEY}}" })).toMatchObject({ ok: true });
+  test("accepts valid values", () => {
+    const r = validateRuleFieldPatch({ execution: "persistent", resumeOnRespawn: false, brief: "@builtin:bug" });
+    expect(r).toEqual({ ok: true, patch: { execution: "persistent", resumeOnRespawn: false, brief: "@builtin:bug" } });
   });
 
   test.each([
@@ -59,8 +58,10 @@ describe("validateRuleFieldPatch — the new fields", () => {
     // The legacy Rocket.Chat key is refused like any other unknown field.
     [{ account: "none" }, 'unknown field "account"'],
     [{ resumeOnRespawn: "yes" }, "resumeOnRespawn must be a boolean"],
-    [{ resumeContextCutoff: 0 }, "resumeContextCutoff must be a positive integer"],
-    [{ resumeContextCutoff: 1.5 }, "resumeContextCutoff must be a positive integer"],
+    // FACTORY-1018: resumeContextCutoff is removed entirely — it is no
+    // longer an editable field at all, refused the same way as any other
+    // unknown key (not a "must be a positive integer" validation error).
+    [{ resumeContextCutoff: 40000 }, 'unknown field "resumeContextCutoff"'],
     [{ brief: "   " }, "brief must be a non-empty string"],
     [{ brief: "x".repeat(BRIEF_MAX_LENGTH + 1) }, "brief must be a non-empty string"],
     [{ brief: "@builtin:stroy" }, "unknown built-in brief"],
@@ -75,9 +76,9 @@ describe("validateRuleCreateInput — the new fields", () => {
   const base = { id: "new-one", resourceProvider: "jira-work", query: "project = C" };
 
   test("accepts them", () => {
-    expect(validateRuleCreateInput({ ...base, brief: "hello", execution: "singleton", resumeOnRespawn: true, resumeContextCutoff: 5 })).toEqual({
+    expect(validateRuleCreateInput({ ...base, brief: "hello", execution: "singleton", resumeOnRespawn: true })).toEqual({
       ok: true,
-      input: { ...base, brief: "hello", execution: "singleton", resumeOnRespawn: true, resumeContextCutoff: 5 },
+      input: { ...base, brief: "hello", execution: "singleton", resumeOnRespawn: true },
     } as never);
   });
 
@@ -86,7 +87,8 @@ describe("validateRuleCreateInput — the new fields", () => {
     [{ execution: "x" }, "execution"],
     [{ account: "none" }, 'unknown field "account"'],
     [{ resumeOnRespawn: 1 }, "resumeOnRespawn"],
-    [{ resumeContextCutoff: null }, "resumeContextCutoff"],
+    // FACTORY-1018: resumeContextCutoff is removed entirely — never accepted on create.
+    [{ resumeContextCutoff: 5 }, 'unknown field "resumeContextCutoff"'],
     [{ stalledMinutes: 0 }, "stalledMinutes"],
     [{ stalledMinutes: null }, "stalledMinutes"],
     [{ notifyDeliveryMode: "email" }, "notifyDeliveryMode"],
@@ -103,18 +105,29 @@ describe("validateRuleCreateInput — the new fields", () => {
 });
 
 describe("applying and planning", () => {
-  test("applyRuleFieldPatch sets each field, and a null cutoff removes the key", () => {
-    const text = JSON.stringify({ rules: [{ ...SWARM_OFF, resumeContextCutoff: 9 }] });
-    const next = JSON.parse(applyRuleFieldPatch(text, "quiet", { execution: "singleton", resumeOnRespawn: false, resumeContextCutoff: null, brief: "new" })).rules[0];
+  test("applyRuleFieldPatch sets each field", () => {
+    const text = JSON.stringify({ rules: [SWARM_OFF] });
+    const next = JSON.parse(applyRuleFieldPatch(text, "quiet", { execution: "singleton", resumeOnRespawn: false, brief: "new" })).rules[0];
     expect(next).toMatchObject({ execution: "singleton", resumeOnRespawn: false, brief: "new" });
-    expect("resumeContextCutoff" in next).toBe(false);
     expect(buildFieldsAllowedPaths(text, "quiet", { execution: "singleton", brief: "new" })).toEqual(["rules.0.execution", "rules.0.brief"]);
+  });
+
+  // FACTORY-1018: an already-deployed rule's legacy resumeContextCutoff
+  // survives an unrelated field patch untouched (never cleared, never
+  // acted on) — a PUT patch no longer even accepts the key (see
+  // `validateRuleFieldPatch`'s own test above), so this exercises the
+  // lower-level `applyRuleFieldPatch` directly, as if an old value were
+  // already on disk.
+  test("applyRuleFieldPatch leaves an already-deployed legacy resumeContextCutoff untouched", () => {
+    const text = JSON.stringify({ rules: [{ ...SWARM_OFF, resumeContextCutoff: 9 }] });
+    const next = JSON.parse(applyRuleFieldPatch(text, "quiet", { execution: "singleton" })).rules[0];
+    expect(next).toMatchObject({ execution: "singleton", resumeContextCutoff: 9 });
   });
 
   test("brief/execution changes restart an enabled rule's agent; resume settings never do", () => {
     expect(computeLocalPlanCounts(true, { brief: "x" }).restarted).toBe(1);
     expect(computeLocalPlanCounts(true, { execution: "persistent" }).restarted).toBe(1);
-    expect(computeLocalPlanCounts(true, { resumeOnRespawn: false, resumeContextCutoff: 3 }).restarted).toBe(0);
+    expect(computeLocalPlanCounts(true, { resumeOnRespawn: false }).restarted).toBe(0);
     expect(computeLocalPlanCounts(false, { brief: "x" }).restarted).toBe(0);
   });
 
@@ -155,18 +168,18 @@ describe("writeRuleFields — the new fields", () => {
 
   test("config-only fields write without confirm, and the brief is written verbatim", async () => {
     seed([SWARM_OFF]);
-    const patch: RuleFieldPatch = { resumeOnRespawn: false, resumeContextCutoff: 12, brief: "Fix {{KEY}}: {{SUMMARY}}" };
+    const patch: RuleFieldPatch = { resumeOnRespawn: false, brief: "Fix {{KEY}}: {{SUMMARY}}" };
     const plan = await planned("quiet", patch);
     const written = await writeRuleFields("quiet", patch, plan.etag, false, plan.planHash, async () => 0, deps());
     expect(written.ok).toBe(true);
-    expect(readRules()[0]).toMatchObject({ resumeOnRespawn: false, resumeContextCutoff: 12, brief: "Fix {{KEY}}: {{SUMMARY}}" });
+    expect(readRules()[0]).toMatchObject({ resumeOnRespawn: false, brief: "Fix {{KEY}}: {{SUMMARY}}" });
   });
 });
 
 describe("createRule — the new fields", () => {
   test("a create body's brief/execution/resume settings land in the file; absent ones keep the defaults; no account key is written", async () => {
     seed([]);
-    const input = { id: "made", resourceProvider: "jira-work" as const, query: "project = Z", brief: "@builtin:story", execution: "persistent" as const, resumeOnRespawn: false, resumeContextCutoff: 7 };
+    const input = { id: "made", resourceProvider: "jira-work" as const, query: "project = Z", brief: "@builtin:story", execution: "persistent" as const, resumeOnRespawn: false };
     const scopeOf = async () => 0;
     const plan = await planRuleCreate(input, true, scopeOf, deps());
     if (!plan.ok) throw new Error(plan.error);
@@ -176,7 +189,7 @@ describe("createRule — the new fields", () => {
     if (!plan2.ok) throw new Error(plan2.error);
     expect((await createRule(plain, true, plan2.planHash, scopeOf, deps())).ok).toBe(true);
     const [made, other] = readRules();
-    expect(made).toMatchObject({ brief: "@builtin:story", execution: "persistent", resumeOnRespawn: false, resumeContextCutoff: 7, enabled: false });
+    expect(made).toMatchObject({ brief: "@builtin:story", execution: "persistent", resumeOnRespawn: false, enabled: false });
     expect(other).toMatchObject({ brief: "@builtin:task", execution: "swarm" });
     expect("account" in made! || "account" in other!).toBe(false);
   });
