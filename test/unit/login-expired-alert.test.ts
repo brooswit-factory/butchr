@@ -19,20 +19,15 @@ describe("createCredentialDeathTracker (FACTORY-363/FACTORY-397)", () => {
     expect(tracker.current()).toBeDefined();
   });
 
-  test("a KEYED pane (no managed-session identity at all) still produces the alert — this tracker never consults managedSessionOf, unlike escalator.onDrovrUnknownDialog which no-ops on a keyed pane", () => {
-    // This test proves the trap from criterion 1: createManagedSessionEscalationWatcher's
-    // sink (escalator.onDrovrUnknownDialog, src/agents/escalation-loop.ts) returns early
-    // whenever `managedSessionOf(paneId)` resolves to null — deliberately correct for
-    // answerable dialogs, but FACTORY-314/w1T and FACTORY-324/w1V (the two real incidents)
-    // were both KEYED panes, which resolve to null there and would be silently dropped.
-    // createCredentialDeathTracker has no managedSessionOf concept at all — every paneId
-    // drovr's createLoginExpiredWatcher reports reaches the alert, keyed or not.
+  test("a KEYED pane still produces the alert — every pane drovr reports reaches it, keyed or not", () => {
+    // FACTORY-314/w1T and FACTORY-324/w1V (the two real incidents) were both
+    // KEYED panes — criterion 1's trap was a sink that silently dropped them.
+    // createCredentialDeathTracker has no pane-identity filter at all: every
+    // paneId drovr's createLoginExpiredWatcher reports reaches the alert.
     const { deps, lines } = fakeDeps();
     const tracker = createCredentialDeathTracker(deps);
 
-    // "w1T" stands in for a keyed pane id (drovr's LoginExpiredEscalation carries no
-    // managed-session identity at all — this tracker's input type doesn't have the field
-    // escalator.onDrovrUnknownDialog's routing depends on, which is the point).
+    // "w1T" stands in for a keyed pane id.
     tracker.onLoginExpired({ paneId: "w1T", detail: "Login expired · Please run /login" });
 
     expect(lines.length).toBe(1);

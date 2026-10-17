@@ -140,3 +140,7 @@ export function createFixturesSetupApi(opts: FixturesSetupApiOptions = {}): Setu
     rotateToken: () => respond(),
   };
 }
+
+/** local/ui — the `vite dev` switch, as in `./settings.ts`: a configured daemon whose token writes succeed. */
+const viteEnv = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+export const setupApi: SetupApi = viteEnv?.["DEV"] === true ? createFixturesSetupApi({ status: { configured: true } }) : realSetupApi;

@@ -50,7 +50,7 @@
  * `realRulesApi`/`createFixturesRulesApi` BY NAME instead of this
  * flag-selected default: a test must never depend on which bundler ran it.
  */
-import type { AccountPolicy, AgentEffort, AgentHarness, AgentRole, ExecutionMode, NotifyDeliveryMode, ResourceProvider, RulePermissionMode } from "../../../src/rules/rules.js";
+import type { AgentEffort, AgentHarness, AgentRole, ExecutionMode, NotifyDeliveryMode, ResourceProvider, RulePermissionMode } from "../../../src/rules/rules.js";
 export type { NotifyDeliveryMode };
 import { AGENT_ROLES, CAPACITY_ROLE_DEFAULT, RULE_FORM_CATALOG, type RuleFormCatalogEntry } from "../../../src/rules/rule-form-catalog.js";
 
@@ -92,7 +92,11 @@ export const ENABLE_SCOPE_CEILING = 25;
  * a matching server-side change — `resourceProvider`'s own validation,
  * `./rule-form-catalog.ts`-style wiring — whenever they'd ever change).
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"] as const satisfies readonly ResourceProvider[];
+// local/ui: `trello-card` (src/rules/trello-card-type.ts) is ours, and
+// upstream's `confluence-page` (FACTORY-998) was missing from this copy.
+// Upstream's `jira-component` (FACTORY-990) stays out: butchr can't run it
+// yet, so the Rules page doesn't offer it.
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page", "trello-card"] as const satisfies readonly ResourceProvider[];
 
 export interface RuleAgentPreferenceDto {
   harness: AgentHarness;
@@ -107,17 +111,16 @@ export interface RuleDto {
   enabled: boolean;
   /** Display-only in this slice — the count control is `execution`, not a `maxAgents` field (spec change, agentsafety review 2026-10-05: there is no `title`/`maxAgents` field). See `../../../src/rules/rules.js`'s own `ExecutionMode` doc comment for what each value means. */
   execution: ExecutionMode;
-  account: AccountPolicy;
   role: AgentRole;
   /** `[]` when the rule sets no preference (uses butchr's global agent config) — same as `RuleInventoryEntry.agentPreferences`. */
   agentPreferences: RuleAgentPreferenceDto[];
   /** FACTORY-729 — `null` when absent (butchr's own launch default applies; see `Rule.permissionMode`'s own doc comment, `../../../src/rules/rules.js`). */
   permissionMode: RulePermissionMode | null;
-  /** FACTORY-729 — `null` when absent (the "eligible for scanning" default — see `Rule.lizardMode`'s own doc comment). */
+  /** FACTORY-729 — `null` when absent (local/ui: off, not scanned — see `Rule.lizardMode`'s own doc comment). */
   lizardMode: boolean | null;
-  /** FACTORY-851 — `null` when absent; means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`). Display-only in this slice, same as `account`/`role` above. */
+  /** FACTORY-851 — `null` when absent; means ON, no tri-state (see `Rule.resumeOnRespawn`'s own doc comment, `../../../src/rules/rules.js`). Display-only in this slice, same as `role` above. */
   resumeOnRespawn: boolean | null;
-  /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeContextCutoff`'s own doc comment). Display-only in this slice, same as `account`/`role` above. */
+  /** FACTORY-851 — `null` when absent; means the daemon's own default cutoff applies (see `Rule.resumeContextCutoff`'s own doc comment). Display-only in this slice, same as `role` above. */
   resumeContextCutoff: number | null;
   /**
    * FACTORY-846 (epic FACTORY-836, story FACTORY-844): CONFIG SURFACE ONLY
@@ -141,6 +144,14 @@ export interface RuleDto {
   idlePokeEnabled: boolean;
   /** FACTORY-1010 — `null` when absent; means today's channel-first/prompt-fallback `deliverNotice` behaviour, never necessarily `"channel"` (see `Rule.notifyDeliveryMode`'s own doc comment, `../../../src/rules/rules.js`). */
   notifyDeliveryMode: NotifyDeliveryMode | null;
+  /** local/ui — the rule's own stall threshold in minutes; `null`/absent inherits the daemon default. Optional so upstream's fixtures and tests don't all need it. */
+  stalledMinutes?: number | null;
+  /** local/ui — linked-change eventing (`Rule.linkedEventing` and its knobs). Absent means off, or butchr's default for a count. Optional for the same reason as `stalledMinutes`. */
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number;
+  maxLinkedItems?: number;
   /**
    * Tri-state, reused verbatim from `RuleInventoryEntry.staffed`
    * (`../../../src/agents/query-agent-inventory.ts`): `true` staffed,
@@ -153,6 +164,20 @@ export interface RuleDto {
   staffed: boolean | null;
   /** Why not staffed, or why that could not be determined; `null` iff `staffed === true`. Server-side this is named `whyUnstaffed` (`RulesApiRuleEntry`) — renamed here only, at the `mapServerRulesResponse` edge, to keep every pre-existing reader of this field unchanged. */
   reason: string | null;
+  /** local/ui — the first 200 characters of the rule's brief (the server's `briefExcerpt`), when the server sends it: enough to tell a `@builtin:<name>` reference from custom text. The full text comes from `getBrief`. */
+  briefExcerpt?: string;
+}
+
+/** local/ui — `GET /api/rules/:id/details`: the rule's full brief, plus every other field as the daemon parsed it (secret-looking keys redacted). */
+export interface RuleDetails {
+  brief: string;
+  fields: Record<string, unknown>;
+}
+
+/** local/ui — one shipped `@builtin:<name>` brief, with its fully resolved text. */
+export interface BuiltinBrief {
+  name: string;
+  text: string;
 }
 
 export interface RulesFileError {
@@ -204,7 +229,7 @@ export interface RuleAgentPreferencePatch {
  * `lizardMode`/`agentPreferences[i].harness` to FACTORY-663's original
  * `query`/`agentPreferences[i].model/effort/modelPower/effortPower`;
  * FACTORY-817 adds `role`, previously file-only — see that field's own doc
- * comment). No `title`/`maxAgents`/`brief`/`mcpServers`/`account`/
+ * comment). No `title`/`maxAgents`/`brief`/`mcpServers`/
  * `relationships`/`linked*`/`mcpConfigFile`/`resourceProvider`/`id` field
  * exists here — those stay file-only, per this ticket's own scope
  * discipline.
@@ -230,6 +255,22 @@ export interface RuleFieldPatch {
   idlePokeEnabled?: boolean;
   /** FACTORY-1010 — CONFIG SURFACE ONLY, never risky: no confirm is required. `null` clears it back to the omitted/default behaviour — `undefined` (the field simply absent) leaves whatever is currently set alone; see the server's own `RuleFieldPatch.notifyDeliveryMode` doc comment (`../../../src/rules/rules-write-registry.js`) for why `undefined` cannot also mean "clear". */
   notifyDeliveryMode?: NotifyDeliveryMode | null;
+  /** local/ui — config surface only; `null` clears it back to the daemon default. */
+  stalledMinutes?: number | null;
+  /** local/ui — linked-change eventing; config surface only. A count's `null` clears it back to butchr's default. */
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number | null;
+  maxLinkedItems?: number | null;
+  /** local/ui — see `src/rules/rules-write-registry.ts`. On an enabled rule a change counts as a restart; switching to `"swarm"` is confirmed like a swarm enable. */
+  execution?: ExecutionMode;
+  /** local/ui — config surface only. */
+  resumeOnRespawn?: boolean;
+  /** local/ui — `null` clears it back to the daemon's default. Config surface only. */
+  resumeContextCutoff?: number | null;
+  /** local/ui — `@builtin:<name>` or literal text. On an enabled rule a change counts as a restart. */
+  brief?: string;
 }
 
 /** `POST /api/rules/plan`'s own patch shape — the SAME `RuleFieldPatch` plus the one extra field only the dedicated enable route (and this report-only plan) ever considers. */
@@ -241,11 +282,9 @@ export interface RulePlanPatch extends RuleFieldPatch {
  * FACTORY-927 — `POST /api/rules`'s own body shape (minus `confirm`, which
  * `createRule` below takes as its own separate argument, same discipline as
  * `setEnabled`/`updateFields`). Mirrors the server's own `RuleCreateInput`
- * (`src/rules/rules-write-registry.ts`) field-for-field: `brief`/
- * `execution`/`account`/`enabled` are deliberately absent — there is
- * nothing to send for them, the server hardcodes all four (a created rule
- * is ALWAYS disabled; see that module's own doc comment for why the other
- * three stay file-only in this v1 slice).
+ * (`src/rules/rules-write-registry.ts`) field-for-field: `enabled` is
+ * deliberately absent — a created rule is ALWAYS disabled (see that
+ * module's own doc comment).
  */
 export interface RuleCreateDraft {
   id: string;
@@ -256,6 +295,18 @@ export interface RuleCreateDraft {
   role?: AgentRole;
   /** At most one entry — a brand-new rule has no existing slot to grow, so (unlike `RuleFieldPatch.agentPreferences`) this is 0 or 1, never more; `harness` is REQUIRED on this one entry (unlike a PUT patch to an existing rule, there is no prior value to leave unchanged). */
   agentPreferences?: [RuleAgentPreferencePatch & { harness: AgentHarness }] | [];
+  /** local/ui — optional; the server keeps its defaults (`"@builtin:task"`, `"swarm"`) when these are absent. */
+  brief?: string;
+  execution?: ExecutionMode;
+  resumeOnRespawn?: boolean;
+  resumeContextCutoff?: number;
+  stalledMinutes?: number;
+  notifyDeliveryMode?: NotifyDeliveryMode;
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number;
+  maxLinkedItems?: number;
 }
 
 /**
@@ -406,7 +457,8 @@ export interface RulesApi {
    */
   previewRule(ruleId: string, signal?: AbortSignal, queryOverride?: string): Promise<RulePreviewResponse>;
   /** Report-only: never applies anything. */
-  planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
+  /** local/ui: `opts.assumeDisabled` plans against the rule as it will be once turned off (a field update saved right after its disable). */
+  planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal, opts?: { assumeDisabled?: boolean }): Promise<RulePlanResponse>;
   /** `POST /api/rules/:id/enabled` — the ONLY call that may flip `enabled`. `ifMatch` must be the rule list's own `sourceEtag` (never `fileEtag`); `planHash` must be the SAME plan just returned by `planRule` for this exact patch. */
   setEnabled(ruleId: string, enabled: boolean, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /** `PUT /api/rules/:id` — the nested allowlist edit. Same `ifMatch`/`planHash` discipline as `setEnabled`. */
@@ -455,6 +507,10 @@ export interface RulesApi {
    * needing `realRulesApi` at all.
    */
   refreshCapabilities(signal?: AbortSignal): Promise<RulesApiCapabilities>;
+  /** local/ui — `GET /api/rules/:id/details`: one rule's full brief and its other fields. Optional so other `RulesApi` stand-ins keep compiling. */
+  getRuleDetails?(ruleId: string, signal?: AbortSignal): Promise<RuleDetails>;
+  /** local/ui — the shipped `@builtin:` briefs (name + resolved text), from `GET /api/rules/catalog`'s `briefs`. */
+  getBriefs?(signal?: AbortSignal): Promise<readonly BuiltinBrief[]>;
 }
 
 interface RequestOpts {
@@ -577,7 +633,6 @@ interface ServerRuleEntry {
   query: string;
   enabled: boolean;
   execution: ExecutionMode;
-  account: AccountPolicy;
   role: AgentRole;
   agentPreferences: RuleAgentPreferenceDto[];
   permissionMode: RulePermissionMode | null;
@@ -588,8 +643,17 @@ interface ServerRuleEntry {
   idlePokeMessage: string | null;
   idlePokeEnabled: boolean;
   notifyDeliveryMode: NotifyDeliveryMode | null;
+  /** The server sends this; optional so hand-built test responses needn't. */
+  stalledMinutes?: number | null;
+  /** Always sent by the server; the five knobs below only when the rule sets them. */
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number;
+  maxLinkedItems?: number;
   staffed: boolean | null;
   whyUnstaffed: string | null;
+  briefExcerpt?: string;
 }
 
 /** The ONE place the server's `RulesApiResponse` shape is translated onto this module's own stable `RulesListResponse` — see this file's top comment for why the two deliberately differ. */
@@ -604,7 +668,6 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       query: r.query,
       enabled: r.enabled,
       execution: r.execution,
-      account: r.account,
       role: r.role,
       agentPreferences: r.agentPreferences,
       permissionMode: r.permissionMode,
@@ -615,8 +678,17 @@ function mapServerRulesResponse(data: ServerRulesApiResponse): RulesListResponse
       idlePokeMessage: r.idlePokeMessage,
       idlePokeEnabled: r.idlePokeEnabled,
       notifyDeliveryMode: r.notifyDeliveryMode,
+      // local/ui — only when set, so the mapped shape for an unset rule stays exactly upstream's.
+      ...(r.stalledMinutes != null ? { stalledMinutes: r.stalledMinutes } : {}),
+      ...(r.linkedEventing ? { linkedEventing: true } : {}),
+      ...(r.linkedRemoteLinks !== undefined ? { linkedRemoteLinks: r.linkedRemoteLinks } : {}),
+      ...(r.linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: r.linkedDescriptionLinks } : {}),
+      ...(r.linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: r.linkedPollIntervalMs } : {}),
+      ...(r.maxLinkedItems !== undefined ? { maxLinkedItems: r.maxLinkedItems } : {}),
       staffed: r.staffed,
       reason: r.whyUnstaffed,
+      // A real brief is never empty, so an empty excerpt carries nothing worth keeping.
+      ...(r.briefExcerpt ? { briefExcerpt: r.briefExcerpt } : {}),
     })),
     errors: data.valid ? [] : data.problems.map((message) => ({ path: data.path, message })),
   };
@@ -646,6 +718,11 @@ export const realRulesApi: RulesApi = {
   listRules: async (signal) => mapServerRulesResponse(await request<ServerRulesApiResponse>("/api/rules", { signal })),
   getCatalog: async (signal) => (await request<{ harnesses: RuleFormCatalogEntry[] }>("/api/rules/catalog", { signal })).harnesses,
   getCapacityRoles: async (signal) => (await request<{ capacityRoles: RuleCapacityRolesCatalog }>("/api/rules/catalog", { signal })).capacityRoles,
+  getRuleDetails: async (ruleId, signal) => {
+    const body = await request<{ id: string; brief: string; fields?: Record<string, unknown> }>(`/api/rules/${encodeURIComponent(ruleId)}/details`, { signal });
+    return { brief: body.brief, fields: body.fields ?? {} };
+  },
+  getBriefs: async (signal) => (await request<{ briefs?: BuiltinBrief[] }>("/api/rules/catalog", { signal })).briefs ?? [],
   // FACTORY-686: the REAL server answers `{ok, keys: string[], total, cap, warning}`
   // (src/web/rules-preview.ts), not the `{ruleId, total, tickets: [{key}]}` shape this
   // client's fixtures grew around: reading `tickets` off the real response was
@@ -655,7 +732,7 @@ export const realRulesApi: RulesApi = {
     const qs = queryOverride !== undefined ? `?query=${encodeURIComponent(queryOverride)}` : "";
     return mapServerPreview(ruleId, await request<unknown>(`/api/rules/${encodeURIComponent(ruleId)}/preview${qs}`, { signal }));
   },
-  planRule: async (ruleId, patch, confirm, signal) => {
+  planRule: async (ruleId, patch, confirm, signal, opts) => {
     // `csrf: true` is REQUIRED here even though this route only ever
     // reports, never writes: the real merged guard (`src/web/view.ts`'s
     // `onRequest` hook) fails closed on PATH SHAPE, not per-route
@@ -663,7 +740,7 @@ export const realRulesApi: RulesApi = {
     // pass the full `checkWriteGuard`, CSRF included, before its own
     // handler (which itself calls `checkWriteGuard` again) is ever
     // reached. Omitting this would 403 every real plan call.
-    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, csrf: true, signal });
+    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm, ...(opts?.assumeDisabled ? { assumeDisabled: true } : {}) }, csrf: true, signal });
     // `requiresConfirm`/`confirmReason` are read straight off the server's
     // own response — same field names on both sides (FACTORY-685, item 2's
     // own deliberate deviation: no rename to the ticket's literal
@@ -755,6 +832,12 @@ export interface FixturesRulesApiOptions {
   plans?: Record<string, RulePlanResponse>;
   /** When set, every call rejects with this message — simulates a fixtures-mode backend error. */
   failWith?: string;
+  /** local/ui — full brief text per rule id; a rule without one falls back to its `briefExcerpt`, then `"@builtin:task"`. */
+  briefs?: Record<string, string>;
+  /** local/ui — extra file-only fields per rule id, merged into `getRuleDetails()`'s `fields`. */
+  ruleFields?: Record<string, Record<string, unknown>>;
+  /** local/ui — `getBriefs()`'s answer; defaults to a short stand-in for each shipped brief. */
+  builtinBriefs?: readonly BuiltinBrief[];
   /** `refreshCapabilities()`'s own answer — defaults `true`. Set `false` to rehearse the Rules page's "session check failed, writes stay disabled" render path without touching `realRulesApi`. */
   sessionOk?: boolean;
   /**
@@ -790,9 +873,20 @@ function computeLocalPlanCounts(wasEnabled: boolean, patch: RulePlanPatch): { sp
     return patch.enabled ? { spawned: 1, stopped: 0, restarted: 0 } : { spawned: 0, stopped: 1, restarted: 0 };
   }
   // FACTORY-729: mirrors the real server's own `computeLocalPlanCounts` (`src/rules/rules-write.ts`) — permissionMode/lizardMode count the same as query/agentPreferences.
-  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined;
+  const otherFieldsChanged =
+    patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined || patch.brief !== undefined || patch.execution !== undefined;
   return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
 }
+
+/** local/ui — stand-ins for the shipped `@builtin:` briefs, for the fixtures API and the dev server. */
+export const FIXTURE_BUILTIN_BRIEFS: readonly BuiltinBrief[] = [
+  { name: "task", text: "# task agent - {{KEY}}: {{SUMMARY}}\n\nYou own one unit of work. Produce the artifact or answer requested.\nRelated work context: {{PARENT}}." },
+  { name: "bug", text: "# bug agent - {{KEY}}: {{SUMMARY}}\n\nReproduce the bug, fix it, and prove the fix." },
+  { name: "story", text: "# story agent - {{KEY}}: {{SUMMARY}}\n\nBreak the story into tasks and see them through." },
+  { name: "epic", text: "# epic agent - {{KEY}}: {{SUMMARY}}\n\nOwn the epic's outcome; coordinate its stories." },
+  { name: "project", text: "# project manager - {{KEY}}\n\nKeep the project's work moving." },
+  { name: "default", text: "# agent - {{KEY}}: {{SUMMARY}}\n\nDo the work this ticket asks for." },
+];
 
 /**
  * Demo dataset for `bun run dev:web` — every tri-state `staffed` value, a
@@ -814,7 +908,6 @@ export function defaultRulesFixture(): RulesListResponse {
         query: 'project = FACTORY AND status = "To Do"',
         enabled: true,
         execution: "swarm",
-        account: "none",
         role: "worker",
         agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
         permissionMode: null,
@@ -827,6 +920,7 @@ export function defaultRulesFixture(): RulesListResponse {
         notifyDeliveryMode: null,
         staffed: true,
         reason: null,
+        briefExcerpt: "@builtin:task",
       },
       {
         id: "stale-github-prs",
@@ -834,7 +928,6 @@ export function defaultRulesFixture(): RulesListResponse {
         query: "is:open label:needs-triage",
         enabled: false,
         execution: "swarm",
-        account: "none",
         role: "worker",
         agentPreferences: [],
         permissionMode: null,
@@ -847,6 +940,7 @@ export function defaultRulesFixture(): RulesListResponse {
         notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled",
+        briefExcerpt: "@builtin:task",
       },
       {
         id: "vip-zendesk",
@@ -854,7 +948,6 @@ export function defaultRulesFixture(): RulesListResponse {
         query: "tags:vip status<solved",
         enabled: true,
         execution: "singleton",
-        account: "none",
         role: "worker",
         agentPreferences: [{ harness: "claude", effort: "high" }],
         permissionMode: "default",
@@ -867,6 +960,7 @@ export function defaultRulesFixture(): RulesListResponse {
         notifyDeliveryMode: null,
         staffed: null,
         reason: "census unavailable: most recent agent-list poll failed",
+        briefExcerpt: "Triage VIP tickets for {{KEY}}: summarize the customer's issue and propose a reply.",
       },
       {
         id: FIRST_RULE_ID,
@@ -874,7 +968,6 @@ export function defaultRulesFixture(): RulesListResponse {
         query: PLACEHOLDER_QUERY,
         enabled: false,
         execution: "swarm",
-        account: "none",
         role: "worker",
         agentPreferences: [],
         permissionMode: null,
@@ -887,6 +980,7 @@ export function defaultRulesFixture(): RulesListResponse {
         notifyDeliveryMode: null,
         staffed: false,
         reason: "disabled: not yet configured (query is still the placeholder)",
+        briefExcerpt: "@builtin:task",
       },
     ],
     errors: [],
@@ -919,6 +1013,8 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
   let nextRateLimit = opts.nextRateLimit;
   let backupCounter = 0;
   const backups = new Map<string, RulesListResponse>();
+  // local/ui — full brief text, which `RuleDto` only ever carries an excerpt of.
+  const briefs = new Map<string, string>(state.rules.map((r) => [r.id, opts.briefs?.[r.id] ?? r.briefExcerpt ?? "@builtin:task"]));
 
   const delay = () => (latencyMs > 0 ? new Promise<void>((resolve) => setTimeout(resolve, latencyMs)) : Promise.resolve());
   const maybeFail = () => {
@@ -1006,7 +1102,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       return opts.capacityRoles ?? { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT };
     },
-    async planRule(ruleId, patch, confirm) {
+    async planRule(ruleId, patch, confirm, _signal, planOpts) {
       await delay();
       maybeFail();
       if (opts.plans?.[ruleId]) return opts.plans[ruleId]!;
@@ -1015,26 +1111,33 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       // placeholder-query refusal happens BEFORE any confirm/scope logic is
       // even computed, so a still-placeholder enable refuses plainly rather
       // than showing a confirm dialog for a write that can never succeed.
-      if (patch.enabled === true && !rule.enabled && rule.query === PLACEHOLDER_QUERY) {
+      // local/ui: like the server, a dry run that also edits the query checks the edited one.
+      if (patch.enabled === true && !rule.enabled && (patch.query ?? rule.query) === PLACEHOLDER_QUERY) {
         throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
       }
-      const counts = computeLocalPlanCounts(rule.enabled, patch);
+      // local/ui: like the server, plan against the rule as it will be once turned off when asked.
+      const ruleEnabled = planOpts?.assumeDisabled ? false : rule.enabled;
+      const counts = computeLocalPlanCounts(ruleEnabled, patch);
       // FACTORY-730 (review round 2): a CHANGED `query` is dry-run against
       // its NEW text — regardless of `counts.spawned` (always 0 for a real
       // field edit) — mirroring the real server's own `planRuleWrite`.
       // `previewsByQuery` (keyed `${ruleId}:${patch.query}`) lets a test fix
       // a distinct count for the draft text; falls back to `previews`.
       const queryChanged = patch.query !== undefined && patch.query !== rule.query;
+      // local/ui: mirrors the server's `isSwarmSwitch` (`src/rules/rules-write.ts`).
+      const swarmSwitch = ruleEnabled && patch.execution === "swarm" && rule.execution !== "swarm";
       const scopeCount = counts.spawned > 0
-        ? opts.previews?.[ruleId]?.total ?? 0
+        ? (patch.query !== undefined ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total : undefined) ?? opts.previews?.[ruleId]?.total ?? 0
         : queryChanged
           ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0
-          : undefined;
+          : swarmSwitch
+            ? opts.previews?.[ruleId]?.total ?? 0
+            : undefined;
       // Mirrors `src/rules/rules-write.ts`'s own `planRuleWrite` gate order
       // (FACTORY-685, item 2): a swarm enable needs confirm at ANY scope,
       // not only above the ceiling.
-      const rawSwarmEnable = counts.spawned > 0 && rule.execution === "swarm";
-      const rawOverCeiling = counts.spawned > 0 && scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
+      const rawSwarmEnable = (counts.spawned > 0 && (patch.execution ?? rule.execution) === "swarm") || swarmSwitch;
+      const rawOverCeiling = (counts.spawned > 0 || swarmSwitch) && scopeCount !== undefined && scopeCount > ENABLE_SCOPE_CEILING;
       // FACTORY-730: raw/unconditional, same discipline as the gates above.
       const rawQueryChange = queryChanged;
       const rawStopRestart = counts.stopped > 0 || counts.restarted > 0;
@@ -1111,6 +1214,9 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         const scopeCount = opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total ?? opts.previews?.[ruleId]?.total ?? 0;
         throw new Error(`editing "${ruleId}"'s query would now match ${scopeCount} ticket(s) — retry with confirm: true to proceed`);
       }
+      if (rule.enabled && patch.execution === "swarm" && rule.execution !== "swarm" && !confirm) {
+        throw new Error(`switching "${ruleId}" to swarm will staff up to ${opts.previews?.[ruleId]?.total ?? 0} ticket(s) — retry with confirm: true to proceed`);
+      }
       const updated: RuleDto = {
         ...rule,
         query: patch.query ?? rule.query,
@@ -1126,9 +1232,16 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         // to the rule's CURRENT value for an explicit `null`, since `??`
         // treats `null` the same as `undefined`.
         notifyDeliveryMode: patch.notifyDeliveryMode === null ? null : (patch.notifyDeliveryMode ?? rule.notifyDeliveryMode),
+        stalledMinutes: patch.stalledMinutes === null ? null : (patch.stalledMinutes ?? rule.stalledMinutes ?? null),
+        execution: patch.execution ?? rule.execution,
+        resumeOnRespawn: patch.resumeOnRespawn ?? rule.resumeOnRespawn,
+        resumeContextCutoff: patch.resumeContextCutoff === null ? null : (patch.resumeContextCutoff ?? rule.resumeContextCutoff),
+        ...(patch.brief !== undefined ? { briefExcerpt: patch.brief.slice(0, 200) } : {}),
         agentPreferences:
           patch.agentPreferences?.map((p, i) => ({ ...(rule.agentPreferences[i] ?? { harness: "claude" as AgentHarness }), ...p })) ?? rule.agentPreferences,
       };
+      applyLinkedFields(updated, patch);
+      if (patch.brief !== undefined) briefs.set(ruleId, patch.brief);
       return commitWrite(state.rules.map((r) => (r.id === ruleId ? updated : r)), [ruleId]);
     },
     async deleteRule(ruleId, ifMatch, confirm) {
@@ -1175,6 +1288,23 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       this.capabilities.write = opts.sessionOk ?? true;
       return this.capabilities;
     },
+    async getRuleDetails(ruleId) {
+      await delay();
+      maybeFail();
+      const rule = findRule(ruleId);
+      // The parsed-rule shape the real route returns: only fields that are set, nulls left out.
+      const fields: Record<string, unknown> = {};
+      for (const key of ["id", "enabled", "resourceProvider", "query", "execution", "role", "agentPreferences", "permissionMode", "lizardMode", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "notifyDeliveryMode", "stalledMinutes", ...LINKED_BOOLEAN_KEYS, ...LINKED_COUNT_KEYS] as const) {
+        const value = rule[key];
+        if (value !== null && value !== undefined) fields[key] = value;
+      }
+      return { brief: briefs.get(ruleId) ?? "@builtin:task", fields: { ...fields, ...(opts.ruleFields?.[ruleId] ?? {}) } };
+    },
+    async getBriefs() {
+      await delay();
+      maybeFail();
+      return opts.builtinBriefs ?? FIXTURE_BUILTIN_BRIEFS;
+    },
     // FACTORY-927 (review round 1, items 2/3) — mirrors the real server's
     // own three-outcome `POST /api/rules` (`src/web/view.ts`): a collision
     // is `{kind: "refused"}` regardless of `confirm`; `confirm !== true`
@@ -1217,24 +1347,44 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
         resourceProvider: draft.resourceProvider,
         query: draft.query,
         enabled: false,
-        execution: "swarm",
-        account: "none",
+        execution: draft.execution ?? "swarm",
         role: draft.role ?? "worker",
         agentPreferences: draft.agentPreferences ?? [],
         permissionMode: draft.permissionMode ?? null,
         lizardMode: draft.lizardMode ?? null,
-        resumeOnRespawn: null,
-        resumeContextCutoff: null,
+        resumeOnRespawn: draft.resumeOnRespawn ?? null,
+        resumeContextCutoff: draft.resumeContextCutoff ?? null,
         idlePokeMinutes: null,
         idlePokeMessage: null,
-        idlePokeEnabled: true,
-        notifyDeliveryMode: null,
+        idlePokeEnabled: false,
+        notifyDeliveryMode: draft.notifyDeliveryMode ?? null,
+        stalledMinutes: draft.stalledMinutes ?? null,
         staffed: false,
         reason: "disabled",
+        briefExcerpt: (draft.brief ?? "@builtin:task").slice(0, 200),
       };
+      applyLinkedFields(created, draft);
+      briefs.set(draft.id, draft.brief ?? "@builtin:task");
       return { kind: "created", result: commitWrite([...state.rules, created], [draft.id]) };
     },
   };
+}
+
+/** local/ui — the linked-eventing fields, restated from `src/rules/rules-write-registry.ts` (a value import from there would pull `node:` builtins into the browser bundle). */
+const LINKED_BOOLEAN_KEYS = ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const;
+const LINKED_COUNT_KEYS = ["linkedPollIntervalMs", "maxLinkedItems"] as const;
+
+/** Applies a patch's or create body's linked-eventing fields the way the server does: a count's `null` removes it. */
+function applyLinkedFields(target: RuleDto, source: RuleFieldPatch | RuleCreateDraft): void {
+  for (const k of LINKED_BOOLEAN_KEYS) {
+    const v = source[k];
+    if (v !== undefined) target[k] = v;
+  }
+  for (const k of LINKED_COUNT_KEYS) {
+    const v = source[k];
+    if (v === null) delete target[k];
+    else if (v !== undefined) target[k] = v;
+  }
 }
 
 export const fixturesRulesApi: RulesApi = createFixturesRulesApi();

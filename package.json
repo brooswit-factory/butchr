@@ -42,10 +42,15 @@
     "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz"
   },
   "devDependencies": {
+    "@codemirror/autocomplete": "6.20.3",
+    "@codemirror/commands": "6.11.1",
+    "@codemirror/language": "6.13.1",
+    "@codemirror/state": "6.7.6",
+    "@codemirror/view": "6.43.14",
     "@happy-dom/global-registrator": "20.14.5",
     "@launchpad-ui/components": "0.25.0",
+    "@launchpad-ui/icons": "0.26.7",
     "@launchpad-ui/tokens": "0.19.0",
-    "@rocket.chat/message-parser": "0.32.0",
     "@testing-library/dom": "10.4.2",
     "@testing-library/react": "16.3.3",
     "@types/bun": "^1.2.0",
@@ -59,6 +64,7 @@
     "react-hook-form": "^7.89.0",
     "react-router": "^8.4.0",
     "react-stately": "^3.50.0",
+    "style-mod": "4.1.4",
     "typescript": "^5.6.0",
     "vite": "^6"
   },

@@ -1,5 +1,5 @@
 import { decodeAgentKey } from "../rules/agent-key.js";
-import { effortFor, mcpIdentityHeaders, modelFor, resolveAccountHeader, type SpawnSpec } from "./workspace.js";
+import { effortFor, mcpIdentityHeaders, modelFor, type SpawnSpec } from "./workspace.js";
 import {
   buildAgentStartParams,
   checkManagedAgentArgv,
@@ -90,12 +90,12 @@ export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md. ${KICKOFF_REMINDER}
  * ONLY inside `agentLaunchConfig` below — see that function's own doc
  * comment for why nowhere else is the right place. `acceptEdits` auto-
  * accepts file edits only; Bash/MCP tool-permission prompts still fire,
- * which is why this default NEVER ships without `lizardMode` also
- * defaulting to eligible (see `ruleLizardModeOf`,
- * src/agents/permission-answer-loop.ts, and the managed-session
- * `lizardModes` map fill, src/rules/session-definition-type.ts) — the
- * DROVR-37 freeze incident is what an accept-edits agent with no lizard
- * coverage looks like.
+ * which is why upstream pairs this default with `lizardMode` also
+ * defaulting to eligible — the DROVR-37 freeze incident is what an
+ * accept-edits agent with no lizard coverage looks like. local/ui: the user
+ * asked for lizard mode to be off by default (`ruleLizardModeOf`,
+ * src/agents/permission-answer-loop.ts), so a rule that wants unattended
+ * prompt-clearing turns it on.
  */
 export const DEFAULT_PERMISSION_MODE = "acceptEdits" as const;
 export type AgentProvider = ManagedAgentProvider;
@@ -227,30 +227,13 @@ const boundChannels = (spec: SpawnSpec): string[] => (spec.mcpServers ?? []).fil
  * and the agent's own `mcp.json` (Claude only, see `buildWorkspace`'s 0600
  * handling) — Codex argv is exactly such an "anywhere else". A binding that
  * names ONLY `headersEnvVar` simply connects Codex to the bound server with
- * no extra headers; docs/managed-sessions.md and docs/mcp-server-bindings.md
- * both say so loudly, since an authenticated bridge then fails to
- * authenticate otherwise (`resolveMcpServerHeaders` itself, used only by
- * the Claude/`mcp.json` path below, already logs when a named var resolves
- * to nothing).
- *
- * BUTCHR-413 (review finding 1) IS an exception, deliberately: a binding's
- * `accountHeader` (see that field's own doc comment, src/rules/rules.ts)
- * carries only an account NAME, `spec.rocketchatAccount` — never a
- * bearer token — so `resolveAccountHeader` (src/agents/workspace.ts, the
- * SAME function `buildWorkspace` calls for Claude's `mcp.json`, reused here
- * verbatim rather than a second copy) reaches Codex argv here where
- * `headersEnvVar`'s own resolved value never does. This is what makes a
- * Codex agent's own reply through `rocketr`'s tools possible at all after
- * this same review's earlier fix (BUTCHR-411) struck every bound-server
- * header from a Codex launch: that fix is unweakened — `headersEnvVar`
- * still never reaches here — this only adds a second, narrower, non-secret
- * channel the earlier review never considered.
+ * no extra headers; docs/mcp-server-bindings.md says so loudly, since an
+ * authenticated bridge then fails to authenticate otherwise
+ * (`resolveMcpServerHeaders` itself, used only by the Claude/`mcp.json`
+ * path below, already logs when a named var resolves to nothing).
  */
-const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string; headers?: Record<string, string> }> =>
-  (spec.mcpServers ?? []).map((s) => {
-    const headers = resolveAccountHeader(s, spec.rocketchatAccount);
-    return { name: s.name, url: s.url, ...(headers ? { headers } : {}) };
-  });
+const boundCodexServers = (spec: SpawnSpec): Array<{ name: string; url: string }> =>
+  (spec.mcpServers ?? []).map((s) => ({ name: s.name, url: s.url }));
 
 /**
  * Butchr supplies workspace intent; Drovr owns provider-specific process

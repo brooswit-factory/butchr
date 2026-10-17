@@ -3,8 +3,6 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { providerAtlassianTools } from "../../src/tools/provider-atlassian.js";
-import { resourceLinkTools } from "../../src/tools/resource-links.js";
-import type { LinkStore } from "../../src/resources/link-store.js";
 import type { AtlassianOps } from "../../src/tools/atlassian.js";
 import { BRIEF_COVERAGE, type BriefCoverageEntry } from "../../src/tools/brief-coverage.js";
 
@@ -42,7 +40,7 @@ function extractVerbs(text: string): string[] {
 
 /** The real tool registry the daemon serves — never a hand-maintained second list. */
 function realToolSurface(): Set<string> {
-  return new Set(Object.keys({ ...providerAtlassianTools({} as AtlassianOps), ...resourceLinkTools({} as LinkStore) }));
+  return new Set(Object.keys(providerAtlassianTools({} as AtlassianOps)));
 }
 
 describe("brief↔tool-surface drift guard (BUTCHR-48)", () => {
@@ -68,7 +66,7 @@ describe("brief↔tool-surface drift guard (BUTCHR-48)", () => {
     }
     // A handful of verbs every brief in this vocabulary is expected to teach;
     // if extraction silently stopped matching anything, this is what would notice.
-    for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "confluence_update_page", "add_link"]) {
+    for (const verb of ["jira_get_issue", "jira_add_comment", "jira_transition", "jira_create_issue", "confluence_update_page"]) {
       expect(names.has(verb)).toBe(true);
     }
   });
@@ -85,7 +83,7 @@ function allTaughtVerbs(): Set<string> {
 
 /**
  * The registry verbs with NO `BRIEF_COVERAGE` entry at all — the "never
- * neither" half of total coverage. A verb newly added to `providerAtlassianTools() + resourceLinkTools()`
+ * neither" half of total coverage. A verb newly added to `providerAtlassianTools()`
  * with no matching entry in `BRIEF_COVERAGE` shows up here, failing the
  * suite exactly as BUTCHR-257's DoD #1 requires ("adding a verb to the
  * registry FAILS THE SUITE until someone declares whether a brief must
@@ -122,13 +120,13 @@ function findFalselyTaughtVerbs(coverage: Readonly<Record<string, BriefCoverageE
 
 function formatUncoveredVerbsError(verbs: readonly string[]): string {
   return [
-    `${verbs.length} registry verb(s) from providerAtlassianTools() + resourceLinkTools() have no BRIEF_COVERAGE entry in src/tools/brief-coverage.ts: ${verbs.join(", ")}.`,
+    `${verbs.length} registry verb(s) from providerAtlassianTools() have no BRIEF_COVERAGE entry in src/tools/brief-coverage.ts: ${verbs.join(", ")}.`,
     'TO FIX: add an entry — { taught: true } if a brief is expected to name it (and does — see the corroboration test below), or { taught: false, reason: "..." } with a real, non-empty reason otherwise.',
   ].join("\n");
 }
 
 function formatStaleCoverageError(verbs: readonly string[]): string {
-  return `${verbs.length} BRIEF_COVERAGE entr${verbs.length === 1 ? "y names" : "ies name"} a verb no longer in providerAtlassianTools() + resourceLinkTools(): ${verbs.join(", ")}. Remove the stale entr${verbs.length === 1 ? "y" : "ies"} from src/tools/brief-coverage.ts.`;
+  return `${verbs.length} BRIEF_COVERAGE entr${verbs.length === 1 ? "y names" : "ies name"} a verb no longer in providerAtlassianTools(): ${verbs.join(", ")}. Remove the stale entr${verbs.length === 1 ? "y" : "ies"} from src/tools/brief-coverage.ts.`;
 }
 
 function formatFalselyTaughtError(verbs: readonly string[]): string {
@@ -174,7 +172,7 @@ function formatTaughtFalseButNamedError(verbs: readonly string[], coverage: Read
 // ---------------------------------------------------------------------
 // The forward test above ("every backticked verb... exists in the real tool
 // registry") only ever enforced one direction. This section makes the
-// REVERSE claim explicit and executable: every verb `providerAtlassianTools() + resourceLinkTools()` ships
+// REVERSE claim explicit and executable: every verb `providerAtlassianTools()` ships
 // is accounted for in `src/tools/brief-coverage.ts`'s `BRIEF_COVERAGE`,
 // either as `taught: true` (verified below against the real briefs/*.md
 // text) or `taught: false` with a written, non-empty reason — never neither.
@@ -189,7 +187,7 @@ function formatTaughtFalseButNamedError(verbs: readonly string[], coverage: Read
 // pure functions above are self-contained, matching that idiom, checking a
 // DIFFERENT derived family (registry verbs, not brief types).
 describe("BUTCHR-257: total brief-coverage accounting of the derived tool registry", () => {
-  test("every verb providerAtlassianTools() + resourceLinkTools() ships has exactly one BRIEF_COVERAGE entry, and BRIEF_COVERAGE names no stale verb", () => {
+  test("every verb providerAtlassianTools() ships has exactly one BRIEF_COVERAGE entry, and BRIEF_COVERAGE names no stale verb", () => {
     const registry = [...realToolSurface()];
     expect(registry.length).toBeGreaterThan(0); // rules out "passes because the registry is empty"
 

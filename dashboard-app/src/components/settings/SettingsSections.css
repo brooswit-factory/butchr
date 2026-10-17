@@ -1,0 +1,143 @@
+/*
+ * local/ui — the Settings page's grouped daemon settings, in the Providers
+ * cards' style. Public LaunchPad tokens only; a static stylesheet, since
+ * butchr's CSP (style-src 'self') blocks runtime <style> injection.
+ */
+
+.sg-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-16);
+  max-width: var(--lp-size-1200);
+  margin-bottom: var(--lp-size-32);
+}
+
+.sg-section__title {
+  margin: 0 0 var(--lp-size-4);
+  font: var(--lp-text-heading-2-semibold);
+}
+
+.sg-section__intro p {
+  margin: 0;
+}
+
+.sg-muted {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.sg-ok {
+  color: var(--lp-color-text-feedback-success);
+}
+
+.sg-error {
+  color: var(--lp-color-text-feedback-error);
+}
+
+.sg-warning {
+  color: var(--lp-color-text-feedback-warning);
+}
+
+.sg-card {
+  border: 1px solid var(--lp-color-border-ui-secondary);
+  border-radius: var(--lp-border-radius-medium);
+  background: var(--lp-color-bg-ui-primary);
+}
+
+.sg-card__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--lp-size-8);
+  padding: var(--lp-size-12) var(--lp-size-16);
+  border-bottom: 1px solid var(--lp-color-border-ui-secondary);
+}
+
+.sg-card__title {
+  margin: 0;
+  font: var(--lp-text-heading-3-semibold);
+}
+
+.sg-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* One setting: what it is on the left, its value or field on the right. */
+.sg-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 380px);
+  align-items: start;
+  gap: var(--lp-size-8) var(--lp-size-24);
+  padding: var(--lp-size-12) var(--lp-size-16);
+}
+
+.sg-row + .sg-row {
+  border-top: 1px solid var(--lp-color-border-ui-secondary);
+}
+
+@media (max-width: 760px) {
+  .sg-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.sg-row__about {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-4);
+  min-width: 0;
+}
+
+.sg-row__about p {
+  margin: 0;
+}
+
+.sg-row__label {
+  font: var(--lp-text-label-1-semibold);
+}
+
+.sg-row__meta {
+  color: var(--lp-color-text-ui-secondary);
+}
+
+.sg-row__meta code,
+.sg-value {
+  font-family: var(--lp-font-family-monospace);
+  font-size: 0.92em;
+  overflow-wrap: anywhere;
+}
+
+.sg-row__value {
+  min-width: 0;
+  padding-top: var(--lp-size-2);
+  font: var(--lp-text-body-2-regular);
+}
+
+.sg-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--lp-size-4);
+}
+
+.sg-field p {
+  margin: 0;
+}
+
+.sg-field__row {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+}
+
+.sg-field__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.sg-confirm {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--lp-size-4);
+}

@@ -15,138 +15,55 @@ const EVENT: Omit<AuditWriteEvent, "time"> = {
 };
 
 describe("createAuditLogger", () => {
-  test("accepted write: appends exactly one JSON line, parseable, with every field, and alerts immediately", async () => {
+  test("accepted write: appends exactly one JSON line, parseable, with every field, and logs the same line", () => {
     const lines: string[] = [];
-    let posted: string | undefined;
-    const logger = createAuditLogger({ append: (l: string) => lines.push(l), postAlert: async (t: string) => { posted = t; }, host: "servyboi", log: () => {} });
+    const logged: string[] = [];
+    const logger = createAuditLogger({ append: (l: string) => lines.push(l), log: (l: string) => logged.push(l) });
     logger(EVENT);
     expect(lines).toHaveLength(1);
     expect(lines[0]!.endsWith("\n")).toBe(true);
     const parsed = JSON.parse(lines[0]!.trimEnd());
     expect(parsed).toMatchObject(EVENT);
     expect(typeof parsed.time).toBe("string");
-    await Promise.resolve();
-    expect(posted).toBeDefined();
-    expect(posted).toContain("ACCEPTED");
+    expect(logged).toEqual([`[butchr:audit] ${lines[0]!.trimEnd()}`]);
   });
 
   test("a rejected event carries its reason", () => {
     const lines: string[] = [];
-    const logger = createAuditLogger({ append: (l: string) => lines.push(l), host: "servyboi", log: () => {} });
+    const logger = createAuditLogger({ append: (l: string) => lines.push(l), log: () => {} });
     logger({ ...EVENT, outcome: "rejected", reason: "stale etag" });
     const parsed = JSON.parse(lines[0]!.trimEnd());
     expect(parsed.outcome).toBe("rejected");
     expect(parsed.reason).toBe("stale etag");
   });
 
+  test("every event in a burst of rejections gets its own line — nothing is aggregated away", () => {
+    const lines: string[] = [];
+    const logger = createAuditLogger({ append: (l: string) => lines.push(l), log: () => {} });
+    for (let i = 0; i < 5; i++) logger({ ...EVENT, outcome: "rejected", reason: `r${i}` });
+    expect(lines.map((l) => JSON.parse(l).reason)).toEqual(["r0", "r1", "r2", "r3", "r4"]);
+  });
+
+  test("a connection test (kind: \"test\") is recorded with its kind", () => {
+    const lines: string[] = [];
+    const logger = createAuditLogger({ append: (l: string) => lines.push(l), log: () => {} });
+    logger({ ...EVENT, kind: "test", outcome: "rejected", reason: "401" });
+    expect(JSON.parse(lines[0]!)).toMatchObject({ kind: "test", outcome: "rejected", reason: "401" });
+  });
+
   test("never throws when append itself throws — fails open, logs a WARNING", () => {
     const logged: string[] = [];
-    const logger = createAuditLogger({ append: () => { throw new Error("disk full"); }, host: "servyboi", log: (l: string) => logged.push(l) });
+    const logger = createAuditLogger({ append: () => { throw new Error("disk full"); }, log: (l: string) => logged.push(l) });
     expect(() => logger(EVENT)).not.toThrow();
     expect(logged.some((l) => l.includes("WARNING") && l.includes("disk full"))).toBe(true);
   });
 
-  test("no postAlert configured: logs once, never throws, never calls anything", () => {
-    const lines: string[] = [];
-    const logger = createAuditLogger({ append: (l: string) => lines.push(l), host: "servyboi", log: () => {} });
-    expect(() => logger(EVENT)).not.toThrow();
-    expect(lines).toHaveLength(1);
-  });
-
-  test("a failing postAlert never throws back into the caller", async () => {
-    const logged: string[] = [];
-    const logger = createAuditLogger({ append: () => {}, postAlert: async () => { throw new Error("rocketchat unreachable"); }, host: "servyboi", log: (l: string) => logged.push(l) });
-    expect(() => logger(EVENT)).not.toThrow();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(logged.some((l) => l.includes("WARNING") && l.includes("rocketchat unreachable"))).toBe(true);
-  });
-
   test("diffSummary with an embedded newline is flattened to one JSON line", () => {
     const lines: string[] = [];
-    const logger = createAuditLogger({ append: (l: string) => lines.push(l), host: "servyboi", log: () => {} });
+    const logger = createAuditLogger({ append: (l: string) => lines.push(l), log: () => {} });
     logger({ ...EVENT, diffSummary: "line one\nline two" });
     expect(lines).toHaveLength(1);
     expect(lines[0]!.split("\n")).toHaveLength(2); // one content line + the trailing newline's own split artifact
-  });
-
-  test("B4 fix (2): a burst of REJECTED writes aggregates into ONE alert naming the count; every ACCEPTED write still alerts individually", async () => {
-    const posted: string[] = [];
-    const logger = createAuditLogger({
-      append: () => {},
-      postAlert: async (t: string) => { posted.push(t); },
-      host: "servyboi",
-      log: () => {},
-      now: () => 0,
-      rejectAggregateWindowMs: 20,
-    });
-    logger({ ...EVENT, outcome: "rejected", reason: "forged origin" });
-    logger({ ...EVENT, outcome: "rejected", reason: "bad csrf" });
-    logger({ ...EVENT, outcome: "rejected", reason: "bad csrf again" });
-    logger({ ...EVENT, outcome: "accepted" }); // alerts immediately, independent of the pending rejection burst
-    expect(posted).toHaveLength(1);
-    expect(posted[0]).toContain("ACCEPTED");
-    await new Promise((r) => setTimeout(r, 40));
-    expect(posted).toHaveLength(2);
-    expect(posted[1]).toContain("REJECTED x3");
-    expect(posted[1]).toContain("bad csrf again"); // the LAST rejection's own detail
-  });
-
-  test("FACTORY-694 item 2: an ACCEPTED test (kind: \"test\") still appends one audit line, but alerts NOBODY", async () => {
-    const lines: string[] = [];
-    const posted: string[] = [];
-    const logger = createAuditLogger({ append: (l: string) => lines.push(l), postAlert: async (t: string) => { posted.push(t); }, host: "servyboi", log: () => {} });
-    logger({ ...EVENT, route: "POST /api/settings/jira/test", action: "jira-test", kind: "test", outcome: "accepted" });
-    await Promise.resolve();
-    expect(lines).toHaveLength(1);
-    expect(JSON.parse(lines[0]!.trimEnd()).outcome).toBe("accepted");
-    expect(posted).toHaveLength(0);
-  });
-
-  test("FACTORY-694 item 2: a FAILED test (kind: \"test\", outcome rejected) alerts immediately under its own label, never \"write\"", async () => {
-    const posted: string[] = [];
-    const logger = createAuditLogger({ append: () => {}, postAlert: async (t: string) => { posted.push(t); }, host: "servyboi", log: () => {} });
-    logger({ ...EVENT, route: "POST /api/settings/jira/test", action: "jira-test", kind: "test", outcome: "rejected", reason: "rate limited: too many jira connection tests — retry after 5s" });
-    await Promise.resolve();
-    expect(posted).toHaveLength(1);
-    expect(posted[0]).toContain("connection test FAILED");
-    expect(posted[0]).not.toContain("write ACCEPTED");
-    expect(posted[0]).not.toContain("write REJECTED");
-    expect(posted[0]).toContain("retry after 5s");
-  });
-
-  test("FACTORY-694 item 2: a burst of FAILED tests never joins the \"write\" rejection aggregator — each test alerts on its own, and a real rejected write's own \"last event\" detail survives untouched", async () => {
-    const posted: string[] = [];
-    const logger = createAuditLogger({
-      append: () => {},
-      postAlert: async (t: string) => { posted.push(t); },
-      host: "servyboi",
-      log: () => {},
-      now: () => 0,
-      rejectAggregateWindowMs: 20,
-    });
-    logger({ ...EVENT, outcome: "rejected", reason: "real write rejection A" });
-    logger({ ...EVENT, route: "POST /api/settings/jira/test", action: "jira-test", kind: "test", outcome: "rejected", reason: "429 from jira-test limiter" });
-    logger({ ...EVENT, route: "POST /api/settings/jira/test", action: "jira-test", kind: "test", outcome: "rejected", reason: "429 from jira-test limiter again" });
-    logger({ ...EVENT, outcome: "rejected", reason: "real write rejection B (the last one)" });
-    // the two test failures alert immediately, independent of the write-rejection aggregation window
-    expect(posted.filter((p) => p.includes("connection test FAILED"))).toHaveLength(2);
-    await new Promise((r) => setTimeout(r, 40));
-    // the write-rejection aggregator saw exactly the two WRITE rejections, and its "last event" is the last WRITE rejection — never a test's detail
-    const writeAlert = posted.find((p) => p.includes("write REJECTED"));
-    expect(writeAlert).toBeDefined();
-    expect(writeAlert).toContain("REJECTED x2");
-    expect(writeAlert).toContain("real write rejection B");
-    expect(writeAlert).not.toContain("jira-test limiter");
-  });
-
-  test("B4 fix (1): alert text neutralizes an @mention and defangs a link carried in a caller-controlled field", async () => {
-    const posted: string[] = [];
-    const logger = createAuditLogger({ append: () => {}, postAlert: async (t: string) => { posted.push(t); }, host: "servyboi", log: () => {} });
-    logger({ ...EVENT, ids: ["@all see http://evil.example/steal"] });
-    await Promise.resolve();
-    expect(posted).toHaveLength(1);
-    expect(posted[0]).not.toContain("@all");
-    expect(posted[0]).not.toContain("http://evil.example");
   });
 });
 

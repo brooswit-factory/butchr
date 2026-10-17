@@ -47,20 +47,6 @@ describe("resource loop health", () => {
     poll.stop();
   });
 
-  test("FACTORY-45: managedSessionEscalations rides beside the liveness components, absent when empty, and never flips ok", () => {
-    let t = 0;
-    const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
-    t = 5_000; poll.recordSuccess();
-    const escalations = [{ agentKey: "filesystem:managed-sessions:%2Ffoo.json", definitionPath: "/foo.json", paneId: "p1", fingerprint: "abc12345", since: new Date(5_000).toISOString() }];
-
-    const withEscalations = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, escalations);
-    expect(withEscalations.managedSessionEscalations).toEqual(escalations);
-    expect(withEscalations.ok).toBe(true); // a stalled managed session is a real problem, never a liveness failure
-    expect("managedSessionEscalations" in combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, [])).toBe(false);
-    expect("managedSessionEscalations" in combineHealth([poll])).toBe(false);
-    poll.stop();
-  });
-
   test("FACTORY-752: a completed tick with nothing eligible advances lastSuccessAt — the exact blindness the new field exists to remove", () => {
     let t = 0;
     const h = createTickHealth({ name: "permissionAnswer", thresholdMs: 1_000, now: () => t, checkIntervalMs: 1e9 });
@@ -114,7 +100,7 @@ describe("resource loop health", () => {
     t = 5_000; poll.recordSuccess();
     const dashboardApp = { built: false, path: "/some/dist/web/index.html" };
 
-    const withDashboardApp = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardApp);
+    const withDashboardApp = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardApp);
     expect(withDashboardApp.dashboardApp).toEqual(dashboardApp);
     expect(withDashboardApp.ok).toBe(true); // a missing web build is a deploy gap, never a liveness failure
     expect("dashboardApp" in combineHealth([poll])).toBe(false);

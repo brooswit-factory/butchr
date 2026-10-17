@@ -17,7 +17,7 @@ function jsonFetch(body: unknown): typeof fetch {
 // retired there.
 describe("ConfigurationsRoute — FACTORY-614", () => {
   test("shows the live entry count from /config-inventory once loaded", async () => {
-    const response: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
+    const response: QueryAgentInventory = { rules: [], errors: [] };
     globalThis.fetch = jsonFetch(response);
     const { getByTestId } = render(<ConfigurationsRoute />);
     await waitFor(() => expect(getByTestId("config-entry-count").textContent).toBe("0 entries"));

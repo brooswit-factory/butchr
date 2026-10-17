@@ -8,7 +8,7 @@ happened. Never touch Zippy/zipzoom — out of scope entirely.
 
 This runbook covers ONE thing: getting the new Butchr build onto Codey's
 `butchr.service` safely — build, health check, automatic rollback, restart,
-recovery verification, and the hand-off to the real-Rocket.Chat check. It
+and recovery verification. It
 does **not** cover the agent migration/cutover itself (Nexus, Bakr,
 Candlestix) — that is `docs/codey-migration-runbook.md` (BUTCHR-466), a
 separate task, and it runs strictly **after** this one, per BUTCHR-396's
@@ -642,47 +642,11 @@ rules/definitions).
 
 ---
 
-## 9. Real-RC verification hand-off
+## 9. Real-RC verification hand-off (removed)
 
-**Do not re-derive or duplicate this — `docs/real-rc-verification-runbook.md`
-(written by S4/BUTCHR-395) is the actual runbook; run it in full, in order,
-now that the new build is live and healthy.** This section is only the
-checklist of terms Nexus and the director imposed, so you can confirm
-you've satisfied every one of them before/while you run it — not a
-substitute for reading that document's own ten sections.
-
-- [ ] **Notify Nexus in `#ask-helpdesk` when this step begins** (before any
-      test account is created) — see that runbook's §2.
-- [ ] **Use the provisioner PAT file Nexus names on Codey — never a shared
-      admin token** — §1.1–1.3.
-- [ ] **Test accounts use the `butchr-test-` prefix EXACTLY** — §4.
-- [ ] **At most 5 concurrent test accounts** (tighter than this codebase's
-      own general `ROCKETCHAT_TEMPORARY_CAP_THRESHOLD=8` safety default —
-      this 5 is Nexus's specific term for this verification run, not a
-      value to relax) — §3.
-- [ ] **Test users create no DMs or rooms themselves**; a DM sent TO a test
-      user is allowed, but gets deleted along with the user — **capture
-      evidence (message exports/screenshots + journal lines) BEFORE
-      cleanup**, not after — §4, §9.
-- [ ] **Test rooms are owned by the provisioner and explicitly deleted** —
-      §4, §9.
-- [ ] **Seat count recorded before and after** — §3, §10.
-- [ ] **Creation AND deletion of every test account recorded, with
-      verification the account and its integration are actually gone —
-      not just that a delete call was issued** — §9, §10.
-- [ ] The runbook's own §7 (Claude and Codex each receiving and answering a
-      channel message) and §8 (the mud-bridge-bound Claude case) both run
-      against THIS deploy's live build.
-
-**Rollback:** if the real-RC verification itself fails, that is NOT
-necessarily a reason to roll back this code deploy (the failure may be
-RC-side, credential-side, or Nexus-policy-side) — follow that runbook's own
-§9 "if cleanup fails partway" guidance, and treat a code-level rollback as
-a separate decision gated on whether the deploy itself (this document) is
-implicated.
-**Evidence:** everything that runbook's own §10 (Evidence) already
-specifies — post it to `admin-assembly` alongside this deploy's evidence,
-cross-referenced by `$NEW_SHA`.
+There is nothing to hand off: Rocket.Chat support (agent accounts, the
+account-management client and the room poster) has been removed from
+butchr, along with `docs/real-rc-verification-runbook.md`.
 
 ---
 

@@ -40,7 +40,7 @@
  * default port/fragment/trailing slash, …), so two refs are the same link
  * IFF their canonical strings are equal. `canonicalKey` below is a thin,
  * intent-documenting alias of `formatResourceRef` — not a second
- * normalization step — so the string a human sees in `butchr link list` is
+ * normalization step — so the string a human saw in `butchr link list` (local/ui: removed) is
  * exactly the string dedup/idempotency compare against.
  */
 import { formatGithubIssueRef, githubIssueRefFromUrl, parseGithubIssueRef, type GithubIssueRef } from "./github-issue-ref.js";

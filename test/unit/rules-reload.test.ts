@@ -9,8 +9,8 @@ import type { FilesystemResource } from "../../src/resources/filesystem.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 
 // Built through `parseRules` itself, never by hand — a hand-built `Rule`
-// literal omits the defaults `parseRules` fills in (`account: "none"`,
-// `role: "worker"`, `execution: "swarm"`), which would make every
+// literal omits the defaults `parseRules` fills in (`role: "worker"`,
+// `execution: "swarm"`), which would make every
 // "unchanged" comparison in this file a false "changed".
 const [ruleA, ruleB]: Rule[] = parseRules({
   rules: [
@@ -33,6 +33,16 @@ describe("reloadRules", () => {
     expect(result.removed).toEqual([]);
     expect(result.changed).toEqual([]);
     expect(holder.getRules().map((r) => r.id)).toEqual(["a", "b"]);
+  });
+
+  test("a legacy Rocket.Chat account value reloads fine and comes back as a warning; the old default stays silent", () => {
+    const holder = createRulesHolder([ruleA]);
+    const loud = reloadRules(holder, { BUTCHR_RULES_FILE: "/rules.json" }, () => JSON.stringify({ rules: [{ ...ruleA, account: "temporary" }] }));
+    expect(loud.ok).toBe(true);
+    expect(loud.warnings).toEqual(['/rules.json: rules[0].account "temporary" is ignored: Rocket.Chat support was removed']);
+    const quiet = reloadRules(holder, { BUTCHR_RULES_FILE: "/rules.json" }, () => JSON.stringify({ rules: [{ ...ruleA, account: "none" }] }));
+    expect(quiet.ok).toBe(true);
+    expect(quiet).not.toHaveProperty("warnings");
   });
 
   test("a rule present before and after, with a different query, is reported changed — never silently missed", () => {

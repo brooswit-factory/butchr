@@ -3,7 +3,7 @@ import { PROVIDER_ENABLED_ENV_VAR, parseProviderEnabledMap, applyProviderSwitch,
 import type { ResourceProvider } from "../../src/rules/agent-key.js";
 import { parseRules } from "../../src/rules/rules.js";
 
-const ALL_PROVIDERS: ResourceProvider[] = ["jira-work", "jira-idea", "jira-project", "confluence-page", "github-issue", "github-pr", "zendesk-ticket", "filesystem", "jira-component"];
+const ALL_PROVIDERS: ResourceProvider[] = ["jira-work", "jira-idea", "jira-project", "confluence-page", "github-issue", "github-pr", "zendesk-ticket", "filesystem", "jira-component", "trello-card"];
 
 describe("PROVIDER_ENABLED_ENV_VAR (FACTORY-66 review round 2)", () => {
   test("exactly one distinctly-named env var per registered RESOURCE_PROVIDERS entry — no two providers share a switch", () => {

@@ -1,0 +1,188 @@
+/*
+ * local/ui — the app shell (one top bar + workspace), built from public
+ * LaunchPad tokens, carrying butchr's own mark. Imported after `App.css` so it wins ties; the
+ * older `.app-*` classes in that file are simply no longer used.
+ */
+html,
+body {
+  margin: 0;
+  /* The workspace below is the page's only scroller; the window itself never scrolls. */
+  overflow: hidden;
+}
+
+/* react-aria normally injects this rule as a <style> tag, which butchr's CSP (style-src 'self') blocks. */
+[data-react-aria-pressable] {
+  touch-action: pan-x pan-y pinch-zoom;
+}
+
+body {
+  background: var(--lp-color-bg-ui-primary);
+  color: var(--lp-color-text-ui-primary-base);
+  font: var(--lp-text-body-1-regular);
+  font-variant-ligatures: no-contextual;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--lp-font-family-monospace);
+}
+
+.bt-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100vh;
+  background: var(--lp-color-bg-ui-primary);
+  color: var(--lp-color-text-ui-primary-base);
+  font-family: var(--lp-font-family-base);
+}
+
+/* One row across the top: mark, nav, theme switch. Scrolls sideways rather than wrapping on a narrow window. */
+.bt-topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-16);
+  min-height: var(--lp-size-56);
+  padding: 0 var(--lp-size-16);
+  overflow-x: auto;
+  white-space: nowrap;
+  background: var(--lp-color-bg-ui-primary);
+  border-bottom: 1px solid var(--lp-color-border-ui-secondary);
+}
+
+.bt-masthead {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+}
+
+.bt-masthead__mark {
+  width: var(--lp-size-32);
+  height: var(--lp-size-32);
+  border-radius: var(--lp-border-radius-medium);
+  flex-shrink: 0;
+}
+
+.bt-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.bt-nav {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.bt-nav__list {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.bt-nav__item {
+  display: flex;
+}
+
+.bt-nav__link {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+  padding: var(--lp-size-6) var(--lp-size-12);
+  border-radius: var(--lp-border-radius-medium);
+  color: var(--lp-color-text-ui-primary-base);
+  font: var(--lp-text-label-1-medium);
+  line-height: var(--lp-size-24);
+  text-decoration: none;
+  outline: none;
+}
+
+.bt-nav__link svg {
+  flex-shrink: 0;
+  fill: currentColor;
+}
+
+.bt-nav__link:hover {
+  background: var(--lp-color-bg-interactive-tertiary-hover);
+}
+
+.bt-nav__link:active {
+  background: var(--lp-color-bg-interactive-tertiary-active);
+}
+
+.bt-nav__link[aria-current="page"] {
+  background: var(--lp-color-bg-interactive-secondary-hover);
+}
+
+.bt-nav__link:focus-visible {
+  outline: 2px solid var(--lp-color-shadow-interactive-focus);
+  outline-offset: -2px;
+}
+
+.bt-topbar__end {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  margin-left: auto;
+}
+
+.bt-workspace {
+  /*
+   * The containing block for absolutely positioned content inside it. Without
+   * this, react-aria's visually hidden inputs (position: absolute) are placed
+   * against the page, stretch the document past the viewport, and focusing a
+   * switch scrolls the whole window away.
+   */
+  position: relative;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 0 var(--lp-size-20) var(--lp-size-48);
+  background: var(--lp-color-bg-ui-primary);
+}
+
+/* Pages that predate this shell open with a small LaunchPad Heading; give it the page-title treatment. */
+.bt-workspace > section > :is(h1, h2, h3):first-child {
+  display: flex;
+  align-items: center;
+  min-height: var(--lp-size-64);
+  margin: 0;
+  font: var(--lp-text-heading-1-semibold);
+}
+
+/* The page header restyled pages use: title on the left, actions on the right. */
+.bt-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--lp-size-12);
+  min-height: var(--lp-size-64);
+}
+
+.bt-page-header__title {
+  margin: 0;
+  font: var(--lp-text-heading-1-semibold);
+}
+
+.bt-page-header__actions {
+  display: flex;
+  align-items: center;
+  gap: var(--lp-size-8);
+}
+
+.bt-page-intro {
+  max-width: 48rem;
+  margin: 0 0 var(--lp-size-16);
+  color: var(--lp-color-text-ui-secondary);
+  font: var(--lp-text-body-2-regular);
+}

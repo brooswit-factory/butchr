@@ -112,10 +112,6 @@ delegate to the shared resolver, a strict superset of the old behavior.
 `src/agents/permission-answer-loop.ts` gets its own pane-to-agent resolution
 injected as `eligiblePanes` from `daemon/index.ts`, so it is covered through
 that file rather than calling either function itself.
-`src/accounts/manager.ts` keeps Rocket.Chat token files in a daemon-owned
-`tokenDir` "never inside any agent's own workspace directory" (its own doc
-comment), keyed by agent key rather than by path — confirmed no migration
-needed there.
 
 ## Empirical slug verification
 
@@ -316,10 +312,6 @@ completeness, not as a claim unique to this ticket's own testing.
   lizard-mode permission loop), never silent data loss. Opt-in via
   `scripts/migrate-workspace-layout.ts --include-claude-settings`, run at a
   quiet moment for the whole host (see the runbook below).
-- **Rocket.Chat account state** (`src/accounts/manager.ts`): token files
-  live in a daemon-owned `tokenDir`, explicitly "never inside any agent's
-  own workspace directory" (that module's own doc comment), keyed by agent
-  key rather than by path. No migration needed.
 - **herdr's own tracked pane/workspace cwd**: see the `/proc` section above.
 - **`~/.claude/todos`, shell snapshots, `statsig`-style state**: not
   path-keyed by this workspace's directory name in any way this

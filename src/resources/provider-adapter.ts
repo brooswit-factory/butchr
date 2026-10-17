@@ -23,7 +23,7 @@ export interface ProviderAdapter<Ref extends ResourceRef = ResourceRef> {
   /**
    * NOT IMPLEMENTED IN THIS STORY. Once a provider adapter exists, this
    * discovers `ref`'s provider-native links (e.g. a Jira work item's own
-   * `issuelinks`) for `mergeEffectiveLinks` (`./managed-links.ts`) to combine
+   * `issuelinks`) for `mergeEffectiveLinks` (local/ui: removed with managed links) to combine
    * with the managed collection. Optional: a provider with nothing native
    * to discover (e.g. `filesystem`) may omit it entirely, exactly like
    * `Discovery.related` (`./types.ts`) is already optional for the same

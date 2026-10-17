@@ -47,6 +47,14 @@
     "test/unit/dashboard-app-jira-connection-card.test.tsx",
     "test/unit/dashboard-app-create-rule-dialog.test.tsx",
     "test/unit/dashboard-app-agent-control-panel.test.tsx",
-    "test/unit/dashboard-app-daemon-route.test.tsx"
+    "test/unit/dashboard-app-daemon-route.test.tsx",
+    "test/unit/dashboard-app-rules-targeting-route.test.tsx",
+    "test/unit/dashboard-app-theme.test.tsx",
+    "test/unit/dashboard-app-query-editor.test.tsx",
+    "test/unit/dashboard-app-csp-styles.test.tsx",
+    "test/unit/dashboard-app-settings-credentials.test.tsx",
+    "test/unit/dashboard-app-status-route.test.tsx",
+    "test/unit/dashboard-app-settings-sections.test.tsx",
+    "test/unit/dashboard-app-coming-soon.test.tsx"
   ]
 }

@@ -68,6 +68,7 @@ const OWN_TOOLS: Readonly<Record<Exclude<CallerIdentity["provider"], "jira-work"
   "github-pr": "github_get_pr and github_pr_add_comment",
   "jira-idea": "jira_idea_get, jira_idea_github_issues, jira_idea_add_comment and jira_idea_link_github_issue",
   "zendesk-ticket": "zendesk_get_ticket and zendesk_add_internal_note",
+  "trello-card": "trello_get_card and trello_add_comment",
   "filesystem": "your own file tools (Read/Write/Edit/Bash) directly — there is no butchr MCP tool for a filesystem resource",
   // FACTORY-998: the ONE non-Jira provider with a narrow carve-out in
   // `forJiraCallers` below (`CONFLUENCE_PAGE_OWN_TOOL_NAMES`) — every OTHER

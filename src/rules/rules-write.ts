@@ -40,9 +40,9 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { updateRulesFile, restoreBackup, rulesEtag, type WriteRulesIo, type WriteRulesResult } from "./write-rules.js";
-import { rulesPath, type RulesEnv } from "./rules.js";
+import { rulesPath, type ResourceProvider, type RulesEnv } from "./rules.js";
 import { applyRuleFieldPatch, readRuleById, removeRuleById, buildEnabledAllowedPaths, buildFieldsAllowedPaths, ruleIdExists, appendRule, RuleWriteApplyError } from "./rules-write-apply.js";
-import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, RISKY_PERMISSION_MODES, type RuleFieldPatch, type RuleCreateInput } from "./rules-write-registry.js";
+import { PLACEHOLDER_QUERY, ENABLE_SCOPE_CEILING, LINKED_BOOLEAN_FIELDS, LINKED_COUNT_FIELDS, RISKY_PERMISSION_MODES, type RuleFieldPatch, type RuleCreateInput } from "./rules-write-registry.js";
 
 const sha256 = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
 
@@ -56,6 +56,17 @@ const sha256 = (text: string): string => createHash("sha256").update(text, "utf8
  * is compared.
  */
 const executionOf = (raw: unknown): string => (raw === undefined ? "swarm" : String(raw));
+
+/**
+ * local/ui — whether `patch` switches an ENABLED rule to `"swarm"`: from
+ * then on it runs one agent per matching resource, so the write is gated
+ * on its dry-run scope exactly like enabling a swarm rule is. One pure
+ * function both `planRuleWrite` and `writeRuleFields` call, so the plan and
+ * the write can't disagree about it.
+ */
+export function isSwarmSwitch(current: Record<string, unknown>, patch: RuleFieldPatch): boolean {
+  return current.enabled === true && patch.execution === "swarm" && executionOf(current.execution) !== "swarm";
+}
 
 /**
  * FACTORY-731 — shared across `RulesPlanResult.confirmReason` (the
@@ -204,7 +215,11 @@ export function computeLocalPlanCounts(wasEnabled: boolean, patch: RuleFieldPatc
   // FACTORY-729: permissionMode/lizardMode change the SpawnSpec an
   // already-running rule's agent was launched with, same as query/
   // agentPreferences — counted as a restart for the SAME reason those are.
-  const otherFieldsChanged = patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined;
+  // local/ui: `brief`/`execution` change what (and how many) agents an
+  // enabled rule runs, so they count the same conservative way. The resume
+  // settings are config-only and never restart anything.
+  const otherFieldsChanged =
+    patch.query !== undefined || patch.agentPreferences !== undefined || patch.permissionMode !== undefined || patch.lizardMode !== undefined || patch.brief !== undefined || patch.execution !== undefined;
   return { spawned: 0, stopped: 0, restarted: wasEnabled && otherFieldsChanged ? 1 : 0 };
 }
 
@@ -277,7 +292,8 @@ export interface ScopeCacheDeps {
 
 /** `createScopeCache`'s own return type: callable exactly like the old bare function (`scopeOf(id, queryText)`), plus `clear()` — see that function's own doc comment for why both exist. */
 export interface ScopeOf {
-  (id: string, queryText: string): Promise<number>;
+  /** `provider` (local/ui) is only used for an id with no saved rule yet — a create's dry run — so the previewer knows how to search. */
+  (id: string, queryText: string, provider?: ResourceProvider): Promise<number>;
   /** FACTORY-685 (N4): drops every cached entry — wired at every reload/write call site in `src/daemon/index.ts` so a stale scope reading can never outlive the write (or SIGHUP) that invalidated it. */
   clear(): void;
 }
@@ -313,16 +329,17 @@ export interface ScopeOf {
  * "override" there searches with the SAME text the rule already carries —
  * byte-identical behavior, never a second code path.
  */
-export function createScopeCache(scopeOf: (id: string, queryOverride: string) => Promise<number>, deps: ScopeCacheDeps = {}): ScopeOf {
+export function createScopeCache(scopeOf: (id: string, queryOverride: string, provider?: ResourceProvider) => Promise<number>, deps: ScopeCacheDeps = {}): ScopeOf {
   const ttlMs = deps.ttlMs ?? 10_000;
   const now = deps.now ?? (() => Date.now());
   const cache = new Map<string, { scope: number; at: number }>();
-  const cachedScopeOf = (async (id: string, queryText: string): Promise<number> => {
-    const key = `${id}:${sha256(queryText)}`;
+  const cachedScopeOf = (async (id: string, queryText: string, provider?: ResourceProvider): Promise<number> => {
+    // local/ui: the provider is part of the key too — a draft rule's provider can change between two dry runs.
+    const key = provider === undefined ? `${id}:${sha256(queryText)}` : `${id}:${provider}:${sha256(queryText)}`;
     const t = now();
     const cached = cache.get(key);
     if (cached !== undefined && t - cached.at < ttlMs) return cached.scope;
-    const scope = await scopeOf(id, queryText);
+    const scope = provider === undefined ? await scopeOf(id, queryText) : await scopeOf(id, queryText, provider);
     cache.set(key, { scope, at: t });
     return scope;
   }) as ScopeOf;
@@ -533,7 +550,7 @@ export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch
   const env = deps.env ?? process.env;
 
   let scopeForHash: number | null = null;
-  if (patch.query !== undefined) {
+  if (patch.query !== undefined || patch.execution !== undefined) {
     let current: Record<string, unknown>;
     try {
       current = readRuleById(readCurrentRulesText(env), id);
@@ -541,8 +558,8 @@ export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch
       if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
       throw e;
     }
-    if (patch.query !== current.query) {
-      scopeForHash = await scopeOf(id, patch.query);
+    if ((patch.query !== undefined && patch.query !== current.query) || isSwarmSwitch(current, patch)) {
+      scopeForHash = await scopeOf(id, patch.query ?? String(current.query ?? ""));
       // Same unconditional fail-closed discipline as `writeRuleEnabled`'s
       // own unmeasurable-scope guard — there is no real number a `confirm:
       // true` could possibly be confirming otherwise.
@@ -566,7 +583,8 @@ export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch
         // bound in via `queryChanged` below instead, mirroring
         // `planRuleWrite`'s own `spawned === 0, queryChanged` branch.
         const queryChanged = patch.query !== undefined && patch.query !== rule.query;
-        const scope = queryChanged ? scopeForHash : null;
+        const swarmSwitch = isSwarmSwitch(rule, patch);
+        const scope = queryChanged || swarmSwitch ? scopeForHash : null;
         const freshHash = buildPlanHash(nextText, counts, scope);
         if (freshHash !== planHash) {
           throw new WriteRefusedError(`planHash does not match a fresh plan for this write (the file may have changed, or the plan is stale) — call POST /api/rules/plan again`, 409);
@@ -575,6 +593,9 @@ export async function writeRuleFields(id: string, patch: RuleFieldPatch, ifMatch
         requireConfirmForRiskyFields(patch, confirm);
         if (queryChanged && !confirm) {
           throw new WriteRefusedError(`editing "${id}"'s query would now match ${scopeLabel(scopeForHash ?? Number.POSITIVE_INFINITY)} ticket(s) — retry with confirm: true to proceed`, 409);
+        }
+        if (swarmSwitch && !confirm) {
+          throw new WriteRefusedError(`switching "${id}" to swarm will staff up to ${scopeLabel(scopeForHash ?? Number.POSITIVE_INFINITY)} ticket(s) — retry with confirm: true to proceed`, 409);
         }
         allowedPaths = buildFieldsAllowedPaths(currentText, id, patch);
         return nextText;
@@ -772,7 +793,20 @@ export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; er
  * the fleet-wide admission picture should read `/api/rules/:id/preview`'s
  * own `warning` field too.
  */
-export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
+/**
+ * local/ui — dry-run-only options. `assumeDisabled` plans the patch against the
+ * rule as it will be once it's turned off: the Rules page saves a rule's
+ * disable before its field update, so this is exactly what that update's own
+ * plan sees at save time. Can't be combined with `enabled` in the patch.
+ */
+export interface PlanRuleWriteOptions {
+  assumeDisabled?: boolean;
+}
+
+export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps, opts: PlanRuleWriteOptions = {}): Promise<RulesPlanOutcome> {
+  if (opts.assumeDisabled && patch.enabled !== undefined) {
+    return { ok: false, status: 400, error: "assumeDisabled can't be combined with enabled in the same plan" };
+  }
   const env = deps.env ?? process.env;
   const currentText = readCurrentRulesText(env);
   try {
@@ -790,10 +824,18 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
     if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
     throw e;
   }
+  if (opts.assumeDisabled) current = { ...current, enabled: false };
   const etag = rulesEtag(env, deps.io);
   const wasEnabled = current.enabled === true;
+  // local/ui: a dry run that both edits fields and turns the rule on (the
+  // Rules page reviews an edited rule's enable this way) checks, measures and
+  // classifies the rule as it would be after the edit: its new query and its
+  // new execution, not the ones still in the file. Real writes never send
+  // both, so nothing else changes.
+  const queryAfter = patch.query !== undefined ? patch.query : current.query;
+  const executionAfter = patch.execution !== undefined ? patch.execution : current.execution;
 
-  if (patch.enabled === true && !wasEnabled && current.query === PLACEHOLDER_QUERY) {
+  if (patch.enabled === true && !wasEnabled && queryAfter === PLACEHOLDER_QUERY) {
     return { ok: false, status: 403, error: `rule "${id}" cannot be enabled while its query is still the placeholder` };
   }
 
@@ -809,10 +851,11 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   // `patch` could combine them, in which case the spawn scope (the rule
   // ACTUALLY starting up) takes priority as the more consequential one.
   const queryChanged = patch.query !== undefined && patch.query !== current.query;
+  const swarmSwitch = isSwarmSwitch(current, patch);
   let scope: number | null = null;
   let scopeUnmeasurable = false;
   if (counts.spawned > 0) {
-    const rawScope = await scopeOf(id, String(current.query ?? ""));
+    const rawScope = await scopeOf(id, String(queryAfter ?? ""));
     if (Number.isFinite(rawScope)) {
       scope = rawScope;
     } else {
@@ -824,8 +867,8 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
       // real number for a caller to have confirmed.
       scopeUnmeasurable = true;
     }
-  } else if (queryChanged) {
-    const rawScope = await scopeOf(id, patch.query!);
+  } else if (queryChanged || swarmSwitch) {
+    const rawScope = await scopeOf(id, patch.query ?? String(current.query ?? ""));
     if (Number.isFinite(rawScope)) {
       scope = rawScope;
     } else {
@@ -836,8 +879,9 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
   // only one above the ceiling — computed "raw" (independent of `confirm`)
   // so `confirmReason` can classify the gate even on a call that already
   // supplied `confirm: true`.
-  const rawSwarmEnable = counts.spawned > 0 && executionOf(current.execution) === "swarm";
-  const rawOverCeiling = counts.spawned > 0 && scope !== null && scope > ENABLE_SCOPE_CEILING;
+  // local/ui: switching an enabled rule to swarm is gated like enabling one.
+  const rawSwarmEnable = (counts.spawned > 0 && executionOf(executionAfter) === "swarm") || swarmSwitch;
+  const rawOverCeiling = (counts.spawned > 0 || swarmSwitch) && scope !== null && scope > ENABLE_SCOPE_CEILING;
   // FACTORY-730: raw/unconditional, same discipline as the three gates
   // above — `queryChanged` alone is the gate (there is no "ceiling" for a
   // query-change scope; any changed query needs an explicit look, however
@@ -900,11 +944,11 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
 /**
  * The full on-disk `Rule` object a `RuleCreateInput` becomes — the ONE
  * place `createRule`/`planRuleCreate` build it, so a plan's `nextText` and
- * the real write's `nextText` can never drift. `brief`/`execution`/
- * `account` are hardcoded to the exact values `./seed-first-run.ts`'s own
- * first-run template rule uses (same precedent — see
- * `rules-write-registry.ts`'s `RuleCreateInput` doc comment for why these
- * three are deliberately never client-settable in this slice). `enabled` is
+ * the real write's `nextText` can never drift. `brief`/`execution` default
+ * to the exact values `./seed-first-run.ts`'s own first-run template rule
+ * uses (same precedent — see `rules-write-registry.ts`'s `RuleCreateInput`
+ * doc comment). No `account` key is written: Rocket.Chat support is gone,
+ * and the loader only tolerates that key in older files. `enabled` is
  * hardcoded `false`, unconditionally — see `createRule`'s own doc comment
  * for why this NEVER reads a client-supplied value, there being none to
  * read in `RuleCreateInput` at all.
@@ -915,10 +959,15 @@ function buildNewRuleRecord(input: RuleCreateInput): Record<string, unknown> {
     enabled: false,
     resourceProvider: input.resourceProvider,
     query: input.query,
-    brief: "@builtin:task",
-    execution: "swarm",
-    account: "none",
+    // local/ui: still FACTORY-927's defaults when the create body omits them.
+    brief: input.brief ?? "@builtin:task",
+    execution: input.execution ?? "swarm",
   };
+  if (input.resumeOnRespawn !== undefined) record.resumeOnRespawn = input.resumeOnRespawn;
+  if (input.resumeContextCutoff !== undefined) record.resumeContextCutoff = input.resumeContextCutoff;
+  if (input.stalledMinutes !== undefined) record.stalledMinutes = input.stalledMinutes;
+  if (input.notifyDeliveryMode !== undefined) record.notifyDeliveryMode = input.notifyDeliveryMode;
+  for (const k of [...LINKED_BOOLEAN_FIELDS, ...LINKED_COUNT_FIELDS]) if (input[k] !== undefined) record[k] = input[k];
   if (input.role !== undefined) record.role = input.role;
   if (input.permissionMode !== undefined) record.permissionMode = input.permissionMode;
   if (input.lizardMode !== undefined) record.lizardMode = input.lizardMode;
@@ -972,7 +1021,7 @@ function buildCreatePlanHash(nextText: string, scope: number | null): string {
  * restart count to gate on the way `planRuleWrite` does) OR whenever the
  * scope could not be measured at all (which no `confirm: true` can satisfy).
  */
-export async function planRuleCreate(input: RuleCreateInput, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
+export async function planRuleCreate(input: RuleCreateInput, confirm: boolean, scopeOf: (id: string, queryText: string, provider?: ResourceProvider) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
   const env = deps.env ?? process.env;
   const currentText = readCurrentRulesText(env);
   try {
@@ -987,7 +1036,8 @@ export async function planRuleCreate(input: RuleCreateInput, confirm: boolean, s
   const nextText = appendRule(currentText, buildNewRuleRecord(input));
   const etag = rulesEtag(env, deps.io);
 
-  const rawScope = await scopeOf(input.id, input.query);
+  // local/ui: the new rule isn't saved yet, so the previewer can't find it by id — hand it the provider to search with.
+  const rawScope = await scopeOf(input.id, input.query, input.resourceProvider);
   let scope: number | null = null;
   let scopeUnmeasurable = false;
   if (Number.isFinite(rawScope)) {
@@ -1051,7 +1101,7 @@ export async function planRuleCreate(input: RuleCreateInput, confirm: boolean, s
  * byte-for-byte, exactly like any other write here — undoing a create
  * removes the rule it added, back to the exact prior file content.
  */
-export async function createRule(input: RuleCreateInput, confirm: boolean, planHash: string, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
+export async function createRule(input: RuleCreateInput, confirm: boolean, planHash: string, scopeOf: (id: string, queryText: string, provider?: ResourceProvider) => Promise<number>, deps: RulesWriteDeps): Promise<RulesWriteOutcome> {
   const env = deps.env ?? process.env;
 
   // Pre-lock checks (cheap; see this function's own doc comment, points
@@ -1059,7 +1109,8 @@ export async function createRule(input: RuleCreateInput, confirm: boolean, planH
   if (ruleIdExists(readCurrentRulesText(env), input.id)) {
     return { ok: false, status: 409, error: `a rule with id ${JSON.stringify(input.id)} already exists` };
   }
-  const rawScope = await scopeOf(input.id, input.query);
+  // local/ui: the new rule isn't saved yet, so the previewer can't find it by id — hand it the provider to search with.
+  const rawScope = await scopeOf(input.id, input.query, input.resourceProvider);
   if (!Number.isFinite(rawScope)) {
     return { ok: false, status: 503, error: `could not evaluate the scope for the new rule's query — the previewer is unavailable; this create is refused closed (even with confirm: true) until scope can be measured — try again`, confirmReason: "unmeasurable-scope" };
   }

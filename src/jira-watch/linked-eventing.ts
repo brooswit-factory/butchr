@@ -246,15 +246,14 @@ import type { JiraComment, JiraIssue, JiraRemoteLink } from "../atlassian/types.
 import type { Rule } from "../rules/rules.js";
 import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
 import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
-import { jiraProjectOwnerRef, jiraWorkItemOwnerRef, managedLinkedItems, nativeJiraRefs } from "../resources/link-reconcile.js";
-import type { LinkStore } from "../resources/link-store.js";
 import { watchKeyForResource, type WatchKey } from "../catamorbius/mapping.js";
 import { isDaemonLabelOnlyDiff, excludeBookkeepingComments } from "./diff.js";
 import { watchedKeys } from "./routes.js";
 import {
-  pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
+  parsePullActivityFingerprint, pollConfluencePage, pollFilesystem, pollGithubLink, pollGithubPullActivity, pollWebpage,
   type ConfluencePollDeps, type FilesystemPollDeps, type GithubConditionalDeps, type PollVerdict, type WebpagePollDeps,
 } from "./external-poll.js";
+import { formatGithubIssueRef, parseGithubIssueRef } from "../resources/github-issue-ref.js";
 
 /** The minimal shape this module needs from one owning resource's match — structurally satisfied by `RuleMatch` (src/rules/resource-type.ts) without importing it, avoiding a value/type import cycle between that module and this one. */
 export interface LinkedEventingMatch {
@@ -323,26 +322,16 @@ export interface LinkedEventingMatch {
  *    This makes the backlog drain monotonically under sustained cap
  *    pressure, never starve a tail forever. See `runTick`'s own
  *    `freshOrChangedMembers`/`freshOrChangedTargets`.
- * 2. MANAGED LINKS: `brooswit.butchr.links` (FACTORY-8's project-property
- *    link store), reconciled via the SAME `managedLinkedItems` FACTORY-9
- *    already built for an issue owner, with `nativeRefs: []` (a project has
- *    no structural native links of its own — no issuelinks/parent) so
- *    every managed link is "managed"-origin and watched. A failed
- *    link-store read fails open (logged), independent of member discovery.
+ * (local/ui: a second source, the project's managed links in
+ *    `brooswit.butchr.links`, went with managed links.)
  *
- * DEDUP: a target that is BOTH a project member and a managed-link target
- * is de-duplicated to ONE `LinkedItem`/ONE event line per tick (first
- * occurrence wins, same convention `discoverLinkedItems` itself already
- * uses).
- *
- * REMOVAL TRACKING IS SCOPED TO MANAGED LINKS ONLY: a member issue that
- * simply falls outside the current watermark window (nothing changed
- * recently) is NOT "no longer linked" — it is still a project member,
- * just not recently touched — so member-sourced items never participate in
- * `runTick`'s watch-set-based removal detection; only managed-link-sourced
- * items do (a genuine removal from `brooswit.butchr.links` still fires
- * "no longer linked", exactly as it does for an issue owner's managed
- * links). See `runTick`'s own `managedTargetsByOwner`/`trackedKept`.
+ * NO REMOVAL TRACKING: a member issue that simply falls outside the
+ * current watermark window (nothing changed recently) is NOT "no longer
+ * linked" — it is still a project member, just not recently touched — so
+ * member-sourced items never participate in `runTick`'s watch-set-based
+ * removal detection. local/ui: managed links (`brooswit.butchr.links`), the
+ * one project source that did, are gone. See `runOwnerPass`'s own
+ * `projectOwnerKeys`/`trackedKept`.
  *
  * COMMENT EVENTS: a "comment event" for a project owner is the SAME
  * per-target comment-cursor diff FACTORY-9 already built for any Jira-kind
@@ -492,6 +481,59 @@ export function descriptionLinkedItems(match: LinkedEventingMatch): LinkedItem[]
 }
 
 /**
+ * local/ui — a ticket's OWN open pull request, as GitHub PR discovery last
+ * found it (`LinkedEventingDeps.ticketPullRequest`: a branch named `KEY` or
+ * `KEY-…`), as a `github-pr` item marked `origin: "ticket-pr"`. Unlike a
+ * description-derived PR it never needs `linkedDescriptionLinks`: the
+ * ticket's own PR is where its review conversation happens. Empty when the
+ * dep is omitted (no GitHub configured), nothing is tracked for the key, or
+ * the ref falls outside GitHub's own naming rules.
+ */
+export function ticketPullRequestItems(key: string, lookup: LinkedEventingDeps["ticketPullRequest"]): LinkedItem[] {
+  const ref = lookup?.(key);
+  if (!ref) return [];
+  try {
+    return [{ kind: "github-pr", target: formatGithubIssueRef(ref), origin: "ticket-pr" }];
+  } catch {
+    return [];
+  }
+}
+
+/** First occurrence wins: the same target found by two sources (the ticket's PR also named in its description) is watched once, under the earliest source's item. */
+function dedupeByTarget(items: readonly LinkedItem[]): LinkedItem[] {
+  const seen = new Set<string>();
+  return items.filter((i) => (seen.has(i.target) ? false : (seen.add(i.target), true)));
+}
+
+/**
+ * local/ui — the agent-facing detail for a ticket PR whose activity counts
+ * rose between two `pollGithubPullActivity` fingerprints: names the PR's
+ * URL, what arrived, and how to read it. `null` when no count rose (only the
+ * ETag moved: mergeability, a push, a label, or a deletion) or when either
+ * fingerprint isn't an activity fingerprint (a baseline some other poller
+ * left for the same target), so the caller carries the new fingerprint
+ * forward without an event.
+ */
+export function ticketPullRequestActivityDetail(target: string, before: string, after: string): string | null {
+  const a = parsePullActivityFingerprint(before);
+  const b = parsePullActivityFingerprint(after);
+  if (!a || !b) return null;
+  const parts: string[] = [];
+  const add = (n: number, one: string, many: string) => {
+    if (n > 0) parts.push(n === 1 ? `1 ${one}` : `${n} ${many}`);
+  };
+  add(b.comments - a.comments, "new comment", "new comments");
+  add(b.reviewComments - a.reviewComments, "new review comment", "new review comments");
+  add(b.reviews - a.reviews, "new review", "new reviews");
+  if (!parts.length) return null;
+  const ref = parseGithubIssueRef(target);
+  const url = ref ? `https://github.com/${ref.owner}/${ref.repo}/pull/${ref.number}` : target;
+  const got = parts.length === 1 ? parts[0]! : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]!}`;
+  const inline = b.reviewComments > a.reviewComments && ref ? `; inline ones: gh api repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/comments` : "";
+  return `this ticket's pull request ${url} got ${got} — read them with gh pr view ${url} --comments${inline}`;
+}
+
+/**
  * FACTORY-9: `commentCursor` is the newest comment id (`null` if the target
  * has no comments), populated ONLY when `LinkedEventingDeps.comments` is
  * wired — `undefined` means "not checked this tick" (the dep is omitted, or
@@ -621,19 +663,6 @@ export interface LinkedEventingDeps {
   /** FACTORY-9: `external-poll.ts`'s `pollFilesystem` needs. Optional; omitted, every `filesystem`-kind item resolves `"error"` the same way an omitted `confluenceVersion` does — the same "omitted dep ⇒ feature silently never runs" shape every other optional dep here already has. */
   filesystem?: FilesystemPollDeps;
   /**
-   * FACTORY-9 (epic FACTORY-3, story 3/3): the FACTORY-4 butchr-managed link
-   * store (`src/resources/link-store.ts`) — reconciled, per opted-in owner,
-   * against that owner's own native Jira links (`nativeJiraRefs`,
-   * `src/resources/link-reconcile.ts`) via `mergeEffectiveLinks`, so a
-   * managed-only link becomes a NEW watched item this tick (see
-   * `managedLinkedItems`'s own doc comment for the full contract). Optional;
-   * omitted, no managed link is ever reconciled into a watcher — the SAME
-   * "omitted dep ⇒ feature silently never runs" shape as `remoteLinks`/
-   * `confluenceVersion`/`github`/`webpage` above, so every existing
-   * caller/test that doesn't wire this is completely unaffected.
-   */
-  linkStore?: LinkStore;
-  /**
    * FACTORY-9: a Jira-kind target's own recent comments, newest first — the
    * SAME shape `IssueResourceDeps.comments` (`src/resources/issue.ts`)
    * already uses for an OWN issue's comment-based notify reason, reused here
@@ -650,6 +679,15 @@ export interface LinkedEventingDeps {
    * as a bare "updated", same as today).
    */
   comments?: (key: string) => Promise<readonly JiraComment[]>;
+  /**
+   * local/ui — a ticket's own open pull request, as GitHub PR discovery
+   * (`PrTracker.pullRequestFor`, src/labels/pr.ts) last found it. Read once
+   * per opted-in ISSUE owner per tick, never a network call; the PR then
+   * rides the same external polling, item cap and turn cap as any other
+   * linked item (`ticketPullRequestItems`). Optional; omitted (no GitHub
+   * configured), no ticket PR is ever watched.
+   */
+  ticketPullRequest?: (key: string) => { owner: string; repo: string; number: number } | undefined;
   /**
    * FACTORY-137 (D2): the read-only coverage query the daemon's Catamorbius
    * push controller exposes (`src/catamorbius/push-controller.ts`'s
@@ -774,6 +812,10 @@ async function pollExternalItem(item: LinkedItem, priorFingerprint: string | und
       if (!deps.confluenceVersion) return { status: "error" };
       return await pollConfluencePage(item.target, { getVersion: deps.confluenceVersion });
     }
+    if (item.origin === "ticket-pr") {
+      if (!deps.github) return { status: "error" };
+      return await pollGithubPullActivity(item.target, priorFingerprint ?? null, deps.github);
+    }
     if (item.kind === "github-issue" || item.kind === "github-pr") {
       if (!deps.github) return { status: "error" };
       return await pollGithubLink({ kind: item.kind, target: item.target }, priorFingerprint ?? null, deps.github);
@@ -896,7 +938,8 @@ export function createLinkedEventingState(): LinkedEventingState {
   interface PassContext {
     ownerEntries: ReadonlyArray<{ agentKey: string; rule: Rule; label: string; notifyAgentKey: string }>;
     perOwnerItems: ReadonlyMap<string, readonly LinkedItem[]>;
-    managedTargetsByOwner: ReadonlyMap<string, ReadonlySet<string>>;
+    /** local/ui: this pass's PROJECT owners — none of their items is removal-tracked (see `trackedKept`). */
+    projectOwnerKeys: ReadonlySet<string>;
     memberTargetsByOwner: ReadonlyMap<string, ReadonlySet<string>>;
     usedWatermarkByOwner: ReadonlyMap<string, number>;
     nextProjectWatermark: ReadonlyMap<string, number>;
@@ -938,17 +981,20 @@ export function createLinkedEventingState(): LinkedEventingState {
    * must never restrict what `advance()` commits to `watchSets`.
    */
   async function runOwnerPass(ctx: PassContext, restrict: ReadonlySet<WatchKey> | undefined): Promise<void> {
-    const { ownerEntries, perOwnerItems, managedTargetsByOwner, deps } = ctx;
+    const { ownerEntries, perOwnerItems, projectOwnerKeys, deps } = ctx;
     const now = deps.now ?? Date.now;
     const push = deps.push;
 
     // The subset of `kept` that participates in watch-set/removal
     // tracking: everything, for an issue owner (unchanged pre-BUTCHR-469
-    // behaviour). For a project owner, only its MANAGED-link items — see
-    // `ProjectLinkedEventingMatch`'s own doc comment.
+    // behaviour). For a project owner, nothing: a member aging out of the
+    // watermark window is not a removal, and (local/ui) its managed links,
+    // the one source that was, are gone — see `ProjectLinkedEventingMatch`'s
+    // own doc comment. local/ui: a ticket's own PR (`origin: "ticket-pr"`) is
+    // never removal-tracked either — it leaves `kept` when it merges or
+    // closes, which the pr:* label already reports, not a link being removed.
     const trackedKept = (agentKey: string, kept: readonly LinkedItem[]): LinkedItem[] => {
-      const managedTargets = managedTargetsByOwner.get(agentKey);
-      return managedTargets ? kept.filter((i) => managedTargets.has(i.target)) : [...kept];
+      return projectOwnerKeys.has(agentKey) ? [] : kept.filter((i) => i.origin !== "ticket-pr");
     };
 
     // FACTORY-137 (D2): watch key + owning agent keys for every
@@ -1420,6 +1466,16 @@ export function createLinkedEventingState(): LinkedEventingState {
         }
         if (verdict.fingerprint === before.fingerprint) continue;
         noteIfStreamMissed(item.target, item.kind);
+        if (item.origin === "ticket-pr") {
+          // local/ui: only rising activity counts wake the agent; any other
+          // move (the ETag alone: mergeability, a push, a label) carries
+          // the new fingerprint forward silently, so the next conditional
+          // GET uses the latest ETag.
+          const detail = ticketPullRequestActivityDetail(item.target, before.fingerprint, verdict.fingerprint);
+          if (detail) triggering.push({ target: item.target, kind: item.kind, detail });
+          toAdvance.push(() => baselines.set(bkey, { kind: "external", fingerprint: verdict.fingerprint }));
+          continue;
+        }
         triggering.push({ target: item.target, kind: item.kind, detail: externalChangeDetail(item.kind, before.fingerprint, verdict.fingerprint) });
         toAdvance.push(() => baselines.set(bkey, { kind: "external", fingerprint: verdict.fingerprint }));
       }
@@ -1527,12 +1583,12 @@ export function createLinkedEventingState(): LinkedEventingState {
         if (!opted.length && !projectOpted.length) return;
 
         const perOwnerItems = new Map<string, LinkedItem[]>();
-        // BUTCHR-469: which of a PROJECT owner's kept targets came from its
-        // MANAGED links specifically — the only subset that may ever
-        // participate in "no longer linked" removal detection below. Absent
-        // (an issue owner) means "everything in `kept` is removal-tracked",
-        // unchanged pre-BUTCHR-469 behaviour — see `trackedKept` above.
-        const managedTargetsByOwner = new Map<string, Set<string>>();
+        // BUTCHR-469: the PROJECT owners this tick. Their kept targets are all
+        // member-discovered, and a member aging out of the watermark window is
+        // not a removal, so none of them takes part in "no longer linked"
+        // detection (local/ui: their managed links, the one source that did,
+        // are gone). See `trackedKept` above.
+        const projectOwnerKeys = new Set<string>();
         // BUTCHR-469 (review round 1 fix): which of a project owner's kept
         // targets came from the MEMBER-DISCOVERY search THIS TICK — the
         // only subset for which a missing baseline must be reported as a
@@ -1601,27 +1657,17 @@ export function createLinkedEventingState(): LinkedEventingState {
               linkFetchFailedOwners.add(m.agentKey);
             }
           }
-          // FACTORY-9: this owner's butchr-MANAGED links (FACTORY-4),
-          // reconciled against its own native Jira links so a target
-          // already covered by `jiraItems` below is never double-watched.
-          // Fails open: one owner's broken link store must never block any
-          // other owner's tick.
-          let managedItems: LinkedItem[] = [];
-          if (deps.linkStore) {
-            try {
-              managedItems = await managedLinkedItems(jiraWorkItemOwnerRef(m.issue), nativeJiraRefs(m.issue), deps.linkStore, deps.log);
-            } catch (e) {
-              deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.issue.key}): ${(e as Error)?.message ?? e}`);
-              linkFetchFailedOwners.add(m.agentKey);
-            }
-          }
           // BUTCHR-437: description-derived Confluence/GitHub/webpage items
           // are combined with Jira-kind items BEFORE `maxLinkedItems` caps,
           // so the cap applies uniformly across every kind for this
           // resource — never a separate per-kind budget.
           const jiraItems = jiraKindLinkedItems(m, remoteLinks);
           const externalItems = m.rule.linkedDescriptionLinks === true ? descriptionLinkedItems(m) : [];
-          const { kept } = capLinkedItems([...jiraItems, ...externalItems, ...managedItems], effectiveMaxLinkedItems(m.rule));
+          // local/ui: the ticket's own PR first, so the item cap never drops
+          // it, and deduped so the same PR named in the description isn't
+          // watched twice.
+          const prItems = ticketPullRequestItems(m.issue.key, deps.ticketPullRequest);
+          const { kept } = capLinkedItems(dedupeByTarget([...prItems, ...jiraItems, ...externalItems]), effectiveMaxLinkedItems(m.rule));
           perOwnerItems.set(m.agentKey, kept);
         }
 
@@ -1678,21 +1724,6 @@ export function createLinkedEventingState(): LinkedEventingState {
             }
           }
 
-          // FACTORY-8/FACTORY-9: this project's own managed links, reconciled
-          // via the SAME `managedLinkedItems` an issue owner already uses —
-          // `nativeRefs: []` because a project has no structural native
-          // links of its own. Fails open, independent of the member search
-          // above.
-          let managedItems: LinkedItem[] = [];
-          if (deps.linkStore) {
-            try {
-              managedItems = await managedLinkedItems(jiraProjectOwnerRef(m.projectKey), [], deps.linkStore, deps.log);
-            } catch (e) {
-              deps.log?.(`  WARNING: [linked-eventing] managed-link fetch failed for ${m.agentKey} (${m.projectKey}): ${(e as Error)?.message ?? e}`);
-              linkFetchFailedOwners.add(m.agentKey);
-            }
-          }
-          managedTargetsByOwner.set(m.agentKey, new Set(managedItems.map((i) => i.target)));
 
           // De-duplicated by target, first occurrence wins — an issue that
           // is both a member and a managed-link target must yield ONE item,
@@ -1702,13 +1733,14 @@ export function createLinkedEventingState(): LinkedEventingState {
           // always go to whatever still needs one.
           const seen = new Set<string>();
           const combinedProjectItems: LinkedItem[] = [];
-          for (const item of [...memberItems, ...managedItems]) {
+          for (const item of memberItems) {
             if (seen.has(item.target)) continue;
             seen.add(item.target);
             combinedProjectItems.push(item);
           }
           const { kept: projectKept, skipped: projectSkipped } = capLinkedItems(combinedProjectItems, effectiveMaxLinkedItems(m.rule));
           perOwnerItems.set(m.agentKey, projectKept);
+          projectOwnerKeys.add(m.agentKey);
           memberTargetsByOwner.set(m.agentKey, new Set(memberItems.map((i) => i.target)));
 
           // BUTCHR-469 (review round 1 fix, refined in round 2): a MANAGED
@@ -1736,7 +1768,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey, notifyAgentKey: m.notifyAgentKey ?? m.agentKey })),
         ];
 
-        const ctx: PassContext = { ownerEntries, perOwnerItems, managedTargetsByOwner, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, issuelinkIdsThisTick, deps };
+        const ctx: PassContext = { ownerEntries, perOwnerItems, projectOwnerKeys, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, issuelinkIdsThisTick, deps };
         lastPassContext = ctx;
         await runOwnerPass(ctx, undefined);
       });

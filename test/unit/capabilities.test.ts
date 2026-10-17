@@ -28,19 +28,19 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
     expect(capabilitiesOf(REF_OF["jira-work-item"])).toEqual(["query", "read", "comments", "links", "catamorbiusPush"]);
   });
   test("jira-project: query and links only — no dedicated getProject(key), no event-rules/poll wiring, no native project comments", () => {
-    expect(capabilitiesOf(REF_OF["jira-project"])).toEqual(["query", "links"]);
+    expect(capabilitiesOf(REF_OF["jira-project"])).toEqual(["query"]);
   });
   test("jira-idea: query, read and comments (FACTORY-21: wired through comments.ts, reusing JiraIdeaClient.comments/.addComment) — links stays false, still no managed-link-store integration and still excluded from ResourceRef", () => {
     expect(capabilitiesOf(REF_OF["jira-idea"])).toEqual(["query", "read", "comments"]);
   });
   test("confluence-page: query, comments and links (FACTORY-998: a real provider/rule now exists, src/rules/confluence-page-type.ts) — read stays false, comments is wired (FACTORY-29/31) over AtlassianOps.getPageComments/commentOnPage, see comments.test.ts", () => {
-    expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["query", "comments", "links"]);
+    expect(capabilitiesOf(REF_OF["confluence-page"])).toEqual(["query", "comments"]);
   });
-  test("github-issue: query, read, links, comments and catamorbiusPush (FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — createGithubIssueEventRules does real diff/notify, same shape as jira-work-item's own event rules, but same bar keeps snapshot false (FACTORY-27/814)", () => {
-    expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "links", "catamorbiusPush"]);
+  test("github-issue: query, read, comments and catamorbiusPush (local/ui: no links since managed links went; FACTORY-21: wired through comments.ts, reusing GithubIssueClient.comments/.addComment) — createGithubIssueEventRules does real diff/notify, same shape as jira-work-item's own event rules, but same bar keeps snapshot false (FACTORY-27/814)", () => {
+    expect(capabilitiesOf(REF_OF["github-issue"])).toEqual(["query", "read", "comments", "catamorbiusPush"]);
   });
-  test("github-pr: query, read, links, comments and catamorbiusPush (FACTORY-57: mirrors github-issue's own capability row exactly) — createGithubPrEventRules likewise real but not capability-qualifying (FACTORY-27/814)", () => {
-    expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "links", "catamorbiusPush"]);
+  test("github-pr: query, read, comments and catamorbiusPush (local/ui: no links since managed links went; FACTORY-57: mirrors github-issue's own capability row exactly) — createGithubPrEventRules likewise real but not capability-qualifying (FACTORY-27/814)", () => {
+    expect(capabilitiesOf(REF_OF["github-pr"])).toEqual(["query", "read", "comments", "catamorbiusPush"]);
   });
   test("zendesk-ticket: query, read and comments (FACTORY-21: wired through comments.ts, reusing ZendeskTicketClient.comments/addInternalNote, private-note-only) — still excluded from ResourceRef so no links at all", () => {
     expect(capabilitiesOf(REF_OF["zendesk-ticket"])).toEqual(["query", "read", "comments"]);
@@ -48,11 +48,11 @@ describe("capabilitiesOf/supports: declaration truthfulness, one row per provide
   test("trello-card: query, read and comments (FACTORY-1009: wired through comments.ts, reusing TrelloCardClient.comments/.addComment) — no rule type/link-store integration yet, so links stays false and it's excluded from ResourceRef, same shape as zendesk-ticket's own row", () => {
     expect(capabilitiesOf(REF_OF["trello-card"])).toEqual(["query", "read", "comments"]);
   });
-  test("filesystem: query and links (BUTCHR-407: listFilesystemResources is a real, generic query entry point) — no read/stat-content or snapshot capability wired for a zero-provider-knowledge caller", () => {
-    expect(capabilitiesOf(REF_OF.filesystem)).toEqual(["query", "links"]);
+  test("filesystem: query only (BUTCHR-407: listFilesystemResources is a real, generic query entry point) — no read/stat-content or snapshot capability wired for a zero-provider-knowledge caller; local/ui: no links since managed links went", () => {
+    expect(capabilitiesOf(REF_OF.filesystem)).toEqual(["query"]);
   });
-  test("webpage: links only — no fetch/read code anywhere", () => {
-    expect(capabilitiesOf(REF_OF.webpage)).toEqual(["links"]);
+  test("webpage: nothing — no fetch/read code anywhere, and (local/ui) no managed links any more", () => {
+    expect(capabilitiesOf(REF_OF.webpage)).toEqual([]);
   });
   test("createTask is absent for every provider — genuinely unbuilt, not merely undeclared", () => {
     for (const provider of CAPABILITY_PROVIDERS) expect(supports(REF_OF[provider], "createTask")).toBe(false);
@@ -93,15 +93,15 @@ describe("catamorbiusPush (FACTORY-134, implementing story FACTORY-22): true exa
  */
 const EXPECTED_MATRIX: Record<(typeof CAPABILITY_PROVIDERS)[number], Record<(typeof CAPABILITIES)[number], boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
-  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
-  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
-  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: true },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: true },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
   "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
-  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
-  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
+  webpage: { query: false, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
 };
 
 describe("the entire 9x7 MATRIX, pinned so any future drift is loud", () => {
@@ -139,7 +139,7 @@ describe("assertSupports / UnsupportedCapabilityError: typed, programmatically d
   });
   test("never throws for a declared-supported capability", () => {
     expect(() => assertSupports(REF_OF["jira-work-item"], "comments")).not.toThrow();
-    expect(() => assertSupports(REF_OF["jira-project"], "links")).not.toThrow();
+    expect(() => assertSupports(REF_OF["jira-work-item"], "links")).not.toThrow();
   });
   test("UnsupportedCapabilityError is a real Error subclass a caller can also catch generically", () => {
     const err = new UnsupportedCapabilityError("webpage", "comments");

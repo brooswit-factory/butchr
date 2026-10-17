@@ -9,6 +9,7 @@ import { isGithubPrRef } from "../resources/github-pr-ref.js";
 import { isIssueKey, isProjectId, isConfluencePageResourceId } from "../resources/id.js";
 import { isJiraComponentRef } from "../resources/jira-component-ref.js";
 import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
+import { isTrelloCardRef } from "../resources/trello-card-ref.js";
 
 /**
  * One provider per resource TYPE, not per vendor: Jira work items, GitHub
@@ -23,8 +24,10 @@ import { isZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
  * `../rules/jira-component-type.ts`'s own header) Jira components, one agent
  * per `<PROJECT>:<componentId>` rather than per issue or project. Only
  * providers with an adapter are listed.
+ * local/ui: `trello-card` (cards on the one configured Trello board) is ours,
+ * appended last so every upstream provider keeps its position.
  */
-export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page", "jira-component"] as const;
+export const RESOURCE_PROVIDERS = ["jira-work", "github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "confluence-page", "jira-component", "trello-card"] as const;
 export type ResourceProvider = (typeof RESOURCE_PROVIDERS)[number];
 
 /** Lowercase slug: starts alphanumeric, then alphanumerics or single hyphens. */
@@ -72,6 +75,8 @@ export interface AgentKeyParts { resourceProvider: ResourceProvider; ruleId: str
  * canonical `<PROJECT>:<componentId>` (`PROJ:10000`) — see
  * `../resources/jira-component-ref.ts`'s header for why the component id,
  * never the component's name, is the stable half of this identity.
+ * never the rule's own ancestor id. `trello-card` (local/ui): a canonical
+ * `<boardId>#<cardId>`, both 24-hex Trello ids (`../resources/trello-card-ref.ts`).
  */
 /**
  * FACTORY-570: `platform` is forwarded only to the `filesystem` case's
@@ -94,6 +99,7 @@ export function isResourceId(provider: ResourceProvider, id: string, platform: N
     case "filesystem": return isFilesystemResourceId(id, platform);
     case "confluence-page": return isConfluencePageResourceId(id);
     case "jira-component": return isJiraComponentRef(id);
+    case "trello-card": return isTrelloCardRef(id);
   }
 }
 

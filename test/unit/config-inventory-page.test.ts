@@ -1,9 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { renderConfigInventory, type ConfigInventoryFetchResult, type RenderConfigInventoryOpts } from "../../src/web/config-inventory-page.js";
-import { buildQueryAgentInventory, type QueryAgentInventory, type RuleInventoryEntry, type SessionDefinitionInventoryEntry } from "../../src/agents/query-agent-inventory.js";
+import { buildQueryAgentInventory, type QueryAgentInventory, type RuleInventoryEntry } from "../../src/agents/query-agent-inventory.js";
 import { agentRowAnchorId } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
-import { sessionAgentKey, sessionFreezeStoreKey } from "../../src/resources/session-freeze.js";
 import type { Rule } from "../../src/rules/rules.js";
 import {
   createDashboardFeed,
@@ -11,15 +10,12 @@ import {
 } from "../../src/agents/dashboard.js";
 import { createAdmissionController } from "../../src/agents/admission.js";
 import { StatusFloorTracker } from "../../src/agents/status-floor.js";
-import type { FilesystemQuery } from "../../src/resources/filesystem-query.js";
-import type { FilesystemResource } from "../../src/resources/filesystem.js";
-import type { SessionFreezeStore } from "../../src/resources/session-freeze.js";
 
 // ---- fixtures, same shape as query-agent-inventory.test.ts's own — real
 // producers, never a hand-built shape that merely happens to typecheck. ----
 
 function rule(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
-  return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+  return { enabled: true, query: "q", brief: "b", execution: "swarm", role: "worker", ...over };
 }
 // FACTORY-340: declare every source a rule in THIS file's fixtures is
 // covered by (jira-work -> "issue", plus github-issue/jira-idea/filesystem
@@ -44,25 +40,6 @@ function agentRow(resourceKey: string): AgentDashboardRow {
   return { kind: "agent", resourceKey, tier: { kind: "project" }, agentStatus: "working", pane: "p1", timeInStatus: floor, confirmedAt: new Date(0).toISOString() };
 }
 const noConfigReason = () => null;
-function res(path: string): FilesystemResource {
-  return { path, kind: "file", name: path.split("/").pop()!, size: 10, mtimeMs: 1000 };
-}
-function fakeSessionDefinitions(byDir: Record<string, Record<string, string>>, frozenAgentKeys: Set<string> = new Set()) {
-  const list = async (q: FilesystemQuery): Promise<FilesystemResource[]> => Object.keys(byDir[q.root] ?? {}).map((p) => res(p));
-  const read = async (path: string): Promise<string> => {
-    for (const files of Object.values(byDir)) if (path in files) return files[path]!;
-    throw Object.assign(new Error(`ENOENT: no such file ${path}`), { code: "ENOENT" });
-  };
-  const store: SessionFreezeStore = {
-    async read(id) { return { frozen: frozenAgentKeys.has(id) }; },
-    async set(id, f) { if (f) frozenAgentKeys.add(id); else frozenAgentKeys.delete(id); },
-  };
-  return { list, read, store };
-}
-const goodDefinition = (over: Record<string, unknown> = {}) => JSON.stringify({
-  workingDirectory: "/repo/project", brief: "Tend this repo.", vendor: "claude", tier: "tier1", permissionMode: "default", ...over,
-});
-
 // FACTORY-132: `agentCensusChecked` defaults to `true` (the checked state) —
 // every existing test in this file below models a checked census and never
 // passes this option itself, so defaulting it keeps every pre-existing
@@ -96,7 +73,6 @@ describe("renderConfigInventory — rules table (FACTORY-81 requirement 1)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard([agentRow(liveKey)]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [agentRow(liveKey)], opts());
     const row = rowSlice(html, "my-ideas");
@@ -121,7 +97,6 @@ describe("renderConfigInventory — rules table (FACTORY-81 requirement 1)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     const row = rowSlice(html, "project-managers");
@@ -137,7 +112,6 @@ describe("renderConfigInventory — rules table (FACTORY-81 requirement 1)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: () => reason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     expect(rowSlice(html, "gh-triage")).toContain(reason);
@@ -149,113 +123,15 @@ describe("renderConfigInventory — rules table (FACTORY-81 requirement 1)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     expect(rowSlice(html, "bare")).toContain(">—<");
   });
 
   test("no rules configured renders a genuine empty finding, not a hollow table", async () => {
-    const inventory: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
+    const inventory: QueryAgentInventory = { rules: [], errors: [] };
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     expect(html).toContain("no rules configured");
-  });
-});
-
-// ---- session-definitions table ------------------------------------------
-
-describe("renderConfigInventory — managed-session definitions table (FACTORY-81 requirement 2)", () => {
-  test("a valid, active definition shows vendor/tier, permissionMode, execution, account, role, workingDirectory, mcpServerNames, both frozen states, and both controller lists", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: {
-        "/defs/repo-a.json": goodDefinition({
-          execution: "persistent", account: "temporary", role: "worker",
-          mcpServers: [{ name: "rocketr", type: "http", url: "https://mcp.internal/x", headersEnvVar: "E", accountHeader: "H", channel: true }],
-          freezeControllers: ["alice"], unfreezeControllers: ["bob"],
-        }),
-      },
-    });
-    const liveKey = sessionAgentKey("/defs/repo-a.json");
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard([agentRow(liveKey)]),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [agentRow(liveKey)], opts());
-    const row = rowSlice(html, "repo-a.json");
-    expect(row).toContain("claude/tier1");
-    expect(row).toContain("default"); // permissionMode
-    expect(row).toContain("persistent");
-    expect(row).toContain("temporary");
-    expect(row).toContain("worker");
-    expect(row).toContain("/repo/project");
-    expect(row).toContain("rocketr");
-    expect(row).toContain('<span class="manifestfrozen">manifestFrozen: <span class="off">false</span></span>');
-    expect(row).toContain('<span class="storefrozen">storeFrozen: <span class="off">false</span></span>');
-    expect(row).toContain("freeze: alice");
-    expect(row).toContain("unfreeze: bob");
-    expect(row).toContain(">active<");
-    expect(row).not.toContain("ARCHIVED");
-    expect(row).toContain(liveKey);
-    // Never the raw url/headersEnvVar/accountHeader of an MCP binding.
-    expect(row).not.toContain("mcp.internal");
-    expect(row).not.toContain(">E<");
-  });
-
-  test("an archived definition is visible and clearly marked ARCHIVED", async () => {
-    const activeDir = "/defs";
-    const archiveDir = "/defs-archive";
-    const deps = fakeSessionDefinitions({ [archiveDir]: { "/defs-archive/old.json": goodDefinition({ frozen: true }) } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    const row = rowSlice(html, "old.json");
-    expect(row).toContain("ARCHIVED");
-    expect(row).toContain('<span class="manifestfrozen">manifestFrozen: <span class="known">true</span></span>');
-  });
-
-  test("an invalid definition shows INVALID plus every problem, and its content fields render not-applicable rather than a different layout", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/bad.json": "not json at all" } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    const row = rowSlice(html, "bad.json");
-    expect(row).toContain("INVALID");
-    const realProblems = inventory.sessionDefinitions.find((e) => e.name === "bad.json")!.problems;
-    expect(realProblems.length).toBeGreaterThan(0);
-    for (const p of realProblems) expect(row).toContain(escHtml(p));
-    // Structurally-absent content fields read as not-applicable, never a crash or a blank cell with no marker.
-    expect(row.match(/class="na"/g)?.length ?? 0).toBeGreaterThan(0);
-  });
-
-  test("a session definition with no running agent shows 'no running agent', never a broken/empty link", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    expect(rowSlice(html, "idle.json")).toContain("no running agent");
-  });
-
-  test("no session definitions configured renders a genuine empty finding", () => {
-    const inventory: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    expect(html).toContain("no managed-session definitions configured");
   });
 });
 
@@ -269,7 +145,6 @@ describe("renderConfigInventory — cross-links (FACTORY-81 requirement 3)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard([agentRow(liveKey)]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [agentRow(liveKey)], opts());
     expect(rowSlice(html, "director")).toContain(liveKey);
@@ -283,7 +158,6 @@ describe("renderConfigInventory — cross-links (FACTORY-81 requirement 3)", () 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard([withheld]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const row = rowSlice(renderConfigInventory({ ok: true, inventory }, [withheld], opts()), "task");
     expect(row).toContain("admission cap");
@@ -296,35 +170,33 @@ describe("renderConfigInventory — cross-links (FACTORY-81 requirement 3)", () 
 describe("renderConfigInventory — errors (FACTORY-81 requirement 4)", () => {
   test("every errors[] entry is displayed prominently, with its real path and message", async () => {
     const inventory: QueryAgentInventory = {
-      rules: [], sessionDefinitions: [],
-      errors: [{ path: "/config/rules.json", message: "invalid JSON: Unexpected token o" }, { path: "/defs/bad.json", message: "problem A\nproblem B" }],
+      rules: [],
+      errors: [{ path: "/config/rules.json", message: "invalid JSON: Unexpected token o" }],
     };
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
+    expect(html).toContain("1 configuration load/parse error(s)");
     expect(html).toContain("/config/rules.json");
     expect(html).toContain("invalid JSON: Unexpected token o");
-    expect(html).toContain("/defs/bad.json");
-    expect(html).toContain("problem A");
   });
 
   test("no errors renders no error banner at all — never a hollow '0 errors'", () => {
-    const inventory: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
+    const inventory: QueryAgentInventory = { rules: [], errors: [] };
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     expect(html).not.toContain("errors banner");
     expect(html).not.toContain("error(s)");
   });
 
-  test("a failed fetch of /config-inventory itself is a loud banner, and renders NO rules/sessions tables at all — never an empty table read as 'no config'", () => {
+  test("a failed fetch of /config-inventory itself is a loud banner, and renders NO rules table at all — never an empty table read as 'no config'", () => {
     const result: ConfigInventoryFetchResult = { ok: false, error: "ECONNREFUSED" };
     const html = renderConfigInventory(result, [], opts());
     expect(html).toContain("COULD NOT CHECK");
     expect(html).toContain("ECONNREFUSED");
     expect(html).not.toContain('id="rules"');
-    expect(html).not.toContain('id="sessions"');
     expect(html).not.toContain("no rules configured");
   });
 
   test("a genuinely empty inventory (fetch succeeded, nothing configured) is textually distinguishable from a fetch failure", () => {
-    const empty = renderConfigInventory({ ok: true, inventory: { rules: [], sessionDefinitions: [], errors: [] } }, [], opts());
+    const empty = renderConfigInventory({ ok: true, inventory: { rules: [], errors: [] } }, [], opts());
     const failed = renderConfigInventory({ ok: false, error: "boom" }, [], opts());
     expect(empty).not.toContain("COULD NOT CHECK");
     expect(failed).not.toContain("no rules configured");
@@ -337,24 +209,11 @@ describe("renderConfigInventory — no secrets (FACTORY-81 requirement 5)", () =
   test("an entry carrying an unexpected extra field with a secret-shaped value never surfaces it — only named fields are ever read", () => {
     const FAKE_SECRET = "ghp_FAKESECRETTOKENabcdef1234567890";
     const rulesWithExtra = [
-      { kind: "rule", id: "x", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", account: "none", role: "worker", agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null, unexpectedSecretField: FAKE_SECRET } as unknown as RuleInventoryEntry,
+      { kind: "rule", id: "x", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", role: "worker", agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null, unexpectedSecretField: FAKE_SECRET } as unknown as RuleInventoryEntry,
     ];
-    const sessionsWithExtra = [
-      { kind: "session-definition", name: "y.json", path: "/defs/y.json", agentKey: sessionAgentKey("/defs/y.json"), valid: true, problems: [], archived: false, vendor: "claude", tier: "tier1", unexpectedSecretField: FAKE_SECRET } as unknown as SessionDefinitionInventoryEntry,
-    ];
-    const inventory: QueryAgentInventory = { rules: rulesWithExtra, sessionDefinitions: sessionsWithExtra, errors: [] };
+    const inventory: QueryAgentInventory = { rules: rulesWithExtra, errors: [] };
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     expect(html).not.toContain(FAKE_SECRET);
-  });
-
-  test("a future, unknown-shaped tier value (per FACTORY-74's own note) never hard-fails the render — it renders as whatever value is present", () => {
-    const entry = {
-      kind: "session-definition", name: "future.json", path: "/defs/future.json", valid: true, problems: [],
-      archived: false, vendor: "claude", tier: 42, // FACTORY-74 may replace the tier enum with a 0-100 integer
-    } as unknown as SessionDefinitionInventoryEntry;
-    const inventory: QueryAgentInventory = { rules: [], sessionDefinitions: [entry], errors: [] };
-    expect(() => renderConfigInventory({ ok: true, inventory }, [], opts())).not.toThrow();
-    expect(renderConfigInventory({ ok: true, inventory }, [], opts())).toContain("claude/42");
   });
 });
 
@@ -363,7 +222,7 @@ describe("renderConfigInventory — no secrets (FACTORY-81 requirement 5)", () =
 describe("renderConfigInventory — rows param is read-only input, not echoed", () => {
   test("an unrelated dashboard row (no matching config entry) never appears anywhere on the page", async () => {
     const unrelatedKey = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "unrelated", resourceId: "acme/repo#1" });
-    const inventory: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
+    const inventory: QueryAgentInventory = { rules: [], errors: [] };
     const rows: DashboardRow[] = [agentRow(unrelatedKey)];
     const html = renderConfigInventory({ ok: true, inventory }, rows, opts());
     expect(html).not.toContain(unrelatedKey);
@@ -371,13 +230,12 @@ describe("renderConfigInventory — rows param is read-only input, not echoed", 
 });
 
 // ---- the epic's own verification scenario (FACTORY-81 Definition of Done) -
-// 8 managed sessions (some frozen/archived/invalid), disabled
-// project-managers/mud-manager rules, an enabled staffed my-ideas rule, a
-// rule unstaffed for a provider-config reason, plus the load error the
-// invalid session definition itself produces — end to end, through the real
-// buildQueryAgentInventory, never a hand-assembled inventory literal.
+// disabled project-managers/mud-manager rules, an enabled staffed my-ideas
+// rule and a rule unstaffed for a provider-config reason — end to end,
+// through the real buildQueryAgentInventory, never a hand-assembled
+// inventory literal.
 describe("renderConfigInventory — the epic's own verification scenario, end to end (FACTORY-81 DoD)", () => {
-  test("renders every rule and all 8 session definitions correctly, with the errors list and cross-links intact", async () => {
+  test("renders every rule correctly, with cross-links intact and no error banner", async () => {
     const rules = [
       rule({ id: "project-managers", resourceProvider: "jira-work", enabled: false }),
       rule({ id: "mud-manager", resourceProvider: "filesystem", enabled: false }),
@@ -385,131 +243,36 @@ describe("renderConfigInventory — the epic's own verification scenario, end to
       rule({ id: "gh-triage", resourceProvider: "github-issue" }),
     ];
     const myIdeasKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
-    const activeDir = "/defs";
-    const archiveDir = "/defs-archive";
-    const frozenAgentKeys = new Set([sessionFreezeStoreKey("/defs/repo-c.json")]);
-    const deps = fakeSessionDefinitions(
-      {
-        [activeDir]: {
-          "/defs/repo-a.json": goodDefinition({ workingDirectory: "/repo/a" }),
-          "/defs/repo-b.json": goodDefinition({ workingDirectory: "/repo/b", frozen: true }),
-          "/defs/repo-c.json": goodDefinition({ workingDirectory: "/repo/c" }), // storeFrozen via frozenAgentKeys
-          "/defs/repo-d.json": "not valid json at all", // the one load error
-          "/defs/repo-g.json": goodDefinition({ workingDirectory: "/repo/g" }),
-          "/defs/repo-h.json": goodDefinition({ workingDirectory: "/repo/h" }),
-        },
-        [archiveDir]: {
-          "/defs-archive/old-e.json": goodDefinition({ workingDirectory: "/repo/e" }),
-          "/defs-archive/old-f.json": goodDefinition({ workingDirectory: "/repo/f", frozen: true }),
-        },
-      },
-      frozenAgentKeys,
-    );
     const reason = "github-issue rules not staffed (gh-triage): set GITHUB_TOKEN_FILE and BUTCHR_GITHUB_ORGS";
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules, error: null },
       dashboard: checkedDashboard([agentRow(myIdeasKey)]),
       configReasonFor: (r) => (r.resourceProvider === "github-issue" ? reason : null),
-      sessionDefinitions: { ...deps, activeDir, archiveDir },
     });
-
-    // Sanity on the scenario itself, before even rendering: 8 session
-    // definitions, exactly one load error (the malformed repo-d.json).
-    expect(inventory.sessionDefinitions).toHaveLength(8);
-    expect(inventory.errors).toHaveLength(1);
-    expect(inventory.errors[0]!.path).toBe("/defs/repo-d.json");
+    expect(inventory.errors).toEqual([]);
 
     const html = renderConfigInventory({ ok: true, inventory }, [agentRow(myIdeasKey)], opts());
 
-    // Rules: both disabled rules visible; my-ideas staffed and linked to its live row; gh-triage's real reason.
+    // Both disabled rules visible; my-ideas staffed and linked to its live row; gh-triage's real reason.
     expect(rowSlice(html, "project-managers")).toContain("UNSTAFFED: disabled");
     expect(rowSlice(html, "mud-manager")).toContain("UNSTAFFED: disabled");
     const myIdeasRow = rowSlice(html, "my-ideas");
     expect(myIdeasRow).toContain(">staffed<");
     expect(myIdeasRow).toContain(myIdeasKey);
     expect(rowSlice(html, "gh-triage")).toContain(reason);
-
-    // Sessions: active/frozen/store-frozen/archived/invalid, all visible and distinguishable.
-    expect(rowSlice(html, "repo-a.json")).toContain('<span class="manifestfrozen">manifestFrozen: <span class="off">false</span></span>');
-    expect(rowSlice(html, "repo-b.json")).toContain('<span class="manifestfrozen">manifestFrozen: <span class="known">true</span></span>');
-    expect(rowSlice(html, "repo-c.json")).toContain('<span class="storefrozen">storeFrozen: <span class="known">true</span></span>');
-    expect(rowSlice(html, "repo-d.json")).toContain("INVALID");
-    expect(rowSlice(html, "old-e.json")).toContain("ARCHIVED");
-    const oldF = rowSlice(html, "old-f.json");
-    expect(oldF).toContain("ARCHIVED");
-    expect(oldF).toContain('<span class="manifestfrozen">manifestFrozen: <span class="known">true</span></span>');
-    expect(rowSlice(html, "repo-g.json")).toContain("/repo/g");
-    expect(rowSlice(html, "repo-h.json")).toContain("/repo/h");
-
-    // The one load error is shown prominently, with its real path.
-    expect(html).toContain("1 configuration load/parse error(s)");
-    expect(html).toContain("/defs/repo-d.json");
+    expect(html).not.toContain("error(s)");
   });
 });
 
 // ---- resolved model/effort (FACTORY-120) -----------------------------------
 
 describe("renderConfigInventory — resolved model/effort (FACTORY-120)", () => {
-  test("a modelPower/effort (two-axis) definition shows the resolved model/effort labels, the raw values as secondary detail, and never the old 'vendor/?' placeholder", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: { "/defs/two-axis.json": goodDefinition({ tier: undefined, modelPower: 70, effort: 65 }) },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    const row = rowSlice(html, "two-axis.json");
-    // Literal values: CLAUDE_MODEL_POWER_TABLE's 60-84 band is "opus", EFFORT_TABLE's 60-79 band is "xhigh" (power-scale.ts).
-    expect(row).toContain("Model: opus · Effort: xhigh");
-    expect(row).toContain("raw: modelPower 70, effort 65");
-    expect(row).not.toContain("claude/?");
-  });
-
-  test("a tier-based (deprecated) definition keeps its vendor/tier display, and additionally shows its resolved model plus the honest 'no effort set' wording — a known fact, never an em-dash", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({
-      [activeDir]: { "/defs/tier-based.json": goodDefinition({ tier: "tier4" }) },
-    });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    const row = rowSlice(html, "tier-based.json");
-    expect(row).toContain("claude/tier4"); // vendor/tier display, unchanged
-    expect(row).toContain("Model: opus"); // literal spot-check: CLAUDE_TIER_MODEL.tier4 -> opus
-    expect(row).toContain("no effort set");
-  });
-
-  test("an INVALID definition's resolved-model/effort span never shows a Model:/Effort: value — same not-applicable discipline as its other content fields, and no crash", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/bad.json": "not json at all" } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: checkedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts());
-    const row = rowSlice(html, "bad.json");
-    expect(row).toContain('<span class="resolvedagent">');
-    expect(row).not.toContain("Model:");
-    expect(row).not.toContain("Effort:");
-  });
-
   test("a rule preference with a resolved model/effort renders labeled values, never the stale '(model/effort stand in for tier)' caption", async () => {
     const r = rule({ id: "labeled-pref", resourceProvider: "jira-work", agentPreferences: [{ harness: "codex", model: "gpt-6-astra", effort: "max" }] });
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     const row = rowSlice(html, "labeled-pref");
@@ -523,7 +286,6 @@ describe("renderConfigInventory — resolved model/effort (FACTORY-120)", () => 
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: checkedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts());
     const row = rowSlice(html, "bare-pref");
@@ -540,7 +302,6 @@ describe("renderConfigInventory — agent-census-unavailable rendering (FACTORY-
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: uncheckedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     expect(inventory.rules[0]!.reason).not.toBeNull();
@@ -557,29 +318,12 @@ describe("renderConfigInventory — agent-census-unavailable rendering (FACTORY-
     expect(row).toMatch(/<span class="staffed cnc">COULD NOT CHECK/);
   });
 
-  test("a session-definition row's cross-link area renders COULD NOT CHECK, never 'no running agent', when the census is unavailable", async () => {
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
-    const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [], error: null },
-      dashboard: uncheckedDashboard(),
-      configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
-    });
-    const html = renderConfigInventory({ ok: true, inventory }, [], opts({ agentCensusChecked: false }));
-    const row = rowSlice(html, "idle.json");
-    expect(row).toContain("COULD NOT CHECK");
-    expect(row).not.toContain("no running agent");
-    expect(row).toMatch(/class="cnc"/);
-  });
-
   test("a DISABLED rule's staffing cell stays 'UNSTAFFED: disabled' (a config fact, AC4) while its OWN cross-link area independently renders COULD NOT CHECK (AC3's flat rule) — the two axes are independent", async () => {
     const r = rule({ id: "project-managers", resourceProvider: "jira-work", enabled: false });
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: uncheckedDashboard(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, [], opts({ agentCensusChecked: false }));
     const row = rowSlice(html, "project-managers");
@@ -598,7 +342,6 @@ describe("renderConfigInventory — agent-census-unavailable rendering (FACTORY-
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: uncheckedDashboard([staleRow]),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]).toMatchObject({ staffed: true, reason: null });
 
@@ -616,7 +359,7 @@ describe("renderConfigInventory — agent-census-unavailable rendering (FACTORY-
 // failed-after-a-good-poll variant), fed into the real
 // buildQueryAgentInventory, then the real renderConfigInventory — and the
 // transition back to known states after a real successful poll, for BOTH a
-// rule row and a session-definition row, pinning that the discriminator is
+// matched rule row and an unmatched one, pinning that the discriminator is
 // the real census flag and not an always-on message.
 
 /** Same harmless admission fixture as dashboard.test.ts's own `noWithholding()` — this block only exercises the agent.list()/census axis. */
@@ -629,16 +372,13 @@ function realFeed(now: () => number) {
 }
 
 describe("renderConfigInventory — end to end through a REAL createDashboardFeed (FACTORY-132, AC5)", () => {
-  test("before any poll: a rule row AND a session-definition row both render COULD NOT CHECK, never UNSTAFFED or 'no running agent'", async () => {
+  test("before any poll: a rule row renders COULD NOT CHECK, never UNSTAFFED or 'no running agent'", async () => {
     const f = realFeed(() => 0);
     const r = rule({ id: "task", resourceProvider: "jira-work" });
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
     const inventory = await buildQueryAgentInventory({
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
 
@@ -647,9 +387,6 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
     expect(ruleRow.toUpperCase()).not.toContain("UNSTAFFED");
     expect(ruleRow).not.toContain("no running agent");
     expect(ruleRow).toContain("COULD NOT CHECK");
-    const sessionRow = rowSlice(html, "idle.json");
-    expect(sessionRow).toContain("COULD NOT CHECK");
-    expect(sessionRow).not.toContain("no running agent");
   });
 
   test("a poll that fails AFTER an earlier good poll renders the SAME COULD NOT CHECK page for a rule with no match — the stale-carry-forward case", async () => {
@@ -666,7 +403,6 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
     const html = renderConfigInventory({ ok: true, inventory }, f.snapshot().rows, opts({ agentCensusChecked: f.snapshot().checked }));
@@ -676,21 +412,19 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
     expect(row).not.toContain("no running agent");
   });
 
-  test("after a successful poll, a rule row AND a session-definition row both transition to known states — proving the discriminator is the real census flag, not an always-on message", async () => {
+  test("after a successful poll, a matched rule row AND an unmatched rule row both transition to known states — proving the discriminator is the real census flag, not an always-on message", async () => {
     const f = realFeed(() => 9000);
     const r = rule({ id: "my-ideas", resourceProvider: "jira-idea" });
+    const idle = rule({ id: "idle-rule", resourceProvider: "jira-work", enabled: false });
     const liveKey = encodeAgentKey({ resourceProvider: "jira-idea", ruleId: "my-ideas", resourceId: "IDEAS-1" });
-    const activeDir = "/defs";
-    const deps = fakeSessionDefinitions({ [activeDir]: { "/defs/idle.json": goodDefinition() } });
 
     await f.poll(async () => ({ agents: [{ agent_key: liveKey, agent_status: "working", pane_id: "p1" }] }));
     expect(f.snapshot().checked).toBe(true);
 
     const inventory = await buildQueryAgentInventory({
-      rulesFile: { path: "/rules.json", rules: [r], error: null },
+      rulesFile: { path: "/rules.json", rules: [r, idle], error: null },
       dashboard: f.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...deps, activeDir, archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]).toMatchObject({ staffed: true, reason: null });
 
@@ -700,11 +434,11 @@ describe("renderConfigInventory — end to end through a REAL createDashboardFee
     expect(ruleRow).toContain(liveKey);
     expect(ruleRow).not.toContain("COULD NOT CHECK");
 
-    // Genuinely no match for the session definition, but the census IS
+    // Genuinely no match for the (disabled) second rule, but the census IS
     // available now — the pre-existing, unchanged "no running agent" wording.
-    const sessionRow = rowSlice(html, "idle.json");
-    expect(sessionRow).toContain("no running agent");
-    expect(sessionRow).not.toContain("COULD NOT CHECK");
+    const idleRow = rowSlice(html, "idle-rule");
+    expect(idleRow).toContain("no running agent");
+    expect(idleRow).not.toContain("COULD NOT CHECK");
   });
 });
 
@@ -733,7 +467,6 @@ describe("renderConfigInventory — the admission-source-unavailable tri-state t
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     expect(inventory.rules[0]!.staffed).toBeNull();
 
@@ -761,7 +494,6 @@ describe("renderConfigInventory — the admission-source-unavailable tri-state t
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, feed.snapshot().rows, opts({ agentCensusChecked: feed.snapshot().checked }));
     const row = rowSlice(html, "task");
@@ -780,7 +512,6 @@ describe("renderConfigInventory — the admission-source-unavailable tri-state t
       rulesFile: { path: "/rules.json", rules: [r], error: null },
       dashboard: feed.snapshot(),
       configReasonFor: noConfigReason,
-      sessionDefinitions: { ...fakeSessionDefinitions({}), activeDir: "/defs", archiveDir: "/defs-archive" },
     });
     const html = renderConfigInventory({ ok: true, inventory }, feed.snapshot().rows, opts({ agentCensusChecked: feed.snapshot().checked }));
     const row = rowSlice(html, "task");

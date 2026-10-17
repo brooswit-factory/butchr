@@ -4,12 +4,10 @@ BUTCHR-411 (task of story BUTCHR-395, epic BUTCHR-391), CNDLX-45. Adds
 `Rule.mcpServers` (`src/rules/rules.ts`): a rule can bind its agent(s) to any
 number of MCP servers beyond butchr's own, each independently flagged as a
 Claude "channel" (push notifications) or tools-only. This is what lets an
-agent receive event-driven pushes from a non-Rocket.Chat MCP server — the
-same mechanism `server:butchr` has always used — with no polling substitute
-and no dependency on `Rule.account` (BUTCHR-397/398's Rocket.Chat lifecycle
-field). Concrete case: the 10 Candlestix MUD players, whose shared
-`mud-mcp` HTTP bridge delivers telnet output as MCP channel events, and who
-get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
+agent receive event-driven pushes from another MCP server — the same
+mechanism `server:butchr` has always used — with no polling substitute.
+Concrete case: the 10 Candlestix MUD players, whose shared `mud-mcp` HTTP
+bridge delivers telnet output as MCP channel events.
 
 ## The field
 
@@ -21,14 +19,12 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
       "resourceProvider": "jira-work",
       "query": "project = CNDLX",
       "brief": "…",
-      "account": "none",           // no RC account — see docs/execution-modes.md
       "mcpServers": [
         {
           "name": "mud-mcp",
           "type": "http",
           "url": "https://mud-bridge.internal/mcp",
           "headersEnvVar": "MUD_MCP_HEADERS",   // optional
-          "accountHeader": "x-rocketr-account", // optional, BUTCHR-412
           "channel": true
         }
       ]
@@ -43,7 +39,6 @@ get NO Rocket.Chat account (`account: "none"`) under the sibling S4 task.
 | `type` | yes | `"http"` only, today |
 | `url` | yes | absolute `http:`/`https:` URL |
 | `headersEnvVar` | no | the NAME of an env var on **this daemon's own process** holding a JSON object of extra HTTP headers — see "Headers are by reference, never inline" below. **Never reaches Codex argv.** |
-| `accountHeader` | no | BUTCHR-412: a valid HTTP header name; that header's VALUE is filled in per-AGENT from `SpawnSpec.rocketchatAccount` (this agent's own Rocket.Chat account name — set only when the rule's `account` policy actually provisioned one) — see "Per-agent account headers" below. Never secret; combines with `headersEnvVar` on the same binding. **Unlike `headersEnvVar`, this one DOES reach Codex argv/mcp.json (BUTCHR-413)** — see "Codex" below. |
 | `channel` | yes | `true`: Claude also receives this server's push notifications (one more `--dangerously-load-development-channels=server:<name>`); `false`: MCP tool access only |
 
 Validation (`parseRules`, same house style as every other rule field —
@@ -93,32 +88,13 @@ applies when the call CREATES the file; a rebuilt workspace's `mcp.json`
 already exists and would otherwise keep whatever permissions it had. A
 binding-less `mcp.json`, or one with bindings that carry no resolved
 `headersEnvVar` header, keeps today's exact default permissions — untouched,
-byte-for-byte the same behaviour as before this ticket. An `accountHeader`
-resolution alone (see below) never tightens permissions by itself — the
-value is a non-secret account name, not a credential.
+byte-for-byte the same behaviour as before this ticket.
 
-### Per-agent account headers (`accountHeader`, BUTCHR-412)
+### The legacy `accountHeader` key
 
-`headersEnvVar` resolves ONE static value per RULE, from this daemon's own
-environment — every agent that rule spawns gets the same header value.
-`accountHeader` is the opposite shape: a DIFFERENT value per AGENT, filled
-in from `SpawnSpec.rocketchatAccount` (`resolveAccountHeader`,
-`src/agents/workspace.ts`) — set only by `src/agents/account-lifecycle.ts`'s
-`ensure()`, after `ensureAccount` actually provisioned this agent's Rocket.Chat
-account for THIS launch (see `docs/rocketchat-accounts.md`'s "Credential
-design, corrected" section for the full mechanism this exists for: an agent
-naming only its own account, non-secret, to Nexus's `rocketr` bridge, which
-holds every actual token centrally). A binding with `accountHeader` set but
-no `spec.rocketchatAccount` for this launch (the rule's `account` policy is
-`"none"`, or provisioning didn't happen/wasn't needed) simply omits the
-header — same "absent means no extra header" discipline `headersEnvVar` has.
-Combines with `headersEnvVar` on the same binding: both are resolved
-independently and merged into one `headers` object.
-
-Resolved for Codex too, as of BUTCHR-413 (see "Codex" below, and
-`docs/rocketchat-accounts.md`'s "Credential design, corrected" section for
-the same fact told from the account-design side) — `headersEnvVar` remains
-the one thing that never reaches a Codex launch; `accountHeader` does.
+A binding in an older rules file may still carry `accountHeader` (a header
+named after the Rocket.Chat account an agent was given). Rocket.Chat support
+is gone, so the key is accepted, ignored, and logged as a startup warning.
 
 ## Launch wiring
 
@@ -158,13 +134,8 @@ stream open on the agent's behalf instead and delivers each push as a
 `herd.nudge` prompt — a deliberate stopgap for BUTCHR-359 (Codex's own
 push/wake path) to subsume, not built here; see
 `docs/codex-channel-relay.md` for the full mechanism. `boundCodexServers`
-resolves `headersEnvVar`
-for NEITHER Claude-style secret headers — never, on any binding — but DOES
-resolve `accountHeader` (BUTCHR-413, see below): a Codex-launched binding
-gets its own non-secret account name when its binding sets `accountHeader`,
-letting it call an authenticated bound server whose only "credential" is
-that name; a binding relying on `headersEnvVar` alone still gets no extra
-headers for Codex.
+never resolves `headersEnvVar` for Codex, on any binding: a Codex-launched
+binding gets no extra headers.
 
 **A bound server's `headersEnvVar` is NEVER sent to Codex, loudly by
 design** (review finding, PR #387): Drovr renders a Codex MCP server's
@@ -177,46 +148,13 @@ bearer token) never lands anywhere but the daemon's own process
 environment and the agent's own `mcp.json` (Claude only, and permission-
 tightened — see above); Codex argv is exactly such an "anywhere else", so
 `boundCodexServers` (`src/agents/argv.ts`) never resolves `headersEnvVar`
-for it. This is unweakened by the paragraph below — it is still true today.
+for it.
 
-**`accountHeader` IS sent to Codex, deliberately (BUTCHR-413, review
-finding 1)** — the one exception to the paragraph above, and a different
-field entirely from `headersEnvVar`: it names a header (Rocket.Chat's
-`rocketr` uses `"x-rocketr-account"`) that carries this agent's own
-non-secret account NAME, `spec.rocketchatAccount` (`rcUsernameFor(agentKey)`,
-`src/accounts/identity.ts` — a deterministic public identifier, never a
-credential). `boundCodexServers` calls `resolveAccountHeader`
-(`src/agents/workspace.ts` — the SAME function `buildWorkspace` calls for
-Claude's `mcp.json`, reused verbatim) for exactly this value and only this
-value — it has no access to `headersEnvVar`'s resolved secret at all, by
-construction, not by discipline. Reading an account name off `ps`/`/proc` or a daemon log
-line tells an observer WHICH account an agent is, never lets them ACT as
-it: only `rocketr`'s own centrally-held token, which never travels over
-this header, grants any authority. This is what lets a Codex agent
-authenticate to `rocketr` for its own outbound tool calls (a reply) at all
-— see `docs/codex-channel-relay.md`'s "How it answers back" for the full
-account, and BUTCHR-418 (filed by BUTCHR-413's first round, before this
-design existed) for the now-resolved "Codex cannot authenticate" framing. A
-binding can set `headersEnvVar`, `accountHeader`, both, or neither; for
-Claude/this daemon's own connections, `resolveMcpServerHeaders` (the
-`headersEnvVar` half) and `resolveAccountHeader` (the `accountHeader` half)
-are resolved independently and merged (`buildWorkspace`, src/agents/workspace.ts);
-`boundCodexServers` (Codex) calls `resolveAccountHeader` alone.
+### The open gap: secrets for a Codex connection (BUTCHR-419/462)
 
-### The general pattern beyond rocketr, and its one open gap (BUTCHR-419/462)
-
-`accountHeader` is not a rocketr-specific mechanism — it is the general, safe
-pattern for ANY future authenticated bound server whose "credential" is a
-non-secret identifier: a value that tells the server WHO is asking, never
-one that grants the ask by itself. Any such server can set `accountHeader`
-on its binding today and get a working, per-agent identifier through to both
-Claude's `mcp.json` and Codex's argv (`resolveAccountHeader`, above) — no
-new Butchr mechanism is needed to add another one; rocketr's
-`"x-rocketr-account"` is simply the first instance of it.
-
-That pattern stops at the boundary above: a bound server whose Codex
-connection needs an actual SECRET — a bearer token, an API key, anything
-that grants authority by itself — has no equivalent path today.
+A bound server whose Codex connection needs an actual SECRET — a bearer
+token, an API key, anything that grants authority by itself — has no path
+today.
 `headersEnvVar` is precisely the mechanism that never reaches Codex, on
 purpose (see above), and nothing replaces it for Codex specifically.
 BUTCHR-420 (`butchr:shelved`; branch `origin/BUTCHR-420`, investigation at
@@ -240,8 +178,7 @@ rejected on that branch, because the real spawn path never goes through the
 Butchr-side argv helper that a hand-appended string would land in — see the
 branch's own comment thread for why. That branch was deliberately shelved,
 not merged or rebased here, because no concrete consumer needs a
-secret-carrying Codex header today — the only authenticated bound server in
-this epic's scope (rocketr) is fully served by `accountHeader` alone. File
+secret-carrying Codex header today. File
 the `@brooswit/drovr` extension (and the Butchr-side wiring on top of it)
 only once a real bound server needs it, building on BUTCHR-420's
 investigation rather than repeating it.
@@ -249,8 +186,7 @@ investigation rather than repeating it.
 Plainly, so this isn't read as more settled than it is: **a secret-carrying
 header for a Codex connection does not work today.** A Codex-launched
 binding that sets `headersEnvVar` still reaches Codex with no extra headers
-from it, `accountHeader` alone excepted, same as everywhere else in this
-doc.
+from it, same as everywhere else in this doc.
 
 ### AGY
 
@@ -319,23 +255,21 @@ promptly, restart them explicitly rather than relying on reconciliation.
 ```jsonc
 {
   "id": "mud", "resourceProvider": "jira-work", "query": "project = CNDLX",
-  "brief": "…", "account": "none",
+  "brief": "…",
   "mcpServers": [{ "name": "mud-mcp", "type": "http", "url": "https://mud-bridge.internal/mcp", "channel": true }]
 }
 ```
 
 - `specForMatch`/`specForRuleQuery` (`src/rules/resource-type.ts`) copy
   `rule.mcpServers` onto the agent's `SpawnSpec` — the same pattern
-  `agentPreferences` already uses. `SpawnSpec` has no `account` field at
-  all, so this path structurally cannot read Rocket.Chat account policy
-  even by accident.
+  `agentPreferences` already uses.
 - `buildWorkspace` writes `mcp.json` with both `butchr` and `mud-mcp`.
 - `agentLaunchConfig` produces `developmentChannels: ["server:butchr",
   "server:mud-mcp"]` and the matching `--dangerously-load-development-channels`
   flags.
 - The MUD players' agents wake on telnet output the same way every butchr
   agent already wakes on a Jira comment — no `mud_status`/`mud_read`
-  polling loop, and no Rocket.Chat account anywhere in the picture.
+  polling loop.
 
 See `test/unit/rule-engine.test.ts`'s `mud-bridge worked example` describe
 block for the executable version of this walkthrough, end to end through
@@ -400,7 +334,6 @@ this ticket only decides WHICH server names get the flag, identically for
 
 BUTCHR-393 (the managed-session definition format) reuses this shape
 verbatim rather than defining its own. `McpServerBinding` (`src/rules/rules.ts`):
-`{ name, type: "http", url, headersEnvVar?, accountHeader?, channel }`
-(`accountHeader` added by BUTCHR-412). See the coordination comment on
+`{ name, type: "http", url, headersEnvVar?, channel }`. See the coordination comment on
 BUTCHR-411 from the story agent (BUTCHR-395) and the reply posted on
 BUTCHR-393 once this branch was pushed.

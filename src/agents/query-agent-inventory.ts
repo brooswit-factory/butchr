@@ -1,9 +1,8 @@
 /**
  * FACTORY-72 (story FACTORY-69, epic FACTORY-68) — a read-only inventory of
  * EVERY configured query agent, whether or not it currently has a running
- * agent: every rule in the daemon's own rules file, and every managed-session
- * definition (active or archived), each with a real, computed reason when it
- * is not currently staffed. Served by the daemon's `/config-inventory` GET
+ * agent: every rule in the daemon's own rules file, each with a real,
+ * computed reason when it is not currently staffed. Served by the daemon's `/config-inventory` GET
  * route (`src/web/view.ts`) — this module builds the response; the route
  * itself does no shaping of its own.
  *
@@ -38,31 +37,18 @@
  *   the caller (`src/daemon/index.ts`) passes a `configReasonFor` callback
  *   built directly from its own already-computed `githubStaffing`/
  *   `zendeskStaffing` values.
- * - A managed-session definition's fields are answered by
- *   `listSessionDefinitions` (`../resources/session-definition-manage.ts`) —
- *   the exact function `butchr session list` already uses, extended
- *   (additively; see that module's own diff) with the handful of fields this
- *   ticket needs that the CLI never surfaced (`permissionMode`, `account`,
- *   `workingDirectory`, `mcpServerNames`) but that `SessionDefinition` always
- *   had. Called TWICE — once for the active definitions directory, once for
- *   the archive directory (`../resources/session-archive.ts`'s
- *   `sessionArchiveDir`) with `identityDir` pointed back at the active
- *   directory, exactly the shape `butchr session list --archived` already
- *   uses — so "archived" is a real, computed boolean, never guessed.
  *
  * NO SECRETS, BY CONSTRUCTION, NOT BY REDACTION: every field on
- * `RuleInventoryEntry`/`SessionDefinitionInventoryEntry` is copied out one at
- * a time, by name, from an already-validated `Rule`/`SessionDefinition` —
- * never a spread of the source object. An MCP server binding contributes
- * only its OWN `name` (`mcpServerNames`), never `url`/`headersEnvVar`/
- * `accountHeader` — see `McpServerBinding`'s own doc comment (`../rules/
- * rules.ts`) for why those two fields are already NAMES, not secret values,
- * but this module omits them anyway, exactly matching this ticket's own
+ * `RuleInventoryEntry` is copied out one at a time, by name, from an
+ * already-validated `Rule` — never a spread of the source object. An MCP server binding contributes
+ * only its OWN `name` (`mcpServerNames`), never `url`/`headersEnvVar` — see
+ * `McpServerBinding`'s own doc comment (`../rules/rules.ts`) for why
+ * `headersEnvVar` is already a NAME, not a secret value, but this module
+ * omits it anyway, exactly matching this ticket's own
  * wording ("MCP server NAMES ONLY"). A parse-error `message` is whatever
- * `sessionDefinitionProblems`/`parseRules` already produced — both of those
- * validators are themselves field-whitelisted and echo unknown-field KEYS
- * only, never values (see `session-definition.ts`/`rules.ts`'s own
- * `unknownFields` helpers), so no new secret-echoing surface is introduced
+ * `parseRules` already produced — that validator is itself field-whitelisted
+ * and echoes unknown-field KEYS only, never values (see `rules.ts`'s own
+ * `unknownFields` helper), so no new secret-echoing surface is introduced
  * here; `test/unit/query-agent-inventory.test.ts` proves this end-to-end
  * against fixtures carrying fake secret-shaped strings, including in a
  * malformed-file case.
@@ -74,25 +60,15 @@
  * resourceId}` for an ordinary per-resource `swarm` match, or a `{kind:
  * "query", resourceProvider, ruleId}` for a `singleton`/`persistent` rule's
  * one query-level agent — either way, `ruleId === entry.id &&
- * resourceProvider === entry.resourceProvider` is the whole match. A
- * `SessionDefinitionInventoryEntry`'s `agentKey` (when present — see that
- * field's own doc comment on `SessionDefinitionListEntry`) is `sessionAgentKey
- * (path)`, byte-identical to the `resourceKey` a managed-session's own
- * `AgentDashboardRow` carries. Neither is a new format this ticket invented.
+ * resourceProvider === entry.resourceProvider` is the whole match — not a
+ * new format this ticket invented.
  */
-import type { AgentEffort, AgentHarness, AgentPreference, AgentRole, AccountPolicy, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
+import type { AgentEffort, AgentHarness, AgentPreference, AgentRole, ExecutionMode, ReadRulesFile, Rule, RulesEnv, ResourceProvider } from "../rules/rules.js";
 import { loadRules, rulesPath } from "../rules/rules.js";
 import { decodeAnyAgentKey } from "../rules/agent-key.js";
 import type { AdmissionCensusField, AdmissionView, DashboardResponse, DashboardRow } from "./dashboard.js";
-import {
-  listSessionDefinitions,
-  type SessionDefinitionListDeps,
-  type SessionDefinitionListEntry,
-} from "../resources/session-definition-manage.js";
-import { assertArchiveDirDisjoint } from "../resources/session-archive.js";
-import { effectiveAgent } from "../resources/session-definition.js";
 
-/** One file (a rules file, or a session-definition file) that failed to load or parse — never swallowed, never log-only. */
+/** One file (the rules file) that failed to load or parse — never swallowed, never log-only. */
 export interface FileErrorEntry {
   path: string;
   message: string;
@@ -107,7 +83,6 @@ export interface RuleInventoryEntry {
   query: string;
   enabled: boolean;
   execution: ExecutionMode;
-  account: AccountPolicy;
   role: AgentRole;
   /**
    * `rule.agentPreferences`, ranked-order preserved, each copied field-by-field
@@ -154,37 +129,9 @@ export interface RuleInventoryEntry {
   reason: string | null;
 }
 
-export interface SessionDefinitionInventoryEntry extends SessionDefinitionListEntry {
-  kind: "session-definition";
-  /** `true` when this entry was read from the archive directory rather than the active one — computed from which directory actually produced it, never guessed. */
-  archived: boolean;
-  /**
-   * FACTORY-120 — the resolved effective model for this definition, via
-   * `effectiveAgent()` (`../resources/session-definition.ts`): reused
-   * verbatim, never re-derived from `../resources/power-scale.ts`'s tables
-   * directly, whether this entry is a `tier`-based (deprecated) definition
-   * or a `modelPower`/`effort`-based one — see that function's own doc
-   * comment for why each path resolves differently. `undefined` for an
-   * INVALID entry (`valid: false`) — its content fields, this one included,
-   * structurally do not exist, same NOT-APPLICABLE discipline every other
-   * optional field on this interface already follows.
-   */
-  resolvedModel?: string;
-  /**
-   * Same source (`effectiveAgent()`). `undefined` for an INVALID entry
-   * (as `resolvedModel` above) AND, by design, for a valid `tier`-based
-   * (deprecated) definition: `effectiveAgent()` deliberately returns no
-   * `effort` for that path so a tier-based launch's real behaviour (no
-   * `--effort` override derived from `tier`) is reflected exactly, not
-   * approximated — see `effectiveAgent`'s own doc comment.
-   */
-  resolvedEffort?: AgentEffort;
-}
-
 export interface QueryAgentInventory {
   rules: RuleInventoryEntry[];
-  sessionDefinitions: SessionDefinitionInventoryEntry[];
-  /** Every rules-file or session-definition-file load/parse error, one entry per bad file — see this module's own top comment. Independent of `rules`/`sessionDefinitions`: a bad session-definition file ALSO appears there with `valid: false` and its own `problems`; this list exists so a caller can scan for trouble without walking every entry. */
+  /** The rules file's own load/parse error, when it has one — see this module's own top comment. `[]` when it loaded. */
   errors: FileErrorEntry[];
 }
 
@@ -267,11 +214,6 @@ function liveAndWithheldRuleKeys(rows: readonly DashboardRow[]): { live: Readonl
  * `index.ts` passes `ADMISSION_SOURCE_ISSUE = "issue"`. No other provider has
  * this mismatch. The mapping is TOTAL and 1:1 over every `ResourceProvider` —
  * no two providers share a source, and no provider spans more than one.
- * `"managed-sessions"` (`ADMISSION_SOURCE_MANAGED_SESSIONS`) has no entry
- * here: it is never a `Rule.resourceProvider` value, only the built-in
- * managed-session-definitions loop's own admission bucket, which this module
- * already handles separately (`SessionDefinitionInventoryEntry`, no
- * `staffed`/`reason` of its own).
  *
  * FACTORY-990: `jira-component` is the one entry here with NO matching
  * `admissionController.admit(...)` call site (yet) — it is inert scaffolding
@@ -296,6 +238,7 @@ const RULE_ADMISSION_SOURCE: Readonly<Record<ResourceProvider, string>> = {
   filesystem: "filesystem",
   "confluence-page": "confluence-page",
   "jira-component": "jira-component",
+  "trello-card": "trello-card",
 };
 
 /**
@@ -451,7 +394,6 @@ function buildRuleInventoryEntry(rule: Rule, deps: RuleStaffingDeps): RuleInvent
     query: rule.query,
     enabled: rule.enabled,
     execution: rule.execution,
-    account: rule.account,
     role: rule.role,
     agentPreferences: (rule.agentPreferences ?? []).map(copyAgentPreference),
     linkedEventing: rule.linkedEventing === true,
@@ -494,80 +436,12 @@ export function loadRulesFileState(env: RulesEnv = process.env, read?: ReadRules
   }
 }
 
-export interface SessionDefinitionInventoryDeps extends Omit<SessionDefinitionListDeps, "dir" | "identityDir"> {
-  activeDir: string;
-  archiveDir: string;
-}
-
-/**
- * Every managed-session definition, active and archived alike — see this
- * module's own top comment for why `listSessionDefinitions` is called twice
- * rather than reimplemented. `assertArchiveDirDisjoint` (`../resources/
- * session-archive.ts`) is checked first, exactly as every archive-touching
- * CLI command already does: a misconfigured archive directory that sits
- * inside (or equals) the active one would otherwise double-list the same
- * files as both active and archived, which is confusing but never unsafe
- * (this whole module is read-only) — reported as one `FileErrorEntry`
- * keyed on `archiveDir` rather than thrown, so one misconfigured archive
- * directory does not take down the rest of this endpoint (the same "one bad
- * file must not hide the good ones" discipline this ticket asks for,
- * extended to "one bad directory").
- */
-async function buildSessionDefinitionInventory(deps: SessionDefinitionInventoryDeps): Promise<{ entries: SessionDefinitionInventoryEntry[]; errors: FileErrorEntry[] }> {
-  const errors: FileErrorEntry[] = [];
-  try {
-    assertArchiveDirDisjoint(deps.activeDir, deps.archiveDir);
-  } catch (e) {
-    errors.push({ path: deps.archiveDir, message: (e as Error).message });
-    const active = await listSessionDefinitions({ ...deps, dir: deps.activeDir });
-    return { entries: tagEntries(active, false), errors: [...errors, ...fileErrorsOf(active)] };
-  }
-  const [active, archived] = await Promise.all([
-    listSessionDefinitions({ ...deps, dir: deps.activeDir }),
-    listSessionDefinitions({ ...deps, dir: deps.archiveDir, identityDir: deps.activeDir }),
-  ]);
-  return {
-    entries: [...tagEntries(active, false), ...tagEntries(archived, true)],
-    errors: [...errors, ...fileErrorsOf(active), ...fileErrorsOf(archived)],
-  };
-}
-
-/**
- * FACTORY-120 — `resolvedModel`/`resolvedEffort` via `effectiveAgent()`
- * (`../resources/session-definition.ts`), computed only for a `valid` entry
- * with a `vendor` (an invalid entry's `vendor` is `undefined` by the same
- * NOT-APPLICABLE discipline every other content field here follows — see
- * `SessionDefinitionInventoryEntry`'s own doc comments). Safe to call
- * unconditionally once those two hold: `sessionDefinitionProblems`
- * (`../resources/session-definition.ts`) already rejects a valid entry that
- * sets neither `tier` nor both `modelPower`/`effort`, so `effectiveAgent()`
- * never hits its own "no band covers ..." throw here.
- */
-function resolvedAgentFields(e: SessionDefinitionListEntry): { resolvedModel?: string; resolvedEffort?: AgentEffort } {
-  if (!e.valid || e.vendor === undefined) return {};
-  const { model, effort } = effectiveAgent({
-    vendor: e.vendor,
-    ...(e.tier !== undefined ? { tier: e.tier } : {}),
-    ...(e.modelPower !== undefined ? { modelPower: e.modelPower } : {}),
-    ...(e.effort !== undefined ? { effort: e.effort } : {}),
-  });
-  return { resolvedModel: model, ...(effort !== undefined ? { resolvedEffort: effort } : {}) };
-}
-
-const tagEntries = (entries: readonly SessionDefinitionListEntry[], archived: boolean): SessionDefinitionInventoryEntry[] =>
-  entries.map((e) => ({ ...e, kind: "session-definition" as const, archived, ...resolvedAgentFields(e) }));
-
-/** One `FileErrorEntry` per invalid definition — `problems` joined the same way `loadRulesFileState`'s own `error.message` is (a single string), never truncated to the first problem. */
-const fileErrorsOf = (entries: readonly SessionDefinitionListEntry[]): FileErrorEntry[] =>
-  entries.filter((e) => !e.valid).map((e) => ({ path: e.path, message: e.problems.join("\n") }));
-
 export interface BuildQueryAgentInventoryDeps {
   rulesFile: RulesFileState;
   /** The SAME poll-fed snapshot `/dashboard` already serves (`createDashboardFeed(...).snapshot()`, `./dashboard.ts`) — never a fresh call of this module's own. */
   dashboard: DashboardResponse;
   /** Built by the caller from its own already-computed `githubIssueStaffing`/`zendeskTicketStaffing` (or any future provider's own equivalent) — see `RuleStaffingDeps.configReason`'s own doc comment. Never consulted for a disabled rule. */
   configReasonFor: (rule: Rule) => string | null;
-  sessionDefinitions: SessionDefinitionInventoryDeps;
 }
 
 /** The whole inventory — see this module's own top comment for the shape and the reuse it is built from. */
@@ -582,7 +456,5 @@ export async function buildQueryAgentInventory(deps: BuildQueryAgentInventoryDep
       admissionSourceCensus: admissionSourceCensusFor(rule, deps.dashboard.admission),
     }),
   );
-  const { entries: sessionDefinitions, errors: sessionErrors } = await buildSessionDefinitionInventory(deps.sessionDefinitions);
-  const errors: FileErrorEntry[] = [...(deps.rulesFile.error ? [deps.rulesFile.error] : []), ...sessionErrors];
-  return { rules, sessionDefinitions, errors };
+  return { rules, errors: deps.rulesFile.error ? [deps.rulesFile.error] : [] };
 }

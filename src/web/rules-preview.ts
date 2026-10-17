@@ -20,7 +20,7 @@
  * credentials.
  */
 import type { JiraIssue } from "../atlassian/types.js";
-import type { Rule } from "../rules/rules.js";
+import type { ResourceProvider, Rule } from "../rules/rules.js";
 import { searchRules } from "../rules/resource-type.js";
 import { searchJiraIdeaRules } from "../rules/jira-idea-type.js";
 
@@ -89,7 +89,17 @@ async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIs
  * closure per request would reset it every time, defeating the limit
  * entirely).
  */
-export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, queryOverride?: string) => Promise<RulesPreviewResult> {
+/**
+ * local/ui — the shape a not-yet-saved rule is dry-run as: only the fields
+ * the provider matchers read, plus `searchForRule`'s own forced
+ * `enabled: true`. Used ONLY when no saved rule has this id (a create's
+ * dry run); a saved rule always wins.
+ */
+function draftRule(id: string, resourceProvider: ResourceProvider, query: string): Rule {
+  return { id, enabled: true, resourceProvider, query, brief: "@builtin:task", execution: "swarm", role: "worker" } as Rule;
+}
+
+export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, queryOverride?: string, draftProvider?: ResourceProvider) => Promise<RulesPreviewResult> {
   const now = deps.now ?? (() => Date.now());
   const cap = deps.cap ?? DEFAULT_PREVIEW_CAP;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_PREVIEW_TIMEOUT_MS;
@@ -105,8 +115,10 @@ export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, query
   // existing per-rule limiter (rather than adding a second one keyed by
   // query) is enough to keep it from becoming a free way to hammer this
   // daemon's own Jira credentials with distinct draft strings.
-  return async function preview(id: string, queryOverride?: string): Promise<RulesPreviewResult> {
-    const rule = deps.rules().find((r) => r.id === id);
+  return async function preview(id: string, queryOverride?: string, draftProvider?: ResourceProvider): Promise<RulesPreviewResult> {
+    const saved = deps.rules().find((r) => r.id === id);
+    // local/ui: a create's dry run measures a rule that doesn't exist yet; without this every create was refused as "unmeasurable".
+    const rule = saved ?? (draftProvider !== undefined && queryOverride !== undefined ? draftRule(id, draftProvider, queryOverride) : undefined);
     if (!rule) return { ok: false, status: 404, error: "rule not found" };
     if (!JIRA_BACKED_PROVIDERS.has(rule.resourceProvider)) {
       return { ok: false, status: 400, error: `rule "${id}" is not previewable: "${rule.resourceProvider}" is not a Jira-backed provider` };

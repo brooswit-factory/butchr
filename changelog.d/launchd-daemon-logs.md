@@ -1,0 +1,4 @@
+bump: patch
+
+### Fixed
+- **The dashboard's Daemon logs work under launchd on macOS.** `GET /api/daemon/logs` only knew systemd units and the Windows scheduled task, so a daemon run as a launchd job showed "no systemd unit or scheduled task detected" instead of its log. `currentSystemdInfo()` now also recognises the launchd job running the process: the label from `XPC_SERVICE_NAME`, confirmed by `launchctl print`'s own `pid` for that job (a child process inherits the label, so the label alone proves nothing), with the job's `stderr path` (else `stdout path`) as its log. The logs route reads it with a one-shot, bounded `tail -n <maxLines>`, redacted and byte-capped like every other source. `/health`'s build report now names the job's label as its unit. Asked once per process; nothing changes off macOS.

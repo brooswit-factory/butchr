@@ -42,15 +42,6 @@ Keep cancellations cancelled, freezes frozen, and explicit approval or
 dependency holds intact. Changing a status does not supply missing approval.
 Hierarchy and review assignments are process conventions, not tool permissions.
 
-## Subscriptions
-
-Use `list_links` (resource), `add_link` (resource, target), and `remove_link`
-(resource, target) with canonical references such as jira-project:FACTORY and
-jira-work-item:FACTORY-123. These are observation subscriptions, not ownership,
-staffing or permission grants. Preserve existing relationships unless changing
-them is part of the task. Event delivery requires configured watchers; an added
-link alone is not evidence that any notification or resulting turn occurred.
-
 ## Documents and communication
 
 Butchr does not automatically create a Confluence document for a ticket.
@@ -106,7 +97,7 @@ worktree with unpreserved changes. On respawn, resume surviving work.
 
 Use your workspace ENVIRONMENT.md for environment facts; another agent may run
 on a different host or commit. Cite evidence and ask readers to verify paths
-against their own checkout. Factory guidance: https://wroosbit.atlassian.net/wiki/spaces/ASSIST
+against their own checkout.
 
 Use `jira_add_labels` or `jira_remove_labels` (key, labels) when the workflow requests a label change. Inspect existing labels first and preserve unrelated labels. Do not remove holds or cancellation markers without authorization.
 

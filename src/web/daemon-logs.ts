@@ -14,7 +14,7 @@
  * (`../agents/escalate.js`) — the project's one existing secret-redaction
  * helper, reused verbatim, never a second implementation.
  *
- * `kind: "none"` (no systemd unit, no Windows scheduled task detected) is
+ * `kind: "none"` (no systemd unit, launchd job or Windows scheduled task detected) is
  * an honest, operator-actionable refusal, never an empty page: the UI gets
  * a `source: "unavailable"` result with a message naming exactly why
  * (BUTCHR-this-ticket's own acceptance criterion 1).
@@ -71,6 +71,10 @@ export type DaemonLogsResult =
  * that string (the one piece `SystemdInfo`'s public shape actually carries)
  * and rebuilds a ONE-SHOT, bounded invocation with `maxLines` instead,
  * rather than running the live-follow command as-is.
+ *
+ * `launchd` (macOS): the same, for `parseLaunchdPrint`'s
+ * `tail -n 200 -f "<log file>"`: a one-shot `tail -n <maxLines>` of the
+ * job's own log file.
  */
 function logsArgvFor(info: SystemdInfo, maxLines: number): readonly string[] | null {
   switch (info.kind) {
@@ -80,6 +84,11 @@ function logsArgvFor(info: SystemdInfo, maxLines: number): readonly string[] | n
       const m = /-Path\s+"([^"]+)"/.exec(info.journalctl);
       if (!m) return null;
       return ["powershell", "-NoProfile", "-NonInteractive", "-Command", `Get-Content -Path "${m[1]}" -Tail ${maxLines}`];
+    }
+    case "launchd": {
+      const m = /"([^"]+)"$/.exec(info.journalctl);
+      if (!m) return null;
+      return ["tail", "-n", String(maxLines), m[1]!];
     }
     case "none": return null;
   }
@@ -96,10 +105,10 @@ function logsArgvFor(info: SystemdInfo, maxLines: number): readonly string[] | n
  */
 export async function readDaemonLogs(info: SystemdInfo, opts: DaemonLogsOptions, io: DaemonLogsExecIo = defaultDaemonLogsExecIo()): Promise<DaemonLogsResult> {
   if (info.kind === "none") {
-    return { ok: false, error: "no systemd unit or scheduled task detected for this daemon — logs are unavailable; check the process running this daemon directly" };
+    return { ok: false, error: "no systemd unit, launchd job or scheduled task detected for this daemon — logs are unavailable; check the process running this daemon directly" };
   }
   const argv = logsArgvFor(info, opts.maxLines);
-  if (!argv) return { ok: false, error: "no systemd unit or scheduled task detected for this daemon — logs are unavailable; check the process running this daemon directly" };
+  if (!argv) return { ok: false, error: "no systemd unit, launchd job or scheduled task detected for this daemon — logs are unavailable; check the process running this daemon directly" };
   let stdout: string;
   try {
     stdout = await io.run(argv);

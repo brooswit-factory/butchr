@@ -71,8 +71,6 @@ export interface CreateJiraProjectResourceTypeDeps {
   notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
   /** BUTCHR-469: per-target comment-cursor support for member/managed-link Jira targets — the SAME `LinkedEventingDeps.comments` shape. Optional; omitted, no comment event is ever detected for a project owner (unchanged pre-BUTCHR-469 behaviour). */
   comments?: LinkedEventingDeps['comments'];
-  /** BUTCHR-469: the FACTORY-4/FACTORY-8 managed-link store, routed (`createRoutingLinkStore`, src/resources/link-store-router.ts) so a `jira-project:` owner reaches the `brooswit.butchr.links` project-property store. Optional; omitted, no managed link is ever reconciled into a project owner's watch. */
-  linkStore?: LinkedEventingDeps['linkStore'];
   log?: (line: string) => void;
   /** Injectable clock, for deterministic tests — threaded straight through to `LinkedEventingDeps.now`. */
   now?: () => number;
@@ -133,7 +131,6 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
          notify,
          ...(deps.log ? { log: deps.log } : {}),
          ...(deps.now ? { now: deps.now } : {}),
-         ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
          ...(deps.comments ? { comments: deps.comments } : {}),
          ...(deps.push ? { push: deps.push } : {}),
          ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),

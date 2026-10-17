@@ -24,7 +24,6 @@ function rule(overrides: Partial<RuleDto> = {}): RuleDto {
     query: "project = FACTORY AND type = Epic",
     enabled: false,
     execution: "swarm",
-    account: "none",
     role: "worker",
     agentPreferences: [{ harness: "claude", model: "claude-opus-5" }],
     permissionMode: null,

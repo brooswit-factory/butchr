@@ -16,6 +16,13 @@
  * `role` ("Included in capacity" on the rule form) joins the editable
  * top-level fields — see `EDITABLE_TOP_LEVEL_FIELDS`'s own doc comment.
  *
+ * local/ui widens the row once more, for the dashboard's inline rule editor:
+ * `execution`, `resumeOnRespawn`, `resumeContextCutoff` and `brief` become
+ * editable (and settable on create). The legacy Rocket.Chat `account` key is
+ * refused like any other unknown field. `mcpServers`,
+ * `mcpConfigFile` and `relationships` stay file-only, refused by the same
+ * default-deny mechanism described below.
+ *
  * FACTORY-730 retires the `UI_EDITABLE_ID_PREFIX`/`isUiEditableRuleId` route-
  * level gate this header used to describe as "gate 2": a write to ANY
  * existing rule id (an operator's real `epics`/`tasks`/`bugs` rule, not only
@@ -37,7 +44,8 @@
  *   `EDITABLE_AGENT_PREFERENCE_LEAVES` below are the VOCABULARY those
  *   builders use — never consulted directly by `assertOnlyChanged`.
  */
-import { AGENT_HARNESSES, AGENT_ROLES, NOTIFY_DELIVERY_MODES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type NotifyDeliveryMode, type RulePermissionMode } from "./rules.js";
+import { AGENT_HARNESSES, AGENT_ROLES, EXECUTION_MODES, NOTIFY_DELIVERY_MODES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type ExecutionMode, type NotifyDeliveryMode, type RulePermissionMode } from "./rules.js";
+import { builtinBriefProblem } from "../agents/workspace.js";
 import { AGENT_EFFORTS, powerValueProblems, type AgentEffort } from "../resources/power-scale.js";
 import { customModelProblems } from "./rule-form-catalog.js";
 import { RESOURCE_PROVIDERS, isRuleId, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
@@ -78,7 +86,58 @@ export const EDITABLE_AGENT_PREFERENCE_LEAVES: readonly string[] = ["harness", "
  * `account` still are); now explicit, validated against `AGENT_ROLES`
  * below, same discipline every other leaf here already has.
  */
-export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = ["query", "permissionMode", "lizardMode", "role", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode"];
+export const EDITABLE_TOP_LEVEL_FIELDS: readonly string[] = [
+  "query",
+  "permissionMode",
+  "lizardMode",
+  "role",
+  "idlePokeMinutes",
+  "idlePokeMessage",
+  "idlePokeEnabled",
+  "stalledMinutes",
+  "notifyDeliveryMode",
+  // local/ui — see this file's header.
+  "execution",
+  "resumeOnRespawn",
+  "resumeContextCutoff",
+  "brief",
+  "linkedEventing",
+  "linkedPollIntervalMs",
+  "maxLinkedItems",
+  "linkedRemoteLinks",
+  "linkedDescriptionLinks",
+];
+
+/**
+ * local/ui — the linked-change eventing knobs (`Rule.linkedEventing` and its
+ * companions, `./rules.ts`), validated exactly as `parseRules` does: the
+ * switches are booleans, the counts positive integers. Config surface only,
+ * so no change to them restarts an agent. A count's `null` (PUT only)
+ * removes the key, back to butchr's default.
+ */
+export const LINKED_BOOLEAN_FIELDS = ["linkedEventing", "linkedRemoteLinks", "linkedDescriptionLinks"] as const;
+// FACTORY-252: maxLinkedTurnsPerHour is gone with the hourly linked-notify cap it set.
+export const LINKED_COUNT_FIELDS = ["linkedPollIntervalMs", "maxLinkedItems"] as const;
+
+/** local/ui — the longest brief text the write path accepts (a sanity bound, not a product limit). */
+export const BRIEF_MAX_LENGTH = 200_000;
+
+/** local/ui — shared by the PUT and create validators below so both accept exactly the same values. */
+function validateExecution(v: unknown): { ok: true; value: ExecutionMode } | { ok: false; error: string } {
+  if (typeof v !== "string" || !(EXECUTION_MODES as readonly string[]).includes(v)) return { ok: false, error: `execution must be one of ${EXECUTION_MODES.join(", ")}` };
+  return { ok: true, value: v as ExecutionMode };
+}
+
+function validateBrief(v: unknown): { ok: true; value: string } | { ok: false; error: string } {
+  if (typeof v !== "string" || v.trim() === "" || v.length > BRIEF_MAX_LENGTH) return { ok: false, error: `brief must be a non-empty string, at most ${BRIEF_MAX_LENGTH} characters` };
+  const problem = builtinBriefProblem(v);
+  if (problem) return { ok: false, error: `brief ${problem}` };
+  return { ok: true, value: v };
+}
+
+function isPositiveInteger(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v > 0;
+}
 
 /**
  * FACTORY-729: `permissionMode` values that are never a default and always
@@ -209,6 +268,20 @@ export interface RuleFieldPatch {
    * a literal `"notifyDeliveryMode": null` to the file.
    */
   notifyDeliveryMode?: NotifyDeliveryMode | null;
+  /** local/ui — how many agents the rule runs (`EXECUTION_MODES`). On an enabled rule a change counts as a restart, and switching to `"swarm"` also needs its dry-run scope confirmed (`./rules-write.ts`). */
+  execution?: ExecutionMode;
+  /** local/ui — whether a respawned agent resumes its previous session. Config surface only. */
+  resumeOnRespawn?: boolean;
+  /** local/ui — `null` clears it back to the daemon's default cutoff. Config surface only. */
+  resumeContextCutoff?: number | null;
+  /** local/ui — the agent's brief: `@builtin:<type>` or literal text. On an enabled rule a change counts as a restart, like a query change. */
+  brief?: string;
+  /** local/ui — linked-change eventing (`LINKED_BOOLEAN_FIELDS`/`LINKED_COUNT_FIELDS` above). Config surface only. */
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number | null;
+  maxLinkedItems?: number | null;
 }
 
 /** `patch`'s own shape, independent of what the CURRENT rule looks like (that comparison — e.g. the length match above — happens where the current rule is in hand, in `./write-rules.ts`'s caller). `__proto__`/prototype-pollution bodies are rejected here: a `JSON.parse`'d `__proto__` key never becomes an OWN enumerable property, so `Object.keys`/`in` checks below never see it either way, but every value is read by EXPLICIT key name below, never spread or `Object.assign`-merged onto a trusted object, which is what actually matters for this module's own output never carrying one. */
@@ -270,7 +343,56 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
     if (b.notifyDeliveryMode !== null && (typeof b.notifyDeliveryMode !== "string" || !(NOTIFY_DELIVERY_MODES as readonly string[]).includes(b.notifyDeliveryMode))) return { ok: false, error: `notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}, or null to clear it` };
     patch.notifyDeliveryMode = b.notifyDeliveryMode as NotifyDeliveryMode | null;
   }
-  const allowedKeys = new Set(["enabled", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes", "notifyDeliveryMode", "ifMatch", "confirm", "planHash"]);
+  if ("execution" in b) {
+    const parsed = validateExecution(b.execution);
+    if (!parsed.ok) return parsed;
+    patch.execution = parsed.value;
+  }
+  if ("resumeOnRespawn" in b) {
+    if (typeof b.resumeOnRespawn !== "boolean") return { ok: false, error: "resumeOnRespawn must be a boolean" };
+    patch.resumeOnRespawn = b.resumeOnRespawn;
+  }
+  if ("resumeContextCutoff" in b) {
+    if (b.resumeContextCutoff !== null && !isPositiveInteger(b.resumeContextCutoff)) return { ok: false, error: "resumeContextCutoff must be a positive integer or null (the default)" };
+    patch.resumeContextCutoff = b.resumeContextCutoff as number | null;
+  }
+  if ("brief" in b) {
+    const parsed = validateBrief(b.brief);
+    if (!parsed.ok) return parsed;
+    patch.brief = parsed.value;
+  }
+  for (const k of LINKED_BOOLEAN_FIELDS) {
+    if (!(k in b)) continue;
+    if (typeof b[k] !== "boolean") return { ok: false, error: `${k} must be a boolean` };
+    patch[k] = b[k] as boolean;
+  }
+  for (const k of LINKED_COUNT_FIELDS) {
+    if (!(k in b)) continue;
+    if (b[k] !== null && !isPositiveInteger(b[k])) return { ok: false, error: `${k} must be a positive integer or null (butchr's default)` };
+    patch[k] = b[k] as number | null;
+  }
+  const allowedKeys = new Set([
+    "enabled",
+    "query",
+    "permissionMode",
+    "lizardMode",
+    "role",
+    "agentPreferences",
+    "idlePokeMinutes",
+    "idlePokeMessage",
+    "idlePokeEnabled",
+    "stalledMinutes",
+    "notifyDeliveryMode",
+    "execution",
+    "resumeOnRespawn",
+    "resumeContextCutoff",
+    "brief",
+    ...LINKED_BOOLEAN_FIELDS,
+    ...LINKED_COUNT_FIELDS,
+    "ifMatch",
+    "confirm",
+    "planHash",
+  ]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not editable` };
   }
@@ -280,14 +402,11 @@ export function validateRuleFieldPatch(body: unknown): { ok: true; patch: RuleFi
 /**
  * FACTORY-927 — `POST /api/rules`'s own body shape: everything an operator
  * may set when creating a new rule from the Rules page. Deliberately a
- * NARROWER surface than the full `Rule` shape (`./rules.ts`): `brief`,
- * `execution`, and `account` are never client-settable here — same
- * discipline `PUT /api/rules/:id` already applies to `brief` (file-only).
- * `createRule` (`./rules-write.ts`) hardcodes those three to the exact
- * values `./seed-first-run.ts`'s own first-run template rule uses
- * (`brief: "@builtin:task"`, `execution: "swarm"`, `account: "none"`) — a
- * deliberate v1 scope cut, not an oversight; a later ticket can widen this
- * if an operator needs a different brief/execution/account at create time.
+ * NARROWER surface than the full `Rule` shape (`./rules.ts`). local/ui
+ * makes `brief` and `execution` optional here; when they're absent,
+ * `createRule` (`./rules-write.ts`) uses the exact values
+ * `./seed-first-run.ts`'s own first-run template rule uses
+ * (`brief: "@builtin:task"`, `execution: "swarm"`).
  * `enabled` is never accepted at all (the create route always creates a
  * rule DISABLED — see `createRule`'s own doc comment).
  */
@@ -300,6 +419,19 @@ export interface RuleCreateInput {
   role?: AgentRole;
   /** At most one entry in this v1 slice — a brand-new rule has no existing preference slot to grow, so (unlike `RuleFieldPatch.agentPreferences`, which must match an existing length) this accepts 0 or 1, never more. */
   agentPreferences?: AgentPreferencePatch[];
+  /** local/ui — optional on create; absent keeps FACTORY-927's defaults (`"@builtin:task"`, `"swarm"`). */
+  brief?: string;
+  execution?: ExecutionMode;
+  resumeOnRespawn?: boolean;
+  resumeContextCutoff?: number;
+  /** local/ui — same values the PUT path accepts, minus its `null` clear (a new rule has nothing to clear). */
+  stalledMinutes?: number;
+  notifyDeliveryMode?: NotifyDeliveryMode;
+  linkedEventing?: boolean;
+  linkedRemoteLinks?: boolean;
+  linkedDescriptionLinks?: boolean;
+  linkedPollIntervalMs?: number;
+  maxLinkedItems?: number;
 }
 
 /**
@@ -360,7 +492,61 @@ export function validateRuleCreateInput(body: unknown): { ok: true; input: RuleC
     }
     input.agentPreferences = entries;
   }
-  const allowedKeys = new Set(["id", "resourceProvider", "query", "permissionMode", "lizardMode", "role", "agentPreferences", "confirm", "planHash"]);
+  if ("brief" in b) {
+    const parsed = validateBrief(b.brief);
+    if (!parsed.ok) return parsed;
+    input.brief = parsed.value;
+  }
+  if ("execution" in b) {
+    const parsed = validateExecution(b.execution);
+    if (!parsed.ok) return parsed;
+    input.execution = parsed.value;
+  }
+  if ("resumeOnRespawn" in b) {
+    if (typeof b.resumeOnRespawn !== "boolean") return { ok: false, error: "resumeOnRespawn must be a boolean" };
+    input.resumeOnRespawn = b.resumeOnRespawn;
+  }
+  if ("resumeContextCutoff" in b) {
+    if (!isPositiveInteger(b.resumeContextCutoff)) return { ok: false, error: "resumeContextCutoff must be a positive integer" };
+    input.resumeContextCutoff = b.resumeContextCutoff;
+  }
+  if ("stalledMinutes" in b) {
+    if (typeof b.stalledMinutes !== "number" || !Number.isFinite(b.stalledMinutes) || b.stalledMinutes <= 0) return { ok: false, error: "stalledMinutes must be a positive number" };
+    input.stalledMinutes = b.stalledMinutes;
+  }
+  if ("notifyDeliveryMode" in b) {
+    if (typeof b.notifyDeliveryMode !== "string" || !(NOTIFY_DELIVERY_MODES as readonly string[]).includes(b.notifyDeliveryMode)) return { ok: false, error: `notifyDeliveryMode must be one of ${NOTIFY_DELIVERY_MODES.join(", ")}` };
+    input.notifyDeliveryMode = b.notifyDeliveryMode as NotifyDeliveryMode;
+  }
+  for (const k of LINKED_BOOLEAN_FIELDS) {
+    if (!(k in b)) continue;
+    if (typeof b[k] !== "boolean") return { ok: false, error: `${k} must be a boolean` };
+    input[k] = b[k] as boolean;
+  }
+  for (const k of LINKED_COUNT_FIELDS) {
+    if (!(k in b)) continue;
+    if (!isPositiveInteger(b[k])) return { ok: false, error: `${k} must be a positive integer` };
+    input[k] = b[k] as number;
+  }
+  const allowedKeys = new Set([
+    "id",
+    "resourceProvider",
+    "query",
+    "permissionMode",
+    "lizardMode",
+    "role",
+    "agentPreferences",
+    "brief",
+    "execution",
+    "resumeOnRespawn",
+    "resumeContextCutoff",
+    "stalledMinutes",
+    "notifyDeliveryMode",
+    ...LINKED_BOOLEAN_FIELDS,
+    ...LINKED_COUNT_FIELDS,
+    "confirm",
+    "planHash",
+  ]);
   for (const k of Object.keys(b)) {
     if (!allowedKeys.has(k)) return { ok: false, error: `unknown field "${k}" is not accepted when creating a rule` };
   }

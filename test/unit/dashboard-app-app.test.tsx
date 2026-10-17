@@ -16,37 +16,41 @@ beforeEach(() => {
 });
 
 describe("App shell — FACTORY-614", () => {
-  test("renders the LaunchPad Heading-based header and both nav links", () => {
-    const { getByRole } = render(
+  test("renders the LaunchPad Heading-based header and the nav links, with Status in place of Dashboard and Daemon", () => {
+    const { getByRole, queryByRole } = render(
       <MemoryRouter initialEntries={["/"]}>
         <App />
       </MemoryRouter>,
     );
     expect(getByRole("heading", { name: "butchr dashboard" })).toBeTruthy();
-    expect(getByRole("link", { name: "Dashboard" })).toBeTruthy();
-    expect(getByRole("link", { name: "Configurations" })).toBeTruthy();
+    expect(getByRole("link", { name: "Status" })).toBeTruthy();
+    expect(getByRole("link", { name: "Rules" })).toBeTruthy();
+    expect(queryByRole("link", { name: "Dashboard" })).toBeNull();
+    // local/ui: Agents right after Rules (the user asked), Coming soon last.
+    expect([...document.querySelectorAll(".bt-nav__link")].map((a) => a.textContent)).toEqual(["Rules", "Agents", "Settings", "Status", "Coming soon"]);
+    expect(queryByRole("link", { name: "Daemon" })).toBeNull();
   });
 
-  test("route \"/\" renders the Dashboard placeholder and marks the Dashboard nav link current", async () => {
+  test("route \"/\" renders the Status page (local/ui: the old Dashboard and Daemon pages) and marks the Status nav link current", async () => {
     const { getByRole } = render(
       <MemoryRouter initialEntries={["/"]}>
         <App />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(getByRole("heading", { name: "Dashboard" })).toBeTruthy());
-    expect(getByRole("link", { name: "Dashboard" }).getAttribute("aria-current")).toBe("page");
-    expect(getByRole("link", { name: "Configurations" }).getAttribute("aria-current")).toBeNull();
+    await waitFor(() => expect(getByRole("heading", { name: "Status" })).toBeTruthy());
+    expect(getByRole("link", { name: "Status" }).getAttribute("aria-current")).toBe("page");
+    expect(getByRole("link", { name: "Rules" }).getAttribute("aria-current")).toBeNull();
   });
 
-  test("route \"/configurations\" renders the Configurations placeholder and marks that nav link current", async () => {
-    const { getByRole } = render(
-      <MemoryRouter initialEntries={["/configurations"]}>
+  test("route \"/configurations\" (local/ui: gone, the Rules page shows the same) lands on Rules and marks that nav link current", async () => {
+    const { getByRole, queryByRole } = render(
+      <MemoryRouter initialEntries={["/configurations#rule-jira-work--x"]}>
         <App />
       </MemoryRouter>,
     );
-    await waitFor(() => expect(getByRole("heading", { name: "Configurations" })).toBeTruthy());
-    expect(getByRole("link", { name: "Configurations" }).getAttribute("aria-current")).toBe("page");
-    expect(getByRole("link", { name: "Dashboard" }).getAttribute("aria-current")).toBeNull();
+    await waitFor(() => expect(getByRole("link", { name: "Rules" }).getAttribute("aria-current")).toBe("page"));
+    expect(queryByRole("link", { name: "Configurations" })).toBeNull();
+    expect(getByRole("link", { name: "Status" }).getAttribute("aria-current")).toBeNull();
   });
 
   test("theme wiring: the app shell renders fine under the explicit data-theme=\"dark\" attribute main.tsx's `watchSystemTheme` applies on an OS dark preference (apply-system-theme.test.ts covers that logic itself) — this just proves the shell tolerates the attribute, never requiring the absence of a toggle to mean the absence of a theme", () => {

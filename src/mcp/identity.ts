@@ -13,6 +13,7 @@
 import { parseGithubIssueRef, type GithubIssueRef } from "../resources/github-issue-ref.js";
 import { parseGithubPrRef, type GithubPrRef } from "../resources/github-pr-ref.js";
 import { parseZendeskTicketRef, type ZendeskTicketRef } from "../resources/zendesk-ticket-ref.js";
+import { parseTrelloCardRef, type TrelloCardRef } from "../resources/trello-card-ref.js";
 import { decodeAnyAgentKey, type ResourceProvider } from "../rules/agent-key.js";
 
 export type CallerIdentity =
@@ -22,6 +23,8 @@ export type CallerIdentity =
   | { provider: "jira-project"; agent: string; ruleId: string; resource: string }
   | { provider: "jira-idea"; agent: string; ruleId: string; resource: string }
   | { provider: "zendesk-ticket"; agent: string; ruleId: string; resource: string; ref: ZendeskTicketRef }
+  /** local/ui: a Trello card agent, identified by its agent key alone like a Zendesk one. */
+  | { provider: "trello-card"; agent: string; ruleId: string; resource: string; ref: TrelloCardRef }
   | { provider: "filesystem"; agent: string; ruleId: string; resource: string }
   /**
    * FACTORY-998: the ONE provider that legitimately carries BOTH
@@ -43,7 +46,7 @@ export type CallerIdentity =
   | { provider: ResourceProvider; agent: string; ruleId: string; query: true };
 
 /** Providers whose agents identify by agent key alone, never `x-issue`. */
-export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"];
+export const KEY_ONLY_PROVIDERS: readonly ResourceProvider[] = ["github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "trello-card"];
 
 /**
  * `decoded` is `decodeAnyAgentKey`'s result, so it can be a query-level key
@@ -82,6 +85,10 @@ export function callerIdentity(headers: Readonly<Record<string, string | undefin
   }
   if (decoded?.resourceProvider === "filesystem") {
     return issue ? null : { provider: "filesystem", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId };
+  }
+  if (decoded?.resourceProvider === "trello-card") {
+    const ref = parseTrelloCardRef(decoded.resourceId);
+    return issue || !ref ? null : { provider: "trello-card", agent: agent!, ruleId: decoded.ruleId, resource: decoded.resourceId, ref };
   }
   // FACTORY-998: the one branch that REQUIRES `issue`, rather than refusing
   // its presence — see `CallerIdentity`'s own "confluence-page" member doc

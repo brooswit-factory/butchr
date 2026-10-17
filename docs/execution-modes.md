@@ -1,8 +1,8 @@
-# `execution`, `account`, `role`: rule schema, query-level identity, reconciliation, and fleet capacity
+# `execution`, `role`: rule schema, query-level identity, reconciliation, and fleet capacity
 
 BUTCHR-397 (task 1) and BUTCHR-398 (task 2), both of story BUTCHR-392, epic
 BUTCHR-391 (the Bakr/Candlestix consolidation). BUTCHR-397 shipped the
-`execution`/`account` rule fields, their validation, and the identity codec
+`execution` rule field, its validation, and the identity codec
 for the one agent a `singleton`/`persistent` rule runs. **BUTCHR-398 ships
 reconciliation** — actually spawning, stopping, and delivering scope-wide
 events to that agent, for all four resource providers — plus a new field,
@@ -13,16 +13,15 @@ the default for both `execution` and (with `role`) the default for capacity.
 ## The three fields
 
 All optional on a `Rule`; a pre-BUTCHR-397 rules document loads unchanged,
-with all three fields filled in at their defaults — no migration, no changed
+with both fields filled in at their defaults — no migration, no changed
 agent keys, no changed admission behaviour.
 
 | field | values | default | independent of the others? |
 |---|---|---|---|
 | `execution` | `swarm` \| `singleton` \| `persistent` | `swarm` | yes |
-| `account` | `none` \| `temporary` \| `permanent` | `none` | yes |
 | `role` | `worker` \| `sentinel` | `worker` | yes |
 
-Any combination across all three is valid at the schema level. A bad value is
+Any combination of the two is valid at the schema level. A bad value is
 rejected at load with the rule's index and field named, e.g.:
 
 ```
@@ -49,56 +48,23 @@ that field's own note below.
   (`enabled: false`) stops it — a query dropping to zero matches does not.
   **Implemented (BUTCHR-398).**
 
-## What `account` means
+## The legacy `account` key
 
-Rocket.Chat account lifecycle for a rule's agent(s), independent of
-`execution`: `none` (nothing — today's behaviour, exactly), `temporary`, or
-`permanent`. **The lifecycle module exists (BUTCHR-410, S4):** an RC REST
-client and an idempotent, race-safe account manager
-(`src/resources/rocketchat.ts`, `src/accounts/manager.ts`,
-`src/accounts/identity.ts`) implementing create-if-missing, unprovision, and
-a configurable guardrail below RC's 50-user allowance. **Wired into agent
-start/stop (BUTCHR-412, S4 follow-up):** `src/agents/account-lifecycle.ts`
-calls `ensureAccount`/`releaseAccount` from `reconcileNow`
-(`src/daemon/loop.ts`) at exactly the ids about to be spawned/stopped, for
-every rule loop and every execution mode alike — `execution` and `account`
-are genuinely independent axes; the account layer never inspects which
-execution mode produced an id. See `docs/rocketchat-accounts.md`'s "Wiring"
-section for the full design: which stop paths release a temporary account
-and which don't (respawn, daemon-restart and a session-limit close never
-do), and what happens when either cap (the RC-wide guardrail, or the
-separate temporary-account cap) refuses (the spawn is withheld, not
-degraded).
-
-**Corrected credential design (BUTCHR-412, BUTCHR-391 comment 24007): an
-agent never holds a Rocket.Chat credential.** Butchr mints and stores the
-account's token itself (a 0600 file, never inside any agent's workspace) and
-hands Nexus a batched manifest of (account name, token file path) pairs;
-Nexus registers each account with rocketr, the central bridge that actually
-holds every token. An agent's own MCP binding to rocketr names only its
-account, non-secret, in a header (`x-rocketr-account` by convention) — see
-`McpServerBinding.accountHeader` below and `docs/rocketchat-accounts.md`'s
-"Credential design, corrected" section for the full mechanism.
-
-**`account` is not a prerequisite for event-driven delivery.** A rule's
-`mcpServers` bindings (BUTCHR-411, see docs/mcp-server-bindings.md) bind
-Claude to push notifications from ANY MCP channel server, independent of
-`account` — an `account: "none"` rule (e.g. Candlestix's MUD players, who
-get no Rocket.Chat account at all under S4) still gets full, non-polling
-channel delivery from its own bound server(s). The two fields share a rule
-but nothing else: `mcpServers`-derived launch argv never reads `account`.
+Older rules files may still carry `account` (`none` \| `temporary` \|
+`permanent`), the Rocket.Chat account policy. Rocket.Chat support is gone:
+the key is accepted and ignored, silently for `none` (the old default) and
+with one startup warning for any other value. The dashboard and the write
+API never set it.
 
 ## `mcpServers`: binding a rule to additional MCP servers (BUTCHR-411)
 
-Separate from the three fields above — see docs/mcp-server-bindings.md for
-the full field, launch-argv, and staleness story. Noted here only because a
-reader of this page's `account` section is likely to ask exactly the
-question the previous paragraph answers.
+Separate from the two fields above — see docs/mcp-server-bindings.md for
+the full field, launch-argv, and staleness story.
 
 ## `permissionMode` and `lizardMode`: rule-side lizard mode (FACTORY-87/FACTORY-76, companion to DROVR-42)
 
-Two independently optional fields, same house style as `execution`/`account`/
-`role` above (accepted for every resource provider, independent of each
+Two independently optional fields, same house style as `execution`/`role`
+above (accepted for every resource provider, independent of each
 other and of every other field):
 
 | field | values | default | reaches argv? |
@@ -479,8 +445,7 @@ pins this directly.
 ## Fleet capacity role (BUTCHR-398, epic decision on BUTCHR-391, 2026-09-25T00:25Z)
 
 A late-arriving requirement, folded into this task rather than a new one so
-it did not wait on the fleet's own agent cap. Independent of `execution` and
-`account`.
+it did not wait on the fleet's own agent cap. Independent of `execution`.
 
 - **`role: "worker" | "sentinel"`, default `"worker"`.** Every rule is a
   worker unless explicitly flagged otherwise — existing rules files need NO
@@ -896,7 +861,7 @@ running) or block another workspace's own relabel.
 
 ## Tests
 
-`test/unit/rules.test.ts` covers `execution`/`account` (BUTCHR-397, unchanged)
+`test/unit/rules.test.ts` covers `execution` (BUTCHR-397), the ignored legacy `account` key,
 and `role` (BUTCHR-398: defaults, provider-generic acceptance, bad-value
 rejection, pre-change-document compatibility) at the schema layer, and the
 query-level codec itself (encode/decode round-trip, non-collision, restart

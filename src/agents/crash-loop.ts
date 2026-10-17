@@ -211,7 +211,7 @@ export interface CrashLoopDetectorDeps {
   comments: (id: string) => Promise<readonly CommentRow[]>;
   log?: (line: string) => void;
   /**
-   * FACTORY-622 — the PUSH half of this detector, for a tier whose
+   * FACTORY-622 — the ops-alert half of this detector, for a tier whose
    * `addComment` has nowhere to go.
    *
    * THE DEFECT. A managed session (director, genius, an admin agent) has no
@@ -226,20 +226,19 @@ export interface CrashLoopDetectorDeps {
    * exists to fix, and which that module's own header already names this
    * detector as the planned caller for.
    *
-   * A THUNK, NOT THE ROUTER ITSELF, and this is the only reason why: both
-   * detector instances are module-level `const`s in `src/daemon/index.ts`
-   * built several hundred lines BEFORE the Rocket.Chat credential the router
-   * is constructed from is even loaded. Taking the router by value would
-   * force that whole chain to move earlier (it is depended on in between) or
-   * read it in its temporal dead zone. Resolved per raise instead, which
-   * also costs nothing: `raise` is itself cheap and synchronous.
+   * A THUNK, NOT THE ROUTER ITSELF: a detector instance is a module-level
+   * `const` in `src/daemon/index.ts` that can be built several hundred lines
+   * BEFORE the router is. Taking the router by value would force that whole
+   * chain to move earlier or read it in its temporal dead zone. Resolved per
+   * raise instead, which also costs nothing: `raise` is itself cheap and
+   * synchronous.
    *
    * Absent — the ordinary state for a tier that HAS a ticket to comment on —
    * nothing about this detector changes. It is deliberately NOT wired into
    * the issue tier: that tier's complaint lands on the resource's own Jira
-   * ticket where the people who care already look, and duplicating it into a
-   * shared room is the "spam destroys a channel's credibility" outcome this
-   * module's own top comment ranks worse than silence.
+   * ticket where the people who care already look, and duplicating it into
+   * the ops-alert route is the "spam destroys a channel's credibility"
+   * outcome this module's own top comment ranks worse than silence.
    */
   opsAlert?: () => OpsAlertRouter | undefined;
   /**
@@ -414,13 +413,14 @@ export function createCrashLoopDetector(deps: CrashLoopDetectorDeps): CrashLoopD
         // therefore on EVERY poll past the threshold — deliberately, for two
         // reasons that both come straight from the measured incidents.
         //
-        // First, the latch and the room are answering different questions.
-        // The latch exists so one episode produces one COMMENT; the room's
-        // own hourly dedup (`OpsAlertRouter.raise`, whose doc says in as many
-        // words that it is safe to call on every poll and that the window,
-        // not the caller, decides what posts) exists so one ongoing condition
-        // produces one POST per hour. Gating the raise on the latch would
-        // hand the room's dedup decision to the comment path.
+        // First, the latch and the ops-alert route are answering different
+        // questions. The latch exists so one episode produces one COMMENT;
+        // the route's own hourly dedup (`OpsAlertRouter.raise`, whose doc
+        // says in as many words that it is safe to call on every poll and
+        // that the window, not the caller, decides what is logged) exists so
+        // one ongoing condition produces one LINE per hour. Gating the raise
+        // on the latch would hand the route's dedup decision to the comment
+        // path.
         //
         // Second, and this is the actual defect: on the tier that needs this
         // most, the comment path CANNOT SUCCEED. `postComplaint` returns null

@@ -701,10 +701,7 @@ describe("startPermissionAnswerLoop", () => {
 // be exercised directly.
 describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
   const rule = (over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule =>
-    ({ enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over });
-
-  const noManagedSession = () => false;
-  const emptyMap = new Map<string, boolean>();
+    ({ enabled: true, query: "q", brief: "b", execution: "swarm", role: "worker", ...over });
 
   const cases: { label: string; resourceProvider: Rule["resourceProvider"]; resourceId: string }[] = [
     { label: "jira-work", resourceProvider: "jira-work", resourceId: "BUTCHR-7" },
@@ -719,31 +716,25 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
       const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
       const deps: RuleLizardModeDeps = {
         rules: [rule({ id: "lz", resourceProvider, lizardMode: true })],
-        isManagedSessionAgent: noManagedSession,
-        managedSessionLizardModes: emptyMap,
       };
       expect(ruleLizardModeOf(id, deps)).toBe(true);
       expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
     });
 
-    test(`positive (${label}): FACTORY-138 — lizardMode absent on the owning rule (found, field unset) is now ELIGIBLE by default, labelled by its resource id's basename`, () => {
+    test(`negative (${label}): local/ui — lizardMode absent on the owning rule (found, field unset) is OFF by default (upstream's FACTORY-138 makes it eligible), so no label`, () => {
       const id = encodeAgentKey({ resourceProvider, ruleId: "lz", resourceId });
       const deps: RuleLizardModeDeps = {
         rules: [rule({ id: "lz", resourceProvider })],
-        isManagedSessionAgent: noManagedSession,
-        managedSessionLizardModes: emptyMap,
       };
-      expect(ruleLizardModeOf(id, deps)).toBe(true);
-      expect(lizardModeLabelFor(id, deps)).toBe(resourceId.split("/").pop());
+      expect(ruleLizardModeOf(id, deps)).toBe(false);
+      expect(lizardModeLabelFor(id, deps)).toBeUndefined();
     });
   }
 
-  test("negative: FACTORY-138 — an EXPLICIT lizardMode: false on the owning rule opts out, no longer the same as absent (absent is now eligible)", () => {
+  test("negative: an EXPLICIT lizardMode: false on the owning rule opts out (local/ui: the same as absent)", () => {
     const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "lz", resourceId: "BUTCHR-7" });
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: false })],
-      isManagedSessionAgent: noManagedSession,
-      managedSessionLizardModes: emptyMap,
     };
     expect(ruleLizardModeOf(id, deps)).toBe(false);
   });
@@ -752,8 +743,6 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
     const id = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "gone", resourceId: "BUTCHR-7" });
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true }), rule({ id: "lz2", resourceProvider: "jira-work", lizardMode: true })],
-      isManagedSessionAgent: noManagedSession,
-      managedSessionLizardModes: emptyMap,
     };
     expect(ruleLizardModeOf(id, deps)).toBe(false);
   });
@@ -763,8 +752,6 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
     const id = encodeAgentKey({ resourceProvider: "github-issue", ruleId: "lz", resourceId: "acme/w#1" });
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true })],
-      isManagedSessionAgent: noManagedSession,
-      managedSessionLizardModes: emptyMap,
     };
     expect(ruleLizardModeOf(id, deps)).toBe(false);
   });
@@ -772,50 +759,15 @@ describe("ruleLizardModeOf / lizardModeLabelFor (FACTORY-87)", () => {
   test("negative: a legacy bare-issue id (no rule-engine key shape at all) is never eligible", () => {
     const deps: RuleLizardModeDeps = {
       rules: [rule({ id: "lz", resourceProvider: "jira-work", lizardMode: true })],
-      isManagedSessionAgent: noManagedSession,
-      managedSessionLizardModes: emptyMap,
     };
     expect(ruleLizardModeOf("BUTCHR-7", deps)).toBe(false);
     expect(lizardModeLabelFor("BUTCHR-7", deps)).toBeUndefined();
   });
 
   test("negative: undecodable/garbage input is never eligible, and a null id resolves undefined without throwing", () => {
-    const deps: RuleLizardModeDeps = { rules: [], isManagedSessionAgent: noManagedSession, managedSessionLizardModes: emptyMap };
+    const deps: RuleLizardModeDeps = { rules: [] };
     expect(ruleLizardModeOf("not:even:close:to:valid", deps)).toBe(false);
     expect(ruleLizardModeOf("", deps)).toBe(false);
     expect(lizardModeLabelFor(null, deps)).toBeUndefined();
-  });
-
-  describe("the managed-session branch", () => {
-    const id = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/sessions/def.json" });
-
-    test("resolves from the live map, true only when the map says true — never from `rules`", () => {
-      const deps: RuleLizardModeDeps = {
-        // Even though a matching Rule with lizardMode: true is on file, the managed-session branch must never consult it.
-        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
-        isManagedSessionAgent: () => true,
-        managedSessionLizardModes: new Map([[id, true]]),
-      };
-      expect(ruleLizardModeOf(id, deps)).toBe(true);
-      expect(lizardModeLabelFor(id, deps)).toBe("def.json");
-    });
-
-    test("the map saying false wins over a matching Rule saying true", () => {
-      const deps: RuleLizardModeDeps = {
-        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
-        isManagedSessionAgent: () => true,
-        managedSessionLizardModes: new Map([[id, false]]),
-      };
-      expect(ruleLizardModeOf(id, deps)).toBe(false);
-    });
-
-    test("an id absent from the map (not yet observed this daemon's lifetime) is never eligible", () => {
-      const deps: RuleLizardModeDeps = {
-        rules: [rule({ id: "managed-sessions", resourceProvider: "filesystem", lizardMode: true })],
-        isManagedSessionAgent: () => true,
-        managedSessionLizardModes: new Map(),
-      };
-      expect(ruleLizardModeOf(id, deps)).toBe(false);
-    });
   });
 });

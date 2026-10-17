@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PrTracker, isApproved, reviewState } from "../../src/labels/pr.js";
+import { PrTracker, headRefMatch, isApproved, reviewState } from "../../src/labels/pr.js";
 
 function fakeFetch(handlers: Array<{ match: RegExp; respond: () => unknown | null }>) {
   const calls: string[] = [];
@@ -46,6 +46,23 @@ describe("isApproved", () => {
   test("COMMENTED/PENDING are ignored entirely", () => {
     expect(isApproved([{ user: { login: "a" }, state: "COMMENTED" }])).toBe(false);
     expect(isApproved([])).toBe(false);
+  });
+});
+
+describe("headRefMatch", () => {
+  test("the key itself is exact; the key plus -, _ or / and a slug is prefixed", () => {
+    expect(headRefMatch("KAN-3020", "KAN-3020")).toBe("exact");
+    expect(headRefMatch("KAN-3020-fix-login", "KAN-3020")).toBe("prefixed");
+    expect(headRefMatch("KAN-3020_fix", "KAN-3020")).toBe("prefixed");
+    expect(headRefMatch("KAN-3020/fix", "KAN-3020")).toBe("prefixed");
+  });
+  test("the key followed by any other character is another ticket's branch", () => {
+    expect(headRefMatch("KAN-790", "KAN-79")).toBeNull();
+    expect(headRefMatch("KAN-79a", "KAN-79")).toBeNull();
+    expect(headRefMatch("KAN-79.", "KAN-79")).toBeNull();
+    expect(headRefMatch("fix-KAN-79", "KAN-79")).toBeNull();
+    expect(headRefMatch("KAN-79-", "KAN-79")).toBe("prefixed");
+    expect(headRefMatch("kan-79-fix", "KAN-79")).toBeNull(); // case-sensitive, like the key
   });
 });
 
@@ -102,16 +119,16 @@ describe("PrTracker", () => {
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
     expect(await tracker.stateFor("KAN-1")).toBe("changes-requested");
   });
-  // The one interaction neither KAN-814 nor KAN-819 could test on its own: a
-  // prefix-colliding search hit is rejected by KAN-814's exact-head-ref
-  // validation, discovery falls through to the PR whose head really is the
-  // key, and THAT PR's outstanding CHANGES_REQUESTED then resolves through
-  // KAN-819's reviewState — so the author of the right PR hears the right
-  // review outcome. Get either half wrong and this returns "open" or null.
-  test("a prefix-colliding hit is skipped by exact-ref validation, and the exact-ref PR's outstanding CHANGES_REQUESTED still resolves (KAN-814 + KAN-819)", async () => {
+  // The one interaction neither KAN-814 nor KAN-819 could test on its own:
+  // an earlier `KEY-slug` hit is held while discovery keeps looking, the PR
+  // whose head really IS the key wins, and THAT PR's outstanding
+  // CHANGES_REQUESTED then resolves through KAN-819's reviewState — so the
+  // author of the right PR hears the right review outcome. Get either half
+  // wrong and this returns "open" or null.
+  test("an exact head ref wins over an earlier KEY-slug hit, and its outstanding CHANGES_REQUESTED still resolves (KAN-814 + KAN-819)", async () => {
     const { fetchImpl } = fakeFetch([
       { match: /search\/issues/, respond: () => ({ items: [
-        { number: 7, repository_url: "https://api.github.com/repos/acme/widgets" }, // KAN-1-ownwrites: prefix collision
+        { number: 7, repository_url: "https://api.github.com/repos/acme/widgets" }, // KAN-1-ownwrites: a KEY-slug match, held
         { number: 5, repository_url: "https://api.github.com/repos/acme/widgets" }, // the real KAN-1
       ] }) },
       { match: /pulls\/7$/, respond: pull("open", false, "KAN-1-ownwrites") },
@@ -159,23 +176,68 @@ describe("PrTracker", () => {
     expect(calls.some((u) => u.includes("other"))).toBe(true);
   });
 
-  test("a prefix-colliding head ref (KAN-790-ownwrites for key KAN-790) is not cached; a later exact match on the same key is still discoverable", async () => {
+  test("a colliding head ref (KAN-790 for key KAN-79) is not cached; a later matching PR on the same key is still discoverable", async () => {
     let exact = false;
     let now = 0;
     const { fetchImpl } = fakeFetch([
       { match: /search\/issues/, respond: () => (exact ? searchHit("acme", "widgets", 70)() : searchHit("acme", "widgets", 66)()) },
-      { match: /pulls\/66$/, respond: pull("open", false, "KAN-790-ownwrites") },
-      { match: /pulls\/70$/, respond: pull("open", false, "KAN-790") },
+      { match: /pulls\/66$/, respond: pull("open", false, "KAN-790") },
+      { match: /pulls\/70$/, respond: pull("open", false, "KAN-79") },
       { match: /pulls\/70\/reviews/, respond: () => [] },
     ]);
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"], now: () => now });
-    expect(await tracker.stateFor("KAN-790")).toBeNull(); // search hit is the task's PR (head KAN-790-ownwrites), not an exact match
+    expect(await tracker.stateFor("KAN-79")).toBeNull(); // search hit is KAN-790's PR, a different ticket
+    expect(tracker.pullRequestFor("KAN-79")).toBeUndefined();
     exact = true;
     now = 15_000; // past the KAN-824 negative-cache backoff opened by the miss above
-    expect(await tracker.stateFor("KAN-790")).toBe("open"); // a later poll's exact-head PR is discoverable — nothing was poisoned
+    expect(await tracker.stateFor("KAN-79")).toBe("open"); // a later poll's matching PR is discoverable — nothing was poisoned
   });
 
-  test("a prefix-colliding hit sorted FIRST in the same org's results doesn't shadow an exact-head hit sorted second (KAN-814 review, PR #77)", async () => {
+  test("a KEY-slug head ref (KAN-3020-fix-login) is the ticket's PR when no exact one exists, and pullRequestFor exposes it", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("example-org", "widgets", 547) },
+      { match: /pulls\/547$/, respond: pull("open", false, "KAN-3020-fix-login") },
+      { match: /pulls\/547\/reviews/, respond: () => [] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["example-org"] });
+    expect(tracker.pullRequestFor("KAN-3020")).toBeUndefined(); // nothing until discovery runs
+    expect(await tracker.stateFor("KAN-3020")).toBe("open");
+    expect(tracker.pullRequestFor("KAN-3020")).toEqual({ owner: "example-org", repo: "widgets", number: 547 });
+  });
+
+  test("an exact head ref in a later org still wins over a KEY-slug hit in an earlier one", async () => {
+    const { fetchImpl } = fakeFetch([
+      { match: /org%3Aacme|org:acme/, respond: searchHit("acme", "widgets", 66) },
+      { match: /org%3Aother|org:other/, respond: searchHit("other", "gadgets", 70) },
+      { match: /widgets\/pulls\/66$/, respond: pull("open", false, "KAN-790-ownwrites") },
+      { match: /gadgets\/pulls\/70$/, respond: pull("open", false, "KAN-790") },
+      { match: /pulls\/70\/reviews/, respond: () => [] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme", "other"] });
+    expect(await tracker.stateFor("KAN-790")).toBe("open");
+    expect(tracker.pullRequestFor("KAN-790")).toEqual({ owner: "other", repo: "gadgets", number: 70 });
+  });
+
+  test("pullRequestFor drops a PR once it's merged or closed, never searching to answer", async () => {
+    let state = "open";
+    let merged = false;
+    const { fetchImpl, calls } = fakeFetch([
+      { match: /search\/issues/, respond: searchHit("acme", "widgets", 5) },
+      { match: /pulls\/5$/, respond: () => pull(state, merged, "KAN-1-fix")() },
+      { match: /pulls\/5\/reviews/, respond: () => [] },
+    ]);
+    const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
+    expect(await tracker.stateFor("KAN-1")).toBe("open");
+    const before = calls.length;
+    expect(tracker.pullRequestFor("KAN-1")).toEqual({ owner: "acme", repo: "widgets", number: 5 });
+    expect(calls.length).toBe(before); // a cache read, not a request
+    state = "closed";
+    merged = true;
+    expect(await tracker.stateFor("KAN-1")).toBe("merged");
+    expect(tracker.pullRequestFor("KAN-1")).toBeUndefined();
+  });
+
+  test("a KEY-slug hit sorted FIRST in the same org's results doesn't shadow an exact-head hit sorted second (KAN-814 review, PR #77)", async () => {
     const { fetchImpl } = fakeFetch([
       { match: /search\/issues/, respond: searchHits("acme", "widgets", [66, 70]) }, // collision (66, head KAN-790-ownwrites) sorts before the exact match (70, head KAN-790)
       { match: /pulls\/66$/, respond: pull("open", false, "KAN-790-ownwrites") },
@@ -197,11 +259,11 @@ describe("PrTracker", () => {
     expect(calls.filter((u) => u.includes("search/issues")).length).toBe(2); // open search tried first, then merged
   });
 
-  test("a merged-search hit whose head ref is only a prefix collision still yields null, not a false merged", async () => {
+  test("a merged-search hit whose head ref only collides (KAN-7901 for key KAN-790) still yields null, not a false merged", async () => {
     const { fetchImpl } = fakeFetch([
       { match: /is%3Aopen/, respond: () => ({ items: [] }) },
       { match: /is%3Amerged/, respond: searchHit("acme", "widgets", 66) },
-      { match: /pulls\/66$/, respond: pull("closed", true, "KAN-790-ownwrites") },
+      { match: /pulls\/66$/, respond: pull("closed", true, "KAN-7901") },
     ]);
     const tracker = new PrTracker({ fetchImpl, orgs: ["acme"] });
     expect(await tracker.stateFor("KAN-790")).toBeNull();

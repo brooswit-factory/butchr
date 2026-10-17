@@ -3,18 +3,15 @@ import type { JiraComment, JiraIssue } from "../../src/atlassian/types.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import type { NotifyReason } from "../../src/resources/types.js";
 import { createLinkedEventingState, type LinkedEventingDeps, type ProjectLinkedEventingMatch } from "../../src/jira-watch/linked-eventing.js";
-import { addLink, removeLink, type LinkStore } from "../../src/resources/link-store.js";
-import { parseResourceRef, type ResourceRef } from "../../src/resources/resource-ref.js";
 
 /**
  * BUTCHR-469: linked-eventing for `jira-project` owners — one member-
  * discovery watch (`project = <key> AND updated >= "-<N>m" ORDER BY updated
- * ASC`, a per-project watermark) plus this project's own managed links
- * (`brooswit.butchr.links`, reused via FACTORY-9's `managedLinkedItems`),
- * both delivered through the EXACT SAME coalescer/notify
- * `test/unit/linked-eventing.test.ts` and
- * `test/unit/linked-eventing-managed-links.test.ts` already cover for an
- * issue owner — that machinery is reused UNCHANGED here, never re-tested.
+ * ASC`, a per-project watermark), delivered through the EXACT SAME
+ * coalescer/notify `test/unit/linked-eventing.test.ts` already
+ * covers for an issue owner — that machinery is reused UNCHANGED here,
+ * never re-tested. (local/ui: a project's managed links, its second source,
+ * are gone with managed links.)
  * This file covers what is NEW for a project owner specifically.
  *
  * `membersByProject` in `fakeProjectDeps` models REAL Jira window-search
@@ -27,27 +24,6 @@ import { parseResourceRef, type ResourceRef } from "../../src/resources/resource
  * project member" tests below for the fixed behaviour and its regression
  * coverage).
  */
-
-const ref = (s: string): ResourceRef => parseResourceRef(s);
-
-function fakeLinkStore(initial: Record<string, string[]> = {}): LinkStore {
-  const data: Record<string, string[]> = structuredClone(initial);
-  return {
-    async list(ownerKey) { return data[ownerKey] ?? []; },
-    async add(ownerKey, targetKey) {
-      const existing = data[ownerKey] ?? [];
-      if (existing.includes(targetKey)) return false;
-      data[ownerKey] = [...existing, targetKey];
-      return true;
-    },
-    async remove(ownerKey, targetKey) {
-      const existing = data[ownerKey] ?? [];
-      if (!existing.includes(targetKey)) return false;
-      data[ownerKey] = existing.filter((t) => t !== targetKey);
-      return true;
-    },
-  };
-}
 
 const rule = (over: Partial<Record<string, unknown>> = {}): Rule =>
   parseRules({ rules: [{ id: "mgrs", resourceProvider: "jira-project", query: '{"keys":["BUTCHR"]}', brief: "manage it", linkedEventing: true, ...over }] })[0]!;
@@ -64,7 +40,6 @@ const PROJECT_JQL_RE = /^project = (\S+) AND updated >= "-(\d+)m" ORDER BY updat
 const KEY_IN_RE = /^key in \((.*)\)$/;
 
 function fakeProjectDeps(world: Record<string, JiraIssue>, membersByProject: Record<string, string[]>, opts: {
-  linkStore?: LinkStore;
   commentsByKey?: Record<string, JiraComment[]>;
   now?: { value: number };
   failProjectSearchFor?: Set<string>;
@@ -87,7 +62,6 @@ function fakeProjectDeps(world: Record<string, JiraIssue>, membersByProject: Rec
     },
     notify: async (agent, about, reason) => { notified.push({ agent, about, reason }); },
     log: (l) => logs.push(l),
-    ...(opts.linkStore ? { linkStore: opts.linkStore } : {}),
     ...(opts.commentsByKey ? { comments: async (key: string) => opts.commentsByKey![key] ?? [] } : {}),
     ...(opts.now ? { now: () => opts.now!.value } : {}),
   };
@@ -95,10 +69,9 @@ function fakeProjectDeps(world: Record<string, JiraIssue>, membersByProject: Rec
 }
 
 describe("BUTCHR-469: jira-project member-discovery watch", () => {
-  test("a rule without linkedEventing yields zero member searches and zero link-store reads", async () => {
+  test("a rule without linkedEventing yields zero member searches", async () => {
     const state = createLinkedEventingState();
-    const throwingStore: LinkStore = { list: async () => { throw new Error("must not be called"); }, add: async () => true, remove: async () => true };
-    const { deps, notified, searchCalls } = fakeProjectDeps({}, { BUTCHR: ["BUTCHR-1"] }, { linkStore: throwingStore });
+    const { deps, notified, searchCalls } = fakeProjectDeps({}, { BUTCHR: ["BUTCHR-1"] });
     const r = rule({ linkedEventing: undefined });
     await state.runTick([], deps, [projectMatch("jira-project:mgrs:BUTCHR", r, "BUTCHR")]);
     expect(searchCalls).toHaveLength(0);
@@ -231,45 +204,6 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     expect(notified).toHaveLength(1); // must NOT read as "no longer linked" (there is no removal event kind for a member at all)
   });
 
-  test("a managed link on a project owner IS removal-tracked: 'no longer linked' fires once on genuine removal", async () => {
-    const state = createLinkedEventingState();
-    const store = fakeLinkStore();
-    const ownerRef = ref("jira-project:BUTCHR");
-    const targetRef = ref("jira-work-item:BUTCHR-2");
-    await addLink(store, ownerRef, targetRef);
-    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2") };
-    const { deps, notified } = fakeProjectDeps(world, {}, { linkStore: store });
-    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
-
-    await state.runTick([], deps, [m]); // seed watermark (no members) + seed managed-link baseline
-    await state.runTick([], deps, [m]); // no-op tick
-    expect(notified).toHaveLength(0);
-
-    await removeLink(store, ownerRef, targetRef);
-    await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: "no longer linked" }]);
-  });
-
-  test("an issue that is both a project member AND a managed-link target yields ONE event line, never two", async () => {
-    const state = createLinkedEventingState();
-    const store = fakeLinkStore();
-    await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-9"));
-    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9", { status: "To Do" }) };
-    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const { deps, notified } = fakeProjectDeps(world, membersByProject, { linkStore: store });
-    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
-
-    await state.runTick([], deps, [m]); // seed watermark + managed-link baseline (silent — managed links always seed silently)
-    expect(notified).toHaveLength(0);
-
-    world["BUTCHR-9"] = issue("BUTCHR-9", { status: "In Progress" }); // the real change that also makes it a member this tick
-    membersByProject.BUTCHR = ["BUTCHR-9"];
-    await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' }]); // ONE line, a real diff (baseline already existed from the managed-link seed) — never two, never the generic first-appearance phrasing
-  });
-
   test("coalescing: many members changing in one tick produce ONE nudge for the project owner", async () => {
     const state = createLinkedEventingState();
     const world: Record<string, JiraIssue> = {
@@ -396,86 +330,24 @@ describe("BUTCHR-469: jira-project member-discovery watch", () => {
     expect(notified).toHaveLength(2); // no further, spurious notification
   });
 
-  test("a failed member search fails open: logged, skips member discovery for that owner only, managed links and other owners unaffected", async () => {
+  test("a failed member search fails open: logged, skips member discovery for that owner only, other owners unaffected", async () => {
     const state = createLinkedEventingState();
-    const store = fakeLinkStore();
-    await addLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-2"));
-    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1"), "BUTCHR-2": issue("BUTCHR-2"), "OTHER-1": issue("OTHER-1") };
+    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1"), "OTHER-1": issue("OTHER-1") };
     const membersByProject: Record<string, string[]> = { BUTCHR: [], OTHER: [] };
-    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: store, failProjectSearchFor: new Set(["BUTCHR"]) });
+    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { failProjectSearchFor: new Set(["BUTCHR"]) });
     const bad = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
     const good = projectMatch("jira-project:mgrs:OTHER", rule({ id: "other" }), "OTHER");
 
     await state.runTick([], deps, [bad, good]); // seed both watermarks
-    await state.runTick([], deps, [bad, good]); // BUTCHR's member search fails; OTHER's succeeds (empty window); BUTCHR's managed link still seeds
+    await state.runTick([], deps, [bad, good]); // BUTCHR's member search fails; OTHER's succeeds (empty window)
     expect(logs.some((l) => l.includes("WARNING: [linked-eventing] project-member search failed") && l.includes("BUTCHR"))).toBe(true);
     expect(notified).toHaveLength(0); // pure seeding tick either way
 
-    // BUTCHR's managed link still genuinely tracked despite the member-search failure:
-    await removeLink(store, ref("jira-project:BUTCHR"), ref("jira-work-item:BUTCHR-2"));
+    // OTHER keeps reporting while BUTCHR's search is still down.
+    membersByProject.OTHER = ["OTHER-1"];
     await state.runTick([], deps, [bad, good]);
-    expect(notified.map((n) => n.agent)).toEqual(["jira-project:mgrs:BUTCHR"]);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: "no longer linked" }]);
-  });
-
-  test("a broken link store fails open for its own project owner without blocking that SAME owner's member discovery or any other owner's tick", async () => {
-    const badStore: LinkStore = {
-      list: async (ownerKey) => { if (ownerKey === "jira-project:BUTCHR") throw new Error("disk error"); return []; },
-      add: async () => true,
-      remove: async () => true,
-    };
-    const state = createLinkedEventingState();
-    const world: Record<string, JiraIssue> = { "BUTCHR-1": issue("BUTCHR-1", { status: "To Do" }) };
-    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: badStore });
-    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
-
-    await state.runTick([], deps, [m]); // seed watermark
-    membersByProject.BUTCHR = ["BUTCHR-1"];
-    await state.runTick([], deps, [m]); // link-store fails (logged); member discovery still runs and reports BUTCHR-1's first appearance
-    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR"))).toBe(true);
-    expect(notified).toHaveLength(1); // member discovery kept working despite the broken link store
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-1", kind: "jira-key", detail: expect.stringMatching(/^updated since /) }]);
-  });
-
-  test("FACTORY-833: a genuine managed-link removal for a project owner that happens DURING a failed link-store tick is still caught, exactly once, on the next successful tick", async () => {
-    const ownerRef = ref("jira-project:BUTCHR");
-    const targetRef = ref("jira-work-item:BUTCHR-9");
-    const real = fakeLinkStore();
-    await addLink(real, ownerRef, targetRef);
-    let broken = false;
-    const store: LinkStore = {
-      list: async (k) => { if (broken) throw new Error("disk error"); return real.list(k); },
-      add: real.add,
-      remove: real.remove,
-    };
-    const state = createLinkedEventingState();
-    const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
-    const membersByProject: Record<string, string[]> = { BUTCHR: [] };
-    const { deps, notified, logs } = fakeProjectDeps(world, membersByProject, { linkStore: store });
-    const m = projectMatch("jira-project:mgrs:BUTCHR", rule(), "BUTCHR");
-
-    await state.runTick([], deps, [m]); // seed watermark + BUTCHR-9 watched via managed link
-    await state.runTick([], deps, [m]); // unchanged
-    expect(notified).toHaveLength(0);
-
-    // The link-store read fails this tick. BUTCHR-9 is genuinely unlinked
-    // during this same window, but that must not surface yet.
-    broken = true;
-    await removeLink(real, ownerRef, targetRef);
-    await state.runTick([], deps, [m]);
-    expect(logs.some((l) => l.includes("WARNING: [linked-eventing] managed-link fetch failed") && l.includes("BUTCHR"))).toBe(true);
-    expect(notified).toHaveLength(0);
-
-    // The store recovers and now genuinely reports BUTCHR-9 gone — caught
-    // exactly once, against the last genuinely observed membership.
-    broken = false;
-    await state.runTick([], deps, [m]);
-    expect(notified).toHaveLength(1);
-    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "BUTCHR-9", kind: "jira-key", detail: "no longer linked" }]);
-
-    await state.runTick([], deps, [m]); // still absent — must not re-report
-    expect(notified).toHaveLength(1);
+    expect(notified.map((n) => n.agent)).toEqual(["jira-project:mgrs:OTHER"]);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([{ target: "OTHER-1", kind: "jira-key", detail: expect.stringMatching(/^updated since /) }]);
   });
 
   test("comment events: a new comment on a project member (already baselined) is reported as 'got a new comment', the same mechanism an issue owner's linked target already uses", async () => {

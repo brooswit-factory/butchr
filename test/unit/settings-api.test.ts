@@ -1,13 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
+import { buildCurrentSettingsApiResponse, buildSettingEntries, buildAtlassianTokenFileStatus, isModeTooOpen, redactUrlUserinfo, SETTINGS_DEFINITIONS, SECRET_KEY_RE } from "../../src/web/settings-api.js";
 
 /** FACTORY-694 item 4: every definition that is actually secret, reviewed and hardcoded by hand — NOT derived from `SECRET_KEY_RE` or any other rule. Adding a new `SETTINGS_DEFINITIONS` entry without updating this set (when it should be secret) is caught by the "every definition's secret flag is deliberate" test below. */
 const EXPECTED_SECRET_KEYS = new Set([
   "ATLASSIAN_TOKEN",
   "GITHUB_TOKEN_FILE",
-  "ROCKETCHAT_ADMIN_TOKEN_FILE",
-  "ROCKETCHAT_TOKEN_DIR",
-  "BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE",
+  // local/ui: the Settings page's Zendesk and Trello cards.
+  "ZENDESK_OAUTH_TOKEN_FILE",
+  "TRELLO_API_KEY_FILE",
+  "TRELLO_TOKEN_FILE",
 ]);
 
 describe("buildSettingEntries", () => {
@@ -56,21 +57,22 @@ describe("buildSettingEntries", () => {
 
   test("a canary URL with embedded userinfo (scheme://user:pass@host) in a non-secret value is redacted, not returned verbatim", () => {
     const canaryUserinfo = "canary-user:canary-pass-should-never-leak";
-    const entries = buildSettingEntries({ ROCKETCHAT_URL: `https://${canaryUserinfo}@chat.example.com/path?x=1` });
-    const rc = entries.find((e) => e.key === "ROCKETCHAT_URL")!;
-    expect(rc.secret).toBe(false);
-    if (!rc.secret) {
-      expect(rc.value).not.toContain(canaryUserinfo);
-      expect(rc.value).not.toContain("canary-pass");
-      expect(rc.value).toBe("https://[redacted]@chat.example.com/path?x=1");
+    const entries = buildSettingEntries({ ATLASSIAN_SITE: `https://${canaryUserinfo}@example.atlassian.net/path?x=1` });
+    const site = entries.find((e) => e.key === "ATLASSIAN_SITE")!;
+    expect(site.secret).toBe(false);
+    if (!site.secret) {
+      expect(site.value).not.toContain(canaryUserinfo);
+      expect(site.value).not.toContain("canary-pass");
+      expect(site.value).toBe("https://[redacted]@example.atlassian.net/path?x=1");
     }
     expect(JSON.stringify(entries)).not.toContain(canaryUserinfo);
   });
 
-  test("the same userinfo redaction applies to ANY non-secret value, not only ROCKETCHAT_URL by name", () => {
-    const entries = buildSettingEntries({ ATLASSIAN_SITE: "https://evil-canary-secret@example.atlassian.net" });
-    const site = entries.find((e) => e.key === "ATLASSIAN_SITE")!;
-    if (!site.secret) expect(site.value).toBe("https://[redacted]@example.atlassian.net");
+  test("the same userinfo redaction applies to ANY non-secret value, not only a URL-shaped key by name", () => {
+    const entries = buildSettingEntries({ HERDR_SOCKET: "https://evil-canary-secret@example.net/sock" });
+    const sock = entries.find((e) => e.key === "HERDR_SOCKET")!;
+    expect(sock.secret).toBe(false);
+    if (!sock.secret) expect(sock.value).toBe("https://[redacted]@example.net/sock");
   });
 
   test("a value with no userinfo is passed through unchanged", () => {
@@ -80,7 +82,7 @@ describe("buildSettingEntries", () => {
   });
 
   test("SECRET_KEY_RE matches every env var this ticket's spec names as secret-like", () => {
-    for (const name of ["ATLASSIAN_TOKEN", "GITHUB_TOKEN_FILE", "ROCKETCHAT_ADMIN_TOKEN_FILE", "BUTCHR_ASSIGNEE_STORY"]) {
+    for (const name of ["ATLASSIAN_TOKEN", "GITHUB_TOKEN_FILE", "ATLASSIAN_TOKEN_FILE", "BUTCHR_ASSIGNEE_STORY"]) {
       if (name === "BUTCHR_ASSIGNEE_STORY") { expect(SECRET_KEY_RE.test(name)).toBe(false); continue; }
       expect(SECRET_KEY_RE.test(name)).toBe(true);
     }
@@ -141,6 +143,11 @@ describe("buildSettingEntries", () => {
       "BUTCHR_AGENT_PROVIDERS_TASK",
       "BUTCHR_MAX_AGENTS",
       "BUTCHR_POLL_STALE_MS",
+      // local/ui: the Settings page's GitHub card edits the org list.
+      "BUTCHR_GITHUB_ORGS",
+      // local/ui: and the Zendesk/Trello cards their subdomain and board.
+      "ZENDESK_SUBDOMAIN",
+      "TRELLO_BOARD_ID",
       // FACTORY-66 review round 2: one independent switch per registered provider.
       "BUTCHR_PROVIDER_JIRA_WORK_ENABLED",
       "BUTCHR_PROVIDER_JIRA_IDEA_ENABLED",
@@ -151,6 +158,8 @@ describe("buildSettingEntries", () => {
       "BUTCHR_PROVIDER_ZENDESK_TICKET_ENABLED",
       "BUTCHR_PROVIDER_FILESYSTEM_ENABLED",
       "BUTCHR_PROVIDER_JIRA_COMPONENT_ENABLED",
+      // local/ui: and our trello-card provider's.
+      "BUTCHR_PROVIDER_TRELLO_CARD_ENABLED",
     ].sort());
   });
 
@@ -245,5 +254,21 @@ describe("redactUrlUserinfo: a password that itself contains '@' leaves no remai
   test("a plain URL without userinfo, and a path containing '@', are untouched", () => {
     expect(redactUrlUserinfo("https://chat.example.com/a@b")).toBe("https://chat.example.com/a@b");
     expect(redactUrlUserinfo("https://chat.example.com")).toBe("https://chat.example.com");
+  });
+});
+
+describe("buildCurrentSettingsApiResponse (local/ui)", () => {
+  test("reads settings.json as it is at each call: a value saved after startup reads back as saved, and the environment still wins", async () => {
+    let file: Record<string, string> = {};
+    const read = () => ({ values: file });
+    const statFn = async () => { throw Object.assign(new Error("absent"), { code: "ENOENT" }); };
+    const row = async (key: string, env: Record<string, string | undefined> = {}) =>
+      (await buildCurrentSettingsApiResponse(env, read, { statFn: statFn as never })).settings.find((e) => e.key === key);
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: null, source: "default" });
+    file = { BUTCHR_MAX_AGENTS: "20" };
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: "20", source: "file" });
+    file = { BUTCHR_MAX_AGENTS: "10" };
+    expect(await row("BUTCHR_MAX_AGENTS")).toMatchObject({ value: "10", source: "file" });
+    expect(await row("BUTCHR_MAX_AGENTS", { BUTCHR_MAX_AGENTS: "4" })).toMatchObject({ value: "4", source: "environment" });
   });
 });

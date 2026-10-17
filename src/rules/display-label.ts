@@ -20,31 +20,18 @@
  * every provider/rule-type module owns its OWN `*ShortDisplayId` function —
  * `jiraWorkShortDisplayId` (resource-type.ts), `jiraIdeaShortDisplayId`
  * (jira-idea-type.ts), `jiraProjectShortDisplayId` (jira-project-type.ts),
- * `filesystemShortDisplayId` (filesystem-type.ts), `managedSessionShortDisplayId`
- * (session-definition-type.ts), `githubIssueShortDisplayId`
+ * `filesystemShortDisplayId` (filesystem-type.ts), `githubIssueShortDisplayId`
  * (github-issue-type.ts), `githubPrShortDisplayId` (github-pr-type.ts), and
  * `zendeskTicketShortDisplayId` (zendesk-ticket-type.ts). `shortDisplayId`
  * below is NOT a second implementation of any of them — it is the one,
- * narrow DISPATCH from a decoded agent key's `resourceProvider` (plus the
- * one structural exception below) to the matching provider's own method.
+ * narrow DISPATCH from a decoded agent key's `resourceProvider` to the
+ * matching provider's own method.
  * Something has to know which method to call for a given provider; this is
  * that spot, and it must never grow provider-specific ID LOGIC of its own —
  * only routing.
  *
- * THE ONE STRUCTURAL EXCEPTION: a managed-session agent is, underneath, a
- * `filesystem`-provider resource (BUTCHR-407/BUTCHR-408) — but FACTORY-83
- * deliberately decided it gets its OWN short-id method
- * (`managedSessionShortDisplayId`) rather than the generic filesystem one,
- * because its parent directory is always the same fixed well-known
- * definitions root and naming it on every label would be noise (see that
- * function's own doc comment). The dispatch below tells the two apart by
- * RULE ID (`MANAGED_SESSIONS_RULE_ID`), never by provider alone.
- *
- * COMBINING WITH THE RULE ID: an ordinary resource agent displays as
- * `"<ruleId> · <shortId>"` (e.g. `"jira-work · FACTORY-51"`; rule id first so panes group by query when sorted, FACTORY-861) — a managed
- * session displays its bare short id alone (its rule id is the same reserved
- * literal for every session, so appending it would add noise, not
- * information), and a query-level agent (BUTCHR-397 singleton/persistent
+ * COMBINING WITH THE RULE ID: a resource agent displays as
+ * `"<ruleId> · <shortId>"` (e.g. `"jira-work · FACTORY-51"`; rule id first so panes group by query when sorted, FACTORY-861), and a query-level agent (BUTCHR-397 singleton/persistent
  * rules, no single resource) has nothing to combine with and displays its
  * bare rule id.
  */
@@ -54,12 +41,12 @@ import { jiraWorkShortDisplayId } from "./resource-type.js";
 import { jiraIdeaShortDisplayId } from "./jira-idea-type.js";
 import { jiraProjectShortDisplayId } from "./jira-project-type.js";
 import { filesystemShortDisplayId } from "./filesystem-type.js";
-import { managedSessionShortDisplayId, MANAGED_SESSIONS_RULE_ID } from "./session-definition-type.js";
 import { githubIssueShortDisplayId } from "./github-issue-type.js";
 import { githubPrShortDisplayId } from "./github-pr-type.js";
 import { zendeskTicketShortDisplayId } from "./zendesk-ticket-type.js";
 import { confluencePageShortDisplayId } from "./confluence-page-type.js";
 import { jiraComponentShortDisplayId } from "./jira-component-type.js";
+import { trelloCardShortDisplayId } from "./trello-card-type.js";
 
 /**
  * The one dispatch spot — see this module's own top comment for why this is
@@ -72,7 +59,6 @@ import { jiraComponentShortDisplayId } from "./jira-component-type.js";
  * would duplicate it.
  */
 export function shortDisplayId(provider: ResourceProvider, ruleId: string, resourceId: string): string {
-  if (provider === "filesystem" && ruleId === MANAGED_SESSIONS_RULE_ID) return managedSessionShortDisplayId(resourceId);
   switch (provider) {
     case "jira-work": return jiraWorkShortDisplayId(resourceId);
     case "jira-idea": return jiraIdeaShortDisplayId(resourceId);
@@ -83,6 +69,7 @@ export function shortDisplayId(provider: ResourceProvider, ruleId: string, resou
     case "zendesk-ticket": return zendeskTicketShortDisplayId(resourceId);
     case "confluence-page": return confluencePageShortDisplayId(resourceId);
     case "jira-component": return jiraComponentShortDisplayId(resourceId);
+    case "trello-card": return trelloCardShortDisplayId(resourceId);
   }
 }
 
@@ -101,7 +88,6 @@ export function baseDisplayLabel(agentKey: string): string {
   if (!decoded) return agentKey; // legacy/bare id — unchanged, pre-FACTORY-95 behaviour
   if (decoded.kind === "query") return decoded.ruleId;
   const shortId = shortDisplayId(decoded.resourceProvider, decoded.ruleId, decoded.resourceId);
-  if (decoded.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID) return shortId;
   return `${decoded.ruleId} · ${shortId}`;
 }
 

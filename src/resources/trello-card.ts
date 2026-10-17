@@ -40,6 +40,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import type { FetchLike } from "../labels/pr.js";
+import { expandHomePath } from "../config/home-path.js";
 import { formatTrelloCardRef, isTrelloId, type TrelloCardRef } from "./trello-card-ref.js";
 
 export interface TrelloCard {
@@ -61,6 +62,9 @@ export interface TrelloCard {
 }
 
 export interface TrelloComment { id: string; authorId: string | null; body: string; created: string }
+
+/** local/ui: one list on the configured board — what `trello-card` rules' `list:` qualifier and `trello_get_card` name a card's list by. */
+export interface TrelloList { id: string; name: string; closed: boolean }
 
 export class TrelloHttpError extends Error {
   constructor(readonly status: number, what: string) {
@@ -114,9 +118,11 @@ export function loadTrelloAuth(env: TrelloAuthEnv, io: TrelloCredentialFileIo = 
   const boardId = env.TRELLO_BOARD_ID?.trim();
   if (!boardId) return { ok: false, reason: "set TRELLO_BOARD_ID" };
   if (!isTrelloId(boardId)) return { ok: false, reason: `TRELLO_BOARD_ID must be a 24-character Trello board id, got ${JSON.stringify(boardId)}` };
-  const key = readCredentialFile("TRELLO_API_KEY_FILE", env.TRELLO_API_KEY_FILE?.trim(), io);
+  // `~/` expanded, the same paths Settings writes the key and token to (`resolveCredentialTarget`).
+  const fileOf = (raw: string | undefined) => { const p = raw?.trim(); return p ? expandHomePath(p, env) : undefined; };
+  const key = readCredentialFile("TRELLO_API_KEY_FILE", fileOf(env.TRELLO_API_KEY_FILE), io);
   if (!key.ok) return { ok: false, reason: key.reason };
-  const token = readCredentialFile("TRELLO_TOKEN_FILE", env.TRELLO_TOKEN_FILE?.trim(), io);
+  const token = readCredentialFile("TRELLO_TOKEN_FILE", fileOf(env.TRELLO_TOKEN_FILE), io);
   if (!token.ok) return { ok: false, reason: token.reason };
   return { ok: true, boardId, apiKey: key.value, token: token.value };
 }
@@ -201,6 +207,8 @@ export interface TrelloCardClient {
   get(ref: TrelloCardRef): Promise<TrelloCard>;
   /** Add a comment after `get` confirms the target is on the configured board. Every Trello comment is visible to the whole board — there is no private-note variant. */
   addComment(ref: TrelloCardRef, body: string): Promise<{ id: string; created: string | null }>;
+  /** local/ui: every list on the configured board, archived ones included, so a card sitting in an archived list still has a name. */
+  lists(): Promise<TrelloList[]>;
 }
 
 export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardClient {
@@ -242,6 +250,16 @@ export function createTrelloCardClient(deps: TrelloCardClientDeps): TrelloCardCl
         if (!card) continue;
         if (q && !card.name.toLowerCase().includes(q) && !card.desc.toLowerCase().includes(q)) continue;
         out.push(card);
+      }
+      return out;
+    },
+    async lists() {
+      const body = await request(`/boards/${deps.boardId}/lists`, "board lists", { filter: "all", fields: "id,name,closed" }) as unknown;
+      if (!Array.isArray(body)) throw new Error("Trello board lists returned an unexpected body");
+      const out: TrelloList[] = [];
+      for (const item of body as Array<Record<string, unknown>>) {
+        if (typeof item?.id !== "string" || !isTrelloId(item.id) || typeof item.name !== "string") continue;
+        out.push({ id: item.id, name: item.name, closed: item.closed === true });
       }
       return out;
     },
