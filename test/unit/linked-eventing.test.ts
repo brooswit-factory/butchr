@@ -362,19 +362,58 @@ describe("BUTCHR-436: linked-change eventing", () => {
 
   // FACTORY-252: the ORIGINAL version of this test (PR #800 review round 2)
   // relied on the hourly rate cap updating `observedAt` every tick while
-  // STILL withholding delivery across several ticks, so a status
-  // transition's own frozen timestamp could be shown to survive a LATER
-  // unrelated edit landing before eventual delivery. With the cap removed,
-  // the only remaining mechanism that defers a tick's advance (a failing
-  // batched search) ALSO skips observing anything that tick at all (see
-  // "SEARCH FAILURE SKIPS THE WHOLE TICK" in this module's own top
-  // comment) — so there is no longer any reachable path where a genuine
-  // Jira-kind field change is observed on one tick, held, and then
-  // overtaken by a DIFFERENT field's later edit before delivery. That
-  // specific nuance test is therefore removed rather than approximated;
-  // `changeDetail`'s own status-over-summary priority is still covered by
-  // the FACTORY-833 (ask #3) test above and by the single-jump case in the
-  // test immediately above this comment.
+  // STILL withholding delivery across several ticks. The cap itself is
+  // gone, but `observedAt`'s per-field frozen timestamps are NOT dead code
+  // — a tick can still observe a change and then fail to advance for an
+  // UNRELATED reason: `deps.notify` throwing propagates out of `runTick`
+  // (the per-owner loop has no try/catch around it) before `advance()`
+  // runs for that owner, even though `observedAt` was already updated
+  // earlier in the same pass, before any delivery decision. This
+  // reproduces the held-then-overtaken scenario via that path instead of
+  // the removed cap.
+  test("FACTORY-833: a status transition held by a failed delivery keeps ITS OWN timestamp even after a later unrelated summary-only edit lands before the retried delivery", async () => {
+    const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
+    const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
+    const state = createLinkedEventingState();
+    let failNotify = false;
+    const notified: Array<{ agent: string; about: string; reason: NotifyReason }> = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        const m = /^key in \((.*)\)$/.exec(jql);
+        const keys = m ? m[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (agent, about, reason) => {
+        if (failNotify) throw new Error("nudge failed");
+        notified.push({ agent, about, reason });
+      },
+      log: () => {},
+    };
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
+
+    await state.runTick([m], deps); // seed
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress", updated: "t2" });
+    await state.runTick([m], deps); // delivered immediately
+    expect(notified).toHaveLength(1);
+
+    // The real transition to "Done" happens at t3, but delivery fails —
+    // observedAt already moved to t3 before notify was attempted, and
+    // advance() never ran, so the baseline stays at "In Progress".
+    failNotify = true;
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s0", updated: "t3" });
+    await expect(state.runTick([m], deps)).rejects.toThrow("nudge failed");
+    expect(notified).toHaveLength(1);
+
+    // A LATER, unrelated summary-only edit lands before the retry succeeds.
+    failNotify = false;
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done", summary: "s1", updated: "t4" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(2);
+    const reason = notified[1]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of t3)' },
+    ]);
+  });
 
   test("FACTORY-833: two DISTINCT issuelinks (different relationship types) to the SAME target collapse to one watched item (existing dedup-by-target contract) and carry the FIRST link's own id, never a fabricated or merged one", async () => {
     const owner = issue("BUTCHR-1", {

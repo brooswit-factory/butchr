@@ -373,7 +373,7 @@ export interface ProjectLinkedEventingMatch {
    * project's per-tick state silently OVERWRITE the first's in every one of
    * those maps, permanently losing that project's watch. Giving each
    * (session, project) pair its own `agentKey` keeps their state
-   * independent (own watermark, own rate-cap bucket); this field then says
+   * independent (own watermark, own baseline set); this field then says
    * where the resulting nudge actually goes — the session's own real agent
    * key, which is also what `herd.nudge`'s own freeze check
    * (`instanceFreezeStore.assertRunnable`) is keyed on, so a frozen session
@@ -610,7 +610,7 @@ export interface LinkedEventingDeps {
   /** The exact delivery seam every other notify in this codebase already uses — see this module's own top comment for why this is "UNCHANGED IN SHAPE". */
   notify: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
   log?: (line: string) => void;
-  /** Injectable clock, for a deterministic rate-cap test. Defaults to `Date.now`. */
+  /** Injectable clock, for deterministic tests of `linkedPollIntervalMs`/project-watermark timing. Defaults to `Date.now`. */
   now?: () => number;
   /** BUTCHR-437: `AtlassianClient#confluencePageVersion` — called ONLY for a match whose rule has `linkedDescriptionLinks: true` AND whose description names at least one Confluence page URL. Optional; omitted, every Confluence-kind item resolves `"error"` (skipped, retried next due tick, never reported unreadable) — the same "omitted means the feature silently never runs" shape `remoteLinks` above already has. */
   confluenceVersion?: ConfluencePollDeps["getVersion"];
@@ -841,8 +841,8 @@ export function createLinkedEventingState(): LinkedEventingState {
   // `updated` timestamp frozen at the tick that field was last seen to
   // actually differ from the previously observed value — distinct from
   // `baselines`, which only advances on a genuinely delivered tick. This
-  // map updates EVERY tick, immediately, regardless of rate-capping or
-  // delivery (the same "delayed, not lost" exception `lastExternalPollAt`
+  // map updates EVERY tick, immediately, regardless of delivery (the same
+  // "delayed, not lost" exception `lastExternalPollAt`
   // above already documents for a different field). Three INDEPENDENT
   // timestamps, not one shared one: a status transition whose delivery is
   // held (e.g. by a search failure) must not inherit a LATER tick's
@@ -1343,8 +1343,8 @@ export function createLinkedEventingState(): LinkedEventingState {
           const bkey = baselineKey(entry.agentKey, item.target);
           // FACTORY-833 (review round 1, PR #800, replayed onto main):
           // updated immediately, every PASS (regular tick or on-demand —
-          // both run this same per-item loop), BEFORE any rate-cap/
-          // suppress/delivery decision — see `observedAt`'s own doc
+          // both run this same per-item loop), BEFORE any suppress/
+          // delivery decision — see `observedAt`'s own doc
           // comment (outer scope) above. Each of the three timestamps only
           // moves when ITS OWN field actually differs from the last
           // observed value for THAT field — an unrelated field bumping

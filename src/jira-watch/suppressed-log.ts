@@ -115,17 +115,15 @@ export function standDownSuppressedLine(key: string, watcher: string, totalComme
   );
 }
 
-/**
- * FACTORY-252: this module ONCE also emitted an `arm=rate-capped` line
- * (`rateCappedSuppressedLine`) whenever the linked-change eventing hourly
- * turn-rate cap (`maxLinkedTurnsPerHour`) dropped a coalesced tick. That cap
- * is REMOVED (src/jira-watch/linked-eventing.ts no longer withholds a
- * linked-change notify for any reason this module would log) — removed
- * here too, not merely disabled, so no new code should ever emit
- * `arm=rate-capped` again. `parseSuppressedLine` below stays generic over
- * `arm` (any string), so a historical journal line with this arm still
- * parses; nothing in this codebase produces one going forward.
- */
+// FACTORY-252: this module ONCE also emitted an `arm=rate-capped` line
+// (`rateCappedSuppressedLine`) whenever the linked-change eventing hourly
+// turn-rate cap (`maxLinkedTurnsPerHour`) dropped a coalesced tick. That cap
+// is REMOVED (src/jira-watch/linked-eventing.ts no longer withholds a
+// linked-change notify for any reason this module would log) — removed
+// here too, not merely disabled, so no new code should ever emit
+// `arm=rate-capped` again. `parseSuppressedLine` below stays generic over
+// `arm` (any string), so a historical journal line with this arm still
+// parses; nothing in this codebase produces one going forward.
 
 /**
  * FACTORY-952: `relatedForRules`'s (src/rules/resource-type.ts) tier guard on
