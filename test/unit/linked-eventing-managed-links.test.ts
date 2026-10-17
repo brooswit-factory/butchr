@@ -14,8 +14,8 @@ import { parseResourceRef, type ResourceRef } from "../../src/resources/resource
  * covers what THIS story adds: managed links reconciled into watchers,
  * cache/snapshot teardown on removal, Jira comment detection, and the
  * FACTORY-1 regression class re-proven for this new path. Everything else
- * (coalescing, the rate cap, Jira status/summary diffing, the three
- * BUTCHR-437 pollers) is already covered by test/unit/linked-eventing.test.ts
+ * (coalescing, Jira status/summary diffing, the three BUTCHR-437 pollers)
+ * is already covered by test/unit/linked-eventing.test.ts
  * and test/unit/linked-eventing-external.test.ts and is reused UNCHANGED
  * here, never re-tested.
  */
@@ -394,8 +394,16 @@ describe("FACTORY-9: Jira comment detection on the existing Jira-kind snapshot",
 // cross-daemon Implements-chain `related:` notify FACTORY-1 used, proven
 // delivered even while THIS owner's OWN linkedEventing budget is exhausted
 // entirely by MANAGED-link churn (not native/description churn).
-describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never lets the notify cap drop a boss-handoff-equivalent event", () => {
-  test("a rate-capped managed-link change is retried (delayed, not lost) on the next allowed tick, never silently dropped", async () => {
+// FACTORY-252: this describe block ONCE proved the managed-link path never
+// let the hourly turn-rate cap drop a boss-handoff-equivalent event — that
+// cap is removed entirely, so there is no longer a "budget exhausted"
+// scenario for the linked path to survive. What remains worth proving:
+// repeated managed-link changes deliver without being dropped (trivially
+// true now, no cap to drop them), and `related:`'s boss-wake path still
+// works correctly alongside managed-link-driven `linked:` activity on the
+// SAME owner/tick, since the two paths are otherwise independent.
+describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never drops a boss-handoff-equivalent event", () => {
+  test("repeated managed-link changes all deliver immediately, with no cap of any kind holding any of them", async () => {
     const owner = issue("BUTCHR-1");
     const store = fakeLinkStore();
     await addLink(store, ref("jira-work-item:BUTCHR-1"), ref("jira-work-item:BUTCHR-2"));
@@ -403,26 +411,24 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     const state = createLinkedEventingState();
     const now = { value: 0 };
     const { deps, notified, logs } = fakeDeps(world, { linkStore: store, now });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
+    const r = rule();
     const m = match("jira-work:task:BUTCHR-1", r, owner);
 
     await state.runTick([m], deps); // seed
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
-    await state.runTick([m], deps); // uses the one allowed turn
+    now.value += 1_000;
+    await state.runTick([m], deps);
     expect(notified).toHaveLength(1);
 
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
-    await state.runTick([m], deps); // capped — dropped this tick, not lost
-    expect(notified).toHaveLength(1);
-    expect(logs.some((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped"))).toBe(true);
-
-    now.value += 61 * 60_000;
-    await state.runTick([m], deps); // the same outstanding change is re-detected and delivered
+    now.value += 1_000;
+    await state.runTick([m], deps); // delivered immediately too — no cap to hold it
     expect(notified).toHaveLength(2);
     expect(linkedEvents(notified[1]!.reason)).toEqual([{ target: "BUTCHR-2", kind: "jira-key", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false);
   });
 
-  test("cross-daemon epic hears its story's move to In Review via related:, even with its OWN managed-link budget exhausted by unrelated managed-link churn", async () => {
+  test("cross-daemon epic hears its story's move to In Review via related:, alongside unrelated managed-link churn in the same poll (the two paths are independent)", async () => {
     const bossKey = "DROVR-37";
     const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it (BUTCHR-388's own documented live-fleet shape)
     const siblingKeys = ["DROVR-30", "DROVR-31"]; // NOT Implements targets — pure managed-link churn used to exhaust the budget
@@ -437,7 +443,7 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
     const sibling = (key: string, round: number) => issue(key, { status: round % 2 === 0 ? "In Progress" : "In Review" });
 
     const logs: string[] = [];
-    const ruleSet = parseRules({ rules: [{ id: "epics", resourceProvider: "jira-work", query: "issuetype = Epic", brief: "do it", linkedEventing: true, maxLinkedTurnsPerHour: 2 }] });
+    const ruleSet = parseRules({ rules: [{ id: "epics", resourceProvider: "jira-work", query: "issuetype = Epic", brief: "do it", linkedEventing: true }] });
     const search = async (jql: string): Promise<JiraIssue[]> => {
       if (jql === "issuetype = Epic") return [boss()];
       if (jql.startsWith("key in (")) {
@@ -460,17 +466,15 @@ describe("FACTORY-9 / FACTORY-1 regression class: the managed-link path never le
 
     // BUTCHR-472: the workerKey Implements/outward pair below is now
     // de-duplicated out of the linked path entirely (already covered by
-    // related:), so its own status flip can no longer be what trips the
-    // rate cap. One more round of the SAME unrelated managed-link churn
+    // related:). One more round of the SAME unrelated managed-link churn
     // used above, landing in the SAME tick as the story's move, keeps this
-    // test proving what it always proved: the linked path's cap being
-    // genuinely exhausted (by unrelated churn) never blocks related:.
+    // test proving what it always proved: unrelated `linked:` activity for
+    // this owner never blocks `related:`.
     siblingRound++;
     storyStatus = "In Review";
     await type.discovery.search();
     const relatedAfter = await type.discovery.related!(active);
-
-    expect(logs.some((l) => l.includes("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(bossKey))).toBe(true);
+    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false); // no cap exists any more
 
     const evPoll = await type.eventRules.poll({ primary: [], related }, { primary: [], related: relatedAfter });
     const watchersOf = (k: string) =>

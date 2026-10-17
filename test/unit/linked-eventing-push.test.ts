@@ -375,7 +375,7 @@ describe("FACTORY-137 D3/D6: on-demand pass via runDirtyPass", () => {
   });
 });
 
-describe("FACTORY-137 T3/T4: dirty generation and rate-cap interaction", () => {
+describe("FACTORY-137 T3/T4: dirty generation and held-advance interaction", () => {
   test("T3: a dirty mark that arrives again mid-fetch is not cleared by that fetch's own settle", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
@@ -420,32 +420,46 @@ describe("FACTORY-137 T3/T4: dirty generation and rate-cap interaction", () => {
     expect(delivered).toBe(true);
   });
 
-  test("T4: a rate-capped owner leaves its target dirty; the next allowed pass re-delivers", async () => {
+  // FACTORY-252: this test ONCE proved a dirty mark survives a RATE-CAPPED
+  // pass (the owner's advance held by the removed hourly cap) and
+  // re-delivers once the window freed. That cap is gone — a search failure
+  // is now the one remaining mechanism that holds a pass's advance (and,
+  // per T4's own invariant, must leave the dirty mark set too), so this
+  // test now holds delivery that way instead.
+  test("T4: a pass whose search fails leaves its target dirty; the next successful pass re-delivers", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }) };
     const state = createLinkedEventingState();
-    const now = { value: 0 };
     const { push } = fakePush();
-    const { deps, notified } = fakeDeps(world, { now, push });
-    const r = rule({ maxLinkedTurnsPerHour: 1 });
-    const m = match("jira-work:task:BUTCHR-1", r, owner);
+    let failSearch = false;
+    const notified: NotifyReason[] = [];
+    const deps: LinkedEventingDeps = {
+      search: async (jql) => {
+        if (failSearch) throw new Error("transient");
+        const m2 = /^key in \((.*)\)$/.exec(jql);
+        const keys = m2 ? m2[1]!.split(",") : [];
+        return keys.map((k) => world[k]).filter((i): i is JiraIssue => Boolean(i));
+      },
+      notify: async (_a, _b, reason) => { notified.push(reason); },
+      push,
+    };
+    const m = match("jira-work:task:BUTCHR-1", rule(), owner);
     await state.runTick([m], deps); // seed
 
-    // Use up the one allowed turn this hour with an ordinary polled change.
-    now.value = 1;
+    // An ordinary polled change, delivered immediately (no cap at all).
     state.markDirty("jira:BUTCHR-2");
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
     await state.runDirtyPass();
     expect(notified).toHaveLength(1);
 
-    // A second dirty change this same hour is rate-capped, not delivered.
-    now.value = 2;
+    // A second dirty change, but this pass's search fails — held, not delivered.
+    failSearch = true;
     state.markDirty("jira:BUTCHR-2");
     world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
     await state.runDirtyPass();
-    expect(notified).toHaveLength(1); // still capped
+    expect(notified).toHaveLength(1); // still held
 
-    now.value = 61 * 60_000; // roll the sliding window over
+    failSearch = false;
     await state.runTick([m], deps); // the still-dirty target is re-detected on the very next regular tick too
     expect(notified).toHaveLength(2);
   });

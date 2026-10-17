@@ -121,17 +121,20 @@ export function managedSessionShortDisplayId(resourceId: string): string {
  * fixed, shared, never-user-editable `Rule`-shaped value simply always
  * carries `linkedEventing: true` — there is no separate boolean to plumb
  * through, and every OTHER linked-eventing knob (`maxLinkedItems`,
- * `maxLinkedTurnsPerHour`, `linkedRemoteLinks`, `linkedDescriptionLinks`) is
- * left absent. BUTCHR-471: absent no longer means "uncapped" for the two
- * cap fields — `runTick` itself (`effectiveMaxLinkedItems`/
- * `effectiveMaxLinkedTurnsPerHour`, src/jira-watch/linked-eventing.ts) falls
- * back to a fixed default (2 turns/hour, 25 items) whenever a rule leaves
- * either absent, THIS rule included, precisely so a managed session cannot
- * run uncapped either — there is still no per-definition override (a known,
+ * `linkedRemoteLinks`, `linkedDescriptionLinks`) is left absent.
+ * BUTCHR-471: absent no longer means "uncapped" for `maxLinkedItems` —
+ * `runTick` itself (`effectiveMaxLinkedItems`, src/jira-watch/linked-eventing.ts)
+ * falls back to a fixed default (25 items) whenever a rule leaves it
+ * absent, THIS rule included, precisely so a managed session cannot run
+ * uncapped either — there is still no per-definition override (a known,
  * deliberately-deferred gap tracked in FACTORY-78/BUTCHR-471's own
- * follow-up list), only the shared default. `linkedRemoteLinks`/
- * `linkedDescriptionLinks` are unaffected by this ticket and still mean
- * "off" when absent, same as an unconfigured `jira-project` rule.
+ * follow-up list), only the shared default. FACTORY-252 removed the
+ * companion hourly turn-rate cap (`maxLinkedTurnsPerHour`/
+ * `effectiveMaxLinkedTurnsPerHour`) entirely — a managed session's linked
+ * notifications are no longer rate-limited at all, same as every other
+ * linked-eventing owner. `linkedRemoteLinks`/`linkedDescriptionLinks` are
+ * unaffected by this ticket and still mean "off" when absent, same as an
+ * unconfigured `jira-project` rule.
  * `resourceProvider: "filesystem"` (rather
  * than "jira-project") is deliberate: this value never names a jira-project
  * RULE — it names the managed-sessions definition file that granted the

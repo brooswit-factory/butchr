@@ -337,8 +337,6 @@ export interface Rule {
   linkedPollIntervalMs?: number;
   /** Hard cap on linked items discovered/watched per resource; the excess is logged as skipped, never silently truncated — see `capLinkedItems` (src/resources/linked-discovery.ts), which this story's own discovery logging already honours. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_ITEMS` (25) via `effectiveMaxLinkedItems`; an explicit value here always wins over that default, in both directions. */
   maxLinkedItems?: number;
-  /** Sliding-window rate cap (turns/hour) for linked-change notifications, story 2's own per-agent budget. BUTCHR-471: for a rule with `linkedEventing: true`, absent no longer means uncapped — `runTick` (src/jira-watch/linked-eventing.ts) falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (2) via `effectiveMaxLinkedTurnsPerHour`; an explicit value here always wins over that default, in both directions. */
-  maxLinkedTurnsPerHour?: number;
   /**
    * BUTCHR-436 (epic BUTCHR-421, story 2/4): opt in to fetching this rule's
    * matched resources' Jira REMOTE links as an additional linked-Jira-item
@@ -686,11 +684,26 @@ export const DEFAULT_IDLE_POKE_MINUTES = 30;
  */
 export const DEFAULT_IDLE_POKE_MESSAGE = "You've been idle 30 min: post your ticket comment (done, links, left, blockers), then continue or stand down";
 
+/**
+ * FACTORY-252 — keys this schema ONCE had and no longer does, kept in the
+ * accepted-key set so an ALREADY-DEPLOYED `rules.json` written against the
+ * old schema still loads instead of failing every rule with "unknown
+ * field" and leaving the daemon with zero rules on upgrade. `maxLinkedTurnsPerHour`
+ * configured the per-agent hourly linked-notify rate cap — removed
+ * entirely (see `runTick`, src/jira-watch/linked-eventing.ts), not merely
+ * disabled, because the cap's own "delayed, not lost" catch-up discipline
+ * motivated its removal rather than a repair. Parsed into nothing, read by
+ * nothing, surfaced nowhere. This set is a MIGRATION AFFORDANCE ONLY: never
+ * add a new key here, and never read one of these back out.
+ */
+const REMOVED_RULE_FIELDS: readonly string[] = ["maxLinkedTurnsPerHour"];
+
 const RULE_FIELDS = new Set([
   "id", "enabled", "resourceProvider", "query", "brief", "execution", "account", "role", "agentPreferences", "relationships", "mcpServers", "mcpConfigFile",
-  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "maxLinkedTurnsPerHour", "linkedRemoteLinks", "linkedDescriptionLinks",
+  "linkedEventing", "linkedPollIntervalMs", "maxLinkedItems", "linkedRemoteLinks", "linkedDescriptionLinks",
   "permissionMode", "lizardMode", "maxNewPerTick", "minSecondsBetweenAdmissions", "resumeOnRespawn", "resumeContextCutoff", "idlePokeMinutes", "idlePokeMessage", "idlePokeEnabled", "stalledMinutes",
   "notifyDeliveryMode",
+  ...REMOVED_RULE_FIELDS,
 ]);
 const PREFERENCE_FIELDS = new Set(["harness", "model", "effort", "modelPower", "effortPower"]);
 const RELATIONSHIP_FIELDS = new Set(["childRule", "inwardConnectionRules"]);
@@ -867,12 +880,12 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
     if (account !== undefined && !oneOf(ACCOUNT_POLICIES, account)) errors.push(`${at}.account must be one of ${ACCOUNT_POLICIES.join(", ")}`);
     // `role` (BUTCHR-398): independent of `execution`/`account` and of `resourceProvider` too — every provider accepts every role, same house style as the two fields above.
     if (role !== undefined && !oneOf(AGENT_ROLES, role)) errors.push(`${at}.role must be one of ${AGENT_ROLES.join(", ")}`);
-    // BUTCHR-429: four independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
-    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, maxLinkedTurnsPerHour, linkedRemoteLinks } = raw;
+    // BUTCHR-429: independently optional linked-eventing knobs, same house style — independent of `resourceProvider`, `execution`, `account` and `role` alike, and of each other.
+    // FACTORY-252: `maxLinkedTurnsPerHour` (the hourly linked-notify rate cap) is REMOVED from this destructure — see `REMOVED_RULE_FIELDS`'s own doc comment above; an already-deployed value is accepted (RULE_FIELDS) but parsed into nothing.
+    const { linkedEventing, linkedPollIntervalMs, maxLinkedItems, linkedRemoteLinks } = raw;
     if (linkedEventing !== undefined && typeof linkedEventing !== "boolean") errors.push(`${at}.linkedEventing must be a boolean`);
     if (linkedPollIntervalMs !== undefined && !isPositiveInt(linkedPollIntervalMs)) errors.push(`${at}.linkedPollIntervalMs must be a positive integer`);
     if (maxLinkedItems !== undefined && !isPositiveInt(maxLinkedItems)) errors.push(`${at}.maxLinkedItems must be a positive integer`);
-    if (maxLinkedTurnsPerHour !== undefined && !isPositiveInt(maxLinkedTurnsPerHour)) errors.push(`${at}.maxLinkedTurnsPerHour must be a positive integer`);
     // BUTCHR-436: fifth linked-eventing knob, same independently-optional house style.
     if (linkedRemoteLinks !== undefined && typeof linkedRemoteLinks !== "boolean") errors.push(`${at}.linkedRemoteLinks must be a boolean`);
     // BUTCHR-437: sixth linked-eventing knob, same independently-optional house style.
@@ -936,7 +949,6 @@ export function parseRules(doc: unknown, origin = "rules"): Rule[] {
       ...(linkedEventing !== undefined ? { linkedEventing: linkedEventing as boolean } : {}),
       ...(linkedPollIntervalMs !== undefined ? { linkedPollIntervalMs: linkedPollIntervalMs as number } : {}),
       ...(maxLinkedItems !== undefined ? { maxLinkedItems: maxLinkedItems as number } : {}),
-      ...(maxLinkedTurnsPerHour !== undefined ? { maxLinkedTurnsPerHour: maxLinkedTurnsPerHour as number } : {}),
       ...(linkedRemoteLinks !== undefined ? { linkedRemoteLinks: linkedRemoteLinks as boolean } : {}),
       ...(linkedDescriptionLinks !== undefined ? { linkedDescriptionLinks: linkedDescriptionLinks as boolean } : {}),
       ...(permissionMode !== undefined ? { permissionMode: permissionMode as RulePermissionMode } : {}),

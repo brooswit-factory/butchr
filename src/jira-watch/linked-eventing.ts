@@ -2,8 +2,8 @@
  * linked-eventing.ts — BUTCHR-436 (epic BUTCHR-421, story 2/4 of 4): makes a
  * change to a Jira-kind link discovered by story 1
  * (`discoverLinkedItems`/`capLinkedItems`, src/resources/linked-discovery.ts)
- * actually cause exactly one coalesced, rate-capped channel nudge to the
- * OWNING resource's agent — the mechanism this story exists to build. This
+ * actually cause exactly one coalesced channel nudge to the OWNING
+ * resource's agent — the mechanism this story exists to build. This
  * module only ever watches `issuelink`/`parent`/`jira-key`-kind targets
  * (already free — they ride the same `search()` fields story 1 uses) plus,
  * when a rule opts into `linkedRemoteLinks`, a Jira remote link that
@@ -28,7 +28,7 @@
  * (BUTCHR-425/BUTCHR-444, PR #407) and is implemented here as
  * `ProjectLinkedEventingMatch` — a second, `JiraIssue`-free match shape
  * `runTick` accepts via its own optional third parameter, reusing the EXACT
- * SAME coalescer/rate-cap/notify below with no forked delivery path.
+ * SAME coalescer/notify below with no forked delivery path.
  * `jiraKindLinkedItems` below was deliberately kept a per-MATCH function
  * returning a plain `LinkedItem[]`, exactly so this project-member source
  * could be unioned in without rework — see `ProjectLinkedEventingMatch`'s
@@ -46,8 +46,8 @@
  * `ProjectMatch` shape (src/rules/jira-project-type.ts). The one seam this
  * addition needed INSIDE this module is `ProjectLinkedEventingMatch.notifyAgentKey`
  * (see its own doc comment) — everything else, including the opt-in gate
- * (`m.rule.linkedEventing === true`) and the rate cap, is reused completely
- * unchanged: a managed-session match's `rule` is a fixed, shared, non-editable
+ * (`m.rule.linkedEventing === true`), is reused completely unchanged: a
+ * managed-session match's `rule` is a fixed, shared, non-editable
  * `Rule`-shaped value with `linkedEventing: true` (naming a project in
  * `linkedEventingProjects` already IS the opt-in — there is no separate
  * per-session boolean to carry), so this module never needed a second,
@@ -81,7 +81,8 @@
  * be watched by more than one owning resource (e.g. two tickets both link
  * BUTCHR-9). A per-target-only baseline would let owner A's SUCCESSFUL
  * delivery silently advance the baseline out from under owner B's still-
- * outstanding, rate-capped notification — B would never hear about a change
+ * outstanding notification (e.g. B's own tick ran a moment earlier and
+ * simply hasn't diffed this change yet) — B would never hear about a change
  * it was genuinely owed. Keying every baseline by `(owner, target)` instead
  * means each owner's own view of "what have I already been told" is
  * independent, at the cost of one baseline entry per (owner, target) pair
@@ -100,28 +101,37 @@
  * poll is CONDITIONAL on that owner's OWN last-seen fingerprint (an ETag/
  * Last-Modified sent as `If-None-Match`/`If-Modified-Since`), and two owners
  * watching the same external target can legitimately hold DIFFERENT
- * baselines (e.g. one was rate-capped last tick and never advanced) — a
+ * baselines (e.g. one owner's own poll failed last tick, or its
+ * `linkedPollIntervalMs` cadence is looser, and never advanced) — a
  * shared fetch could only carry one owner's conditional headers and would
  * risk answering "unchanged" to the other owner's genuinely stale baseline.
  * Costed and accepted for this fleet's scale; noted in the PR as a real
  * (if unlikely at this scale) source of duplicate external requests when
  * several owners share one target.
  *
- * RATE CAP AND "DELAYED, NOT LOST": a capped tick's per-(owner,target)
- * baselines and its owner's removed-link watch set are deliberately left
- * UNADVANCED (see `runTick`'s own `advance` closures below) — so the next
- * allowed tick re-runs the exact same comparison against the exact same
- * stale baseline and re-derives the same outstanding diff (plus anything
- * that changed again since), rather than needing a separate pending-event
- * queue. This is the same "advance state only once genuinely delivered"
- * discipline `own-writes.ts`'s own ledger uses for a different problem.
+ * "ADVANCE STATE ONLY ONCE GENUINELY CONSUMED": a tick that can't trust its
+ * own diff for some reason — a failed batched search, a failed per-owner
+ * remote-link/managed-link fetch, a per-item fetch that errored — leaves
+ * that owner's per-(owner,target) baselines and removed-link watch set
+ * deliberately UNADVANCED (see `runTick`'s own `advance` closures below) —
+ * so the next tick re-runs the exact same comparison against the exact
+ * same stale baseline and re-derives the same outstanding diff (plus
+ * anything that changed again since), rather than needing a separate
+ * pending-event queue. This is the same discipline `own-writes.ts`'s own
+ * ledger uses for a different problem. FACTORY-252: this module ONCE also
+ * deferred `advance()` for a tick whose notify was withheld by an hourly
+ * turn-rate cap (`maxLinkedTurnsPerHour`) — that cap, and the deferral it
+ * motivated, are REMOVED; every owner with outstanding events is now
+ * notified and advanced unconditionally, every tick (see the per-owner
+ * delivery loop below). The deferral mechanism itself survives for the
+ * fetch-failure cases above, which are unrelated to the removed cap.
  * BUTCHR-437: `lastExternalPollAt` (this story's own poll-cadence gate,
  * below) is DELIBERATELY NOT part of this "advance only on success"
- * discipline — it records that an external fetch was ATTEMPTED this tick,
- * independent of whether this tick's eventual notify gets rate-capped,
- * because re-fetching sooner than `linkedPollIntervalMs` would not change
- * the outcome either way and would defeat the entire reason the knob exists
- * (bounding how often a real network call goes out per owner).
+ * discipline — it records that an external fetch was ATTEMPTED this tick
+ * regardless of outcome, because re-fetching sooner than
+ * `linkedPollIntervalMs` would not change the outcome either way and would
+ * defeat the entire reason the knob exists (bounding how often a real
+ * network call goes out per owner).
  *
  * ACCEPTED, STATED LIMITATION: baseline/watch-set entries for an owner whose
  * rule later disables `linkedEventing` (or whose resource leaves the rules
@@ -160,7 +170,7 @@
  * this tick entirely (the WARNING below still logs) — the next tick's
  * batched fetch, if it succeeds, diffs against the SAME unadvanced baselines
  * and re-derives whatever was genuinely outstanding, so nothing is lost,
- * only delayed, exactly like a rate-capped tick. This applies ONLY to the
+ * only delayed. This applies ONLY to the
  * Jira-kind batched search (a single shared call whose failure says nothing
  * about any one target) — an external poller's per-target failure is
  * necessarily scoped to that one target already (see above), so it skips
@@ -241,7 +251,6 @@ import type { LinkStore } from "../resources/link-store.js";
 import { watchKeyForResource, type WatchKey } from "../catamorbius/mapping.js";
 import { isDaemonLabelOnlyDiff, excludeBookkeepingComments } from "./diff.js";
 import { watchedKeys } from "./routes.js";
-import { rateCappedSuppressedLine } from "./suppressed-log.js";
 import {
   pollConfluencePage, pollFilesystem, pollGithubLink, pollWebpage,
   type ConfluencePollDeps, type FilesystemPollDeps, type GithubConditionalDeps, type PollVerdict, type WebpagePollDeps,
@@ -279,9 +288,9 @@ export interface LinkedEventingMatch {
  *    onward does the search run at all. DELAYED, NOT LOST: the watermark
  *    only actually advances (`runTick`'s own deferred `toAdvance` — this
  *    owner's `advance()` closure) once this tick's events are genuinely
- *    delivered or safely consumed (not rate-capped away, not lost to a
- *    search failure or to `maxLinkedItems` capping a member away — see
- *    "CAPPING" below) — a failed member search leaves it unadvanced, fails
+ *    delivered or safely consumed (not lost to a search failure or to
+ *    `maxLinkedItems` capping a member away — see "CAPPING" below) — a
+ *    failed member search leaves it unadvanced, fails
  *    open, is logged, and never blocks any other owner or this owner's OWN
  *    managed-link source.
  *    A MEMBER'S FIRST APPEARANCE IS ITSELF THE CHANGE: unlike a managed or
@@ -364,7 +373,7 @@ export interface ProjectLinkedEventingMatch {
    * project's per-tick state silently OVERWRITE the first's in every one of
    * those maps, permanently losing that project's watch. Giving each
    * (session, project) pair its own `agentKey` keeps their state
-   * independent (own watermark, own rate-cap bucket); this field then says
+   * independent (own watermark, own baseline set); this field then says
    * where the resulting nudge actually goes — the session's own real agent
    * key, which is also what `herd.nudge`'s own freeze check
    * (`instanceFreezeStore.assertRunnable`) is keyed on, so a frozen session
@@ -514,24 +523,26 @@ function commentChangedBetween(before: JiraSnapshot, after: JiraSnapshot): boole
  * happened." This is the "accurate transition timestamps" half of the
  * ticket's ask, chosen over "suppress stale transitions" because
  * suppression risks silently dropping a real, still-unread change a
- * rate-capped or slow-polling owner genuinely needs to hear about — see
- * this module's own top comment ("DELAYED, NOT LOST") for why this module
- * already treats "never silently drop a genuine change" as load-bearing
- * elsewhere.
+ * slow-polling owner, or one whose tick was held by a fetch failure,
+ * genuinely needs to hear about — see this module's own "ADVANCE STATE
+ * ONLY ONCE GENUINELY CONSUMED" top comment for why this module already
+ * treats "never silently drop a genuine change" as load-bearing elsewhere.
  *
  * `asOf` is NOT simply `after.updated` (review round 1, PR #800): Jira's
  * `updated` is bumped by ANY field changing, not specifically the one this
- * line reports — a status transition held by the rate cap, followed by a
- * LATER unrelated edit (a comment, a label) with status unchanged, would
- * have `after.updated` reflect that later unrelated edit's own time, not
- * the status transition's, falsely implying the transition is as recent
- * as the unrelated edit. `observed` carries THREE independent timestamps
+ * line reports — a status transition whose delivery was held (e.g. by a
+ * search failure skipping the tick), followed by a LATER unrelated edit (a
+ * comment, a label) with status unchanged, would have `after.updated`
+ * reflect that later unrelated edit's own time, not the status
+ * transition's, falsely implying the transition is as recent as the
+ * unrelated edit. `observed` carries THREE independent timestamps
  * (`statusAt`/`summaryAt`/`commentAt`, from `runTick`'s own per-tick
  * observation-tracking — see `observedAt`'s own doc comment above), each
  * frozen at the moment its OWN field last actually differed from the
  * previously observed value, immediately on every tick regardless of
- * rate-capping — so whichever branch fires below names the time THAT
- * field moved, never a later unrelated bump to a different field. The
+ * whether this tick's own delivery is held — so whichever branch fires
+ * below names the time THAT field moved, never a later unrelated bump to
+ * a different field. The
  * generic "updated" fallback has no specific field to shadow — none of
  * status/summary/comment differ from the baseline, so `after.updated`
  * IS the only fact being reported, used directly rather than frozen.
@@ -562,39 +573,24 @@ function unreadableDetail(httpStatus: number | undefined): string {
   return httpStatus === undefined ? "unreadable" : `unreadable (${httpStatus})`;
 }
 
-/** A sliding hour — the unit `maxLinkedTurnsPerHour` is denominated in. */
-const SLIDING_WINDOW_MS = 60 * 60_000;
-
 /**
- * BUTCHR-471 (epic BUTCHR-446): the two default caps applied wherever a cap
- * is READ (never at rule-parse time — see `effectiveMaxLinkedItems`/
- * `effectiveMaxLinkedTurnsPerHour` below), so no linked-eventing owner kind
- * (a `jira-work` rule, a `jira-project` rule, or a managed session opted in
+ * BUTCHR-471 (epic BUTCHR-446): the default item cap applied wherever
+ * `maxLinkedItems` is READ (never at rule-parse time — see
+ * `effectiveMaxLinkedItems` below), so no linked-eventing owner kind (a
+ * `jira-work` rule, a `jira-project` rule, or a managed session opted in
  * via `linkedEventingProjects`) can run uncapped. An explicit
- * `maxLinkedTurnsPerHour`/`maxLinkedItems` on a rule always wins over the
- * default, in both directions (looser or tighter) — these constants only
- * fill in for a rule that leaves the field absent.
+ * `maxLinkedItems` on a rule always wins over the default, in both
+ * directions (looser or tighter) — this constant only fills in for a rule
+ * that leaves the field absent.
  *
- * Sourced from BUTCHR-450/BUTCHR-468's phase-2 measurement (window
- * 2026-09-25T18:39:27Z to ~2026-09-26T18:44Z, both Servy daemons, every
- * enabled `jira-work` rule already running with `maxLinkedTurnsPerHour: 2`
- * and `maxLinkedItems: 25`): delivered linked turns per agent per hour
- * stayed inside the cap in organic operation — median 2, p95 2, max 4, with
- * both buckets above 2 being daemon-restart artifacts (a restart resets
- * every agent's sliding window), observed independently on both daemons.
- * Nothing measured supports a looser default, and spend was never obtained
- * (admin-agentcost did not answer two requests), so there is no argument for
- * anything looser either. An operator can still raise or lower either value
- * per rule via the existing fields.
+ * FACTORY-252: the companion hourly turn-rate cap (`DEFAULT_MAX_LINKED_TURNS_PER_HOUR`/
+ * `effectiveMaxLinkedTurnsPerHour`/`maxLinkedTurnsPerHour`) is REMOVED
+ * entirely, not merely defaulted — see `runTick`'s own per-owner delivery
+ * loop below, which now notifies unconditionally whenever an owner has
+ * outstanding events, with no sliding-window bookkeeping at all. This item
+ * cap is unaffected and still enforced exactly as BUTCHR-471 left it.
  */
-export const DEFAULT_MAX_LINKED_TURNS_PER_HOUR = 2;
-/** See `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`'s own doc comment for where this number comes from. */
 export const DEFAULT_MAX_LINKED_ITEMS = 25;
-
-/** The turn-rate cap `runTick` actually enforces for one linked-eventing owner's rule — an explicit `rule.maxLinkedTurnsPerHour` always wins; absent falls back to `DEFAULT_MAX_LINKED_TURNS_PER_HOUR` (BUTCHR-471). Never `undefined`: unlike `capLinkedItems`'s own `max` parameter, there is deliberately no "uncapped" value this can resolve to. */
-export function effectiveMaxLinkedTurnsPerHour(rule: Rule): number {
-  return rule.maxLinkedTurnsPerHour ?? DEFAULT_MAX_LINKED_TURNS_PER_HOUR;
-}
 
 /** The item cap `runTick` actually enforces for one linked-eventing owner's rule — an explicit `rule.maxLinkedItems` always wins; absent falls back to `DEFAULT_MAX_LINKED_ITEMS` (BUTCHR-471). Never `undefined` for an OPTED-IN owner (every call site below only ever calls this from inside `opted`/`projectOpted`, both pre-filtered to `rule.linkedEventing === true`) — `capLinkedItems`'s own `max === undefined` ⇒ uncapped contract is unchanged; this function simply never hands it `undefined`. */
 export function effectiveMaxLinkedItems(rule: Rule): number {
@@ -614,7 +610,7 @@ export interface LinkedEventingDeps {
   /** The exact delivery seam every other notify in this codebase already uses — see this module's own top comment for why this is "UNCHANGED IN SHAPE". */
   notify: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
   log?: (line: string) => void;
-  /** Injectable clock, for a deterministic rate-cap test. Defaults to `Date.now`. */
+  /** Injectable clock, for deterministic tests of `linkedPollIntervalMs`/project-watermark timing. Defaults to `Date.now`. */
   now?: () => number;
   /** BUTCHR-437: `AtlassianClient#confluencePageVersion` — called ONLY for a match whose rule has `linkedDescriptionLinks: true` AND whose description names at least one Confluence page URL. Optional; omitted, every Confluence-kind item resolves `"error"` (skipped, retried next due tick, never reported unreadable) — the same "omitted means the feature silently never runs" shape `remoteLinks` above already has. */
   confluenceVersion?: ConfluencePollDeps["getVersion"];
@@ -828,11 +824,10 @@ export function createLinkedEventingState(): LinkedEventingState {
   // (there is no fresher read to prefer; the link is gone).
   const watchSets = new Map<string, Map<string, { kind: string; linkId?: string }>>();
   const unreadableOwners = new Map<string, Set<string>>();
-  const turns = new Map<string, number[]>();
   // BUTCHR-437: last time (per owner) this state actually ATTEMPTED an
   // external-kind poll — see this module's own top comment ("delayed, not
-  // lost") for why this is intentionally NOT part of the rate-cap's
-  // "advance only on success" discipline.
+  // lost") for why this is intentionally NOT part of the "advance only on
+  // success" discipline every per-item fetch in this module still follows.
   const lastExternalPollAt = new Map<string, number>();
   // BUTCHR-469: per-project-owner member-discovery watermark (ms since
   // epoch, this daemon's own clock) — see `ProjectLinkedEventingMatch`'s own
@@ -846,13 +841,13 @@ export function createLinkedEventingState(): LinkedEventingState {
   // `updated` timestamp frozen at the tick that field was last seen to
   // actually differ from the previously observed value — distinct from
   // `baselines`, which only advances on a genuinely delivered tick. This
-  // map updates EVERY tick, immediately, regardless of rate-capping or
-  // delivery (the same "delayed, not lost" exception `lastExternalPollAt`
+  // map updates EVERY tick, immediately, regardless of delivery (the same
+  // "delayed, not lost" exception `lastExternalPollAt`
   // above already documents for a different field). Three INDEPENDENT
-  // timestamps, not one shared one: a status transition held by the rate
-  // cap must not inherit a LATER tick's unrelated summary/comment edit's
-  // own `updated` value (or vice versa) — see `changeDetail`'s own doc
-  // comment for the concrete repro this closes.
+  // timestamps, not one shared one: a status transition whose delivery is
+  // held (e.g. by a search failure) must not inherit a LATER tick's
+  // unrelated summary/comment edit's own `updated` value (or vice versa) —
+  // see `changeDetail`'s own doc comment for the concrete repro this closes.
   const observedAt = new Map<string, { status: string; statusAt: string; summary: string; summaryAt: string; commentCursor: string | null | undefined; commentAt: string }>();
   // FACTORY-833 (review round 2, PR #800): per issue owner, the last
   // GENUINELY OBSERVED native-issuelink membership, keyed by the Jira
@@ -860,7 +855,7 @@ export function createLinkedEventingState(): LinkedEventingState {
   // (this tick's scratch counterpart, computed fresh every tick) for why
   // this exists alongside `watchSets`. Advanced only inside the SAME
   // `advance()` as every other per-owner state (delayed, not lost on a
-  // rate-capped tick).
+  // tick whose advance is held).
   const issuelinkMembership = new Map<string, ReadonlyMap<string, string>>();
   const baselineKey = (owner: string, target: string): string => `${owner} ${target}`;
 
@@ -1348,8 +1343,8 @@ export function createLinkedEventingState(): LinkedEventingState {
           const bkey = baselineKey(entry.agentKey, item.target);
           // FACTORY-833 (review round 1, PR #800, replayed onto main):
           // updated immediately, every PASS (regular tick or on-demand —
-          // both run this same per-item loop), BEFORE any rate-cap/
-          // suppress/delivery decision — see `observedAt`'s own doc
+          // both run this same per-item loop), BEFORE any suppress/
+          // delivery decision — see `observedAt`'s own doc
           // comment (outer scope) above. Each of the three timestamps only
           // moves when ITS OWN field actually differs from the last
           // observed value for THAT field — an unrelated field bumping
@@ -1476,40 +1471,31 @@ export function createLinkedEventingState(): LinkedEventingState {
       });
     }
 
+    // FACTORY-252: the former hourly turn-rate cap (`maxLinkedTurnsPerHour`)
+    // is removed — every owner with outstanding events is notified
+    // unconditionally, every tick, with no sliding-window bookkeeping and no
+    // suppression logging. `advance()` therefore always runs immediately
+    // after a genuine delivery (never deferred by a cap), same as it always
+    // already did for an owner with no events at all.
     const advancedOwners = new Set<string>();
     for (const entry of ownerEntries) {
       const advance = advanceByOwner.get(entry.agentKey)!;
       const events = eventsByOwner.get(entry.agentKey);
-      if (!events?.length) { advance(); advancedOwners.add(entry.agentKey); continue; }
-      // BUTCHR-471 (replayed onto main): never `undefined` — an explicit
-      // `rule.maxLinkedTurnsPerHour` always wins, absent falls back to
-      // `DEFAULT_MAX_LINKED_TURNS_PER_HOUR`, so this block now always runs
-      // (no owner kind can run uncapped).
-      const max = effectiveMaxLinkedTurnsPerHour(entry.rule);
-      const history = (turns.get(entry.agentKey) ?? []).filter((t) => now() - t < SLIDING_WINDOW_MS);
-      if (history.length >= max) {
-        turns.set(entry.agentKey, history);
-        // BUTCHR-471: `entry.notifyAgentKey`, NOT `entry.agentKey` — for a
-        // managed-session owner, `agentKey` is the synthetic per-(session,
-        // project) STATE key, which embeds a literal NUL byte that must
-        // never reach a journal write (see src/daemon/log-sink.ts's own
-        // flatten). `entry.label` still keeps the project/issue identifiable.
-        deps.log?.(rateCappedSuppressedLine(entry.label, entry.notifyAgentKey, history.length, max));
-        continue; // NOT advanced — next allowed tick re-detects everything still outstanding
-      }
-      history.push(now());
-      turns.set(entry.agentKey, history);
-      await deps.notify(entry.notifyAgentKey, entry.notifyAgentKey, { linked: { events } });
+      if (events?.length) await deps.notify(entry.notifyAgentKey, entry.notifyAgentKey, { linked: { events } });
       advance();
       advancedOwners.add(entry.agentKey);
     }
 
     // FACTORY-137 (T4): a dirty mark is cleared only once EVERY owner that
     // references its target has genuinely advanced this pass (not merely
-    // been fetched) — a rate-capped owner leaves it dirty, so the next pass
-    // re-derives the outstanding diff for that owner too, exactly the
-    // "delayed, not lost" discipline every other piece of state here
-    // already has.
+    // been fetched). FACTORY-252: every owner in `ownerEntries` now always
+    // advances this same pass (the former hourly cap that could leave an
+    // owner un-advanced is removed) — this loop is only reached at all when
+    // the batched search itself succeeded (a search failure `return`s
+    // before here, leaving every dirty mark untouched for the next pass),
+    // so in practice this condition is always true today. Kept as an
+    // explicit check rather than assumed, since this is cheap and the
+    // invariant is exactly the contract this function must uphold.
     for (const wk of dirtyAtStart) {
       if (dirtyGen.get(wk) !== dirtyGenAtStart.get(wk)) continue; // T3: a newer mark arrived mid-pass — never clear it
       const owners = touchedOwnersByKey.get(wk);
@@ -1741,8 +1727,8 @@ export function createLinkedEventingState(): LinkedEventingState {
         }
 
         // BUTCHR-469: from here on, an issue owner and a project owner are
-        // handled UNIFORMLY — the coalescer, rate cap and notify below never
-        // fork on which kind of match produced an owner's items.
+        // handled UNIFORMLY — the coalescer and notify below never fork on
+        // which kind of match produced an owner's items.
         // FACTORY-53/FACTORY-71: `notifyAgentKey` defaults to `agentKey` for
         // an issue owner and for any project owner that leaves it unset.
         const ownerEntries: Array<{ agentKey: string; rule: Rule; label: string; notifyAgentKey: string }> = [
