@@ -2704,8 +2704,151 @@ describe("resumeInPlace", () => {
     });
   });
 
-  // FACTORY-916: the flag-off / intentional-stop / missing-transcript /
-  // over-cutoff fallback outcomes are all covered directly against
+  // FACTORY-1018: the same-ticket reviewer re-entry case this ticket's own
+  // acceptance criteria names — a ticket (e.g. a reviewer rule's own
+  // ticket) leaves In Review, is respawned UNINTENDEDLY, and has a
+  // persisted session whose transcript is far larger than the FORMER
+  // 100,000-token cutoff (FACTORY-851/FACTORY-916, removed by this
+  // ticket). Driven through the REAL `HerdrHerd.spawn()` -> `tryClaudeResume()`
+  // path, same shape as the "under cutoff" test immediately above —
+  // proving the full respawn integration (not just `decideRespawnResume`
+  // in isolation, already covered unit-level by
+  // test/unit/respawn-resume-decision.test.ts) launches with `--resume
+  // <id>` and resumes that EXACT session id, never starting fresh solely
+  // because of transcript size.
+  test("FACTORY-1018: an unintended-stop respawn with a persisted session id and a transcript far larger than the former cutoff still launches with --resume <id>", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task-review-opus", resourceId: "FACTORY-1017" });
+      const cwd = workspaceDirFor(key);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-respawn-resume-large-"));
+      try {
+        const priorId = "prior-reviewer-conversation-id";
+        persistDiscoveredSessionId(cwd, priorId);
+        const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+        mkdirSync(projectDir, { recursive: true });
+        // ~125,000 estimated tokens under the old 4-bytes-per-token estimate
+        // — well over the former 100,000-token cutoff this ticket removes.
+        writeFileSync(join(projectDir, `${priorId}.jsonl`), "x".repeat(500_000));
+        const f = fakeHerdr([]); // no live agent — this is the respawn's own fresh launch, re-entering In Review
+        f.client.pane.processInfo = async () => ({ process_info: { pane_id: "w9:p1", foreground_processes: [{ pid: 1, argv: ["claude", "--resume", priorId], name: "claude" }] } });
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        await herd.spawn({ key, issuetype: "Task", summary: "s", parent: null, ticketStatus: "In Review", ticketLabels: [] });
+        expect(f.started).toHaveLength(1);
+        expect(f.started[0]!.args).toContain("--resume");
+        expect(f.started[0]!.args[f.started[0]!.args.indexOf("--resume") + 1]).toBe(priorId);
+        expect(workspaceSessionId(cwd)).toBe(priorId); // untouched — never invalidated, never discarded for size
+        expect(herd.lastFreshSpawnResumed(key)).toBe(true);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-1018 (review round 1): the reviewer re-entry case driven through
+  // MATCHING/RECONCILE, not `HerdrHerd.spawn()` directly — two real
+  // `reconcileNow` polls over one REAL `HerdrHerd`, mirroring the actual
+  // ticket lifecycle: a same-ticket reviewer rule (task-review-opus) and
+  // implementer rule (tasks) alternate which one is "desired" as the
+  // ticket's own status flips between In Review and In Progress, exactly
+  // as `desiredFrom`'s own rule-query matching would produce poll to poll.
+  // Poll 1 (ticket moves to In Progress): the reviewer is no longer
+  // desired -> `herd.stop()`; the implementer becomes desired and not yet
+  // running -> `herd.spawn()` -> `tryClaudeResume()` resumes the
+  // implementer's OWN persisted session (small transcript). Poll 2 (ticket
+  // returns to In Review): the implementer is no longer desired -> stop;
+  // the reviewer becomes desired again -> spawn -> resumes the reviewer's
+  // OWN persisted session, whose transcript is far larger than the FORMER
+  // 100,000-token cutoff (FACTORY-851/FACTORY-916, removed by this
+  // ticket) — proving the exact saved reviewer session id resumes
+  // regardless of size. The implementer's distinct session id/transcript
+  // is the control: each launch's `--resume` argument must name ITS OWN
+  // rule's session, never the other's, and both persisted ids are
+  // untouched (never invalidated) throughout.
+  test("FACTORY-1018: a same-ticket reviewer In Review -> In Progress -> In Review cycle, driven through reconcileNow + a real HerdrHerd, resumes the exact saved reviewer session despite a transcript far larger than the former cutoff — with a distinct implementer-session identity control", async () => {
+    await withTempWorkspaces(async () => {
+      const { mkdtempSync, rmSync, mkdirSync, writeFileSync } = require("node:fs") as typeof import("node:fs");
+      const { tmpdir } = require("node:os") as typeof import("node:os");
+      const { resolve } = require("node:path") as typeof import("node:path");
+      const reviewerKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task-review-opus", resourceId: "FACTORY-1017" });
+      const implementerKey = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "tasks", resourceId: "FACTORY-1017" });
+      const reviewerCwd = workspaceDirFor(reviewerKey);
+      const implementerCwd = workspaceDirFor(implementerKey);
+      const home = mkdtempSync(join(tmpdir(), "claude-home-review-cycle-"));
+      try {
+        const reviewerId = "reviewer-own-saved-session";
+        const implementerId = "implementer-own-saved-session";
+        persistDiscoveredSessionId(reviewerCwd, reviewerId);
+        persistDiscoveredSessionId(implementerCwd, implementerId);
+        const writeTranscript = (cwd: string, sessionId: string, bytes: number) => {
+          const projectDir = join(home, ".claude", "projects", resolve(cwd).replace(/[^a-zA-Z0-9]/g, "-"));
+          mkdirSync(projectDir, { recursive: true });
+          writeFileSync(join(projectDir, `${sessionId}.jsonl`), "x".repeat(bytes));
+        };
+        // ~125,000 estimated tokens under the old 4-bytes-per-token
+        // estimate — well over the former 100,000-token cutoff.
+        writeTranscript(reviewerCwd, reviewerId, 500_000);
+        writeTranscript(implementerCwd, implementerId, 100); // ordinary small transcript — the control
+
+        // A dedicated fixture, not the shared `fakeHerdr()` above: unlike
+        // that one, `pane.close` here actually REMOVES the closed pane
+        // from `agent.list()`'s own backing array — real herdr's own
+        // behaviour (see `closePaneDefensively`'s own doc comment higher
+        // in this file) — which this two-poll cycle depends on: poll 2's
+        // own `running` snapshot must not still report poll 1's stopped
+        // pane as live.
+        let agents: Array<{ name?: string; pane_id: string; cwd: string }> = [{ name: "reviewer-pane", pane_id: "w1:p1", cwd: reviewerCwd }];
+        const started: any[] = []; const closed: string[] = [];
+        let createdCwd: string | undefined; let nextPane = 1;
+        const client = {
+          agent: {
+            list: async () => ({ agents: agents.map((a) => ({ ...a, agent: "claude", workspace_id: "w9" })) }),
+            start: async (p: any) => { started.push(p); agents = [...agents, { name: p.name, pane_id: p.pane_id, cwd: createdCwd! }]; },
+          },
+          pane: {
+            close: async (id: string) => { closed.push(id); agents = agents.filter((a) => a.pane_id !== id); },
+            processInfo: async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv: ["claude"], name: "claude" }] } }),
+          },
+          workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: `w9:p${++nextPane}` } }; } },
+        };
+        const herd = new HerdrHerd(client as any, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+
+        // Poll 1: ticket is In Progress — the reviewer's pane is currently
+        // running (left over from before this cycle) but no longer
+        // desired; the implementer is desired and not yet running.
+        const implementerSpec = { key: implementerKey, issuetype: "Task" as const, summary: "s", parent: null, ticketStatus: "In Progress", ticketLabels: [] };
+        await reconcileNow(herd, new Map([[implementerKey, implementerSpec]]));
+
+        expect(closed).toEqual(["w1:p1"]); // the reviewer's pane was stopped — no longer desired
+        expect(started).toHaveLength(1);
+        expect(started[0]!.args).toContain("--resume");
+        expect(started[0]!.args[started[0]!.args.indexOf("--resume") + 1]).toBe(implementerId); // its OWN session, never the reviewer's
+
+        // Poll 2: ticket returns to In Review — the implementer (now
+        // running, from poll 1's own `agent.start`) is no longer desired;
+        // the reviewer is desired again and not currently running.
+        const reviewerSpec = { key: reviewerKey, issuetype: "Task" as const, summary: "s", parent: null, ticketStatus: "In Review", ticketLabels: [] };
+        await reconcileNow(herd, new Map([[reviewerKey, reviewerSpec]]));
+
+        expect(closed).toHaveLength(2); // the implementer's own pane, started above, is now stopped too
+        expect(started).toHaveLength(2);
+        expect(started[1]!.args).toContain("--resume");
+        expect(started[1]!.args[started[1]!.args.indexOf("--resume") + 1]).toBe(reviewerId); // the reviewer's OWN saved session, despite its much larger transcript
+
+        // Both persisted ids are untouched throughout — neither was
+        // invalidated, and neither was overwritten with the other's.
+        expect(workspaceSessionId(reviewerCwd)).toBe(reviewerId);
+        expect(workspaceSessionId(implementerCwd)).toBe(implementerId);
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // FACTORY-916: the flag-off / intentional-stop / missing-transcript
+  // fallback outcomes are all covered directly against
   // `decideRespawnResume` itself (test/unit/respawn-resume-decision.test.ts)
   // — this is the one "does the fallback reach a REAL spawn correctly"
   // check: no persisted session id at all is the simplest fallback to
