@@ -58,7 +58,9 @@ export async function reviewChanges(api: RulesApi, changes: readonly RuleChange[
     try {
       switch (change.kind) {
         case "update": {
-          const plan = await api.planRule(change.ruleId, change.patch, false, signal);
+          // A rule turned off in the same draft is saved off first, so its field update is reviewed against the rule as it will be then.
+          const disabledFirst = changes.some((c) => c.kind === "disable" && c.ruleId === change.ruleId);
+          const plan = await api.planRule(change.ruleId, change.patch, false, signal, disabledFirst ? { assumeDisabled: true } : undefined);
           // An edit that switches an enabled rule to swarm staffs every match, like turning a swarm rule on.
           const ticketKeys = await staffingKeys(api, change.ruleId, plan, change.patch.query);
           reviewed.push({ change, plan, ...(ticketKeys ? { ticketKeys } : {}) });

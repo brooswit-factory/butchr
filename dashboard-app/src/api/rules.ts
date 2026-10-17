@@ -460,7 +460,8 @@ export interface RulesApi {
    */
   previewRule(ruleId: string, signal?: AbortSignal, queryOverride?: string): Promise<RulePreviewResponse>;
   /** Report-only: never applies anything. */
-  planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal): Promise<RulePlanResponse>;
+  /** local/ui: `opts.assumeDisabled` plans against the rule as it will be once turned off (a field update saved right after its disable). */
+  planRule(ruleId: string, patch: RulePlanPatch, confirm: boolean, signal?: AbortSignal, opts?: { assumeDisabled?: boolean }): Promise<RulePlanResponse>;
   /** `POST /api/rules/:id/enabled` — the ONLY call that may flip `enabled`. `ifMatch` must be the rule list's own `sourceEtag` (never `fileEtag`); `planHash` must be the SAME plan just returned by `planRule` for this exact patch. */
   setEnabled(ruleId: string, enabled: boolean, ifMatch: string, planHash: string, confirm: boolean, signal?: AbortSignal): Promise<RuleWriteResult>;
   /** `PUT /api/rules/:id` — the nested allowlist edit. Same `ifMatch`/`planHash` discipline as `setEnabled`. */
@@ -736,7 +737,7 @@ export const realRulesApi: RulesApi = {
     const qs = queryOverride !== undefined ? `?query=${encodeURIComponent(queryOverride)}` : "";
     return mapServerPreview(ruleId, await request<unknown>(`/api/rules/${encodeURIComponent(ruleId)}/preview${qs}`, { signal }));
   },
-  planRule: async (ruleId, patch, confirm, signal) => {
+  planRule: async (ruleId, patch, confirm, signal, opts) => {
     // `csrf: true` is REQUIRED here even though this route only ever
     // reports, never writes: the real merged guard (`src/web/view.ts`'s
     // `onRequest` hook) fails closed on PATH SHAPE, not per-route
@@ -744,7 +745,7 @@ export const realRulesApi: RulesApi = {
     // pass the full `checkWriteGuard`, CSRF included, before its own
     // handler (which itself calls `checkWriteGuard` again) is ever
     // reached. Omitting this would 403 every real plan call.
-    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm }, csrf: true, signal });
+    const raw = await request<RulePlanResponse & { scope?: number | null }>("/api/rules/plan", { method: "POST", body: { id: ruleId, patch, confirm, ...(opts?.assumeDisabled ? { assumeDisabled: true } : {}) }, csrf: true, signal });
     // `requiresConfirm`/`confirmReason` are read straight off the server's
     // own response — same field names on both sides (FACTORY-685, item 2's
     // own deliberate deviation: no rename to the ticket's literal
@@ -1106,7 +1107,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       maybeFail();
       return opts.capacityRoles ?? { values: AGENT_ROLES, default: CAPACITY_ROLE_DEFAULT };
     },
-    async planRule(ruleId, patch, confirm) {
+    async planRule(ruleId, patch, confirm, _signal, planOpts) {
       await delay();
       maybeFail();
       if (opts.plans?.[ruleId]) return opts.plans[ruleId]!;
@@ -1119,7 +1120,9 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       if (patch.enabled === true && !rule.enabled && (patch.query ?? rule.query) === PLACEHOLDER_QUERY) {
         throw new Error(`rule "${ruleId}" cannot be enabled while its query is still the placeholder — edit the query first`);
       }
-      const counts = computeLocalPlanCounts(rule.enabled, patch);
+      // local/ui: like the server, plan against the rule as it will be once turned off when asked.
+      const ruleEnabled = planOpts?.assumeDisabled ? false : rule.enabled;
+      const counts = computeLocalPlanCounts(ruleEnabled, patch);
       // FACTORY-730 (review round 2): a CHANGED `query` is dry-run against
       // its NEW text — regardless of `counts.spawned` (always 0 for a real
       // field edit) — mirroring the real server's own `planRuleWrite`.
@@ -1127,7 +1130,7 @@ export function createFixturesRulesApi(opts: FixturesRulesApiOptions = {}): Rule
       // a distinct count for the draft text; falls back to `previews`.
       const queryChanged = patch.query !== undefined && patch.query !== rule.query;
       // local/ui: mirrors the server's `isSwarmSwitch` (`src/rules/rules-write.ts`).
-      const swarmSwitch = rule.enabled && patch.execution === "swarm" && rule.execution !== "swarm";
+      const swarmSwitch = ruleEnabled && patch.execution === "swarm" && rule.execution !== "swarm";
       const scopeCount = counts.spawned > 0
         ? (patch.query !== undefined ? opts.previewsByQuery?.[`${ruleId}:${patch.query}`]?.total : undefined) ?? opts.previews?.[ruleId]?.total ?? 0
         : queryChanged

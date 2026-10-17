@@ -793,7 +793,20 @@ export type RulesPlanOutcome = RulesPlanResult | { ok: false; status: number; er
  * the fleet-wide admission picture should read `/api/rules/:id/preview`'s
  * own `warning` field too.
  */
-export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps): Promise<RulesPlanOutcome> {
+/**
+ * local/ui — dry-run-only options. `assumeDisabled` plans the patch against the
+ * rule as it will be once it's turned off: the Rules page saves a rule's
+ * disable before its field update, so this is exactly what that update's own
+ * plan sees at save time. Can't be combined with `enabled` in the patch.
+ */
+export interface PlanRuleWriteOptions {
+  assumeDisabled?: boolean;
+}
+
+export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: boolean, scopeOf: (id: string, queryText: string) => Promise<number>, deps: RulesWriteDeps, opts: PlanRuleWriteOptions = {}): Promise<RulesPlanOutcome> {
+  if (opts.assumeDisabled && patch.enabled !== undefined) {
+    return { ok: false, status: 400, error: "assumeDisabled can't be combined with enabled in the same plan" };
+  }
   const env = deps.env ?? process.env;
   const currentText = readCurrentRulesText(env);
   try {
@@ -811,6 +824,7 @@ export async function planRuleWrite(id: string, patch: RuleFieldPatch, confirm: 
     if (e instanceof RuleWriteApplyError) return { ok: false, status: 400, error: e.message };
     throw e;
   }
+  if (opts.assumeDisabled) current = { ...current, enabled: false };
   const etag = rulesEtag(env, deps.io);
   const wasEnabled = current.enabled === true;
   // local/ui: a dry run that both edits fields and turns the rule on (the

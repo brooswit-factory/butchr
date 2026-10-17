@@ -795,6 +795,31 @@ describe("POST /api/rules/plan — report-only", () => {
   });
 });
 
+describe("POST /api/rules/plan — assumeDisabled (local/ui)", () => {
+  test("passes assumeDisabled through to the plan, and refuses a non-boolean", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const seen: unknown[] = [];
+    const planResult: RulesPlanOutcome = { ok: true, planHash: "h1", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "etag-1", requiresConfirm: true, confirmReason: "risky-permission" };
+    const { app, origin, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+      rulesWrite: {
+        enabled: (() => { throw new Error("unused"); }) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (async (_id: string, _patch: unknown, _confirm: boolean, opts: unknown) => { seen.push(opts); return planResult; }) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
+      },
+    });
+    const post = (body: unknown) => fetch(`${origin}/api/rules/plan`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: JSON.stringify(body) });
+    try {
+      expect((await post({ id: "managers", patch: { lizardMode: true }, assumeDisabled: true })).status).toBe(200);
+      expect((await post({ id: "managers", patch: { lizardMode: true } })).status).toBe(200);
+      expect(seen).toEqual([{ assumeDisabled: true }, undefined]);
+      expect((await post({ id: "managers", patch: { lizardMode: true }, assumeDisabled: "yes" })).status).toBe(400);
+    } finally { await app.stop(true); }
+  });
+});
+
 describe("POST /api/rules — create a rule", () => {
   const ACCEPTED_PLAN: RulesPlanOutcome = { ok: true, planHash: "create-hash-1", spawned: 0, stopped: 0, restarted: 0, scope: 5, etag: "etag-1", requiresConfirm: false };
   const CREATED: RulesWriteOutcome = { ok: true, backupId: "20261009T000000Z", etag: "etag-next", changedIds: ["new-rule"], reload: { applied: true, problems: [] } };

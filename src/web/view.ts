@@ -278,7 +278,8 @@ export interface ViewDeps {
     enabled: (id: string, enabled: boolean, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     fields: (id: string, patch: RuleFieldPatch, ifMatch: string, confirm: boolean, planHash: string) => Promise<RulesWriteOutcome>;
     undo: (backupId: string) => RulesWriteOutcome;
-    plan: (id: string, patch: RuleFieldPatch, confirm: boolean) => Promise<RulesPlanOutcome>;
+    /** local/ui: `opts.assumeDisabled` plans against the rule as it will be once turned off (see `PlanRuleWriteOptions`). */
+    plan: (id: string, patch: RuleFieldPatch, confirm: boolean, opts?: { assumeDisabled?: boolean }) => Promise<RulesPlanOutcome>;
     /** FACTORY-731 — `DELETE /api/rules/:id`. See `../rules/rules-write.ts`'s `writeRuleDelete` for the full gate list (unknown id, stale etag, enabled, live agents, missing confirm). */
     delete: (id: string, ifMatch: string, confirm: boolean) => RulesWriteOutcome;
     /**
@@ -1449,7 +1450,9 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const parsed = validateRuleFieldPatch(patchSource);
       if (!parsed.ok) { set.status = 400; return { error: parsed.error }; }
       const confirm = b.confirm === true;
-      const outcome = await deps.rulesWrite.plan(b.id, parsed.patch, confirm);
+      // local/ui: optional, dry-run only — see `PlanRuleWriteOptions.assumeDisabled`.
+      if (b.assumeDisabled !== undefined && typeof b.assumeDisabled !== "boolean") { set.status = 400; return { error: "assumeDisabled must be a boolean" }; }
+      const outcome = await deps.rulesWrite.plan(b.id, parsed.patch, confirm, b.assumeDisabled === true ? { assumeDisabled: true } : undefined);
       if (!outcome.ok) { set.status = outcome.status; return { error: outcome.error }; }
       set.headers["cache-control"] = "no-store";
       return outcome;

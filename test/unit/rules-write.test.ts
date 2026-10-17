@@ -1012,6 +1012,16 @@ describe("planRuleWrite (report-only)", () => {
     }
   });
 
+  test("local/ui: assumeDisabled plans a field edit against the rule as it will be once it's off: no restart, so a risky field is the reason", async () => {
+    seed([MANAGERS_RULE]); // enabled
+    const asIs = await planRuleWrite("managers", { lizardMode: true }, false, noScope, { env: env() });
+    expect(asIs.ok && [asIs.restarted, asIs.confirmReason]).toEqual([1, "stop-restart"]);
+    const afterDisable = await planRuleWrite("managers", { lizardMode: true }, false, noScope, { env: env() }, { assumeDisabled: true });
+    expect(afterDisable.ok && [afterDisable.restarted, afterDisable.requiresConfirm, afterDisable.confirmReason]).toEqual([0, true, "risky-permission"]);
+    const mixed = await planRuleWrite("managers", { enabled: false }, false, noScope, { env: env() }, { assumeDisabled: true });
+    expect(mixed.ok).toBe(false);
+  });
+
   test("refuses enabling while query is the placeholder", async () => {
     seed([{ ...UI_RULE, query: PLACEHOLDER_QUERY }]);
     const plan = await planRuleWrite("ui-first-rule", { enabled: true }, false, async () => 1, { env: env() });

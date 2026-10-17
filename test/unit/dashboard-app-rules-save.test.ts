@@ -41,6 +41,17 @@ async function setup(rules: RuleDto[], actions: RulesDraftAction[], opts: Parame
 }
 
 describe("reviewChanges", () => {
+  test("an enabled rule turned off with lizard mode switched on in the same draft: the update is reviewed against the off rule, so the save doesn't stop halfway", async () => {
+    const { api, state, etag } = await setup([rule({ enabled: true, lizardMode: false })], [{ type: "edit", key: "triage", changes: { enabled: false, lizardMode: true } }]);
+    const changes = computeRuleChanges(state);
+    expect(changes.map((c) => c.kind)).toEqual(["disable", "update"]);
+    const reviewed = await reviewChanges(api, changes);
+    const update = reviewed.find((r) => r.change.kind === "update")!;
+    expect([update.plan?.restarted, update.plan?.confirmReason]).toEqual([0, "risky-permission"]);
+    const outcome = await saveChanges(api, reviewed, etag);
+    expect(outcome.steps.map((s) => [s.change.kind, s.status, s.error ?? null])).toEqual([["disable", "saved", null], ["update", "saved", null]]);
+  });
+
   test("a disabled singleton rule edited to swarm and turned on is reviewed as a swarm enable, so the save confirms it instead of stopping halfway", async () => {
     const { api, state, etag } = await setup(
       [rule({ execution: "singleton" })],

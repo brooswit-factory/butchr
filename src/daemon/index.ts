@@ -1351,7 +1351,7 @@ const { app, mcp } = buildApp({
     enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
-    plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
+    plan: (id, patch, confirm, opts) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps, opts),
     // FACTORY-731: `hasLiveAgents` reads the SAME poll-fed
     // `dashboardFeed.snapshot().rows` every other "is this rule staffed"
     // check in this daemon already reads (`ruleHasLiveAgent`'s own doc
