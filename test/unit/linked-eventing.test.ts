@@ -116,6 +116,79 @@ describe("BUTCHR-436: linked-change eventing", () => {
     expect(reason.linked.events).toEqual([{ target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' }]);
   });
 
+  // FACTORY-252: reproduction sketch from the historical BUTCHR-430/439/421
+  // verification report — maxLinkedTurnsPerHour: 2, two earlier real
+  // deliveries use both slots, further real changes to the (still linked)
+  // targets are rate-capped on every tick while genuinely outstanding
+  // (mirroring the observed ~15s repeated [notify-suppressed] lines), then
+  // NO further changes are made and the clock advances past the 1-hour
+  // sliding window so both used slots age out. Expected per this module's
+  // own "DELAYED, NOT LOST" contract: the FIRST tick after the window frees
+  // re-detects the still-outstanding diff against its still-unadvanced
+  // baseline and delivers a coalesced catch-up notify — WITHOUT any new
+  // change having landed at that tick.
+  test("FACTORY-252: a rate-capped change that stops recurring is still caught up once the hourly window frees, with no new event needed", async () => {
+    const owner = issue("BUTCHR-1", {
+      issuelinks: [
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" },
+        { type: "Blocks", otherEnd: "outward", key: "BUTCHR-3" },
+      ] as never,
+    });
+    const world: Record<string, JiraIssue> = {
+      "BUTCHR-2": issue("BUTCHR-2", { status: "To Do" }),
+      "BUTCHR-3": issue("BUTCHR-3", { status: "To Do" }),
+    };
+    const state = createLinkedEventingState();
+    const now = { value: 0 };
+    const { deps, notified, logs } = fakeDeps(world, { now });
+    const r = rule({ maxLinkedTurnsPerHour: 2 });
+    const m = match("jira-work:task:BUTCHR-1", r, owner);
+
+    await state.runTick([m], deps); // seed both baselines
+    expect(notified).toHaveLength(0);
+
+    // Two real changes, each on its own tick, use both of the hour's slots.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "In Progress" });
+    now.value += 11_000;
+    await state.runTick([m], deps);
+    world["BUTCHR-3"] = issue("BUTCHR-3", { status: "In Progress" });
+    now.value += 11_000;
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(2); // both slots now used
+
+    // The genuinely outstanding change: BUTCHR-2 moves again while capped.
+    world["BUTCHR-2"] = issue("BUTCHR-2", { status: "Done" });
+    now.value += 20_000;
+    await state.runTick([m], deps); // capped — held, not delivered
+    expect(notified).toHaveLength(2);
+    const suppressedCount = () => logs.filter((l) => l.startsWith("[notify-suppressed]") && l.includes("arm=rate-capped")).length;
+    expect(suppressedCount()).toBeGreaterThan(0);
+
+    // A few more ticks while STILL capped and the diff is STILL outstanding
+    // — the suppression line fires every time, matching the historical
+    // report's "every ~15s while something is actively pending".
+    for (let i = 0; i < 3; i++) {
+      now.value += 15_000;
+      await state.runTick([m], deps);
+    }
+    expect(notified).toHaveLength(2); // still never delivered
+    const suppressedBeforeQuiet = suppressedCount();
+    expect(suppressedBeforeQuiet).toBeGreaterThan(1); // fired on every one of those ticks too
+
+    // Now NO further changes land on either target — just the clock running
+    // until both used slots age out of the sliding hour.
+    now.value += 61 * 60_000 - 42_000; // past both turns' one-hour mark
+    await state.runTick([m], deps);
+
+    // The still-outstanding BUTCHR-2 diff (never delivered) must be caught
+    // up now, coalesced into exactly one notify, with no new change at all.
+    expect(notified).toHaveLength(3);
+    const reason = notified[2]!.reason as { linked: { events: readonly { target: string; kind: string; detail: string }[] } };
+    expect(reason.linked.events).toEqual([
+      { target: "BUTCHR-2", kind: "issuelink", detail: 'status changed from "In Progress" to "Done" (as of 2026-09-16T00:00:00.000+0000)' },
+    ]);
+  });
+
   test("an agent's own edit to a linked ticket does not notify itself (own-write echo)", async () => {
     const owner = issue("BUTCHR-1", { issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never });
     const world: Record<string, JiraIssue> = { "BUTCHR-2": issue("BUTCHR-2", { status: "To Do", updated: "t1" }) };
