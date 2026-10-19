@@ -94,12 +94,35 @@ const SCENARIO_PHRASES: Record<string, RegExp> = {
  * as `SCENARIO_PHRASES` above.
  */
 const BLOCKED_TO_DO_PHRASES: Record<string, RegExp> = {
-  "genuinely blocked work moves to To Do before stopping": /move the issue to to do before\s+you stop or go idle/i,
+  // Round-1 review (PR #819): the bare "move to To Do" instruction, with
+  // no requirement that the ACTUAL-BLOCKER condition precede it, survived
+  // deleting the opening "When your scoped work genuinely cannot proceed
+  // ... or another actual hold," clause — leaving an unconditional To Do
+  // instruction. This now requires both halves together: the condition's
+  // own closing anchor ("or another actual hold,") immediately followed by
+  // the move instruction, so deleting the condition (while leaving the
+  // instruction) fails this test.
+  "genuinely blocked work moves to To Do before stopping, conditioned on an actual hold":
+    /genuinely cannot proceed because of a\s*confirmed[\s\S]*?or another actual hold, move the issue to to do before\s+you stop or go idle/i,
   "blocked rule takes precedence over staying In Progress for query-eligibility": /do\s+not leave a genuinely blocked issue in progress solely to keep it\s+query-eligible/i,
-  "holds/assignee/PR/reviewer continuity preserved across the move": /implementation\/pr\/reviewer continuity/i,
+  // Round-1 review: the narrow "implementation/PR/reviewer continuity"
+  // substring alone survived deleting the entire preceding preservation
+  // list ("Preserve every blocked label, approval/quota/dependency/
+  // freeze/cancellation hold, the existing assignee, and all"). Now
+  // requires the full clause, so deleting that list (while leaving the
+  // continuity words) fails this test.
+  "holds/assignee/PR/reviewer continuity preserved across the move":
+    /preserve every blocked label, approval\/quota\/dependency\/\s*freeze\/cancellation hold, the existing assignee, and all\s*implementation\/pr\/reviewer continuity/i,
   "status change grants no permission and does not finish/cancel the work": /changing status grants no\s+permission, clears no blocker, and neither finishes nor cancels the work/i,
   "existing PR is not closed/abandoned merely because the issue moves to To Do": /never close or abandon an existing pr merely because its issue moves to to\s+do/i,
-  "one concise cause/unblock-condition/next-owner comment on an actual change": /naming the concrete cause and evidence, the exact condition\s+that unblocks/i,
+  // Round-1 review: the cause/unblock-condition fragment alone survived
+  // deleting BOTH the leading "Post one concise comment when the blocked
+  // state actually changes," trigger and the trailing "and the responsible
+  // next owner/action," clause. Now requires the trigger, the cause/
+  // unblock-condition fragment, AND the next-owner/action clause together
+  // in one match, so deleting any of the three fails this test.
+  "one concise cause/unblock-condition/next-owner comment on an actual change":
+    /post one concise comment when the blocked state actually\s+changes,\s*naming the concrete cause and evidence, the exact condition\s+that unblocks\s*it, and the responsible next owner\/action/i,
   "no repeated unchanged blocker comment on every wake": /don't repost the same still-true blocker\s+comment on every wake/i,
   "no re-asking a decision already resolved in the latest history": /don't ask again for a decision already resolved\s+in the latest history/i,
   "ordinary pending CI/review is not automatically a blocker": /ordinary pending ci or an active requested review is\s+not automatically a blocker/i,
