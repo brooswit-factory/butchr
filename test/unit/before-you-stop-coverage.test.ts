@@ -59,7 +59,16 @@ const SCENARIO_PHRASES: Record<string, RegExp> = {
   "transition unavailable on this issue's workflow": /the target status\s+doesn't exist on this issue's workflow/i,
   "transition denied": /it was denied/i,
   "readback mismatch": /the readback doesn't match/i,
-  "blocked\\/incomplete acceptance cannot close": /acceptance that hasn't actually happened yet/i,
+  "incomplete acceptance cannot close": /acceptance that hasn't actually happened yet/i,
+  // Round-4 review finding: this is an INDEPENDENT falsifier from the
+  // incomplete-acceptance one above — anchored to "being blocked," as a
+  // literal substring of the SAME sentence that ends "...is never by
+  // itself grounds to move to Done," ([^.]* stops at the sentence
+  // boundary) so deleting just "Being blocked," from that sentence (while
+  // leaving "having posted a comment"/"agent having stopped" intact)
+  // fails this test even though the incomplete-acceptance regex above,
+  // and the shared source's other scenario phrases, stay green.
+  "being blocked is never by itself grounds to move to Done": /being\s+blocked,[^.]*is never by itself grounds to move to done/i,
   "waiver is scoped to the named requirement": /waiver of that named\s+requirement/i,
   "no duplicate unchanged comment on every wake": /don't repost the same still-true comment on every wake/i,
   // finding 1a: use jira_transition by name when supported, else discover
