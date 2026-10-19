@@ -15,10 +15,14 @@ freshly read this issue's current status, full comment history, holds and
 dependencies, and current PR state — never transition off stale
 information. Discover the live transition API/schema and the target
 statuses actually available on THIS issue. Use the supported
-`jira_transition` (key, status) by name when this issue's workflow
-supports it; when it doesn't, discover the actual transition ID through
-the live API instead and use that — never hardcode or copy a status name
-or a transition ID from another issue.
+`jira_transition` (key, status) by name if that tool is present; only when
+it is absent should you instead discover this issue's own transition IDs
+through the live, authorized API and use those — never hardcode or copy a
+status name or a transition ID from another issue. Whether a particular
+target status exists on THIS issue's workflow is a separate question from
+which tool/API you use to make the call — discovering a transition ID
+cannot make an unsupported target status exist; see the failure paragraph
+below for what to do when the target status itself isn't available.
 
 Move to In Progress when actual authorized implementation starts — the
 transition itself is not proof staffing happened, only a record of it.

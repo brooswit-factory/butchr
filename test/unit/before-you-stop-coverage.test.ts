@@ -73,7 +73,16 @@ const SCENARIO_PHRASES: Record<string, RegExp> = {
   "no duplicate unchanged comment on every wake": /don't repost the same still-true comment on every wake/i,
   // finding 1a: use jira_transition by name when supported, else discover
   // the real transition ID live — never hardcode/copy either.
-  "transition-ID discovery fallback when status-name transition isn't supported": /discover the actual transition id through\s+the live api/i,
+  // Round-5 review finding: the fallback is chosen by TOOL/API presence
+  // (jira_transition present vs. absent), never by whether this issue's
+  // WORKFLOW supports a given target status — those are separate
+  // questions, and discovering an ID cannot make an unsupported status
+  // exist. This regex requires both halves of that distinction in order
+  // ("by name if that tool is present" ... "only when it is absent should
+  // you instead discover"), so rephrasing the fallback condition back to
+  // workflow-support fails this test even if some other "discover...ID"
+  // text still exists elsewhere in the source.
+  "transition tool/API presence (not workflow support) selects the fallback": /by name if that tool is present;\s*only when\s*it is absent should you instead discover/i,
   // finding 1b: an agent:working label change is never grounds for Done.
   "agent:working label change is never grounds for Done": /an?\s+agent:working label changing is never by itself grounds to move to done/i,
 };
