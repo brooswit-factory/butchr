@@ -13,6 +13,7 @@ import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
+import RECURSIVE_CHILD_CLOSURE from "../../briefs/_recursive-child-closure.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
@@ -193,8 +194,22 @@ export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec
  */
 export const BEFORE_YOU_STOP_INCLUDE_MARKER = "<!-- include: briefs/_before-you-stop.md -->";
 
-/** Resolves `BEFORE_YOU_STOP_INCLUDE_MARKER` in a shipped brief template to the shared section's real text. */
-const resolveIncludes = (template: string): string => template.replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim());
+/**
+ * FACTORY-1020: the marker a parent-tier template (one whose issue type can
+ * own children — epic/story/bug/project today) carries to pull in the
+ * shared recursive-child-closure section. `task.md`/`default.md` carry no
+ * marker and so get no recursive-closure text — a bare Task owns no
+ * children to recurse into. Same include discipline as
+ * `BEFORE_YOU_STOP_INCLUDE_MARKER` above: `briefs/_recursive-child-closure.md`
+ * itself is not a template and carries no marker of its own.
+ */
+export const RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER = "<!-- include: briefs/_recursive-child-closure.md -->";
+
+/** Resolves every known `<!-- include: ... -->` marker in a shipped brief template to its shared section's real text. */
+const resolveIncludes = (template: string): string =>
+  template
+    .replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim())
+    .replaceAll(RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER, RECURSIVE_CHILD_CLOSURE.trim());
 
 const BRIEF_BY_TYPE: Readonly<Record<string, string>> = {
   epic: resolveIncludes(EPIC),

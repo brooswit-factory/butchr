@@ -101,4 +101,6 @@ against their own checkout.
 
 Use `jira_add_labels` or `jira_remove_labels` (key, labels) when the workflow requests a label change. Inspect existing labels first and preserve unrelated labels. Do not remove holds or cancellation markers without authorization.
 
+<!-- include: briefs/_recursive-child-closure.md -->
+
 <!-- include: briefs/_before-you-stop.md -->

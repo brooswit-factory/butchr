@@ -107,4 +107,6 @@ identified project discussion page via `confluence_add_comment`, or the issue
 being reviewed via `jira_add_comment`. A project key is not an issue key; never
 pass it as one. Report a missing discussion destination instead of guessing.
 
+<!-- include: briefs/_recursive-child-closure.md -->
+
 <!-- include: briefs/_before-you-stop.md -->
