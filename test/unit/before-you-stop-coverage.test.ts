@@ -160,14 +160,30 @@ describe("FACTORY-1020: worker briefs own verified In Review and Done transition
     }
   });
 
-  test("briefs/_recursive-child-closure.md exists and requires recursive, verified child closure with project-key safety", () => {
+  test("briefs/_recursive-child-closure.md exists and requires recursive, verified descendant closure with project-key safety", () => {
     const text = readFileSync(join(BRIEFS_DIR, "_recursive-child-closure.md"), "utf8");
-    expect(text).toMatch(/read the actual current state of every\s+child/i);
-    expect(text).toMatch(/require its owner to correct the status/i);
+    expect(text).toMatch(/read the actual current state of every\s+descendant/i);
+    expect(text).toMatch(/require its owner to\s+correct the status/i);
     expect(text).toMatch(/verify that correction yourself/i);
-    expect(text).toMatch(/do not close\s+this ticket while scoped child work remains unmet/i);
-    expect(text).toMatch(/never silently treat an unmet child as done/i);
-    expect(text).toMatch(/never on the project key itself/i); // project-key safety
+    expect(text).toMatch(/do not close\s+this ticket while scoped work anywhere in that\s+descendant tree remains unmet/i);
+    expect(text).toMatch(/never silently treat an unmet descendant as\s+done/i);
+    expect(text).toMatch(/never on the\s+project key itself/i); // project-key safety
+  });
+
+  // Review finding (PR #818, round 1): the fragment previously stopped at
+  // the IMMEDIATE child's status, so a Done direct child could conceal
+  // unmet or unevidenced grandchild work. These are the two falsifiers:
+  // delete the recursion requirement, or delete the per-level evidence
+  // requirement, and this test must fail either way.
+  test("the recursive-closure fragment requires traversing EVERY level, not just immediate children, and verified closure evidence at each level", () => {
+    const text = readFileSync(join(BRIEFS_DIR, "_recursive-child-closure.md"), "utf8");
+    expect(text).toMatch(/not just its immediate children/i); // falsifier: recursion requirement
+    expect(text).toMatch(/recursively/i);
+    expect(text).toMatch(/recurse into\s+its own children/i);
+    expect(text).toMatch(/level by level/i);
+    expect(text).toMatch(/is not by itself sufficient to trust/i); // falsifier: evidence requirement
+    expect(text).toMatch(/has the linked closure\/acceptance evidence/i);
+    expect(text).toMatch(/at any depth/i);
   });
 
   // THE FALSIFIER for recursive closure: fails loud if a parent-tier
@@ -192,14 +208,46 @@ describe("FACTORY-1020: worker briefs own verified In Review and Done transition
   test("briefFor() resolves the recursive-closure include for every parent tier, and never leaks the marker", () => {
     for (const type of ["epic", "story", "bug", "project"]) {
       const brief = briefFor(type);
-      expect(brief).toMatch(/require its owner to correct the status/i);
+      expect(brief).toMatch(/require its owner to\s+correct the status/i);
       expect(brief).not.toContain(RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER);
     }
   });
 
   test("briefFor() for task and the DEFAULT fallback does NOT resolve recursive-closure text", () => {
     for (const type of ["task", "Sub-task"]) {
-      expect(briefFor(type)).not.toMatch(/require its owner to correct the status/i);
+      expect(briefFor(type)).not.toMatch(/require its owner to\s+correct the status/i);
     }
+  });
+
+  // Review finding (PR #818, round 1): project.md correctly says a
+  // project key is not an issue key, but the shared lifecycle section used
+  // to tell EVERY brief (project included) to manage "your own Jira
+  // lifecycle" and call `jira_transition` on "this issue" — internally
+  // unsafe once resolved into project.md, which owns a PROJECT key, not an
+  // issue key. The shared source now exempts a project resource
+  // explicitly; this is the falsifier for that exemption.
+  test("the shared lifecycle section exempts a project resource from issue-transition instructions", () => {
+    const text = readFileSync(join(BRIEFS_DIR, "_before-you-stop.md"), "utf8");
+    expect(text).toMatch(/if what you own is\s+a project resource/i);
+    expect(text).toMatch(/never call `jira_transition` with a project\s+key/i);
+    expect(text).toMatch(/it is not an issue key/i);
+  });
+
+  test("the resolved project brief never directs a transition of the project key — it carries both the project-key warning and the issue-scoped exemption", () => {
+    const brief = briefFor("project");
+    // project.md's own, pre-existing warning (never touched by this ticket):
+    expect(brief).toMatch(/a project key is not an issue key; never/i);
+    // the shared section's new exemption, now resolved into this same brief:
+    expect(brief).toMatch(/never call `jira_transition` with a project\s+key/i);
+    expect(brief).toMatch(/skip them entirely for the\s+project resource itself/i);
+  });
+
+  test("a non-project brief (task) is unaffected by the project exemption — it still gets the full issue-transition rules unconditionally", () => {
+    const brief = briefFor("task");
+    for (const phrase of REQUIRED_LIFECYCLE_PHRASES) expect(brief).toMatch(phrase);
+    // the conditional exemption text is present (it's shared), but nothing
+    // about task.md's OWN content tells it to skip transitioning its issue —
+    // task.md never claims to own a "project resource".
+    expect(brief.toLowerCase()).not.toContain("you own a product direction");
   });
 });

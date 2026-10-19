@@ -1,5 +1,14 @@
 ## Before you stop or go idle
 
+Everything below about transitioning, reading back, and moving through In
+Progress/In Review/Done is about a Jira ISSUE's status. If what you own is
+a project resource rather than a single Jira issue, you have no status of
+your own to transition at all: never call `jira_transition` with a project
+key — it is not an issue key. Apply the rules below only to an actual issue
+you are directly working or reviewing, if any; skip them entirely for the
+project resource itself, and post your before-you-stop comment on the
+destination your own brief names instead.
+
 You own keeping your own Jira lifecycle accurate; a status change is never
 someone else's job to notice and apply for you. Before any transition,
 freshly read this issue's current status, full comment history, holds and
