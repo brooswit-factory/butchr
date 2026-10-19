@@ -12,14 +12,18 @@ level by level, not just the direct children.
 A descendant reporting Done is not by itself sufficient to trust: also
 verify IT has the linked closure/acceptance evidence its own definition of
 done actually requires (review, merge, release/deployment, end-to-end
-acceptance — whichever apply) rather than an unverified status flip, and
-recurse into ITS OWN children before accepting its Done as real — a Done
-direct child can otherwise conceal unmet or unevidenced work at a deeper
-level. For every descendant, at every level, that is still open, still
-scoped, and not explicitly cancelled or waived, require its owner to
-correct the status and then verify that correction yourself by reading it
-back. Do not close this ticket while scoped work anywhere in that
-descendant tree remains unmet or unevidenced, however deep.
+acceptance — whichever apply), and recurse into ITS OWN children, before
+accepting its Done as real. A Done that lacks that evidence, or that hides
+unresolved descendants underneath it, is a STALE status exactly like a
+status that never advanced — require its owner to correct it to whatever
+the real state actually is, then verify that correction yourself by
+reading it back, the same way you would for work that is stuck. Genuinely,
+accurately open, in-scope work that is not cancelled or waived needs no
+such correction from its owner — it already carries the right status; it
+simply blocks this ticket from closing until it resolves. Do not close
+this ticket while scoped work anywhere in that descendant tree remains
+unmet or unevidenced, however deep — whether that work is honestly still
+open or hiding behind a false Done.
 
 Document explicitly any descendant that is genuinely unrelated, cancelled,
 or has an explicit user waiver; never silently treat an unmet descendant as

@@ -14,9 +14,11 @@ someone else's job to notice and apply for you. Before any transition,
 freshly read this issue's current status, full comment history, holds and
 dependencies, and current PR state — never transition off stale
 information. Discover the live transition API/schema and the target
-statuses actually available on THIS issue, and use `jira_transition` (key,
-status) with a supported target; never hardcode or copy a transition ID
-from another issue.
+statuses actually available on THIS issue. Use the supported
+`jira_transition` (key, status) by name when this issue's workflow
+supports it; when it doesn't, discover the actual transition ID through
+the live API instead and use that — never hardcode or copy a status name
+or a transition ID from another issue.
 
 Move to In Progress when actual authorized implementation starts — the
 transition itself is not proof staffing happened, only a record of it.
@@ -33,9 +35,10 @@ explicit user waiver of that named requirement. Where the ticket requires
 them, required review, merge, release/deployment and end-to-end acceptance
 are part of Done — an approval, merged code, or green CI alone never
 substitutes for acceptance that hasn't actually happened yet. Being
-blocked, having posted a comment, or being about to stop is never by
-itself grounds to move to Done. Preserve existing approval gates and do not
-infer a waiver that was never actually given.
+blocked, having posted a comment, the agent having stopped, or an
+agent:working label changing is never by itself grounds to move to Done.
+Preserve existing approval gates and do not infer a waiver that was never
+actually given.
 
 After every transition, read the issue back and verify the status actually
 changed to what you asked for. If the transition failed, the target status
