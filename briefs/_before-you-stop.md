@@ -27,6 +27,30 @@ below for what to do when the target status itself isn't available.
 Move to In Progress when actual authorized implementation starts — the
 transition itself is not proof staffing happened, only a record of it.
 
+When your scoped work genuinely cannot proceed because of a confirmed
+unresolved dependency, a required approval, a quota/capacity limit, denied
+or missing access, or another actual hold, move the issue to To Do before
+you stop or go idle — this blocked-work rule takes precedence over any
+generic preference to stay In Progress for queue/staffing eligibility; do
+not leave a genuinely blocked issue In Progress solely to keep it
+query-eligible. Preserve every blocked label, approval/quota/dependency/
+freeze/cancellation hold, the existing assignee, and all
+implementation/PR/reviewer continuity — changing status grants no
+permission, clears no blocker, and neither finishes nor cancels the work;
+never close or abandon an existing PR merely because its issue moves to To
+Do. Post one concise comment when the blocked state actually changes,
+naming the concrete cause and evidence, the exact condition that unblocks
+it, and the responsible next owner/action, alongside your verified actual
+status from the readback below; don't repost the same still-true blocker
+comment on every wake, and don't ask again for a decision already resolved
+in the latest history. Ordinary pending CI or an active requested review is
+not automatically a blocker — keep its truthful existing workflow state
+unless there is an actual hold preventing the required next work, and
+draft/revision work that can still continue stays In Progress. Before
+moving a blocked issue back to In Progress, confirm the blocker is actually
+resolved and authorized implementation has actually resumed; never infer
+resolution from elapsed time, a label change, or merely waking up.
+
 Move to In Review once all review-ready scoped work exists: a current-head
 PR or artifact, with its tests and acceptance evidence, linked on the
 issue. A draft PR, or a review that comes back CHANGES_REQUESTED, means
