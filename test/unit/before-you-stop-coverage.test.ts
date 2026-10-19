@@ -87,6 +87,49 @@ const SCENARIO_PHRASES: Record<string, RegExp> = {
   "agent:working label change is never grounds for Done": /an?\s+agent:working label changing is never by itself grounds to move to done/i,
 };
 
+/**
+ * FACTORY-1021: a genuinely blocked issue moves to To Do — one falsifier
+ * per named DoD scenario, each anchored to that scenario's own sentence so
+ * deleting just that sentence fails exactly its own test, same discipline
+ * as `SCENARIO_PHRASES` above.
+ */
+const BLOCKED_TO_DO_PHRASES: Record<string, RegExp> = {
+  // Round-1 review (PR #819): the bare "move to To Do" instruction, with
+  // no requirement that the ACTUAL-BLOCKER condition precede it, survived
+  // deleting the opening "When your scoped work genuinely cannot proceed
+  // ... or another actual hold," clause — leaving an unconditional To Do
+  // instruction. This now requires both halves together: the condition's
+  // own closing anchor ("or another actual hold,") immediately followed by
+  // the move instruction, so deleting the condition (while leaving the
+  // instruction) fails this test.
+  "genuinely blocked work moves to To Do before stopping, conditioned on an actual hold":
+    /genuinely cannot proceed because of a\s*confirmed[\s\S]*?or another actual hold, move the issue to to do before\s+you stop or go idle/i,
+  "blocked rule takes precedence over staying In Progress for query-eligibility": /do\s+not leave a genuinely blocked issue in progress solely to keep it\s+query-eligible/i,
+  // Round-1 review: the narrow "implementation/PR/reviewer continuity"
+  // substring alone survived deleting the entire preceding preservation
+  // list ("Preserve every blocked label, approval/quota/dependency/
+  // freeze/cancellation hold, the existing assignee, and all"). Now
+  // requires the full clause, so deleting that list (while leaving the
+  // continuity words) fails this test.
+  "holds/assignee/PR/reviewer continuity preserved across the move":
+    /preserve every blocked label, approval\/quota\/dependency\/\s*freeze\/cancellation hold, the existing assignee, and all\s*implementation\/pr\/reviewer continuity/i,
+  "status change grants no permission and does not finish/cancel the work": /changing status grants no\s+permission, clears no blocker, and neither finishes nor cancels the work/i,
+  "existing PR is not closed/abandoned merely because the issue moves to To Do": /never close or abandon an existing pr merely because its issue moves to to\s+do/i,
+  // Round-1 review: the cause/unblock-condition fragment alone survived
+  // deleting BOTH the leading "Post one concise comment when the blocked
+  // state actually changes," trigger and the trailing "and the responsible
+  // next owner/action," clause. Now requires the trigger, the cause/
+  // unblock-condition fragment, AND the next-owner/action clause together
+  // in one match, so deleting any of the three fails this test.
+  "one concise cause/unblock-condition/next-owner comment on an actual change":
+    /post one concise comment when the blocked state actually\s+changes,\s*naming the concrete cause and evidence, the exact condition\s+that unblocks\s*it, and the responsible next owner\/action/i,
+  "no repeated unchanged blocker comment on every wake": /don't repost the same still-true blocker\s+comment on every wake/i,
+  "no re-asking a decision already resolved in the latest history": /don't ask again for a decision already resolved\s+in the latest history/i,
+  "ordinary pending CI/review is not automatically a blocker": /ordinary pending ci or an active requested review is\s+not automatically a blocker/i,
+  "draft/revision work that can continue stays In Progress": /draft\/revision work that can still continue stays in\s+progress/i,
+  "blocked -> In Progress requires confirmed actual resume, never inferred": /confirm the blocker is actually\s+resolved and authorized implementation has actually resumed; never infer\s+resolution from elapsed time, a label change, or merely waking up/i,
+};
+
 /** Every template under `briefs/` whose name starts with "_" is a shared fragment, never a standalone brief. */
 const isSharedFragment = (f: string): boolean => f.startsWith("_");
 
@@ -344,5 +387,48 @@ describe("FACTORY-1020: worker briefs own verified In Review and Done transition
     // about task.md's OWN content tells it to skip transitioning its issue —
     // task.md never claims to own a "project resource".
     expect(brief.toLowerCase()).not.toContain("you own a product direction");
+  });
+});
+
+describe("FACTORY-1021: genuinely blocked work moves to To Do", () => {
+  // THE FALSIFIERS: one assertion per named DoD scenario, each targeting
+  // ONLY that scenario's own sentence in the shared source.
+  for (const [scenario, phrase] of Object.entries(BLOCKED_TO_DO_PHRASES)) {
+    test(`the shared source falsifies: ${scenario}`, () => {
+      const text = readFileSync(join(BRIEFS_DIR, "_before-you-stop.md"), "utf8");
+      expect(text).toMatch(phrase);
+    });
+  }
+
+  test("briefFor() resolves the blocked-to-To Do rule into every known tier plus the DEFAULT fallback", () => {
+    for (const type of [...knownBriefTypes(), "Sub-task"]) {
+      const brief = briefFor(type);
+      for (const phrase of Object.values(BLOCKED_TO_DO_PHRASES)) expect(brief).toMatch(phrase);
+    }
+  });
+
+  test("both kickoff prompts carry the blocked-to-To Do rule", () => {
+    for (const phrase of Object.values(BLOCKED_TO_DO_PHRASES)) {
+      expect(KICKOFF_PROMPT).toMatch(phrase);
+      expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
+    }
+  });
+
+  // The readback/failure-reporting paragraph already above this rule in the
+  // shared source is generic over "the target status" — it is not
+  // re-narrowed here, but confirm it still applies verbatim to a To Do
+  // transition: an unavailable/denied/mismatched To Do move must be
+  // reported, never silently substituted or claimed.
+  test("the existing generic readback/failure paragraph still covers a To Do transition (not narrowed to Review/Done)", () => {
+    const text = readFileSync(join(BRIEFS_DIR, "_before-you-stop.md"), "utf8");
+    expect(text).toMatch(/the target status\s+doesn't exist on this issue's workflow/i);
+    expect(text).toMatch(/do not claim success or silently\s+substitute a different status, done included/i);
+    expect(text).toMatch(/leave the status as it is rather than picking a\s+different one/i);
+  });
+
+  test("the project-key exemption still applies: a project brief never directs a To Do transition of its own project key", () => {
+    const brief = briefFor("project");
+    expect(brief).toMatch(/never call `jira_transition` with a project\s+key/i);
+    expect(brief).toMatch(/skip them entirely for the\s+project resource itself/i);
   });
 });
