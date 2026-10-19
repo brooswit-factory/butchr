@@ -166,5 +166,6 @@ you've since pushed past, means ask for a re-review, not merge; a
 means read the review, fix, push, and comment that a re-review is
 needed. Then merge your own PR.
 
+<!-- include: briefs/_recursive-child-closure.md -->
 
 <!-- include: briefs/_before-you-stop.md -->
