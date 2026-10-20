@@ -726,6 +726,13 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // fields already carry. No I/O on this request path either: `dashboard()`
     // and `header()` both just read state a poll already produced.
     .get("/", async () => {
+      // In setup mode the legacy dashboard has nothing useful to say and no
+      // link out — the only reachable UI is the React setup wizard at
+      // `/dashboard-app/`. Send the operator straight there so a fresh
+      // install doesn't dead-end on a yellow "COULD NOT CHECK" banner.
+      if (deps.setupStatus?.().configured === false) {
+        return new Response(null, { status: 302, headers: { location: "/dashboard-app/" } });
+      }
       const response = await deps.dashboard();
       const html = renderDashboard(response, {
         now: Date.now(),
@@ -748,6 +755,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     // request path. A rejected `configInventory()` is reported as a loud
     // fetch-failure banner (requirement 4), never a thrown 500.
     .get("/configurations", async () => {
+      // Same setup-mode redirect as `/` above: this page is a cross-link
+      // over the dashboard's rows, which don't exist yet in setup mode.
+      if (deps.setupStatus?.().configured === false) {
+        return new Response(null, { status: 302, headers: { location: "/dashboard-app/" } });
+      }
       const dashboard = await deps.dashboard();
       let result: ConfigInventoryFetchResult;
       try {
