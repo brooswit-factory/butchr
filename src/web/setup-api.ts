@@ -11,7 +11,6 @@
 import { validateAtlassianSiteShape } from "../config/config.js";
 import { writeJiraToken, jiraTokenFilePath, type JiraTokenWriteIo, type FetchLike, type JiraTokenWriteOutcome } from "../setup/jira-token-write.js";
 import { writeJiraIdentity, jiraIdentityFilePath, type JiraIdentityFileIo } from "../setup/jira-identity-file.js";
-import type { SetupCodeManager } from "../setup/setup-code.js";
 
 export interface SetupStatusResponse {
   configured: boolean;
@@ -27,7 +26,6 @@ export type JiraWriteRequestOutcome =
   | { ok: false; status: 409; body: { error: "provided by environment" } }
   | { ok: false; status: 429; body: { error: string }; retryAfterSeconds: number };
 
-/** Called by `handleJiraTokenWrite` only AFTER the setup code has verified, so a mistyped code can never spend rate-limit budget (director 2026-10-06, item 5). */
 export type RateGate = () => { ok: true } | { ok: false; error: string; retryAfterSeconds: number };
 
 /** True iff the daemon's OWN process env currently supplies the Atlassian token — never derived from the request body. */
@@ -47,7 +45,6 @@ export function isTokenLiteralFromEnvironment(env: Record<string, string | undef
 }
 
 export interface JiraWriteDeps {
-  setupCode: SetupCodeManager;
   io?: JiraTokenWriteIo;
   fetchFn?: FetchLike;
   path?: string;
@@ -101,9 +98,15 @@ function outcomeToResponse(outcome: JiraTokenWriteOutcome, identity?: { persiste
  * the request's concern to override. `requireEnvCheck:
  * false` (initial setup) skips that check entirely: setup mode exists
  * precisely because no env-provided token exists yet.
+ *
+ * The write-guard chain (same-UID peer, origin, CSRF) run before this
+ * function is the gate on who may call it; there is no separate operator
+ * code because any same-UID process already has arbitrary read on the
+ * secret files this writes and shell access via herdr's own same-UID
+ * socket — a second knock in front of walls that low adds nothing.
  */
 export async function handleJiraTokenWrite(
-  input: { site: string; email: string; token: string; setupCode: string },
+  input: { site: string; email: string; token: string },
   deps: JiraWriteDeps,
   opts: { requireEnvCheck: boolean; rateGate?: RateGate },
 ): Promise<JiraWriteRequestOutcome> {
@@ -116,10 +119,6 @@ export async function handleJiraTokenWrite(
   const destination = deps.checkDestination?.(path);
   if (destination && !destination.ok) return { ok: false, status: 400, body: { error: destination.error } };
 
-  const codeCheck = deps.setupCode.check(input.setupCode);
-  if (!codeCheck.ok) {
-    return { ok: false, status: 400, body: { error: `setup code: ${codeCheck.reason}` } };
-  }
   const gate = opts.rateGate?.();
   if (gate && !gate.ok) return { ok: false, status: 429, body: { error: gate.error }, retryAfterSeconds: gate.retryAfterSeconds };
 

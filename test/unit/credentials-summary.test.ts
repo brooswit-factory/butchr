@@ -1,12 +1,12 @@
 /**
  * local/ui — the credentials summary `GET /api/settings` carries: sources,
- * paths, file health and setup-code instructions, never a token value.
+ * paths and file health, never a token value.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildCredentialsSummary, setupCodeInstructions, type CredentialsSummaryInput } from "../../src/web/credentials-api.js";
+import { buildCredentialsSummary, type CredentialsSummaryInput } from "../../src/web/credentials-api.js";
 
 const CANARY = "s3cr3t-canary-TOKEN-value";
 let dir: string;
@@ -17,7 +17,7 @@ const STARTED = "2026-10-16T11:55:17.444Z";
 const launchd = { kind: "launchd" as const, job: { label: "com.example.butchr", target: "gui/501/com.example.butchr", stderrPath: "/Users/b/Library/Logs/butchr.log" } };
 
 function input(overrides: Partial<CredentialsSummaryInput> = {}): CredentialsSummaryInput {
-  return { rawEnv: { XDG_CONFIG_HOME: dir }, settingsFileValues: {}, atlassian: { site: "https://x.atlassian.net", email: "a@b.c" }, githubActive: false, running: { githubOrgs: [], zendeskSubdomain: null, trelloBoardId: null }, startedAt: STARTED, supervisor: launchd, ownPid: 77, ...overrides };
+  return { rawEnv: { XDG_CONFIG_HOME: dir }, settingsFileValues: {}, atlassian: { site: "https://x.atlassian.net", email: "a@b.c" }, githubActive: false, running: { githubOrgs: [], zendeskSubdomain: null, trelloBoardId: null }, startedAt: STARTED, supervisor: launchd, ...overrides };
 }
 
 describe("buildCredentialsSummary", () => {
@@ -65,23 +65,6 @@ describe("buildCredentialsSummary", () => {
   test("a site with embedded credentials is redacted", async () => {
     const summary = await buildCredentialsSummary(input({ atlassian: { site: "https://user:pass@x.atlassian.net", email: "a@b.c" } }));
     expect(summary.atlassian.site).toBe("https://[redacted]@x.atlassian.net");
-  });
-});
-
-describe("setupCodeInstructions", () => {
-  test("launchd: launchctl kill for this job, and a grep of its own stderr log", () => {
-    expect(setupCodeInstructions(launchd, 77)).toEqual({
-      command: "launchctl kill SIGUSR2 gui/$(id -u)/com.example.butchr",
-      findCommand: "grep 'setup code' /Users/b/Library/Logs/butchr.log | tail -1",
-      where: "butchr's log (/Users/b/Library/Logs/butchr.log)",
-    });
-    const spaced = setupCodeInstructions({ kind: "launchd", job: { ...launchd.job, stderrPath: "/Users/b/My Logs/it's.log" } }, 77);
-    expect(spaced.findCommand).toBe(`grep 'setup code' '/Users/b/My Logs/it'\\''s.log' | tail -1`);
-  });
-
-  test("systemd and an unsupervised process", () => {
-    expect(setupCodeInstructions({ kind: "systemd" }, 77).command).toBe("systemctl --user kill -s SIGUSR2 butchr.service");
-    expect(setupCodeInstructions({ kind: "none" }, 77)).toEqual({ command: "kill -USR2 77", findCommand: null, where: "butchr's own output (stderr)" });
   });
 
   test("restart support follows the supervisor", async () => {

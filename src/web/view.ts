@@ -417,7 +417,7 @@ export interface ViewDeps {
    * after setup" rule). Optional: an omitted value makes the route
    * unreachable (503).
    */
-  setupJiraWrite?: (input: { site: string; email: string; token: string; setupCode: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
+  setupJiraWrite?: (input: { site: string; email: string; token: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
   /**
    * FACTORY-665 (PR-2) — `PUT /api/settings/jira/token`'s own logic
    * (configured mode — ROTATION only, never settable site/email here: this
@@ -426,7 +426,7 @@ export interface ViewDeps {
    * `requireEnvCheck: true` baked in). Optional: an omitted value makes
    * the route unreachable (503).
    */
-  jiraTokenRotate?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
+  jiraTokenRotate?: (input: { token: string }, rateGate?: RateGate) => Promise<JiraWriteRequestOutcome>;
   /**
    * FACTORY-665 (PR-2) — shared by BOTH `POST /api/setup/jira` and `PUT
    * /api/settings/jira/token`: 5 attempts per 10 minutes per the ticket's
@@ -450,18 +450,18 @@ export interface ViewDeps {
   jiraTokenWriteRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
   /**
    * local/ui — `PUT /api/settings/github/token` (`./credentials-api.ts`'s
-   * `handleGithubTokenWrite`): same setup-code requirement and the SAME two
-   * secret-write budgets as the Jira token route (`jiraRateGate`).
+   * `handleGithubTokenWrite`): the SAME two secret-write budgets as the
+   * Jira token route (`jiraRateGate`).
    */
-  githubTokenWrite?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<GithubTokenWriteRequestOutcome>;
+  githubTokenWrite?: (input: { token: string }, rateGate?: RateGate) => Promise<GithubTokenWriteRequestOutcome>;
   /** local/ui — `POST /api/settings/github/test`: the daemon's own loaded GitHub token, never anything from the request (`./github-connection-test.ts`). */
   githubTest?: () => Promise<GithubTestResult>;
   /** local/ui — the GitHub test's own budget, same shape as `jiraTestRateLimit`. */
   githubTestRateLimit?: (clientKey: string) => WriteRateLimitOutcome;
   /** local/ui — `PUT /api/settings/zendesk/token` (`./credentials-api.ts`'s `handleZendeskTokenWrite`): the GitHub token route's discipline exactly. */
-  zendeskTokenWrite?: (input: { token: string; setupCode: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
+  zendeskTokenWrite?: (input: { token: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
   /** local/ui — `PUT /api/settings/trello/credentials` (`handleTrelloCredentialsWrite`): the key and token, tested and written as a pair. */
-  trelloCredentialsWrite?: (input: { apiKey: string; token: string; setupCode: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
+  trelloCredentialsWrite?: (input: { apiKey: string; token: string }, rateGate?: RateGate) => Promise<ProviderSecretWriteRequestOutcome>;
   /** local/ui — `POST /api/settings/zendesk/test` / `POST /api/settings/trello/test`: the running daemon's own loaded credentials, never anything from the request. */
   zendeskTest?: () => Promise<ProviderConnectionTestResult>;
   trelloTest?: () => Promise<ProviderConnectionTestResult>;
@@ -1028,11 +1028,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      if (typeof b.site !== "string" || typeof b.email !== "string" || typeof b.token !== "string" || typeof b.setupCode !== "string") {
+      if (typeof b.site !== "string" || typeof b.email !== "string" || typeof b.token !== "string") {
         set.status = 400;
-        return { error: "body must be { site: string, email: string, token: string, setupCode: string }" };
+        return { error: "body must be { site: string, email: string, token: string }" };
       }
-      const result = await deps.setupJiraWrite({ site: b.site, email: b.email, token: b.token, setupCode: b.setupCode }, rateGate);
+      const result = await deps.setupJiraWrite({ site: b.site, email: b.email, token: b.token }, rateGate);
       auditOutcome(deps, { route: "POST /api/setup/jira", action: "setup", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
@@ -1057,11 +1057,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+      if (typeof b.token !== "string") {
         set.status = 400;
-        return { error: "body must be { token: string, setupCode: string }" };
+        return { error: "body must be { token: string }" };
       }
-      const result = await deps.jiraTokenRotate({ token: b.token, setupCode: b.setupCode }, rateGate);
+      const result = await deps.jiraTokenRotate({ token: b.token }, rateGate);
       auditOutcome(deps, { route: "PUT /api/settings/jira/token", action: "rotate", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
@@ -1084,11 +1084,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+      if (typeof b.token !== "string") {
         set.status = 400;
-        return { error: "body must be { token: string, setupCode: string }" };
+        return { error: "body must be { token: string }" };
       }
-      const result = await deps.githubTokenWrite({ token: b.token, setupCode: b.setupCode }, rateGate);
+      const result = await deps.githubTokenWrite({ token: b.token }, rateGate);
       auditOutcome(deps, { route: "PUT /api/settings/github/token", action: "set github token", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
@@ -1143,11 +1143,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      if (typeof b.token !== "string" || typeof b.setupCode !== "string") {
+      if (typeof b.token !== "string") {
         set.status = 400;
-        return { error: "body must be { token: string, setupCode: string }" };
+        return { error: "body must be { token: string }" };
       }
-      const result = await deps.zendeskTokenWrite({ token: b.token, setupCode: b.setupCode }, rateGate);
+      const result = await deps.zendeskTokenWrite({ token: b.token }, rateGate);
       auditOutcome(deps, { route, action: "set zendesk token", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
@@ -1169,11 +1169,11 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const bad = bodyProblem(body);
       if (bad) { set.status = bad.status; return { error: bad.error }; }
       const b = body as Record<string, unknown>;
-      if (typeof b.apiKey !== "string" || typeof b.token !== "string" || typeof b.setupCode !== "string") {
+      if (typeof b.apiKey !== "string" || typeof b.token !== "string") {
         set.status = 400;
-        return { error: "body must be { apiKey: string, token: string, setupCode: string }" };
+        return { error: "body must be { apiKey: string, token: string }" };
       }
-      const result = await deps.trelloCredentialsWrite({ apiKey: b.apiKey, token: b.token, setupCode: b.setupCode }, rateGate);
+      const result = await deps.trelloCredentialsWrite({ apiKey: b.apiKey, token: b.token }, rateGate);
       auditOutcome(deps, { route, action: "set trello credentials", ids: [], origin: request.headers.get("origin") }, result.ok ? { ok: true } : { ok: false, error: result.body.error });
       set.status = result.status;
       if (result.status === 429) set.headers["retry-after"] = String(result.retryAfterSeconds);
