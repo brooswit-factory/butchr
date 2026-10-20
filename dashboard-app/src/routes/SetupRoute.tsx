@@ -1,10 +1,10 @@
 /**
  * FACTORY-665 (PR-2) — the Setup page: shown (by `App.tsx`'s own gate, see
  * `useSetupGate`) only while `GET /api/setup/status` reports
- * `configured: false`. Site/email/token/setup-code fields, a submit
- * action that calls `POST /api/setup/jira` (which tests the candidate
- * token against Jira and writes it only on success — see
- * `../api/setup.ts`), and the server's own fixed result strings verbatim.
+ * `configured: false`. Site/email/token fields, a submit action that
+ * calls `POST /api/setup/jira` (which tests the candidate token against
+ * Jira and writes it only on success — see `../api/setup.ts`), and the
+ * server's own fixed result strings verbatim.
  *
  * Password field discipline (the ticket's own words): `type="password"`,
  * `autoComplete="off"`, cleared from component state on submit (success
@@ -34,13 +34,12 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
   const [site, setSite] = useState("");
   const [email, setEmail] = useState("");
   const [token, setToken] = useState("");
-  const [setupCode, setSetupCode] = useState("");
   const [state, setState] = useState<SetupState>({ kind: "idle" });
 
   async function submit() {
     setState({ kind: "pending" });
     try {
-      const result = await api.submitSetup({ site, email, token, setupCode });
+      const result = await api.submitSetup({ site, email, token });
       setState({ kind: "done", accountId: result.accountId, displayName: result.displayName, identityPersisted: result.identityPersisted, restarting: result.restarting === true, ...(result.identityError !== undefined ? { identityError: result.identityError } : {}) });
       onSetupSucceeded?.();
     } catch (e) {
@@ -52,7 +51,6 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
       // Cleared on submit, success or failure — never left in memory
       // (and never persisted anywhere) longer than the one request needs.
       setToken("");
-      setSetupCode("");
     }
   }
 
@@ -74,9 +72,8 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
         Set up butchr
       </Text>
       <Text elementType="p" size="small">
-        This daemon has no Atlassian (Jira) identity configured yet. Enter your Jira site, email, API
-        token, and the one-time setup code printed in this daemon&apos;s own log, then restart butchr to
-        finish.
+        This daemon has no Atlassian (Jira) identity configured yet. Enter your Jira site, email,
+        and API token, then restart butchr to finish.
       </Text>
 
       <div className="setup-page__field">
@@ -90,10 +87,6 @@ export function SetupRoute({ api, onSetupSucceeded }: SetupRouteProps) {
       <div className="setup-page__field">
         <label htmlFor="setup-token">API token</label>
         <input id="setup-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} disabled={pending} data-testid="setup-token-input" />
-      </div>
-      <div className="setup-page__field">
-        <label htmlFor="setup-code">Setup code</label>
-        <input id="setup-code" type="text" autoComplete="off" value={setupCode} onChange={(e) => setSetupCode(e.target.value)} disabled={pending} data-testid="setup-code-input" />
       </div>
 
       <Button onPress={() => void submit()} isDisabled={pending} data-testid="setup-submit-button">

@@ -14,7 +14,6 @@ import { checkSecretDestination, resolveCredentialTarget } from "../setup/secret
 import { buildCredentialsSummary, handleGithubTokenWrite, handleTrelloCredentialsWrite, handleZendeskTokenWrite, testTrelloConnection, testZendeskConnection, type SupervisorInfo } from "../web/credentials-api.js";
 import { githubTestInputs, testGithubConnection } from "../web/github-connection-test.js";
 import { runSetupModeDaemon } from "./setup-mode.js";
-import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
 import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
 import { jiraTokenFilePath } from "../setup/jira-token-write.js";
 import { AtlassianClient } from "../atlassian/client.js";
@@ -1052,14 +1051,6 @@ const jiraTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
 // to track separately.
 const daemonRestartRateLimitInstance = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 1 });
 const daemonRestartRateLimit = () => daemonRestartRateLimitInstance("daemon-restart");
-// FACTORY-665 (PR-2): `PUT /api/settings/jira/token` (rotation) gets its own
-// setup-code manager — this daemon is already configured, so no code is
-// minted at startup (there is nothing to onboard); an operator mints one
-// on demand via `SIGUSR2` whenever they actually want to rotate the token
-// (same handler setup mode installs — see `../setup/setup-code.ts`'s own
-// header for why this exists in BOTH modes, not just the unconfigured one).
-const jiraTokenRotateCodeManager = createSetupCodeManager();
-installSetupCodeSigusr2Handler(jiraTokenRotateCodeManager, (line) => console.error(line));
 // Same two-budget shape setup mode uses for the identical reason — see
 // `ViewDeps.jiraTokenTestRateLimit`/`jiraTokenWriteRateLimit`'s own doc
 // comments (`../web/view.ts`).
@@ -1069,8 +1060,8 @@ const jiraTokenWriteRateLimit = createWriteRateLimiter({ windowMs: 60 * 60_000, 
 const githubTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
 const providerTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
 // local/ui: which supervisor runs this daemon, measured once (one
-// `systemctl`/`launchctl print` call) — the Settings page shows the matching
-// setup-code command and whether its Restart button works.
+// `systemctl`/`launchctl print` call) — the Settings page shows whether its
+// Restart button works.
 const supervisorInfo: Promise<SupervisorInfo> = (async () => {
   if (await isRunningUnderThisUnit()) return { kind: "systemd" } as const;
   const job = await launchdJobForThisProcess();
@@ -1093,7 +1084,6 @@ const credentialsSummary = async () => buildCredentialsSummary({
   running: startupCardSettings,
   startedAt: buildIdentity.startedAt,
   supervisor: await supervisorInfo,
-  ownPid: process.pid,
 });
 // local/ui: the env the NEXT start would build (this process's env, then
 // settings.json and the managed secret files as they are now), for the
@@ -1429,8 +1419,7 @@ const { app, mcp } = buildApp({
   // daemon's own already-loaded `config.atlassian` values (never settable
   // from the request body here — see `ViewDeps.jiraTokenRotate`'s own doc
   // comment), and `requireEnvCheck: true` means an env-provided token
-  // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 before
-  // the setup code is even checked.
+  // (`ATLASSIAN_TOKEN`/`ATLASSIAN_TOKEN_FILE` set) refuses with 409 up front.
   // FACTORY-66: `config.atlassian` can now be `undefined` — rotation makes
   // no sense with no Atlassian credential to rotate, refused the same way
   // any other bad input to this route already is (400), never a crash.
@@ -1442,9 +1431,8 @@ const { app, mcp } = buildApp({
     if (!config.atlassian) return Promise.resolve({ ok: false as const, status: 400 as const, body: { error: disabledAtlassianReason() } });
     const target = resolveCredentialTarget("atlassian", process.env as Record<string, string | undefined>);
     return handleJiraTokenWrite(
-      { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
+      { site: config.atlassian.site, email: config.atlassian.email, token: input.token },
       {
-        setupCode: jiraTokenRotateCodeManager,
         path: target.path ?? jiraTokenFilePath(process.env as Record<string, string | undefined>),
         env: process.env as Record<string, string | undefined>,
         checkDestination: (path) => checkSecretDestination(path, { managed: target.managed }),
@@ -1454,12 +1442,11 @@ const { app, mcp } = buildApp({
   },
   jiraTokenTestRateLimit,
   jiraTokenWriteRateLimit,
-  // local/ui: the GitHub token is set with the same setup code (one SIGUSR2
-  // code authorizes one secret write, whichever it is) and written where
-  // `resolveCredentialTarget` says it lives, resolved per request.
+  // local/ui: the GitHub token is written where `resolveCredentialTarget`
+  // says it lives, resolved per request.
   githubTokenWrite: (input, rateGate) => handleGithubTokenWrite(
     input,
-    { setupCode: jiraTokenRotateCodeManager, target: resolveCredentialTarget("github", process.env as Record<string, string | undefined>) },
+    { target: resolveCredentialTarget("github", process.env as Record<string, string | undefined>) },
     { ...(rateGate ? { rateGate } : {}) },
   ),
   githubTest: () => {
@@ -1473,7 +1460,6 @@ const { app, mcp } = buildApp({
   zendeskTokenWrite: (input, rateGate) => handleZendeskTokenWrite(
     input,
     {
-      setupCode: jiraTokenRotateCodeManager,
       targets: [resolveCredentialTarget("zendesk", process.env as Record<string, string | undefined>)],
       subdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || loadSettingsFile(process.env).values.ZENDESK_SUBDOMAIN || null,
     },
@@ -1482,7 +1468,6 @@ const { app, mcp } = buildApp({
   trelloCredentialsWrite: (input, rateGate) => handleTrelloCredentialsWrite(
     input,
     {
-      setupCode: jiraTokenRotateCodeManager,
       targets: [resolveCredentialTarget("trello-key", process.env as Record<string, string | undefined>), resolveCredentialTarget("trello-token", process.env as Record<string, string | undefined>)],
     },
     { ...(rateGate ? { rateGate } : {}) },

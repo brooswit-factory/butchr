@@ -8,30 +8,27 @@ withDom();
 afterEach(cleanup);
 
 describe("SetupRoute — FACTORY-665 (PR-2)", () => {
-  test("renders site/email/token/setup-code fields, token is type=password with autoComplete=off", () => {
+  test("renders site/email/token fields, token is type=password with autoComplete=off", () => {
     const { getByTestId } = render(<SetupRoute api={createFixturesSetupApi()} />);
     const token = getByTestId("setup-token-input") as HTMLInputElement;
     expect(token.type).toBe("password");
     expect(token.autocomplete).toBe("off");
     expect(getByTestId("setup-site-input")).toBeTruthy();
     expect(getByTestId("setup-email-input")).toBeTruthy();
-    expect(getByTestId("setup-code-input")).toBeTruthy();
   });
 
-  test("submitting shows the success result and calls onSetupSucceeded, then clears the token/code fields", async () => {
+  test("submitting shows the success result and calls onSetupSucceeded, then clears the token field", async () => {
     let succeeded = false;
     const api = createFixturesSetupApi({ nextResult: defaultSetupSuccess({ accountId: "acct-9", displayName: "Nine" }) });
     const { getByTestId } = render(<SetupRoute api={api} onSetupSucceeded={() => { succeeded = true; }} />);
     fireEvent.change(getByTestId("setup-site-input"), { target: { value: "https://x.atlassian.net" } });
     fireEvent.change(getByTestId("setup-email-input"), { target: { value: "a@b.c" } });
     fireEvent.change(getByTestId("setup-token-input"), { target: { value: "canary-token" } });
-    fireEvent.change(getByTestId("setup-code-input"), { target: { value: "ABCDEFGHJKMN" } });
     fireEvent.click(getByTestId("setup-submit-button"));
     await waitFor(() => expect(getByTestId("setup-result").textContent).toContain("Nine"));
     expect(getByTestId("setup-result").textContent).toContain("acct-9");
     expect(succeeded).toBe(true);
     expect((getByTestId("setup-token-input") as HTMLInputElement).value).toBe("");
-    expect((getByTestId("setup-code-input") as HTMLInputElement).value).toBe("");
   });
 
   test("an identityPersisted:false result shows the warning text alongside success", async () => {
@@ -42,10 +39,10 @@ describe("SetupRoute — FACTORY-665 (PR-2)", () => {
   });
 
   test("a rejected submit shows the fixed error message, never a stack trace or raw object", async () => {
-    const api = createFixturesSetupApi({ nextResult: { throw: new Error("setup code: mismatch") } });
+    const api = createFixturesSetupApi({ nextResult: { throw: new Error("token rejected") } });
     const { getByTestId } = render(<SetupRoute api={api} />);
     fireEvent.click(getByTestId("setup-submit-button"));
-    await waitFor(() => expect(getByTestId("setup-result").textContent).toContain("setup code: mismatch"));
+    await waitFor(() => expect(getByTestId("setup-result").textContent).toContain("token rejected"));
   });
 
   test("a rate-limited submit shows the retry-after text", async () => {

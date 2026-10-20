@@ -1,9 +1,9 @@
 /**
  * local/ui — the Settings page's Providers section: one card per integration
- * butchr holds a token for (Atlassian, GitHub, Zendesk, Trello), the one-time setup-code
- * instructions every token change needs, and a restart banner once
- * something changed. Tokens go in password fields that are cleared after
- * every submit; nothing here displays, stores or logs a token value.
+ * butchr holds a token for (Atlassian, GitHub, Zendesk, Trello) and a
+ * restart banner once something changed. Tokens go in password fields
+ * that are cleared after every submit; nothing here displays, stores or
+ * logs a token value.
  */
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { Alert, AlertText, Button, Dialog, FieldError, Heading, IconButton, Input, Label, Modal, ModalOverlay, Text, TextField } from "@launchpad-ui/components";
@@ -81,20 +81,18 @@ interface SecretField {
 }
 
 /**
- * "Set token" / "Replace token": one password field per secret plus the
- * setup code, all cleared after every submit. Each field's test id is
- * `<prefix>-<name>`.
+ * "Set token" / "Replace token": one password field per secret, all
+ * cleared after every submit. Each field's test id is `<prefix>-<name>`.
  */
 function SecretForm({ tokens, fields, labels, testIdPrefix, submit }: {
   tokens: readonly TokenStatus[];
   fields: readonly SecretField[];
   labels: { set: string; replace: string; save: string };
   testIdPrefix: string;
-  submit: (values: Readonly<Record<string, string>>, setupCode: string) => Promise<string>;
+  submit: (values: Readonly<Record<string, string>>) => Promise<string>;
 }) {
   const [open, setOpen] = useState(false);
   const [values, setValues] = useState<Record<string, string>>({});
-  const [code, setCode] = useState("");
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<Result>(null);
 
@@ -107,15 +105,15 @@ function SecretForm({ tokens, fields, labels, testIdPrefix, submit }: {
     );
   }
 
-  const complete = fields.every((f) => (values[f.name] ?? "").trim() !== "") && code.trim() !== "";
+  const complete = fields.every((f) => (values[f.name] ?? "").trim() !== "");
   const setField = (name: string) => (value: string) => setValues((prev) => ({ ...prev, [name]: value }));
-  const clear = () => { setValues({}); setCode(""); };
+  const clear = () => setValues({});
 
   async function save() {
     if (pending || !complete) return;
     setPending(true);
     try {
-      setResult({ kind: "ok", text: await submit(values, code) });
+      setResult({ kind: "ok", text: await submit(values) });
       setOpen(false);
     } catch (e) {
       setResult({ kind: "error", text: errorText(e) });
@@ -140,11 +138,6 @@ function SecretForm({ tokens, fields, labels, testIdPrefix, submit }: {
               <Input type="password" autoComplete="off" spellCheck={false} data-testid={`${testIdPrefix}-${f.name}`} {...typed(setField(f.name))} />
             </TextField>
           ))}
-          <TextField className="cr-field" value={code} onChange={setCode} isDisabled={pending}>
-            <Label>Setup code</Label>
-            <Input autoComplete="off" spellCheck={false} data-testid={`${testIdPrefix}-code`} {...typed(setCode)} />
-            <Text slot="description">One-time code from butchr's log. See "Getting a setup code" below.</Text>
-          </TextField>
           <div className="cr-actions">
             <Button onPress={() => { setOpen(false); clear(); }} isDisabled={pending}>
               Cancel
@@ -161,14 +154,14 @@ function SecretForm({ tokens, fields, labels, testIdPrefix, submit }: {
 }
 
 /** The one-secret case every token card uses. */
-function TokenForm({ token, label, testIdPrefix, submit }: { token: TokenStatus; label: string; testIdPrefix: string; submit: (input: { token: string; setupCode: string }) => Promise<string> }) {
+function TokenForm({ token, label, testIdPrefix, submit }: { token: TokenStatus; label: string; testIdPrefix: string; submit: (input: { token: string }) => Promise<string> }) {
   return (
     <SecretForm
       tokens={[token]}
       fields={[{ name: "token", label }]}
       labels={{ set: "Set token", replace: "Replace token", save: "Save token" }}
       testIdPrefix={testIdPrefix}
-      submit={(values, setupCode) => submit({ token: values["token"] ?? "", setupCode })}
+      submit={(values) => submit({ token: values["token"] ?? "" })}
     />
   );
 }
@@ -541,47 +534,13 @@ function TrelloCard({ trello, api, onChanged }: { trello: CredentialsSummary["tr
           fields={[{ name: "key", label: "Trello API key" }, { name: "token", label: "Trello token" }]}
           labels={{ set: "Set key and token", replace: "Replace key and token", save: "Save both" }}
           testIdPrefix="cr-trello"
-          submit={async (values, setupCode) => {
-            const r = await api.writeTrelloCredentials({ apiKey: values["key"] ?? "", token: values["token"] ?? "", setupCode });
+          submit={async (values) => {
+            const r = await api.writeTrelloCredentials({ apiKey: values["key"] ?? "", token: values["token"] ?? "" });
             onChanged("the Trello credentials");
             return `Saved. They belong to ${r.account}. Restart butchr to use them.`;
           }}
         />
       </div>
-    </section>
-  );
-}
-
-function CommandLine({ command, testId }: { command: string; testId: string }) {
-  return (
-    <div className="cr-command">
-      <code data-testid={testId}>{command}</code>
-      <IconButton icon="copy-code" aria-label="Copy command" size="small" variant="minimal" onPress={() => void navigator.clipboard?.writeText(command)} />
-    </div>
-  );
-}
-
-function SetupCodeHelp({ setupCode }: { setupCode: CredentialsSummary["setupCode"] }) {
-  return (
-    <section className="cr-help" aria-labelledby="cr-setup-code-title" data-testid="cr-setup-code">
-      <Heading level={3} id="cr-setup-code-title" className="cr-card__title">
-        Getting a setup code
-      </Heading>
-      <Text elementType="p" size="small">
-        Every token change needs a one-time code that butchr prints only to {setupCode.where}, so only someone at this machine can approve it. In a terminal, run:
-      </Text>
-      <CommandLine command={setupCode.command} testId="cr-setup-code-command" />
-      {setupCode.findCommand && (
-        <>
-          <Text elementType="p" size="small">
-            then read the code with:
-          </Text>
-          <CommandLine command={setupCode.findCommand} testId="cr-setup-code-find" />
-        </>
-      )}
-      <Text elementType="p" size="small" className="cr-muted">
-        A code works once, for 10 minutes. Five wrong tries lock it until you ask for a new one.
-      </Text>
     </section>
   );
 }
@@ -696,7 +655,6 @@ export function CredentialsSection({ credentials, api, setupApi, restartAndWait,
         <ZendeskCard zendesk={credentials.zendesk} api={api} onChanged={onChanged} />
         <TrelloCard trello={credentials.trello} api={api} onChanged={onChanged} />
       </div>
-      <SetupCodeHelp setupCode={credentials.setupCode} />
     </section>
   );
 }

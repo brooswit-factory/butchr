@@ -37,7 +37,6 @@ import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { buildSetupStatus, handleJiraTokenWrite } from "../web/setup-api.js";
-import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
 import { jiraTokenFilePath, type FetchLike } from "../setup/jira-token-write.js";
 import { rulesPath } from "../rules/rules.js";
 import { join, dirname } from "node:path";
@@ -55,9 +54,7 @@ export interface SetupModeDeps {
  * re-parsed from `env`) so a test can pick an arbitrary value without
  * fighting `BUTCHR_PORT` parsing.
  */
-export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void, fetchFn?: FetchLike, onSetupComplete: () => void = () => {}): { viewDeps: ViewDeps; setupCodeManager: ReturnType<typeof createSetupCodeManager> } {
-  const setupCodeManager = createSetupCodeManager();
-
+export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<string, string | undefined>, log: (line: string) => void, fetchFn?: FetchLike, onSetupComplete: () => void = () => {}): { viewDeps: ViewDeps } {
   // `dashboardOriginGuard.port` is read FRESH on every `peerUidCheck` call
   // (never captured by value) so a caller that passes `port: 0` here and
   // learns the OS-assigned real port only after `.listen()` can still
@@ -97,7 +94,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     setupJiraWrite: async (input, rateGate) => {
       const result = await handleJiraTokenWrite(
         { ...input },
-        { setupCode: setupCodeManager, path: jiraTokenFilePath(env), env, ...(fetchFn ? { fetchFn } : {}) },
+        { path: jiraTokenFilePath(env), env, ...(fetchFn ? { fetchFn } : {}) },
         { requireEnvCheck: false, ...(rateGate ? { rateGate } : {}) },
       );
       if (!result.ok) return result;
@@ -112,7 +109,7 @@ export function buildSetupModeViewDeps(port: number, env: ConfigEnv & Record<str
     jiraTokenWriteRateLimit: createWriteRateLimiter({ windowMs: 60 * 60_000, max: 3 }),
   };
 
-  return { viewDeps, setupCodeManager };
+  return { viewDeps };
 }
 
 /**
@@ -126,16 +123,13 @@ export async function runSetupModeDaemon(deps: SetupModeDeps = {}): Promise<void
   const log = deps.log ?? ((line: string) => console.error(line));
   const port = parsePort(env);
 
-  const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(port, env, log, undefined, () => {
+  const { viewDeps } = buildSetupModeViewDeps(port, env, log, undefined, () => {
     log("butchr: setup complete — exiting so the supervisor restarts butchr in normal mode (a process started by hand must be started again).");
     setTimeout(() => process.exit(1), 1500);
   });
 
   log(`butchr: starting in SETUP MODE — no Atlassian identity configured yet.`);
-  const initialCode = setupCodeManager.mint();
-  log(`butchr: setup code (10 min, single-use, 5 attempts): ${initialCode}`);
-  log(`butchr: open the dashboard and enter this code to configure Jira; mint a fresh one any time with: kill -SIGUSR2 ${process.pid} (or: systemctl --user kill -s SIGUSR2 butchr.service)`);
-  installSetupCodeSigusr2Handler(setupCodeManager, log);
+  log(`butchr: open the dashboard at http://${DAEMON_HOSTNAME}:${port}/ to configure Jira.`);
 
   const { app } = buildApp(viewDeps, {}, log);
   app.listen(listenOptions(port));
