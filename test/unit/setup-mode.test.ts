@@ -61,6 +61,17 @@ describe("buildSetupModeViewDeps", () => {
         // is WIRED and reaches real orchestration logic, not 503.
         expect(setupRes.status).not.toBe(503);
 
+        // GET `/` and GET `/configurations` redirect to the React setup
+        // wizard at `/dashboard-app/` — the legacy server-rendered pages
+        // have no nav to the wizard and only show "COULD NOT CHECK" errors
+        // in setup mode, which dead-ends a fresh install.
+        const root = await fetch(`http://127.0.0.1:${port}/`, { headers, redirect: "manual" });
+        expect(root.status).toBe(302);
+        expect(root.headers.get("location")).toBe("/dashboard-app/");
+        const configs = await fetch(`http://127.0.0.1:${port}/configurations`, { headers, redirect: "manual" });
+        expect(configs.status).toBe(302);
+        expect(configs.headers.get("location")).toBe("/dashboard-app/");
+
         // Settings/rules/rotation routes are all unreachable: these deps were
         // never supplied, so every one of them 503s rather than crashing.
         const settings = await fetch(`http://127.0.0.1:${port}/api/settings`, { headers });
