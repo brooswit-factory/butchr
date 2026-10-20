@@ -107,6 +107,16 @@ export function confluencePageShortDisplayId(resourceId: string): string {
  */
 export const MAX_CHILD_PAGES = 5_000;
 
+/** A preview timeout cannot cancel an already-issued SDK request, but it must
+ * stop this cursor loop before it can issue another one. */
+export interface ListChildPagesOptions {
+  signal?: AbortSignal;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("confluence child enumeration cancelled");
+}
+
 /**
  * Pages every cursor `getChildPages` hands back for one ancestor, to
  * exhaustion — the DoD's own pagination requirement. `cursor` continues a
@@ -115,14 +125,28 @@ export const MAX_CHILD_PAGES = 5_000;
  * page's `nextCursor` is `undefined`, never guessed or capped by a fixed
  * page count.
  */
-async function listAllChildPages(
+export async function listAllChildPages(
   deps: Pick<ConfluencePageResourceDeps, "getChildPages">,
   ancestor: string,
+  options: ListChildPagesOptions = {},
 ): Promise<Array<{ id: string; title?: string }>> {
   const out: Array<{ id: string; title?: string }> = [];
   let cursor: string | undefined;
+  const seenCursors = new Set<string>();
   do {
+    throwIfAborted(options.signal);
+    if (cursor !== undefined) {
+      if (seenCursors.has(cursor)) throw new Error("confluence child enumeration returned a repeated cursor");
+      seenCursors.add(cursor);
+    }
     const page = await deps.getChildPages(ancestor, cursor);
+    throwIfAborted(options.signal);
+    if (!Array.isArray(page?.results) || page.results.some((child) => typeof child?.id !== "string" || child.id.length === 0)) {
+      throw new Error("confluence child enumeration returned a malformed page");
+    }
+    if (page.nextCursor !== undefined && (typeof page.nextCursor !== "string" || page.nextCursor.length === 0)) {
+      throw new Error("confluence child enumeration returned a malformed cursor");
+    }
     out.push(...page.results);
     if (out.length > MAX_CHILD_PAGES) {
       throw new Error(`confluence-page ancestor ${ancestor} has over ${MAX_CHILD_PAGES} child pages; narrow the rule or split it`);

@@ -826,7 +826,14 @@ describe("SECTION 7 — the pagination blind spot, CLOSED per axis (BUTCHR-309)"
     expect(getPageCommentsBody).toContain("cursor");
     // (3) the sibling getChildPages, in the SAME file, still paginates the
     // same way — the two are no longer asymmetric.
-    const getChildPagesBody = source.slice(source.indexOf("getChildPages:"), source.indexOf("getChildPages:") + 400);
+    const getChildPagesStart = source.indexOf("getChildPages:");
+    const getChildPagesEnd = source.indexOf("\n\n    // Read-modify-write", getChildPagesStart);
+    // Bound this to the complete method, not an arbitrary character count:
+    // response validation can legitimately grow ahead of the pagination
+    // follow, but losing the limit/cursor code below must still fail.
+    expect(getChildPagesStart).toBeGreaterThanOrEqual(0);
+    expect(getChildPagesEnd).toBeGreaterThan(getChildPagesStart);
+    const getChildPagesBody = source.slice(getChildPagesStart, getChildPagesEnd);
     expect(getChildPagesBody).toContain("limit: 50");
     expect(getChildPagesBody).toContain("_links?.next");
     expect(getChildPagesBody).toContain("cursor");

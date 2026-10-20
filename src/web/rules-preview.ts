@@ -21,6 +21,8 @@
  */
 import type { JiraIssue } from "../atlassian/types.js";
 import type { ResourceProvider, Rule } from "../rules/rules.js";
+import { listAllChildPages, type ConfluencePageResourceDeps } from "../rules/confluence-page-type.js";
+import { parseConfluencePageQuery } from "../resources/confluence-page-query.js";
 import { searchRules } from "../rules/resource-type.js";
 import { searchJiraIdeaRules } from "../rules/jira-idea-type.js";
 
@@ -46,6 +48,12 @@ export interface RulesPreviewDeps {
   rules: () => readonly Rule[];
   /** `AtlassianClient#searchAll`, bound — the ONLY Jira capability this module ever calls (a GET search), same discipline as `rules-cli.ts`'s own `RulesCheckJiraEnv`. */
   search: (jql: string) => Promise<JiraIssue[]>;
+  /**
+   * The existing cursor-paginated Confluence direct-child reader. Required
+   * only for `confluence-page` previews; absent means that preview remains
+   * fail-closed rather than looking like a zero-resource rule.
+   */
+  getChildPages?: ConfluencePageResourceDeps["getChildPages"];
   maxAgents: number;
   now?: () => number;
   cap?: number;
@@ -54,10 +62,12 @@ export interface RulesPreviewDeps {
 }
 
 /** Same discipline as `../jira-watch/external-poll.ts`'s own `withTimeout` — kept as a small local copy rather than exported/shared, since this module's only network-shaped await is the one call below. */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+function withTimeout<T>(work: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
-    p.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+    const controller = new AbortController();
+    const timeout = new Error(`timed out after ${ms}ms`);
+    const t = setTimeout(() => { controller.abort(timeout); reject(timeout); }, ms);
+    work(controller.signal).then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
   });
 }
 
@@ -81,6 +91,16 @@ async function searchForRule(rule: Rule, search: (jql: string) => Promise<JiraIs
     return (await searchRules({ rules: [asEnabled], search })).map((m) => m.issue);
   }
   return (await searchJiraIdeaRules({ rules: [asEnabled], search })).map((m) => m.issue);
+}
+
+async function childIdsForRule(
+  rule: Rule,
+  getChildPages: ConfluencePageResourceDeps["getChildPages"],
+  queryOverride?: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const { ancestor } = parseConfluencePageQuery(queryOverride ?? rule.query);
+  return (await listAllChildPages({ getChildPages }, ancestor, signal === undefined ? {} : { signal })).map((child) => child.id);
 }
 
 /**
@@ -120,8 +140,12 @@ export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, query
     // local/ui: a create's dry run measures a rule that doesn't exist yet; without this every create was refused as "unmeasurable".
     const rule = saved ?? (draftProvider !== undefined && queryOverride !== undefined ? draftRule(id, draftProvider, queryOverride) : undefined);
     if (!rule) return { ok: false, status: 404, error: "rule not found" };
-    if (!JIRA_BACKED_PROVIDERS.has(rule.resourceProvider)) {
+    const isConfluencePage = rule.resourceProvider === "confluence-page";
+    if (!JIRA_BACKED_PROVIDERS.has(rule.resourceProvider) && !isConfluencePage) {
       return { ok: false, status: 400, error: `rule "${id}" is not previewable: "${rule.resourceProvider}" is not a Jira-backed provider` };
+    }
+    if (isConfluencePage && !deps.getChildPages) {
+      return { ok: false, status: 503, error: "preview unavailable: Confluence child enumeration is not configured" };
     }
 
     const t = now();
@@ -131,21 +155,25 @@ export function createRulesPreviewer(deps: RulesPreviewDeps): (id: string, query
     }
     lastCallAt.set(id, t);
 
-    let issues: JiraIssue[];
+    let keys: string[];
     try {
-      issues = await withTimeout(searchForRule(rule, deps.search, queryOverride), timeoutMs);
+      keys = isConfluencePage
+        ? await withTimeout((signal) => childIdsForRule(rule, deps.getChildPages!, queryOverride, signal), timeoutMs)
+        : (await withTimeout(() => searchForRule(rule, deps.search, queryOverride), timeoutMs)).map((issue) => issue.key);
     } catch (e) {
       const timedOut = (e as Error)?.message?.startsWith("timed out after");
-      // Never the real Jira error body/stack here (SPEC CHANGE (b)) — a
-      // fixed, safe message regardless of what actually failed.
-      return { ok: false, status: timedOut ? 504 : 502, error: timedOut ? "preview timed out" : "preview failed: could not query Jira" };
+      // Never surface an upstream error body/stack: this is a safety gate,
+      // so an unreadable or malformed scope must be a fixed failure, never
+      // a misleading empty result.
+      const failedProvider = isConfluencePage ? "enumerate Confluence children" : "query Jira";
+      return { ok: false, status: timedOut ? 504 : 502, error: timedOut ? "preview timed out" : `preview failed: could not ${failedProvider}` };
     }
 
-    const total = issues.length;
-    const keys = issues.slice(0, cap).map((i) => i.key);
+    const total = keys.length;
+    const resourceLabel = isConfluencePage ? "resource(s)" : "ticket(s)";
     const warning = total > deps.maxAgents
-      ? `this rule would staff ${total} real ticket(s), exceeding maxAgents=${deps.maxAgents} — only ${deps.maxAgents} would run across the whole fleet this poll`
+      ? `this rule would staff ${total} real ${resourceLabel}, exceeding maxAgents=${deps.maxAgents} — only ${deps.maxAgents} would run across the whole fleet this poll`
       : null;
-    return { ok: true, keys, total, cap, warning };
+    return { ok: true, keys: keys.slice(0, cap), total, cap, warning };
   };
 }

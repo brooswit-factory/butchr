@@ -81,6 +81,19 @@ jobs:
       - name: unit + load tests, coverage ≥ 90%
         continue-on-error: true
         run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+  windows-guarded-write:
+    name: windows guarded write
+    # The aggregate Windows suite remains diagnostic while its unrelated
+    # baseline failures are investigated. Keep this supported guarded-create
+    # and enable path independently observable and non-optional.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
+      - run: bun install --frozen-lockfile
+      - name: guarded Confluence create/enable and directory fsync
+        run: bun test test/unit/rules-write-local-ui.test.ts && bun test test/unit/write-rules.test.ts --test-name-pattern "fsyncDir error handling"
   release-gate:
     name: release gate
     # Runs on pull requests AND branch pushes: with a pull_request-only `if`, a branch pushed
