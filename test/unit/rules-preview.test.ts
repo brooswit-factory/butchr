@@ -40,6 +40,94 @@ describe("createRulesPreviewer", () => {
     expect(called).toBe(false);
   });
 
+  test("confluence-page preview enumerates every direct-child page through the cursor and returns bounded IDs", async () => {
+    const cursors: Array<string | undefined> = [];
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "pages", resourceProvider: "confluence-page", query: '{"ancestor":"60096513"}' })],
+      search: async () => { throw new Error("Jira must not be used for Confluence preview"); },
+      getChildPages: async (ancestor, cursor) => {
+        expect(ancestor).toBe("60096513");
+        cursors.push(cursor);
+        return cursor === undefined
+          ? { results: [{ id: "101" }, { id: "102" }], nextCursor: "next" }
+          : { results: [{ id: "103" }] };
+      },
+      maxAgents: 2,
+      cap: 2,
+    });
+    const r = await preview("pages");
+    expect(r).toEqual({
+      ok: true,
+      keys: ["101", "102"],
+      total: 3,
+      cap: 2,
+      warning: "this rule would staff 3 real resource(s), exceeding maxAgents=2 — only 2 would run across the whole fleet this poll",
+    });
+    expect(cursors).toEqual([undefined, "next"]);
+  });
+
+  test("a draft confluence-page rule is previewable before it is saved", async () => {
+    const preview = createRulesPreviewer({
+      rules: () => [],
+      search: async () => [],
+      getChildPages: async (ancestor) => {
+        expect(ancestor).toBe("60096513");
+        return { results: [] };
+      },
+      maxAgents: 5,
+    });
+    await expect(preview("draft-pages", '{"ancestor":"60096513"}', "confluence-page"))
+      .resolves.toEqual({ ok: true, keys: [], total: 0, cap: 50, warning: null });
+  });
+
+  test("a confluence enumeration failure is fail-closed without exposing its upstream error", async () => {
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "pages", resourceProvider: "confluence-page", query: '{"ancestor":"60096513"}' })],
+      search: async () => [],
+      getChildPages: async () => { throw new Error("Confluence 401 token secret"); },
+      maxAgents: 5,
+    });
+    await expect(preview("pages")).resolves.toEqual({ ok: false, status: 502, error: "preview failed: could not enumerate Confluence children" });
+  });
+
+  test("a Confluence enumeration that never resolves times out with the same fixed response", async () => {
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "pages", resourceProvider: "confluence-page", query: '{"ancestor":"60096513"}' })],
+      search: async () => [],
+      getChildPages: () => new Promise(() => {}),
+      maxAgents: 5,
+      timeoutMs: 20,
+    });
+    await expect(preview("pages")).resolves.toEqual({ ok: false, status: 504, error: "preview timed out" });
+  });
+
+  test("a Confluence timeout aborts pagination before a completed first page can start its next request", async () => {
+    let calls = 0;
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "pages", resourceProvider: "confluence-page", query: '{"ancestor":"60096513"}' })],
+      search: async () => [],
+      getChildPages: async () => {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { results: [], nextCursor: "next" };
+      },
+      maxAgents: 5,
+      timeoutMs: 10,
+    });
+    await expect(preview("pages")).resolves.toEqual({ ok: false, status: 504, error: "preview timed out" });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(calls).toBe(1);
+  });
+
+  test("a confluence preview without the existing child enumerator remains unavailable, never zero", async () => {
+    const preview = createRulesPreviewer({
+      rules: () => [rule({ id: "pages", resourceProvider: "confluence-page", query: '{"ancestor":"60096513"}' })],
+      search: async () => [],
+      maxAgents: 5,
+    });
+    await expect(preview("pages")).resolves.toEqual({ ok: false, status: 503, error: "preview unavailable: Confluence child enumeration is not configured" });
+  });
+
   test("keys and total, capped, no summary/status text anywhere (SPEC CHANGE b)", async () => {
     const issues = Array.from({ length: 5 }, (_, i) => issue(`F-${i}`));
     const preview = createRulesPreviewer({ rules: () => [rule()], search: async () => issues, maxAgents: 10, cap: 3 });

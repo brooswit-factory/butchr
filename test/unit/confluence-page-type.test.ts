@@ -5,6 +5,7 @@ import {
   MAX_CONFLUENCE_PAGE_BRIEF_CHARS,
   createConfluencePageTypeEventRules,
   MAX_CHILD_PAGES,
+  listAllChildPages,
   ownsConfluencePageAgent,
   searchConfluencePageRules,
   specForConfluencePage,
@@ -30,6 +31,36 @@ function page(over: Partial<ConfluencePageSnapshot> & { id: string }): Confluenc
 }
 
 describe("searchConfluencePageRules — discovery: real child-page enumeration", () => {
+  test("a repeated cursor is refused before a third request can turn an incomplete scope into a result", async () => {
+    const cursors: Array<string | undefined> = [];
+    await expect(listAllChildPages({
+      getChildPages: async (_ancestor, cursor) => {
+        cursors.push(cursor);
+        return { results: [], nextCursor: "again" };
+      },
+    }, "100")).rejects.toThrow("repeated cursor");
+    expect(cursors).toEqual([undefined, "again"]);
+  });
+
+  test("a malformed successful page is refused rather than read as zero children", async () => {
+    await expect(listAllChildPages({
+      getChildPages: async () => ({ nextCursor: undefined } as never),
+    }, "100")).rejects.toThrow("malformed page");
+  });
+
+  test("an aborted preview never starts the next cursor request", async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    await expect(listAllChildPages({
+      getChildPages: async () => {
+        calls++;
+        controller.abort(new Error("timed out after 20ms"));
+        return { results: [], nextCursor: "next" };
+      },
+    }, "100", { signal: controller.signal })).rejects.toThrow("timed out after 20ms");
+    expect(calls).toBe(1);
+  });
+
   test("one rule, one page of children: each child becomes a match keyed by the real encoded agent key", async () => {
     const r = rule({ id: "docs", query: JSON.stringify({ ancestor: "100" }) });
     const deps: Pick<ConfluencePageResourceDeps, "rules" | "getChildPages" | "getPageVersions" | "getPageComments" | "getPage"> = {

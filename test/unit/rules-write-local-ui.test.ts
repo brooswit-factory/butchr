@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpHandle } from "@brooswit/thatch";
 import type { RulesEnv } from "../../src/rules/rules.js";
-import { computeLocalPlanCounts, createRule, createScopeCache, isSwarmSwitch, planRuleCreate, planRuleWrite, writeRuleFields, type RulesWriteDeps } from "../../src/rules/rules-write.js";
+import { computeLocalPlanCounts, createRule, createScopeCache, isSwarmSwitch, planRuleCreate, planRuleWrite, writeRuleEnabled, writeRuleFields, type RulesWriteDeps } from "../../src/rules/rules-write.js";
 import { createRulesPreviewer } from "../../src/web/rules-preview.js";
 import type { JiraIssue } from "../../src/atlassian/types.js";
 import type { Rule } from "../../src/rules/rules.js";
@@ -316,6 +316,78 @@ describe("measuring a new rule's scope (create dry run)", () => {
     // Existing call sites, with no provider, still call through with just (id, query).
     await scopeOf("triage", "project = A");
     expect(calls[2]).toEqual(["triage", "project = A"]);
+  });
+
+  test("a measurable empty Confluence draft follows the real guarded plan-then-confirm create path", async () => {
+    seed([]);
+    let pageCalls = 0;
+    const preview = createRulesPreviewer({
+      rules: () => [], search: async () => [], maxAgents: 5, rateLimitMs: 0,
+      getChildPages: async (ancestor) => { pageCalls++; expect(ancestor).toBe("60096513"); return { results: [] }; },
+    });
+    const scopeOf = createScopeCache(async (id, query, provider) => {
+      const result = await preview(id, query, provider);
+      return result.ok ? result.total : Number.POSITIVE_INFINITY;
+    });
+    const input = { id: "servy-openai-agent-documents", resourceProvider: "confluence-page" as const, query: '{"ancestor":"60096513"}' };
+    const plan = await planRuleCreate(input, false, scopeOf, deps());
+    expect(plan).toMatchObject({ ok: true, scope: 0, requiresConfirm: true, confirmReason: "rule-create" });
+    if (!plan.ok) throw new Error(plan.error);
+    const refused = await createRule(input, false, plan.planHash, scopeOf, deps());
+    expect(refused).toMatchObject({ ok: false, status: 409, confirmReason: "rule-create" });
+    expect(readRules()).toEqual([]);
+    expect((await createRule(input, true, plan.planHash, scopeOf, deps())).ok).toBe(true);
+    expect(readRules()).toMatchObject([{ id: input.id, resourceProvider: "confluence-page", enabled: false }]);
+    expect(pageCalls).toBe(1); // cache prevents the confirmation path from bypassing preview rate limits
+  });
+
+  test("a saved Confluence rule's enable and query edit use the same finite guarded scope", async () => {
+    const saved = { id: "pages", enabled: false, resourceProvider: "confluence-page", query: '{"ancestor":"100"}', brief: "b", execution: "swarm", role: "worker" } as Rule;
+    seed([saved]);
+    const preview = createRulesPreviewer({
+      rules: () => [saved], search: async () => [], maxAgents: 5, rateLimitMs: 0,
+      getChildPages: async (ancestor) => ancestor === "100" ? { results: [{ id: "one" }] } : { results: [{ id: "two" }, { id: "three" }] },
+    });
+    const scopeOf = createScopeCache(async (id, query, provider) => {
+      const result = await preview(id, query, provider);
+      return result.ok ? result.total : Number.POSITIVE_INFINITY;
+    });
+    const enablePlan = await planRuleWrite("pages", { enabled: true }, true, scopeOf, deps());
+    expect(enablePlan).toMatchObject({ ok: true, scope: 1, requiresConfirm: false });
+    if (!enablePlan.ok) throw new Error(enablePlan.error);
+    expect((await writeRuleEnabled("pages", true, enablePlan.etag, true, enablePlan.planHash, scopeOf, deps())).ok).toBe(true);
+
+    const editPlan = await planRuleWrite("pages", { query: '{"ancestor":"200"}' }, true, scopeOf, deps());
+    expect(editPlan).toMatchObject({ ok: true, scope: 2, requiresConfirm: false });
+    if (!editPlan.ok) throw new Error(editPlan.error);
+    expect((await writeRuleFields("pages", { query: '{"ancestor":"200"}' }, editPlan.etag, true, editPlan.planHash, scopeOf, deps())).ok).toBe(true);
+    expect(readRules()).toMatchObject([{ enabled: true, query: '{"ancestor":"200"}' }]);
+  });
+
+  test.each([
+    ["missing child reader", undefined],
+    ["read error", async () => { throw new Error("upstream secret"); }],
+    ["malformed query", async () => ({ results: [] })],
+    ["timeout", () => new Promise(() => {})],
+    ["pagination cap", async () => ({ results: Array.from({ length: 5_001 }, (_, i) => ({ id: String(i) })) })],
+  ] as const)("a %s Confluence draft remains refused even with confirm: true and performs no write", async (_name, getChildPages) => {
+    seed([]);
+    const query = _name === "malformed query" ? "not json" : '{"ancestor":"60096513"}';
+    const preview = createRulesPreviewer({
+      rules: () => [], search: async () => [], maxAgents: 5, rateLimitMs: 0, timeoutMs: 10,
+      ...(getChildPages === undefined ? {} : { getChildPages: getChildPages as never }),
+    });
+    const scopeOf = createScopeCache(async (id, text, provider) => {
+      const result = await preview(id, text, provider);
+      return result.ok ? result.total : Number.POSITIVE_INFINITY;
+    });
+    const input = { id: `bad-${_name.replaceAll(" ", "-")}`, resourceProvider: "confluence-page" as const, query };
+    const plan = await planRuleCreate(input, true, scopeOf, deps());
+    expect(plan).toMatchObject({ ok: true, scope: null, scopeUnmeasurable: true, confirmReason: "unmeasurable-scope" });
+    if (!plan.ok) throw new Error(plan.error);
+    const outcome = await createRule(input, true, plan.planHash, scopeOf, deps());
+    expect(outcome).toMatchObject({ ok: false, status: 503, confirmReason: "unmeasurable-scope" });
+    expect(readRules()).toEqual([]);
   });
 });
 

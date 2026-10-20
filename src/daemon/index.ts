@@ -1025,9 +1025,14 @@ const resourceConnections = new ResourceConnections(`http://127.0.0.1:${config.p
 // `getRules` (review round 2, R2: a function, read fresh every call — see
 // `RulesPreviewDeps.rules`'s own doc comment — never a startup snapshot, so
 // a reload takes effect on the very next preview) and the SAME
-// `atlassian.searchAll` capability the poll loops themselves call — the
-// ONLY Jira capability it is ever given.
-const rulesPreviewer = createRulesPreviewer({ rules: getRules, search: (jql) => atlassian.searchAll(jql), maxAgents: config.maxAgents });
+// `atlassian.searchAll` Jira capability and the existing direct-child
+// Confluence reader used by the poll loops themselves.
+const rulesPreviewer = createRulesPreviewer({
+  rules: getRules,
+  search: (jql) => atlassian.searchAll(jql),
+  getChildPages: ops.getChildPages,
+  maxAgents: config.maxAgents,
+});
 
 // FACTORY-662: this process's one CSRF token (`GET /api/session` hands it
 // out; every write route checks it) — minted once, here, never per-request
