@@ -9,8 +9,6 @@ import {
   type ManagedAgentLaunch,
   type ParamsOf,
 } from "@brooswit/drovr";
-// Bun embeds this at build time, so the built binary carries it — same discipline as workspace.ts's own briefs/*.md imports.
-import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 
 /**
  * FACTORY-892: herdr's `agent.start` rejects any start argument containing a
@@ -40,7 +38,23 @@ export function controlCharStartArgs(args: readonly string[]): Array<{ index: nu
  */
 export function assertSafeStartArgv(args: readonly string[]): void {
   const bad = controlCharStartArgs(args);
-  if (bad.length === 0) return;
+  if (bad.length === 0) {
+    // Belt-and-suspenders over the length ceiling too (see
+    // KICKOFF_PROMPT_MAX_BYTES): herdr's canonical-mode input-line
+    // rejection ("wait for the shell prompt and retry") returns an opaque
+    // `agent_start_input_failed` that fails staffing silently and labels
+    // the ticket `agent:none`. Catch it butchr-side, with butchr's own
+    // message, so a future kickoff that grows past the ceiling fails loud
+    // at build time instead of silently at launch time.
+    const oversize = args
+      .map((value, index) => ({ index, bytes: Buffer.byteLength(value, "utf8") }))
+      .filter(({ bytes }) => bytes > KICKOFF_PROMPT_MAX_BYTES);
+    if (oversize.length === 0) return;
+    const detail = oversize.map(({ index, bytes }) => `args[${index}]=${bytes}B`).join(", ");
+    throw new Error(
+      `refusing to start agent: start argv exceeds the TTY canonical-mode line limit (max ${KICKOFF_PROMPT_MAX_BYTES}B; ${detail}) — herdr would reject this as agent_start_input_failed`,
+    );
+  }
   const detail = bad.map(({ index, value }) => `args[${index}]=${JSON.stringify(value)}`).join(", ");
   throw new Error(`refusing to start agent: control character(s) in start argv — herdr rejects these before shell-quoting (${detail})`);
 }
@@ -58,23 +72,41 @@ const flattenToSingleLine = (text: string): string =>
   text.trim().replace(MARKDOWN_LEADING_LINE_MARKER, "").replace(/\s+/g, " ");
 
 /**
- * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
- * every kickoff prompt below, so it is in context from the agent's very
- * first turn — not just inside `brief.md` (which a long session's own
- * context compaction can push out) — and so it is still there at the moment
- * the agent is deciding whether to stop or go idle. Same shared source
- * (`briefs/_before-you-stop.md`) `src/agents/workspace.ts`'s own
- * `BEFORE_YOU_STOP_INCLUDE_MARKER` resolves into every `briefs/*.md`
- * template — this is the SECOND of the two places FACTORY-735 requires the
- * text to land, not a competing copy of it.
- *
- * FACTORY-892: flattened to one line (`flattenToSingleLine`, not just
- * `.trim()`) — `briefs/_before-you-stop.md` is hand-wrapped Markdown with
- * real newlines mid-sentence, and a multi-line kickoff is exactly the
- * regression this ticket fixes. See `CONTROL_CHAR_PATTERN`'s own doc
- * comment above for why.
+ * The hard upper bound on any `agent.start` kickoff prompt (`args[0]`),
+ * sized against herdr's own TTY canonical-mode input-line limit: Linux's
+ * line discipline buffers at most 4096 bytes per line in canonical mode,
+ * and the standard POSIX minimum (`MAX_CANON`) is only 1024 bytes.
+ * Herdr types the whole `args` into the pane's shell before the agent
+ * CLI switches the TTY to non-canonical mode, so a kickoff above this
+ * ceiling is rejected with `agent_start_input_failed`: "input contains a
+ * N-byte line but the terminal is in canonical mode with a 1024-byte
+ * limit; wait for the shell prompt and retry". 900 leaves comfortable
+ * headroom under even the strictest ceiling for the agent CLI's own
+ * flags that get concatenated onto this positional. If this ever needs
+ * to grow, verify first with herdr's own `agent.start` on a real
+ * terminal — the limit is enforced by the Linux kernel, not herdr.
  */
-const KICKOFF_REMINDER = flattenToSingleLine(BEFORE_YOU_STOP);
+export const KICKOFF_PROMPT_MAX_BYTES = 900;
+
+/**
+ * FACTORY-735/FACTORY-739: a reminder to re-read brief.md's "Before you
+ * stop or go idle" section is appended to every kickoff prompt so it is
+ * in context from the agent's very first turn — not just inside
+ * `brief.md` (which a long session's own context compaction can push
+ * out) — and so the mandate is still legible at the moment the agent is
+ * deciding whether to stop or go idle.
+ *
+ * This used to inline the FULL `briefs/_before-you-stop.md` body
+ * (5960 bytes), flattened to one line, which pushed every kickoff over
+ * 6kB — well past herdr's TTY canonical-mode line limit of 1024 bytes
+ * (`agent_start_input_failed`, "wait for the shell prompt and retry").
+ * Every launch failed. The full text still lands in `brief.md` via
+ * `BEFORE_YOU_STOP_INCLUDE_MARKER` (`src/agents/workspace.ts`), so the
+ * agent still has access to it; the kickoff carries the directive to
+ * go re-read it, with enough context to survive compaction.
+ */
+const KICKOFF_REMINDER =
+  "Before you stop or go idle, re-read brief.md's \"Before you stop or go idle\" section in full and apply it — never skip the ticket-status/label/comment steps it names.";
 
 /** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. ONE LINE — see FACTORY-892 above. */
 export const KICKOFF_PROMPT = `follow your CLAUDE.md. ${KICKOFF_REMINDER}`;

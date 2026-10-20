@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { briefFor, knownBriefTypes, BEFORE_YOU_STOP_INCLUDE_MARKER, RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER } from "../../src/agents/workspace.js";
-import { KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
+import { KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT, KICKOFF_PROMPT_MAX_BYTES } from "../../src/agents/argv.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
 const BRIEFS_DIR = join(ROOT, "briefs");
@@ -213,17 +213,34 @@ describe("FACTORY-735/FACTORY-739: shared 'before you stop' section", () => {
     }
   });
 
-  // DoD item 4: the SAME text, in the worker's kickoff prompt — delivered
-  // (and so in context) from the agent's very first turn, not only inside
-  // brief.md.
-  test("the Claude kickoff prompt carries the same required text", () => {
-    for (const phrase of REQUIRED_PHRASES) expect(KICKOFF_PROMPT).toMatch(phrase);
+  // DoD item 4 revised: the kickoff prompt names the "Before you stop or
+  // go idle" section and tells the agent to go re-read it in brief.md
+  // every time. The FULL text used to be inlined here flattened to one
+  // line (5960 bytes), which pushed every kickoff over herdr's TTY
+  // canonical-mode line limit (1024 bytes) and silently failed every
+  // launch with `agent_start_input_failed`. The directive still carries
+  // the mandate's name in context from turn 1 so compaction has
+  // something to summarise around, and the agent is explicitly told to
+  // re-read brief.md's section when it is deciding whether to stop.
+  test("the Claude kickoff prompt names the shared section and points at brief.md", () => {
     expect(KICKOFF_PROMPT).toContain("follow your CLAUDE.md");
+    expect(KICKOFF_PROMPT).toMatch(/before you stop or go idle/i);
+    expect(KICKOFF_PROMPT).toMatch(/re-read brief\.md/i);
   });
 
-  test("the non-Claude (AGENTS.md) kickoff prompt carries the same required text", () => {
-    for (const phrase of REQUIRED_PHRASES) expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
+  test("the non-Claude (AGENTS.md) kickoff prompt names the shared section and points at brief.md", () => {
     expect(AGENTS_KICKOFF_PROMPT).toContain("follow your AGENTS.md");
+    expect(AGENTS_KICKOFF_PROMPT).toMatch(/before you stop or go idle/i);
+    expect(AGENTS_KICKOFF_PROMPT).toMatch(/re-read brief\.md/i);
+  });
+
+  // Falsifier for the regression this file now protects against: a
+  // kickoff bigger than `KICKOFF_PROMPT_MAX_BYTES` is rejected by herdr
+  // before the shell switches to non-canonical mode. Fails loudly here
+  // the moment any future edit pushes the prompt past that ceiling.
+  test("both kickoff prompts stay under KICKOFF_PROMPT_MAX_BYTES — the TTY canonical-mode input-line ceiling", () => {
+    expect(Buffer.byteLength(KICKOFF_PROMPT, "utf8")).toBeLessThanOrEqual(KICKOFF_PROMPT_MAX_BYTES);
+    expect(Buffer.byteLength(AGENTS_KICKOFF_PROMPT, "utf8")).toBeLessThanOrEqual(KICKOFF_PROMPT_MAX_BYTES);
   });
 });
 
@@ -264,15 +281,13 @@ describe("FACTORY-1020: worker briefs own verified In Review and Done transition
     }
   });
 
-  // Both supported kickoff reminders (DoD: "both supported kickoff
-  // reminders receiving the same text") carry the lifecycle rules too, not
-  // just the original before-you-stop phrasing.
-  test("both kickoff prompts carry the lifecycle rules and every named scenario", () => {
-    for (const phrase of [...REQUIRED_LIFECYCLE_PHRASES, ...Object.values(SCENARIO_PHRASES)]) {
-      expect(KICKOFF_PROMPT).toMatch(phrase);
-      expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
-    }
-  });
+  // The DoD's "both supported kickoff reminders receiving the same text"
+  // used to assert the FULL lifecycle rule set was inlined in the
+  // kickoff — see the "names the shared section" tests above for why
+  // that moved to brief.md only, and the KICKOFF_PROMPT_MAX_BYTES ceiling
+  // test for the regression this now protects against. The lifecycle
+  // rules still land in every brief via `briefFor()` (DoD item 1,
+  // asserted immediately above).
 
   test("briefs/_recursive-child-closure.md exists and requires recursive, verified descendant closure with project-key safety", () => {
     const text = readFileSync(join(BRIEFS_DIR, "_recursive-child-closure.md"), "utf8");
@@ -407,12 +422,10 @@ describe("FACTORY-1021: genuinely blocked work moves to To Do", () => {
     }
   });
 
-  test("both kickoff prompts carry the blocked-to-To Do rule", () => {
-    for (const phrase of Object.values(BLOCKED_TO_DO_PHRASES)) {
-      expect(KICKOFF_PROMPT).toMatch(phrase);
-      expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
-    }
-  });
+  // The blocked-to-To Do rule now lives in brief.md only — the kickoff
+  // carries the pointer, not the rule set. See the "names the shared
+  // section" tests at the top of this file and KICKOFF_PROMPT_MAX_BYTES
+  // for the regression this change protects against.
 
   // The readback/failure-reporting paragraph already above this rule in the
   // shared source is generic over "the target status" — it is not
