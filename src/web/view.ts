@@ -1776,12 +1776,46 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     .get("/agents/pane/:pane/attach", async ({ params, set }) => {
       const pane = decodeURIComponent(params.pane);
       const r = await deps.openPane(pane);
-      set.headers["content-type"] = "text/plain; charset=utf-8";
-      if (!r.ok) { set.status = 409; return r.error ?? "could not open"; }
-      // BUTCHR-267 criterion 6: the spawn is fire-and-forget — say only what
-      // is actually known (the emulator was launched), never that a window
-      // appeared, which was never observed.
-      return `launched a terminal for ${pane} (fire-and-forget: whether a window actually appeared was not, and cannot be, confirmed)`;
+      // Failure still answers as plain text — a human who clicked the link
+      // must be able to read why nothing opened (BUTCHR-267 criterion 5).
+      if (!r.ok) {
+        set.status = 409;
+        set.headers["content-type"] = "text/plain; charset=utf-8";
+        return r.error ?? "could not open";
+      }
+      // Success answers as a tiny HTML page that steps the browser back to
+      // the dashboard the click came from. The old plain-text success body
+      // ("launched a terminal for <pane> (fire-and-forget …)") was a
+      // dead-end: the dashboard operator who clicked "open terminal" had
+      // to hit Back to get out, and the fact that the launch call RETURNED
+      // is all they actually wanted to see — the terminal itself is a
+      // separate OS window, not this response. The HTML carries the same
+      // honesty hedge (fire-and-forget; whether a window appeared can't be
+      // confirmed from here), so JS-off or no-history navigation still
+      // reads the real status, not an actually blank page.
+      // BUTCHR-267 criterion 6: the spawn is fire-and-forget — say only
+      // what is actually known (the emulator was launched), never that a
+      // window appeared, which was never observed.
+      set.headers["content-type"] = "text/html; charset=utf-8";
+      set.headers["cache-control"] = "no-store";
+      // Pane ids are herdr-formatted (`wN:pN`), but still escape defensively
+      // in case a future provider widens the shape — keeps HTML output
+      // injection-safe without depending on a validator upstream.
+      const paneEsc = pane
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+      return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<title>launched terminal for ${paneEsc}</title>
+<script>if (history.length > 1) { history.back(); } else { location.replace("/"); }</script>
+</head><body>
+<p>Launched a terminal for <code>${paneEsc}</code> (fire-and-forget: whether a window actually appeared cannot be confirmed from here).</p>
+<p>If this page did not navigate back on its own, <a href="/">return to butchr</a>.</p>
+</body></html>`;
     })
     // BUTCHR-339: the dashboard row's RESOURCE link target — a small
     // server-side redirect that resolves a resource key to its correct
