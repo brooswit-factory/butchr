@@ -1,0 +1,4 @@
+bump: patch
+
+### Changed
+- **`open terminal` returns the dashboard operator to the dashboard.** `GET /agents/pane/:pane/attach` used to answer every success with plain text (`"launched a terminal for <pane> (fire-and-forget …)"`), leaving the clicker stranded on a near-blank page that forced a Back click to return. The success path now answers a tiny HTML page that calls `history.back()` (falling back to `location.replace("/")` when there is no prior page), so a click in either dashboard puts the operator right back where they came from. The same honesty hedge is still in the body text for a JS-off or direct-navigation browser (BUTCHR-267 criterion 5 — a human who clicked still reads what actually happened, never an actually blank page). The failure path is unchanged: 409 + plain-text, specific reason.
