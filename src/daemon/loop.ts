@@ -212,6 +212,9 @@ export class ResumeDeferGuard {
 export const RESUME_WAITING_NOTICE_AT_POLLS = 10;
 
 export interface ReconcileOptions {
+  /** Earlier configuration stops already attempted this poll; preserve isolation and report with ordinary failures. */
+  initialFailures?: readonly ReconcileFailure[];
+
   ruleLease?: number|undefined;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
@@ -536,7 +539,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   if(rulePolicy){const census=herd.ruleCensus?await herd.ruleCensus():{ids:await herd.runningIssues(),complete:false};rulePolicy.census(census);if(opts.ruleLease===undefined)ruleLease=rulePolicy.generation();runtimeRunning=census.ids;desired=rulePolicy.prepare(desired,runtimeRunning,ruleLease);}
   const frozen = new Set(herd.frozen ? await herd.frozen([...desired.keys()]) : []);
   desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
-  const failures: ReconcileFailure[] = [];
+  const failures: ReconcileFailure[] = [...(opts.initialFailures??[])];
   if (herd.recoverQuota) {
     await Promise.all([...desired.values()].map(async (spec) => {
       try {
@@ -710,6 +713,8 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // one bad `herd.stop` no longer aborts the REST of this loop (every other
   // resource still gets stopped this poll) or the `respawn` loop below.
   for (const issue of plan.stop) {
+    if(opts.initialFailures?.some(failure=>failure.stage==='stop'&&failure.id===issue))continue;
+
     if(!frozen.has(issue)&&rulePolicy?.protectStop(issue,ruleLease))continue;
     try {
       await herd.stop(issue,rulePolicy?ruleLease:undefined);
@@ -1229,10 +1234,16 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   let previousRulesSnapshot:Snapshot<T>={issues:[],related:[]};
   return watch<Snapshot<T>>(
     async () => {
-      await reconcileDisabledRules(deps.herd,deps.ownsId,deps.onStopped);
+      const configuration=await reconcileDisabledRules(deps.herd,deps.ownsId,deps.onStopped);
+      for(const failure of configuration.failures){
+       try{deps.log?.(`WARNING: [reconcile] rule-off stop failed id=${failure.id}; retained for retry`);}catch{/* Logging cannot starve other rule work. */}
+      }
       const ruleLease=deps.herd.ruleRuntime?.().generation();
       // Intentional policy fencing completes the loop without observing or advancing its journal.
-      if(deps.herd.ruleRuntime&&!deps.herd.ruleRuntime().canObserve(deps.ruleProvider)){await deps.onFencedPoll?.();deps.onPollSuccess?.();deps.onNotifySuccess?.();return {...previousRulesSnapshot,ruleLease,observed:false};}
+      if(deps.herd.ruleRuntime&&!deps.herd.ruleRuntime().canObserve(deps.ruleProvider)){
+       if(deps.checkReconcileFailure)await deps.checkReconcileFailure(configuration.failures,[],configuration.running.filter(deps.ownsId));
+       await deps.onFencedPoll?.();deps.onPollSuccess?.();deps.onNotifySuccess?.();return {...previousRulesSnapshot,ruleLease,observed:false};
+      }
       const issues = await resourceType.discovery.search();
       const desired = desiredFrom(issues, resourceType);
       // Two separate passes over `issues`, each re-calling `verdictFor` per
@@ -1245,7 +1256,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       // relaxing that constraint.
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
-        ruleLease,
+        ruleLease,initialFailures:configuration.failures,
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
         ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
