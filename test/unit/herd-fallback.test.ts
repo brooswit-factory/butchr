@@ -118,6 +118,12 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(f.prompts.some(p=>p.text.includes('Transcript chunk')||p.text.includes('private historical context'))).toBe(false);
     expect(f.prompts.at(-1).text).toBe(kickoffFor("claude",spec));
   });
+  test('failed fresh readiness preserves source and durably marks the paid attempt for inspection',async()=>{
+    const f=fixture({existing:[existing('codex','done')],missingAck:true});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    expect(await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true)).toMatchObject({status:'blocked',partial:true,current:{paneId:'old',provider:'codex'}});
+    expect(f.closed).not.toContain('old');expect(f.creates).toHaveLength(1);expect(f.prompts).toEqual([]);
+  },150000);
   test('desired handoff preserves current-main MCP channel binding',async()=>{
     const f=fixture({existing:[existing('codex','done')]});
     const binding={name:'fixture-channel',type:'http' as const,url:'https://fixture.example/mcp',channel:false};

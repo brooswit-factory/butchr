@@ -895,7 +895,7 @@ export class HerdrHerd implements Herd {
       previousPane=current.pane_id;
       if(current.agent_status!=='idle'&&current.agent_status!=='done')return {status:'blocked',reason:'Current worker is not idle or done',current:physical()};
       const result=await this.startProviders(spec,current.pane_id,'Desired rule launch preferences changed');guard();const applied=physical();
-      if(result.status!=='success')return {status:'blocked',reason:result.status==='blocked'?result.reason:'No requested provider is available',current:applied,partial:!!applied&&applied.paneId!==previousPane};
+      if(result.status!=='success')return {status:'blocked',reason:result.status==='blocked'?result.reason:'No requested provider is available',current:applied,partial:result.status==='blocked'&&!!result.requiresInspection||!!applied&&applied.paneId!==previousPane};
       if(!result.attempted.length||!applied||applied.paneId===previousPane||applied.paneId!==result.value)return {status:'blocked',reason:'Drovr did not acknowledge a replacement worker',current:applied};
       return {status:'applied',current:applied};
     }));
