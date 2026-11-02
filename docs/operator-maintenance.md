@@ -125,3 +125,56 @@ No hook installation, rule changes, quota override or paid readiness probe occur
 After an authorized integration repair, status is rechecked automatically.
 Preserved uncommitted staging panes still require normal ownership recovery;
 this guard never closes a pane or fabricates a native session reference.
+
+### Interrupted empty Claude bootstrap
+
+`butchr-operator staged-bootstrap plan` inspects a specific Codex source and
+unregistered Claude staging target. It is a read-only recovery for an interrupted
+handoff that is now blocked by ambiguous physical inventory. It requires the
+connected Servr rule to remain enabled for Claude, the original managed source,
+an exact deterministic staging name, one foreground process per pane, matching
+process generations and executable identities, and no canary, freeze, stop or
+partial-handoff hold. It refuses active handoffs.
+
+```sh
+butchr-operator staged-bootstrap plan \
+  --worker RESOURCE_PROVIDER:RULE_ID:RESOURCE_ID \
+  --source SOURCE_PANE --target TARGET_PANE \
+  --socket EXISTING_HERDR_SOCKET --state OWNER_PRIVATE_STATE_DIRECTORY \
+  --daemon-url http://127.0.0.1:PORT \
+  --native-root EXACT_OWNER_CLAUDE_PROJECT_DIRECTORY \
+  --target-executable EXACT_CANONICAL_CLAUDE_IMAGE
+```
+
+The foreground process's generated random bootstrap nonce must match exactly one
+bounded native history in that project. Only the original bootstrap prompt and
+its readiness acknowledgement are allowed: extra turns, tools, file backups,
+unknown records, ambiguous sessions or changed files refuse recovery. The target
+must be idle, unfocused, at the bottom of its screen with an empty input prompt.
+The source's registered native history must still be readable. Plans contain
+identity hashes and sizes, never conversation bodies or credentials. Planning
+creates no directories or files and sends no prompts.
+
+Review the exact plan and its effects before saving it in an existing owner-private
+directory as a mode `0600` file. Applying requires separate explicit authorization:
+
+```sh
+butchr-operator staged-bootstrap apply --plan-file PRIVATE_PLAN_FILE \
+  --confirm EXACT_PLAN_HASH --approval-reference EXPLICIT_AUTHORIZATION
+butchr-operator staged-bootstrap status --plan-file PRIVATE_PLAN_FILE
+```
+
+Apply revalidates the entire evidence twice, records a durable private audit, and
+closes only the proven empty staging pane. Both native histories remain on disk;
+the command never closes the source, changes settings, clears holds, or launches
+a worker. Removing the duplicate can allow **normal reconciliation to launch a
+paid replacement and import the full source history**. The plan reports source
+size and estimated import chunk count so the operator can assess this cost. The
+normal handoff must acknowledge the history before retiring the original source.
+
+A lost close response retains an uncertainty lock. Subsequent apply calls only
+verify physical absence and history preservation; they never repeat an uncertain
+close. Inspect the status and private receipt if either pane or its identity
+changes. Never delete the lock, fabricate a native reference, manually close a
+pane, or use this command to discard useful work. Registered targets or targets
+with any additional work require a separate history-preserving recovery.
