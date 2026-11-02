@@ -147,11 +147,11 @@ describe("ReapGuard", () => {
 // 3/4: HerdrHerd.closeStranded — the live-process safety layer
 // ---------------------------------------------------------------------------
 describe("HerdrHerd.closeStranded", () => {
-  function fakeHerdrForClose(processInfo: (paneId: string) => Promise<{ process_info?: { pane_id: string; foreground_processes?: FakeProcess[] } }>, closeFails = false) {
+  function fakeHerdrForClose(processInfo: (paneId: string) => Promise<{ process_info?: { pane_id: string; foreground_processes?: FakeProcess[] } }>, closeFails = false, paneIds=["w1:p1"]) {
     const closed: string[] = [];
     const client = {
-      workspace: { close: async (p: { workspace_id: string }) => { if (closeFails) throw new Error("herdr close boom"); closed.push(p.workspace_id); } },
-      pane: { processInfo: (p: { pane_id: string }) => processInfo(p.pane_id) },
+      workspace: { list:async()=>({workspaces:[{workspace_id:"w1"}]}),close: async (p: { workspace_id: string }) => { if (closeFails) throw new Error("herdr close boom"); closed.push(p.workspace_id); } },
+      pane: { list:async()=>({panes:paneIds.map(pane_id=>({pane_id,workspace_id:"w1",cwd:join(root,"BUTCHR-9")}))}),processInfo: (p: { pane_id: string }) => processInfo(p.pane_id) },
     };
     return { client: client as any, closed };
   }
@@ -198,7 +198,7 @@ describe("HerdrHerd.closeStranded", () => {
       "w1:p1": ok([{ pid: 1, name: "fish", argv: ["/usr/bin/fish"] }]),
       "w1:p2": ok([{ pid: 2, name: "claude", argv: ["claude"] }]),
     };
-    const f = fakeHerdrForClose((paneId) => responses[paneId]!());
+    const f = fakeHerdrForClose((paneId) => responses[paneId]!(),false,["w1:p1","w1:p2"]);
     const herd = new HerdrHerd(f.client, "u");
     expect(await herd.closeStranded(candidate(["w1:p1", "w1:p2"]))).toBe(false);
     expect(f.closed).toEqual([]);
@@ -209,7 +209,7 @@ describe("HerdrHerd.closeStranded", () => {
       "w1:p1": ok([{ pid: 1, name: "fish", argv: ["/usr/bin/fish"] }]),
       "w1:p2": async () => { throw new Error("hiccup"); },
     };
-    const f = fakeHerdrForClose((paneId) => responses[paneId]!());
+    const f = fakeHerdrForClose((paneId) => responses[paneId]!(),false,["w1:p1","w1:p2"]);
     const herd = new HerdrHerd(f.client, "u");
     expect(await herd.closeStranded(candidate(["w1:p1", "w1:p2"]))).toBe(false);
     expect(f.closed).toEqual([]);
