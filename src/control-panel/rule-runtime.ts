@@ -39,6 +39,13 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   if(m.deactivation&&(typeof m.deactivation.originalText!=='string'||typeof m.deactivation.emptyEtag!=='string'))throw Error('Invalid deactivation record');return m;
  }
  try{const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||(stat.mode&0o077)||stat.size>MAX)throw Error('Unsafe remote authority manifest');manifest=validate(JSON.parse(readFileSync(path,'utf8')));retained=new Map(manifest.retained);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+ // A previous process may have staged a target before dying. Never convert
+ // an interrupted durable request into another paid launch after restart.
+ for(const entry of retained.values())if(entry.lastHandoff?.status==='pending'||entry.reconciliation?.status==='pending'){
+  const prior=entry.lastHandoff??entry.reconciliation!;
+  const blocked={...prior,status:'blocked' as const,partial:true,reason:'Interrupted handoff requires exact source/target inspection before retry'};
+  entry.needsReconciliation=true;entry.lastHandoff=blocked;entry.reconciliation=blocked;
+ }
  function initializationRules():Rule[]{
   if(!manifest?.active)return [...local.holder.getRules()];
   const rules=new Map(manifest.remote.map(r=>[keyOf(r.definition),structuredClone(r.definition)]));

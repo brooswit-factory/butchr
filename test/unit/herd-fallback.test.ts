@@ -7,7 +7,7 @@ import {createWorkerRollout,nativeSessionHash,type CanaryPermit} from '../../src
 import {persistIntentionalStop} from '../../src/agents/stop-cause.js';
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { AgentConfig } from "../../src/agents/argv.js";
-import { AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
+import { AGENTS_KICKOFF_PROMPT, kickoffFor } from "../../src/agents/argv.js";
 import { buildWorkspace, workspaceRoot, workspaceDirFor } from "../../src/agents/workspace.js";
 
 const spec = { key: "TEST-1", issuetype: "Task", summary: "fallback fixture", parent: null };
@@ -108,6 +108,16 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(result).toMatchObject({status:'applied',current:{paneId:'new-1',provider:'claude'}});
     expect(f.closed).toEqual(['old']);expect(f.starts.length).toBe(1);expect(f.starts[0].args.join(' ')).toContain('DROVR_HANDOFF_READY_');
   });
+  test('ordinary desired handoff skips oversized saved history while preserving work and normal brief',async()=>{
+    const f=fixture({existing:[existing('codex','done')],historyText:'private historical context'.repeat(250000)});
+    const dir=workspaceDirFor(spec.key);mkdirSync(dir,{recursive:true});const work=join(dir,'uncommitted-work.txt');writeFileSync(work,'preserve exactly');
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    expect((await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true)).status).toBe('applied');
+    expect(f.closed).toEqual(['old']);expect(f.creates).toHaveLength(1);expect(readFileSync(work,'utf8')).toBe('preserve exactly');
+    expect(readFileSync(join(workspaceRoot(),'old-native.jsonl'),'utf8').length).toBeGreaterThan(4*1024*1024);
+    expect(f.prompts.some(p=>p.text.includes('Transcript chunk')||p.text.includes('private historical context'))).toBe(false);
+    expect(f.prompts.at(-1).text).toBe(kickoffFor("claude",spec));
+  });
   test('desired handoff preserves current-main MCP channel binding',async()=>{
     const f=fixture({existing:[existing('codex','done')]});
     const binding={name:'fixture-channel',type:'http' as const,url:'https://fixture.example/mcp',channel:false};
@@ -152,11 +162,11 @@ describe("HerdrHerd ordered provider fallback", () => {
       expect(c.f.starts.length).toBe(1);
     });
   }
-  test('unfenced workers retain default byte limit and source identity before target creation',async()=>{
+  test('ordinary replacements intentionally skip source byte limit without changing that limit',async()=>{
     const f=fixture({existing:[existing('codex','done')],historyText:'x'.repeat(4*1024*1024+1)});
     const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
     const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
-    expect(result.status).toBe('blocked');expect(f.creates).toEqual([]);expect(f.closed).toEqual([]);expect(f.rows()[0]!.pane_id).toBe('old');
+    expect(result.status).toBe('applied');expect(f.creates).toHaveLength(1);expect(f.closed).toEqual(['old']);expect(f.rows()[0]!.pane_id).toBe('new-1');expect(f.prompts.some(p=>p.text.includes('Transcript chunk'))).toBe(false);
   });
   test('canary missing ACK closes only its owned target and never retires source or retries',async()=>{
     const c=await canaryFixture({missingAck:true});
@@ -190,7 +200,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     const f=fixture({existing:[existing('codex','done')]});f.client.pane.close=async()=>{throw Error('synthetic retirement failure');};
     const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
     const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
-    expect(result).toMatchObject({status:'blocked',partial:true,current:{paneId:'new-1',provider:'claude'}});expect(f.rows().map(r=>r.pane_id)).toEqual(['old','new-1']);expect(f.prompts).toHaveLength(1);expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
+    expect(result).toMatchObject({status:'blocked',partial:true,current:{paneId:'new-1',provider:'claude'}});expect(f.rows().map(r=>r.pane_id)).toEqual(['old','new-1']);expect(f.prompts).toHaveLength(0);expect(f.starts[0].args.join(' ')).toContain('history is intentionally not imported');
   });
   test("desired handoff leaves actively working source uninterrupted", async () => {
     const f=fixture({existing:[existing('codex','working')]});
@@ -208,7 +218,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(f.closed).toEqual([]);
     expect(f.prompts).toEqual([]);
     expect(await herd.paneFor(spec.key)).toBe("old");
-    expect(logs.some(line => line.includes("native transcript"))).toBe(true);
+    expect(logs.some(line => line.includes("native identity"))).toBe(true);
   });
 
   test("nudge waits for handoff acknowledgement and uses the committed pane", async () => {
@@ -229,8 +239,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     release();
     expect(await recovery).toBe("recovered");
     expect(await nudge).toEqual({ delivered: true });
-    expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
-    expect(f.prompts.slice(1)).toEqual([
+    expect(f.prompts).toEqual([
       { target: "new-1", text: AGENTS_KICKOFF_PROMPT },
       { target: "new-1", text: "new request" },
     ]);
@@ -504,9 +513,9 @@ describe("HerdrHerd ordered provider fallback", () => {
       const herd = new HerdrHerd(f.client, url, instant, line => logs.push(line), config, availability);
       expect(await herd.recoverQuota(spec)).toBe("recovered");
       expect(f.starts.map(p => p.kind)).toEqual(["claude"]);
-      expect(f.starts[0].args[0]).toContain("context handoff bootstrap");
+      expect(f.starts[0].args[0]).toContain("fresh-session handoff");
       expect(f.starts[0].args[0].length).toBeLessThan(512);
-      expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
+      expect(f.prompts[0].text).not.toContain('Transcript chunk');
       expect(f.closed).toEqual(["old"]);
       expect(f.creates[0].cwd).toBe(existing().cwd);
       expect(await herd.paneFor(spec.key)).toBe("new-1");

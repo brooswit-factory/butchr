@@ -207,3 +207,7 @@ After review, configure `BUTCHR_AGENT_PROVIDER=codex` and optionally
 `BUTCHR_AGENT_MODEL` in the service environment; have the deployment owner
 install the reviewed build and schedule activation. Leave provider unset or
 `claude` to retain the default. Do not change either user's global MCP config.
+
+## Fresh-session vendor and model changes
+
+Ordinary Butchr replacements intentionally omit conversation-history import. They retain the workspace and saved native histories, verify the new provider’s native readiness acknowledgement, retire the idle source only after that proof, and then send the normal task brief. No historical transcript size limit is raised. Existing partial-handoff and security/quota holds remain blockers; a fresh-session policy does not adopt ambiguous workers or authorize clearing those holds. Explicit historical canary permits keep their original contract.

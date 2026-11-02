@@ -164,3 +164,17 @@ test('remote authority restart with an absent local default does not reject its 
 });
 for(const status of ['partial','pending'] as const)test('cleanup preserves '+status+' source/target ownership across empty census and restart',()=>{const f=fixture();try{f.update();f.runtime.recordFullCensus([key()],true);f.activate();const path=join(f.directory,'remote-rule-authority.json'),m=JSON.parse(readFileSync(path,'utf8')),entry=m.retained.find((v:any)=>v[0]===key())[1];entry.lastHandoff={status:status==='partial'?'blocked':'pending',partial:status==='partial',token:'b'.repeat(64),current:{paneId:'source:p1',provider:'codex'}};entry.reconciliation={...entry.lastHandoff};if(status==='partial')entry.needsReconciliation=true;writeFileSync(path,JSON.stringify(m),{mode:0o600});f.restart();f.update();let p=f.runtime.policy,g=p.generation();expect(p.protectCleanup!(key(),g)).toBe(true);expect(p.protectStop(key(),g)).toBe(true);expect(p.protectRespawn(key(),g)).toBe(true);expect(p.canSpawn(spec(key()),g)).toBe(false);f.runtime.recordFullCensus([],true);expect(f.runtime.observedWorkerIds()).toContain(key());f.restart();f.update();p=f.runtime.policy;g=p.generation();expect(p.protectCleanup!(key(),g)).toBe(true);expect(f.runtime.observedWorkerIds()).toContain(key());}finally{f.close();}});
 test('cleanup refuses stale leases, disconnected authority, unknown owner and pending admission',()=>{const f=fixture();try{f.update();f.runtime.recordFullCensus([key()],true);f.activate();const p=f.runtime.policy,g=p.generation();expect(p.protectCleanup!(key(),g)).toBe(false);expect(p.protectCleanup!(key('unknown'),g)).toBe(true);expect(p.canSpawn(spec(key('new')),g)).toBe(true);expect(p.protectCleanup!(key('new'),g)).toBe(true);f.update({connected:false});expect(p.protectCleanup!(key(),g)).toBe(true);expect(p.protectCleanup!(key(),p.generation())).toBe(true);}finally{f.close();}});
+
+
+test('restart of an interrupted staged handoff never launches a second replacement even when only the source is listed',async()=>{
+ const f=fixture();try{
+  f.update();f.runtime.recordFullCensus([key()],true);f.activate();
+  const path=join(f.directory,'remote-rule-authority.json'),m=JSON.parse(readFileSync(path,'utf8')),entry=m.retained.find((v:any)=>v[0]===key())[1];
+  entry.lastHandoff={status:'pending',token:'b'.repeat(64)};entry.reconciliation={...entry.lastHandoff};writeFileSync(path,JSON.stringify(m),{mode:0o600});
+  let launches=0;const runtime=createRuleRuntime(f.directory,{...f.local,reconcile:async()=>{launches++;throw Error('must not launch');}});
+  const desired=rows({rules:[{...doc.rules[0],agentPreferences:[{harness:'claude',model:'sonnet'}]},doc.rules[1]]});
+  runtime.update({connected:true,rules:desired,revision:'b'.repeat(64),source,control:{enabled:true,disabledRules:[]}});
+  const p=runtime.policy;p.prepare(new Map([[key(),spec(key())]]),[key()],p.generation());runtime.recordFullCensus([key()],true);runtime.retryReconciliation();await runtime.settleReconciliation();
+  expect(launches).toBe(0);expect(runtime.summary().workerReconciliation[0]).toMatchObject({status:'blocked',partial:true,cleanupProtected:true});
+ }finally{f.close();}
+});

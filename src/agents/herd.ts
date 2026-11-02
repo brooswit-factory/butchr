@@ -1735,6 +1735,8 @@ export class HerdrHerd implements Herd {
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
       ...(reason ? {reason} : {}),
       ...(ownedContinuation?{continuation:ownedContinuation}:{}),
+      // Ordinary replacements intentionally start fresh; explicit historical canary permits retain their own contract.
+      ...(!this.rollout&&refusedPane?{historyMode:"fresh" as const}:{}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
       // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
