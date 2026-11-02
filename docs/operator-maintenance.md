@@ -61,6 +61,18 @@ bun dist/butchr-operator.js retire-validation plan --socket /existing/herdr.sock
   --freeze-root /existing/freeze/control
 ```
 
+First read `GET /api/operator-paths` through the existing same-origin, same-owner
+local dashboard route. It returns only the running PID, runtime, effective freeze
+root and workspace root; match the PID/release to the selected service and use
+those exact roots. This reflects environment-file overrides without opening
+credential files or returning other environment fields. An unavailable or
+mismatched readback must be resolved before confirming a plan.
+
+An absent effective freeze directory is valid: the plan records its absence,
+creates nothing, and rechecks its existence and every existing canonical ancestor
+on subsequent hold reads. A new directory, hold file, symlink or non-directory
+ancestor changes or refuses the plan. Do not create a directory to pass planning.
+
 `plan` is read-only. Review its exact survivor inventory, evidence hashes,
 independent hold fingerprints and confirmation hash. Required explicit authority:
 retire **only this historical validation mode**, preserve its original permit,

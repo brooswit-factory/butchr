@@ -2,6 +2,7 @@
 /** Explicit local operator workflow. Default commands inspect only; no import-time mutations. */
 import {parseArgs} from 'node:util';import {execFileSync} from 'node:child_process';
 import {join,isAbsolute} from 'node:path';import {constants,openSync,closeSync,fstatSync,readFileSync,lstatSync,readdirSync,readlinkSync,realpathSync} from 'node:fs';
+import {inspectFreezeRoot} from '../../src/operator/maintenance-paths.js';
 import {DrovrClient} from '@brooswit/drovr';
 import {planValidationRetirement,retireValidationMode,privateText,hash,verifyValidationRetirement,type RetirementIO} from '../../src/operator/validation-retirement.js';
 import {planNativeRecovery,applyNativeRecovery,linuxNativeEvidence,nativeReadiness,parseIntegrationStatus,type NativeClient} from '../../src/operator/native-session.js';
@@ -13,7 +14,7 @@ export async function runMaintenance(args:string[]){
  if(command==='native-session'){if(!values.pane)throw Error('Exact pane required');const io=linuxNativeEvidence(native),plan=await planNativeRecovery(native,values.pane,values['native-root']??[],io);console.log(JSON.stringify(action==='plan'?plan:action==='apply'?await applyNativeRecovery(native,plan,values.confirm??'',io):(()=>{throw Error('Unknown action');})(),null,2));return;}
  if(command==='retire-validation'&&action==='status'){if(!values.state)throw Error('State directory required');console.log(JSON.stringify({retired:verifyValidationRetirement(values.state,values.permit)}));return;}
  if(command!=='retire-validation'||!values.state||!values.permit||!values.runtime||!values.workspaces||!values['freeze-root'])throw Error('Retirement requires explicit existing state, permit, runtime, workspace and freeze roots');
- const state=values.state,permit=values.permit,runtime=realpathSync(values.runtime),workspaces=realpathSync(values.workspaces),freezeRoot=realpathSync(values['freeze-root']);
+ const state=values.state,permit=values.permit,runtime=realpathSync(values.runtime),workspaces=realpathSync(values.workspaces),freezeRoot=inspectFreezeRoot(values['freeze-root']).path;
  // Supported Linux user unit; no commands stop, restart, edit, disable or install anything.
  const selectedUnit=values.unit??'butchr.service';if(!/^butchr(?:-[A-Za-z0-9_-]+)?\.service$/.test(selectedUnit))throw Error('Existing Butchr user unit required');
  const fingerprint=(path:string)=>{let fd:number;try{fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return null;throw e;}try{if(realpathSync(path)!==path)throw Error('Control path must be canonical');const s=fstatSync(fd);if(!s.isFile()||s.uid!==process.getuid?.()||(s.mode&0o022)||s.nlink!==1||s.size>8_000_000)throw Error('Unsafe selected control file');const text=readFileSync(fd,'utf8'),after=fstatSync(fd);if([s.dev,s.ino,s.size,s.mtimeMs,s.ctimeMs].join(':')!==[after.dev,after.ino,after.size,after.mtimeMs,after.ctimeMs].join(':'))throw Error('Control file changed during read');return hash(text);}finally{closeSync(fd);}};
@@ -23,7 +24,7 @@ export async function runMaintenance(args:string[]){
   holds:async()=>{const manifest=JSON.parse(privateText(join(state,'remote-rule-authority.json')));const paths=[join(state,'remote-rule-authority.json'),join(state,'remote-overrides.json')];for(const [id] of manifest.retained??[]){if(typeof id!=='string')throw Error('Unknown retained identity');paths.push(join(freezeRoot,hash('butchr:'+id)+'.json'));}
    // Only exact stop-marker names under the explicitly permitted workspace root. No native history or credentials.
    const {agents}=await client.agent.list();for(const a of agents){const cwd=a.cwd;if(!cwd||!isAbsolute(cwd)||!(cwd===workspaces||cwd.startsWith(workspaces+'/')))continue;paths.push(join(cwd,'.butchr-stop-cause.json'));}
-   return [...new Set(paths)].sort().map(path=>({path,sha256:fingerprint(path)}));},
+   return {freezeRoot:inspectFreezeRoot(freezeRoot),files:[...new Set(paths)].sort().map(path=>({path,sha256:fingerprint(path)}))};},
   assertStopped:async()=>{for(const unit of [selectedUnit,'butchr-health-watchdog.timer','butchr-health-watchdog.service']){const s=show(unit);if(unit===selectedUnit&&(s.WorkingDirectory!==runtime||!s.ExecStart?.includes(join(runtime,'dist/butchr.js'))))throw Error('Selected service binding differs from inspected release');if(s.ActiveState!=='inactive'||s.Job||s.MainPID&&s.MainPID!=='0'||unit.endsWith('.service')&&s.SubState!=='dead')throw Error('Daemon/watchdog must be independently stopped: '+unit);}
    if(process.platform!=='linux')throw Error('Linux process proof required');for(const name of readdirSync('/proc')){if(!/^\d+$/.test(name)||Number(name)===process.pid)continue;const path='/proc/'+name;try{if(lstatSync(path).uid!==process.getuid?.())continue;const cwd=readlinkSync(path+'/cwd'),argv=readFileSync(path+'/cmdline').toString().split('\0');if(cwd===runtime||argv.includes(join(runtime,'dist/butchr.js')))throw Error('Competing runtime process');}catch(e){if(['ENOENT','ESRCH'].includes((e as NodeJS.ErrnoException).code??''))continue;throw e;}}
   }

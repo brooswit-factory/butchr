@@ -1,6 +1,7 @@
 import {test,expect} from 'bun:test';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
+import {effectiveMaintenancePaths} from '../../src/operator/maintenance-paths.js';
 import {liveView,type ViewDeps} from '../../src/web/view.js';
 import {createCsrfTokenIssuer} from '../../src/web/csrf.js';
 import {createControlPanelClient} from '../../src/control-panel/client.js';
@@ -11,6 +12,9 @@ test('connection-only API preserves Origin/peer/CSRF protection, private keys an
  const app=liveView({} as any,deps);app.listen({hostname:'127.0.0.1',port:0});guard.port=app.server!.port!;const url=`http://127.0.0.1:${guard.port}`,sid=client.sessionId,did=client.deploymentId;
  try{
   expect((await fetch(url+'/api/control-panel',{headers:{origin:'https://hostile.invalid'}})).status).toBe(403);
+  expect((await fetch(url+'/api/operator-paths',{headers:{origin:'https://hostile.invalid'}})).status).toBe(403);
+  const paths=await fetch(url+'/api/operator-paths',{headers:{origin:url}});expect(paths.status).toBe(200);expect(paths.headers.get('cache-control')).toBe('no-store');expect(await paths.json()).toEqual(effectiveMaintenancePaths());
+  peerAllowed=false;expect((await fetch(url+'/api/operator-paths',{headers:{origin:url}})).status).toBe(403);peerAllowed=true;
   const initial=await fetch(url+'/api/control-panel',{headers:{origin:url}});expect(initial.status).toBe(200);expect(((await initial.json()) as {configured:boolean}).configured).toBe(false);
   peerAllowed=false;expect((await fetch(url+'/api/control-panel',{headers:{origin:url}})).status).toBe(403);peerAllowed=true;
   const headers={origin:url,'content-type':'application/json'};expect((await fetch(url+'/api/control-panel/reconnect',{method:'POST',headers,body:'{}'})).status).toBe(403);

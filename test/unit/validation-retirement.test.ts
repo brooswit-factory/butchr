@@ -1,3 +1,4 @@
+import {inspectFreezeRoot} from '../../src/operator/maintenance-paths.js';
 import {test,expect} from 'bun:test';
 import {mkdtempSync,mkdirSync,writeFileSync,readFileSync,rmSync,existsSync} from 'node:fs';
 import {tmpdir} from 'node:os';import {join} from 'node:path';
@@ -16,3 +17,10 @@ posixTest('partial target retirement verifies exact surviving identity and retai
  }finally{f.close();}});
 
 posixTest('invalid retirement archive paths are rejected before any external evidence can be read',()=>{const f=fixture();try{writeFileSync(join(f.state,'worker-canary-retired.json'),JSON.stringify({version:1,confirmation:'../../outside',archive:join(f.state,'validation-retirement-../../outside.json')}),{mode:0o600});expect(()=>verifyValidationRetirement(f.state,f.path)).toThrow('archive binding');}finally{f.close();}});
+
+posixTest('read-only retirement plan accepts absent effective freeze state and binds its later appearance without creating state',async()=>{const f=fixture();try{
+ const root=join(f.state,'absent','drovr','control'),original=f.io.holds;f.io.holds=async()=>({freezeRoot:inspectFreezeRoot(root),other:await original()});
+ const evidence=[f.path,f.receipt,join(f.state,'worker-canary-mode.json'),join(f.state,'remote-rule-authority.json')],before=evidence.map(p=>readFileSync(p,'utf8'));
+ const plan=await planValidationRetirement(f.state,f.path,f.io);expect(plan.independentHolds).toMatchObject({freezeRoot:{path:root,present:false}});expect(existsSync(join(f.state,'absent'))).toBe(false);expect(existsSync(join(f.state,'worker-canary-control.lock'))).toBe(false);expect(evidence.map(p=>readFileSync(p,'utf8'))).toEqual(before);
+ mkdirSync(root,{recursive:true,mode:0o700});await expect(retireValidationMode(plan,plan.confirmation,'synthetic',f.io)).rejects.toThrow('Plan changed');expect(existsSync(join(f.state,'worker-canary-retired.json'))).toBe(false);expect(evidence.map(p=>readFileSync(p,'utf8'))).toEqual(before);
+ }finally{f.close();}});
