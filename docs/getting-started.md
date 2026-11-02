@@ -9,7 +9,7 @@ This guide takes you from nothing to one working rule.
 | Requirement | Why |
 | --- | --- |
 | Linux or macOS | Linux uses systemd user services, macOS uses launchd, to keep the daemon (and herdr) running. On Windows, install inside WSL (Linux/systemd path, see [windows-wsl-host.md](windows-wsl-host.md)) or natively, no WSL (see [windows-native-host.md](windows-native-host.md)). |
-| [Bun](https://bun.sh) (`curl -fsSL https://bun.sh/install | bash`) | runs the daemon and builds the dashboard |
+| [Bun](https://bun.sh) 1.3.11 and Node 20.20.2 | runtimes used for the verified source build |
 | `git` | to download butchr |
 | herdr, already running and on the daemon's `PATH` | the terminal manager each agent runs in — see "Installing herdr" below |
 | The `claude` command-line tool, signed in | the default agent provider (Codex is also supported, see [agent-providers.md](agent-providers.md)) — see "Installing the `claude` tool" below |
@@ -48,14 +48,23 @@ This writes `~/.claude/hooks/herdr-agent-state.sh` and adds a hook block to `~/.
 
 ## 1. Install
 
-```
-git clone https://github.com/brooswit-factory/butchr.git
+Use an empty parent directory (with no existing `butchr` or `drovr` folders). Both public repositories are required as siblings because Butchr's package dependencies point to `../drovr` and `../drovr/legacy-events`. The pinned commits below contain the merged recovery and do not depend on a temporary branch.
+
+```sh
+git clone https://github.com/brooswit-factory/drovr.git drovr
+git -C drovr checkout --detach 4df054e3767d2af6568346daae0d29e85ed11d61
+git clone https://github.com/brooswit-factory/butchr.git butchr
+git -C butchr checkout --detach 2962b6141096abb9553fc8bad6b5c63f18ddace3
+(cd drovr && bun install --frozen-lockfile --ignore-scripts && bun run build)
+(cd drovr/legacy-events && bun install --frozen-lockfile --ignore-scripts && bun run build)
 cd butchr
-bun install
+bun install --frozen-lockfile --ignore-scripts
+bun run typecheck
+bun run typecheck:web
 bun run build
 ```
 
-`bun run build` produces the dashboard. If you skip it, the dashboard page answers 503 and tells you to build.
+The final commands run inside `butchr`; keep that directory for the next step. `bun run build` produces the dashboard assets as well as the daemon bundle. See [source recovery and build validation](../RECOVERY.md) for provenance. The [README install section](../README.md#install--run) uses the same pinned setup.
 
 ## 2. Start the daemon
 

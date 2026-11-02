@@ -58,15 +58,27 @@ one Elysia process
 
 ## Install & run
 
-No npm package is published — Brooswit's decision: no npm publishing for now; clone and run from source on each machine:
+No npm package is published. Use Bun 1.3.11 and Node 20.20.2 for the verified source build below. Start in a parent directory where `butchr` and `drovr` do not exist. Keep the repositories as siblings: Butchr depends on both `../drovr` and `../drovr/legacy-events`.
 
-```
-git clone https://github.com/brooswit-factory/butchr.git
+```sh
+git clone https://github.com/brooswit-factory/drovr.git drovr
+git -C drovr checkout --detach 4df054e3767d2af6568346daae0d29e85ed11d61
+git clone https://github.com/brooswit-factory/butchr.git butchr
+git -C butchr checkout --detach 2962b6141096abb9553fc8bad6b5c63f18ddace3
+(cd drovr && bun install --frozen-lockfile --ignore-scripts && bun run build)
+(cd drovr/legacy-events && bun install --frozen-lockfile --ignore-scripts && bun run build)
 cd butchr
-bun install
+bun install --frozen-lockfile --ignore-scripts
+bun run typecheck
+bun run typecheck:web
 bun run build
-cp .env.example .env          # fill in ATLASSIAN_SITE / EMAIL / TOKEN_FILE
-bun run start                 # reads .env / the environment
+```
+
+These immutable commits contain the merged source recovery and rule-OFF fix; no recovery branch is required. See [RECOVERY.md](RECOVERY.md) for provenance and validation. After building, run from the `butchr` directory:
+
+```sh
+cp .env.example .env          # optional: configure the providers you use
+bun run start
 ```
 
 `bun run build` (or standalone `bun run build:web`) is what produces the dashboard app's assets (`dist/web`) — `bun run start` alone runs from source and never builds anything. Skip it and `/dashboard-app/` 503s with a message naming the remedy; the daemon logs a `[butchr:dashboard-app]` line and `/health`'s `dashboardApp` field says so too, but the old server-rendered pages (`/`, `/configurations`) work either way.
