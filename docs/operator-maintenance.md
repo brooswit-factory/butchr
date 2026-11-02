@@ -85,9 +85,32 @@ Butchr daemon and its automatic watchdog launchers, under separate stop/restart
 authorization. Workers remain running in Herdr. The default unit is
 `butchr.service`; `--unit` selects an existing `butchr-*.service`. The apply
 command independently checks inactive/dead state, no pending service jobs,
-matching release binding and no competing runtime. Unknown process access fails
-closed; it is not treated as absence. A changed inventory, hold or authority
-requires replanning and renewed exact confirmation.
+matching release binding and no competing writer for this control directory.
+
+The plan now records the identity of the existing owner-private
+`.control-panel-writer.sqlite` file. Apply takes the same kernel-backed exclusive
+SQLite transaction that every supported daemon acquires before initializing its
+control panel or worker rollout, and holds it until the retirement finishes.
+This excludes another daemon even when it uses a different release path, and
+prevents a new daemon startup from entering while maintenance holds the lease.
+The separate exclusive canary-control lock excludes competing retirement and
+permit writers. Both service-state checks still require the selected daemon and
+watchdog units to be inactive/dead, with no pending jobs and no service PID.
+
+No administrator attestation, privileged command or `/proc` enumeration is needed.
+Unrelated protected SSH, systemd and provider processes are not part of this
+writer invariant and are never inspected. This is a live kernel proof, not an
+operator-supplied claim that unreadable processes are absent. Missing, unsafe,
+symlinked, multiply linked or replaced writer files, an owned transaction, or
+unknown/active service state refuse the operation. Planning never creates the
+writer database. Do not remove or replace its file to force access.
+
+Use the existing daemon-owner account and existing service-manager route. After
+reviewing a fresh plan, the supported sequence remains: stop the selected Butchr
+unit and both watchdog units, apply the exact confirmed plan, inspect the audit,
+then restart the previously active units. Workers remain in Herdr. This does not
+clear partial-worker, security, quota, freeze or stop holds. A changed inventory,
+hold, writer identity or authority requires replanning and exact confirmation.
 
 Run the same arguments with `apply --confirm EXACT_PLAN_HASH
 --approval-reference EXPLICIT_OPERATOR_AUTHORIZATION` only after that approval.

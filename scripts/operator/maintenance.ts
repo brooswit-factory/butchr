@@ -2,7 +2,8 @@
 import {createProviderReadiness} from '../../src/agents/provider-readiness.js';
 /** Explicit local operator workflow. Default commands inspect only; no import-time mutations. */
 import {parseArgs} from 'node:util';import {execFileSync} from 'node:child_process';
-import {join,isAbsolute} from 'node:path';import {constants,openSync,closeSync,fstatSync,readFileSync,lstatSync,readdirSync,readlinkSync,realpathSync} from 'node:fs';
+import {join,isAbsolute} from 'node:path';import {constants,openSync,closeSync,fstatSync,readFileSync,lstatSync,realpathSync} from 'node:fs';
+import {assertRetirementServicesStopped} from '../../src/operator/retirement-writer.js';
 import {inspectFreezeRoot} from '../../src/operator/maintenance-paths.js';
 import {DrovrClient} from '@brooswit/drovr';
 import {stagedBootstrapRuntime} from '../../src/operator/staged-bootstrap-runtime.js';
@@ -40,8 +41,7 @@ export async function runMaintenance(args:string[]){
    // Only exact stop-marker names under the explicitly permitted workspace root. No native history or credentials.
    const {agents}=await client.agent.list();for(const a of agents){const cwd=a.cwd;if(!cwd||!isAbsolute(cwd)||!(cwd===workspaces||cwd.startsWith(workspaces+'/')))continue;paths.push(join(cwd,'.butchr-stop-cause.json'));}
    return {freezeRoot:inspectFreezeRoot(freezeRoot),files:[...new Set(paths)].sort().map(path=>({path,sha256:fingerprint(path)}))};},
-  assertStopped:async()=>{for(const unit of [selectedUnit,'butchr-health-watchdog.timer','butchr-health-watchdog.service']){const s=show(unit);if(unit===selectedUnit&&(s.WorkingDirectory!==runtime||!s.ExecStart?.includes(join(runtime,'dist/butchr.js'))))throw Error('Selected service binding differs from inspected release');if(s.ActiveState!=='inactive'||s.Job||s.MainPID&&s.MainPID!=='0'||unit.endsWith('.service')&&s.SubState!=='dead')throw Error('Daemon/watchdog must be independently stopped: '+unit);}
-   if(process.platform!=='linux')throw Error('Linux process proof required');for(const name of readdirSync('/proc')){if(!/^\d+$/.test(name)||Number(name)===process.pid)continue;const path='/proc/'+name;try{if(lstatSync(path).uid!==process.getuid?.())continue;const cwd=readlinkSync(path+'/cwd'),argv=readFileSync(path+'/cmdline').toString().split('\0');if(cwd===runtime||argv.includes(join(runtime,'dist/butchr.js')))throw Error('Competing runtime process');}catch(e){if(['ENOENT','ESRCH'].includes((e as NodeJS.ErrnoException).code??''))continue;throw e;}}
+  assertStopped:async()=>{if(process.platform!=='linux')throw Error('Linux service proof required');assertRetirementServicesStopped(runtime,selectedUnit,show);
   }
  };
  const plan=await planValidationRetirement(state,permit,io);if(action==='plan'){console.log(JSON.stringify(plan,null,2));return;}if(action!=='apply')throw Error('Unknown action');console.log(JSON.stringify(await retireValidationMode(plan,values.confirm??'',values['approval-reference']??'',io),null,2));
