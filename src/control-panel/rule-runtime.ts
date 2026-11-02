@@ -51,7 +51,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  }
  function saveRetained(){if(manifest)persist({...manifest,retained:[...retained]});}
  const definitions=()=>manifest?.active?manifest.observationGraph:[...local.holder.getRules()];
- const graphFingerprint=(rules:readonly Rule[])=>JSON.stringify([...rules].sort((a,b)=>a.id.localeCompare(b.id)).map(r=>{const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks','maxLinkedTurnsPerHour'];return fields.map(k=>(r as unknown as Record<string,unknown>)[k]);}));
+ const graphFingerprint=(rules:readonly Rule[])=>JSON.stringify([...rules].sort((a,b)=>a.id.localeCompare(b.id)).map(r=>{const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'];return fields.map(k=>(r as unknown as Record<string,unknown>)[k]);}));
  function graphDeferred(){return !!manifest?.active&&graphFingerprint(manifest.observationGraph)!==graphFingerprint(manifest.remote.map(r=>r.definition));}
  function heldObservationKeys(graph:readonly Rule[]){
   const previous=new Map(graph.map(rule=>[keyOf(rule),rule]));
@@ -148,7 +148,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  async function prepareActivation(){if(!local.census)throw Error('Complete worker census unavailable');const before=generation,etag=sourceEtagOf(local.readText());const census=await local.census();if(before!==generation||etag!==sourceEtagOf(local.readText()))throw Error('Cutover state changed during census');recordFullCensus(census.ids,census.complete);if(!census.complete)throw Error('Worker inventory is incomplete or ambiguous');}
  function managed(id:string){if(ownsManagedSessionAgent(id))return false;return !!retained.get(id)?.managed||(!!manifest?.active||fault)&&!!decodeAnyAgentKey(id);}
  function current(id:string,lease:number){const r=ruleFor(id);return !fault&&lease===generation&&!!r&&allowed(r);}
- function observationCompatible(a:Rule,b:Rule){const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks','maxLinkedTurnsPerHour'];return JSON.stringify(fields.map(k=>(a as unknown as Record<string,unknown>)[k]))===JSON.stringify(fields.map(k=>(b as unknown as Record<string,unknown>)[k]));}
+ function observationCompatible(a:Rule,b:Rule){const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'];return JSON.stringify(fields.map(k=>(a as unknown as Record<string,unknown>)[k]))===JSON.stringify(fields.map(k=>(b as unknown as Record<string,unknown>)[k]));}
  function lifecycleEnabled(rule:Rule){return observationAllowed(rule)&&(!manifest?.active||!control.disabledRules.includes(remoteIdentity(rule)));}
  function safeLifecycle(id:string,lease:number){const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!!entry?.known&&!!r&&lease===generation&&allowed(r)&&fingerprint(appliedRule(entry))===fingerprint(r);}
  // OFF is an explicit configuration verdict, never inferred from a missing rule or failed discovery.

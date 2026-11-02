@@ -137,3 +137,11 @@ for(const scenario of ['success','failed','off','wrong-result','source','authori
   runtime.retryReconciliation();await runtime.settleReconciliation();expect(calls).toBe(['success','failed','off','wrong-result'].includes(scenario)?1:0);
  }finally{f.close();}
 });
+
+test('retired hourly-cap fields in saved authority cannot defer current-main observation after upgrade',()=>{const f=fixture();try{
+ f.update();f.runtime.recordFullCensus([key()],true);f.activate();
+ const savedPath=join(f.directory,'remote-rule-authority.json'),saved=JSON.parse(readFileSync(savedPath,'utf8'));
+ for(const rule of [...saved.baseline.rules,...saved.remote.map((r:any)=>r.definition),...saved.observationGraph,...saved.history,...saved.retained.map((r:any)=>r[1].rule)])rule.maxLinkedTurnsPerHour=2;
+ writeFileSync(savedPath,JSON.stringify(saved));f.restart();f.update();f.runtime.recordFullCensus([key()],true);
+ expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.policy.canObserve('jira-work')).toBe(true);
+ }finally{f.close();}});
