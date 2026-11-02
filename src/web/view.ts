@@ -1,3 +1,4 @@
+import type {ControlPanelClient} from "../control-panel/client.js";
 import { Elysia } from "elysia";
 import type { McpHandle } from "@brooswit/thatch";
 import { renderDashboard, type DashboardHeaderInfo } from "./dashboard-page.js";
@@ -40,6 +41,8 @@ const iconResponse = ({ path }: { path: string }) => new Response(ICON_ROUTES[pa
 export interface AgentState { issue: string; status: string; summary: string }
 
 export interface ViewDeps {
+  controlPanel?:ControlPanelClient;
+  localRulesWritable?:()=>boolean;
   /** The active agents to show (herdr-managed, with status). */
   state: () => Promise<AgentState[]>;
   /** Open the agent's shell in a terminal. Returns whether it launched. */
@@ -651,6 +654,15 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
     };
   }
 
+  async function controlPanelReadGuard(request: Request, server: { requestIP: (r: Request) => { address: string; port: number } | null } | null) {
+    if (!deps.dashboardOriginGuard || !deps.peerUidCheck) return { status: 503, error: "endpoint disabled: not configured" };
+    const guard = checkDashboardOrigin({ origin: request.headers.get("origin"), host: request.headers.get("host"), secFetchSite: request.headers.get("sec-fetch-site"), method: request.method }, deps.dashboardOriginGuard);
+    if (!guard.ok) return { status: guard.status, error: guard.reason };
+    const client = server?.requestIP(request);
+    if (!client || !(await deps.peerUidCheck(client))) return { status: 403, error: "peer uid check failed" };
+    return null;
+  }
+
   return new Elysia()
     .onRequest(async ({ request, set, server }) => {
       const method = request.method;
@@ -674,6 +686,7 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!deps.writeGuard) { set.status = 503; return { error: "endpoint disabled: not configured" }; }
       const guard = await checkWriteGuard(buildWriteGuardRequest(request, server), deps.writeGuard);
       if (!guard.ok) { set.status = guard.status; return guard.body; }
+      if(/^\/api\/rules(?:\/|$)/.test(path)&&deps.localRulesWritable?.()===false){set.status=409;return {error:'Local rules are archived under remote authority; roll back before editing'};}
     })
     // FACTORY-662 item 3: a capped, counted read (never a trust in
     // `Content-Length` alone) BEFORE `JSON.parse` — global, since every
@@ -794,6 +807,51 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       if (!status.ok) set.status = 503;
       return status;
     })
+    .get('/api/remote-rules/cutover',async({request,server,set})=>{
+      const guard=await controlPanelReadGuard(request,server);if(guard){set.status=guard.status;return {error:guard.error};}
+      const runtime=deps.controlPanel?.ruleRuntime();if(!runtime){set.status=503;return {error:'Runtime rule authority is unavailable in this process'};}
+      set.headers['cache-control']='no-store';return {status:runtime.summary(),plan:runtime.plan()};
+    })
+    .post('/api/remote-rules/cutover',async({body,request,server,set})=>{
+      if(!deps.writeGuard){set.status=503;return {error:'Runtime write guard unavailable'};}
+      const guard=await checkWriteGuard(buildWriteGuardRequest(request,server),deps.writeGuard);if(!guard.ok){set.status=guard.status;return guard.body;}
+      const runtime=deps.controlPanel?.ruleRuntime();if(!runtime){set.status=503;return {error:'Runtime rule authority unavailable'};}
+      const b=body as {action?:string;localDigest:string;remoteDigest:string;confirm:boolean};
+      try{if(b?.action==='activate'){await runtime.prepareActivation();return runtime.activate(b);}if(b?.action==='deactivate-local')return runtime.deactivateLocal(b);if(b?.action==='rollback')return runtime.rollback(b.confirm);set.status=400;return {error:'Unknown cutover action'};}catch{set.status=409;return {error:'Cutover refused; inspect the current plan and retained local backup',status:runtime.summary()};}
+    })
+    .get("/api/remote-rules", async ({request,server,set})=>{
+      const guard=await controlPanelReadGuard(request,server);if(guard){set.status=guard.status;return {error:guard.error};}
+      set.headers["cache-control"]="no-store";
+      if(!deps.controlPanel){set.status=503;return {error:"Remote rules unavailable"};}
+      return deps.controlPanel.remoteRules();
+    })
+    .get("/api/remote-config",async({request,server,set})=>{
+      const guard=await controlPanelReadGuard(request,server);if(guard){set.status=guard.status;return {error:guard.error};}
+      set.headers["cache-control"]="no-store";return deps.controlPanel?.remoteConfig()??{enabled:true,disabledRules:[]};
+    })
+    .put("/api/remote-config",async({body,request,server,set})=>{
+      if(!deps.writeGuard||!deps.controlPanel){set.status=503;return {error:"Remote configuration unavailable"};}
+      const guard=await checkWriteGuard(buildWriteGuardRequest(request,server),deps.writeGuard);if(!guard.ok){set.status=guard.status;return guard.body;}
+      const limited=checkWriteRateLimit(deps,server?.requestIP(request)??undefined,{route:"/api/remote-config",action:"remote-config-override",ids:[],origin:request.headers.get("origin")});if(limited){set.status=429;return limited.body;}
+      try{return deps.controlPanel.setRemoteConfig(body);}catch{set.status=400;return {error:"Could not save local remote configuration override"};}
+    })
+    .get("/api/control-panel", async ({ request, server, set }) => {
+      const guard = await controlPanelReadGuard(request, server);
+      if (guard) { set.status=guard.status; return {error:guard.error}; }
+      set.headers["cache-control"]="no-store";
+      if(!deps.controlPanel){set.status=503;return {error:"Control panel unavailable"};}
+      return deps.controlPanel.summary();
+    })
+    .put("/api/control-panel", async ({ body, request, server, set }) => {
+      if(!deps.writeGuard || !deps.controlPanel){set.status=503;return {error:"Control panel unavailable"};}
+      const guard=await checkWriteGuard(buildWriteGuardRequest(request,server),deps.writeGuard);
+      if(!guard.ok){set.status=guard.status;return guard.body;}
+      const limited=checkWriteRateLimit(deps,server?.requestIP(request)??undefined,{route:"/api/control-panel",action:"control-panel-configure",ids:[],origin:request.headers.get("origin")});
+      if(limited){set.status=429;return limited.body;}
+      set.headers["cache-control"]="no-store";
+      try{return deps.controlPanel.configure(body);}catch{set.status=400;return {error:"Could not save integration. Use an HTTPS server origin or loopback HTTP URL and valid key; enter a new key when changing servers."};}
+    })
+    .post("/api/control-panel/reconnect",async({set})=>{if(!deps.controlPanel){set.status=503;return {error:"Control panel unavailable"};}await deps.controlPanel.connect();return deps.controlPanel.summary();})
     .get("/state", () => deps.state())
     // BUTCHR-269: read-only, no action verbs, no alerting — a VIEW over data
     // this daemon already has in hand (see src/agents/dashboard.ts's own

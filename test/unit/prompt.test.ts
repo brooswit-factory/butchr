@@ -45,7 +45,7 @@ $ another earlier command
 $ cat .env
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 DATABASE_URL=postgres://admin:hunter2@prod-db.internal:5432/main
-GITHUB_TOKEN=ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA
+GITHUB_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 $ deploy --prod
 Choose deployment target:
 ❯ 1. Production
@@ -68,7 +68,7 @@ describe("keysToSelect", () => {
 describe("un-numbered trust dialog (Claude Code 2.x)", () => {
   const TRUST = `──────────────────────────────
  Accessing workspace:
- /home/brooswit/butchr-workspaces/KAN-706
+ /home/example/butchr-workspaces/KAN-706
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a
  well-known open source project, or work from your team). If not, take a moment to review
  what's in this folder first.
@@ -430,7 +430,7 @@ describe("un-numbered branch: footer must be line-anchored, not merely present (
   test("a real un-numbered dialog still parses identically (regression: the captured trust dialog)", () => {
     const trust = `──────────────────────────────
  Accessing workspace:
- /home/brooswit/butchr-workspaces/KAN-706
+ /home/example/butchr-workspaces/KAN-706
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a
  well-known open source project, or work from your team). If not, take a moment to review
  what's in this folder first.

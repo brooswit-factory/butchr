@@ -207,7 +207,7 @@ describe("renderConfigInventory — errors (FACTORY-81 requirement 4)", () => {
 
 describe("renderConfigInventory — no secrets (FACTORY-81 requirement 5)", () => {
   test("an entry carrying an unexpected extra field with a secret-shaped value never surfaces it — only named fields are ever read", () => {
-    const FAKE_SECRET = "ghp_FAKESECRETTOKENabcdef1234567890";
+    const FAKE_SECRET = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const rulesWithExtra = [
       { kind: "rule", id: "x", resourceProvider: "jira-work", query: "q", enabled: true, execution: "swarm", role: "worker", agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null, unexpectedSecretField: FAKE_SECRET } as unknown as RuleInventoryEntry,
     ];

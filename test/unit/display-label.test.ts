@@ -29,7 +29,7 @@ describe("per-provider short display id", () => {
   });
 
   test("filesystem: <parent>:<name> (operator's own example)", () => {
-    expect(filesystemShortDisplayId("/home/brooswit/brooswit-factory/rinth")).toBe("brooswit-factory:rinth");
+    expect(filesystemShortDisplayId("/home/example/brooswit-factory/rinth")).toBe("brooswit-factory:rinth");
   });
 
   test("filesystem: a path one segment below root has no parent to name", () => {

@@ -1,3 +1,12 @@
+import {createContinuationPolicyReader} from '../control-panel/worker-continuation-policy.js';
+import {deliverAdmittedNotice} from '../control-panel/admitted-notice.js';
+import {admittedPolicyUnits} from '../control-panel/admitted-policy.js';
+import {writeRulesFile} from '../rules/write-rules.js';
+import {configuredWorkerRollout,daemonWorkerClient} from '../control-panel/worker-rollout.js';
+import {createControlPanelClient} from "../control-panel/client.js";
+import {createOperationalAgentFeed} from "../control-panel/telemetry.js";
+import {join as integrationJoin} from "node:path";
+import {homedir as integrationHome} from "node:os";
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { atlassianProviderStaffing } from '../rules/atlassian-staffing.js';
 import { applyProviderSwitch, parseProviderEnabledMap } from '../rules/provider-enablement.js';
@@ -357,6 +366,11 @@ let missingRulesPath: string | null = null;
 // file's startup sequence — the raise happens there, right after that router
 // exists (search `firstRunSeedOutcome` below).
 const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
+// Connection-only integration: never attaches remote rule execution authority.
+const controlPanelDirectory=process.env.BUTCHR_CONTROL_PANEL_DIR??integrationJoin(process.env.XDG_CONFIG_HOME??integrationJoin(integrationHome(),".config"),"butchr");
+const controlPanel=createControlPanelClient(controlPanelDirectory);
+const workerRollout=configuredWorkerRollout(process.env.BUTCHR_RECONCILIATION_CANARY,controlPanelDirectory);
+if(workerRollout)console.error(`[worker-canary] ${JSON.stringify(workerRollout.summary())}`);
 if (firstRunSeedOutcome.kind === "seeded") {
   console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); edit its query in the dashboard, then enable it (its brief is file-only — edit that in ${firstRunSeedOutcome.path} by hand if you want it)`);
   if (firstRunSeedOutcome.dirPermissionsWarning) console.error(`WARNING: butchr: ${firstRunSeedOutcome.dirPermissionsWarning}`);
@@ -412,7 +426,10 @@ const rulesHolder = (() => {
 // restart, and what still doesn't (a provider with
 // ZERO enabled rules — and so no client/loop at all — at startup still
 // needs one to ever begin staffing; see the SIGHUP handler below).
-const getRules = rulesHolder.getRules;
+const ruleAuthority=controlPanel.attachRuleRuntime({...(workerRollout?{rollout:workerRollout}:{}),holder:rulesHolder,readText:()=>{try{return readFileSync(rulesPath(),"utf8");}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}},writeText:(text,ifMatch)=>writeRulesFile(text,process.env,undefined,{ifMatch}),reload:()=>reloadLocalRules(),census:()=>herd.ruleCensus(),reconcile:(change,isCurrent)=>herd.reconcilePreferences(change.spec,isCurrent,change)});
+const getRules=ruleAuthority.getRules;
+const initializationRules=ruleAuthority.getInitializationRules();
+const reloadLocalRules=()=>{const result=reloadRules(rulesHolder);if(result.ok)ruleAuthority.refreshLocal();return result;};
 // BUTCHR-398: log every sentinel rule at startup, one line each, so an
 // operator can see at a glance what is exempt from the fleet agent cap —
 // the epic decision's own ask ("log each sentinel rule at startup"). No
@@ -433,7 +450,7 @@ for (const r of getRules()) {
 const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAdmission(id);
   return rule?.role;
 };
 /**
@@ -448,7 +465,8 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  * that decision to its own live rules (`getRules()`) — see
  * `RuleLizardModeDeps`'s own doc comment.
  */
-const ruleLizardModeOf = (id: string): boolean => sharedRuleLizardModeOf(id, { rules: getRules() });
+const ruleLizardModeOf = (id: string): boolean =>
+  !ruleAuthority.isUnresolvedAgent(id) && sharedRuleLizardModeOf(id, { rules: ruleAuthority.ruleForAgent(id) ? [ruleAuthority.ruleForAgent(id)!] : getRules() });
 // FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
 // capacity is decided solely by each rule's own `role` field — see
 // src/agents/capacity-role.ts for the construction-level exceptions (bare
@@ -469,7 +487,7 @@ const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleR
 const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAdmission(id);
   if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
   return {
     ruleId: rule.id,
@@ -498,7 +516,7 @@ for (const u of unresolvedRelationships(getRules())) console.error(`  ${formatUn
 const mcpBindingsOf = (id: string) => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAgent(id);
   return rule?.mcpServers;
 };
 
@@ -519,7 +537,7 @@ const mcpBindingsOf = (id: string) => {
 const resolvedAgentOf = (id: string, provider: string): { model?: string; effort?: AgentEffort } | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAgent(id);
   const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
   return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
@@ -530,7 +548,7 @@ const resolvedAgentOf = (id: string, provider: string): { model?: string; effort
 // FACTORY-66 review round 2: `applyProviderSwitch` applies this provider's
 // OWN independent switch on top of the credential-driven decision above —
 // see that function's own doc comment (src/rules/provider-enablement.ts).
-const githubStaffing = applyProviderSwitch("github-issue", githubIssueStaffing(getRules(), config.github), config.providerEnabled["github-issue"]);
+const githubStaffing = applyProviderSwitch("github-issue", githubIssueStaffing(initializationRules, config.github), config.providerEnabled["github-issue"]);
 const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -539,7 +557,7 @@ const githubIssues = githubStaffing.run && config.github
 // Config["github"]'s own doc comment) but are their own provider, staffing
 // gate, client and loop — a rules file with github-issue rules and no
 // github-pr rules stays unaffected, and vice versa.
-const githubPrStaffingResult = applyProviderSwitch("github-pr", githubPrStaffing(getRules(), config.github), config.providerEnabled["github-pr"]);
+const githubPrStaffingResult = applyProviderSwitch("github-pr", githubPrStaffing(initializationRules, config.github), config.providerEnabled["github-pr"]);
 const githubPrs = githubPrStaffingResult.run && config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -558,7 +576,7 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // The risk acknowledgement is still read from it unchanged: settings.json can never set that key.
 const zendeskStaffing = applyProviderSwitch(
   "zendesk-ticket",
-  zendeskTicketStaffingIfEnabled(getRules(), effectiveJiraEnv, config.providerEnabled["zendesk-ticket"]),
+  zendeskTicketStaffingIfEnabled(initializationRules, effectiveJiraEnv, config.providerEnabled["zendesk-ticket"]),
   config.providerEnabled["zendesk-ticket"],
 );
 const zendeskTickets = zendeskStaffing.run
@@ -583,7 +601,7 @@ const trelloCards = trelloStaffing.run
 // this provider's own independent switch is off (FACTORY-66 review round
 // 2: see `FilesystemLoopDeps.enabled`'s own doc comment,
 // src/daemon/filesystem-loop.ts).
-const fsRules = filesystemRules(getRules());
+const fsRules = filesystemRules(initializationRules);
 const filesystemEnabled = config.providerEnabled.filesystem;
 const filesystemStaffing = applyProviderSwitch("filesystem", { run: fsRules.length > 0, rules: fsRules, reason: null }, filesystemEnabled);
 
@@ -592,7 +610,7 @@ const filesystemStaffing = applyProviderSwitch("filesystem", { run: fsRules.leng
 // this daemon CAN now reach here with Atlassian disabled; the old "always
 // runs" assumption is no longer true. See `confluencePageStaffing` below,
 // which `startConfluencePageLoop`'s own call site gates on.
-const confluencePageEnabledRules = confluencePageRules(getRules());
+const confluencePageEnabledRules = confluencePageRules(initializationRules);
 
 // FACTORY-66: see `atlassianProviderStaffing`'s own doc comment
 // (src/rules/atlassian-staffing.ts) for the shape and the "why one function
@@ -604,10 +622,10 @@ const confluencePageEnabledRules = confluencePageRules(getRules());
 // the whole credential; these four are the finer-grained complement a
 // reviewer asked for (one of the four can be off while the other three
 // and the credential itself stay fully active).
-const jiraWorkStaffing = applyProviderSwitch("jira-work", atlassianProviderStaffing("jira-work", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-work"]);
-const jiraIdeaStaffing = applyProviderSwitch("jira-idea", atlassianProviderStaffing("jira-idea", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-idea"]);
-const jiraProjectStaffing = applyProviderSwitch("jira-project", atlassianProviderStaffing("jira-project", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-project"]);
-const confluencePageStaffing = applyProviderSwitch("confluence-page", atlassianProviderStaffing("confluence-page", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["confluence-page"]);
+const jiraWorkStaffing = applyProviderSwitch("jira-work", atlassianProviderStaffing("jira-work", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-work"]);
+const jiraIdeaStaffing = applyProviderSwitch("jira-idea", atlassianProviderStaffing("jira-idea", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-idea"]);
+const jiraProjectStaffing = applyProviderSwitch("jira-project", atlassianProviderStaffing("jira-project", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-project"]);
+const confluencePageStaffing = applyProviderSwitch("confluence-page", atlassianProviderStaffing("confluence-page", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["confluence-page"]);
 
 /**
  * FACTORY-66 — disabled stand-ins for the real Atlassian client/ops, used
@@ -645,7 +663,7 @@ const atlassian = config.atlassian
 // configured), not merely `ideaRules.length` — a rules file with jira-idea
 // rules but Atlassian disabled must not construct a client that would only
 // ever reject.
-const ideaRules = jiraIdeaRules(getRules());
+const ideaRules = jiraIdeaRules(initializationRules);
 const jiraIdeas = jiraIdeaStaffing.run ? createJiraIdeaClient(atlassian) : undefined;
 // Tool connections are independent of agent staffing (an agent may still
 // want `*_tools` available with zero enabled rules for that provider) but
@@ -692,7 +710,7 @@ const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassia
 // extra: before this, a hung herdr socket left `herdr.agent.list()` and
 // `herdr.subscribe()` pending forever, wedging every caller that serializes
 // on one of them.
-const herdr = new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs });
+const herdr = daemonWorkerClient(new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs }),workerRollout);
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
 // rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
@@ -715,7 +733,15 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf, workerRollout);
+herd.ruleRuntime=()=>ruleAuthority.policy;
+{const spec=workerRollout?.continuationSpec();if(spec){
+ if(!atlassian)throw Error('Configured issue policy client required for continuation');
+ workerRollout!.installContinuationPolicyReader(createContinuationPolicyReader(spec.policy,{
+ intent:()=>controlPanel.readContinuationIntent(spec.authority),issue:()=>atlassian.issue(spec.policy.issueKey),comments:()=>atlassian.allComments(spec.policy.issueKey)
+ }));
+}}
+{const census=await herd.ruleCensus();ruleAuthority.recordFullCensus(census.ids,census.complete);}
 // FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): relabel every
 // currently-running, butchr-owned herdr workspace to its short display label
 // on every daemon startup — no agent restart. Idempotent (see
@@ -790,7 +816,7 @@ const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
 const ADMISSION_SOURCE_TRELLO_CARD = "trello-card";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
-  residency: () => herd.runningIssues(),
+  residency: async()=>{const census=await herd.ruleCensus();ruleAuthority.recordFullCensus(census.ids,census.complete);if(!census.complete)throw Error("Ambiguous worker census");return census.ids;},
   // BUTCHR-398: shared across every rule provider's admission bucket —
   // `roleOfAgent` reads the FULL `rules` list (every provider), so it
   // correctly classifies a running id of ANY provider, not just jira-work.
@@ -858,6 +884,8 @@ const dashboardFeed = createDashboardFeed({
   withheldTracker: dashboardWithheldStatusFloor,
   admission: () => admissionController.census(),
 });
+const operationalAgentFeed=createOperationalAgentFeed(Date.now,key=>ruleAuthority.admittedRuleIdentity(key));
+controlPanel.setTelemetrySource(()=>operationalAgentFeed.snapshot("daemon",true));
 
 const ops: AtlassianOps = config.atlassian ? realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }) : createDisabledAtlassianOpsStub();
 
@@ -1138,7 +1166,7 @@ const scopeOf = createScopeCache(async (id: string, queryOverride: string, provi
 const rulesWriteDeps = {
   env: process.env,
   reload: () => {
-    const result = reloadRules(rulesHolder);
+    const result = reloadLocalRules();
     // FACTORY-685 (N4): every successful write already calls this via
     // `toOutcome` — clearing the scope cache here, unconditionally, means a
     // cached scope reading can never outlive the write (or SIGHUP, or the
@@ -1168,13 +1196,14 @@ const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
 // or from `SIGHUP`'s own handler below, which also calls `reloadRules`
 // directly against this one `rulesHolder`.
 const reloadRulesInProcess = () => {
-  const result = reloadRules(rulesHolder);
+  const result = reloadLocalRules();
   scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
   return result;
 };
 
 const { app, mcp } = buildApp({
-  getRules,
+  getRules:rulesHolder.getRules,
+  localRulesWritable:()=>ruleAuthority.summary().authority!=="remote",
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
   reloadRulesNow: reloadRulesInProcess,
   daemonReload: reloadRulesInProcess,
@@ -1235,13 +1264,14 @@ const { app, mcp } = buildApp({
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
+  controlPanel,
   // FACTORY-72: every configured rule, staffed or not — see src/agents/query-agent-inventory.ts's own top
   // comment for the reuse this is built from. `rulesFile`/`configReasonFor`
   // are this daemon's own already-computed values (loaded/decided once at
   // startup above), never a second load or a second staffing decision.
   configInventory: () =>
     buildQueryAgentInventory({
-      rulesFile: { path: rulesPath(), rules: getRules(), error: null },
+      rulesFile: { path: rulesPath(), rules: rulesHolder.getRules(), error: null },
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
@@ -1339,7 +1369,7 @@ const { app, mcp } = buildApp({
     } catch {
       mtime = null;
     }
-    return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
+    return { path: rulesPath(), rules: rulesHolder.getRules(), error: null, mtime, fileEtag: rulesEtag() };
   },
   rulesPreview: (id, queryOverride) => rulesPreviewer(id, queryOverride),
   // FACTORY-662: the write path's own deps — see the comments just above
@@ -1555,7 +1585,7 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 // once, at startup, and is unaffected either way.
 process.on("SIGHUP", () => {
   const before = rulesHolder.getRules().length;
-  const result = reloadRules(rulesHolder);
+  const result = reloadLocalRules();
   scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
   if (!result.ok) {
     console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
@@ -1725,6 +1755,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
+      operationalAgentFeed.record(agents.map(a=>({agentKey:agentIdOfWorkspacePath(a.cwd??null),status:a.agent_status})));
       // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
       // own correlation identifier (`buildDashboardRows`); `resource_key`
       // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
@@ -1733,6 +1764,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
       return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: dashboardAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
+    operationalAgentFeed.decline();
     coverage.recordDeclined(DASHBOARD_DETECTOR);
     throw e;
   }
@@ -1823,17 +1855,19 @@ const stallRemediation = config.stallRemediationMode === "off" ? undefined : cre
 const idlePokeRuleConfigByIssue = new Map<string, IdlePokeRuleConfig>();
 function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): void {
   idlePokeRuleConfigByIssue.clear();
-  for (const m of resourceMatches(units)) {
+  const policies=resourceMatches(admittedPolicyUnits(units,ruleAuthority)).map(m=>({issueKey:m.issue.key,rule:m.rule}));
+  for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-work'&&!isQueryLevelAgent(held.id))policies.push({issueKey:resourceKeyOf(held.id),rule:held.rule});
+  for (const m of policies) {
     if (!m.rule.enabled) continue;
-    const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
+    const existing = idlePokeRuleConfigByIssue.get(m.issueKey);
     if (m.rule.idlePokeEnabled !== true) {
-      idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
+      idlePokeRuleConfigByIssue.set(m.issueKey, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
       continue;
     }
     if (existing?.idlePokeEnabled === false) continue; // an earlier rule's explicit opt-out already wins
     const idlePokeMinutes = m.rule.idlePokeMinutes !== undefined && (existing?.idlePokeMinutes === undefined || m.rule.idlePokeMinutes < existing.idlePokeMinutes) ? m.rule.idlePokeMinutes : existing?.idlePokeMinutes;
     const idlePokeMessage = existing?.idlePokeMessage ?? m.rule.idlePokeMessage;
-    idlePokeRuleConfigByIssue.set(m.issue.key, {
+    idlePokeRuleConfigByIssue.set(m.issueKey, {
       idlePokeEnabled: true,
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes } : {}),
       ...(idlePokeMessage !== undefined ? { idlePokeMessage } : {}),
@@ -2135,7 +2169,7 @@ if (jiraWorkStaffing.run) void sweepStaleAgentLabels({
 const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined => {
   const decoded = decodeAnyAgentKey(agent);
   if (!decoded) return undefined;
-  return getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider)?.notifyDeliveryMode;
+  return ruleAuthority.ruleForAgent(agent)?.notifyDeliveryMode;
 };
 
 const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
@@ -2152,7 +2186,7 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const msg = reason && "linked" in reason ? linkedChangeNudge(issue, reason.linked.events)
     : reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
     : changeNudge(issue, aboutIssue, reason);
-  const result = await deliverNotice({
+  const result = await deliverAdmittedNotice(ruleAuthority.policy,agent,{
     pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
     nudgePrompt: () => herd.nudge(agent, msg),
     mode: ruleNotifyDeliveryMode(agent),
@@ -2252,6 +2286,8 @@ const ruleResourceType = createRuleResourceType({
 // `runResourceLoop`/`startLoop`) — never re-registers an agent, re-reads
 // config, or duplicates any of this daemon's other long-lived state.
 const startIssueLoop = () => runResourceLoop(ruleResourceType, {
+  onFencedPoll: async()=>{await agentStatusesFeedingDashboard();},
+  ruleProvider:"jira-work",
   herd,
   ownsId: ownsRuleAgent,
   notify: notifyRuleAgent,
@@ -2320,7 +2356,8 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     // doc comment above for why this is the only place that association
     // is still available.
     if (idlePoke) updateIdlePokeRuleConfig(matches);
-    stalledMinutesByIssue = stalledMinutesForIssues(matches);
+    stalledMinutesByIssue = new Map(stalledMinutesForIssues(admittedPolicyUnits(matches,ruleAuthority)));
+    for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-work'&&held.rule.stalledMinutes!==undefined)(stalledMinutesByIssue as Map<string,number>).set(resourceKeyOf(held.id),held.rule.stalledMinutes);
     return syncLabels(uniqueIssues(matches));
   },
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
@@ -3129,11 +3166,13 @@ const projectType = createJiraProjectResourceType({
 const projectDiscoverySearch = projectType.discovery.search;
 projectType.discovery.search = async () => {
   const matches = await projectDiscoverySearch();
-  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  pinnedActiveMinutesByProject = new Map(pinnedActiveMinutesFor(matches.flatMap(m=>ruleAuthority.isUnresolvedAgent(m.agentKey)?[]:[{...m,rule:ruleAuthority.ruleForAgent(m.agentKey)??m.rule}])));
+  for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-project'&&held.rule.stalledMinutes!==undefined)(pinnedActiveMinutesByProject as Map<string,number>).set(held.id,held.rule.stalledMinutes);
   return matches;
 };
 if (!jiraProjectStaffing.run && jiraProjectStaffing.reason) console.error(`  WARNING: ${jiraProjectStaffing.reason}`);
 runResourceLoop(projectType, {
+  ruleProvider:"jira-project",
   herd,
   ownsId: ownsJiraProjectAgent,
   // Free-form: no notification concept (eventRules.poll always reports no

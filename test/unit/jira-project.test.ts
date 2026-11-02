@@ -15,7 +15,7 @@ const clean:(()=>void)[]=[];afterEach(()=>{for(const f of clean.splice(0).revers
 
 /**
  * BUTCHR-425 AC7 — deploy-hazard regression test. Codey's live rules file
- * (BUTCHR_RULES_FILE=/home/brooswit/.config/butchr/project-managers/rules.json,
+ * (BUTCHR_RULES_FILE=/home/example/.config/butchr/project-managers/rules.json,
  * verified read-only on Codey — see BUTCHR-425 comment 24137) carries rules
  * in EXACTLY this shape: these seven fields, no others — no `execution`,
  * `account`, `role`, or any linked-eventing field. `mcpConfigFile` exists
@@ -33,7 +33,7 @@ test('BUTCHR-425 AC7 (deploy hazard): a jira-project rule in Codey\'s exact live
     query: '{"keys":["BUTCHR"]}',
     brief: 'Manage the BUTCHR project per operator direction.',
     agentPreferences: [{ harness: 'claude' }],
-    mcpConfigFile: '/home/brooswit/.config/butchr/project-managers/mcp.json',
+    mcpConfigFile: '/home/example/.config/butchr/project-managers/mcp.json',
   };
   expect(Object.keys(codeyShapedRule).sort()).toEqual(['agentPreferences', 'brief', 'enabled', 'id', 'mcpConfigFile', 'query', 'resourceProvider'].sort());
   const [parsed] = parseRules({ rules: [codeyShapedRule] });
@@ -44,7 +44,7 @@ test('BUTCHR-425 AC7 (deploy hazard): a jira-project rule in Codey\'s exact live
     query: '{"keys":["BUTCHR"]}',
     brief: 'Manage the BUTCHR project per operator direction.',
     agentPreferences: [{ harness: 'claude' }],
-    mcpConfigFile: '/home/brooswit/.config/butchr/project-managers/mcp.json',
+    mcpConfigFile: '/home/example/.config/butchr/project-managers/mcp.json',
   });
   // And the whole live file — two rules, both this shape — loads as a unit too.
   const liveFileShape = { rules: [codeyShapedRule, { ...codeyShapedRule, id: 'pm-atmo', query: '{"keys":["ATMO"]}' }] };

@@ -72,6 +72,7 @@ export function startGithubPrLoop(deps: GithubPrLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsGithubPrAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"github-pr",
     herd: deps.herd,
     ownsId: ownsGithubPrAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {

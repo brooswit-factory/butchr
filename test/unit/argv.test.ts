@@ -133,7 +133,7 @@ describe("checkArgv", () => {
 
   test("a bare `claude --resume <id>` -> stale, reason names all three required flags", () => {
     const expected = spawnArgs(spec, "/w/KAN-783");
-    const observed = ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"];
+    const observed = ["claude", "--resume", "00000000-0000-4000-8000-f54f26bc067d"];
     const check = checkArgv(expected, observed);
     expect(check.ok).toBe(false);
     if (!check.ok) {
@@ -563,7 +563,7 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("a fresh Claude launch NEVER gets --session-id, even when the workspace happens to have a discovered id persisted from an earlier launch", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("11111111-1111-1111-1111-111111111111"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-bafde89c041e"));
       const args = spawnArgs(spec, dir);
       expect(args).not.toContain("--session-id");
       expect(args).not.toContain("--resume");
@@ -581,16 +581,16 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("agent.resumeSessionId set emits --resume instead of --session-id, even when a persisted id also exists (the persisted id itself, if consistent, or a caller-chosen one)", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
-      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" });
-      expect(args).toEqual(expect.arrayContaining(["--resume", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-4242a3bcf136"));
+      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "00000000-0000-4000-8000-4242a3bcf136" });
+      expect(args).toEqual(expect.arrayContaining(["--resume", "00000000-0000-4000-8000-4242a3bcf136"]));
       expect(args).not.toContain("--session-id");
     });
   });
 
   test("non-Claude providers never get either flag", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-1de0d88279f7"));
       const args = spawnArgs(spec, dir, { provider: "agy" });
       expect(args).not.toContain("--session-id");
       expect(args).not.toContain("--resume");
@@ -599,14 +599,14 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("a resumed launch still carries every OTHER flag a fresh launch has — DoD 1b", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("cccccccc-cccc-cccc-cccc-cccccccccccc"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-9b12a6c1bcd4"));
       const fresh = spawnArgs(spec, dir);
-      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "cccccccc-cccc-cccc-cccc-cccccccccccc" });
+      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "00000000-0000-4000-8000-9b12a6c1bcd4" });
       for (const flag of ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels=server:butchr"]) {
         expect(fresh).toContain(flag);
         expect(resumed).toContain(flag);
       }
-      expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
+      expect(resumed).toEqual(expect.arrayContaining(["--resume", "00000000-0000-4000-8000-9b12a6c1bcd4", "--model", "claude-opus-5", "--effort", "medium"]));
     });
   });
 

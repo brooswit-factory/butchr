@@ -73,6 +73,7 @@ export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsZendeskTicketAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"zendesk-ticket",
     herd: deps.herd,
     ownsId: ownsZendeskTicketAgent,
     // BUTCHR-398: `about`, not `resourceKeyOf(agent)` unconditionally — see

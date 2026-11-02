@@ -1,6 +1,6 @@
 
-⏺ Called jira_get_issue(BUTCHR-261) (ctrl+o to expand)
-  ⎿  You've hit your session limit · resets 9:50pm — this is the exact refusal text quoted in KAN-804 for reference.
+⏺ Called jira_get_issue(FIXTURE-1) (ctrl+o to expand)
+  ⎿  You've hit your session limit · resets 9:50pm — this is the exact refusal text quoted in FIXTURE-1 for reference.
      ...and nothing ever re-sent the prompt after that.
      … +12 lines (ctrl+o to expand)
 

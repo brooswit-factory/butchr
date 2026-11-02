@@ -89,6 +89,7 @@ export function startFilesystemLoop(deps: FilesystemLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsFilesystemAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"filesystem",
     herd: deps.herd,
     ownsId: ownsFilesystemAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {

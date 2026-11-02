@@ -125,11 +125,14 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
   //    name, closing exactly the gap `resumeInPlace` fell through here.
   test("FACTORY-426: scopedHerd forwards EVERY member of Herd, named or not — closes the class, not just this one instance", () => {
     const full: Required<Herd> = {
+      ruleCensus:async()=>({ids:[],complete:true}),
+      ruleRuntime:()=>{throw Error("Not invoked by forwarding test");},
       frozen: async (ids) => new Set(ids),
       runningIssues: async () => [],
       staleIssues: async () => [],
       spawn: async () => {},
       recoverQuota: async () => "not-refused",
+      reconcilePreferences:async()=>({status:'blocked',reason:'Not invoked by forwarding test'}),
       stop: async () => {},
       paneFor: async () => null,
       nudge: async () => ({ delivered: false }),
@@ -2856,8 +2859,10 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
       onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
       intervalMs: 10,
     });
-    await new Promise((r) => setTimeout(r, 100));
+    // Exercise multiple complete polls even when the test runner is busy.
+    for(let attempt=0;attempt<200&&n<8;attempt++)await new Promise(r=>setTimeout(r,5));
     stop();
+    expect(n).toBeGreaterThanOrEqual(8);
     const kEvents = notified.filter((e) => e.issue === "K");
     expect(kEvents.length).toBe(2);
     expect(kEvents[0]!.reason).toEqual({ appeared: true });
@@ -2904,11 +2909,13 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
     expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // delivered exactly once, from the forced re-check — never lost, never duplicated
   });
 
-  test("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure", async () => {
+  test.each([0, 80])("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure (initial poll delay%dms)", async (delay) => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
     const skipped: Array<{ key: string; reason: string }> = [];
     let pollIndex = 0;
+    let observed!: () => void;
+    const observedSkip = new Promise<void>(resolve => { observed = resolve; });
     const comments = async () => {
       if (pollIndex === 1) return [comment("c0")];
       throw new AtlassianHttpError(429, "GET", "/rest/api/3/issue/K/comment", "rate limited");
@@ -2916,15 +2923,20 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
     const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")]];
     let n = 0;
     const stop = startLoop({
-      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      search: async () => { if(n === 0 && delay > 0) await new Promise(resolve => setTimeout(resolve, delay)); pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
       herd,
       notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
       comments,
-      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
+      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); observed(); },
       intervalMs: 10,
     });
-    await new Promise((r) => setTimeout(r, 60));
-    stop();
+    // Observe completion, not an assumed number of polls inside a60ms wall-clock window.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([observedSkip, new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('Expected429 load-skip callback was not observed')), 1000);
+      })]);
+    } finally { stop(); clearTimeout(deadline); }
     const kEvents = notified.filter((e) => e.issue === "K");
     expect(kEvents.length).toBe(1); // only "appeared" — the 429'd check never delivers
     expect(skipped).toEqual([{ key: "K", reason: "load" }]);

@@ -287,7 +287,7 @@ describe("comment identity tagging", () => {
 
 describe("jira_create_issue: role assignment, implements/parent resolution, orphan opt-out (KAN-802)", () => {
   const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
-  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
+  const TASK_ID = "000000:11111111-1111-4111-8111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -634,7 +634,7 @@ describe("confluence_create_page parentId", () => {
 
 describe("jira_assign (KAN-810)", () => {
   const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
-  const TASK_ID = "000000:11111111-1111-1111-1111-111111111111";
+  const TASK_ID = "000000:11111111-1111-4111-8111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -2202,7 +2202,7 @@ describe("get_my_confluence_page / get_my_confluence_page_comments (FACTORY-996)
     // "" is excluded here — an empty x-issue hits the "no x-issue at all"
     // refusal (requireCaller) first, tested separately above; this test is
     // about a PRESENT but wrongly-shaped x-issue.
-    for (const bad of ["123abc", "-1", "1.5", "https://wroosbit.atlassian.net/wiki/spaces/X/pages/500/Title"]) {
+    for (const bad of ["123abc", "-1", "1.5", "https://example.atlassian.net/wiki/spaces/X/pages/500/Title"]) {
       await expect(tools.get_my_confluence_page!.handler({}, { headers: { "x-issue": bad } } as any)).rejects.toThrow(/not a confluence-page resource id/);
     }
     expect(getPageCalls).toEqual([]);

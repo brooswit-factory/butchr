@@ -205,7 +205,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     const notOptedIn = issue("BUTCHR-5");
     const world: Record<string, JiraIssue> = {};
     const state = createLinkedEventingState();
-    const { deps, remoteLinkCalls } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": [{ id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null }] } });
+    const { deps, remoteLinkCalls } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": [{ id: "1", globalId: null, relationship: null, url: "https://example.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null }] } });
 
     const matches = [
       match("jira-work:task:BUTCHR-1", rule({ linkedRemoteLinks: true }), optedIn),
@@ -557,7 +557,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     const owner = issue("BUTCHR-1");
     const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
     const state = createLinkedEventingState();
-    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
+    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://example.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
     const { deps, notified, logs } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": [remoteLink] } });
     const r = rule({ linkedRemoteLinks: true });
 
@@ -587,7 +587,7 @@ describe("BUTCHR-436: linked-change eventing", () => {
     const owner = issue("BUTCHR-1");
     const world: Record<string, JiraIssue> = { "BUTCHR-9": issue("BUTCHR-9") };
     const state = createLinkedEventingState();
-    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
+    const remoteLink: JiraRemoteLink = { id: "1", globalId: null, relationship: null, url: "https://example.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null };
     let currentRemoteLinks: JiraRemoteLink[] = [remoteLink];
     const { deps, notified, logs } = fakeDeps(world, { remoteLinksByKey: { "BUTCHR-1": currentRemoteLinks } });
     const r = rule({ linkedRemoteLinks: true });
@@ -787,7 +787,7 @@ describe("jiraKindLinkedItems", () => {
     const owner: JiraIssue = issue("BUTCHR-1", {
       issuelinks: [{ type: "Blocks", otherEnd: "outward", key: "BUTCHR-2" }] as never,
       parent: "BUTCHR-421",
-      description: "See BUTCHR-9 and https://example.com/docs and https://wroosbit.atlassian.net/wiki/spaces/X/pages/1",
+      description: "See BUTCHR-9 and https://example.com/docs and https://example.atlassian.net/wiki/spaces/X/pages/1",
     });
     const items = jiraKindLinkedItems({ agentKey: "a", rule: rule(), issue: owner }, undefined);
     expect(items.map((i) => i.kind).sort()).toEqual(["issuelink", "jira-key", "parent"]);
@@ -796,7 +796,7 @@ describe("jiraKindLinkedItems", () => {
   test("a remote link resolving to a Jira browse URL becomes a jira-kind item; a non-Jira remote link is excluded", () => {
     const owner: JiraIssue = issue("BUTCHR-1");
     const remoteLinks: JiraRemoteLink[] = [
-      { id: "1", globalId: null, relationship: null, url: "https://wroosbit.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null },
+      { id: "1", globalId: null, relationship: null, url: "https://example.atlassian.net/browse/BUTCHR-9", title: "t", applicationType: null },
       { id: "2", globalId: null, relationship: null, url: "https://github.com/brooswit-factory/butchr/pull/1", title: "t2", applicationType: null },
     ];
     const items = jiraKindLinkedItems({ agentKey: "a", rule: rule(), issue: owner }, remoteLinks);

@@ -1,6 +1,4 @@
 import { parseArgs } from "node:util";
-import { startBridge } from "./bridge.js";
-import { bridgeWorkspace } from "./workspace.js";
 
 export async function runBridge(args: string[]) {
   const { values } = parseArgs({ args, options: { "workspace-root": { type: "string" }, help: { type: "boolean" } } });
@@ -9,7 +7,9 @@ export async function runBridge(args: string[]) {
     return;
   }
   if (!values["workspace-root"]) throw new Error("Workspace root required");
+  const { bridgeWorkspace } = await import("./workspace.js");
   const { url, identity, agent } = bridgeWorkspace(values["workspace-root"], process.cwd());
+  const { startBridge } = await import("./bridge.js");
   const bridge = await startBridge(url, identity, { ...(agent ? { agent } : {}), onError: () => {
     process.exitCode = 1;
     console.error("Butchr MCP transport failed");

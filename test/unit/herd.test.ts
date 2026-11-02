@@ -913,12 +913,9 @@ describe("staleIssues", () => {
     }
   });
 
-  // FACTORY-108: toggling lizardMode on an ALREADY-RUNNING Codex agent is
-  // NOT symmetric — `checkManagedAgentArgv` only ever flags a WANTED-BUT-MISSING
-  // flag, never an unwanted-but-present one. Both directions measured
-  // directly here rather than assumed, per this ticket's own requirement to
-  // document (and prove) what toggling actually does, not leave it silent.
-  test("FACTORY-108: turning lizardMode ON while a CODEX agent is already running IN bypass mode is SILENT — not flagged stale, since the new expected argv no longer wants the bypass flag at all and checkArgv never flags an unwanted-but-present flag", async () => {
+  // The current SDK detects an unwanted bypass flag as well as missing launch flags.
+
+  test("turning lizardMode ON detects an existing unwanted Codex bypass flag", async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = require("node:fs") as typeof import("node:fs");
     const { tmpdir } = require("node:os") as typeof import("node:os");
     const previous = process.env.BUTCHR_WORKSPACES;
@@ -933,7 +930,10 @@ describe("staleIssues", () => {
       const stillBypassedArgv = ["codex", ...spawnArgs({ key, issuetype: "task", summary: "s", parent: null, resource: DEF_RESOURCE }, cwd, { provider: "codex", disabledMcpServers: [] }, "http://x/mcp")];
       const { client } = fakeHerdrWithCwd([{ pane_id: "w1:p1", cwd }], { "w1:p1": ok([{ pid: 1, argv: stillBypassedArgv, name: "codex" }]) });
       const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, { provider: "codex", disabledMcpServers: [] });
-      expect(await herd.staleIssues()).toEqual([]);
+      expect(await herd.staleIssues()).toEqual([{
+        issue:key,observedArgv:stillBypassedArgv,
+        reason:"argv has unwanted --dangerously-bypass-approvals-and-sandbox",resumable:false,
+      }]);
     } finally {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES; else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
@@ -1628,7 +1628,7 @@ describe("HerdrHerd + reconcileNow: the argv-staleness headline case", () => {
   const ok = (foreground_processes: FakeProcess[]) => async () => ({ process_info: { pane_id: "x", foreground_processes } });
 
   test("a) a stale pane (bare `claude --resume`) is closed and a fresh agent started with the full spawn argv; the [butchr:respawn] notice fires exactly once", async () => {
-    const argv = ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"];
+    const argv = ["claude", "--resume", "00000000-0000-4000-8000-f54f26bc067d"];
     const f = fakeHerdrStale(ok([{ pid: 1, argv, name: "claude" }]));
     const herd = new HerdrHerd(f.client, "http://x/mcp", () => Promise.resolve());
     const notices: Array<{ issue: string; reason: string; observedArgv: string[] }> = [];

@@ -73,6 +73,7 @@ export function startGithubIssueLoop(deps: GithubIssueLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsGithubIssueAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"github-issue",
     herd: deps.herd,
     ownsId: ownsGithubIssueAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {

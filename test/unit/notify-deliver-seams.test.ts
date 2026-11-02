@@ -54,7 +54,8 @@ describe("every delivery seam routes through the ONE shared gate (acceptance D)"
   });
 
   test("deliverNotice and renderNotifyDelivery are each invoked exactly 9 times — one per seam, no seam keeps its own copy", () => {
-    expect(src.split("deliverNotice({").length - 1).toBe(9);
+    expect(src.split("deliverNotice({").length - 1).toBe(8);
+    expect(src.split("deliverAdmittedNotice(ruleAuthority.policy,agent,{").length - 1).toBe(1);
     expect(src.split("renderNotifyDelivery(").length - 1).toBe(9);
   });
 
@@ -77,9 +78,11 @@ function sliceAfter(marker: string, length = 600): string {
 }
 
 describe("named per-seam checks", () => {
-  test("jira-work rule engine (notifyRuleAgent)", () => {
+  test("jira-work rule engine (notifyRuleAgent)", async () => {
     const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1400);
-    expect(block).toContain("deliverNotice({");
+    expect(block).toContain("deliverAdmittedNotice(ruleAuthority.policy,agent,{");
+    const guarded=await Bun.file(new URL("../../src/control-panel/admitted-notice.ts",import.meta.url)).text();
+    expect(guarded).toContain("await deliverNotice(");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
   });

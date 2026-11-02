@@ -251,8 +251,8 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
     // Distinct, clearly-shaped targets so a mismatch (e.g. the project row
     // 302ing to the issue row's Jira url) is unambiguous.
     const resourceLink = async (key: string) => {
-      if (key === issueKey) return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/BUTCHR-1" };
-      if (key === projectKey) return { ok: true as const, url: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" };
+      if (key === issueKey) return { ok: true as const, url: "https://example.atlassian.net/browse/BUTCHR-1" };
+      if (key === projectKey) return { ok: true as const, url: "https://example.atlassian.net/wiki/spaces/BUTCHR/overview" };
       return { ok: false as const, error: `unexpected resource key ${key}` };
     };
     // BUTCHR-344 [correction] (V1): a REAL header — distinct from every other
@@ -293,11 +293,11 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
 
       const issueRedirect = await fetch(`${b}${issueResourceHrefMatch[1]}`, { redirect: "manual" });
       expect(issueRedirect.status).toBe(302);
-      expect(issueRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/BUTCHR-1");
+      expect(issueRedirect.headers.get("location")).toBe("https://example.atlassian.net/browse/BUTCHR-1");
 
       const projectRedirect = await fetch(`${b}${projectResourceHrefMatch[1]}`, { redirect: "manual" });
       expect(projectRedirect.status).toBe(302);
-      expect(projectRedirect.headers.get("location")).toBe("https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview");
+      expect(projectRedirect.headers.get("location")).toBe("https://example.atlassian.net/wiki/spaces/BUTCHR/overview");
     } finally {
       app.stop();
     }
@@ -702,7 +702,7 @@ describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-26
 // dashboard-page.test.ts for the template's own href-building.
 describe("GET /resource/:key/open — the dashboard row's resource link target (BUTCHR-339)", () => {
   const resourceLink = async (key: string) => {
-    if (key === "KAN-9") return { ok: true as const, url: "https://wroosbit.atlassian.net/browse/KAN-9" };
+    if (key === "KAN-9") return { ok: true as const, url: "https://example.atlassian.net/browse/KAN-9" };
     return { ok: false as const, error: `"${key}" is neither a valid Jira issue key nor a valid project id — cannot resolve a resource link for it` };
   };
   const { app } = buildApp({ ...view, resourceLink });
@@ -719,7 +719,7 @@ describe("GET /resource/:key/open — the dashboard row's resource link target (
   test("a resolvable key 302s to the resolved url with an empty body — verified against a real booted app, not reasoned about", async () => {
     const r = await fetch(`${b}/resource/KAN-9/open`, { redirect: "manual" });
     expect(r.status).toBe(302);
-    expect(r.headers.get("location")).toBe("https://wroosbit.atlassian.net/browse/KAN-9");
+    expect(r.headers.get("location")).toBe("https://example.atlassian.net/browse/KAN-9");
     expect(await r.text()).toBe("");
   });
   test("an unresolvable key is refused with a specific, human-readable reason, in plain text — never a blank page", async () => {

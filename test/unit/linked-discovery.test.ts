@@ -74,8 +74,8 @@ describe("FACTORY-833: linkId — the provider's own link identity, never fabric
 
 describe("descriptionItems: URLs and Jira keys in free text", () => {
   test("a Confluence page URL", () => {
-    const description = "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/38469685/Design";
-    expect(descriptionItems(description)).toEqual([{ kind: "confluence", target: "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/38469685/Design" }]);
+    const description = "Design: https://example.atlassian.net/wiki/spaces/BUTCHR/pages/38469685/Design";
+    expect(descriptionItems(description)).toEqual([{ kind: "confluence", target: "https://example.atlassian.net/wiki/spaces/BUTCHR/pages/38469685/Design" }]);
   });
 
   test("a GitHub issue URL", () => {
@@ -94,7 +94,7 @@ describe("descriptionItems: URLs and Jira keys in free text", () => {
   });
 
   test("a Jira browse URL is a jira-key, not a webpage", () => {
-    const description = "Related: https://wroosbit.atlassian.net/browse/BUTCHR-426";
+    const description = "Related: https://example.atlassian.net/browse/BUTCHR-426";
     expect(descriptionItems(description)).toEqual([{ kind: "jira-key", target: "BUTCHR-426" }]);
   });
 
@@ -163,7 +163,7 @@ describe("discoverLinkedItems: combined, de-duplicated set", () => {
       expect(discoverLinkedItems({ description: "See BUTCHR-426 for context.", ownKey: "BUTCHR-426" })).toEqual([]);
     });
     test("a Jira browse URL pointing at the resource's own key is excluded too", () => {
-      expect(discoverLinkedItems({ description: "https://wroosbit.atlassian.net/browse/BUTCHR-426", ownKey: "BUTCHR-426" })).toEqual([]);
+      expect(discoverLinkedItems({ description: "https://example.atlassian.net/browse/BUTCHR-426", ownKey: "BUTCHR-426" })).toEqual([]);
     });
     test("other keys/links in the same description are unaffected", () => {
       expect(discoverLinkedItems({ description: "BUTCHR-426 relates to BUTCHR-1.", ownKey: "BUTCHR-426" })).toEqual([{ kind: "jira-key", target: "BUTCHR-1" }]);

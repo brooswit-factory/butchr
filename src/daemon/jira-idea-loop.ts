@@ -91,6 +91,7 @@ export function startJiraIdeaLoop(deps: JiraIdeaLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsJiraIdeaAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"jira-idea",
     herd: deps.herd,
     ownsId: ownsJiraIdeaAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {

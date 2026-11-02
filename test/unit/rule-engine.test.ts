@@ -230,7 +230,7 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
     const lines: string[] = [];
     const withDescription = issue("BUTCHR-1", {
       description: [
-        "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
+        "Design: https://example.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
         "Issue: https://github.com/brooswit-factory/butchr/issues/42",
         "PR: https://github.com/brooswit-factory/butchr/pull/395",
         "Docs: https://example.com/some/docs",
@@ -240,7 +240,7 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
     const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withDescription], log: (l) => lines.push(l) });
     await type.discovery.search();
     const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
-    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://example.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-issue target=brooswit-factory/butchr#42 skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-pr target=brooswit-factory/butchr#395 skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=webpage target=https://example.com/some/docs skipped=false");

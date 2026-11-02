@@ -1,3 +1,4 @@
+import {buildContinuationHelper} from './continuation-helper.js';
 /**
  * BUTCHR-54: the real build step. Bakes the git sha (and a dirty-tree flag)
  * this build was made FROM into `dist/butchr.js` via `Bun.build`'s `define`
@@ -68,3 +69,6 @@ const bridgeFile = `${OUTDIR}/butchr-mcp.js`;
 writeFileSync(bridgeFile, `#!/usr/bin/env bun\n${readFileSync(bridgeFile, "utf8")}`);
 chmodSync(bridgeFile, 0o755);
 console.log(`built ${bridgeFile}`);
+
+// Build the same pure helper exercised by the isolated packaged regression.
+await buildContinuationHelper(process.cwd(),OUTDIR);

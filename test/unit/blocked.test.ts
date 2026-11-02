@@ -49,7 +49,8 @@ describe("watchBlocked", () => {
       undefined,
       (ids, seq) => ticks.push({ ids, seq }),
     );
-    await new Promise((r) => setTimeout(r, 45));
+    // Wait for the condition being asserted, rather than assuming three polls fit in45ms.
+    for(let attempt=0;attempt<200&&ticks.length<3;attempt++)await new Promise(r=>setTimeout(r,5));
     stop();
     expect(ticks.length).toBeGreaterThanOrEqual(3);
     expect(ticks[0]!.seq).toBe(1);

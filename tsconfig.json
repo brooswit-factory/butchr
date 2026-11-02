@@ -30,6 +30,7 @@
   // covers them. The plain-TS view-model tests for the same feature stay
   // in this program unexcluded, same as every other `test/unit/*.test.ts`.
   "exclude": [
+    "test/unit/dashboard-app-react-dom-teardown.test.tsx",
     "test/unit/dashboard-app-use-polling.test.tsx",
     "test/unit/dashboard-app-use-dashboard.test.tsx",
     "test/unit/dashboard-app-use-config-inventory.test.tsx",

@@ -351,7 +351,7 @@ describe("loadConfig", () => {
     expect(c.assignees.task).toBeUndefined();
   });
   test("describeConfig includes the resolved accountIds and names the consequence when a role is unset, never a token", () => {
-    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "000000:00000000-0000-0000-0000-000000000000", BUTCHR_ASSIGNEE_TASK: "000000:11111111-1111-1111-1111-111111111111" }, noRead));
+    const both = describeConfig(loadConfig({ ...base, BUTCHR_ASSIGNEE_STORY: "000000:00000000-0000-0000-0000-000000000000", BUTCHR_ASSIGNEE_TASK: "000000:11111111-1111-4111-8111-111111111111" }, noRead));
     expect(both).toContain("assignees=story:000000:0000");
     expect(both).toContain("task:000000:1111");
     const none = describeConfig(loadConfig(base, noRead));

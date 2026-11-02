@@ -75,6 +75,7 @@ export function startConfluencePageLoop(deps: ConfluencePageLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsConfluencePageAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"confluence-page",
     herd: deps.herd,
     ownsId: ownsConfluencePageAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {

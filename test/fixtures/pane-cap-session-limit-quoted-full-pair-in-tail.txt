@@ -1,5 +1,5 @@
 
-⏺ Called jira_get_issue(BUTCHR-261) (ctrl+o to expand)
+⏺ Called jira_get_issue(FIXTURE-1) (ctrl+o to expand)
   ⎿  You've hit your session limit · resets 9:50pm (America/Los_Angeles)
      /usage-credits to finish what you’re working on.
      That is the exact banner text from the incident, quoted verbatim for the record.

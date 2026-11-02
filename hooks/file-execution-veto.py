@@ -64,7 +64,7 @@ def is_dangerous_root(token):
         return True
     if t.startswith("~/"):             # ~/.claude, ~/.ssh, ~/anything
         return True
-    if _USER_HOME_RE.match(t):         # /home/brooswit, /home/brooswit/*
+    if _USER_HOME_RE.match(t):         # /home/example, /home/example/*
         return True
     if _TILDE_USER_RE.match(t):        # ~brooswit
         return True

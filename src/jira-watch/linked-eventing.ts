@@ -1534,12 +1534,15 @@ export function createLinkedEventingState(): LinkedEventingState {
     // after a genuine delivery (never deferred by a cap), same as it always
     // already did for an owner with no events at all.
     const advancedOwners = new Set<string>();
+    const deliveryErrors:unknown[]=[];
     for (const entry of ownerEntries) {
       const advance = advanceByOwner.get(entry.agentKey)!;
       const events = eventsByOwner.get(entry.agentKey);
-      if (events?.length) await deps.notify(entry.notifyAgentKey, entry.notifyAgentKey, { linked: { events } });
-      advance();
-      advancedOwners.add(entry.agentKey);
+      try {
+        if (events?.length) await deps.notify(entry.notifyAgentKey, entry.notifyAgentKey, { linked: { events } });
+        advance();
+        advancedOwners.add(entry.agentKey);
+      } catch(error) { deliveryErrors.push(error); }
     }
 
     // FACTORY-137 (T4): a dirty mark is cleared only once EVERY owner that
@@ -1571,7 +1574,8 @@ export function createLinkedEventingState(): LinkedEventingState {
     // D5: resyncPending survives until a pass has actually forced the fetch
     // of every covered target WHILE covered — never consumed by a pass that
     // ran while nothing was covered, and never by a failed batch.
-    if (resyncActiveThisPass && !searchFailed && push?.isCoveringNow()) resyncPending = false;
+    if (resyncActiveThisPass && !searchFailed && !deliveryErrors.length && push?.isCoveringNow()) resyncPending = false;
+    if(deliveryErrors.length)throw deliveryErrors[0];
   }
 
   return {

@@ -424,7 +424,7 @@ test('FACTORY-697 pre-review #1: a FAILING adoption (gateway-initiated initializ
  const originalProxy=conn.proxy;
  conn.proxy={url:`http://127.0.0.1:${fakeServer.port}/mcp`,headers:{Authorization:'Bearer fake-secret'}};
  try {
-  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'deadbeef-dead-beef-dead-beefdeadbeef'},
+  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'00000000-0000-4000-8000-2fea58d48d07'},
    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'identity',arguments:{}}})}));
   // What would make this fail: the pre-fix code returns 502 here (jsonError(502,...)), which is exactly what
   // this test guards against — a transient recovery failure must never look terminal to the client.
@@ -450,7 +450,7 @@ test('upstream genuinely down is passed straight through (JSON-ified), never ado
   return origFetch(input,init);
  }) as typeof fetch;
  try {
-  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'deadbeef-dead-beef-dead-beefdeadbeef'},
+  const res=await f.app.handle(new Request(server.url,{method:'POST',headers:{...server.headers!,'content-type':'application/json',accept:'application/json, text/event-stream','mcp-session-id':'00000000-0000-4000-8000-2fea58d48d07'},
    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'identity',arguments:{}}})}));
   expect(res.status).toBe(503); // passed straight through — NOT reinterpreted as an unknown-session 404
   expect(res.headers.get('content-type')).toContain('application/json');

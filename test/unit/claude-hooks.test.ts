@@ -280,7 +280,7 @@ describe.skipIf(!usablePython3().ok)("file-execution-veto checker", () => {
 
   test.each([
     ["rm -rf $HOME/", "a.sh", "sh"],
-    ["rm -rf /home/brooswit", "b.sh", "sh"],
+    ["rm -rf /home/example", "b.sh", "sh"],
     ["rm -rf $HOME/.claude", "c.sh", "bash"],
     ["rm -rf ~/.codex", "d.sh", "bash"],
     ["find ~ -delete", "e.sh", "sh"],

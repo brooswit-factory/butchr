@@ -712,7 +712,7 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);
-    const leaked = "sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghij";
+    const leaked = "sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     const det = createCrashLoopDetector({
       now: () => now, count: 5, windowMinutes: 60,
       addComment: chan.addComment, comments: chan.comments,

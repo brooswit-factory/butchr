@@ -101,10 +101,10 @@ describe("redact", () => {
     expect(redact("normal text with no secrets")).toBe("normal text with no secrets");
   });
   test("provider token shapes", () => {
-    expect(redact("token is ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA now")).toBe("token is [redacted] now");
-    expect(redact("sk-abcdefghijklmnopqrstuvwxyz123456")).toBe("[redacted]");
+    expect(redact("token is ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA now")).toBe("token is [redacted] now");
+    expect(redact("sk-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")).toBe("[redacted]");
     expect(redact("xoxb-1234567890-abcdefghij")).toBe("[redacted]");
-    expect(redact("AKIAIOSFODNN7EXAMPLE")).toBe("[redacted]");
+    expect(redact("AKIAAAAAAAAAAAAAAAAA")).toBe("[redacted]");
   });
   test("credentials embedded in a URL — only the password is masked, host survives", () => {
     expect(redact("postgres://admin:hunter2@prod-db.internal:5432/main")).toBe(
@@ -120,7 +120,7 @@ describe("redact", () => {
     expect(redact(`token: ${blob}`)).not.toContain(blob);
   });
   test("a normal filesystem path is not mistaken for an opaque blob", () => {
-    const path = "/home/brooswit/butchr-workspaces/KAN-706-a-very-long-branch-name";
+    const path = "/home/example/butchr-workspaces/KAN-706-a-very-long-branch-name";
     expect(redact(path)).toBe(path);
   });
 });
@@ -219,7 +219,7 @@ describe("escalationComment — redaction end-to-end (KAN-736)", () => {
   const PANE_WITH_SECRET = `$ cat .env
 AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 DATABASE_URL=postgres://admin:hunter2@prod-db.internal:5432/main
-GITHUB_TOKEN=ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA
+GITHUB_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 $ deploy --prod
 Choose deployment target:
 ❯ 1. Production
@@ -234,13 +234,13 @@ Enter to confirm · Esc to cancel`;
     expect(c).toContain("2. Staging");
     expect(c).not.toContain("wJalrXUtnFEMI");
     expect(c).not.toContain("hunter2");
-    expect(c).not.toContain("ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA");
+    expect(c).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   });
 
   test("secrets in option labels are also redacted (defence in depth)", () => {
-    const p: Prompt = { question: "Use this token?", options: ["Yes, use ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA", "No"], current: 1 };
+    const p: Prompt = { question: "Use this token?", options: ["Yes, use ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "No"], current: 1 };
     const c = escalationComment("KAN-1", p, "a1b2c3d4");
-    expect(c).not.toContain("ghp_16CharsOfRealLookingTokenAAAAAAAAAAAA");
+    expect(c).not.toContain("ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
   });
 
   test("the 600-char cap truncates a long question with a marker", () => {
@@ -267,7 +267,7 @@ Enter to confirm · Esc to cancel`;
 
     const TRUST = `──────────────────────────────
  Accessing workspace:
- /home/brooswit/butchr-workspaces/KAN-706
+ /home/example/butchr-workspaces/KAN-706
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a
  well-known open source project, or work from your team). If not, take a moment to review
  what's in this folder first.

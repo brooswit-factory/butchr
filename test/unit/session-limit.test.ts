@@ -7,18 +7,8 @@ const fixture = (name: string) => readFileSync(new URL(`../fixtures/${name}`, im
 const fixtureBytes = (name: string) => readFileSync(new URL(`../fixtures/${name}`, import.meta.url));
 
 describe("detectSessionLimitRefusal", () => {
-  // BUTCHR-259: `pane-cap-session-limit.txt` used to be a hand-built, bare
-  // "You've hit…" line with no tool-result prefix at all — a shape that, per
-  // the epic's own measurement, NEVER occurs in production (every real
-  // banner is `⎿`-prefixed). This is now a REAL, sha256-manifest-verified
-  // capture (BUTCHR-236-unrecognised-20260902T204727Z.txt, header stripped)
-  // from the preserved corpus at
-  // /home/wroosbit/butchr-workspaces/BUTCHR-207/captures-preserved-20260903/
-  // — readable from this task's own Unix account (re-verify from yours
-  // before trusting this claim; the ticket's own history shows this
-  // permission boundary moved once already). The old assertion (resetsAt
-  // 9:50pm) is replaced with this fixture's real reset time, 5:10pm.
-  test("recognises a genuine, real-captured ⎿-prefixed refusal, and parses its reset time", () => {
+  // Synthetic specimen preserves the refusal prefix, wrap and terminal chrome.
+  test("recognises a synthetic ⎿-prefixed refusal, and parses its reset time", () => {
     const now = new Date(2026, 7, 28, 12, 0, 0); // noon — before the 5:10pm reset, same day
     const r = detectSessionLimitRefusal(fixture("pane-cap-session-limit.txt"), now);
     expect(r).not.toBeNull();
@@ -31,7 +21,7 @@ describe("detectSessionLimitRefusal", () => {
   // bare `You'` shape the way the two fixtures above already did once. Exact
   // byte spec from the ticket: `20 20 e2 8e bf 20 c2 a0 59 6f 75 27` — two
   // spaces, U+23BF (⎿), space, U+00A0 (NBSP), then "You'".
-  test("the genuine fixture's refusal line carries the real ⎿+NBSP tool-result prefix, byte for byte", () => {
+  test("the synthetic fixture's refusal line carries the real ⎿+NBSP tool-result prefix, byte for byte", () => {
     const bytes = fixtureBytes("pane-cap-session-limit.txt");
     const needle = Buffer.from("You've hit your session limit", "utf8");
     const idx = bytes.indexOf(needle);
@@ -187,7 +177,7 @@ describe("detectSessionLimitRefusal", () => {
   // the bypass-permissions line), the tightest real case of "composer chrome
   // directly below a live refusal". Old assertion (resetsAt 9:50pm) replaced
   // with this fixture's real reset time, 12:10pm.
-  test("matches a genuine, real-captured refusal even with the real composer chrome rendered directly below it", () => {
+  test("matches a synthetic refusal even with the real composer chrome rendered directly below it", () => {
     const now = new Date(2026, 7, 28, 6, 0, 0);
     const r = detectSessionLimitRefusal(fixture("pane-cap-session-limit-with-composer.txt"), now);
     expect(r).not.toBeNull();

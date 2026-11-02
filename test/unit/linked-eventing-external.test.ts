@@ -17,7 +17,7 @@ import type { FetchLike } from "../../src/labels/pr.js";
  * removed entirely — `maxLinkedItems` is the only cap left to share).
  */
 
-const CONF_URL = "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/12484678/Some+Page";
+const CONF_URL = "https://example.atlassian.net/wiki/spaces/BUTCHR/pages/12484678/Some+Page";
 const GH_ISSUE_URL = "https://github.com/acme/widgets/issues/12";
 const GH_PR_URL = "https://github.com/acme/widgets/pull/7";
 const WEBPAGE_URL = "https://example.com/status";
@@ -153,7 +153,7 @@ describe("BUTCHR-437: Confluence page poller", () => {
   });
 
   test("an unresolvable Confluence URL (no /pages/<id>/ segment) is unreadable with no HTTP call", async () => {
-    const noPageId = issue("BUTCHR-1", { description: "see https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview" });
+    const noPageId = issue("BUTCHR-1", { description: "see https://example.atlassian.net/wiki/spaces/BUTCHR/overview" });
     const state = createLinkedEventingState();
     const { base, notified } = fakeBase();
     const conf = fakeConfluence({ value: 1 });

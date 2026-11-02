@@ -4,13 +4,15 @@
   "workspaces": {
     "": {
       "dependencies": {
-        "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.16.11/brooswit-drovr-0.16.11.tgz",
-        "@brooswit/drovr-events": "file:vendor/brooswit-drovr-freeze.tgz",
+        "@brooswit/drovr": "file:../drovr",
+        "@brooswit/drovr-events": "file:../drovr/legacy-events",
         "@brooswit/sundry": "^0.2.1",
         "@brooswit/thatch": "0.8.0",
         "@modelcontextprotocol/sdk": "^1.30.0",
         "confluence.js": "^3.2.0",
         "elysia": "^1.4.29",
+        "eventsource": "3.0.7",
+        "fast-json-patch": "3.1.1",
         "jira.js": "^6.2.0",
       },
       "devDependencies": {
@@ -36,6 +38,7 @@
         "react-hook-form": "^7.89.0",
         "react-router": "^8.4.0",
         "react-stately": "^3.50.0",
+        "scheduler": "0.28.0",
         "style-mod": "4.1.4",
         "typescript": "^5.6.0",
         "vite": "^6",
@@ -88,9 +91,9 @@
 
     "@borewit/text-codec": ["@borewit/text-codec@0.2.2", "", {}, "sha512-DDaRehssg1aNrH4+2hnj1B7vnUGEjU6OIlyRdkMd0aUdIUvKXrJfXsy8LVtXAy7DRvYVluWbMspsRhz2lcW0mQ=="],
 
-    "@brooswit/drovr": ["@brooswit/drovr@https://github.com/brooswit-factory/drovr/releases/download/v0.16.11/brooswit-drovr-0.16.11.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.3.0", "@modelcontextprotocol/sdk": "^1.30.0" } }, "sha512-00R5WRvDOJL4m4/9Oq9GyQEzLwMIPFUbEZI0JXcOeHK/ySTiSUW5MoubbBB0w7rrGJkx1VVizJ0GmjqhrMoy3Q=="],
+    "@brooswit/drovr": ["@brooswit/drovr@file:../drovr", { "dependencies": { "@brooswit/herdr-sdk": "0.3.0", "@modelcontextprotocol/sdk": "1.30.0", "fast-uri": "3.1.8", "zod": "4.6.5" }, "devDependencies": { "@types/bun": "^1.2.0", "typescript": "^5.6.0" } }],
 
-    "@brooswit/drovr-events": ["@brooswit/drovr-events@vendor/brooswit-drovr-freeze.tgz", { "dependencies": { "@brooswit/herdr-sdk": "^0.1.3", "@modelcontextprotocol/sdk": "^1.30.0" }, "bin": { "drovr-instance": "./dist/freeze-cli.js" } }, "sha512-0hRGUDWuc45rN5fdPVt2qmAMTi6J8tzbUGIY04jxznUC5COVp7d6ZAJgAciruiieYVYXCoDKEaXiWci0F9Xfzw=="],
+    "@brooswit/drovr-events": ["@brooswit/drovr-events@file:../drovr/legacy-events", { "dependencies": { "@brooswit/herdr-sdk": "0.1.3", "@modelcontextprotocol/sdk": "1.30.0", "fast-uri": "3.1.8", "zod": "4.6.5" }, "devDependencies": { "@types/bun": "^1.2.0", "typescript": "^5.6.0" }, "bin": { "drovr-instance": "./dist/freeze-cli.js" } }],
 
     "@brooswit/herdr-sdk": ["@brooswit/herdr-sdk@0.3.0", "", {}, "sha512-55Hlf3/VFiXjJIj3i+p1K/vqivjN+ar3ebKDhR0XXvFmdte+Z7SLEQhvDW+hDdZcBqX3MfYTaQ8vvkkFFK4wvA=="],
 
@@ -412,7 +415,9 @@
 
     "fast-deep-equal": ["fast-deep-equal@3.1.3", "", {}, "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q=="],
 
-    "fast-uri": ["fast-uri@3.1.6", "", {}, "sha512-7Ical1vFEMr0onbVzEDIreM22I4khW+fzyQPwvAFWBp1iwdshSZRsL4jjRvPG9JP1uiqMHRto+YU6R2/CzDz5Q=="],
+    "fast-json-patch": ["fast-json-patch@3.1.1", "", {}, "sha512-vf6IHUX2SBcA+5/+4883dsIjpBTqmfBjmYiWK1savxQmFk4JfBMLa7ynTYOs1Rolp/T1betJxHiGD3g1Mn8lUQ=="],
+
+    "fast-uri": ["fast-uri@3.1.8", "", {}, "sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg=="],
 
     "fdir": ["fdir@6.5.0", "", { "peerDependencies": { "picomatch": "^3 || ^4" }, "optionalPeers": ["picomatch"] }, "sha512-tIbYtZbucOs0BRGqPJkshJUYdL+SDH7dVM8gjy+ERp3WAUjLEFJE+02kanyHtwjWOnwrKYBiwAmM0p4kLJAnXg=="],
 
@@ -626,15 +631,25 @@
 
     "yallist": ["yallist@3.1.1", "", {}, "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g=="],
 
-    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+    "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
 
     "zod-to-json-schema": ["zod-to-json-schema@3.25.2", "", { "peerDependencies": { "zod": "^3.25.28 || ^4" } }, "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA=="],
+
+    "@brooswit/thatch/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+
+    "@modelcontextprotocol/sdk/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+
+    "ajv/fast-uri": ["fast-uri@3.1.6", "", {}, "sha512-7Ical1vFEMr0onbVzEDIreM22I4khW+fzyQPwvAFWBp1iwdshSZRsL4jjRvPG9JP1uiqMHRto+YU6R2/CzDz5Q=="],
 
     "body-parser/content-type": ["content-type@2.1.0", "", {}, "sha512-mj7UPXE0jaqaOsukNZRUEfEi2AcL7C/vwmwcHV0O97eO1E1pxBZuyjlZrx5seTaNBg1U6+o35wpa35Qfcc+7ag=="],
 
     "class-variance-authority/clsx": ["clsx@2.0.0", "", {}, "sha512-rQ1+kcj+ttHG0MKVGBUXwayCCF1oh39BF5COIpRzuCEv8Mwjv0XucrI2ExNTOn9IlLifGClWQcU9BrZORvtw6Q=="],
 
+    "confluence.js/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+
     "express/cookie": ["cookie@0.7.2", "", {}, "sha512-yki5XnKuf750l50uGTllt6kKILY4nQ1eNIQatoXEByZ5dWgnKqbnqmTrBE5B4N7lrMJKQ2ytWMiTO2o0v6Ew/w=="],
+
+    "jira.js/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
     "negotiator/content-type": ["content-type@2.1.0", "", {}, "sha512-mj7UPXE0jaqaOsukNZRUEfEi2AcL7C/vwmwcHV0O97eO1E1pxBZuyjlZrx5seTaNBg1U6+o35wpa35Qfcc+7ag=="],
 
