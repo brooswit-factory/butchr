@@ -1,7 +1,8 @@
 import { join } from "node:path";
 import { workspaceRoot } from "../agents/workspace.js";
 import type { RestoredResumePolicy } from "../agents/argv.js";
-import { MANAGED_ESCALATION_DEFAULTS, OPS_ALERT_DEFAULTS, type ManagedEscalationRouting } from "../agents/escalation-helper.js";
+import { OPS_ALERT_DEFAULTS } from "../agents/escalation-helper.js";
+import { expandHomePath } from "./home-path.js";
 import type { ResourceProvider } from "../rules/agent-key.js";
 import { PROVIDER_ENABLED_ENV_VAR, parseProviderEnabledMap } from "../rules/provider-enablement.js";
 
@@ -141,7 +142,7 @@ export interface Config {
    * Default 10_000: comfortably below every sweep interval a hung call could
    * otherwise block forever (the permission-answer watch's 20s,
    * `PERMISSION_ANSWER_READ_TIMEOUT_MS`'s 8s), while still a small multiple
-   * of the 5s loops (`watchPrompts`, `blockingEscalationTimer`) that also
+   * of the 5s loops (`watchPrompts`, `loginExpiredTimer`) that also
    * serialize on this client — a timeout this short recovers within one or
    * two of their ticks instead of a human noticing hours later.
    *
@@ -178,102 +179,13 @@ export interface Config {
   /** FACTORY-66: set only when `GITHUB_TOKEN_FILE` was set but unreadable — isolates that failure to `github` staying `undefined` (same as merely unset) rather than failing `loadConfig`/the whole daemon over a provider that is, by its own contract above, optional. */
   githubTokenReadError?: string;
   /**
-   * BUTCHR-395/S4: Rocket.Chat account lifecycle config. OPTIONAL, same
-   * all-or-nothing shape as `github` above: present only when
-   * `ROCKETCHAT_URL`, `ROCKETCHAT_ADMIN_USER_ID` and
-   * `ROCKETCHAT_ADMIN_TOKEN_FILE` are ALL set; otherwise `undefined`, and a
-   * daemon with no rule using `account !== "none"` behaves exactly as
-   * before this field existed. `adminTokenFile` is a PATH, never the token's
-   * content — this function's `readFile` signature stays the simple
-   * "return file contents" shape every other section here uses, so the
-   * actual secret load (plus the owner-only-file permission check) happens
-   * in `../resources/rocketchat.ts`'s `loadRocketChatAuth`, at the point a
-   * caller actually builds a client from this config — never here, and
-   * never merely because this field is present. A rule with `account !==
-   * "none"` but this section absent is a refusal from the account manager
-   * at the point of use (`../accounts/manager.ts`), not a startup crash;
-   * see `docs/rocketchat-accounts.md`.
-   */
-  rocketchat?: {
-    url: string;
-    adminUserId: string;
-    adminTokenFile: string;
-    userCapThreshold: number;
-    /**
-     * BUTCHR-412 (BUTCHR-391 comment 23999): a SEPARATE, tighter cap on
-     * concurrently-existing `temporary` accounts alone — see
-     * `../accounts/manager.ts`'s `AccountManagerDeps.tempAccountCapThreshold`
-     * for why this is not the same knob as `userCapThreshold` above. Default
-     * 8 (below `ROCKETCHAT_USER_CAP_THRESHOLD`'s own headroom): "about 10 of
-     * the 50 RC seats are free" is shared between auto-provisioned temporary
-     * accounts and S5's own `butchr-test-*` cap (5, Nexus's own limit, not
-     * enforced here), so 8 leaves room for a handful of those alongside a
-     * temporary-account swarm at its own cap.
-     */
-    temporaryAccountCapThreshold: number;
-    /** BUTCHR-412: daemon-owned directory each managed account's 0600 token file is written into — see `../accounts/manager.ts`'s `AccountManagerDeps.tokenDir`. Defaults under the workspace root, never inside any agent's own workspace directory. */
-    tokenDir: string;
-    /** BUTCHR-412: where the batched Nexus hand-off manifest is published — see `../accounts/nexus-manifest.ts`. Defaults under the workspace root. */
-    nexusManifestFile: string;
-    /** BUTCHR-412 (naming convention, BUTCHR-391 comment 24003 item 7): overrides `RC_MANAGED_PREFIX` (`../accounts/identity.ts`) when set. The convention itself is to be agreed with Nexus — this is only the knob, not that agreement. */
-    managedPrefix?: string;
-  };
-  /**
-   * FACTORY-369: a managed session's unanswerable-dialog escalation to
-   * Rocket.Chat's `#team-admin` — a SEPARATE identity/credential from
-   * `rocketchat` above, deliberately. That one is account-management ONLY
-   * (its own doc comment explains why, and `docs/real-rc-verification-runbook.md`
-   * §1.3 verifies its credential is REFUSED for posting-adjacent calls as a
-   * defence-in-depth check); the identity that may POST to a room is a
-   * different Nexus grant that did not exist when this ticket was filed
-   * (see `src/resources/rocketchat.ts`'s `RocketChatPoster`). OPTIONAL,
-   * same all-or-nothing shape as `rocketchat`/`github`: present only when
-   * BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL, _USER_ID and _TOKEN_FILE are ALL set;
-   * otherwise every managed-session escalation degrades to a loud,
-   * complete journal line only (`EscalatorDeps.teamAdminNotify` absent —
-   * see `src/agents/escalation-loop.ts`), never a crash and never a silent
-   * drop.
-   */
-  managedEscalationRocketChat?: {
-    url: string;
-    adminUserId: string;
-    adminTokenFile: string;
-    /** Defaults to `"team-admin"` (the routing spec's own room, FACTORY-358 comment 26435) when BUTCHR_TEAM_ADMIN_ROOM is unset. */
-    room: string;
-  };
-  /**
-   * FACTORY-609 (Part B): rooms, mentions and the 10/20-minute tier delays
-   * for a managed-session escalation's tiered routing — "config, not
-   * literals" per the director's spec (FACTORY-607 comment 28778). ALWAYS
-   * present (unlike `managedEscalationRocketChat` above, which is gated on
-   * a credential that may not exist yet) — these values are needed for the
-   * `[managed-escalation]` journal line and the composed message text
-   * regardless of whether posting is actually configured, so there is
-   * nothing to gate. Defaults to `MANAGED_ESCALATION_DEFAULTS`
-   * (escalation-helper.ts) — the SAME constant `src/agents/escalation-loop.ts`
-   * falls back to when this dep is omitted, so there is exactly one place
-   * the director's default routing values are written down.
-   */
-  managedEscalationRouting: ManagedEscalationRouting;
-  /**
-   * FACTORY-630: routing for the generic OPS-ALERT path
-   * (`src/agents/ops-alert.ts`) — the push destination for a daemon
-   * condition no agent can fix or even be told about, of which
-   * `credential-dead` (`src/agents/login-expired-alert.ts`) is the first.
-   * ALWAYS present, for the same reason `managedEscalationRouting` above is:
-   * these values are needed for the `[butchr:ops-alert]` journal line
-   * regardless of whether a POSTING credential exists, so there is nothing
-   * to gate. The credential itself is deliberately NOT a new env group —
-   * the ops-alert route reuses `managedEscalationRocketChat`'s one, because
-   * there is no second Nexus grant to ask for, only a second CALLER of the
-   * same poster (`RocketChatPoster` already takes a channel per call).
+   * FACTORY-630: the generic OPS-ALERT path (`src/agents/ops-alert.ts`) —
+   * one `[butchr:ops-alert]` journal line for a daemon condition no agent
+   * can fix or even be told about, of which `credential-dead`
+   * (`src/agents/login-expired-alert.ts`) is the first. Always present.
    */
   opsAlert: {
-    /** Defaults to `team-admin` (the director's own choice on FACTORY-630) when BUTCHR_OPS_ALERT_ROOM is unset. */
-    room: string;
-    /** Prepended to every ops-alert post so a human is actually pinged — the whole defect FACTORY-630 closes is a correct alert that reached nobody. Defaults to `@director`, since these conditions are by construction unfixable by any agent. Set BUTCHR_OPS_ALERT_MENTION to a literal `none` to post with no mention at all. */
-    mention: string;
-    /** The dedup window: at most one post per condition per this many minutes (the director's figure is 60). Config, not a literal, so a flapping-credential incident can be tuned without a release. */
+    /** The dedup window: at most one line per condition per this many minutes (the director's figure is 60). Config, not a literal, so a flapping-credential incident can be tuned without a release. */
     dedupMinutes: number;
   };
   /**
@@ -622,7 +534,7 @@ export interface Config {
    * for non-emptiness here — an unresolvable package or an unreadable
    * override path is a RUNTIME degrade-to-silence (logged once), never a
    * startup crash, same "don't let an optional feature's misconfiguration
-   * take down an unrelated daemon" contract as `github`/`rocketchat` above.
+   * take down an unrelated daemon" contract as `github` above.
    */
   lizardApprovalSound?: { overridePath?: string };
   /**
@@ -750,8 +662,8 @@ export interface Config {
    * FACTORY-497 (implementing FACTORY-475): NOT CONFIGURABLE any more.
    * `allowedOrigins` is always exactly `[CLEAVR_EXTENSION_ORIGIN]` — there is
    * no env var, default-plus-override, or operator allowlist left to
-   * describe here. DELIBERATELY ALWAYS PRESENT (unlike `github`/
-   * `rocketchat`, which are `undefined` when off): a guarded route always
+   * describe here. DELIBERATELY ALWAYS PRESENT (unlike `github`, which is
+   * `undefined` when off): a guarded route always
    * has an `extensionAuth` object to pass straight to the guard, with NO
    * config-shape branch of its own.
    */
@@ -786,29 +698,8 @@ export interface ConfigEnv {
   BUTCHR_TERMINAL?: string | undefined;
   GITHUB_TOKEN_FILE?: string | undefined;
   BUTCHR_GITHUB_ORGS?: string | undefined;
-  ROCKETCHAT_URL?: string | undefined;
-  ROCKETCHAT_ADMIN_USER_ID?: string | undefined;
-  ROCKETCHAT_ADMIN_TOKEN_FILE?: string | undefined;
-  ROCKETCHAT_USER_CAP_THRESHOLD?: string | undefined;
-  ROCKETCHAT_TEMPORARY_CAP_THRESHOLD?: string | undefined;
-  ROCKETCHAT_TOKEN_DIR?: string | undefined;
-  ROCKETCHAT_NEXUS_MANIFEST_FILE?: string | undefined;
-  ROCKETCHAT_MANAGED_PREFIX?: string | undefined;
-  BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL?: string | undefined;
-  BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?: string | undefined;
-  BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?: string | undefined;
-  BUTCHR_TEAM_ADMIN_ROOM?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES?: string | undefined;
-  /** FACTORY-630: the ops-alert route's room/mention/dedup window — see `Config.opsAlert`. */
-  BUTCHR_OPS_ALERT_ROOM?: string | undefined;
-  BUTCHR_OPS_ALERT_MENTION?: string | undefined;
+  /** FACTORY-630: the ops-alert route's dedup window — see `Config.opsAlert`. */
   BUTCHR_OPS_ALERT_DEDUP_MINUTES?: string | undefined;
-  BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES?: string | undefined;
   BUTCHR_STALLED_MINUTES?: string | undefined;
   BUTCHR_BLOCKED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
   BUTCHR_STALLED_WAKE_DEBOUNCE_MINUTES?: string | undefined;
@@ -917,7 +808,8 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   let githubTokenReadError: string | undefined;
   if (anyGithubProviderEnabled && env.GITHUB_TOKEN_FILE) {
     try {
-      githubToken = readFile(env.GITHUB_TOKEN_FILE).trim();
+      // local/ui: a `~/...` token file path is expanded (`./home-path.ts`); every other path is read exactly as given.
+      githubToken = readFile(expandHomePath(env.GITHUB_TOKEN_FILE, env as Record<string, string | undefined>)).trim();
     } catch (e) {
       githubTokenReadError = `could not read GITHUB_TOKEN_FILE (${env.GITHUB_TOKEN_FILE}): ${(e as Error).message} — github-issue/github-pr rules and pr:* discovery are not staffed until it is fixed`;
     }
@@ -925,95 +817,13 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
   const githubOrgs = env.BUTCHR_GITHUB_ORGS ? env.BUTCHR_GITHUB_ORGS.split(",").map((o) => o.trim()).filter(Boolean) : [];
   const github = githubToken && githubOrgs.length ? { token: githubToken, orgs: githubOrgs } : undefined;
 
-  const rcUrl = env.ROCKETCHAT_URL?.trim();
-  const rcAdminUserId = env.ROCKETCHAT_ADMIN_USER_ID?.trim();
-  const rcAdminTokenFile = env.ROCKETCHAT_ADMIN_TOKEN_FILE?.trim();
-  // Validated only when RC is otherwise fully configured — a stray
-  // ROCKETCHAT_USER_CAP_THRESHOLD with RC otherwise unset must never crash a
-  // daemon that isn't using Rocket.Chat at all (same "optional, never a
-  // startup crash for unrelated config" contract as `github` above).
-  let rocketchat: Config["rocketchat"];
-  if (rcUrl && rcAdminUserId && rcAdminTokenFile) {
-    // BUTCHR-395/S4: default 45, not 50 — the guardrail must refuse BEFORE
-    // the real allowance is hit, so a threshold equal to (or over) it would
-    // defeat the whole point; 45 leaves 5 seats of headroom for
-    // humans/legacy users this manager never touches (see
-    // docs/rocketchat-accounts.md).
-    const userCapThreshold = env.ROCKETCHAT_USER_CAP_THRESHOLD ? Number(env.ROCKETCHAT_USER_CAP_THRESHOLD) : 45;
-    if (!Number.isInteger(userCapThreshold) || userCapThreshold <= 0 || userCapThreshold >= 50) throw new Error(`ROCKETCHAT_USER_CAP_THRESHOLD must be a positive integer below 50: ${env.ROCKETCHAT_USER_CAP_THRESHOLD}`);
-    // BUTCHR-412 (BUTCHR-391 comment 23999): a separate, tighter cap on
-    // concurrently-existing TEMPORARY accounts alone — see `Config.rocketchat`'s
-    // own doc comment for why 8, and why this is a different knob from
-    // `userCapThreshold` above.
-    const temporaryAccountCapThreshold = env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD ? Number(env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD) : 8;
-    if (!Number.isInteger(temporaryAccountCapThreshold) || temporaryAccountCapThreshold <= 0) throw new Error(`ROCKETCHAT_TEMPORARY_CAP_THRESHOLD must be a positive integer: ${env.ROCKETCHAT_TEMPORARY_CAP_THRESHOLD}`);
-    const tokenDir = env.ROCKETCHAT_TOKEN_DIR?.trim() || join(workspaceRoot(), ".butchr-rc-tokens");
-    const nexusManifestFile = env.ROCKETCHAT_NEXUS_MANIFEST_FILE?.trim() || join(workspaceRoot(), ".butchr-rc-nexus-manifest.json");
-    const managedPrefix = env.ROCKETCHAT_MANAGED_PREFIX?.trim();
-    rocketchat = { url: rcUrl, adminUserId: rcAdminUserId, adminTokenFile: rcAdminTokenFile, userCapThreshold, temporaryAccountCapThreshold, tokenDir, nexusManifestFile, ...(managedPrefix ? { managedPrefix } : {}) };
-  }
-
-  // FACTORY-369: a SEPARATE identity from `rocketchat` above — see
-  // `Config.managedEscalationRocketChat`'s own doc comment for why. Same
-  // "optional, never a startup crash for unrelated config" contract: a
-  // stray BUTCHR_TEAM_ADMIN_ROOM with the credential otherwise unset must
-  // never crash a daemon that isn't using this feature at all.
-  const teamAdminUrl = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL?.trim();
-  const teamAdminAdminUserId = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_USER_ID?.trim();
-  const teamAdminTokenFile = env.BUTCHR_TEAM_ADMIN_ROCKETCHAT_TOKEN_FILE?.trim();
-  let managedEscalationRocketChat: Config["managedEscalationRocketChat"];
-  if (teamAdminUrl && teamAdminAdminUserId && teamAdminTokenFile) {
-    const room = env.BUTCHR_TEAM_ADMIN_ROOM?.trim() || "team-admin";
-    managedEscalationRocketChat = { url: teamAdminUrl, adminUserId: teamAdminAdminUserId, adminTokenFile: teamAdminTokenFile, room };
-  }
-
-  // FACTORY-609 (Part B): routing is ALWAYS present (see `Config.
-  // managedEscalationRouting`'s own doc comment for why it is not gated on
-  // `managedEscalationRocketChat` the way the credential above is) — every
-  // value here defaults to `MANAGED_ESCALATION_DEFAULTS`, the director's own
-  // routing (FACTORY-607 comment 28688), so an operator who sets none of
-  // these still gets correct behaviour. `normalRoom` deliberately reuses
-  // BUTCHR_TEAM_ADMIN_ROOM (already parsed above) rather than a second env
-  // var — tier 1/2 of an ordinary managed session is the SAME room
-  // FACTORY-369 already shipped under that name.
-  const managedEscalationAnswererMention = env.BUTCHR_MANAGED_ESCALATION_ANSWERER_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.normalMention;
-  const managedEscalationNormalRoom = env.BUTCHR_TEAM_ADMIN_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.normalRoom;
-  const managedEscalationAssemblyMention = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyMention;
-  const managedEscalationAssemblyRoom = env.BUTCHR_MANAGED_ESCALATION_ASSEMBLY_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.assemblyRoom;
-  const managedEscalationDirectorMention = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_MENTION?.trim() || MANAGED_ESCALATION_DEFAULTS.directorMention;
-  const managedEscalationDirectorRoom = env.BUTCHR_MANAGED_ESCALATION_DIRECTOR_ROOM?.trim() || MANAGED_ESCALATION_DEFAULTS.directorRoom;
-  const managedEscalationTier2Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier2Minutes;
-  if (!Number.isFinite(managedEscalationTier2Minutes) || managedEscalationTier2Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES}`);
-  const managedEscalationTier3Minutes = env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES ? Number(env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES) : MANAGED_ESCALATION_DEFAULTS.tier3Minutes;
-  if (!Number.isFinite(managedEscalationTier3Minutes) || managedEscalationTier3Minutes <= 0) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES is not a positive number: ${env.BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES}`);
-  if (managedEscalationTier3Minutes <= managedEscalationTier2Minutes) throw new Error(`BUTCHR_MANAGED_ESCALATION_TIER3_MINUTES (${managedEscalationTier3Minutes}) must be greater than BUTCHR_MANAGED_ESCALATION_TIER2_MINUTES (${managedEscalationTier2Minutes})`);
-  const managedEscalationRouting: ManagedEscalationRouting = {
-    normalMention: managedEscalationAnswererMention,
-    normalRoom: managedEscalationNormalRoom,
-    assemblyMention: managedEscalationAssemblyMention,
-    assemblyRoom: managedEscalationAssemblyRoom,
-    directorMention: managedEscalationDirectorMention,
-    directorRoom: managedEscalationDirectorRoom,
-    tier2Minutes: managedEscalationTier2Minutes,
-    tier3Minutes: managedEscalationTier3Minutes,
-  };
-
-  // FACTORY-630: the ops-alert route's own routing — see `Config.opsAlert`'s
-  // doc comment for why it is always present and why it deliberately adds no
-  // new credential env group. `OPS_ALERT_DEFAULTS` (src/agents/ops-alert.ts
-  // has the route; the defaults live in escalation-helper.ts alongside
-  // MANAGED_ESCALATION_DEFAULTS) is the single place these literals are
-  // written down, so this parser and any caller that falls back cannot drift.
-  const opsAlertRoom = env.BUTCHR_OPS_ALERT_ROOM?.trim() || OPS_ALERT_DEFAULTS.room;
-  // A literal `none` means "post with no mention", distinct from UNSET
-  // (which takes the default mention): an operator who wants an unpinged
-  // room needs a way to say so that an empty env var cannot express, since
-  // an empty value is indistinguishable from unset after `?.trim() ||`.
-  const opsAlertMentionRaw = env.BUTCHR_OPS_ALERT_MENTION?.trim();
-  const opsAlertMention = opsAlertMentionRaw === undefined || opsAlertMentionRaw === "" ? OPS_ALERT_DEFAULTS.mention : opsAlertMentionRaw === "none" ? "" : opsAlertMentionRaw;
+  // FACTORY-630: the ops-alert route's dedup window — see `Config.opsAlert`.
+  // `OPS_ALERT_DEFAULTS` (src/agents/escalation-helper.ts) is the single
+  // place the default is written down, so this parser and any caller that
+  // falls back cannot drift.
   const opsAlertDedupMinutes = env.BUTCHR_OPS_ALERT_DEDUP_MINUTES ? Number(env.BUTCHR_OPS_ALERT_DEDUP_MINUTES) : OPS_ALERT_DEFAULTS.dedupMinutes;
   if (!Number.isFinite(opsAlertDedupMinutes) || opsAlertDedupMinutes <= 0) throw new Error(`BUTCHR_OPS_ALERT_DEDUP_MINUTES is not a positive number: ${env.BUTCHR_OPS_ALERT_DEDUP_MINUTES}`);
-  const opsAlert = { room: opsAlertRoom, mention: opsAlertMention, dedupMinutes: opsAlertDedupMinutes };
+  const opsAlert = { dedupMinutes: opsAlertDedupMinutes };
 
   const stalledMinutes = env.BUTCHR_STALLED_MINUTES ? Number(env.BUTCHR_STALLED_MINUTES) : 10;
   if (!Number.isFinite(stalledMinutes) || stalledMinutes <= 0) throw new Error(`BUTCHR_STALLED_MINUTES is not a positive number: ${env.BUTCHR_STALLED_MINUTES}`);
@@ -1155,9 +965,6 @@ export function loadConfig(env: ConfigEnv, readFile: (path: string) => string): 
     ...(env.HERDR_SOCKET ? { herdrSocket: env.HERDR_SOCKET } : {}),
     ...(env.BUTCHR_TERMINAL ? { terminalPrefix: env.BUTCHR_TERMINAL.trim().split(/\s+/).filter(Boolean) } : {}),
     ...(github ? { github } : {}),
-    ...(rocketchat ? { rocketchat } : {}),
-    ...(managedEscalationRocketChat ? { managedEscalationRocketChat } : {}),
-    managedEscalationRouting,
     opsAlert,
     assignees: {
       ...(assigneeStory ? { story: assigneeStory } : {}),
@@ -1302,7 +1109,8 @@ export function loadAtlassianConfig(env: ConfigEnv, readFile: (path: string) => 
     validateAtlassianSiteShape(site);
     const email = required(env.ATLASSIAN_EMAIL, "ATLASSIAN_EMAIL");
     const token = env.ATLASSIAN_TOKEN_FILE
-      ? readFile(env.ATLASSIAN_TOKEN_FILE).trim()
+      // local/ui: a `~/...` token file path is expanded (`./home-path.ts`); every other path is read exactly as given.
+      ? readFile(expandHomePath(env.ATLASSIAN_TOKEN_FILE, env as Record<string, string | undefined>)).trim()
       : required(env.ATLASSIAN_TOKEN, "ATLASSIAN_TOKEN (or ATLASSIAN_TOKEN_FILE)");
     if (!token) throw new Error("Atlassian token is empty");
     return { config: { site, email, token } };
@@ -1411,10 +1219,7 @@ export const describeConfig = (c: Config): string =>
   // "=enabled"s) — see `Config.providerEnabled`'s own doc comment.
   `${(() => { const off = (Object.entries(c.providerEnabled) as Array<[string, boolean]>).filter(([, v]) => !v).map(([k]) => k); return off.length ? `providerSwitchOff=${off.join(",")} ` : ""; })()}` +
   `github=${c.github ? `orgs=${c.github.orgs.join(",")} token=***(${c.github.token.length} chars)` : `disabled${c.githubTokenReadError ? ` (${c.githubTokenReadError})` : ""}`} ` +
-  `rocketchat=${c.rocketchat ? `url=${c.rocketchat.url} adminUserId=${truncAccountId(c.rocketchat.adminUserId)} userCapThreshold=${c.rocketchat.userCapThreshold} temporaryAccountCapThreshold=${c.rocketchat.temporaryAccountCapThreshold} tokenDir=${c.rocketchat.tokenDir} nexusManifestFile=${c.rocketchat.nexusManifestFile} managedPrefix=${c.rocketchat.managedPrefix ?? "(default)"} adminTokenFile=${c.rocketchat.adminTokenFile}` : "disabled"} ` +
-  `managedEscalationRocketChat=${c.managedEscalationRocketChat ? `url=${c.managedEscalationRocketChat.url} adminUserId=${truncAccountId(c.managedEscalationRocketChat.adminUserId)} room=${c.managedEscalationRocketChat.room} adminTokenFile=${c.managedEscalationRocketChat.adminTokenFile}` : "disabled — managed-session escalations log a [managed-escalation] journal line only"} ` +
-  `managedEscalationRouting=normal:${c.managedEscalationRouting.normalMention}@#${c.managedEscalationRouting.normalRoom} assembly:${c.managedEscalationRouting.assemblyMention}@#${c.managedEscalationRouting.assemblyRoom} director:${c.managedEscalationRouting.directorMention}@#${c.managedEscalationRouting.directorRoom} tier2Minutes=${c.managedEscalationRouting.tier2Minutes} tier3Minutes=${c.managedEscalationRouting.tier3Minutes} ` +
-  `opsAlert=#${c.opsAlert.room} mention=${c.opsAlert.mention || "(none)"} dedupMinutes=${c.opsAlert.dedupMinutes}${c.managedEscalationRocketChat ? "" : " — NO posting credential: ops alerts log a [butchr:ops-alert] journal line only"} ` +
+  `opsAlertDedupMinutes=${c.opsAlert.dedupMinutes} ` +
   `stalledMinutes=${c.stalledMinutes} blockedWakeDebounceMinutes=${c.blockedWakeDebounceMinutes} stalledWakeDebounceMinutes=${c.stalledWakeDebounceMinutes} stalledWakeMaxPerHour=${c.stalledWakeMaxPerHour} silentStopMode=${c.silentStopMode} silentStopSuppressMinutes=${c.silentStopSuppressMinutes} idlePokeMode=${c.idlePokeMode} idlePokeSuppressMinutes=${c.idlePokeSuppressMinutes} idlePokeMaxPerPoll=${c.idlePokeMaxPerPoll} stallRemediationMode=${c.stallRemediationMode} abandonedMinutes=${c.abandonedMinutes} atRestMinutes=${c.atRestMinutes} crashLoopCount=${c.crashLoopCount} crashLoopWindowMinutes=${c.crashLoopWindowMinutes} standDownMaxSleepMinutes=${c.standDownMaxSleepMinutes} yieldLoopCount=${c.yieldLoopCount} yieldLoopWindowMinutes=${c.yieldLoopWindowMinutes} unresponsiveMinutes=${c.unresponsiveMinutes} idleDialogMinutes=${c.idleDialogMinutes} pollStaleMs=${c.pollStaleMs} herdrCallTimeoutMs=${c.herdrCallTimeoutMs} loopWatchdogThresholdMs=${c.loopWatchdogThresholdMs} ` +
   `assignees=story:${describeRole("Story", c.assignees.story)} task:${describeRole("Task", c.assignees.task)} epic:${describeRole("Epic", c.assignees.epic)} ` +
   `roleCollisions(this daemon only)=${describeCollisions(c.assignees)} ` +

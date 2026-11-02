@@ -1,5 +1,4 @@
-import { DEFAULT_RESUME_CONTEXT_CUTOFF } from "../rules/rules.js";
-import { claudeTranscriptExists, estimateTranscriptTokens, invalidatePersistedSessionId, workspaceSessionId } from "./workspace.js";
+import { claudeTranscriptExists, invalidatePersistedSessionId, workspaceSessionId } from "./workspace.js";
 import { classifyStop, clearStopCause, workspaceStopCause } from "./stop-cause.js";
 
 export const RESPAWN_MARKER = "[butchr:respawn]";
@@ -73,7 +72,6 @@ export const RESUME_DECISION_REASON = {
   intentional: "stop was intentional",
   noSessionId: "no persisted session id",
   transcriptMissing: "transcript missing",
-  overCutoff: (estimatedTokens: number, cutoff: number) => `over cutoff (estimated ~${estimatedTokens} tokens > ${cutoff})`,
 } as const;
 
 export interface RespawnResumeDecisionInput {
@@ -81,12 +79,10 @@ export interface RespawnResumeDecisionInput {
   dir: string;
   /** `SpawnSpec.resumeOnRespawn` — `Rule.resumeOnRespawn` passthrough; absent means ON. */
   resumeOnRespawn?: boolean;
-  /** `SpawnSpec.resumeContextCutoff` — absent means `DEFAULT_RESUME_CONTEXT_CUTOFF`. */
-  resumeContextCutoff?: number;
   /** `SpawnSpec.ticketStatus`/`ticketLabels` — fed straight into `classifyStop`. */
   ticketStatus?: string;
   ticketLabels?: readonly string[];
-  /** Overrides `homedir()` for `claudeTranscriptExists`/`estimateTranscriptTokens` — test-only seam, same shape those two functions already take. */
+  /** Overrides `homedir()` for `claudeTranscriptExists` — test-only seam, same shape that function already takes. */
   home?: string;
 }
 
@@ -103,9 +99,11 @@ export interface RespawnResumeDecision {
  * be (re)spawned, decide whether it should `--resume` its prior session or
  * start fresh, and why. Pure over its explicit inputs plus three cheap,
  * already-fail-safe filesystem reads (`workspaceStopCause`, `workspaceSessionId`,
- * `claudeTranscriptExists`/`estimateTranscriptTokens` — none of them parse
- * the (potentially large) transcript itself, see `estimateTranscriptTokens`'s
- * own doc comment) — no Jira or herdr call of its own.
+ * `claudeTranscriptExists` — a bare `existsSync`, never parsing the
+ * (potentially large) transcript itself) — no Jira or herdr call of its own.
+ *
+ * FACTORY-1018 removed the transcript-size resume cutoff: a valid saved
+ * session is no longer vetoed merely because its transcript is large.
  *
  * ALSO performs this story's step 6 (DoD): clears/supersedes this
  * workspace's durable stop-cause marker, every time this is called — see
@@ -153,15 +151,5 @@ export function decideRespawnResume(input: RespawnResumeDecisionInput): RespawnR
     invalidatePersistedSessionId(input.dir);
     return { reason: RESUME_DECISION_REASON.transcriptMissing };
   }
-  const cutoff = input.resumeContextCutoff ?? DEFAULT_RESUME_CONTEXT_CUTOFF;
-  const estimatedTokens = estimateTranscriptTokens(input.dir, sessionId, input.home);
-  // `estimatedTokens === undefined` only via a stat-failure race against the
-  // `claudeTranscriptExists` check immediately above (the file existed,
-  // then vanished) — vanishingly rare, and resuming is the safe side to
-  // fall to: the transcript existed a moment ago, and a wrong resume here
-  // is bounded by the cutoff this estimate exists to enforce in the first
-  // place, same "unintended/resume is the cheap direction to be wrong in"
-  // reasoning `classifyStop`'s own doc comment argues.
-  if (estimatedTokens !== undefined && estimatedTokens > cutoff) return { reason: RESUME_DECISION_REASON.overCutoff(estimatedTokens, cutoff) };
   return { resumeSessionId: sessionId };
 }

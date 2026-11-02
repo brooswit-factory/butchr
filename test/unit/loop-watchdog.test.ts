@@ -96,7 +96,7 @@ describe("loop-watchdog (FACTORY-772)", () => {
   test("/health's loopWatchdog sibling round-trips restart history, additive only", () => {
     const poll = createLoopHealth({ name: "pollLoop", thresholdMs: 1_000, checkIntervalMs: 1e9 });
     const report = [{ name: "pollLoop", restartCount: 2, lastRestartAt: new Date(500).toISOString() }];
-    const withWatchdog = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
+    const withWatchdog = combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, report);
     expect(withWatchdog.loopWatchdog).toEqual(report);
     expect(withWatchdog.ok).toBe(poll.status().ok); // never flips `ok`
     expect("loopWatchdog" in combineHealth([poll])).toBe(false); // absent, never an empty array, when omitted

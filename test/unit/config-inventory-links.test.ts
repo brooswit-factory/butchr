@@ -1,12 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import {
-  agentRowAnchorId, agentRowsForRule, agentRowsForSessionDefinition,
-  configAnchorForResourceKey, ruleAnchorId, sessionAnchorId,
-} from "../../src/agents/config-inventory-links.js";
+import { agentRowAnchorId, agentRowsForRule, configAnchorForResourceKey, ruleAnchorId } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
-import { sessionAgentKey } from "../../src/resources/session-freeze.js";
 import type { AgentDashboardRow, DashboardRow, WithheldDashboardRow } from "../../src/agents/dashboard.js";
-import { absPath } from "../helpers/abs-path";
 
 const floor = { sinceMs: 0, since: new Date(0).toISOString(), humanDuration: "0s", exact: true };
 function agentRow(resourceKey: string): AgentDashboardRow {
@@ -55,31 +50,6 @@ describe("agentRowsForRule (FACTORY-81) — a rule matches a LIVE row iff decode
   });
 });
 
-describe("agentRowsForSessionDefinition (FACTORY-81) — a session definition matches a LIVE row iff resourceKey === its own agentKey, EXACTLY", () => {
-  test("an exact agentKey match", () => {
-    const agentKey = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    const rows: DashboardRow[] = [agentRow(agentKey)];
-    expect(agentRowsForSessionDefinition({ agentKey }, rows)).toEqual([agentRow(agentKey)]);
-  });
-
-  test("a DIFFERENT session definition's row does not match, even though both are filesystem/managed-sessions keys", () => {
-    const mine = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    const other = sessionAgentKey(absPath("home", "butchr", "defs", "bar.json"));
-    expect(agentRowsForSessionDefinition({ agentKey: mine }, [agentRow(other)])).toEqual([]);
-  });
-
-  test("an entry with no agentKey (the oversized-path case) matches nothing, ever", () => {
-    expect(agentRowsForSessionDefinition({}, [agentRow(sessionAgentKey(absPath("home", "butchr", "defs", "foo.json")))])).toEqual([]);
-  });
-
-  test("an ordinary (non-managed-session) filesystem rule's agent row never matches a session definition — exact key equality, not provider/ruleId decoding", () => {
-    const ruleKey = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "watch-repo", resourceId: absPath("home", "butchr", "defs", "foo.json") });
-    const agentKey = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    expect(agentKey).not.toBe(ruleKey); // sanity: same resourceId, different ruleId, so genuinely different keys
-    expect(agentRowsForSessionDefinition({ agentKey }, [agentRow(ruleKey)])).toEqual([]);
-  });
-});
-
 describe("configAnchorForResourceKey (FACTORY-81) — the back-link target, computed WITHOUT the inventory in hand", () => {
   test("an ordinary rule-driven row anchors to that rule's own anchor id", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
@@ -89,18 +59,6 @@ describe("configAnchorForResourceKey (FACTORY-81) — the back-link target, comp
   test("a query-level agent's row anchors to the same rule anchor id as a per-resource row would", () => {
     const key = encodeQueryAgentKey({ resourceProvider: "filesystem", ruleId: "director" });
     expect(configAnchorForResourceKey(key)).toBe(ruleAnchorId("filesystem", "director"));
-  });
-
-  test("a managed-session row (filesystem provider, the reserved managed-sessions rule id) anchors to ITS OWN session anchor, keyed on the whole resourceKey — never the generic rule anchor", () => {
-    const agentKey = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    expect(configAnchorForResourceKey(agentKey)).toBe(sessionAnchorId(agentKey));
-    expect(configAnchorForResourceKey(agentKey)).not.toBe(ruleAnchorId("filesystem", "managed-sessions"));
-  });
-
-  test("two DIFFERENT managed sessions get two DIFFERENT anchors — the whole point of keying on the full resourceKey rather than (provider, ruleId)", () => {
-    const a = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    const b = sessionAgentKey(absPath("home", "butchr", "defs", "bar.json"));
-    expect(configAnchorForResourceKey(a)).not.toBe(configAnchorForResourceKey(b));
   });
 
   test("a resourceKey that fails to decode entirely yields null — nothing to link to", () => {
@@ -114,9 +72,5 @@ describe("anchor ids (FACTORY-81) — stable, distinct, and safe as both an HTML
     const b = agentRowAnchorId("jira-work:task:BUTCHR-2");
     expect(a).not.toBe(b);
     for (const s of [a, b]) expect(s).toMatch(/^agent-[A-Za-z0-9._%-]+$/);
-  });
-
-  test("ruleAnchorId and sessionAnchorId never collide with each other's prefix", () => {
-    expect(ruleAnchorId("filesystem", "managed-sessions")).not.toBe(sessionAnchorId("filesystem:managed-sessions:%2Ffoo"));
   });
 });

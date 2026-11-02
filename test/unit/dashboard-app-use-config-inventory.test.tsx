@@ -12,7 +12,7 @@ function Probe() {
   return <div data-testid="state">{JSON.stringify(state)}</div>;
 }
 
-const okResponse: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
+const okResponse: QueryAgentInventory = { rules: [], errors: [] };
 
 describe("useConfigInventory — FACTORY-614", () => {
   test("fetches GET /config-inventory (same origin, no new API) and resolves to loaded with the real response shape", async () => {

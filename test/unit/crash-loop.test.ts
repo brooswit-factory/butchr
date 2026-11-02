@@ -565,23 +565,21 @@ describe("reconcileNow: checkCrashLoop is called before the spawn loop, with (pl
  * composition and dedup, so a stubbed `raise` would assert nothing about what
  * a human actually receives.
  */
-describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash loop reaches chat, not only the journal", () => {
+describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash loop raises an ops alert", () => {
   /** The ticketless wiring, reproduced exactly: nowhere to post, nothing to read back. */
   function ticketlessChannel() {
     const logged: string[] = [];
     return { logged, addComment: async (_id: string, text: string) => { logged.push(text); }, comments: async () => [] as never[] };
   }
 
+  /** Every line the router logs is an ops-alert (or cleared) line, so they stand in for what used to be posts. */
   function routerWithPostSpy(now: () => number, dedupWindowMs = 60 * MIN) {
-    const posts: { room: string; text: string }[] = [];
-    const router = createOpsAlertRouter({
-      post: async (room, text) => { posts.push({ room, text }); },
-      room: "team-admin", mention: "@here", host: "testhost", now, log: () => {}, dedupWindowMs,
-    });
+    const posts: { text: string }[] = [];
+    const router = createOpsAlertRouter({ host: "testhost", now, log: (text) => { posts.push({ text }); }, dedupWindowMs });
     return { posts, router };
   }
 
-  test("THE DEFECT: a ticketless session crossing the threshold posts to chat, naming the session and the refusal reason", async () => {
+  test("THE DEFECT: a ticketless session crossing the threshold raises an ops alert, naming the session and the refusal reason", async () => {
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);
@@ -597,14 +595,13 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     await Promise.resolve(); await Promise.resolve();
 
     expect(posts).toHaveLength(1);
-    expect(posts[0]!.room).toBe("team-admin");
     expect(posts[0]!.text).toContain("admin-brooswit-nexus"); // the session
     expect(posts[0]!.text).toContain("Current worker disappeared; refusing implicit replacement"); // the refusal reason
     expect(posts[0]!.text).toContain("crashloop");
-    expect(posts[0]!.text).toContain("testhost"); // which daemon — the room collects more than one
+    expect(posts[0]!.text).toContain("testhost"); // which daemon
   });
 
-  test("the SAME ongoing loop posts once per hour, however many polls it spans", async () => {
+  test("the SAME ongoing loop is reported once per hour, however many polls it spans", async () => {
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);
@@ -668,7 +665,7 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     expect(chan.logged).toHaveLength(1);
   });
 
-  test("below the threshold nothing is posted to chat, however many polls — the alert inherits the threshold, it does not bypass it", async () => {
+  test("below the threshold nothing is raised, however many polls — the alert inherits the threshold, it does not bypass it", async () => {
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);
@@ -682,7 +679,7 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     expect(posts).toEqual([]);
   });
 
-  test("a fleet-wide 'nothing running' poll posts nothing to chat either — the inverted confident-zero guard runs before any raise", async () => {
+  test("a fleet-wide 'nothing running' poll raises nothing either — the inverted confident-zero guard runs before any raise", async () => {
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);
@@ -693,7 +690,7 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     });
     for (let i = 0; i < 20; i++) { now = i * MIN; await det.check(["genius", "director"], ["genius", "director"]); }
     await Promise.resolve(); await Promise.resolve();
-    expect(posts).toEqual([]); // a fleet-wide alarm in a shared room is the spam outcome this guard exists to prevent
+    expect(posts).toEqual([]); // a fleet-wide alarm is the spam outcome this guard exists to prevent
   });
 
   test("no refusal reason to quote (the agent dies AFTER a successful launch) says so, rather than inventing one", async () => {
@@ -711,7 +708,7 @@ describe("createCrashLoopDetector: FACTORY-622 — a ticketless session's crash 
     expect(posts[0]!.text).toContain("dying after a successful launch");
   });
 
-  test("the ticket's 'keep the alert text free of secrets' requirement: a refusal reason carrying a token is redacted in the posted text", async () => {
+  test("the ticket's 'keep the alert text free of secrets' requirement: a refusal reason carrying a token is redacted in the alert text", async () => {
     let now = 0;
     const chan = ticketlessChannel();
     const { posts, router } = routerWithPostSpy(() => now);

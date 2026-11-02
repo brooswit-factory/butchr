@@ -6,7 +6,7 @@
  *
  * 1. FACTORY-7's `ResourceRef` kind (below, unchanged from `main`) — the
  *    canonical identity for a `filesystem` entry in the generic cross-issue
- *    LINK system (`src/resources/resource-ref.ts`, `butchr link` CLI). It
+ *    LINK system (`src/resources/resource-ref.ts`; local/ui: the `butchr link` CLI is gone). It
  *    NORMALIZES a possibly-relative-looking, `.`/`..`-bearing path itself
  *    (`parseFilesystemRef`), because a human can type `butchr link add
  *    filesystem:/a/../b` and expects that to resolve, not to be rejected.

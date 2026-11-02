@@ -9,7 +9,7 @@
  * built from, file:function evidence per cell, and every deviation from the
  * original handoff proposal.
  *
- * ADDITIVE ONLY: this module does not rewrite resource-ref.ts, link-store.ts,
+ * ADDITIVE ONLY: this module does not rewrite resource-ref.ts,
  * issue.ts, or any provider's existing query/read/links code — it only
  * DECLARES which of that existing machinery is genuinely usable through a
  * uniform, provider-agnostic interface today. A capability lands `true`
@@ -106,9 +106,12 @@ export class UnsupportedCapabilityError extends Error {
  * status (including "partial") and file:line evidence behind every cell —
  * this table only carries the boolean a caller can safely act on.
  */
+// local/ui: `links` meant "can own or be the target of a butchr-managed
+// link" for every ResourceRef kind. Managed links are gone, so it's true only
+// for jira-work-item, whose own Jira issue links linked-change events read.
 const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   "jira-work-item": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
-  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  "jira-project": { query: true, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
   "jira-idea": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
   // FACTORY-998: `query` flipped true — a real provider/rule now exists
   // (src/rules/confluence-page-type.ts, `{"ancestor": "<page id>"}`), usable
@@ -119,19 +122,18 @@ const MATRIX: Record<CapabilityProvider, Record<Capability, boolean>> = {
   // page CONTENT is read via `get_my_confluence_page`
   // (FACTORY-993/996, src/tools/defs.ts), a self-only verb with no
   // provider-agnostic entry point, not through a shared `read` capability.
-  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: false },
-  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
-  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: true, createTask: false, catamorbiusPush: true },
+  "confluence-page": { query: true, read: false, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
+  "github-issue": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: true },
+  "github-pr": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: true },
   "zendesk-ticket": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
   // FACTORY-1009: query/read/comments mirror zendesk-ticket's own row — a
   // real REST client exists for all three (trello-card.ts), reusable by a
   // zero-provider-knowledge caller through comments.ts the same way. `links`
-  // stays false (no ResourceRef/link-store integration, same reason
-  // zendesk-ticket's does); no event-rules/poll wiring exists, so `snapshot`
+  // stays false, same as zendesk-ticket's; no event-rules/poll wiring exists, so `snapshot`
   // is the plain "absent" case, not a flip under "The snapshot bar".
   "trello-card": { query: true, read: true, snapshot: false, comments: true, links: false, createTask: false, catamorbiusPush: false },
-  filesystem: { query: true, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
-  webpage: { query: false, read: false, snapshot: false, comments: false, links: true, createTask: false, catamorbiusPush: false },
+  filesystem: { query: true, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
+  webpage: { query: false, read: false, snapshot: false, comments: false, links: false, createTask: false, catamorbiusPush: false },
 };
 
 /** Every capability `ref`'s provider truthfully supports today, in `CAPABILITIES` order. */

@@ -49,7 +49,7 @@ const stubSite = `http://127.0.0.1:${stub.port}`;
 const env = { ATLASSIAN_SITE: stubSite, ATLASSIAN_EMAIL: "butchr@example.com", ATLASSIAN_TOKEN: SECRET_SENTINEL, BUTCHR_PORT: "0", BUTCHR_MAX_AGENTS: "8" };
 
 const auditLines: unknown[] = [];
-const auditWrite = createAuditLogger({ append: () => {}, host: "codey", log: () => {} });
+const auditWrite = createAuditLogger({ append: () => {}, log: () => {} });
 const csrf = createCsrfTokenIssuer();
 const guard = { port: 0 };
 const peerUidCheck = (client: { address: string; port: number }) => isSameUidPeer(client, { server: { address: "127.0.0.1", port: guard.port } });
@@ -62,7 +62,7 @@ const deps = {
   dashboard: async () => ({ checked: true, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
   header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "x", version: "0.0.0", versionProvenance: "tag", versionUnknownReason: null } }),
   resourceLink: unused,
-  configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
+  configInventory: async () => ({ rules: [], errors: [] }),
   dashboardAppRoot: join(import.meta.dir, "..", "dist", "web"),
   dashboardOriginGuard: guard, peerUidCheck, csrf, writeGuard: { dashboardOriginGuard: guard, peerUidCheck, csrf },
   auditWrite: (e: unknown) => { auditLines.push(e); (auditWrite as unknown as (e: unknown) => void)(e as never); },

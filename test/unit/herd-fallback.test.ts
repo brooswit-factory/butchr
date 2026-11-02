@@ -108,11 +108,12 @@ describe("HerdrHerd ordered provider fallback", () => {
     expect(result).toMatchObject({status:'applied',current:{paneId:'new-1',provider:'claude'}});
     expect(f.closed).toEqual(['old']);expect(f.starts.length).toBe(1);expect(f.starts[0].args.join(' ')).toContain('DROVR_HANDOFF_READY_');
   });
-  for(const explicit of [undefined,'existing-explicit-account'])test(`desired handoff preserves channel account ${explicit??'fallback'}`,async()=>{
-    const f=fixture({existing:[existing('codex','done')]});const binding={name:'rocketr',type:'http' as const,url:'https://rocketr.example/mcp',channel:false,accountHeader:'x-rocketr-account'};
-    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,()=>[binding],()=> 'existing-computed-account');
-    const result=await herd.reconcilePreferences({...spec,mcpServers:[binding],...(explicit?{rocketchatAccount:explicit}:{}),agents:[{harness:'claude',model:'desired'}]},()=>true);
-    expect(result.status).toBe('applied');const mcp=readFileSync(join(workspaceRoot(),spec.key,'mcp.json'),'utf8');expect(mcp).toContain(explicit??'existing-computed-account');if(explicit)expect(mcp).not.toContain('existing-computed-account');
+  test('desired handoff preserves current-main MCP channel binding',async()=>{
+    const f=fixture({existing:[existing('codex','done')]});
+    const binding={name:'fixture-channel',type:'http' as const,url:'https://fixture.example/mcp',channel:false};
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,()=>[binding]);
+    const result=await herd.reconcilePreferences({...spec,mcpServers:[binding],agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('applied');const mcp=readFileSync(join(workspaceDirFor(spec.key),'mcp.json'),'utf8');expect(mcp).toContain(binding.url);
   });
   async function canaryFixture(options:{missingAck?:boolean;stale?:boolean;historyText?:string}={}){
     const row={...existing('codex','done'),interactive_ready:true};const f=fixture({existing:[row],...(options.missingAck?{missingAck:true}:{}),...(options.historyText?{historyText:options.historyText}:{})});
@@ -124,7 +125,7 @@ describe("HerdrHerd ordered provider fallback", () => {
     row.cwd=workspaceDirFor(key);mkdirSync(row.cwd,{recursive:true});
     const permit:CanaryPermit={version:1,permitId:'00000000-0000-4000-8000-000000000005',workerKey:key,authority,desiredToken:'a'.repeat(64),targetProvider:'claude',expiresAt:new Date(Date.now()+600000).toISOString(),source:{paneId:'old',cwd:row.cwd,provider:'codex',sessionHash:nativeSessionHash(agent.agent_session)!},holdClearance:{notHeld:true,paneId:'old',sessionHash:nativeSessionHash(agent.agent_session)!,expiresAt:new Date(Date.now()+600000).toISOString()}};
     const path=join(root,'canary-permit.json');writeFileSync(path,JSON.stringify(permit),{mode:0o600});const rollout=createWorkerRollout(path,root);
-    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,undefined,undefined,undefined,rollout);
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,undefined,undefined,rollout);
     if(options.stale)row.pane_id='foreign-replacement';
     return {f,herd,rollout,canarySpec,sourceHistory:readFileSync(agent.agent_session.value,'utf8'),change:{id:key,token:permit.desiredToken,authority,spec:canarySpec}};
   }

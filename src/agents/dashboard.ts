@@ -131,8 +131,8 @@ export interface AgentDashboardRow {
    * agent was spawned under (never the bare provider-native resource id
    * alone) — the SAME correlation identifier `query-agent-inventory.ts`'s
    * `liveAndWithheldRuleKeys` and `config-inventory-links.ts`'s
-   * `agentRowsForRule`/`configAnchorForResourceKey`/
-   * `agentRowsForSessionDefinition` already decode/compare it as (those
+   * `agentRowsForRule`/`configAnchorForResourceKey` already decode/compare
+   * it as (those
    * modules' own doc comments describe exactly this contract — this field
    * now actually satisfies it). Carries its own `ruleId` for a `swarm`
    * agent, so which rule owns which per-resource row is never ambiguous

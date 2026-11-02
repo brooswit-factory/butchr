@@ -54,23 +54,10 @@ export interface FilesystemResourceDeps {
   runningIds?: () => Promise<readonly string[]>;
 }
 
-/**
- * The built-in managed-sessions rule's id. Mirrors `MANAGED_SESSIONS_RULE_ID`
- * (src/rules/session-definition-type.ts), declared here too because that
- * module imports this one, so importing it back would create a cycle.
- */
-const MANAGED_SESSIONS_RULE_ID = "managed-sessions";
-
-/**
- * True for exactly the herd ids this type owns. Managed-session agents are
- * `filesystem`-provider ids too, but they belong to the managed-sessions loop
- * (`ownsManagedSessionAgent`), not this one. Claiming them made this loop stop
- * each one as an unwanted leftover on its next poll while the managed-sessions
- * loop respawned it, so every managed session died about every 12s (FACTORY-47).
- */
+/** True for exactly the herd ids this type owns: every `filesystem`-provider id. */
 export const ownsFilesystemAgent = (id: string): boolean => {
   const decoded = decodeAnyAgentKey(id);
-  return decoded?.resourceProvider === "filesystem" && decoded.ruleId !== MANAGED_SESSIONS_RULE_ID;
+  return decoded?.resourceProvider === "filesystem";
 };
 
 /**
@@ -85,14 +72,6 @@ export const ownsFilesystemAgent = (id: string): boolean => {
  * further normalization. A path with only one segment below root (e.g.
  * `/rinth`) has no parent to name; its bare basename is used alone rather
  * than inventing a placeholder parent.
- *
- * NOT used for a managed-session definition file, despite that resource
- * ALSO being a `filesystem`-provider match: `MANAGED_SESSIONS_RULE_ID`'s own
- * short id (`managedSessionShortDisplayId`, session-definition-type.ts) is
- * a deliberately different method, per FACTORY-83's own recorded decision —
- * see that function's own doc comment, and `src/rules/display-label.ts`'s
- * dispatch, for how the two are told apart (by rule id, never by provider
- * alone).
  */
 export function filesystemShortDisplayId(resourceId: string): string {
   const segments = resourceId.split("/").filter(Boolean);

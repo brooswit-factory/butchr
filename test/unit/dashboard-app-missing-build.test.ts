@@ -33,7 +33,7 @@ async function withApp(root: string, run: (base: string) => Promise<void>) {
   const deps: ViewDeps = {
     ...baseDeps,
     dashboardAppRoot: root,
-    health: () => combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardAppStatus(root)),
+    health: () => combineHealth([poll], undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, dashboardAppStatus(root)),
   };
   const { app, mcp } = buildApp(deps);
   app.listen(0);

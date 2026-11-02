@@ -287,7 +287,7 @@ describe("comment identity tagging", () => {
 
 describe("jira_create_issue: role assignment, implements/parent resolution, orphan opt-out (KAN-802)", () => {
   const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
-  const TASK_ID = "000000:00000000-0000-4000-8000-bafde89c041e";
+  const TASK_ID = "000000:11111111-1111-4111-8111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {
@@ -634,7 +634,7 @@ describe("confluence_create_page parentId", () => {
 
 describe("jira_assign (KAN-810)", () => {
   const STORY_ID = "000000:00000000-0000-0000-0000-000000000000";
-  const TASK_ID = "000000:00000000-0000-4000-8000-bafde89c041e";
+  const TASK_ID = "000000:11111111-1111-4111-8111-111111111111";
   const roles = { story: STORY_ID, task: TASK_ID };
 
   function rig(customRoles: { story?: string; task?: string } = roles, opsOverrides: Partial<AtlassianOps> = {}) {

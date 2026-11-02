@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { hostname } from "node:os";
 import type { BuildIdentity } from "../../src/agents/build-identity.js";
 import type { CurrencyVerdict } from "../../src/agents/build-currency.js";
-import { currentSystemdInfo, deriveGroundTruth, groundTruthText, parseCgroup, parseWindowsTaskEnv } from "../../src/agents/ground-truth.js";
+import { currentSystemdInfo, deriveGroundTruth, groundTruthText, parseCgroup, parseLaunchdPrint, parseWindowsTaskEnv } from "../../src/agents/ground-truth.js";
 
 // groundTruthText's build/currency params are exercised in depth by
 // test/unit/build-currency.test.ts (both the pure resolver and the
@@ -64,6 +64,28 @@ describe("parseWindowsTaskEnv (FACTORY-560)", () => {
 
   test("neither var set (an ordinary hand-started daemon on Windows): none", () => {
     expect(parseWindowsTaskEnv({})).toEqual({ kind: "none" });
+  });
+});
+
+describe("parseLaunchdPrint (macOS)", () => {
+  // Trimmed from a real `launchctl print gui/501/<label>`: top-level keys are one tab in, nested sections further.
+  const printed = (pid: number, paths = "\tstdout path = /Users/me/Library/Logs/butchr.log\n\tstderr path = /Users/me/Library/Logs/butchr.err\n") =>
+    `gui/501/nexus.example.butchr = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/nexus.example.butchr.plist\n\ttype = LaunchAgent\n\tstate = running\n\n\tprogram = /bin/zsh\n${paths}\tpid = ${pid}\n\tendpoints = {\n\t\tpid = 1\n\t}\n}\n`;
+
+  test("the job running THIS pid names its label and its stderr log", () => {
+    expect(parseLaunchdPrint("nexus.example.butchr", printed(4242), 4242)).toEqual({ kind: "launchd", unit: "nexus.example.butchr", journalctl: 'tail -n 200 -f "/Users/me/Library/Logs/butchr.err"' });
+  });
+
+  test("falls back to the stdout path when the job has no stderr path", () => {
+    const info = parseLaunchdPrint("nexus.example.butchr", printed(4242, "\tstdout path = /tmp/out.log\n"), 4242);
+    expect(info).toEqual({ kind: "launchd", unit: "nexus.example.butchr", journalctl: 'tail -n 200 -f "/tmp/out.log"' });
+  });
+
+  test("none when the job's pid is another process (a child inherits XPC_SERVICE_NAME), it logs nowhere, or the label is malformed", () => {
+    expect(parseLaunchdPrint("nexus.example.butchr", printed(4243), 4242)).toEqual({ kind: "none" });
+    expect(parseLaunchdPrint("nexus.example.butchr", printed(4242, ""), 4242)).toEqual({ kind: "none" });
+    expect(parseLaunchdPrint("nexus.example.butchr", printed(4242, "\tstderr path = /dev/null\n"), 4242)).toEqual({ kind: "none" });
+    expect(parseLaunchdPrint("bad label", printed(4242), 4242)).toEqual({ kind: "none" });
   });
 });
 

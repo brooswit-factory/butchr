@@ -40,7 +40,7 @@ const noResourceLink = async (key: string) => ({ ok: true as const, url: `https:
 // below that predates /config-inventory and isn't exercising it — that
 // route's own real shape gets its dedicated fixtures in
 // query-agent-inventory.test.ts and this file's own dedicated describe block.
-const noConfigInventory = async () => ({ rules: [], sessionDefinitions: [], errors: [] });
+const noConfigInventory = async () => ({ rules: [], errors: [] });
 
 const opened: string[] = [];
 const openedPanes: string[] = [];
@@ -406,9 +406,9 @@ describe("GET /dashboard (BUTCHR-269): poll-fed snapshot, no I/O on the request 
 // FACTORY-72: read-only, same discipline as /dashboard's own describe block
 // above — the shape/reuse contract itself is exercised in
 // query-agent-inventory.test.ts; this just proves the route is wired.
-describe("GET /config-inventory (FACTORY-72): every configured rule and managed-session definition", () => {
+describe("GET /config-inventory (FACTORY-72): every configured rule", () => {
   test("smoke: the route serves deps.configInventory() verbatim", async () => {
-    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], sessionDefinitions: [], errors: [] };
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }], errors: [] };
     const { app } = buildApp({ ...view, configInventory: async () => inventory });
     app.listen(0);
     try {
@@ -422,7 +422,7 @@ describe("GET /config-inventory (FACTORY-72): every configured rule and managed-
   // FACTORY-132: `staffed: null` (the census-unavailable tri-state) must
   // round-trip through JSON as a real `null`, not dropped or coerced.
   test("staffed: null (census unavailable) round-trips through the JSON route as a real null, with a non-null reason", async () => {
-    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }], sessionDefinitions: [], errors: [] };
+    const inventory = { rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }], errors: [] };
     const { app } = buildApp({ ...view, configInventory: async () => inventory });
     app.listen(0);
     try {
@@ -448,8 +448,8 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
     });
     const dashboard: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: noAdmissionView };
     const inventory = {
-      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }],
-      sessionDefinitions: [], errors: [],
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: true, reason: null }],
+      errors: [],
     };
     const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
     app.listen(0);
@@ -500,8 +500,8 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
   test("when deps.dashboard() reports checked:false, the served page renders COULD NOT CHECK for staffing and cross-links — never UNSTAFFED or 'no running agent'", async () => {
     const dashboard: DashboardResponse = { checked: false, declinedAt: new Date(0).toISOString(), rows: [], admission: noAdmissionView };
     const inventory = {
-      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, account: "none" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }],
-      sessionDefinitions: [], errors: [],
+      rules: [{ kind: "rule" as const, id: "task", resourceProvider: "jira-work" as const, query: "q", enabled: true, execution: "swarm" as const, role: "worker" as const, agentPreferences: [], linkedEventing: false, mcpServerNames: [], staffed: null, reason: "census unavailable: the most recent agent-list poll did not succeed (or none has run yet), so this daemon cannot currently confirm whether a live agent is running" }],
+      errors: [],
     };
     const { app } = buildApp({ ...view, dashboard: async () => dashboard, configInventory: async () => inventory });
     app.listen(0);
@@ -526,7 +526,7 @@ describe("GET /configurations (FACTORY-81): the Configurations view, wired end-t
 // half of DoD requirement 6.
 describe("GET /configurations (FACTORY-136): the admission-source-unavailable tri-state, wired end-to-end through a real feed + admission controller", () => {
   function ruleFixture(over: Partial<Rule> & Pick<Rule, "id" | "resourceProvider">): Rule {
-    return { enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker", ...over };
+    return { enabled: true, query: "q", brief: "b", execution: "swarm", role: "worker", ...over };
   }
 
   test("a never-reported admission source covering a jira-work rule serves COULD NOT CHECK (naming the source) through /configurations and /config-inventory alike, never UNSTAFFED", async () => {
@@ -541,7 +541,6 @@ describe("GET /configurations (FACTORY-136): the admission-source-unavailable tr
         rulesFile: { path: "/rules.json", rules: [r], error: null },
         dashboard: feed.snapshot(),
         configReasonFor: () => null,
-        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
       });
     const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
     app.listen(0);
@@ -589,7 +588,7 @@ describe("GET /configurations (FACTORY-136): the admission-source-unavailable tr
     const feed = createDashboardFeed({ now, issueMeta: () => undefined, tracker: new StatusFloorTracker(now), withheldTracker: new StatusFloorTracker(now), admission: () => admission.census() });
     await feed.poll(async () => ({ agents: [] }));
 
-    const r: Rule = { id: "review-prs", resourceProvider: "github-pr", enabled: true, query: "q", brief: "b", execution: "swarm", account: "none", role: "worker" };
+    const r: Rule = { id: "review-prs", resourceProvider: "github-pr", enabled: true, query: "q", brief: "b", execution: "swarm", role: "worker" };
     const staffing = githubPrStaffing([r], undefined); // config.github === undefined, same as a daemon with no GITHUB_TOKEN_FILE/BUTCHR_GITHUB_ORGS
     if (staffing.run) throw new Error("expected githubPrStaffing to read run:false with no config.github"); // sanity + narrows `staffing.reason` below
     const githubPrStaffingResult = staffing;
@@ -600,7 +599,6 @@ describe("GET /configurations (FACTORY-136): the admission-source-unavailable tr
         dashboard: feed.snapshot(),
         // Mirrors src/daemon/index.ts's own `configInventory: () => ...configReasonFor` callback verbatim, github-pr branch included (this ticket's fix B).
         configReasonFor: (rule) => (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((x) => x.id === rule.id) ? githubPrStaffingResult.reason : null),
-        sessionDefinitions: { activeDir: "/defs", archiveDir: "/defs-archive", list: async () => [], read: async () => { throw new Error("ENOENT"); }, store: { read: async () => ({ frozen: false }) } },
       });
     const { app } = buildApp({ ...view, dashboard: async () => feed.snapshot(), configInventory });
     app.listen(0);

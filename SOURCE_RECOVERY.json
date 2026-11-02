@@ -5534,5 +5534,6 @@
       "sha256": "c436e2ae6a45c5831fb3886d512205522819bad0a385e2837ae41112a2349474"
     }
   ],
-  "publicBaseFiles": "Files outside this source/test/build overlay retain the existing public main revision."
+  "publicBaseFiles": "Files outside this source/test/build overlay retain the existing public main revision.",
+  "manifestScope": "Historical initial recovery payload at commit 7a1b823698484c1ab87e7a023da506bcedbd42e2; subsequent integration/fix changes are recorded by normal Git commits, not asserted to retain these historical file hashes."
 }

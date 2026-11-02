@@ -46,12 +46,11 @@
  * next to that ticket's original text.)
  *
  * Deliberately its OWN timer, wired separately from every other poll loop in
- * src/daemon/index.ts (the ~15s Jira reconcile loop, the 5s blocking-
- * escalation watcher `blockingEscalationTimer`, the 5s `watchPrompts`
+ * src/daemon/index.ts (the ~15s Jira reconcile loop, the 5s `watchPrompts`
  * startup-dialog answerer) — a reconcile failure must never stall permission-
  * answering, and a wedged permission-answer tick must never stall reconcile.
- * Same in-flight-guard shape as `blockingEscalationTimer` (never run two
- * ticks concurrently against the same pane set), factored out here as its
+ * Same in-flight-guard shape as `loginExpiredTimer` (never run two ticks
+ * concurrently against the same pane set), factored out here as its
  * own small, testable module rather than inlined, so `runPermissionAnswerTick`
  * can be unit-tested against a fake client without a real herdr socket.
  *
@@ -59,9 +58,8 @@
  * that answerer handles Claude's STARTUP dialogs (trust, bypass-permissions
  * first-run, fullscreen-renderer, settings recommendations); it has no case
  * for the "Do you want to proceed?" tool-permission dialog `autoAnswerPermissions`
- * targets, so there is no double-answerer hazard here the way there was for
- * drovr's escalation watcher (see managed-session-escalation-watcher.ts's own
- * doc comment) — nothing else on this fleet presses that dialog's keys.
+ * targets, so there is no double-answerer hazard here — nothing else on this
+ * fleet presses that dialog's keys.
  */
 import { mkdir, appendFile } from "node:fs/promises";
 import { dirname, basename } from "node:path";
@@ -131,40 +129,26 @@ export type PermissionAnswerClient = { agent: Pick<DrovrClient["agent"], "list" 
 export interface RuleLizardModeDeps {
   /** Every currently-loaded rule (`src/rules/rules.ts`), read once at daemon startup — matched by `ruleId` + `resourceProvider`, the SAME "rule-level fallback" lookup `ruleRoleOfAgent` (src/daemon/index.ts) already uses for `Rule.role`. */
   rules: readonly Rule[];
-  /** Whether `id` belongs to the managed-sessions built-in rule (`ownsManagedSessionAgent`, src/rules/session-definition-type.ts) — injected rather than imported, so this module stays decoupled from that one. */
-  isManagedSessionAgent: (id: string) => boolean;
-  /** The live, rebuilt-every-poll opt-in map for managed-session agents (`managedSessionLizardModes`, src/daemon/index.ts) — consulted only when `isManagedSessionAgent(id)` is true; a managed-session definition has no static `Rule` of its own to read `lizardMode` off (see `ManagedSessionResourceDeps.lizardModes`'s own doc comment, src/rules/session-definition-type.ts). */
-  managedSessionLizardModes: ReadonlyMap<string, boolean>;
 }
 
 /**
  * True iff `id`'s agent should be scanned/answered by the permission-answer
- * timer. A managed-session id (`deps.isManagedSessionAgent`) resolves
- * straight from the live `deps.managedSessionLizardModes` map — that map's
- * own fill site (`ManagedSessionResourceDeps.lizardModes`,
- * src/rules/session-definition-type.ts) already folds in FACTORY-138's
- * default (eligible unless explicitly `false`, `vendor: "claude"` only), so
- * this function does no `?? true`/`=== true` translation of its own for that
- * branch — the map's stored value IS the resolved answer. Every OTHER
- * rule-engine agent id (`jira-work`/`jira-project`/`github-issue`/
- * `github-pr`/plain `filesystem`) resolves from that id's own `Rule.lizardMode`,
- * looked up against `deps.rules` — a rule is loaded once at daemon startup
- * (no per-rule live poll the way a managed-session definition file gets
- * one), so there is nothing to rebuild here. FACTORY-138 (operator
- * decision, FACTORY-67 director comment 2026-09-26 22:24Z): a rule that IS
- * found and never sets `lizardMode` is now eligible too — only an explicit
- * `false` opts out — the `!== false` shape below (rather than the old
- * `=== true`) is what flips that default while leaving `id` decoding to
+ * timer. A rule-engine agent id (`jira-work`/`jira-project`/`github-issue`/
+ * `github-pr`/`filesystem`/…) resolves from that id's own `Rule.lizardMode`,
+ * looked up against `deps.rules`. FACTORY-138 (operator
+ * decision, FACTORY-67 director comment 2026-09-26 22:24Z): upstream, a rule
+ * that IS found and never sets `lizardMode` is eligible too — only an
+ * explicit `false` opts out. local/ui keeps the old `=== true` shape below
+ * instead (the user asked for lizard mode to be off by default), while
+ * leaving `id` decoding to
  * nothing, or a rule not found at all (a legacy/bare-issue agent, garbage,
  * or a rule since removed), at `false`: those cases mean "butchr does not
  * own this agent" and must never become eligible no matter which way the
  * field's own default points. A `Rule` has no single fixed vendor (ranked
  * `agentPreferences`, resolved per launch — see `RULE_PERMISSION_MODES`'s
- * own doc comment, src/rules/rules.ts) so this cannot special-case Codex/agy
- * the way the managed-session map above does; unlike `SessionDefinition`'s
- * hard rejection of `lizardMode` for `vendor: "codex"`, `Rule.lizardMode`
- * already applies uniformly to whichever vendor a rule resolves to for an
- * EXPLICIT value (silently inert on a non-Claude pane, since
+ * own doc comment, src/rules/rules.ts) so this cannot special-case Codex/agy;
+ * `Rule.lizardMode` applies uniformly to whichever vendor a rule resolves to
+ * for an EXPLICIT value (silently inert on a non-Claude pane, since
  * `autoAnswerPermissions`'s dialog recognition is Claude-specific and never
  * matches one — see `docs/permission-answer-loop.md`), so the new default
  * follows that same existing precedent rather than introducing a
@@ -173,10 +157,10 @@ export interface RuleLizardModeDeps {
 export function ruleLizardModeOf(id: string, deps: RuleLizardModeDeps): boolean {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return false;
-  if (deps.isManagedSessionAgent(id)) return deps.managedSessionLizardModes.get(id) === true;
   const rule = deps.rules.find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
   if (!rule) return false;
-  return rule.lizardMode !== false;
+  // local/ui: off unless the rule turns it on (upstream: `!== false`, on unless the rule turns it off).
+  return rule.lizardMode === true;
 }
 
 /**
@@ -215,8 +199,8 @@ export interface PermissionAnswerLoopDeps {
    * ignored, never pressed) — see `ruleLizardModeOf`'s own doc comment
    * (this file) for where FACTORY-138's default deliberately does, or does
    * not, extend to a non-Claude pane's eligibility itself. Return a Map of
-   * `pane_id -> a human label` (e.g. the managed-session definition's file
-   * name) for exactly the panes eligible this tick; a pane your caller
+   * `pane_id -> a human label` (e.g. the basename of the agent's resource
+   * id) for exactly the panes eligible this tick; a pane your caller
    * leaves out of the returned map is never scanned or answered by
    * `autoAnswerPermissions` at all — that is the ENTIRE enforcement point
    * for `lizardMode`'s own eligibility contract: it happens once, here,
@@ -266,18 +250,15 @@ export interface PermissionAnswerLoopDeps {
   /**
    * FACTORY-581 SAFETY GUARD 3: called once per ANSWERED Claude result this
    * tick (never for Codex — `AutoAnswerCodexApprovalResult`'s `answered`
-   * variant carries `kind`, not `recognizedVia`; no managed session runs
-   * Codex today — `ruleLizardModeOf`'s own doc comment — so there is no
-   * attributable case to cover there yet), with the exact `paneId` and
-   * `recognizedVia` drovr returned. Lets a caller (the daemon's own
-   * `escalator.onPermissionAnswered`, src/daemon/index.ts) attribute a
-   * managed-session pane's "no longer blocked" line to THIS pass — distinct
-   * from an escalated dialog's own resolution — using drovr's own
-   * classification rather than a tag invented here. Same
-   * "never awaited, never allowed to affect this tick's own outcome"
-   * contract as `onApproved` immediately above, and called for EVERY
-   * answered pane (not only managed sessions): the callback is expected to
-   * no-op cheaply for anything it doesn't track.
+   * variant carries `kind`, not `recognizedVia`, so there is no attributable
+   * case to cover there yet), with the exact `paneId` and `recognizedVia`
+   * drovr returned. Lets a caller attribute a pane's "no longer blocked"
+   * transition to THIS pass — distinct from an escalated dialog's own
+   * resolution — using drovr's own classification rather than a tag
+   * invented here. Same "never awaited, never allowed to affect this tick's
+   * own outcome" contract as `onApproved` immediately above, and called for
+   * EVERY answered pane: the callback is expected to no-op cheaply for
+   * anything it doesn't track.
    */
   onAnswered?: (result: { paneId: string; recognizedVia: string }) => void;
   /**
@@ -365,7 +346,7 @@ export interface PermissionAnswerLoopDeps {
  * `autoAnswerPermissions` already isolates into a `failed` result per pane)
  * is caught and logged instead, so one bad tick can never take the timer
  * down — same "isolated poll" discipline every other daemon timer in this
- * file's sibling module (`blockingEscalationTimer`, src/daemon/index.ts)
+ * file's sibling module (`loginExpiredTimer`, src/daemon/index.ts)
  * already follows.
  */
 export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): Promise<readonly (AutoAnswerPermissionResult | AutoAnswerCodexApprovalResult)[]> {
@@ -559,7 +540,7 @@ export async function runPermissionAnswerTick(deps: PermissionAnswerLoopDeps): P
  * Wires `runPermissionAnswerTick` onto its own `setInterval`, guarded so two
  * ticks never run concurrently (a slow tick — many eligible panes, a
  * near-deadline approve attempt — simply skips the next firing rather than
- * overlapping it), same shape as `blockingEscalationTimer`
+ * overlapping it), same shape as `loginExpiredTimer`
  * (src/daemon/index.ts). `.unref()`'d before returning, same as every other
  * background timer in this codebase, so it can never keep the process alive
  * on its own.

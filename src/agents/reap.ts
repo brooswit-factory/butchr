@@ -28,10 +28,10 @@ export interface StrandedCandidate {
   workspaceId: string;
   /**
    * Herdr's own free-text `workspace.label` — display/log only (FACTORY-92).
-   * NEVER used to prove ownership or to derive the account to release: it's
-   * free text a human can type, and a project-tier label is a bare project
-   * key that collides with anything. `agentKey` below is the field every
-   * ownership/account decision actually keys off.
+   * NEVER used to prove ownership: it's free text a human can type, and a
+   * project-tier label is a bare project key that collides with anything.
+   * `agentKey` below is the field every ownership decision actually keys
+   * off.
    */
   label: string;
   /**
@@ -40,7 +40,7 @@ export interface StrandedCandidate {
    * helper residency-census.ts's `groupOwnedPanes` already uses, so there is
    * exactly ONE place that maps cwd -> agent key. This IS the ownership
    * proof (see `strandedCandidates`' own doc comment) and what
-   * `ReaperDeps.release` is called with.
+   * `ReaperDeps.onReaped` is called with.
    */
   agentKey: string;
   paneIds: readonly string[];
@@ -168,21 +168,6 @@ export interface ReaperDeps {
    * close catches its own rejection").
    */
   close: (candidate: StrandedCandidate) => Promise<boolean>;
-  /**
-   * BUTCHR-412: released after a candidate is actually closed — called with
-   * `candidate.agentKey` (FACTORY-92), the real agent key
-   * `strandedCandidates` derived from a pane's cwd via the shared
-   * `agentIdOfWorkspacePath` — NEVER `candidate.label`, which is free text a
-   * human (or a later herdr) can set to anything. This is the self-exit
-   * path's own account teardown (a crash, `/exit`, or a quota-exhaustion
-   * close that never goes through `HerdrHerd.stop()`/`reconcileNow`'s
-   * `plan.stop` at all) — see `docs/rocketchat-accounts.md`'s "Wiring"
-   * section. Optional; omitted, no account lifecycle runs for a reaped
-   * workspace (every caller before this ticket). Never awaited into a
-   * failed reap: a release failure is logged and swallowed, same fault
-   * isolation `check()` already gives every other candidate's close.
-   */
-  release?: (agentKey: string) => Promise<void>;
   /** Called only after a workspace was conclusively closed. */
   onReaped?: (agentKey: string) => Promise<void>;
   log?: (line: string) => void;
@@ -225,9 +210,6 @@ export function createReaper(deps: ReaperDeps): Reaper {
           if (didClose) {
             closed++;
             log(`[reap] reclaimed workspace ${c.workspaceId} (${c.label})`);
-            if (deps.release) {
-              await deps.release(c.agentKey).catch((e) => log(`WARNING: [reap] account release failed for ${c.agentKey}: ${(e as Error)?.message ?? e}`));
-            }
             await deps.onReaped?.(c.agentKey).catch((e) => log(`WARNING: [reap] label purge failed for ${c.agentKey}: ${(e as Error)?.message ?? e}`));
           }
         } catch (e) {

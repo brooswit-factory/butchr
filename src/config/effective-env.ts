@@ -20,6 +20,8 @@ import { statSync } from "node:fs";
 import type { ConfigEnv } from "./config.js";
 import { readJiraIdentity, jiraIdentityFilePath, type JiraIdentityFileIo } from "../setup/jira-identity-file.js";
 import { jiraTokenFilePath } from "../setup/jira-token-write.js";
+import { githubTokenFilePath } from "../setup/github-token-write.js";
+import { managedSecretPath, TRELLO_KEY_FILE_NAME, TRELLO_TOKEN_FILE_NAME, ZENDESK_TOKEN_FILE_NAME } from "../setup/provider-secrets.js";
 
 export interface ResolveEffectiveJiraEnvDeps {
   identityIo?: JiraIdentityFileIo;
@@ -62,4 +64,41 @@ export function resolveEffectiveJiraEnv(env: ConfigEnv & Record<string, string |
     if (managedTokenFileExists(managedPath)) result.ATLASSIAN_TOKEN_FILE = managedPath;
   }
   return result;
+}
+
+/**
+ * local/ui — the GitHub twin of `resolveEffectiveJiraEnv`: when
+ * `GITHUB_TOKEN_FILE` is unset and the Settings page has written the managed
+ * `secrets/github-token`, point `GITHUB_TOKEN_FILE` at it. An env-set
+ * `GITHUB_TOKEN_FILE` always wins. `BUTCHR_GITHUB_ORGS` needs nothing here:
+ * it comes through `settings.json` (`effectiveSettingsEnv`). Returns a new
+ * object; never mutates `env`.
+ */
+export function resolveEffectiveGithubEnv<T extends Record<string, string | undefined>>(env: T, deps: Pick<ResolveEffectiveJiraEnvDeps, "managedTokenFileExists"> = {}): T {
+  const managedTokenFileExists = deps.managedTokenFileExists ?? defaultManagedTokenFileExists;
+  if (env.GITHUB_TOKEN_FILE?.trim()) return { ...env };
+  const managedPath = githubTokenFilePath(env);
+  return managedTokenFileExists(managedPath) ? { ...env, GITHUB_TOKEN_FILE: managedPath } : { ...env };
+}
+
+/**
+ * local/ui — the same fill-in for the Zendesk OAuth token and the Trello
+ * key/token files (`../setup/provider-secrets.ts`): each env var that's
+ * unset is pointed at its managed `secrets/` file when that file exists. An
+ * env-set path always wins. `ZENDESK_SUBDOMAIN`/`TRELLO_BOARD_ID` come
+ * through `settings.json` (`effectiveSettingsEnv`). Returns a new object.
+ */
+export function resolveEffectiveProviderSecretsEnv<T extends Record<string, string | undefined>>(env: T, deps: Pick<ResolveEffectiveJiraEnvDeps, "managedTokenFileExists"> = {}): T {
+  const managedTokenFileExists = deps.managedTokenFileExists ?? defaultManagedTokenFileExists;
+  const result: Record<string, string | undefined> = { ...env };
+  for (const [key, fileName] of [
+    ["ZENDESK_OAUTH_TOKEN_FILE", ZENDESK_TOKEN_FILE_NAME],
+    ["TRELLO_API_KEY_FILE", TRELLO_KEY_FILE_NAME],
+    ["TRELLO_TOKEN_FILE", TRELLO_TOKEN_FILE_NAME],
+  ] as const) {
+    if (result[key]?.trim()) continue;
+    const managedPath = managedSecretPath(fileName, env);
+    if (managedTokenFileExists(managedPath)) result[key] = managedPath;
+  }
+  return result as T;
 }

@@ -36,6 +36,8 @@ export interface ReloadResult {
   changed: string[];
   /** `loadRules`' own error message, one entry per line — empty on success. */
   problems: string[];
+  /** `loadRules`' own `warnings` (ignored legacy keys), present only on a successful reload that has some. */
+  warnings?: string[];
   /**
    * FACTORY-657, agentsafety review R2: the holder's NEW `getSourceEtag()`
    * value after this reload — unset (the OLD etag, unchanged) on failure,
@@ -57,7 +59,7 @@ const byId = (rules: readonly Rule[]) => new Map(rules.filter((r) => r.enabled).
  * overridden by a test.
  */
 export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRulesFile): ReloadResult {
-  let loaded: { path: string; origin: "file" | "missing"; rules: Rule[]; text: string | undefined };
+  let loaded: ReturnType<typeof loadRules>;
   try {
     loaded = loadRules(env, read);
   } catch (e) {
@@ -88,5 +90,5 @@ export function reloadRules(holder: RulesHolder, env?: RulesEnv, read?: ReadRule
   // comment for why the two must never be set independently.
   holder.setRules(loaded.rules);
   holder.setSourceEtag(sourceEtag);
-  return { ok: true, path: loaded.path, added, removed, changed, problems: [], sourceEtag };
+  return { ok: true, path: loaded.path, added, removed, changed, problems: [], sourceEtag, ...(loaded.warnings ? { warnings: loaded.warnings } : {}) };
 }

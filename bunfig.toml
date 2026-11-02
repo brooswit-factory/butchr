@@ -4,4 +4,6 @@ coverage = true
 coverageSkipTestFiles = true
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"
-coveragePathIgnorePatterns = ["test/**"]
+# Sibling file dependencies are SDK code, equivalent to the registry dependency previously excluded under node_modules.
+# The application source/operator coverage gate and its 90% threshold are unchanged.
+coveragePathIgnorePatterns = ["test/**", "../drovr/**"]

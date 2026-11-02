@@ -11,7 +11,6 @@ function rule(overrides: Partial<Rule> = {}): Rule {
     query: "project = FACTORY",
     brief: "a".repeat(300),
     execution: "swarm",
-    account: "none",
     role: "worker",
     ...overrides,
   } as Rule;
@@ -25,7 +24,6 @@ function entry(overrides: Partial<RuleInventoryEntry> = {}): RuleInventoryEntry 
     query: "project = FACTORY",
     enabled: true,
     execution: "swarm",
-    account: "none",
     role: "worker",
     agentPreferences: [],
     linkedEventing: false,
@@ -78,7 +76,7 @@ describe("buildRulesApiResponse", () => {
     expect(out.id).toBe("triage");
     expect(out.resourceProvider).toBe("jira-work");
     expect(out.execution).toBe("swarm");
-    expect(out.account).toBe("none");
+    expect(out).not.toHaveProperty("account");
     expect(out.role).toBe("worker");
     expect(out.staffed).toBe(true);
     expect(out.whyUnstaffed).toBeNull();
@@ -121,18 +119,17 @@ describe("buildRulesApiResponse", () => {
     expect(r.rules[0]!.permissionMode).toBeNull();
     expect(r.rules[0]!.lizardMode).toBeNull();
   });
-  test("FACTORY-851: resumeOnRespawn/resumeContextCutoff are read off the raw Rule, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
+  test("FACTORY-851: resumeOnRespawn is read off the raw Rule, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({
-      rulesFile: { path: "/rules.json", rules: [rule({ resumeOnRespawn: false, resumeContextCutoff: 50_000 })], error: null },
+      rulesFile: { path: "/rules.json", rules: [rule({ resumeOnRespawn: false })], error: null },
       mtime: null,
       sourceEtag: "deadbeef",
       fileEtag: "deadbeef",
       ruleInventory: [entry()],
     });
     expect(r.rules[0]!.resumeOnRespawn).toBe(false);
-    expect(r.rules[0]!.resumeContextCutoff).toBe(50_000);
   });
-  test("FACTORY-851: absent resumeOnRespawn/resumeContextCutoff on the raw Rule read as null, never undefined or a resolved default", () => {
+  test("FACTORY-851: absent resumeOnRespawn on the raw Rule reads as null, never undefined or a resolved default", () => {
     const r = buildRulesApiResponse({
       rulesFile: { path: "/rules.json", rules: [rule()], error: null },
       mtime: null,
@@ -141,7 +138,20 @@ describe("buildRulesApiResponse", () => {
       ruleInventory: [entry()],
     });
     expect(r.rules[0]!.resumeOnRespawn).toBeNull();
-    expect(r.rules[0]!.resumeContextCutoff).toBeNull();
+  });
+  // FACTORY-1018: resumeContextCutoff is removed entirely — no field of
+  // that shape is surfaced on this API response any more, even when an
+  // already-deployed rule still carries the legacy value on disk.
+  test("FACTORY-1018: a legacy resumeContextCutoff on the raw Rule is never surfaced on this API response", () => {
+    const legacyRule = { ...rule(), resumeContextCutoff: 50_000 } as unknown as Rule;
+    const r = buildRulesApiResponse({
+      rulesFile: { path: "/rules.json", rules: [legacyRule], error: null },
+      mtime: null,
+      sourceEtag: "deadbeef",
+      fileEtag: "deadbeef",
+      ruleInventory: [entry()],
+    });
+    expect(r.rules[0]).not.toHaveProperty("resumeContextCutoff");
   });
   test("FACTORY-846 (review round 1): idlePokeMinutes/idlePokeMessage are read off the raw Rule when set, matched by (resourceProvider, id) same as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({
@@ -165,8 +175,8 @@ describe("buildRulesApiResponse", () => {
     });
     expect(r.rules[0]!.idlePokeMinutes).toBeNull();
     expect(r.rules[0]!.idlePokeMessage).toBeNull();
-    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null.
-    expect(r.rules[0]!.idlePokeEnabled).toBe(true);
+    // idlePokeEnabled has no inherit-ambiguity (parseRules always resolves it) — always a real boolean, never null (local/ui: false when absent).
+    expect(r.rules[0]!.idlePokeEnabled).toBe(false);
   });
   test("FACTORY-907: maxNewPerTick/minSecondsBetweenAdmissions are read off the raw Rule, same shape as permissionMode/lizardMode", () => {
     const r = buildRulesApiResponse({

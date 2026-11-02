@@ -156,7 +156,7 @@ export function FirstRuleSetup({ api, rule, sourceEtag, stale, canWrite, onChang
   // `idlePokeEnabled` is NEVER null on `RuleDto` (`parseRules` always
   // resolves it) — no inherit-ambiguity to protect here, so it is always
   // sent on save, same as `lizardMode` above.
-  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule?.idlePokeEnabled ?? true);
+  const [draftIdlePokeEnabled, setDraftIdlePokeEnabled] = useState(rule?.idlePokeEnabled ?? false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastWrite, setLastWrite] = useState<RuleWriteResult | null>(null);

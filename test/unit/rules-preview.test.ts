@@ -15,7 +15,6 @@ function rule(overrides: Partial<Rule> = {}): Rule {
     query: "project = FACTORY",
     brief: "brief",
     execution: "swarm",
-    account: "none",
     role: "worker",
     ...overrides,
   } as Rule;

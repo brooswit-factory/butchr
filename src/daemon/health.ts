@@ -3,7 +3,6 @@ import type { DetectorCoverage } from "./coverage.js";
 import type { AdmissionSnapshot } from "../agents/admission.js";
 import type { CurrencyReport } from "./currency.js";
 import type { UnresolvedRelationship } from "../rules/rules.js";
-import type { ManagedSessionEscalation } from "../agents/escalation-loop.js";
 import type { CredentialDeathAlert } from "../agents/login-expired-alert.js";
 import type { CodexDialogSighting } from "../agents/codex-dialog-sightings.js";
 
@@ -147,26 +146,10 @@ export interface HealthStatus {
    */
   unresolvedRelationships?: UnresolvedRelationship[];
   /**
-   * FACTORY-45: every KEYLESS managed-session pane currently marked
-   * "stalled" — an escalated (logged), not-yet-resolved unanswerable dialog
-   * on a filesystem-provider `managed-sessions` agent (see
-   * docs/managed-sessions.md). A SIBLING field, same "additive, never flips
-   * `ok`" pattern `admission`/`coverage`/`unresolvedRelationships` above
-   * already use: a stalled managed session is a real problem for an
-   * OPERATOR to act on, but it is not a liveness failure of THIS daemon's
-   * own poll loops, so it must never trip the 503 contract `ok` drives.
-   * This is the status SURFACE an operator finds a blocked managed session
-   * on (alongside the `[managed-escalation]` journal line every entry here
-   * is paired with) — see `Escalator.managedSessionEscalations`'s own doc
-   * comment for the in-memory tracking this reads. ABSENT (no key, never an
-   * empty array) when nothing is stalled — same "absent means nothing to
-   * report" convention `unresolvedRelationships` above already uses.
-   */
-  managedSessionEscalations?: ManagedSessionEscalation[];
-  /**
    * FACTORY-363/FACTORY-397: the current host-wide "Claude Code credential
-   * appears dead" alert, if one is open — a FIFTH sibling, alongside
-   * `managedSessionEscalations` above, for the same reason: `ok` is the AND
+   * appears dead" alert, if one is open — a sibling field, same "additive,
+   * never flips `ok`" pattern `admission`/`coverage`/`unresolvedRelationships`
+   * above already use, for the same reason: `ok` is the AND
    * over liveness `components[]` on purpose, and a dead CREDENTIAL is not a
    * liveness failure of THIS daemon's own poll loops (the loops themselves
    * keep polling fine) — conflating the two would make `/health`'s 503
@@ -177,7 +160,7 @@ export interface HealthStatus {
    * this condition kills the very credential every other recovery lever in
    * this daemon depends on. ABSENT (no key at all), never null, when no
    * episode is open — the same "absent means nothing to report" convention
-   * `managedSessionEscalations` above already uses.
+   * `unresolvedRelationships` above already uses.
    */
   credentialDeathAlert?: CredentialDeathAlert;
   /**
@@ -186,20 +169,19 @@ export interface HealthStatus {
    * aggregate sighting (episode) count and a representative excerpt — see
    * `src/agents/codex-dialog-sightings.ts`'s own header for what counts as a
    * sighting and why these counts are a LOWER BOUND, never an authoritative
-   * total. A SIXTH sibling, same "additive, never flips `ok`" reasoning
-   * `managedSessionEscalations`/`credentialDeathAlert` above already use:
+   * total. A sibling, same "additive, never flips `ok`" reasoning
+   * `credentialDeathAlert` above already uses:
    * these are purely observational counts, not a liveness signal for this
    * daemon's own poll loops. ABSENT (no key at all), never an empty array,
    * when nothing has been sighted yet — the same "absent means nothing to
-   * report" convention `managedSessionEscalations` above already uses.
+   * report" convention `unresolvedRelationships` above already uses.
    */
   codexUnrecognisedDialogSightings?: CodexDialogSighting[];
   /**
    * FACTORY-647: whether the dashboard-app's Vite build is actually present
-   * on disk (see `dashboardAppStatus`, src/web/static-assets.ts) — a SEVENTH
+   * on disk (see `dashboardAppStatus`, src/web/static-assets.ts) — a
    * sibling, same "additive, never flips `ok`" reasoning as `build`/
-   * `coverage`/`admission`/`currency`/`managedSessionEscalations`/
-   * `credentialDeathAlert` above: `ok` is the AND over liveness
+   * `coverage`/`admission`/`currency`/`credentialDeathAlert` above: `ok` is the AND over liveness
    * `components[]` on purpose, and a missing web build is a DEPLOY gap, not
    * a liveness failure of this daemon's own poll loops — this daemon serves
    * the old server-rendered pages (`/`, `/configurations`) just fine without
@@ -213,7 +195,7 @@ export interface HealthStatus {
   dashboardApp?: { built: boolean; path: string };
   /**
    * FACTORY-772: per-loop restart history recorded by the issue-loop
-   * watchdog (src/daemon/loop-watchdog.ts) — an EIGHTH sibling, same
+   * watchdog (src/daemon/loop-watchdog.ts) — a sibling, same
    * "additive, never flips `ok`" reasoning as every sibling above: a
    * restart already having happened is reported here for an operator to
    * SEE, but `ok` must keep meaning only "is a loop currently fresh" —
@@ -235,7 +217,7 @@ export interface HealthStatus {
    * confirm whether a pure `updated` bump was a real change — its comment
    * fetch was skipped under load or failed outright — and chose not to
    * notify rather than guess (see that module's own §3D fallback comment).
-   * A NINTH sibling, same "additive, never flips `ok`" reasoning as every
+   * A sibling, same "additive, never flips `ok`" reasoning as every
    * sibling above: a skipped comment check is an EXTERNAL Atlassian
    * degradation (or load-shedding), already logged
    * (`skippedCommentCheckLine`, src/jira-watch/skipped-comment-check-log.ts)
@@ -253,7 +235,7 @@ export interface HealthStatus {
   /**
    * FACTORY-972 (story FACTORY-971, item 5): lifetime count of DELIVERED
    * `agent:stalled` boss wakes (`createIssueEventRules`'s `decide()`,
-   * src/resources/issue.ts) — a TENTH sibling, same "additive, never flips
+   * src/resources/issue.ts) — a sibling, same "additive, never flips
    * `ok`" shape `commentChecksSkipped` above already is. Monotonically
    * increasing for the daemon's lifetime, same convention as every other
    * lifetime count here — watch its RATE, not its absolute value. Absent
@@ -345,7 +327,6 @@ export const combineHealth = (
   currency?: CurrencyReport,
   resourceLoops?: readonly ResourceLoopHealth[],
   unresolvedRelationships?: readonly UnresolvedRelationship[],
-  managedSessionEscalations?: readonly ManagedSessionEscalation[],
   credentialDeathAlert?: CredentialDeathAlert,
   codexUnrecognisedDialogSightings?: readonly CodexDialogSighting[],
   dashboardApp?: { built: boolean; path: string },
@@ -364,7 +345,6 @@ export const combineHealth = (
     ...(currency ? { currency } : {}),
     ...(resourceLoops ? { resourceLoops: resourceLoops.map((l) => l.report()) } : {}),
     ...(unresolvedRelationships && unresolvedRelationships.length ? { unresolvedRelationships: [...unresolvedRelationships] } : {}),
-    ...(managedSessionEscalations && managedSessionEscalations.length ? { managedSessionEscalations: [...managedSessionEscalations] } : {}),
     ...(credentialDeathAlert ? { credentialDeathAlert } : {}),
     ...(codexUnrecognisedDialogSightings && codexUnrecognisedDialogSightings.length
       ? { codexUnrecognisedDialogSightings: [...codexUnrecognisedDialogSightings] }

@@ -29,42 +29,26 @@
  *     unavailable — `RenderConfigInventoryOpts.agentCensusChecked === false`,
  *     the SAME `DashboardResponse.checked` flag `dashboard-page.ts`'s own
  *     page banner keys on): a rule's own staffing cell (`renderRuleRow`) and
- *     the cross-link area of EITHER row kind (`renderAgentLinks`, shared by
- *     `renderRuleRow` and `renderSessionRow` alike). Never rendered as
+ *     its cross-link area (`renderAgentLinks`). Never rendered as
  *     `UNSTAFFED` or "no running agent" — both of those are claims this
  *     daemon cannot back up while the census is unavailable.
- *   - NOT APPLICABLE (`na` class, an em-dash): an INVALID session
- *     definition's content fields (`vendor`, `tier`, `permissionMode`, …)
- *     structurally do not exist — the file's own content cannot be trusted,
- *     not that a read of it failed (see `SessionDefinitionListEntry`'s own
- *     doc comments for exactly which fields this applies to).
- *   - A rule or session definition with NO running agent (`na` class,
- *     "no running agent") — nothing failed; there is simply no row to link.
+ *   - NOT APPLICABLE (`na` class): a rule with NO running agent ("no running
+ *     agent") — nothing failed; there is simply no row to link.
  *     Only rendered when the agent census IS available; see COULD NOT CHECK
  *     above for the case where it is not.
  *
- * CROSS-LINKS (`../agents/config-inventory-links.ts`): each rule/session row
+ * CROSS-LINKS (`../agents/config-inventory-links.ts`): each rule row
  * carries an `id` a running agent row's own back-link points at, and lists
  * links to every matching agent row via `opts.dashboardLinkHref` — the exact
  * inverse of the additive back-link `dashboard-page.ts` now renders.
  */
 import { ICON_HEAD_TAGS, ICON_MARK } from "./icons.js";
-import type { FileErrorEntry, QueryAgentInventory, RuleInventoryEntry, SessionDefinitionInventoryEntry } from "../agents/query-agent-inventory.js";
+import type { FileErrorEntry, QueryAgentInventory, RuleInventoryEntry } from "../agents/query-agent-inventory.js";
 import type { AgentDashboardRow, DashboardRow } from "../agents/dashboard.js";
-import { agentRowsForRule, agentRowsForSessionDefinition, ruleAnchorId, sessionAnchorId } from "../agents/config-inventory-links.js";
+import { agentRowsForRule, ruleAnchorId } from "../agents/config-inventory-links.js";
 
 function esc(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
-/** NOT-APPLICABLE rendering for a possibly-absent string field — an em-dash, never styled like a known value and never confused with a could-not-check failure (see this module's own top comment). */
-function naOr(value: string | undefined): string {
-  return value === undefined ? `<span class="na">—</span>` : esc(value);
-}
-
-/** Same NOT-APPLICABLE discipline for a possibly-absent boolean field (`manifestFrozen`/`storeFrozen`) — rendered as literal `true`/`false` text (never user data, so no `esc` needed) with a `known`/`na` class carrying the actual value's own weight (frozen is not inherently bad, so no `cnc`). */
-function boolOr(value: boolean | undefined): string {
-  return value === undefined ? `<span class="na">—</span>` : `<span class="${value ? "known" : "off"}">${value}</span>`;
 }
 
 export interface RenderConfigInventoryOpts {
@@ -102,9 +86,8 @@ export type ConfigInventoryFetchResult = { ok: true; inventory: QueryAgentInvent
  * ticket); with it unavailable, this daemon cannot say whether a running
  * agent exists at all — rendered `cnc`, and deliberately NOT containing the
  * substring "no running agent", since that specific claim is exactly what
- * is unavailable. Shared verbatim by `renderRuleRow` AND `renderSessionRow`
- * (both call this with the same `opts`), so a disabled rule or an invalid
- * session definition gets the identical could-not-check cross-link
+ * is unavailable. `renderRuleRow` calls this with the same `opts` for every
+ * rule, so a disabled rule gets the identical could-not-check cross-link
  * treatment as any other row — the flat rule the ticket asks for.
  */
 function renderAgentLinks(matches: readonly AgentDashboardRow[], opts: RenderConfigInventoryOpts): string {
@@ -176,70 +159,6 @@ function renderRuleRow(rule: RuleInventoryEntry, rows: readonly DashboardRow[], 
   );
 }
 
-/**
- * Requirement 2's exact field list, uniformly for every entry (valid or not,
- * archived or not) — an INVALID entry simply renders its content fields
- * NOT-APPLICABLE (`naOr`) rather than switching to a different layout, so a
- * reader scanning the column of (say) `workingDirectory` values sees one
- * consistent shape whether or not this particular row's file parsed.
- * `problems` renders only when non-empty (always empty for a valid entry).
- */
-function renderSessionRow(entry: SessionDefinitionInventoryEntry, rows: readonly DashboardRow[], opts: RenderConfigInventoryOpts): string {
-  const agentRows = agentRowsForSessionDefinition(entry, rows);
-  const idAttr = entry.agentKey !== undefined ? ` id="${esc(sessionAnchorId(entry.agentKey))}"` : "";
-  // FACTORY-120: a `tier`-based (deprecated) entry keeps rendering
-  // `vendor/tier` (e.g. "claude/tier1") exactly as before. A modelPower/effort
-  // (two-axis) entry has no `tier` to show here — rendering `vendor/?` was
-  // the visible defect this ticket fixes, so that case shows the vendor
-  // alone instead of inventing a "?" placeholder; the new `resolvedagent`
-  // span below is where its axis information actually lives now.
-  const vendorTier = entry.vendor === undefined ? undefined : entry.tier !== undefined ? `${entry.vendor}/${entry.tier}` : entry.vendor;
-  // Labeled as the actual resolved value — never a bare model string a
-  // reader has to guess the meaning of. `undefined` (renders NOT-APPLICABLE,
-  // `naOr`) exactly when `resolvedModel` itself is absent (an INVALID entry) —
-  // see `SessionDefinitionInventoryEntry.resolvedModel`'s own doc comment.
-  // A `tier`-based entry resolves to no effort BY DESIGN (`effectiveAgent`'s
-  // own doc comment, `../resources/session-definition.ts`) — that is a KNOWN
-  // fact (the daemon's own launch default applies), not a not-applicable
-  // em-dash, so it gets its own honest wording rather than falling through
-  // to `naOr`.
-  const resolvedAgent =
-    entry.resolvedModel !== undefined ? `Model: ${entry.resolvedModel} · Effort: ${entry.resolvedEffort ?? "no effort set — launch default applies"}` : undefined;
-  // The raw 0-100 input, shown as SECONDARY detail alongside the resolved
-  // value above, never in place of it. Absent for a `tier`-based (deprecated)
-  // definition, which has no `modelPower`/`effort` axis at all.
-  const rawPowerParts: string[] = [];
-  if (entry.modelPower !== undefined) rawPowerParts.push(`modelPower ${entry.modelPower}`);
-  if (entry.effort !== undefined) rawPowerParts.push(`effort ${entry.effort}`);
-  const rawPower = rawPowerParts.length > 0 ? rawPowerParts.join(", ") : undefined;
-  const mcp = entry.mcpServerNames === undefined ? undefined : entry.mcpServerNames.length === 0 ? "none" : entry.mcpServerNames.join(", ");
-  const freezeCtl = entry.freezeControllers === undefined ? undefined : entry.freezeControllers.length === 0 ? "none" : entry.freezeControllers.join(", ");
-  const unfreezeCtl = entry.unfreezeControllers === undefined ? undefined : entry.unfreezeControllers.length === 0 ? "none" : entry.unfreezeControllers.join(", ");
-  const problemsHtml = entry.problems.length > 0 ? `<div class="problems">${entry.problems.map((p) => `<div class="problem">${esc(p)}</div>`).join("")}</div>` : "";
-  return (
-    `<div class="row session${entry.archived ? " archived" : ""}${entry.valid ? "" : " invalid"}"${idAttr}>` +
-    `<span class="key">${esc(entry.name)}</span>` +
-    `<span class="archived ${entry.archived ? "known" : "na"}">${entry.archived ? "ARCHIVED" : "active"}</span>` +
-    `<span class="validity ${entry.valid ? "known" : "cnc"}">${entry.valid ? "valid" : "INVALID"}</span>` +
-    `<span class="vendortier">${naOr(vendorTier)}</span>` +
-    `<span class="resolvedagent">${naOr(resolvedAgent)}</span>` +
-    `<span class="rawpower">raw: ${naOr(rawPower)}</span>` +
-    `<span class="permmode">${naOr(entry.permissionMode)}</span>` +
-    `<span class="exec">${naOr(entry.execution)}</span>` +
-    `<span class="account">${naOr(entry.account)}</span>` +
-    `<span class="role">${naOr(entry.role)}</span>` +
-    `<span class="workdir">${naOr(entry.workingDirectory)}</span>` +
-    `<span class="mcp">mcp: ${naOr(mcp)}</span>` +
-    `<span class="manifestfrozen">manifestFrozen: ${boolOr(entry.manifestFrozen)}</span>` +
-    `<span class="storefrozen">storeFrozen: ${boolOr(entry.storeFrozen)}</span>` +
-    `<span class="freezectl">freeze: ${naOr(freezeCtl)}</span>` +
-    `<span class="unfreezectl">unfreeze: ${naOr(unfreezeCtl)}</span>` +
-    problemsHtml +
-    `<div class="agentlinks">${renderAgentLinks(agentRows, opts)}</div>` +
-    `</div>`
-  );
-}
-
 /** Requirement 4's "everything in `errors[]` is displayed prominently" — `""` (nothing rendered, not even an empty container) when there are none, so an empty `errors[]` never shows a hollow "0 errors" banner. */
 function renderErrors(errors: readonly FileErrorEntry[]): string {
   if (errors.length === 0) return "";
@@ -261,16 +180,11 @@ const STYLE = `
  .err{margin:2px 0}
  .row{display:flex;gap:12px;align-items:center;padding:10px 12px;border:1px solid #21262d;border-radius:8px;margin:6px 0;flex-wrap:wrap}
  .row.disabled{border-style:dashed;opacity:0.75}
- .row.archived{border-color:#a371f7}
- .row.invalid{border-color:#f0b429}
  .key{font-weight:600;color:#58a6ff;min-width:90px}
- .provider,.exec,.account,.role,.permmode,.workdir,.query{font-size:12px;color:#8b949e}
+ .provider,.exec,.query{font-size:12px;color:#8b949e}
  .known{color:#3fb950}
  .cnc{color:#f0b429;font-weight:600}
- .off{color:#6e7681}
  .na{font-size:12px;color:#6e7681;font-style:italic}
- .problems{width:100%;font-size:12px;color:#f0b429}
- .problem{margin:2px 0}
  .agentlinks{width:100%;font-size:12px}
  .link{font-size:12px;color:#58a6ff;text-decoration:none;border:1px solid #30363d;padding:2px 8px;border-radius:6px}
  .link:hover{background:#161b22}
@@ -282,7 +196,7 @@ const STYLE = `
  * `QueryAgentInventory` fetch attempt into a finished HTML page. `rows` is
  * the SAME poll-fed `DashboardResponse.rows` `/dashboard`/`/` already serve
  * — passed in, never fetched by this module — used only for the cross-link
- * matching (`agentRowsForRule`/`agentRowsForSessionDefinition`).
+ * matching (`agentRowsForRule`).
  */
 export function renderConfigInventory(result: ConfigInventoryFetchResult, rows: readonly DashboardRow[], opts: RenderConfigInventoryOpts): string {
   const refresh = opts.refreshSeconds ?? 5;
@@ -290,21 +204,13 @@ export function renderConfigInventory(result: ConfigInventoryFetchResult, rows: 
     ? (() => {
         const inv = result.inventory;
         const rulesHtml = inv.rules.length === 0 ? `<div class="empty">no rules configured</div>` : inv.rules.map((r) => renderRuleRow(r, rows, opts)).join("");
-        const sessionsHtml =
-          inv.sessionDefinitions.length === 0
-            ? `<div class="empty">no managed-session definitions configured</div>`
-            : inv.sessionDefinitions.map((e) => renderSessionRow(e, rows, opts)).join("");
-        return (
-          renderErrors(inv.errors) +
-          `<h2>Rules</h2><div id="rules">${rulesHtml}</div>` +
-          `<h2>Managed-session definitions</h2><div id="sessions">${sessionsHtml}</div>`
-        );
+        return renderErrors(inv.errors) + `<h2>Rules</h2><div id="rules">${rulesHtml}</div>`;
       })()
     : `<div class="fetchfail">COULD NOT CHECK — fetching /config-inventory failed: ${esc(result.error)}. Nothing below reflects real configuration; this is NOT the same as "no configuration exists".</div>`;
   return `<!doctype html><html><head><meta charset="utf8"><meta http-equiv="refresh" content="${refresh}"><title>butchr configurations</title>${ICON_HEAD_TAGS}
 <style>${STYLE}</style></head><body>
 <h1>${ICON_MARK}butchr — configurations</h1>
 ${body}
-<div class="hint">read-only view of every configured query agent (rules + managed-session definitions), staffed or not · refreshes every ${refresh}s · <a class="link" href="/">back to agents</a></div>
+<div class="hint">read-only view of every configured rule, staffed or not · refreshes every ${refresh}s · <a class="link" href="/">back to agents</a></div>
 </body></html>`;
 }

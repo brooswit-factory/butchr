@@ -22,7 +22,7 @@ describe("combineHealth FACTORY-972: stalledWakes / stalledWakesCapped", () => {
   test("present and equal to whatever counts the caller passes, never flipping `ok`, and 0 is a real present value", () => {
     const health = combineHealth(
       [poll],
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       undefined,
       5,
       0,

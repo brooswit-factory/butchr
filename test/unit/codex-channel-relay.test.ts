@@ -7,17 +7,16 @@ import {
   type CodexChannelRelayHandle, type CodexChannelRelayPool, type RelayNudge,
 } from "../../src/notify/codex-channel-relay.js";
 import type { McpServerBinding } from "../../src/rules/rules.js";
-import { rcUsernameFor } from "../../src/accounts/identity.js";
 
 /**
- * BUTCHR-413's own "fake Rocket.Chat" harness: a real thatch MCP server (the
- * same primitive `rocketr` would be, and the same one `server:butchr` itself
- * runs on) bound to loopback only — no network, no live RC. `push` is what a
- * real rocketr would do on an inbound RC channel message or DM: `mcp.sendAll`.
+ * BUTCHR-413's own fake channel server: a real thatch MCP server (the same
+ * primitive `server:butchr` itself runs on) bound to loopback only — no
+ * network. `push` is what a real channel server does on an inbound message:
+ * `mcp.sendAll`.
  */
 function fakeChannelServer() {
   const port = 41000 + Math.floor(Math.random() * 4000);
-  const { plugin, mcp } = thatch({ serverInfo: { name: "fake-rocketr", version: "0" }, tools: {} });
+  const { plugin, mcp } = thatch({ serverInfo: { name: "fake-channel", version: "0" }, tools: {} });
   const app = new Elysia().use(plugin);
   app.listen(listenOptions(port));
   return {
@@ -50,24 +49,24 @@ async function until(predicate: () => boolean, ms = 3000) {
   }
 }
 
-const binding = (over: Partial<McpServerBinding> = {}): McpServerBinding => ({ name: "rocketr", type: "http", url: "http://unused/mcp", channel: true, ...over });
+const binding = (over: Partial<McpServerBinding> = {}): McpServerBinding => ({ name: "chat", type: "http", url: "http://unused/mcp", channel: true, ...over });
 
 describe("startCodexChannelRelay (BUTCHR-413)", () => {
   const cleanups: Array<() => Promise<void>> = [];
   afterEach(async () => { while (cleanups.length) await cleanups.pop()!(); });
 
-  test("an RC channel push reaches an idle Codex agent as a herd.nudge prompt, event-driven — no polling call ever made", async () => {
+  test("a channel push reaches an idle Codex agent as a herd.nudge prompt, event-driven — no polling call ever made", async () => {
     const server = fakeChannelServer();
     cleanups.push(server.stop);
     const calls: Array<{ issue: string; text: string }> = [];
     const nudge: RelayNudge = async (issue, text) => { calls.push({ issue, text }); return { delivered: true }; };
-    const relay = startCodexChannelRelay("jira-work:rc:BUTCHR-1", binding({ url: server.url }), { nudge });
+    const relay = startCodexChannelRelay("jira-work:chat:BUTCHR-1", binding({ url: server.url }), { nudge });
     cleanups.push(relay.stop);
 
-    await server.push("hello from rocketr");
+    await server.push("hello from the channel");
     await until(() => calls.length === 1);
-    expect(calls[0]!.issue).toBe("jira-work:rc:BUTCHR-1");
-    expect(calls[0]!.text).toContain("hello from rocketr");
+    expect(calls[0]!.issue).toBe("jira-work:chat:BUTCHR-1");
+    expect(calls[0]!.text).toContain("hello from the channel");
   });
 
   test("no duplicate delivery: the same message id pushed twice nudges once", async () => {
@@ -141,17 +140,15 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     const lines: string[] = [];
     const nudge: RelayNudge = async () => ({ delivered: true });
     const SECRET = "sekrit-bearer-token-xyz";
-    const envVar = `FAKE_ROCKETR_HEADERS_${Math.random().toString(36).slice(2)}`;
+    const envVar = `FAKE_CHANNEL_HEADERS_${Math.random().toString(36).slice(2)}`;
     const previous = process.env[envVar];
-    // A shared rule-level secret (headersEnvVar) AND a per-agent non-secret
-    // account name (accountHeader) resolve together for THIS daemon's own
-    // connection (review finding 2's fix, see startCodexChannelRelay's own
-    // comment) — proving the secret never leaks even while the non-secret
-    // name is in play is the more faithful shape post-redesign.
+    // A shared rule-level secret (headersEnvVar) resolves for THIS daemon's
+    // own connection (see startCodexChannelRelay's own comment) and must
+    // never reach a log line.
     process.env[envVar] = JSON.stringify({ Authorization: `Bearer ${SECRET}` });
     try {
-      const relay = startCodexChannelRelay("ISS-1", binding({ url: server.url, headersEnvVar: envVar, accountHeader: "x-rocketr-account" }), {
-        nudge, log: (l) => lines.push(l), accountNameOf: () => "codex-1",
+      const relay = startCodexChannelRelay("ISS-1", binding({ url: server.url, headersEnvVar: envVar }), {
+        nudge, log: (l) => lines.push(l),
       });
       cleanups.push(relay.stop);
       await server.push("hi");
@@ -160,65 +157,6 @@ describe("startCodexChannelRelay (BUTCHR-413)", () => {
     } finally {
       if (previous === undefined) delete process.env[envVar]; else process.env[envVar] = previous;
     }
-  });
-
-  test("review finding 2: per-agent identity — two Codex agents bound to the SAME binding get distinct connection identities, so a message addressed to one reaches only it", async () => {
-    const port = 41000 + Math.floor(Math.random() * 4000);
-    const { plugin, mcp } = thatch({ serverInfo: { name: "fake-rocketr", version: "0" }, tools: {} });
-    const app = new Elysia().use(plugin);
-    app.listen(listenOptions(port));
-    const url = `http://127.0.0.1:${port}/mcp`;
-    cleanups.push(async () => { await mcp.closeAll(); app.stop(); });
-
-    const callsA: string[] = [];
-    const callsB: string[] = [];
-    const nudgeA: RelayNudge = async (issue) => { callsA.push(issue); return { delivered: true }; };
-    const nudgeB: RelayNudge = async (issue) => { callsB.push(issue); return { delivered: true }; };
-    const relayA = startCodexChannelRelay("AGENT-A", binding({ url, accountHeader: "x-rocketr-account" }), { nudge: nudgeA, accountNameOf: () => "account-a" });
-    const relayB = startCodexChannelRelay("AGENT-B", binding({ url, accountHeader: "x-rocketr-account" }), { nudge: nudgeB, accountNameOf: () => "account-b" });
-    cleanups.push(relayA.stop, relayB.stop);
-
-    // Stands in for rocketr routing a DM by the connection's own identity —
-    // exactly the pattern src/daemon/app.ts's own `notifyAgent` already uses
-    // (`sendAll(..., { where: (c) => c.headers[...] === target })`) — the
-    // account name (never a userId/token, review finding 2's corrected
-    // design) is what a real rocketr would route a DM by.
-    const pushToUser = async (accountName: string, content: string, meta: Record<string, string> = {}) => {
-      const deadline = Date.now() + 3000;
-      for (;;) {
-        const result = await mcp.sendAll({ content, meta }, { where: (c: { headers: Record<string, string> }) => c.headers["x-rocketr-account"] === accountName });
-        if (result.sent.length > 0) return result;
-        if (Date.now() > deadline) throw new Error("no matching connection ever connected");
-        await Bun.sleep(20);
-      }
-    };
-
-    await pushToUser("account-a", "DM for A", { id: "dm-1" });
-    await until(() => callsA.length === 1);
-    await Bun.sleep(150);
-    expect(callsA).toEqual(["AGENT-A"]);
-    expect(callsB).toEqual([]);
-  });
-
-  // Review round 3, blocking finding 2: this relay's own connection identity
-  // must carry the SAME account name `ensureAccount` actually provisioned —
-  // under a NON-DEFAULT `managedPrefix`, that name is NOT `rcUsernameFor(issue)`
-  // (the default-prefix value); an `accountNameOf` that ignored the
-  // configured prefix would connect under a name rocketr never registered.
-  test("review round 3: with a non-default managedPrefix, the relay's connection carries the SAME prefixed account name ensureAccount would provision — never the default-prefix one", async () => {
-    const server = fakeChannelServer();
-    cleanups.push(server.stop);
-    const customPrefix = "acme_rc_";
-    const provisionedName = rcUsernameFor("ISS-PREFIX", customPrefix);
-    const nudge: RelayNudge = async () => ({ delivered: true });
-    let seenHeaders: Record<string, string> | undefined;
-    const connect = (options: { headers?: Record<string, string> }) => { seenHeaders = options.headers; return { stop: async () => {} }; };
-    const relay = startCodexChannelRelay("ISS-PREFIX", binding({ url: server.url, accountHeader: "x-rocketr-account" }), {
-      nudge, connect: connect as never, accountNameOf: (id) => rcUsernameFor(id, customPrefix),
-    });
-    cleanups.push(relay.stop);
-    expect(seenHeaders?.["x-rocketr-account"]).toBe(provisionedName);
-    expect(seenHeaders?.["x-rocketr-account"]).not.toBe(rcUsernameFor("ISS-PREFIX")); // never the default-prefix name
   });
 });
 
@@ -240,7 +178,7 @@ describe("createCodexChannelRelayPool (BUTCHR-413)", () => {
     });
     cleanups.push(pool.stopAll);
     await pool.reconcile();
-    expect(started).toEqual(["CODEX-1 rocketr"]);
+    expect(started).toEqual(["CODEX-1 chat"]);
     expect(pool.size).toBe(1);
   });
 

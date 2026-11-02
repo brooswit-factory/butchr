@@ -73,6 +73,15 @@ export interface LinkedItem {
   kind: LinkedItemKind;
   target: string;
   /**
+   * local/ui — set only on a ticket's OWN pull request, as GitHub PR
+   * discovery found it (`ticketPullRequestItems`,
+   * src/jira-watch/linked-eventing.ts). Such an item is polled for
+   * conversation activity (`pollGithubPullActivity`) rather than raw ETag
+   * churn, and never reported "no longer linked" when the PR merges or
+   * closes. Absent on every other item.
+   */
+  origin?: "ticket-pr";
+  /**
    * FACTORY-833: the provider's OWN identity for this specific link —
    * `IssueLink.id`/`JiraRemoteLink.id` (both real Jira link ids, never
    * fabricated here) for `issuelink`/`remote-link`, absent for every other

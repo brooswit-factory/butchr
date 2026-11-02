@@ -187,6 +187,141 @@ export async function pollGithubLink(item: { kind: "github-issue" | "github-pr";
 }
 
 // ---------------------------------------------------------------------------
+// local/ui — a ticket's own pull request
+// ---------------------------------------------------------------------------
+
+/** Starts every `pollGithubPullActivity` fingerprint, so a baseline some other poller left for the same target (a bare ETag) is never misread as one. */
+const PULL_ACTIVITY_PREFIX = "pr-activity/1";
+
+/** How many submitted reviews one request reads — far more than any one PR collects, so a new one always changes the count. */
+const PULL_REVIEWS_PER_PAGE = 100;
+/** The most review pages followed one `next` at a time, when GitHub sends no `rel="last"` link to jump to. */
+const PULL_REVIEW_PAGE_CAP = 50;
+
+/** A `Link` header's URLs by rel (`next`, `last`, …). */
+function parseLinkHeader(header: string | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of (header ?? "").split(",")) {
+    const m = /<([^>]+)>\s*;\s*rel="([^"]+)"/.exec(part.trim());
+    if (m) for (const rel of m[2]!.split(/\s+/)) out[rel] = m[1]!;
+  }
+  return out;
+}
+
+/** Pagination links are only followed back to the GitHub API itself. */
+function isGithubApiUrl(url: string): boolean {
+  try { return new URL(url).origin === "https://api.github.com"; } catch { return false; }
+}
+
+/** A ticket PR's comparable activity: conversation comments, inline review comments and submitted reviews, plus the ETag the next conditional GET sends. */
+export interface PullActivity {
+  comments: number;
+  reviewComments: number;
+  reviews: number;
+  etag: string;
+}
+
+export function formatPullActivityFingerprint(a: PullActivity): string {
+  return [PULL_ACTIVITY_PREFIX, a.comments, a.reviewComments, a.reviews, a.etag].join("\t");
+}
+
+/** Inverse of `formatPullActivityFingerprint`; `null` for anything else (including a bare ETag from `pollGithubLink`). */
+export function parsePullActivityFingerprint(fingerprint: string | null | undefined): PullActivity | null {
+  if (!fingerprint) return null;
+  const parts = fingerprint.split("\t");
+  if (parts.length < 5 || parts[0] !== PULL_ACTIVITY_PREFIX) return null;
+  const [comments, reviewComments, reviews] = parts.slice(1, 4).map(Number) as [number, number, number];
+  if (![comments, reviewComments, reviews].every(isCount)) return null;
+  return { comments, reviewComments, reviews, etag: parts.slice(4).join("\t") };
+}
+
+function isCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * local/ui — polls a ticket's OWN pull request (a `LinkedItem` with
+ * `origin: "ticket-pr"`) for conversation activity. `GET pulls/{n}` goes out
+ * conditionally on the prior ETag, so an unchanged PR answers 304 and costs
+ * nothing against GitHub's rate limit; a 200 also reads the PR's submitted
+ * reviews. The fingerprint carries the PR's `comments` and
+ * `review_comments` counts and its review count, plus the ETag.
+ * Linked-change eventing compares only the counts: the ETag moves without
+ * anyone saying anything when GitHub recomputes `mergeable` after a push to
+ * the base branch, when the author pushes commits, or when a label changes,
+ * and those carry the ETag forward silently instead of waking the agent.
+ * Same verdict discipline as `pollGithubLink`: 304 not-modified, 404/403
+ * unreadable, a rate-limited 403 or anything transient `"error"`.
+ */
+export async function pollGithubPullActivity(target: string, priorFingerprint: string | null, deps: GithubConditionalDeps): Promise<PollVerdict> {
+  const ref = parseGithubIssueRef(target);
+  if (!ref) return { status: "unreadable" };
+  const base = `https://api.github.com/repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`;
+  const priorEtag = parsePullActivityFingerprint(priorFingerprint)?.etag;
+  const timeoutMs = deps.timeoutMs ?? GITHUB_TIMEOUT_MS;
+  const get = (url: string, etag?: string): Promise<Response> =>
+    withTimeout(deps.fetchImpl(url, { headers: { ...ghHeaders(deps.token), ...(etag ? { "if-none-match": etag } : {}) }, signal: AbortSignal.timeout(timeoutMs) }), timeoutMs);
+  let res: Response;
+  try {
+    res = await get(base, priorEtag || undefined);
+  } catch {
+    return { status: "error" };
+  }
+  if (res.status === 304) { await drain(res); return { status: "not-modified" }; }
+  if (res.status === 403 && isGithubRateLimited(res)) { await drain(res); return { status: "error" }; }
+  if (res.status === 404 || res.status === 403) { await drain(res); return { status: "unreadable", httpStatus: res.status }; }
+  if (!res.ok) { await drain(res); return { status: "error" }; }
+  const etag = res.headers.get("etag") ?? "";
+  let pull: { comments?: unknown; review_comments?: unknown };
+  try {
+    pull = (await res.json()) as typeof pull;
+  } catch {
+    return { status: "error" };
+  }
+  if (!isCount(pull.comments) || !isCount(pull.review_comments)) return { status: "error" };
+  const readReviews = async (url: string): Promise<{ count: number; links: Record<string, string> } | null> => {
+    let r: Response;
+    try {
+      r = await get(url);
+    } catch {
+      return null;
+    }
+    if (!r.ok) { await drain(r); return null; }
+    let body: unknown;
+    try {
+      body = await r.json();
+    } catch {
+      return null;
+    }
+    return Array.isArray(body) ? { count: body.length, links: parseLinkHeader(r.headers.get("link")) } : null;
+  };
+  // GitHub lists reviews oldest first, PULL_REVIEWS_PER_PAGE to a page, so all
+  // of them are counted, or the 101st would never register. The last page is
+  // enough (the full pages before it are numbered); without a `rel="last"`
+  // link, follow `next`.
+  const first = await readReviews(`${base}/reviews?per_page=${PULL_REVIEWS_PER_PAGE}`);
+  if (!first) return { status: "error" };
+  let reviews = first.count;
+  const lastUrl = first.links.last;
+  const lastPage = lastUrl && isGithubApiUrl(lastUrl) ? Number(new URL(lastUrl).searchParams.get("page")) : Number.NaN;
+  if (Number.isInteger(lastPage) && lastPage > 1) {
+    const last = await readReviews(lastUrl!);
+    if (!last) return { status: "error" };
+    reviews = (lastPage - 1) * PULL_REVIEWS_PER_PAGE + last.count;
+  } else {
+    let next = first.links.next;
+    for (let pages = 1; next; pages++) {
+      if (pages >= PULL_REVIEW_PAGE_CAP || !isGithubApiUrl(next)) return { status: "error" };
+      const page = await readReviews(next);
+      if (!page) return { status: "error" };
+      reviews += page.count;
+      next = page.links.next;
+    }
+  }
+  return { status: "ok", fingerprint: formatPullActivityFingerprint({ comments: pull.comments, reviewComments: pull.review_comments, reviews, etag }) };
+}
+
+// ---------------------------------------------------------------------------
 // General webpage
 // ---------------------------------------------------------------------------
 

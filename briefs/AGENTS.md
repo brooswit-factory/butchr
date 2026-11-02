@@ -12,5 +12,3 @@ connection failure rather than assuming a Claude startup warning applies.
 {{GROUND_TRUTH}}
 
 The same block is also in `ENVIRONMENT.md` in this directory, unchanged.
-
-Factory documentation: https://example.atlassian.net/wiki/spaces/ASSIST

@@ -207,10 +207,9 @@ MEMORY_MD_ALLOW_RE = re.compile(r"^(?:~|\$\{?HOME\}?)/\.claude/projects/[^/]+/me
 # Appends (never an overwrite) to the managed-sessions env file: allowed.
 MANAGED_SESSIONS_ALLOW_RE = re.compile(r"^(?:~|\$\{?HOME\}?)/\.config/butchr-new/managed-sessions\.env$", re.I)
 # A script allowed to append to one specific sensitive path, by its own basename —
-# never a general allowance for that path from any other command.
-SCRIPT_REDIRECT_ALLOWLIST = {
-    "add-rocketr-account.sh": re.compile(r"^(?:~|\$\{?HOME\}?)/\.config/rocketchat/secrets\.env$", re.I),
-}
+# never a general allowance for that path from any other command. Empty: the one
+# entry it had (a Rocket.Chat account script) went with Rocket.Chat support.
+SCRIPT_REDIRECT_ALLOWLIST = {}
 
 
 def _sensitive_redirect(content, script_allow_re=None):

@@ -8,7 +8,16 @@ const NONE: SystemdInfo = { kind: "none" };
 describe("readDaemonLogs", () => {
   test("kind: none is an operator-actionable refusal, never an empty page", async () => {
     const result = await readDaemonLogs(NONE, { maxLines: 10, maxBytes: 1000 });
-    expect(result).toEqual({ ok: false, error: expect.stringContaining("no systemd unit or scheduled task detected") });
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("no systemd unit, launchd job or scheduled task detected") });
+  });
+
+  test("a launchd job (macOS): a one-shot tail of the job's own log file, bounded by -n", async () => {
+    let seenArgv: readonly string[] | undefined;
+    const io: DaemonLogsExecIo = { run: async (argv) => { seenArgv = argv; return "started\n"; } };
+    const launchd: SystemdInfo = { kind: "launchd", unit: "nexus.example.butchr", journalctl: 'tail -n 200 -f "/Users/me/Library/Logs/butchr.log"' };
+    const result = await readDaemonLogs(launchd, { maxLines: 5, maxBytes: 1000 }, io);
+    expect(seenArgv).toEqual(["tail", "-n", "5", "/Users/me/Library/Logs/butchr.log"]);
+    expect(result).toEqual({ ok: true, source: launchd.journalctl, unit: "nexus.example.butchr", lines: ["started"], truncated: false });
   });
 
   test("runs journalctl with the unit's OWN derived argv, never a guessed one, bounded by -n", async () => {

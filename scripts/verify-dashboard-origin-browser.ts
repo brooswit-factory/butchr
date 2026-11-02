@@ -79,7 +79,6 @@ async function main(): Promise<void> {
       rulesFile: loadRulesFileState(env),
       dashboard: { checked: true, confirmedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: null, sources: [] } } as any,
       configReasonFor: () => null,
-      sessionDefinitions: { activeDir: join(dir, "sessions-active"), archiveDir: join(dir, "sessions-archive"), store: { read: async () => ({}), write: async () => {} } } as any,
     }),
   };
 

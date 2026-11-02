@@ -55,20 +55,13 @@ function reasonClause(reason: NotifyReason | undefined): string {
   // names every changed link itself; it has no single "about" clause to
   // append). Handled defensively rather than asserted unreachable, for the
   // same reason `pr` already is.
-  //
-  // FACTORY-417: `definitionField` is the same shape of "unreachable here in
-  // practice" — it renders via its own `sessionDefinitionFieldNudge` below,
-  // wired directly by src/daemon/session-definitions-loop.ts, never through
-  // `changeNudge` (only Jira-issue-shaped resources call this function).
-  // Folded into the same defensive fallback rather than given its own
-  // clause here, for the same reason `pr`/`linked` are.
   // FACTORY-998: `confluencePageEdit`/`confluencePageComment` ARE reachable
   // here now — `confluencePageNudge` below (a real `confluence-page` agent's
   // own nudge, src/rules/confluence-page-type.ts) calls THIS function, unlike
   // the FACTORY-997 standalone-page event path, which never wired itself
   // into any nudge renderer at all. Given their own clauses just below,
   // mirroring `notifyReasonTag`'s own rendering of the same two members.
-  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason || "definitionField" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
+  if (!reason || "pr" in reason || "undetermined" in reason || "linked" in reason) return `was updated (${REASON_NOT_DETERMINABLE})`;
   if ("appeared" in reason) return "just appeared in the watch set";
   if ("disappeared" in reason) return "just dropped out of the watch set";
   if ("confluencePageEdit" in reason) return `was edited (version ${reason.confluencePageEdit.from} → ${reason.confluencePageEdit.to})`;
@@ -162,14 +155,6 @@ export function changeNudge(issue: string, about: string, reason: NotifyReason |
 export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if (!reason) return " (reason: not determinable)";
   if ("linked" in reason) return ` (linked:${reason.linked.events.length})`;
-  // FACTORY-417: unreachable via `notifyRuleAgent` in practice (managed
-  // sessions log their own `[notify]` line in src/daemon/session-definitions-loop.ts's
-  // `deps.deliver` caller, never through this tag) — handled defensively,
-  // same precedent as every other member above.
-  if ("definitionField" in reason) {
-    const fields = Object.keys(reason.definitionField);
-    return ` (definitionField:${fields.join(",")})`;
-  }
   if ("pr" in reason) return ` (pr:${reason.pr.from ?? "none"}→pr:${reason.pr.to})`;
   if ("appeared" in reason) return " (appeared)";
   if ("disappeared" in reason) return " (disappeared)";
@@ -193,11 +178,11 @@ export function notifyReasonTag(reason: NotifyReason | undefined): string {
   if ("comment" in reason) return ` (comment:${reason.comment === null ? "deleted" : reason.comment})`;
   if ("blocked" in reason) return ` (blocked:${reason.blocked.key})`; // FACTORY-949
   if ("stalled" in reason) return ` (stalled:${reason.stalled.key})`; // FACTORY-972
-  // FACTORY-997: same "unreachable via notifyRuleAgent in practice" shape
-  // as `definitionField` above — a standalone Confluence page's own event
-  // rules (src/resources/confluence-page.ts) are not wired into this tag's
-  // caller at all (no production `[notify]` line is ever produced for
-  // them yet; see that module's top comment on scope). Handled explicitly
+  // FACTORY-997: unreachable via notifyRuleAgent in practice — a standalone
+  // Confluence page's own event rules (src/resources/confluence-page.ts) are
+  // not wired into this tag's caller at all (no production `[notify]` line is
+  // ever produced for them yet; see that module's top comment on scope).
+  // Handled explicitly
   // rather than folded into an untyped fallback, so a future wiring-in
   // gets a tag "for free" rather than reopening this function.
   if ("confluencePageEdit" in reason) return ` (confluencePageEdit:${reason.confluencePageEdit.from}→${reason.confluencePageEdit.to})`;
@@ -242,6 +227,17 @@ export function zendeskTicketNudge(resource: string, reason: NotifyReason | unde
 }
 
 /**
+ * local/ui — the agent-facing push for a `trello-card` agent's own card.
+ * Names the tool to re-read with and carries no board-authored text: a list
+ * move arrives as a `status` change between list ids
+ * (src/rules/trello-card-type.ts) and is said here without either list's name.
+ */
+export function trelloCardNudge(resource: string, reason: NotifyReason | undefined): string {
+  const clause = reason && "status" in reason ? "moved to another list" : reason && "summary" in reason ? "had its name edited" : reasonClause(reason);
+  return `[butchr] Trello card ${resource} ${clause} — re-read it with trello_get_card.`;
+}
+
+/**
  * The agent-facing push for a `jira-idea` agent's own idea. Names the tool to
  * re-read with, since an idea agent has no Jira work tools.
  */
@@ -264,9 +260,15 @@ export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined
  * anyone else). Never empty: `events` is guaranteed non-empty by the
  * coalescer (a tick with nothing to report never calls this at all).
  */
+/** The linked-item kinds that name a Jira issue (`JIRA_DISCOVERY_KINDS`, src/jira-watch/linked-eventing.ts) — restated, not imported, to keep this module free of that one's imports. */
+const JIRA_LINKED_KINDS = new Set(["issuelink", "parent", "jira-key", "remote-link"]);
+
 export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEvent[]): string {
   const n = events.length;
-  const summary = `[butchr] ${issue}: ${n} linked Jira item${n === 1 ? "" : "s"} changed — re-read them.`;
+  // local/ui: "Jira" only when every event is a Jira issue — a pull request,
+  // Confluence page or webpage isn't one.
+  const what = events.every((e) => JIRA_LINKED_KINDS.has(e.kind)) ? "linked Jira item" : "linked item";
+  const summary = `[butchr] ${issue}: ${n} ${what}${n === 1 ? "" : "s"} changed — re-read them.`;
   // FACTORY-833: `e.linkId`, when present, is appended to the kind
   // (`issuelink 12027`, never a bare `issuelink`) so two distinct links
   // sharing the same `target`+`kind` — the ambiguity this ticket's filer
@@ -300,46 +302,6 @@ export function filesystemNudge(resource: string, reason: NotifyReason | undefin
  */
 export function confluencePageNudge(resource: string, reason: NotifyReason | undefined): string {
   return `[butchr] Confluence page ${resource} ${reasonClause(reason)} — re-read it with get_my_confluence_page.`;
-}
-
-/**
- * FACTORY-417 (story FACTORY-412, epic FACTORY-394): the content-push nudge
- * for a managed-session definition's `brief`/`workingDirectory` edit —
- * `session-definitions-loop.ts`'s `notify` callback renders THIS instead of
- * `filesystemNudge` above whenever `decide()` (src/rules/session-definition-type.ts)
- * detects one of those two fields moved, and falls back to `filesystemNudge`
- * for every other definition-field edit exactly as before (see that
- * function's own top comment).
- *
- * PUSHES THE NEW VALUE DIRECTLY, rather than telling the agent to re-read
- * `brief.md`/re-`cd`, because the survey this ticket implements
- * (`docs/session-field-reload-classification.md`, the `brief`/
- * `workingDirectory` rows) establishes that `buildWorkspace()` — the ONLY
- * code path that ever rewrites `brief.md` on disk — runs exclusively from
- * the spawn/resume path (`HerdrHerd.spawnExclusive`'s `prepare()` and
- * `resumeInPlaceExclusive`'s post-success re-persist, src/agents/herd.ts),
- * never from an ordinary poll against an already-running, non-stale agent.
- * A `brief`/`workingDirectory` edit on a live agent is, by this ticket's own
- * scope, never routed through `resumeInPlace()` or a respawn — so
- * `brief.md` on disk is NOT rewritten when this nudge fires, and "re-read
- * your brief.md" would point the agent at STALE content with no race to
- * even win: the file simply never changes underneath a live agent this
- * mechanism touches. Pushing the new text directly has no such dependency
- * on daemon-internal timing — it is exactly as reliable as `herd.nudge`
- * delivering the message at all, the same guarantee every other
- * `NotifyReason` nudge in this module already rests on.
- *
- * `changes` carries only the field(s) that actually moved this poll (see
- * `NotifyReason`'s own `definitionField` doc comment, src/resources/types.ts)
- * — both keys are rendered when both changed in the same poll, each its own
- * sentence, so a reader (agent or operator) never has to guess whether an
- * omitted field is "unchanged" or "not reported here."
- */
-export function sessionDefinitionFieldNudge(resource: string, changes: { brief?: string; workingDirectory?: string }): string {
-  const sentences: string[] = [];
-  if (changes.brief !== undefined) sentences.push(`its brief changed — act on this new brief now:\n\n${changes.brief}`);
-  if (changes.workingDirectory !== undefined) sentences.push(`its working directory changed — operate in ${changes.workingDirectory} from now on (this does not move your process's actual shell cwd; treat it as an instruction, not a signal anything already moved)`);
-  return `[butchr] Managed-session definition ${resource} was edited: ${sentences.join(" Separately, ")}.`;
 }
 
 /**

@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { renderDashboard, type RenderDashboardOpts } from "../../src/web/dashboard-page.js";
-import { agentRowAnchorId, configAnchorForResourceKey, ruleAnchorId, sessionAnchorId } from "../../src/agents/config-inventory-links.js";
+import { agentRowAnchorId, configAnchorForResourceKey, ruleAnchorId } from "../../src/agents/config-inventory-links.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
-import { sessionAgentKey } from "../../src/resources/session-freeze.js";
-import { absPath } from "../helpers/abs-path";
 import {
   buildDashboardRows,
   buildAdmissionView,
@@ -976,17 +974,6 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
     expect(html).toContain(`href="/configurations#${ruleAnchorId("filesystem", "director")}">config</a>`);
   });
 
-  test("a managed-session row's back-link points at its OWN session anchor — never the generic managed-sessions rule anchor", () => {
-    const key = sessionAgentKey(absPath("home", "butchr", "defs", "foo.json"));
-    const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
-      now: () => 0, issueMeta: () => undefined, tracker: new StatusFloorTracker(() => 0),
-    });
-    const response: DashboardResponse = { checked: true, confirmedAt: new Date(0).toISOString(), rows, admission: NO_ADMISSION };
-    const html = renderDashboard(response, opts());
-    expect(html).toContain(`href="/configurations#${sessionAnchorId(key)}">config</a>`);
-    expect(html).not.toContain(`href="/configurations#${ruleAnchorId("filesystem", "managed-sessions")}">config</a>`);
-  });
-
   test("a caller-supplied configLinkHref is used instead of the default — same pattern as terminalLinkHref/resourceLinkHref", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "task", resourceId: "BUTCHR-1" });
     const rows = buildDashboardRows([{ name: "x", agent_key: key, agent_status: "working", pane_id: "p1" }], {
@@ -1029,7 +1016,7 @@ describe("renderDashboard: the additive Configurations back-link on an agent row
 // FACTORY-81 review fix: a stable, always-rendered entry point into the
 // Configurations view — the per-row back-link only exists on a row with a
 // live agent, but the whole point of that view is to show configs with NO
-// running agent (disabled/unstaffed rules, archived/frozen sessions), so an
+// running agent (disabled/unstaffed rules), so an
 // operator looking at an empty (or all-withheld) `/` still needs a way in
 // that isn't typing the URL by hand.
 // ---------------------------------------------------------------------------

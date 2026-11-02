@@ -795,6 +795,31 @@ describe("POST /api/rules/plan — report-only", () => {
   });
 });
 
+describe("POST /api/rules/plan — assumeDisabled (local/ui)", () => {
+  test("passes assumeDisabled through to the plan, and refuses a non-boolean", async () => {
+    const csrf = createCsrfTokenIssuer();
+    const seen: unknown[] = [];
+    const planResult: RulesPlanOutcome = { ok: true, planHash: "h1", spawned: 0, stopped: 0, restarted: 0, scope: null, etag: "etag-1", requiresConfirm: true, confirmReason: "risky-permission" };
+    const { app, origin, host } = startApp({
+      csrf, writeGuard: writeGuardDeps(csrf), dashboardOriginGuard: { port: 0 }, peerUidCheck: () => true,
+      rulesWrite: {
+        enabled: (() => { throw new Error("unused"); }) as any,
+        fields: (() => { throw new Error("unused"); }) as any,
+        undo: (() => { throw new Error("unused"); }) as any,
+        plan: (async (_id: string, _patch: unknown, _confirm: boolean, opts: unknown) => { seen.push(opts); return planResult; }) as any,
+        delete: (() => { throw new Error("unused"); }) as any,
+      },
+    });
+    const post = (body: unknown) => fetch(`${origin}/api/rules/plan`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body: JSON.stringify(body) });
+    try {
+      expect((await post({ id: "managers", patch: { lizardMode: true }, assumeDisabled: true })).status).toBe(200);
+      expect((await post({ id: "managers", patch: { lizardMode: true } })).status).toBe(200);
+      expect(seen).toEqual([{ assumeDisabled: true }, undefined]);
+      expect((await post({ id: "managers", patch: { lizardMode: true }, assumeDisabled: "yes" })).status).toBe(400);
+    } finally { await app.stop(true); }
+  });
+});
+
 describe("POST /api/rules — create a rule", () => {
   const ACCEPTED_PLAN: RulesPlanOutcome = { ok: true, planHash: "create-hash-1", spawned: 0, stopped: 0, restarted: 0, scope: 5, etag: "etag-1", requiresConfirm: false };
   const CREATED: RulesWriteOutcome = { ok: true, backupId: "20261009T000000Z", etag: "etag-next", changedIds: ["new-rule"], reload: { applied: true, problems: [] } };
@@ -1296,20 +1321,11 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
     } finally { await app.stop(true); }
   });
 
-  test("ALERT COUNT STAYS BOUNDED across a rejected-write burst (B4's existing aggregation covers N2's new 429s too)", async () => {
-    let posted = 0;
-    // A generous window (not the module's own 10s default, but not so
-    // short a slow CI host's own scheduling jitter could make the burst
-    // below spill past it before the aggregation timer fires) — the test
-    // polls for the eventual count rather than sleeping a fixed amount,
-    // so it is not itself a source of flakiness either way.
-    const AGGREGATE_WINDOW_MS = 500;
+  test("every attempt in a rejected-write burst gets its own audit line (N2's 429s included)", async () => {
+    const lines: string[] = [];
     const auditWrite = createAuditLogger({
-      append: () => {}, // skip the real file for this test
-      postAlert: async () => { posted++; },
-      host: "test-host",
+      append: (line) => { lines.push(line); }, // skip the real file for this test
       log: () => {},
-      rejectAggregateWindowMs: AGGREGATE_WINDOW_MS,
     });
     const csrf = createCsrfTokenIssuer();
     const writeRateLimit = createWriteRateLimiter({ windowMs: 10_000, max: 1 });
@@ -1325,17 +1341,13 @@ describe("N2 (FACTORY-678): server-side per-client write flood limit, 429 + Retr
     });
     try {
       const body = JSON.stringify({ enabled: true, ifMatch: "x", planHash: "h" });
-      // One accepted (alerts immediately) + a burst of 10 rejected (429'd by the limiter) within the aggregation window.
+      // One accepted + a burst of 10 rejected (429'd by the limiter).
       for (let i = 0; i < 11; i++) {
         await fetch(`${origin}/api/rules/ui-first-rule/enabled`, { method: "POST", headers: { origin, host, "content-type": "application/json", [CSRF_HEADER]: csrf.token }, body });
       }
-      expect(posted).toBe(1); // the single accepted write's own immediate alert; the 10 rejections haven't posted yet (still aggregating)
-      // Poll for the aggregation timer to fire, rather than a fixed sleep —
-      // bounded well under AGGREGATE_WINDOW_MS's own margin, so this is a
-      // deadline, not a race.
-      const deadline = Date.now() + AGGREGATE_WINDOW_MS * 4;
-      while (posted < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
-      expect(posted).toBe(2); // exactly one more: the aggregated rejection alert, not 10
+      const outcomes = lines.map((l) => (JSON.parse(l) as { outcome: string }).outcome);
+      expect(outcomes.filter((o) => o === "accepted")).toHaveLength(1);
+      expect(outcomes.filter((o) => o === "rejected")).toHaveLength(10);
     } finally { await app.stop(true); }
   });
 

@@ -1,11 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
-import { MANAGED_SESSIONS_RULE_ID } from "../../src/rules/session-definition-type.js";
 import { jiraWorkShortDisplayId } from "../../src/rules/resource-type.js";
 import { jiraIdeaShortDisplayId } from "../../src/rules/jira-idea-type.js";
 import { jiraProjectShortDisplayId } from "../../src/rules/jira-project-type.js";
 import { filesystemShortDisplayId } from "../../src/rules/filesystem-type.js";
-import { managedSessionShortDisplayId } from "../../src/rules/session-definition-type.js";
 import { githubIssueShortDisplayId } from "../../src/rules/github-issue-type.js";
 import { githubPrShortDisplayId } from "../../src/rules/github-pr-type.js";
 import { zendeskTicketShortDisplayId } from "../../src/rules/zendesk-ticket-type.js";
@@ -38,17 +36,6 @@ describe("per-provider short display id", () => {
     expect(filesystemShortDisplayId("/rinth")).toBe("rinth");
   });
 
-  test("managed-sessions: the bare definition name, .json stripped", () => {
-    expect(managedSessionShortDisplayId("/home/brooswrit/.config/butchr/session-definitions/admin-assembly.json")).toBe("admin-assembly");
-  });
-
-  test("managed-sessions: differs from the generic filesystem <parent>:<name> rule applied to the same path (FACTORY-83's deliberate decision)", () => {
-    const path = "/home/brooswrit/.config/butchr/session-definitions/admin-assembly.json";
-    expect(managedSessionShortDisplayId(path)).toBe("admin-assembly");
-    expect(filesystemShortDisplayId(path)).toBe("session-definitions:admin-assembly.json");
-    expect(managedSessionShortDisplayId(path)).not.toBe(filesystemShortDisplayId(path));
-  });
-
   test("github-issue: <repo>#<number>, owner dropped (operator's own example shape)", () => {
     expect(githubIssueShortDisplayId("brooswit-factory/butchr#42")).toBe("butchr#42");
   });
@@ -74,15 +61,6 @@ describe("baseDisplayLabel: combining a short id with its rule id", () => {
   test("an ordinary resource agent displays \"<ruleId> · <shortId>\" (operator's own example)", () => {
     const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-51" });
     expect(baseDisplayLabel(key)).toBe("jira-work · FACTORY-51");
-  });
-
-  test("a managed session displays its bare short id alone — no \"· ruleId\" suffix", () => {
-    const key = encodeAgentKey({
-      resourceProvider: "filesystem",
-      ruleId: MANAGED_SESSIONS_RULE_ID,
-      resourceId: absPath("home", "brooswrit", ".config", "butchr", "session-definitions", "admin-assembly.json"),
-    });
-    expect(baseDisplayLabel(key)).toBe("admin-assembly");
   });
 
   test("a query-level (singleton/persistent) agent with no single resource displays its bare rule id", () => {

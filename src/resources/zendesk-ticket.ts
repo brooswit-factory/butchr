@@ -24,6 +24,7 @@
  */
 import { readFileSync, statSync } from "node:fs";
 import type { FetchLike } from "../labels/pr.js";
+import { expandHomePath } from "../config/home-path.js";
 import { formatZendeskTicketRef, isZendeskSubdomain, type ZendeskTicketRef } from "./zendesk-ticket-ref.js";
 
 export interface ZendeskTicket {
@@ -79,7 +80,9 @@ export function loadZendeskAuth(env: ZendeskAuthEnv, io: ZendeskTokenFileIo = re
   const deprecated = ["ZENDESK_EMAIL", "ZENDESK_API_TOKEN"].filter((k) => env[k]?.trim());
   if (deprecated.length) return { ok: false, reason: `${deprecated.join(" and ")} set: Zendesk email/API-token auth is not supported; unset it and use ZENDESK_OAUTH_TOKEN_FILE` };
   const subdomain = env.ZENDESK_SUBDOMAIN?.trim();
-  const path = env.ZENDESK_OAUTH_TOKEN_FILE?.trim();
+  // local/ui: `~/` expanded, the same path Settings writes the token to (`resolveCredentialTarget`).
+  const rawPath = env.ZENDESK_OAUTH_TOKEN_FILE?.trim();
+  const path = rawPath ? expandHomePath(rawPath, env) : undefined;
   if (!subdomain || !path) return { ok: false, reason: "set ZENDESK_SUBDOMAIN and ZENDESK_OAUTH_TOKEN_FILE" };
   if (!isZendeskSubdomain(subdomain)) return { ok: false, reason: `ZENDESK_SUBDOMAIN must be the subdomain alone (e.g. acme for acme.zendesk.com), got ${JSON.stringify(subdomain)}` };
   let st: ReturnType<ZendeskTokenFileIo["stat"]>;

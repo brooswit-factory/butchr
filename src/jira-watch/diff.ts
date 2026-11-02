@@ -202,7 +202,7 @@ export function prTransition(before: JiraIssue, after: JiraIssue): { from: strin
  * `[butchr:credential-dead]`/`[butchr:ops-alert]` are deliberately absent
  * from both buckets: grepped at this ticket's base commit, neither marker
  * is ever written into a Jira comment body (`addComment`) — both are
- * journal-only (`deps.log`) or Rocket.Chat-only — so neither can ever reach
+ * journal-only (`deps.log`) — so neither can ever reach
  * this predicate's input in the first place.
  */
 export const WAKE_MARKERS: ReadonlySet<string> = new Set([

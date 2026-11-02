@@ -46,7 +46,6 @@ describe("seedFirstRunRules — true first run", () => {
     // "singleton" here, a defect this test previously pinned; updated
     // deliberately rather than deleted, per this ticket's own instruction.
     expect(rule.execution).toBe("swarm");
-    expect(rule.account).toBe("none");
     expect(rule.role).toBe("worker");
     expect(rule.permissionMode).toBe("default");
     expect(rule.lizardMode).toBe(true);

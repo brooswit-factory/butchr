@@ -21,7 +21,6 @@ import {
   createFilesystemEventRules, createFilesystemResourceType, onceOversized, ownsFilesystemAgent, searchFilesystemRules,
   specForFilesystem, specForFilesystemQuery, specForFilesystemUnit, type FilesystemMatch,
 } from "../../src/rules/filesystem-type.js";
-import { ownsManagedSessionAgent } from "../../src/rules/session-definition-type.js";
 import { parseRules, type Rule } from "../../src/rules/rules.js";
 import type { ExecutionUnit } from "../../src/rules/execution.js";
 
@@ -386,7 +385,7 @@ describe("listFilesystemResources caps (fake io)", () => {
 const rule = (over: Partial<Rule> = {}): Rule => ({
   id: "docs", enabled: true, resourceProvider: "filesystem",
   query: JSON.stringify({ root: "/repo", kind: "file", namePattern: "*.md" }),
-  brief: "Keep it current.", execution: "swarm", account: "none", role: "worker",
+  brief: "Keep it current.", execution: "swarm", role: "worker",
   ...over,
 });
 
@@ -491,14 +490,6 @@ describe("ownsFilesystemAgent", () => {
     expect(ownsFilesystemAgent("not a key")).toBe(false);
   });
 
-  test("does not claim managed-session agents, which the managed-sessions loop owns (FACTORY-47)", () => {
-    const managed = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "managed-sessions", resourceId: "/home/u/.config/butchr/session-definitions/nexus.json" });
-    expect(ownsFilesystemAgent(managed)).toBe(false);
-    expect(ownsManagedSessionAgent(managed)).toBe(true);
-    const ordinary = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "docs", resourceId: "/repo/a.md" });
-    expect(ownsFilesystemAgent(ordinary)).toBe(true);
-    expect(ownsManagedSessionAgent(ordinary)).toBe(false);
-  });
 });
 
 describe("createFilesystemEventRules — change events", () => {
@@ -763,7 +754,7 @@ describe("filesystem in the shared agent-key / rules / identity surfaces", () =>
   test("execution/account/role apply generically to filesystem rules too", () => {
     const doc = { id: "docs", resourceProvider: "filesystem", query: JSON.stringify({ root: "/repo", kind: "file" }), brief: "go", execution: "persistent", role: "sentinel" };
     const [r] = parseRules({ rules: [doc] });
-    expect(r).toMatchObject({ execution: "persistent", role: "sentinel", account: "none" });
+    expect(r).toMatchObject({ execution: "persistent", role: "sentinel" });
   });
 
   test("callerIdentity resolves a filesystem agent from its key alone, and refuses one that also carries x-issue", () => {

@@ -24,7 +24,7 @@ const view = {
   dashboard: async () => ({ checked: true as const, confirmedAt: new Date(0).toISOString(), rows: [], admission: { cap: 0, residency: null, sentinels: null, sources: [] } }),
   header: () => ({ build: { sha: null, shaDirty: null, shaUnknownReason: "test fixture", version: "0.0.0", versionProvenance: "tag" as const, versionUnknownReason: null } }),
   resourceLink: async (key: string) => ({ ok: true as const, url: `https://example.invalid/${key}` }),
-  configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
+  configInventory: async () => ({ rules: [], errors: [] }),
 };
 const { app, mcp } = buildApp(view);
 app.listen(0);

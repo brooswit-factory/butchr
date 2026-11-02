@@ -13,11 +13,11 @@ import BUG from "../../briefs/bug.md" with { type: "text" };
 import PROJECT from "../../briefs/project.md" with { type: "text" };
 import DEFAULT from "../../briefs/default.md" with { type: "text" };
 import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
+import RECURSIVE_CHILD_CLOSURE from "../../briefs/_recursive-child-closure.md" with { type: "text" };
 import { buildIdentity } from "./build-identity.js";
 import { computeBuildCurrency } from "./build-currency.js";
 import { deriveGroundTruth, groundTruthText } from "./ground-truth.js";
 import { decodeAgentKey, decodeAnyAgentKey, decodeQueryAgentKey, encodeAgentKey, type AgentKeyParts, type ResourceProvider } from "../rules/agent-key.js";
-import { MANAGED_SESSIONS_RULE_ID } from "../rules/session-definition-type.js";
 import { collisionSuffix, shortDisplayId } from "../rules/display-label.js";
 import type { AgentPreference, McpServerBinding } from "../rules/rules.js";
 import { codexReasoningEffortFlag } from "../resources/power-scale.js";
@@ -43,37 +43,6 @@ export interface SpawnSpec {
   resource?: string;
   brief?: string;
   agents?: readonly AgentPreference[];
-  /**
-   * Rocket.Chat account name for THIS launch (BUTCHR-412 S4 design
-   * correction — BUTCHR-391 comment 24007) — set only by the reconcile-layer
-   * account hook (`src/agents/account-lifecycle.ts`), never by a
-   * `specFor*` function, and only after `ensureAccount` actually succeeded
-   * for this agent's rule policy. Carries NO credential: rocketr (Nexus's
-   * bridge) holds every token centrally, and an agent's own MCP binding
-   * names only its account, non-secret, in the `x-rocketr-account` header —
-   * see `resolveAccountHeader`/`McpServerBinding.accountHeader` below for
-   * how a per-agent literal (as opposed to BUTCHR-411's per-RULE
-   * `headersEnvVar`) reaches that header, and `docs/rocketchat-accounts.md`'s
-   * "Wiring" section for why. Superseded design (kept only in history, never
-   * revived): an earlier round of this ticket delivered a per-agent token in
-   * a dedicated 0600 file (`RC_ACCOUNT_FILE`) that the agent itself read —
-   * removed per the corrected design, which forbids a token ever reaching an
-   * agent's workspace at all.
-   *
-   * BUTCHR-413's own consumers of this SAME field, outside any one launch's
-   * spec: `HerdrHerd.spawn`/`HerdrHerd.staleIssues` (src/agents/herd.ts) fill
-   * this in ONLY when `ensure()` above never ran for a launch at all (no
-   * accountLifecycle wired — RC not configured for any rule), and never
-   * overwrite an already-set value; `createCodexChannelRelayPool`'s own
-   * daemon-side connection (src/notify/codex-channel-relay.ts) has no live
-   * spec to read at all and always derives it. Both use the exact same
-   * `rcUsernameFor(agentKey, prefix)` this field's own real producer
-   * (`ensureAccount`) uses internally, with the SAME configured
-   * `Config.rocketchat.managedPrefix` — one function, one prefix, so a
-   * derived answer can never name a different account than the one actually
-   * provisioned.
-   */
-  rocketchatAccount?: string;
   /** Operator-owned MCP config path (jira-project rules only); `{{KEY}}` expands to the resource key. */
   mcpConfigFile?: string;
   /** Proxied external MCP connections prepared from `mcpConfigFile` (src/agents/resource-connections.ts). */
@@ -190,11 +159,6 @@ export interface SpawnSpec {
    */
   resumeOnRespawn?: boolean;
   /**
-   * FACTORY-916 — `Rule.resumeContextCutoff` passthrough (FACTORY-851).
-   * Absent means `DEFAULT_RESUME_CONTEXT_CUTOFF` applies (src/rules/rules.ts).
-   */
-  resumeContextCutoff?: number;
-  /**
    * FACTORY-916 — this ticket's own current Jira `status`/`labels`
    * (`issue.status`/`issue.labels`, src/atlassian/types.ts), carried onto
    * the spec SOLELY so `classifyStop` (src/agents/stop-cause.ts) can be
@@ -230,8 +194,22 @@ export const resourceOfSpec = (spec: SpawnSpec): string => spec.resource ?? spec
  */
 export const BEFORE_YOU_STOP_INCLUDE_MARKER = "<!-- include: briefs/_before-you-stop.md -->";
 
-/** Resolves `BEFORE_YOU_STOP_INCLUDE_MARKER` in a shipped brief template to the shared section's real text. */
-const resolveIncludes = (template: string): string => template.replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim());
+/**
+ * FACTORY-1020: the marker a parent-tier template (one whose issue type can
+ * own children — epic/story/bug/project today) carries to pull in the
+ * shared recursive-child-closure section. `task.md`/`default.md` carry no
+ * marker and so get no recursive-closure text — a bare Task owns no
+ * children to recurse into. Same include discipline as
+ * `BEFORE_YOU_STOP_INCLUDE_MARKER` above: `briefs/_recursive-child-closure.md`
+ * itself is not a template and carries no marker of its own.
+ */
+export const RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER = "<!-- include: briefs/_recursive-child-closure.md -->";
+
+/** Resolves every known `<!-- include: ... -->` marker in a shipped brief template to its shared section's real text. */
+const resolveIncludes = (template: string): string =>
+  template
+    .replaceAll(BEFORE_YOU_STOP_INCLUDE_MARKER, BEFORE_YOU_STOP.trim())
+    .replaceAll(RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER, RECURSIVE_CHILD_CLOSURE.trim());
 
 const BRIEF_BY_TYPE: Readonly<Record<string, string>> = {
   epic: resolveIncludes(EPIC),
@@ -825,20 +803,14 @@ export function assertNoInheritedMcpConfig(dir: string): void {
  * channel flag (`boundChannels`, src/agents/argv.ts) is the separate,
  * additive decision about PUSH notifications. No bindings -> byte-identical
  * to before (Object.fromEntries([]) spreads nothing). A binding's headers
- * are the union of its (per-RULE, env-resolved, potentially secret)
- * `headersEnvVar` value and its (per-AGENT, always non-secret)
- * `accountHeader` value — see `resolveMcpServerHeaders`/
- * `resolveAccountHeader`'s own doc comments for why these are two
- * different resolution mechanisms sharing one binding shape, not two
- * competing ones.
+ * are its (per-RULE, env-resolved, potentially secret) `headersEnvVar`
+ * value — see `resolveMcpServerHeaders`'s own doc comment.
  */
 export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string): void {
   let hasSecretHeaders = false;
   const bound = Object.fromEntries((spec.mcpServers ?? []).map((b) => {
-    const envHeaders = resolveMcpServerHeaders(b);
-    if (envHeaders) hasSecretHeaders = true;
-    const accountHeaders = resolveAccountHeader(b, spec.rocketchatAccount);
-    const headers = envHeaders || accountHeaders ? { ...envHeaders, ...accountHeaders } : undefined;
+    const headers = resolveMcpServerHeaders(b);
+    if (headers) hasSecretHeaders = true;
     return [b.name, { type: b.type, url: b.url, ...(headers ? { headers } : {}) }];
   }));
   const mcpJsonPath = join(dir, "mcp.json");
@@ -850,9 +822,7 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
   // exists), so this is an explicit chmod, not a write option, and only
   // when this write
   // actually carries a secret; a binding-less (or headers-less) mcp.json
-  // keeps its exact previous permissions, untouched. `accountHeader`'s own
-  // value (an account NAME, never a secret) never sets `hasSecretHeaders`
-  // by itself — only `headersEnvVar`'s resolution does.
+  // keeps its exact previous permissions, untouched.
   if (hasSecretHeaders) chmodSync(mcpJsonPath, 0o600);
 }
 
@@ -1033,33 +1003,33 @@ const providerOf = (spec: SpawnSpec) => decodeAnyAgentKey(spec.key)?.resourcePro
 /** A query-level spec (`singleton`/`persistent`, BUTCHR-398): no single resource, of ANY provider — see `mcpIdentityHeaders`/`buildWorkspace`'s own use. */
 const isQuerySpec = (spec: SpawnSpec): boolean => decodeQueryAgentKey(spec.key) !== null;
 /** Agents identified to MCP by agent key alone — mirrors KEY_ONLY_PROVIDERS (src/mcp/identity.ts), kept local so workspace building loads no MCP code. */
-const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem"].includes(providerOf(spec) ?? "");
+const isKeyOnly = (spec: SpawnSpec): boolean => ["github-issue", "github-pr", "jira-idea", "zendesk-ticket", "jira-project", "filesystem", "trello-card"].includes(providerOf(spec) ?? "");
 
 /** What a `github-issue` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_ISSUE_TOOLS_NOTE =
-  "Your resource is a GitHub issue. Use `github_get_issue` and `github_add_comment` with an explicit target (owner/repo#number), or omit it for your own issue. `github_link_jira_idea` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
+  "Your resource is a GitHub issue. Use `github_get_issue` and `github_add_comment` with an explicit target (owner/repo#number), or omit it for your own issue. `github_link_jira_idea` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
 
 /** FACTORY-57: what a `github-pr` agent is told about its tools; a Jira brief carries no such section. */
 export const GITHUB_PR_TOOLS_NOTE =
-  "Your resource is a GitHub pull request. Use `github_get_pr` and `github_pr_add_comment` with an explicit target (owner/repo#number), or omit it for your own PR. Your rule query determines when this agent is stopped; re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
+  "Your resource is a GitHub pull request. Use `github_get_pr` and `github_pr_add_comment` with an explicit target (owner/repo#number), or omit it for your own PR. Your rule query determines when this agent is stopped; re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
 
 /** What a `jira-idea` agent is told about its tools; a Jira work brief carries no such section. */
 export const JIRA_IDEA_TOOLS_NOTE =
-  "Your resource is a Jira Product Discovery idea. Use `jira_idea_get`, `jira_idea_github_issues`, and `jira_idea_add_comment` with an explicit target (issue key), or omit it for your own idea. `jira_idea_link_github_issue` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
+  "Your resource is a Jira Product Discovery idea. Use `jira_idea_get`, `jira_idea_github_issues`, and `jira_idea_add_comment` with an explicit target (issue key), or omit it for your own idea. `jira_idea_link_github_issue` links explicit resources when available. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
 
 /** What a `zendesk-ticket` agent is told about its tools; a Jira work brief carries no such section. */
 export const ZENDESK_TICKET_TOOLS_NOTE =
-  "Your resource is a Zendesk ticket. Use `zendesk_get_ticket` and `zendesk_add_internal_note` with an explicit target (subdomain#number), or omit it for your own ticket. You cannot reply to the customer with the internal-note operation: every note is internal. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
+  "Your resource is a Zendesk ticket. Use `zendesk_get_ticket` and `zendesk_add_internal_note` with an explicit target (subdomain#number), or omit it for your own ticket. You cannot reply to the customer with the internal-note operation: every note is internal. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
+
+/** local/ui: what a `trello-card` agent is told about its tools; a Jira work brief carries no such section. */
+export const TRELLO_CARD_TOOLS_NOTE =
+  "Your resource is a Trello card. Use `trello_get_card` and `trello_add_comment` with an explicit target (boardId#cardId), or omit it for your own card. Every comment is visible to everyone who can see the board: there is no private note. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
 
 /** File editing remains a native filesystem operation; provider tools use explicit targets. */
 export const FILESYSTEM_TOOLS_NOTE =
-  "Your resource is a file or directory. Read and edit it directly with your own file tools within authorized filesystem boundaries; there is no butchr MCP tool for general file editing. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
+  "Your resource is a file or directory. Read and edit it directly with your own file tools within authorized filesystem boundaries; there is no butchr MCP tool for general file editing. Re-read after change notifications. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative.";
 
-/** Session control retains its explicit authorization independently of provider access. */
-export const MANAGED_SESSION_TOOLS_NOTE =
-  "Your resource is a managed-session definition. Preserve session-control authorization and freezes. `freeze_session` and `unfreeze_session` require the target definition's explicit freezeControllers/unfreezeControllers authorization; do not edit grants or create, archive or delete definitions without authorization. Read docs/managed-sessions.md for this operational contract. Other registered provider operations accept explicit targets using the connected account permissions, independent of your resource identity. Provider denials remain authoritative. Subscriptions observe resources; they do not grant authority.";
-
-const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "github-pr": GITHUB_PR_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE };
+const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISSUE_TOOLS_NOTE, "github-pr": GITHUB_PR_TOOLS_NOTE, "jira-idea": JIRA_IDEA_TOOLS_NOTE, "zendesk-ticket": ZENDESK_TICKET_TOOLS_NOTE, "filesystem": FILESYSTEM_TOOLS_NOTE, "trello-card": TRELLO_CARD_TOOLS_NOTE };
 
 /**
  * A rule-engine brief: the rule's own text under a header naming the ticket.
@@ -1070,9 +1040,7 @@ const TOOLS_NOTE: Partial<Record<string, string>> = { "github-issue": GITHUB_ISS
  */
 const ruleBrief = (spec: SpawnSpec, view: SpawnSpec): string => {
   const decoded = decodeAnyAgentKey(spec.key);
-  const note = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID
-    ? MANAGED_SESSION_TOOLS_NOTE
-    : TOOLS_NOTE[decoded?.resourceProvider ?? ""];
+  const note = TOOLS_NOTE[decoded?.resourceProvider ?? ""];
   const body = interpolate(resolveRuleBrief(spec.brief!), view).trim();
   return `${ruleBriefHeader(decoded?.ruleId ?? "rule", view.key, spec.summary)}\n\n${note ? `${note}\n\n` : ""}${body}\n`;
 };
@@ -1134,33 +1102,6 @@ const tryParseHeaders = (raw: string): Record<string, string> | undefined => {
   } catch { /* malformed JSON in the env var — treated as absent, see doc comment above */ }
   return undefined;
 };
-
-/**
- * The PER-AGENT half of a bound server's headers (BUTCHR-412, BUTCHR-391
- * comment 24007) — `McpServerBinding.accountHeader`'s own doc comment
- * (`src/rules/rules.ts`) explains why this is a second, deliberately
- * separate resolution mechanism from `resolveMcpServerHeaders` above rather
- * than a second reading of the same one: that one resolves ONE static value
- * per RULE from the daemon's own env; this resolves a DIFFERENT value per
- * AGENT from `spec.rocketchatAccount` (set only by
- * `../agents/account-lifecycle.ts`'s `ensure`, after `ensureAccount`
- * actually provisioned this agent's account). No binding names an env var
- * here, and nothing is ever "malformed" — the value is either present
- * (this agent has an account) or it is not (no `accountHeader` on the
- * binding, or no account for this launch), so there is no failure mode to
- * log, unlike `resolveMcpServerHeaders`'s own unset/malformed-env case.
- *
- * BUTCHR-413 reuses this SAME function, unmodified, for Codex's own
- * bound-server config (`boundCodexServers`, src/agents/argv.ts) — safe
- * there in a way `resolveMcpServerHeaders`'s own resolved value never is,
- * because an account name grants no capability by itself (see
- * `McpServerBinding.accountHeader`'s own doc comment for why). One function,
- * two callers (Claude's mcp.json here, Codex's argv there), never a second
- * copy of the same one-line lookup.
- */
-export function resolveAccountHeader(binding: McpServerBinding, account: string | undefined): Record<string, string> | undefined {
-  return binding.accountHeader && account ? { [binding.accountHeader]: account } : undefined;
-}
 
 /** Non-secret launch inventory survives switching the daemon default back to Claude. */
 export function workspaceIsolation(dir: string): AgentConfig["disabledMcpServers"] {
@@ -1414,49 +1355,9 @@ export function claudeTranscriptExists(dir: string, sessionId: string, home?: st
 
 /**
  * FACTORY-916 — the path `claudeTranscriptExists` above checks, exported so
- * `src/agents/respawn.ts` can `statSync` it directly (to ESTIMATE a
- * token count from its byte size, for the respawn-resume context cutoff)
- * without duplicating `claudeProjectDir`'s own encoding.
+ * callers needing the on-disk transcript path directly don't duplicate
+ * `claudeProjectDir`'s own encoding.
  */
 export function claudeTranscriptPath(dir: string, sessionId: string, home?: string): string {
   return join(claudeProjectDir(dir, home), `${sessionId}.jsonl`);
-}
-
-/**
- * FACTORY-916 (epic FACTORY-843, story FACTORY-850) — an ESTIMATE of
- * `sessionId`'s transcript size in tokens, cheap enough to call on every
- * respawn of a large (potentially many-MB) transcript: `statSync` for the
- * byte count, never `readFileSync`/parsed JSON. The whole reason this
- * cutoff exists is to bound the cost of resuming a LARGE transcript, so the
- * check that enforces it must not itself pay a cost proportional to that
- * size — see `Rule.resumeContextCutoff`'s own doc comment (src/rules/rules.ts).
- *
- * `BYTES_PER_TOKEN_ESTIMATE = 4`: a Claude Code `.jsonl` transcript line is
- * mostly English prose and tool JSON, both of which sit close to OpenAI/
- * Anthropic's own commonly-cited "~4 bytes per token" rule of thumb for
- * English text; the surrounding JSON punctuation (quotes, braces, escaped
- * newlines) skews slightly denser than prose alone, which makes this
- * estimate a mild OVER-count of true tokens for a typical transcript — the
- * safe direction for a cutoff whose entire job is to bound cost, since
- * erring toward "estimated over cutoff, start fresh" costs nothing more
- * than the resume this mechanism is already allowed to skip, while erring
- * the other way (resume a transcript actually over budget) is the one
- * outcome this field exists to prevent. Not a measured calibration against
- * this codebase's own real transcripts — a documented rule-of-thumb
- * constant, not a promise of accuracy; callers needing an exact count
- * would have to parse and tokenize the file, exactly what this function is
- * built to avoid.
- *
- * Returns `undefined` when the transcript cannot be stat'd at all (ENOENT —
- * the caller's own `claudeTranscriptExists` check is expected to run
- * first, so this is a defensive fallback, not the primary missing-
- * transcript path) — never a thrown error for the common "file not there"
- * case, same fail-safe shape as `workspaceSessionId`/`workspaceStopCause`.
- */
-const BYTES_PER_TOKEN_ESTIMATE = 4;
-export function estimateTranscriptTokens(dir: string, sessionId: string, home?: string): number | undefined {
-  let size: number;
-  try { size = statSync(claudeTranscriptPath(dir, sessionId, home)).size; }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
-  return Math.ceil(size / BYTES_PER_TOKEN_ESTIMATE);
 }

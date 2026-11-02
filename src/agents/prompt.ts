@@ -15,6 +15,76 @@ export interface Prompt {
 const QUESTION_TAIL = 6;
 
 /**
+ * The horizontal rule Claude Code draws to open a dialog's own frame —
+ * confirmed live in EVERY real capture in this repo's corpus (84/84 escalation
+ * and unrecognised captures under `.captures/`, FACTORY-481): a `─+` line sits
+ * directly above the dialog's own content (a bare question, or a title/tab bar
+ * then the question) in every one, with arbitrary agent/tool/notification
+ * chatter above the rule and nothing but the dialog itself below it. Anchoring
+ * `question` to start fresh after the LAST such rule (see the reset in the
+ * scan loops below) is what makes `question` — and so `fingerprint`, which is
+ * a pure function of `question` + `options` — invariant to how much chatter
+ * scrolled in above the dialog, however much of it there is. Not every real
+ * dialog carries a rule (the un-numbered branch's synthetic startup-dialog
+ * fixtures below have none), so this is a refinement of the tail bound below,
+ * not a replacement for it: with no rule, `QUESTION_TAIL` still caps it.
+ */
+const RULE = /^─+$/;
+
+/**
+ * FACTORY-486: find the real question immediately above the option block,
+ * invariant to chatter injected INSIDE the frame — between the real question
+ * and the options — the gap FACTORY-481 left open: it only anchored
+ * `question` to start fresh after the frame's opening `RULE`, which defeats
+ * chatter scrolled in ABOVE the rule but does nothing about chatter that
+ * lands BELOW it, still above the options.
+ *
+ * Evidence measured against every real dialog capture in this repo's
+ * `.captures/` corpus (34 of the 84 files; the rest are non-dialog
+ * "unrecognised" captures) that draws a `RULE` at all: the option block is
+ * always preceded by exactly one blank line, with nothing else in between —
+ * true whether the question is one line (`pane-cap-weekly-limit-real.txt`),
+ * several (FACTORY-47's real escalation capture), or preceded by its own
+ * header/tab-bar block (BUTCHR-370, BUTCHR-438). That blank is a reliable
+ * anchor: content touching the options with NO blank of its own can never be
+ * a real dialog's own question by this same evidence, so when a blank IS
+ * found, this function walks back from it, past the blank, and takes the
+ * contiguous non-blank block above as `question` — skipping (never
+ * collecting) whatever touched the options below that blank, however much
+ * of it there is.
+ *
+ * Caveat, stated rather than papered over: a real capture with a numbered
+ * menu but NO blank anywhere between its content and its options exists too
+ * (KAN-756's `MCP_TRUST` fixture, no `RULE` drawn at all) — for that shape
+ * there is no structural signal separating a real multi-paragraph question
+ * from chatter that might land beside it, so this function falls back to
+ * the pre-FACTORY-486 undiscriminated tail (`QUESTION_TAIL` lines, whatever
+ * they are) rather than guessing or emptying `question` outright. That
+ * fallback is exactly as vulnerable to in-frame chatter as before this fix;
+ * closing it would need a different signal than blank-line adjacency, and
+ * no such signal has a real example in this corpus to design against.
+ */
+function extractQuestion(lines: string[], firstOptionIdx: number): string {
+  let ruleIdx = -1;
+  for (let i = 0; i < firstOptionIdx; i++) if (RULE.test(lines[i]!.trim())) ruleIdx = i;
+  const frameStart = ruleIdx;
+  let i = firstOptionIdx - 1;
+  if (i > frameStart && lines[i]!.trim()) {
+    // Content touches the options with no blank line in between — chatter,
+    // per the corpus evidence above, unless no blank exists anywhere in the
+    // frame (the MCP_TRUST-shaped fallback case, checked below).
+    let j = i;
+    while (j > frameStart && lines[j]!.trim()) j--;
+    if (j > frameStart) i = j; // found the separating blank: exclude everything below it
+    // else: no blank anywhere — leave `i` as-is and fall through to the tail bound
+  }
+  const block = lines.slice(frameStart + 1, i + 1)
+    .map((l) => l.trim())
+    .filter((t) => t && !/^(Enter to confirm|Esc to cancel|·)/.test(t));
+  return block.slice(-QUESTION_TAIL).join(" ").trim();
+}
+
+/**
  * A real Claude Code selection dialog always ends with this footer,
  * IMMEDIATELY after its last option (blank lines allowed in between, never
  * other content). It is NOT enough to check that this phrase merely occurs
@@ -58,8 +128,8 @@ export function parsePrompt(text: string): Prompt | null {
   const options: string[] = [];
   let current = 1;
   let cursorCount = 0;
+  let firstOptionLineIdx = -1;
   let lastOptionLineIdx = -1;
-  const questionLines: string[] = [];
   for (let li = 0; li < lines.length; li++) {
     const line = lines[li]!;
     const m = /^\s*(❯|>)?\s*(\d+)\.\s+(.*)$/.exec(line);
@@ -67,9 +137,8 @@ export function parsePrompt(text: string): Prompt | null {
       const idx = Number(m[2]);
       if (m[1]) { current = idx; cursorCount++; }
       options[idx - 1] = m[3]!.trim();
+      if (firstOptionLineIdx === -1) firstOptionLineIdx = li;
       lastOptionLineIdx = li;
-    } else if (line.trim() && !/^(Enter to confirm|Esc to cancel|─+|·)/.test(line.trim())) {
-      if (options.length === 0) questionLines.push(line.trim());
     }
   }
   const opts = options.filter((o) => o !== undefined);
@@ -82,7 +151,7 @@ export function parsePrompt(text: string): Prompt | null {
   if (opts.length < 2) return parseUnnumbered(lines);
   if (cursorCount !== 1 || !footerImmediatelyFollows(lines, lastOptionLineIdx)) return null;
   return {
-    question: questionLines.slice(-QUESTION_TAIL).join(" ").trim(),
+    question: extractQuestion(lines, firstOptionLineIdx),
     options: opts,
     current: Math.min(Math.max(current, 1), opts.length),
   };
@@ -122,6 +191,7 @@ function parseUnnumbered(lines: string[]): Prompt | null {
   const options: string[] = [];
   let current = -1;
   let i = footerIdx - 1;
+  let firstOptionLineIdx = footerIdx; // topmost line index actually consumed into the option block
   while (i >= 0 && options.length < 8) {
     const line = lines[i]!;
     const t = line.trim();
@@ -130,7 +200,7 @@ function parseUnnumbered(lines: string[]): Prompt | null {
     if (m) { options.unshift(m[2]!.trim()); current = 0; }
     else if (/^\s{2,}\S/.test(line) && t.length <= 80 && !/[.:]$/.test(t)) options.unshift(t);
     else break;
-    if (m) { /* keep scanning above the marker */ }
+    firstOptionLineIdx = i;
     i--;
   }
   // current = index of the ❯ option within the collected block
@@ -144,8 +214,11 @@ function parseUnnumbered(lines: string[]): Prompt | null {
     seen++;
     if (/^\s*(❯|>)\s+/.test(lines[j]!)) { cur = options.length - seen + 1; break; }
   }
-  const question = lines.slice(0, footerIdx - options.length).map((l) => l.trim())
-    .filter((t) => t && !/^(─+|·)/.test(t)).slice(-QUESTION_TAIL).join(" ").trim();
+  // Same frame anchor as parsePrompt's numbered branch (see RULE and
+  // extractQuestion above): chatter above the dialog's own opening rule, OR
+  // scrolled in between the real question and the options, must never reach
+  // `question`.
+  const question = extractQuestion(lines, firstOptionLineIdx);
   return { question, options, current: cur };
 }
 

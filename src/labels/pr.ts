@@ -14,10 +14,25 @@ export interface GithubDeps {
   log?: (line: string) => void;
 }
 
-interface PrRef {
+export interface PrRef {
   owner: string;
   repo: string;
   number: number;
+}
+
+/**
+ * local/ui — how a PR's head branch relates to a ticket key: `"exact"` for
+ * the key itself, `"prefixed"` for the key followed by `-`, `_` or `/` and
+ * anything after (this project's agents name branches `KEY-slug`, e.g.
+ * `KAN-3020-fix-login`), `null` for anything else. The key followed by any
+ * other character is a DIFFERENT ticket's branch (`KAN-790` for key
+ * `KAN-79`) — exactly the collision GitHub's prefix-matching `head:` search
+ * qualifier would otherwise let through. Case-sensitive, like the key.
+ */
+export function headRefMatch(headRef: string, key: string): "exact" | "prefixed" | null {
+  if (headRef === key) return "exact";
+  if (headRef.length > key.length && headRef.startsWith(key) && "-_/".includes(headRef[key.length]!)) return "prefixed";
+  return null;
 }
 
 interface Review {
@@ -92,7 +107,7 @@ async function fetchPull(deps: GithubDeps, ref: PrRef): Promise<PullPayload | "u
   return (await res.json()) as PullPayload;
 }
 
-/** How many of a search's top hits to check for an exact head-ref match, per org, before giving up on it — GitHub's best-match sort gives no ordering guarantee between a ticket's own PR and a prefix-colliding one (e.g. a task's `KAN-790-ownwrites` branch vs. the story's own `KAN-790`), so the first hit alone isn't enough, but an unranked org-wide result set could in principle be large and each candidate costs a pulls fetch. */
+/** How many of a search's top hits to check for a matching head ref (`headRefMatch`), per org, before giving up on it — GitHub's best-match sort gives no ordering guarantee between a ticket's own PR and a prefix-colliding one (e.g. `KAN-790` showing up for key `KAN-79`), nor between an exact `KAN-790` and a `KAN-790-ownwrites`, so the first hit alone isn't enough, but an unranked org-wide result set could in principle be large and each candidate costs a pulls fetch. */
 const DISCOVER_CANDIDATES = 5;
 
 /**
@@ -156,16 +171,18 @@ interface SearchOutcome {
 }
 
 /**
- * Searches GitHub for a PR whose head branch is EXACTLY `key`, within
- * `status` ("open" or "merged"), across the configured orgs. GitHub's
- * `head:` search qualifier matches by PREFIX — the search result shape
- * doesn't even carry `head.ref` — so each of the top `DISCOVER_CANDIDATES`
- * hits is confirmed against its own pull payload, in order, until one's head
- * ref is an exact match. A prefix-colliding hit (e.g. `KAN-790-ownwrites` for
- * key `KAN-790`) is skipped without caching anything, so a later exact-match
- * PR on the same key stays discoverable on a subsequent poll even if this
- * org never turns one up. The validated pull is returned alongside the ref
- * so the caller can reuse it instead of re-fetching.
+ * Searches GitHub for a PR whose head branch matches `key` (`headRefMatch`:
+ * the key itself, or `KEY-…`/`KEY_…`/`KEY/…`), within `status` ("open" or
+ * "merged"), across the configured orgs. GitHub's `head:` search qualifier
+ * matches by PREFIX — the search result shape doesn't even carry `head.ref`
+ * — so each of the top `DISCOVER_CANDIDATES` hits is confirmed against its
+ * own pull payload, in order. An EXACT head ref returns at once; the first
+ * `KEY-…` match is held while the rest of the candidates (every org) are
+ * checked for an exact one, and returned if none turns up. A colliding hit
+ * (e.g. `KAN-790` for key `KAN-79`) is skipped without caching anything, so
+ * a later matching PR on the same key stays discoverable on a subsequent
+ * poll. The validated pull is returned alongside the ref so the caller can
+ * reuse it instead of re-fetching.
  *
  * A non-OK response from any org aborts the whole call immediately (KAN-824
  * item 4: "back off rather than burn the rest of the window") — it does not
@@ -173,6 +190,7 @@ interface SearchOutcome {
  */
 async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "merged", onSearch: (res: Response) => void): Promise<SearchOutcome> {
   let unconfirmed = false;
+  let prefixed: { ref: PrRef; pull: PullPayload } | undefined;
   for (const org of deps.orgs) {
     const q = new URLSearchParams({ q: `is:pr is:${status} head:${key} org:${org}` });
     const res = await deps.fetchImpl(`https://api.github.com/search/issues?${q}`, { headers: ghHeaders(deps.token) });
@@ -193,10 +211,13 @@ async function discoverStatus(deps: GithubDeps, key: string, status: "open" | "m
       const ref: PrRef = { owner: m[1]!, repo: m[2]!, number: item.number };
       const pull = await fetchPull(deps, ref);
       if (pull === "unavailable") { unconfirmed = true; continue; } // could not confirm this candidate — not a collision, not a match either
-      if (pull.head.ref !== key) continue; // prefix collision: not this ticket's PR
-      return { found: { ref, pull } };
+      const match = headRefMatch(pull.head.ref, key);
+      if (match === "exact") return { found: { ref, pull } };
+      if (match === "prefixed") prefixed ??= { ref, pull }; // held: an exact head ref later on still wins
+      // null: a collision (another ticket's branch) — skipped
     }
   }
+  if (prefixed) return { found: prefixed };
   return unconfirmed ? { unconfirmed: true } : {};
 }
 
@@ -223,8 +244,9 @@ interface KeyState {
 }
 
 /**
- * Discovers the PR whose head branch is EXACTLY a ticket key (the fleet's
- * branch convention), then polls it directly once found — caching
+ * Discovers the PR whose head branch is a ticket key, or the key followed by
+ * `-`/`_`/`/` and a slug (`headRefMatch`; an exact match wins when both
+ * exist), then polls it directly once found — caching
  * owner/repo/number so discovery (an org-wide search) runs at most once per
  * key while it's warm. `gh` and GraphQL are unavailable to the daemon; this
  * is REST only.
@@ -264,6 +286,18 @@ export class PrTracker {
 
   constructor(private readonly deps: GithubDeps) {
     this.now = deps.now ?? Date.now;
+  }
+
+  /**
+   * local/ui — the open PR currently tracked for `key`, read from the cache
+   * `stateFor` fills: never a network call, never a search. `undefined`
+   * until discovery has found one, and again once that PR is merged or
+   * closed (both drop it from the cache). Linked-change eventing reads this
+   * to watch a ticket's own PR (`src/jira-watch/linked-eventing.ts`).
+   */
+  pullRequestFor(key: string): PrRef | undefined {
+    const ref = this.cache.get(key);
+    return ref ? { ...ref } : undefined;
   }
 
   private readonly onSearch = (res: Response): void => {

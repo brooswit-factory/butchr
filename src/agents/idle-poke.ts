@@ -123,7 +123,7 @@ export interface IdlePokeRuleConfig {
   idlePokeMinutes?: number;
   /** Per-rule override of the nudge/comment text. Absent means the engine's own configured default (DEFAULT_IDLE_POKE_MESSAGE). */
   idlePokeMessage?: string;
-  /** Resolved boolean — the caller applies `?? true` (mirrors `Rule.idlePokeEnabled`'s own always-resolved-by-parseRules convention). `false` pokes nothing for this issue at all. */
+  /** Resolved boolean — the caller applies `?? false` (local/ui; mirrors `Rule.idlePokeEnabled`'s own always-resolved-by-parseRules convention). `false` pokes nothing for this issue at all. */
   idlePokeEnabled: boolean;
 }
 
@@ -253,7 +253,7 @@ export interface IdlePokeCheckInput {
   streakStart: number | null;
   /** The ticket's own current Jira status, read fresh this poll (guard 3). */
   status: string;
-  /** This issue's resolved idle-poke config for this poll — `undefined` when no enabled rule carries one (the caller applies `idlePokeEnabled ?? true`, `idlePokeMinutes`/`idlePokeMessage` left absent). */
+  /** This issue's resolved idle-poke config for this poll — `undefined` when no enabled rule carries one, which pokes nothing (local/ui: idle pokes are opt-in per rule). */
   ruleConfig?: IdlePokeRuleConfig;
 }
 
@@ -307,10 +307,9 @@ export function createIdlePokeEngine(deps: IdlePokeDeps): IdlePokeEngine {
       entries.set(issue, e);
     }
 
-    // GUARD 5
-    const enabled = input.ruleConfig?.idlePokeEnabled ?? true;
-    if (!enabled) {
-      return { kind: "skipped", issue, reason: "idlePokeEnabled=false for this rule" };
+    // GUARD 5 — local/ui: off unless a matching rule turns it on (upstream pokes unless one turns it off).
+    if (input.ruleConfig?.idlePokeEnabled !== true) {
+      return { kind: "skipped", issue, reason: input.ruleConfig ? "idlePokeEnabled=false for this rule" : "no enabled rule turns idle pokes on" };
     }
 
     const minutes = input.ruleConfig?.idlePokeMinutes ?? deps.globalMinutes;
