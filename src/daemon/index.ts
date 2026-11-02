@@ -1,3 +1,4 @@
+import {createProviderReadiness} from '../agents/provider-readiness.js';
 import {createContinuationPolicyReader} from '../control-panel/worker-continuation-policy.js';
 import {deliverAdmittedNotice} from '../control-panel/admitted-notice.js';
 import {admittedPolicyUnits} from '../control-panel/admitted-policy.js';
@@ -734,7 +735,7 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf, workerRollout);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf, workerRollout, createProviderReadiness());
 herd.ruleRuntime=()=>ruleAuthority.policy;
 {const spec=workerRollout?.continuationSpec();if(spec){
  if(!atlassian)throw Error('Configured issue policy client required for continuation');

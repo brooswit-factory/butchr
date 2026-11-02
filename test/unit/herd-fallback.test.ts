@@ -600,3 +600,13 @@ describe("HerdrHerd ordered provider fallback", () => {
     });
   });
 });
+
+test('known missing native integration prevents every repeated handoff before creation or paid launch, preserving source and user preference',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'readiness-cost-guard-')),prior=process.env.BUTCHR_WORKSPACES;process.env.BUTCHR_WORKSPACES=root;
+ try{const cwd=workspaceDirFor('TEST-1');mkdirSync(cwd,{recursive:true});const f=fixture({existing:[{pane_id:'old',cwd,agent:'codex',agent_status:'idle'}]});let checks=0;
+ const herd=new HerdrHerd(f.client,url,instant,undefined,config,undefined,async()=>{},undefined,undefined,undefined,undefined,async()=>{checks++;return {ready:false,reason:'Official claude integration missing; paid launch blocked'};});
+ const desired={...spec,agents:[{harness:'claude' as const,model:'desired'}]},before=JSON.stringify(desired);
+ for(let i=0;i<20;i++)expect(await herd.reconcilePreferences(desired,()=>true)).toMatchObject({status:'blocked',reason:'Official claude integration missing; paid launch blocked'});
+ expect(checks).toBe(20);expect(f.creates).toEqual([]);expect(f.starts).toEqual([]);expect(f.closed).toEqual([]);expect(f.prompts).toEqual([]);expect(f.rows().map(r=>r.pane_id)).toEqual(['old']);expect(JSON.stringify(desired)).toBe(before);
+ }finally{process.env.BUTCHR_WORKSPACES=prior;rmSync(root,{recursive:true,force:true});}
+});

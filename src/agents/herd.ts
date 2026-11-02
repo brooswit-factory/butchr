@@ -1,3 +1,4 @@
+import type {ProviderReadiness} from './provider-readiness.js';
 import {nativeSessionHash} from '../control-panel/worker-rollout.js';
 import {WORKER_CANARY_KICKOFF} from '../control-panel/worker-rollout.js';
 import type {WorkerRollout} from '../control-panel/worker-rollout.js';
@@ -769,6 +770,7 @@ export class HerdrHerd implements Herd {
      */
     private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
     private readonly rollout?:WorkerRollout,
+    private readonly providerReadiness?:(provider:ManagedAgentProvider)=>Promise<ProviderReadiness>,
   ) {if(this.rollout)this.herdr=this.rollout.wrap(this.herdr);this.lifecycleFence=createLifecycleFence(this.herdr);this.herdr=this.lifecycleFence.client;}
 
   private withRuleLease<T>(issue:string,kind:'spawn'|'stop'|'resume'|'notify',lease:number|undefined,action:()=>Promise<T>):Promise<T>{
@@ -871,6 +873,7 @@ export class HerdrHerd implements Herd {
   async reconcilePreferences(specIn:SpawnSpec,isCurrent:()=>boolean,change?:WorkerChange):Promise<WorkerChangeResult>{
     if(this.rollout&&specIn.key!==this.rollout.workerKey)return {status:'blocked',reason:'Worker is outside the explicit canary permit'};
     const spec=specIn;
+    if(this.providerReadiness&&spec.agents?.length===1){const readiness=await this.providerReadiness(spec.agents[0]!.harness);if(!readiness.ready)return {status:'blocked',reason:readiness.reason??'Provider integration readiness unavailable; paid handoff blocked'};}
     let lifecycle:ManagedHerdrLifecycle|undefined,previousPane:string|undefined;
     const guard=()=>{if(!isCurrent())throw Error('Desired worker configuration was superseded or disabled');};
     const physical=()=>{const current=lifecycle?.current;return current?{paneId:current.paneId,provider:current.provider}:undefined;};
@@ -1725,6 +1728,7 @@ export class HerdrHerd implements Herd {
       // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
       kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, spec),
       prepare: async provider => {
+        if(this.providerReadiness){const readiness=await this.providerReadiness(provider);if(!readiness.ready)throw new Error(readiness.reason??'Provider integration readiness unavailable; paid launch blocked');}
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
         // A rule's own preference for this harness (its first entry naming it) overrides the global model.
