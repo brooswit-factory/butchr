@@ -5,5 +5,6 @@ coverageSkipTestFiles = true
 coverageReporter = ["text", "lcov"]
 coverageDir = "coverage"
 # Sibling file dependencies are SDK code, equivalent to the registry dependency previously excluded under node_modules.
+# Packaged-helper regression output is generated duplicate code; its source and production builder remain covered.
 # The application source/operator coverage gate and its 90% threshold are unchanged.
-coveragePathIgnorePatterns = ["test/**", "../drovr/**"]
+coveragePathIgnorePatterns = ["test/**", "../drovr/**", "**/continuation-library-build-*/**"]

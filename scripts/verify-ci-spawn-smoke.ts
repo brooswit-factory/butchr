@@ -117,7 +117,11 @@ async function main(): Promise<void> {
   await herdr.agent.start({ pane_id: paneId, name: `ci-spawn-smoke-${THROWAWAY_KEY.toLowerCase()}`, kind: "claude", args });
 
   const started = await pollForStubToRun(paneId, 15_000);
-  if (!started) throw new Error(`agent.start accepted the argv, but the stub never touched its sentinel (${SENTINEL}) within 15s`);
+  if (!started) {
+    const detection=await herdr.pane.read({pane_id:paneId,source:"detection",strip_ansi:true}).catch(()=>undefined);
+    console.error("CI scratch-pane detection on failed start:",detection?.read.text.slice(-16000)??"unavailable");
+    throw new Error(`agent.start accepted the argv, but the stub never touched its sentinel (${SENTINEL}) within 15s`);
+  }
   console.log("OK: herdr accepted the real kickoff argv and actually ran the stub");
 }
 
