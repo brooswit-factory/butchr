@@ -145,3 +145,20 @@ test('retired hourly-cap fields in saved authority cannot defer current-main obs
  writeFileSync(savedPath,JSON.stringify(saved));f.restart();f.update();f.runtime.recordFullCensus([key()],true);
  expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.policy.canObserve('jira-work')).toBe(true);
  }finally{f.close();}});
+
+test('remote authority restart with an absent local default does not reject its live workers',async()=>{
+ const {missingRulesPreflight}=await import('../../src/daemon/missing-rules-preflight.js');
+ const f=fixture();try{
+  f.update();f.runtime.recordFullCensus([key()],true);f.activate();rmSync(f.path);
+  const restored=createRuleRuntime(f.directory,{holder:createRulesHolder([],sourceEtagOf(undefined)),readText:()=>undefined,reload:()=>({ok:true})});
+  const agents=async()=>[{pane_id:'w1:p1',cwd:'/ws/jira-work/worker/FIXTURE-1'}];
+  expect(restored.summary().authority).toBe('remote');
+  expect(restored.getInitializationRules().some(r=>r.id==='worker')).toBe(true);
+  expect(await missingRulesPreflight(f.path,agents,'/ws',restored.summary().authority==='remote')).toEqual({ok:true});
+  expect((await missingRulesPreflight(f.path,agents,'/ws',false)).ok).toBe(false);
+  const g=restored.policy.generation();
+  expect(restored.policy.protectStop(key(),g)).toBe(true);
+  expect(restored.policy.protectRespawn(key(),g)).toBe(true);
+  expect((await missingRulesPreflight(f.path,async()=>{throw Error('unavailable')},'/ws',restored.summary().authority==='remote')).ok).toBe(false);
+ }finally{f.close();}
+});

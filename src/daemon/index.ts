@@ -720,10 +720,11 @@ if (!preflight.ok) {
   console.error(`butchr: ${preflight.message}`);
   process.exit(1);
 }
-// No rules file + live rule agents: refuse, rather than stop the whole fleet
-// on the first poll over what is usually an accident (src/daemon/missing-rules-preflight.ts).
+// Under local authority, refuse missing rules with live rule agents. A validated
+// saved remote authority restores its own rules and keeps lifecycle actions fenced
+// until reconnection and complete inventory (src/daemon/missing-rules-preflight.ts).
 if (missingRulesPath !== null) {
-  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents);
+  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents, undefined, ruleAuthority.summary().authority === "remote");
   if (!rulesPreflight.ok) {
     console.error(`butchr: ${rulesPreflight.message}`);
     process.exit(1);
