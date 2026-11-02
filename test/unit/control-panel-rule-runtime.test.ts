@@ -66,10 +66,11 @@ test('admitted linked-item observation limit remains on admitted observation gra
 
 test('retired local managed-session namespace is never swept into remote OFF reconciliation',async()=>{const f=fixture();try{
  const {encodeAgentKey}=await import('../../src/rules/agent-key.js');
+ const {reconcileDisabledRules}=await import('../../src/control-panel/reconcile-disabled-rules.js');
  const id=encodeAgentKey({resourceProvider:'filesystem',ruleId:'managed-sessions',resourceId:'/defs/disposable.json'});
  f.update();f.activate();const workers=herd([id]);workers.h.ruleRuntime=()=>f.runtime.policy;
  f.runtime.recordFullCensus([id],true);f.remote=rows({rules:[{...doc.rules[0],enabled:false},doc.rules[1]]});f.update();
- await reconcileNow(scopedHerd(workers.h,()=>false),new Map());
+ await reconcileDisabledRules(workers.h,()=>true);
  expect(workers.actions).toEqual([]);expect(workers.running.has(id)).toBe(true);
  expect(f.runtime.policy.protectStop(id,f.runtime.policy.generation())).toBe(true);
  }finally{f.close();}});

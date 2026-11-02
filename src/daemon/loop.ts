@@ -1,3 +1,4 @@
+import {reconcileDisabledRules} from '../control-panel/reconcile-disabled-rules.js';
 import {createObservationJournal} from "../control-panel/observation-journal.js";
 import type {ResourceProvider} from "../rules/rules.js";
 import { watch, type Stop } from "@brooswit/sundry";
@@ -1228,8 +1229,8 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   let previousRulesSnapshot:Snapshot<T>={issues:[],related:[]};
   return watch<Snapshot<T>>(
     async () => {
-      const runtimePolicy=deps.herd.ruleRuntime?.();if(runtimePolicy&&deps.herd.ruleCensus)runtimePolicy.census(await deps.herd.ruleCensus());
-      const ruleLease=runtimePolicy?.generation();
+      await reconcileDisabledRules(deps.herd,deps.ownsId,deps.onStopped);
+      const ruleLease=deps.herd.ruleRuntime?.().generation();
       // Intentional policy fencing completes the loop without observing or advancing its journal.
       if(deps.herd.ruleRuntime&&!deps.herd.ruleRuntime().canObserve(deps.ruleProvider)){await deps.onFencedPoll?.();deps.onPollSuccess?.();deps.onNotifySuccess?.();return {...previousRulesSnapshot,ruleLease,observed:false};}
       const issues = await resourceType.discovery.search();
