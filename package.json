@@ -13,7 +13,8 @@
   },
   "bin": {
     "butchr": "./dist/butchr.js",
-    "butchr-mcp": "./dist/butchr-mcp.js"
+    "butchr-mcp": "./dist/butchr-mcp.js",
+    "butchr-operator": "./dist/butchr-operator.js"
   },
   "files": [
     "dist"

@@ -72,3 +72,8 @@ console.log(`built ${bridgeFile}`);
 
 // Build the same pure helper exercised by the isolated packaged regression.
 await buildContinuationHelper(process.cwd(),OUTDIR);
+
+// Supported, explicit operator workflow; building/importing never applies maintenance.
+const operator=await Bun.build({entrypoints:['scripts/operator/maintenance.ts'],outdir:OUTDIR,naming:'butchr-operator.js',target:'bun'});
+if(!operator.success)throw new AggregateError(operator.logs,'Operator command build failed');
+const operatorFile=OUTDIR+'/butchr-operator.js';writeFileSync(operatorFile,'#!/usr/bin/env bun\n'+readFileSync(operatorFile,'utf8'));chmodSync(operatorFile,0o755);

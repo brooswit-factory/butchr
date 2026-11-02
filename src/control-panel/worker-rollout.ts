@@ -1,3 +1,4 @@
+import {verifyValidationRetirement} from '../operator/validation-retirement.js';
 import {assertClaudeTargetReady} from './worker-target-readiness.js';
 import type {OwnedTargetContinuation,ContinuationProgress} from '@brooswit/drovr';
 import type {ContinuationPolicyBinding,ContinuationPolicyProof} from './worker-continuation-policy.js';
@@ -88,7 +89,7 @@ function privateFile(path: string) {
         closeSync(fd);
     }
 }
-function parsePermit(text: string): CanaryPermit {
+export function parsePermit(text: string): CanaryPermit {
     const p = JSON.parse(text) as CanaryPermit;
     if (![1,2].includes(p.version) || !uuid(p.permitId) || !/^jira-work:tasks:[A-Z][A-Z0-9_]*-\d+$/.test(p.workerKey) || !uuid(p.authority?.serverId) || !uuid(p.authority?.authorizationId) || !uuid(p.authority?.deploymentId) || !/^[a-f0-9]{64}$/.test(p.desiredToken) || !['claude', 'codex', 'agy'].includes(p.targetProvider) || !isAbsolute(p.source?.cwd ?? '') || !p.source?.paneId || !p.source.provider || !/^[a-f0-9]{64}$/.test(p.source.sessionHash) || p.holdClearance?.notHeld !== true || p.holdClearance.paneId !== p.source.paneId || p.holdClearance.sessionHash !== p.source.sessionHash || !Number.isFinite(Date.parse(p.expiresAt)) || !Number.isFinite(Date.parse(p.holdClearance.expiresAt)))
         throw Error('Invalid exact-identity canary permit/hold clearance');
@@ -453,6 +454,7 @@ export function createWorkerRollout(path: string, stateDirectory: string, now = 
 export type WorkerRollout = ReturnType<typeof createWorkerRollout>;
 /** Removing an environment flag alone cannot silently remove a previously armed fence. */
 export function configuredWorkerRollout(path: string | undefined, stateDirectory: string) {
+    if(verifyValidationRetirement(stateDirectory,path))return undefined;
     if (path !== undefined)
         return createWorkerRollout(path, stateDirectory);
     try {
