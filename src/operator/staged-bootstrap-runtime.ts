@@ -16,6 +16,11 @@ export function emptyBootstrapPrompt(pane:any,screen:any){
  if(last===undefined||!/^\s*[❯›>]\s*$/.test(lines[last]!)||!/^\s*[─━═]{3,}\s*$/.test(lines[last+1]??''))throw Error('Empty single-line bootstrap input required; preserve any draft');
  return {sha256:sha(screen.text),empty:true as const};
 }
+/** Saved rules retain their transport staging marker. Execution authority is
+ * established by the connected runtime plus its live active rule readback. */
+export function assertBootstrapRule(saved:any,live:any){
+ if(!saved||!live||live.executionState!=='active'||live.locallyDisabled===true||stable(saved.definition)!==stable(live.definition)||saved.sourceRuleId!==live.sourceRuleId||saved.serverId!==live.serverId||saved.authorizationId!==live.authorizationId)throw Error('Saved and active authoritative rule differ');
+}
 function canonical(path:string){if(!isAbsolute(path)||resolve(path)!==path||realpathSync(path)!==path)throw Error('Explicit existing canonical path required');return path;}
 function mustBeAbsent(path:string){try{lstatSync(path);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return;throw e;}throw Error('Independent hold/control exists; recovery cannot clear it');}
 export function stagedBootstrapRuntime(request:BootstrapRequest):BootstrapRollbackIO{
@@ -42,9 +47,10 @@ export function stagedBootstrapRuntime(request:BootstrapRequest):BootstrapRollba
    const reconciliation=runtime.workerReconciliation?.find((v:any)=>v.id===r.workerKey);if(runtime.phase!=='inventory-uncertain'||runtime.inventoryComplete!==false||reconciliation?.status!=='blocked'||reconciliation.reason!=='A complete observed worker specification is required')throw Error('Only a durably blocked ambiguous-inventory handoff can be rolled back; no concurrent lifecycle operation');
    const authorityText=privateText(join(r.stateDirectory,'remote-rule-authority.json')),manifest=JSON.parse(authorityText),retained=manifest.retained?.find((v:any)=>v[0]===r.workerKey)?.[1];
    const desired=manifest.remote?.filter((v:any)=>v.sourceRuleId===key.ruleId&&v.definition?.resourceProvider===key.resourceProvider);
-   if(manifest.active!==true||manifest.revision!==runtime.revision||desired?.length!==1||desired[0].definition.enabled!==true||desired[0].executionState!=='active'||desired[0].definition.agentPreferences?.length!==1||desired[0].definition.agentPreferences[0].harness!=='claude'||retained?.managed!==true||retained.known!==true||retained.rule?.id!==key.ruleId||retained.lastHandoff?.partial||retained.reconciliation?.partial)throw Error('Managed source and enabled Claude rule without partial handoff required');
+   if(manifest.active!==true||manifest.revision!==runtime.revision||desired?.length!==1||desired[0].definition.enabled!==true||desired[0].definition.agentPreferences?.length!==1||desired[0].definition.agentPreferences[0].harness!=='claude'||retained?.managed!==true||retained.known!==true||retained.rule?.id!==key.ruleId||retained.lastHandoff?.partial||retained.reconciliation?.partial)throw Error('Managed source and enabled Claude rule without partial handoff required');
    const observed=(Array.isArray(remoteRules)?remoteRules:remoteRules.rules)?.filter((v:any)=>v.sourceRuleId===key.ruleId&&v.definition?.resourceProvider===key.resourceProvider);
    if(observed?.length!==1||observed[0].definition.enabled!==true||observed[0].definition.agentPreferences?.length!==1||observed[0].definition.agentPreferences[0].harness!=='claude'||observed[0].locallyDisabled===true)throw Error('Saved and current authoritative rule differ');
+   assertBootstrapRule(desired[0],observed[0]);
    mustBeAbsent(join(r.stateDirectory,'worker-canary-mode.json'));mustBeAbsent(join(r.stateDirectory,'worker-canary-control.lock'));
    const {worker:source}=await worker(r.sourcePane,'codex'),{worker:target,pane}=await worker(r.targetPane,'claude');
    if(agentIdOfWorkspacePath(source.cwd,canonical(paths.workspaces))!==r.workerKey)throw Error('Source is outside the daemon managed workspace');
