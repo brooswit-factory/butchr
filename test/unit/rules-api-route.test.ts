@@ -19,7 +19,7 @@ function baseDeps(overrides: Partial<ViewDeps> = {}): ViewDeps {
   } as ViewDeps;
 }
 
-const emptyInventory: QueryAgentInventory = { rules: [], errors: [] };
+const emptyInventory: QueryAgentInventory = { rules: [], sessionDefinitions: [], errors: [] };
 
 // `server.requestIP(request)` (used to extract the client address+port for
 // the peer-uid check — PR #642 review round 2, G2: BOTH `/api/rules` and
@@ -179,15 +179,15 @@ describe("GET /api/rules", () => {
       configInventory: async () => ({
         rules: [{
           kind: "rule", id: "triage", resourceProvider: "jira-work", query: "project = X", enabled: true,
-          execution: "swarm", role: "worker", agentPreferences: [], linkedEventing: false,
+          execution: "swarm", account: "none", role: "worker", agentPreferences: [], linkedEventing: false,
           mcpServerNames: [], staffed: true, reason: null,
         }],
-        errors: [],
+        sessionDefinitions: [], errors: [],
       }),
       getRulesSourceEtag: () => "deadbeef",
       rulesFileState: async () => ({
         path: "/rules.json",
-        rules: [{ id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = X", brief: "do the thing", execution: "swarm", role: "worker" } as any],
+        rules: [{ id: "triage", enabled: true, resourceProvider: "jira-work", query: "project = X", brief: "do the thing", execution: "swarm", account: "none", role: "worker" } as any],
         error: null,
         mtime: "2026-10-05T12:00:00.000Z",
         fileEtag: "deadbeef",

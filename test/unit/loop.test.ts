@@ -125,11 +125,14 @@ describe("scopedHerd (BUTCHR-91/BUTCHR-68) — must preserve a REAL HerdrHerd's 
   //    name, closing exactly the gap `resumeInPlace` fell through here.
   test("FACTORY-426: scopedHerd forwards EVERY member of Herd, named or not — closes the class, not just this one instance", () => {
     const full: Required<Herd> = {
+      ruleCensus:async()=>({ids:[],complete:true}),
+      ruleRuntime:()=>{throw Error("Not invoked by forwarding test");},
       frozen: async (ids) => new Set(ids),
       runningIssues: async () => [],
       staleIssues: async () => [],
       spawn: async () => {},
       recoverQuota: async () => "not-refused",
+      reconcilePreferences:async()=>({status:'blocked',reason:'Not invoked by forwarding test'}),
       stop: async () => {},
       paneFor: async () => null,
       nudge: async () => ({ delivered: false }),
@@ -317,37 +320,149 @@ describe("reconcileNow", () => {
   });
 });
 
-describe("reconcileNow: every desired spec reaches herd.spawn unchanged", () => {
+describe("reconcileNow: BUTCHR-412 account lifecycle hooks", () => {
   const spec = (k: string) => ({ key: k, issuetype: "Task", summary: "s", parent: null });
 
   function fakeHerdCapturingSpecs(initial: string[] = [], stale: Array<{ issue: string; reason: string; observedArgv: string[] }> = []) {
     const running = new Set(initial);
-    const spawned: Array<{ spec: unknown; origin: string | undefined }> = [];
+    const spawnedSpecs: Array<{ key: string; rocketchatAccount: unknown; origin: string | undefined }> = [];
     const stopped: string[] = [];
     const herd: Herd = {
       async runningIssues() { return [...running]; },
       async staleIssues() { return stale.filter((s) => running.has(s.issue)); },
-      async spawn(sp, origin) { spawned.push({ spec: sp, origin }); running.add(sp.key); },
+      async spawn(sp, origin) { spawnedSpecs.push({ key: sp.key, rocketchatAccount: sp.rocketchatAccount, origin }); running.add(sp.key); },
       async stop(i) { stopped.push(i); running.delete(i); },
       async paneFor(i) { return running.has(i) ? `pane-${i}` : null; },
       async nudge() { return { delivered: true }; },
       async resumeInPlace() { return "unresumable" as const; },
     };
-    return { herd, spawned, stopped };
+    return { herd, running, spawnedSpecs, stopped };
   }
 
-  test("a new id is spawned with exactly its desired spec, and an undesired one is stopped", async () => {
-    const { herd, spawned, stopped } = fakeHerdCapturingSpecs(["OLD"]);
-    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]));
-    expect(spawned).toEqual([{ spec: spec("NEW"), origin: undefined }]);
-    expect(stopped).toEqual(["OLD"]);
+  test("ensure runs before spawn and the AUGMENTED spec (with the account NAME) is what herd.spawn actually receives", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const ensureCalledFor: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: {
+        ensure: async (s) => { ensureCalledFor.push(s.key); return { ...s, rocketchatAccount: "butchr_x" }; },
+        release: async () => {},
+        retryPendingReleases: async () => {},
+        publishBatch: async () => {},
+      },
+    });
+    expect(ensureCalledFor).toEqual(["NEW"]);
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchatAccount: "butchr_x", origin: undefined }]);
   });
 
-  test("a stale id is stopped, then respawned with exactly its desired spec", async () => {
-    const { herd, spawned, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
-    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]));
+  test("ensure refusing (null) WITHHOLDS the spawn: herd.spawn is never called, and the id is excluded from onAdmitted's succeeded set", async () => {
+    const { herd, spawnedSpecs } = fakeHerdCapturingSpecs();
+    const admitted: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: { ensure: async () => null, release: async () => {}, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      onAdmitted: (succeeded) => admitted.push(...succeeded),
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(spawnedSpecs).toEqual([]);
+    expect(admitted).toEqual([]);
+    expect(failures).toEqual([{ id: "NEW", stage: "spawn", error: expect.any(Error) }]);
+  });
+
+  test("release is called for a genuine plan.stop id, AFTER herd.stop succeeds, with reason \"stop\"", async () => {
+    const { herd, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id, reason) => { released.push({ id, reason }); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+    });
+    expect(stopped).toEqual(["OLD"]);
+    expect(released).toEqual([{ id: "OLD", reason: "stop" }]);
+  });
+
+  test("release is never called when herd.stop itself throws — an agent that may still be running must not have its account released", async () => {
+    const herd: Herd = {
+      async runningIssues() { return ["OLD"]; },
+      async staleIssues() { return []; },
+      async spawn() {},
+      async stop() { throw new Error("herdr hiccup"); },
+      async paneFor() { return null; },
+      async nudge() { return { delivered: true }; },
+      async resumeInPlace() { return "unresumable" as const; },
+    };
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(released).toEqual([]);
+    expect(failures).toEqual([{ id: "OLD", stage: "stop", error: expect.any(Error) }]);
+  });
+
+  test("respawn: ensure runs BEFORE the interim stop, release(\"respawn\") is called (documented no-op), and the augmented spec is what gets respawned", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const calls: string[] = [];
+    const released: Array<{ id: string; reason: string }> = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: {
+        ensure: async (s) => { calls.push("ensure"); return { ...s, rocketchatAccount: "butchr_x" }; },
+        release: async (id, reason) => { calls.push("release"); released.push({ id, reason }); },
+        retryPendingReleases: async () => {},
+        publishBatch: async () => {},
+      },
+    });
+    expect(calls).toEqual(["ensure", "release"]); // ensure resolves before the interim stop/release
+    expect(released).toEqual([{ id: "STALE", reason: "respawn" }]);
     expect(stopped).toEqual(["STALE"]);
-    expect(spawned).toEqual([{ spec: spec("STALE"), origin: "respawn" }]);
+    expect(spawnedSpecs).toEqual([{ key: "STALE", rocketchatAccount: "butchr_x", origin: "respawn" }]);
+  });
+
+  test("respawn: ensure refusing leaves the stale-but-working agent running rather than stopping it with no replacement", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["STALE"], [{ issue: "STALE", reason: "x", observedArgv: [] }]);
+    const released: string[] = [];
+    const failures: unknown[] = [];
+    await reconcileNow(herd, new Map([["STALE", spec("STALE")]]), {
+      account: { ensure: async () => null, release: async (id) => { released.push(id); }, retryPendingReleases: async () => {}, publishBatch: async () => {} },
+      checkReconcileFailure: async (fs) => { failures.push(...fs); },
+    });
+    expect(stopped).toEqual([]); // never stopped
+    expect(spawnedSpecs).toEqual([]); // never respawned
+    expect(released).toEqual([]); // release("respawn") never reached — ensure refused first
+    expect(failures).toEqual([{ id: "STALE", stage: "respawn", error: expect.any(Error) }]);
+  });
+
+  test("retryPendingReleases is called exactly once per poll, before anything else, whether or not there is anything to spawn/stop", async () => {
+    const { herd } = fakeHerdCapturingSpecs();
+    let calls = 0;
+    await reconcileNow(herd, new Map(), {
+      account: { ensure: async (s) => s, release: async () => {}, retryPendingReleases: async () => { calls++; }, publishBatch: async () => {} },
+    });
+    expect(calls).toBe(1);
+  });
+
+  // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): published
+  // exactly once, at the very end of the poll — after retryPendingReleases
+  // (top of the poll) AND every ensure/release call this poll made.
+  test("publishBatch is called exactly once per poll, after retryPendingReleases and every ensure/release", async () => {
+    const { herd } = fakeHerdCapturingSpecs(["OLD"]);
+    const order: string[] = [];
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]), {
+      account: {
+        ensure: async (s) => { order.push("ensure"); return s; },
+        release: async () => { order.push("release"); },
+        retryPendingReleases: async () => { order.push("retryPendingReleases"); },
+        publishBatch: async () => { order.push("publishBatch"); },
+      },
+    });
+    expect(order[0]).toBe("retryPendingReleases");
+    expect(order[order.length - 1]).toBe("publishBatch");
+    expect(order.filter((o) => o === "publishBatch")).toHaveLength(1);
+  });
+
+  test("no account hooks at all: behaves exactly as before this ticket (every SpawnSpec reaches herd.spawn unchanged)", async () => {
+    const { herd, spawnedSpecs, stopped } = fakeHerdCapturingSpecs(["OLD"]);
+    await reconcileNow(herd, new Map([["NEW", spec("NEW")]]));
+    expect(spawnedSpecs).toEqual([{ key: "NEW", rocketchatAccount: undefined, origin: undefined }]);
+    expect(stopped).toEqual(["OLD"]);
   });
 });
 
@@ -2856,8 +2971,10 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
       onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
       intervalMs: 10,
     });
-    await new Promise((r) => setTimeout(r, 100));
+    // Exercise multiple complete polls even when the test runner is busy.
+    for(let attempt=0;attempt<200&&n<8;attempt++)await new Promise(r=>setTimeout(r,5));
     stop();
+    expect(n).toBeGreaterThanOrEqual(8);
     const kEvents = notified.filter((e) => e.issue === "K");
     expect(kEvents.length).toBe(2);
     expect(kEvents[0]!.reason).toEqual({ appeared: true });
@@ -2904,11 +3021,13 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
     expect(kEvents[1]!.reason).toEqual({ comment: "c1" }); // delivered exactly once, from the forced re-check — never lost, never duplicated
   });
 
-  test("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure", async () => {
+  test.each([0, 80])("a comment fetch that 429s is SKIPPED and logged/counted as 'load', distinctly from a generic failure (initial poll delay%dms)", async (delay) => {
     const herd = fakeHerd();
     const notified: Array<{ issue: string; reason: unknown }> = [];
     const skipped: Array<{ key: string; reason: string }> = [];
     let pollIndex = 0;
+    let observed!: () => void;
+    const observedSkip = new Promise<void>(resolve => { observed = resolve; });
     const comments = async () => {
       if (pollIndex === 1) return [comment("c0")];
       throw new AtlassianHttpError(429, "GET", "/rest/api/3/issue/K/comment", "rate limited");
@@ -2916,15 +3035,20 @@ describe("startLoop FACTORY-922 (implementing story FACTORY-921): skip-notify wh
     const polls: JiraIssue[][] = [[], [mk("t1")], [mk("t2")]];
     let n = 0;
     const stop = startLoop({
-      search: async () => { pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
+      search: async () => { if(n === 0 && delay > 0) await new Promise(resolve => setTimeout(resolve, delay)); pollIndex = Math.min(n++, polls.length - 1); return polls[pollIndex]!; },
       herd,
       notify: (issue, _about, reason) => { notified.push({ issue, reason }); },
       comments,
-      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); },
+      onCommentCheckSkipped: (key, reason) => { skipped.push({ key, reason }); observed(); },
       intervalMs: 10,
     });
-    await new Promise((r) => setTimeout(r, 60));
-    stop();
+    // Observe completion, not an assumed number of polls inside a60ms wall-clock window.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([observedSkip, new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('Expected429 load-skip callback was not observed')), 1000);
+      })]);
+    } finally { stop(); clearTimeout(deadline); }
     const kEvents = notified.filter((e) => e.issue === "K");
     expect(kEvents.length).toBe(1); // only "appeared" — the 429'd check never delivers
     expect(skipped).toEqual([{ key: "K", reason: "load" }]);

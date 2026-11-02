@@ -678,7 +678,7 @@ async function readLinkedPage(ops: AtlassianOps, key: string): Promise<Versioned
  * — not an error, not a lazily-manufactured page — so an agent can tell
  * "no page" from "empty page" from "call failed". (Reversed from this
  * ticket's original draft, which had the arg-less form create lazily; the
- * settled spec — https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/12484678
+ * settled spec — https://example.atlassian.net/wiki/spaces/BUTCHR/pages/12484678
  * — makes get_doc the one verb here that writes nothing at all.)
  *
  * BOUNDED, CALLER-CONTROLLABLE RANGE READ (BUTCHR-270): `offset`/`limit` let

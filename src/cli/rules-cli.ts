@@ -7,8 +7,9 @@
  * `assignee = currentUser()`); this command answers "what would happen"
  * before the daemon ever runs.
  *
- * Dispatched from a guard at the top of `src/daemon/index.ts`, before
- * that file's own config/rules loading.
+ * Same precedent as `link-cli.ts`/`session-cli.ts`: dispatched from a guard
+ * at the top of `src/daemon/index.ts`, before that file's own config/rules
+ * loading.
  *
  * REUSE, NOT RE-DERIVATION:
  * - validation goes through `loadRulesFileState` (`../agents/query-agent-

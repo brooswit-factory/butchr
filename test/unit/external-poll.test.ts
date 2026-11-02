@@ -5,7 +5,7 @@ import {
 } from "../../src/jira-watch/external-poll.js";
 
 describe("BUTCHR-437: pollConfluencePage", () => {
-  const CONF_URL = "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/12484678/Some+Page";
+  const CONF_URL = "https://example.atlassian.net/wiki/spaces/BUTCHR/pages/12484678/Some+Page";
 
   test("a version bump is a genuine change; an unparseable URL is unreadable with no HTTP call", async () => {
     let calls = 0;
@@ -13,7 +13,7 @@ describe("BUTCHR-437: pollConfluencePage", () => {
     expect(await pollConfluencePage(CONF_URL, deps)).toEqual({ status: "ok", fingerprint: "3" });
     expect(calls).toBe(1);
 
-    const notAPage = "https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/overview";
+    const notAPage = "https://example.atlassian.net/wiki/spaces/BUTCHR/overview";
     expect(await pollConfluencePage(notAPage, deps)).toEqual({ status: "unreadable" });
     expect(calls).toBe(1); // no HTTP call for an unresolvable page id
   });

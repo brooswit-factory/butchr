@@ -1,0 +1,30 @@
+import {mock} from 'bun:test';
+import * as fs from 'node:fs';import {join} from 'node:path';import {tmpdir} from 'node:os';
+const readlink=fs.readlinkSync;let denied=true;const deniedIDs=new Set([123]);
+mock.module('node:fs',()=>({...fs,readlinkSync:(p:any,...args:any[])=>{if(denied&&deniedIDs.has(Number(String(p).match(/\/(\d+)\/cwd$/)?.[1])))throw Object.assign(Error('denied'),{code:'EACCES'});return (readlink as any)(p,...args);}}));
+const {realRenewalInspectionIO}=await import('../../src/control-panel/worker-renewal-inspection.js');
+const d=fs.mkdtempSync(join(tmpdir(),'attested-process-'));let assertions=0;
+try{
+ fs.mkdirSync(join(d,'runtime/dist'),{recursive:true});fs.writeFileSync(join(d,'runtime/dist/butchr.js'),'synthetic');fs.mkdirSync(join(d,'proc/123'),{recursive:true});fs.mkdirSync(join(d,'proc/sys/kernel/random'),{recursive:true});fs.writeFileSync(join(d,'proc/sys/kernel/random/boot_id'),'boot');
+ const stat=(ticks=34)=>'123 (fixture) S '+Array.from({length:19},(_,i)=>i===18?String(ticks):'0').join(' ');fs.writeFileSync(join(d,'proc/123/stat'),stat());fs.symlinkSync('/other',join(d,'proc/123/cwd'));fs.writeFileSync(join(d,'proc/123/cmdline'),'fixture\0');
+ const expected={pid:123,startTicks:34,executable:'/usr/sbin/fixture',sha256:'a'.repeat(64)};let calls=0;let during=()=>{};
+ const policy={bootId:'boot',expected:[expected],attest:async()=>{calls++;during();return {checkedAt:Date.now(),bootId:'boot',processes:[{...expected}]};}};
+ const io=realRenewalInspectionIO({runtimeDirectory:join(d,'runtime'),socketPath:'/unused',procRoot:join(d,'proc'),freezeRoot:'/unused',protectedProcesses:policy});
+ const refuse=async(f:()=>Promise<unknown>)=>{let failed=false;try{await f();}catch{failed=true;}if(!failed)throw Error('Expected refusal');assertions++;};
+ if((await io.competingPids()).length||calls!==1)throw Error('Fresh attestation not consumed');assertions++;
+ await refuse(()=>realRenewalInspectionIO({runtimeDirectory:join(d,'runtime'),socketPath:'/unused',procRoot:join(d,'proc'),freezeRoot:'/unused'}).competingPids() as Promise<number[]>);
+ fs.writeFileSync(join(d,'proc/123/stat'),stat(35));await refuse(()=>io.competingPids() as Promise<number[]>);fs.writeFileSync(join(d,'proc/123/stat'),stat());
+ during=()=>fs.writeFileSync(join(d,'proc/123/stat'),stat(36));await refuse(()=>io.competingPids() as Promise<number[]>);fs.writeFileSync(join(d,'proc/123/stat'),stat());
+ during=()=>{fs.mkdirSync(join(d,'proc/124'));fs.symlinkSync(join(d,'runtime'),join(d,'proc/124/cwd'));fs.writeFileSync(join(d,'proc/124/cmdline'),'bun\0butchr.js\0');};if(!(await io.competingPids()).includes(124))throw Error('Missed daemon during attestation');assertions++;
+ fs.rmSync(join(d,'proc/124'),{recursive:true});during=()=>{};
+ const withParent=(pid:number,parent:number,ticks:number)=>pid+' (fixture) S '+Array.from({length:19},(_,i)=>i===0?String(parent):i===18?String(ticks):'0').join(' ');
+ const add=(pid:number,parent:number,ticks:number)=>{fs.mkdirSync(join(d,'proc',String(pid)),{recursive:true});fs.writeFileSync(join(d,'proc',String(pid),'stat'),withParent(pid,parent,ticks));fs.symlinkSync('/other',join(d,'proc',String(pid),'cwd'));fs.writeFileSync(join(d,'proc',String(pid),'cmdline'),'fixture\0');};
+ add(125,0,88);add(process.pid,125,99);deniedIDs.add(125);
+ let mutate=()=>{};const ancestorPolicy={...policy,operatorAncestorImage:{executable:expected.executable,sha256:expected.sha256},attest:async(rows:any)=>{mutate();return {checkedAt:Date.now(),bootId:'boot',processes:rows.map((r:any)=>({...r}))};}};
+ const ancestorIO=realRenewalInspectionIO({runtimeDirectory:join(d,'runtime'),socketPath:'/unused',procRoot:join(d,'proc'),freezeRoot:'/unused',protectedProcesses:ancestorPolicy});
+ if((await ancestorIO.competingPids()).length)throw Error('Fresh exact ancestor refused');assertions++;
+ add(126,0,90);deniedIDs.add(126);await refuse(()=>ancestorIO.competingPids() as Promise<number[]>);fs.rmSync(join(d,'proc/126'),{recursive:true});deniedIDs.delete(126);
+ mutate=()=>fs.writeFileSync(join(d,'proc',String(process.pid),'stat'),withParent(process.pid,0,99));await refuse(()=>ancestorIO.competingPids() as Promise<number[]>);fs.writeFileSync(join(d,'proc',String(process.pid),'stat'),withParent(process.pid,125,99));
+ mutate=()=>fs.writeFileSync(join(d,'proc/125/stat'),withParent(125,0,89));await refuse(()=>ancestorIO.competingPids() as Promise<number[]>);
+ console.log(JSON.stringify({assertions,passed:true}));
+}finally{fs.rmSync(d,{recursive:true,force:true});}

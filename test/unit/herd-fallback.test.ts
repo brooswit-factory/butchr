@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ProviderAvailabilityRegistry, processProviderAvailability } from "@brooswit/drovr";
+import {createWorkerRollout,nativeSessionHash,type CanaryPermit} from '../../src/control-panel/worker-rollout.js';
+import {persistIntentionalStop} from '../../src/agents/stop-cause.js';
 import { HerdrHerd } from "../../src/agents/herd.js";
 import type { AgentConfig } from "../../src/agents/argv.js";
 import { AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
-import { buildWorkspace, workspaceRoot } from "../../src/agents/workspace.js";
+import { buildWorkspace, workspaceRoot, workspaceDirFor } from "../../src/agents/workspace.js";
 
 const spec = { key: "TEST-1", issuetype: "Task", summary: "fallback fixture", parent: null };
 const url = "http://localhost:7717/mcp";
@@ -25,14 +27,14 @@ const instant = async () => {};
 const config: AgentConfig = { provider: "claude", providers: ["claude", "codex"], disabledMcpServers: [] };
 type Row = { pane_id: string; agent: string; cwd: string; agent_status: string };
 
-function fixture(options: { refuseClaude?: boolean; refuseCodex?: boolean; launchError?: Error; existing?: Row[]; text?: string; missingTranscript?: boolean; missingAck?: boolean } = {}) {
+function fixture(options: { refuseClaude?: boolean; refuseCodex?: boolean; launchError?: Error; existing?: Row[]; text?: string; missingTranscript?: boolean; missingAck?: boolean; historyText?: string } = {}) {
   let rows = options.existing ?? [];
   const starts: any[] = [], creates: any[] = [], closed: string[] = [], prompts: any[] = [], keys: any[] = [];
   const texts = new Map<string, string>();
   const histories = new Map<string, string>();
   function record(pane: string, provider: string, prompt?: string) {
     const token = prompt?.match(/DROVR_HANDOFF_READY_[a-f0-9-]+/)?.[0];
-    const text = token && !options.missingAck ? `${token}\nWorking summary with outstanding work.` : "Previous work and pending objectives.";
+    const text = token && !options.missingAck ? `${token}\nWorking summary with outstanding work.` : (options.historyText ?? "Previous work and pending objectives.");
     const item = provider === "agy" ? { step_index: 0, type: "PLANNER_RESPONSE", source: "MODEL", status: "DONE", content: text }
       : provider === "codex" ? { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text }] } }
       : { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
@@ -99,6 +101,103 @@ describe("HerdrHerd ordered provider fallback", () => {
     pane_id: "old", cwd: join(workspaceRoot(), spec.key), agent, agent_status,
   });
 
+  test("desired preferences use acknowledged native handoff and preserve queued notification delivery", async () => {
+    const f=fixture({existing:[existing('codex','done')]});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result).toMatchObject({status:'applied',current:{paneId:'new-1',provider:'claude'}});
+    expect(f.closed).toEqual(['old']);expect(f.starts.length).toBe(1);expect(f.starts[0].args.join(' ')).toContain('DROVR_HANDOFF_READY_');
+  });
+  for(const explicit of [undefined,'existing-explicit-account'])test(`desired handoff preserves channel account ${explicit??'fallback'}`,async()=>{
+    const f=fixture({existing:[existing('codex','done')]});const binding={name:'rocketr',type:'http' as const,url:'https://rocketr.example/mcp',channel:false,accountHeader:'x-rocketr-account'};
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,()=>[binding],()=> 'existing-computed-account');
+    const result=await herd.reconcilePreferences({...spec,mcpServers:[binding],...(explicit?{rocketchatAccount:explicit}:{}),agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('applied');const mcp=readFileSync(join(workspaceRoot(),spec.key,'mcp.json'),'utf8');expect(mcp).toContain(explicit??'existing-computed-account');if(explicit)expect(mcp).not.toContain('existing-computed-account');
+  });
+  async function canaryFixture(options:{missingAck?:boolean;stale?:boolean;historyText?:string}={}){
+    const row={...existing('codex','done'),interactive_ready:true};const f=fixture({existing:[row],...(options.missingAck?{missingAck:true}:{}),...(options.historyText?{historyText:options.historyText}:{})});
+    f.client.pane.list=async()=>({panes:[...f.rows().map(r=>({pane_id:r.pane_id})),{pane_id:'human-preserved'}]});
+    const {agent}=await f.client.agent.get('old');
+    const authority={serverId:'00000000-0000-4000-8000-000000000001',authorizationId:'00000000-0000-4000-8000-000000000002',deploymentId:'00000000-0000-4000-8000-000000000003'};
+    const key='jira-work:tasks:FIXTURE-1';const canarySpec={...spec,key,agents:[{harness:'claude' as const,model:'desired'}]};
+    // Existing synthetic pane must belong to this exact managed workspace.
+    row.cwd=workspaceDirFor(key);mkdirSync(row.cwd,{recursive:true});
+    const permit:CanaryPermit={version:1,permitId:'00000000-0000-4000-8000-000000000005',workerKey:key,authority,desiredToken:'a'.repeat(64),targetProvider:'claude',expiresAt:new Date(Date.now()+600000).toISOString(),source:{paneId:'old',cwd:row.cwd,provider:'codex',sessionHash:nativeSessionHash(agent.agent_session)!},holdClearance:{notHeld:true,paneId:'old',sessionHash:nativeSessionHash(agent.agent_session)!,expiresAt:new Date(Date.now()+600000).toISOString()}};
+    const path=join(root,'canary-permit.json');writeFileSync(path,JSON.stringify(permit),{mode:0o600});const rollout=createWorkerRollout(path,root);
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}),undefined,undefined,undefined,undefined,rollout);
+    if(options.stale)row.pane_id='foreign-replacement';
+    return {f,herd,rollout,canarySpec,sourceHistory:readFileSync(agent.agent_session.value,'utf8'),change:{id:key,token:permit.desiredToken,authority,spec:canarySpec}};
+  }
+  test('canary actual Drovr ACK then retirement succeeds once; quota/spawn/stop/resume cannot bypass',async()=>{
+    const c=await canaryFixture();
+    const result=await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change);
+    expect(result).toMatchObject({status:'applied',current:{paneId:'new-1',provider:'claude'}});expect(c.f.closed).toEqual(['old']);expect(c.f.starts.length).toBe(1);expect(c.f.prompts.at(-1)?.text).toContain('CANARY_HANDOFF_COMPLETE');expect(c.f.prompts[0]?.text).toContain('Transcript chunk 1 of 1');expect(c.f.starts[0].args[0].length).toBeLessThan(512);
+    expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');
+    await expect(c.herd.spawn(c.canarySpec)).rejects.toThrow('canary');await expect(c.herd.stop(c.canarySpec.key)).rejects.toThrow('canary');await expect(c.herd.resumeInPlace(c.canarySpec)).rejects.toThrow('canary');expect(c.f.starts.length).toBe(1);expect(c.f.closed).toEqual(['old']);
+  });
+  for (const [kind, text] of [['ascii', 'A'.repeat(4 * 1024 * 1024 + 1)], ['unicode', '界😀'.repeat(2 * 1024 * 1024)], ['ack-looking', ('DROVR_HANDOFF_READY DROVR_HANDOFF_READY_00000000-0000-0000-0000-000000000000 ').repeat(70000)]] as const) {
+    test(`only named canary imports complete oversized ${kind} history through actual Drovr chunk ACKs`, async () => {
+      const c = await canaryFixture({ historyText: text });
+      const result = await c.herd.reconcilePreferences(c.canarySpec, () => true, c.change);
+      expect(result).toMatchObject({status:'applied',current:{paneId:'new-1',provider:'claude'}});
+      const prompts = [c.f.starts[0].args[0], ...c.f.prompts.map(p => p.text)].filter(p => p.startsWith('Drovr context handoff. This turn is ONLY'));
+      const imported = prompts.map(p => JSON.parse(p.match(/"(?:[^"\\]|\\.)*"$/s)![0]) as string).join('');
+      expect(prompts.length).toBeGreaterThan(80);
+      expect(imported).toBe(c.sourceHistory);
+      expect(c.f.closed).toEqual(['old']);
+      expect(c.f.rows().map(r=>r.pane_id)).toEqual(['new-1']);
+      expect(c.rollout.summary().status).not.toBe('pending');
+      expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');
+      expect(c.f.starts.length).toBe(1);
+    });
+  }
+  test('unfenced workers retain default byte limit and source identity before target creation',async()=>{
+    const f=fixture({existing:[existing('codex','done')],historyText:'x'.repeat(4*1024*1024+1)});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('blocked');expect(f.creates).toEqual([]);expect(f.closed).toEqual([]);expect(f.rows()[0]!.pane_id).toBe('old');
+  });
+  test('canary missing ACK closes only its owned target and never retires source or retries',async()=>{
+    const c=await canaryFixture({missingAck:true});
+    // Injected instant wait exercises the pinned SDK bounded ACK polling without sleeping.
+    const result=await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change);
+    expect(result.status).toBe('blocked');expect(c.f.closed).not.toContain('old');expect(c.f.starts.length).toBe(1);expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');expect(c.f.starts.length).toBe(1);
+  },150000);
+  test('canary quota observer never replaces source and recognized hold blocks the permitted handoff',async()=>{const c=await canaryFixture();c.f.texts.set('old',codexNotice);expect(await c.herd.recoverQuota(c.canarySpec)).toBe('waiting');expect(c.f.starts).toEqual([]);expect(c.f.closed).toEqual([]);expect(c.rollout.summary().status).toBe('pending');const result=await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change);expect(result).toMatchObject({status:'blocked'});if(result.status==='blocked')expect(result.reason).toContain('hold');expect(c.f.creates).toEqual([]);expect(c.f.closed).toEqual([]);});
+  test('canary does not waive an intentional stand-down marker',async()=>{const c=await canaryFixture();persistIntentionalStop(workspaceDirFor(c.canarySpec.key),'stand_down');const result=await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change);expect(result.status).toBe('blocked');expect(c.f.starts).toEqual([]);expect(c.f.closed).toEqual([]);});
+  test('canary treats a corrupt stop marker as unknown hold rather than clearing it',async()=>{const c=await canaryFixture();writeFileSync(join(workspaceDirFor(c.canarySpec.key),'.butchr-stop-cause.json'),'not-json');expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');expect(c.f.starts).toEqual([]);expect(readFileSync(join(workspaceDirFor(c.canarySpec.key),'.butchr-stop-cause.json'),'utf8')).toBe('not-json');});
+  test('canary stale identity refuses before target creation',async()=>{const c=await canaryFixture({stale:true});expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');expect(c.f.creates).toEqual([]);expect(c.f.closed).toEqual([]);expect(c.rollout.summary().status).not.toBe('pending');c.f.rows()[0]!.pane_id='old';expect((await c.herd.reconcilePreferences(c.canarySpec,()=>true,c.change)).status).toBe('blocked');expect(c.f.creates).toEqual([]);});
+  test("desired handoff refuses missing native history without replacing source", async () => {
+    const f=fixture({existing:[existing('codex','done')],missingTranscript:true});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('blocked');expect(f.starts).toEqual([]);expect(f.closed).toEqual([]);expect(f.rows()[0]!.pane_id).toBe('old');
+  });
+  test("desired handoff fences superseded preparation before native launch", async () => {
+    const f=fixture({existing:[existing('codex','done')]});let current=true;
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>{current=false;return {HOME:root};});
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>current);
+    expect(result.status).toBe('blocked');expect(f.starts).toEqual([]);expect(f.closed).toEqual([]);
+  });
+  test("desired handoff refuses stale pane identity during preparation", async () => {
+    const f=fixture({existing:[existing('codex','done')]});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>{f.rows()[0]!.pane_id='foreign-replacement';return {HOME:root};});
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('blocked');expect(f.starts).toEqual([]);expect(f.closed).toEqual([]);expect(f.rows()[0]!.pane_id).toBe('foreign-replacement');
+  });
+  test("desired handoff exposes committed target when old retirement fails", async () => {
+    const f=fixture({existing:[existing('codex','done')]});f.client.pane.close=async()=>{throw Error('synthetic retirement failure');};
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result).toMatchObject({status:'blocked',partial:true,current:{paneId:'new-1',provider:'claude'}});expect(f.rows().map(r=>r.pane_id)).toEqual(['old','new-1']);expect(f.prompts).toHaveLength(1);expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
+  });
+  test("desired handoff leaves actively working source uninterrupted", async () => {
+    const f=fixture({existing:[existing('codex','working')]});
+    const herd=new HerdrHerd(f.client,url,instant,undefined,config,new ProviderAvailabilityRegistry(),async()=>({HOME:root}));
+    const result=await herd.reconcilePreferences({...spec,agents:[{harness:'claude',model:'desired'}]},()=>true);
+    expect(result.status).toBe('blocked');expect(f.starts).toEqual([]);expect(f.closed).toEqual([]);expect(f.prompts).toEqual([]);
+  });
+
   test("missing native history preserves the refused worker and reports waiting", async () => {
     const f = fixture({ existing: [existing()], missingTranscript: true });
     const logs: string[] = [];
@@ -129,7 +228,8 @@ describe("HerdrHerd ordered provider fallback", () => {
     release();
     expect(await recovery).toBe("recovered");
     expect(await nudge).toEqual({ delivered: true });
-    expect(f.prompts).toEqual([
+    expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
+    expect(f.prompts.slice(1)).toEqual([
       { target: "new-1", text: AGENTS_KICKOFF_PROMPT },
       { target: "new-1", text: "new request" },
     ]);
@@ -152,8 +252,10 @@ describe("HerdrHerd ordered provider fallback", () => {
     }, undefined, instant);
     await herd.spawn(spec);
     expect(f.starts.map(p => p.kind)).toEqual(["claude", "agy"]);
-    expect(f.starts[1].args[1]).toContain("ONLY for importing and compacting historical context");
-    expect(f.prompts).toEqual([{ target: "new-2", text: AGENTS_KICKOFF_PROMPT }]);
+    expect(f.starts[1].args[1]).toContain("context handoff bootstrap");
+    expect(f.starts[1].args[1].length).toBeLessThan(512);
+    expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
+    expect(f.prompts.slice(1)).toEqual([{ target: "new-2", text: AGENTS_KICKOFF_PROMPT }]);
     expect(f.closed).toEqual(["new-1"]);
     expect(JSON.parse(readFileSync(join(f.creates[1].cwd, ".butchr-agy.json"), "utf8"))).toEqual({ issue: spec.key, mcpUrl: url });
     expect(await herd.runningIssues()).toEqual([spec.key]);
@@ -401,7 +503,9 @@ describe("HerdrHerd ordered provider fallback", () => {
       const herd = new HerdrHerd(f.client, url, instant, line => logs.push(line), config, availability);
       expect(await herd.recoverQuota(spec)).toBe("recovered");
       expect(f.starts.map(p => p.kind)).toEqual(["claude"]);
-      expect(f.starts[0].args[0]).toContain("ONLY for importing and compacting historical context");
+      expect(f.starts[0].args[0]).toContain("context handoff bootstrap");
+      expect(f.starts[0].args[0].length).toBeLessThan(512);
+      expect(f.prompts[0].text).toContain('Transcript chunk 1 of 1');
       expect(f.closed).toEqual(["old"]);
       expect(f.creates[0].cwd).toBe(existing().cwd);
       expect(await herd.paneFor(spec.key)).toBe("new-1");

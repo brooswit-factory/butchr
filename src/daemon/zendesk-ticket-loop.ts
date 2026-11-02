@@ -10,6 +10,7 @@
  * reconciliation to `zendesk-ticket` agents, so no loop can stop another's.
  */
 import type { Herd } from "../agents/herd.js";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import { zendeskTicketNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { ZendeskTicketClient } from "../resources/zendesk-ticket.js";
@@ -47,6 +48,8 @@ export interface ZendeskTicketLoopDeps {
   reserveAdmission?: (ids: readonly string[]) => void;
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment (src/daemon/loop.ts) — threaded straight through. Optional; omitted, no account lifecycle runs. */
+  account?: AccountLifecycleHooks;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -73,6 +76,7 @@ export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsZendeskTicketAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"zendesk-ticket",
     herd: deps.herd,
     ownsId: ownsZendeskTicketAgent,
     // BUTCHR-398: `about`, not `resourceKeyOf(agent)` unconditionally — see
@@ -89,6 +93,7 @@ export function startZendeskTicketLoop(deps: ZendeskTicketLoopDeps): Stop {
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
+    ...(deps.account ? { account: deps.account } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? ZENDESK_TICKET_POLL_MS,
     onError: (e) => {

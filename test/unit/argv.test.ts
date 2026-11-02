@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { agentLaunchConfig, agentStartParams, spawnArgs, checkArgv, providerOrder, DEFAULT_PERMISSION_MODE, KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT, kickoffFor, controlCharStartArgs, assertSafeStartArgv } from "../../src/agents/argv.js";
+import { SESSION_PERMISSION_MODES } from "../../src/resources/session-definition.js";
 import { RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { buildAgentStartParams } from "@brooswit/drovr";
 
@@ -32,7 +33,11 @@ describe("spawnArgs", () => {
     expect(DEFAULT_PERMISSION_MODE).toBe("acceptEdits");
   });
 
-  test("FACTORY-138 (AC3): every explicit value in the exported permission-mode union still wins over the new default", () => {
+  test("FACTORY-138 (AC3): every explicit value in BOTH exported permission-mode unions still wins over the new default", () => {
+    for (const mode of SESSION_PERMISSION_MODES) {
+      const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783");
+      expect(args[args.indexOf("--permission-mode") + 1]).toBe(mode);
+    }
     for (const mode of RULE_PERMISSION_MODES) {
       const args = spawnArgs({ ...spec, permissionMode: mode }, "/w/KAN-783");
       expect(args[args.indexOf("--permission-mode") + 1]).toBe(mode);
@@ -133,7 +138,7 @@ describe("checkArgv", () => {
 
   test("a bare `claude --resume <id>` -> stale, reason names all three required flags", () => {
     const expected = spawnArgs(spec, "/w/KAN-783");
-    const observed = ["claude", "--resume", "8e5164dc-c5d6-41b7-aa41-4a6143b818a5"];
+    const observed = ["claude", "--resume", "00000000-0000-4000-8000-f54f26bc067d"];
     const check = checkArgv(expected, observed);
     expect(check.ok).toBe(false);
     if (!check.ok) {
@@ -372,6 +377,45 @@ describe("spawnArgs — MCP server bindings (BUTCHR-411)", () => {
     } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS; }
   });
 
+  // BUTCHR-413 (CHANGES_REQUESTED review finding 1): unlike headersEnvVar's
+  // secret value, a binding's non-secret `accountHeader` reaches Codex argv
+  // — this is what lets a Codex agent's own mcp.json tool calls to a bridge
+  // like rocketr identify which account is replying at all, after the
+  // BUTCHR-411 fix above (still true, still tested immediately above) struck
+  // every OTHER header from a Codex launch.
+  test("a binding's accountHeader reaches Codex argv when this launch carries an rocketchatAccount — a non-secret account name, not a credential", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount], rocketchatAccount: "butchr_jira-work-triage-kan-9_deadbeef00" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).toContain("http_headers");
+    expect(mudArg).toContain("x-rocketr-account");
+    expect(mudArg).toContain("butchr_jira-work-triage-kan-9_deadbeef00");
+  });
+
+  test("accountHeader configured but no rocketchatAccount on this launch (an account:\"none\" rule, or a provisioning refusal) — no headers at all, same as before this field existed", () => {
+    const withAccount = { ...mud, accountHeader: "x-rocketr-account" };
+    const args = spawnArgs({ ...spec, mcpServers: [withAccount] }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+    const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+    expect(mudArg).toBeDefined();
+    expect(mudArg).not.toContain("http_headers");
+  });
+
+  test("both headersEnvVar (secret) and accountHeader (non-secret) configured together: Codex argv carries the account name but never the secret", () => {
+    process.env.BUTCHR_TEST_MUD_HEADERS_2 = JSON.stringify({ Authorization: "Bearer SEKRET-TOKEN-VALUE-2" });
+    try {
+      const both = { ...mud, headersEnvVar: "BUTCHR_TEST_MUD_HEADERS_2", accountHeader: "x-rocketr-account" };
+      const args = spawnArgs({ ...spec, mcpServers: [both], rocketchatAccount: "butchr_acct" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
+      const mudArg = args.find((a) => a.includes("mcp_servers.mud="));
+      expect(mudArg).toBeDefined();
+      expect(mudArg).toContain("x-rocketr-account");
+      expect(mudArg).toContain("butchr_acct");
+      expect(mudArg).not.toContain("SEKRET-TOKEN-VALUE-2");
+      expect(mudArg).not.toContain("Authorization");
+      for (const a of args) expect(a).not.toContain("SEKRET-TOKEN-VALUE-2");
+    } finally { delete process.env.BUTCHR_TEST_MUD_HEADERS_2; }
+  });
+
   test("agy's launch is unaffected by mcpServers — bindings must not break it", () => {
     const launch = agentStartParams({ ...spec, mcpServers: [mud] }, "/w/KAN-783", "pane", "worker", { provider: "agy" });
     expect(launch).toEqual(agentStartParams(spec, "/w/KAN-783", "pane", "worker", { provider: "agy" }));
@@ -452,7 +496,7 @@ describe("FACTORY-108: codex lizard mode — manual-approval launch", () => {
 
 describe("FACTORY-577: codex spec.permissionMode honored", () => {
   const BYPASS_FLAG = "--dangerously-bypass-approvals-and-sandbox";
-  const NON_BYPASS_MODES = RULE_PERMISSION_MODES.filter((m) => m !== "bypassPermissions");
+  const NON_BYPASS_MODES = SESSION_PERMISSION_MODES.filter((m) => m !== "bypassPermissions");
 
   test('explicit "bypassPermissions" => codex launch has the bypass flag, bypassApprovalsAndSandbox true explicitly', () => {
     const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions" }, "/w/KAN-783", { provider: "codex", disabledMcpServers: [] });
@@ -563,7 +607,7 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("a fresh Claude launch NEVER gets --session-id, even when the workspace happens to have a discovered id persisted from an earlier launch", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("11111111-1111-1111-1111-111111111111"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-bafde89c041e"));
       const args = spawnArgs(spec, dir);
       expect(args).not.toContain("--session-id");
       expect(args).not.toContain("--resume");
@@ -581,16 +625,16 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("agent.resumeSessionId set emits --resume instead of --session-id, even when a persisted id also exists (the persisted id itself, if consistent, or a caller-chosen one)", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
-      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" });
-      expect(args).toEqual(expect.arrayContaining(["--resume", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"]));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-4242a3bcf136"));
+      const args = spawnArgs(spec, dir, { provider: "claude", resumeSessionId: "00000000-0000-4000-8000-4242a3bcf136" });
+      expect(args).toEqual(expect.arrayContaining(["--resume", "00000000-0000-4000-8000-4242a3bcf136"]));
       expect(args).not.toContain("--session-id");
     });
   });
 
   test("non-Claude providers never get either flag", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-1de0d88279f7"));
       const args = spawnArgs(spec, dir, { provider: "agy" });
       expect(args).not.toContain("--session-id");
       expect(args).not.toContain("--resume");
@@ -599,14 +643,14 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 
   test("a resumed launch still carries every OTHER flag a fresh launch has — DoD 1b", () => {
     withDir((dir) => {
-      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("cccccccc-cccc-cccc-cccc-cccccccccccc"));
+      writeFileSync(join(dir, ".butchr-session-id.json"), JSON.stringify("00000000-0000-4000-8000-9b12a6c1bcd4"));
       const fresh = spawnArgs(spec, dir);
-      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "cccccccc-cccc-cccc-cccc-cccccccccccc" });
+      const resumed = spawnArgs(spec, dir, { provider: "claude", model: "claude-opus-5", effort: "medium", resumeSessionId: "00000000-0000-4000-8000-9b12a6c1bcd4" });
       for (const flag of ["--permission-mode", "--mcp-config", "--dangerously-load-development-channels=server:butchr"]) {
         expect(fresh).toContain(flag);
         expect(resumed).toContain(flag);
       }
-      expect(resumed).toEqual(expect.arrayContaining(["--resume", "cccccccc-cccc-cccc-cccc-cccccccccccc", "--model", "claude-opus-5", "--effort", "medium"]));
+      expect(resumed).toEqual(expect.arrayContaining(["--resume", "00000000-0000-4000-8000-9b12a6c1bcd4", "--model", "claude-opus-5", "--effort", "medium"]));
     });
   });
 

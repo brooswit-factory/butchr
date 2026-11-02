@@ -12,6 +12,7 @@
  * stop another's.
  */
 import type { Herd } from "../agents/herd.js";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 import { githubPrNudge } from "../agents/change-nudge.js";
 import { resourceKeyOf } from "../agents/workspace.js";
 import type { GithubPrClient } from "../resources/github-pr.js";
@@ -46,6 +47,8 @@ export interface GithubPrLoopDeps {
   reserveAdmission?: (ids: readonly string[]) => void;
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   checkResidency?: (spawning: readonly string[], desired: readonly string[]) => Promise<readonly string[]>;
+  /** See `ReconcileOptions.account`'s doc comment (src/daemon/loop.ts) — threaded straight through. Optional; omitted, no account lifecycle runs. */
+  account?: AccountLifecycleHooks;
   log: (line: string) => void;
   intervalMs?: number;
   /** Each completed poll, for /health. */
@@ -72,6 +75,7 @@ export function startGithubPrLoop(deps: GithubPrLoopDeps): Stop {
     runningIds: async () => (await deps.herd.runningIssues()).filter(ownsGithubPrAgent),
   });
   return runResourceLoop(type, {
+    ruleProvider:"github-pr",
     herd: deps.herd,
     ownsId: ownsGithubPrAgent,
     notify: async (agent: string, about: string, reason?: NotifyReason) => {
@@ -84,6 +88,7 @@ export function startGithubPrLoop(deps: GithubPrLoopDeps): Stop {
     ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
     ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
     ...(deps.checkResidency ? { checkResidency: deps.checkResidency } : {}),
+    ...(deps.account ? { account: deps.account } : {}),
     log: deps.log,
     intervalMs: deps.intervalMs ?? GITHUB_PR_POLL_MS,
     onError: (e) => {

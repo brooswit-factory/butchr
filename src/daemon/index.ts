@@ -1,18 +1,24 @@
+import {createContinuationPolicyReader} from '../control-panel/worker-continuation-policy.js';
+import {deliverAdmittedNotice} from '../control-panel/admitted-notice.js';
+import {admittedPolicyUnits} from '../control-panel/admitted-policy.js';
+import {writeRulesFile} from '../rules/write-rules.js';
+import {configuredWorkerRollout,daemonWorkerClient} from '../control-panel/worker-rollout.js';
+import {createControlPanelClient} from "../control-panel/client.js";
+import {createOperationalAgentFeed} from "../control-panel/telemetry.js";
+import {join as integrationJoin} from "node:path";
+import {homedir as integrationHome} from "node:os";
 import { decodeAgentKey } from '../rules/agent-key.js';
 import { atlassianProviderStaffing } from '../rules/atlassian-staffing.js';
 import { applyProviderSwitch, parseProviderEnabledMap } from '../rules/provider-enablement.js';
 import { ResourceConnections } from '../agents/resource-connections.js';
 import { createJiraProjectResourceType, ownsJiraProjectAgent, pinnedActiveMinutesFor } from '../rules/jira-project-type.js';
 import { readFileSync } from "node:fs";
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { DrovrClient, createLoginExpiredWatcher, scanPendingCodexApprovals, HerdrTransportError } from "@brooswit/drovr";
 import { installLogSink } from "./log-sink.js";
 import { createOutstandingGuard } from "./herdr-subscribe-deadline.js";
 import { loadConfig, describeConfig, ignoredExtensionOriginsWarning, isAtlassianConfigured, type Config } from "../config/config.js";
-import { resolveEffectiveGithubEnv, resolveEffectiveJiraEnv, resolveEffectiveProviderSecretsEnv } from "../config/effective-env.js";
-import { checkSecretDestination, resolveCredentialTarget } from "../setup/secret-target.js";
-import { buildCredentialsSummary, handleGithubTokenWrite, handleTrelloCredentialsWrite, handleZendeskTokenWrite, testTrelloConnection, testZendeskConnection, type SupervisorInfo } from "../web/credentials-api.js";
-import { githubTestInputs, testGithubConnection } from "../web/github-connection-test.js";
+import { resolveEffectiveJiraEnv } from "../config/effective-env.js";
 import { runSetupModeDaemon } from "./setup-mode.js";
 import { createSetupCodeManager, installSetupCodeSigusr2Handler } from "../setup/setup-code.js";
 import { handleJiraTokenWrite, type JiraWriteDeps } from "../web/setup-api.js";
@@ -37,7 +43,7 @@ import { createCurrencyTracker } from "./currency.js";
 import { HerdrHerd } from "../agents/herd.js";
 import { reportPersistedAgentSessions } from "../agents/report-agent-sessions.js";
 import { createCodexChannelRelayPool } from "../notify/codex-channel-relay.js";
-import { agentIdOfWorkspacePath, briefFor, knownBriefTypes, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
+import { agentIdOfWorkspacePath, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceRoot } from "../agents/workspace.js";
 import { basename, dirname, join } from "node:path";
 import { hostname } from "node:os";
 import { StatusFloorTracker } from "../agents/status-floor.js";
@@ -50,7 +56,7 @@ import { resolveWebRoot, dashboardAppStatus } from "../web/static-assets.js";
 import { computeBuildCurrency } from "../agents/build-currency.js";
 import { runResourceLoop } from "./loop.js";
 import { createTodoWorkersFetch } from "../resources/issue.js";
-import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AgentEffort, type AgentRole, type ResourceProvider, type Rule } from "../rules/rules.js";
+import { loadRules, rulesPath, unresolvedRelationships, formatUnresolvedRelationshipWarning, createRulesHolder, sourceEtagOf, DEFAULT_IDLE_POKE_MESSAGE, type AccountPolicy, type AgentEffort, type AgentRole, type Rule } from "../rules/rules.js";
 import { resourceMatches, type ExecutionUnit } from "../rules/execution.js";
 import { createIdlePokeEngine, type IdlePokeRuleConfig } from "../agents/idle-poke.js";
 import { seedFirstRunRules, type FirstRunSeedOutcome } from "../rules/seed-first-run.js";
@@ -66,7 +72,8 @@ import { capacityRoleFor } from "../agents/capacity-role.js";
 import { watchPrompts } from "../agents/prompt-watch.js";
 import { chooseStartupAnswer } from "../agents/prompt.js";
 import { watchBlocked } from "../agents/blocked.js";
-import { createEscalator, type PaneContext } from "../agents/escalation-loop.js";
+import { createEscalator } from "../agents/escalation-loop.js";
+import { createManagedSessionEscalationWatcher } from "../agents/managed-session-escalation-watcher.js";
 import { createCredentialDeathTracker } from "../agents/login-expired-alert.js";
 import { createOpsAlertRouter } from "../agents/ops-alert.js";
 import { createCodexDialogSightingsTracker } from "../agents/codex-dialog-sightings.js";
@@ -121,20 +128,34 @@ import { loadZendeskAuth, createZendeskTicketClient } from "../resources/zendesk
 import { ZENDESK_RISK_ACK_ENV, ZENDESK_RISK_ACK_VALUE, zendeskTicketStaffingIfEnabled } from "../rules/zendesk-ticket-type.js";
 import { zendeskTicketTools } from "../tools/zendesk-ticket.js";
 import { startZendeskTicketLoop, ZENDESK_TICKET_POLL_MS } from "./zendesk-ticket-loop.js";
-// local/ui: trello-card rules (src/rules/trello-card-type.ts) on upstream's Trello client.
-import { createTrelloCardClient, loadTrelloAuth } from "../resources/trello-card.js";
-import { TRELLO_RISK_ACK_ENV, TRELLO_RISK_ACK_VALUE, trelloCardStaffingIfEnabled } from "../rules/trello-card-type.js";
-import { trelloCardTools } from "../tools/trello-card.js";
-import { startTrelloCardLoop, TRELLO_CARD_POLL_MS } from "./trello-card-loop.js";
 import { filesystemRules, FILESYSTEM_POLL_MS, startFilesystemLoop } from "./filesystem-loop.js";
 import { confluencePageRules, CONFLUENCE_PAGE_POLL_MS, startConfluencePageLoop } from "./confluence-page-loop.js";
-import { loadCatamorbiusFullConfig } from "../catamorbius/push-config.js";
-import { createCatamorbiusPushController, attachProcessShutdown, type CatamorbiusPushController } from "../catamorbius/push-controller.js";
-import type { LinkedEventingState } from "../jira-watch/linked-eventing.js";
+import { MANAGED_SESSIONS_POLL_MS, startManagedSessionsLoop } from "./session-definitions-loop.js";
+import { sessionDefinitionsPath } from "../resources/session-definition.js";
+import { ownsManagedSessionAgent } from "../rules/session-definition-type.js";
+import { defaultSessionFreezeIo } from "../resources/session-freeze.js";
+import { writeSessionDefinitionFields, writeSessionDefinitionFrozen, writeSessionDefinitionUndo, type LastUiWriteRef as SessionDefinitionLastUiWriteRef } from "../resources/session-definitions-write.js";
+import { writeLinkAdd, writeLinkRemove, writeLinkUndo, type LastLinksUiWrite } from "../resources/links-write.js";
+import { listAllFileLinks } from "../resources/link-store.js";
+import { sessionArchiveDir } from "../resources/session-archive.js";
 import { buildQueryAgentInventory, ruleHasLiveAgent } from "../agents/query-agent-inventory.js";
+import { listFilesystemResources } from "../resources/filesystem.js";
+import { sessionFreezeTools } from "../tools/session-freeze-tools.js";
 import { legacyAgentPreflight } from "./legacy-preflight.js";
 import { missingRulesPreflight } from "./missing-rules-preflight.js";
+import { loadRocketChatAuth, createRocketChatClient, createRocketChatPoster } from "../resources/rocketchat.js";
+import { createAccountManager, createFileAccountStore } from "../accounts/manager.js";
+import { rcUsernameFor } from "../accounts/identity.js";
+import { createFileNexusManifestPublisher } from "../accounts/nexus-manifest.js";
+import { createAccountLifecycle } from "../agents/account-lifecycle.js";
+import { createAccountOrphanSweep } from "../agents/account-orphan-sweep.js";
+import { runLinkCli } from "../cli/link-cli.js";
+import { runSessionCli } from "../cli/session-cli.js";
 import { runRulesCli } from "../cli/rules-cli.js";
+import { resourceLinkTools } from "../tools/resource-links.js";
+import { createLinkStore, defaultLinksStorePath } from "../resources/link-store.js";
+import { createRoutingLinkStore } from "../resources/link-store-router.js";
+import { createJiraProjectLinkStore } from "../resources/jira-project-link-store.js";
 import { createRulesPreviewer } from "../web/rules-preview.js";
 import { isSameUidPeerAsync } from "../web/peer-uid.js";
 import { rulesEtag } from "../rules/write-rules.js";
@@ -142,40 +163,41 @@ import { createCsrfTokenIssuer } from "../web/csrf.js";
 import { createWriteRateLimiter } from "../web/write-rate-limit.js";
 import { createAuditLogger, fileAuditAppend, WEB_WRITE_AUDIT_LOG_BASENAME } from "../web/audit-log.js";
 import { writeRuleEnabled, writeRuleFields, writeUndo, writeRuleDelete, planRuleWrite, createScopeCache, createRule, planRuleCreate } from "../rules/rules-write.js";
-import { buildCurrentSettingsApiResponse } from "../web/settings-api.js";
+import { buildSettingsApiResponse } from "../web/settings-api.js";
 import { createCachedUnitHint } from "../web/settings-unit-hint.js";
 import { testJiraConnection } from "../web/jira-connection-test.js";
 import { loadSettingsFile, effectiveSettingsEnv, settingsFilePath } from "../settings/settings-file.js";
 import { writeSetting } from "../settings/write-settings.js";
-import { isRunningUnderThisUnit, launchdJobForThisProcess, restartDaemon } from "../web/daemon-restart.js";
+import { restartDaemon } from "../web/daemon-restart.js";
 import { readDaemonLogs, DEFAULT_DAEMON_LOGS_MAX_LINES, DEFAULT_DAEMON_LOGS_MAX_BYTES } from "../web/daemon-logs.js";
 import { currentSystemdInfo } from "../agents/ground-truth.js";
 
-// FACTORY-621: `butchr rules check [file]` — validates a rules file and
-// dry-runs its jira-work/jira-idea queries, read-only. Intercepted before
-// `installLogSink()`/config/rules loading below, so a syntactically-broken
-// rules file can be diagnosed with this command even though it would make
-// the daemon itself refuse to start (package.json's `bin.butchr` builds
-// solely from THIS file). local/ui: `butchr link`, the other subcommand,
-// went with managed links.
-if (process.argv[2] === "rules") {
-  process.exit(await runRulesCli(process.argv.slice(3)));
+// FACTORY-7: `butchr link list|add|remove` is the one subcommand this
+// binary has (package.json's `bin.butchr` builds solely from THIS file —
+// see `src/cli/link-cli.ts`'s own header for why the dispatch lives here).
+// Intercepted before `installLogSink()`/config/rules loading below, on
+// purpose: the link store is provider-agnostic local state, so a `butchr
+// link ...` invocation must not require Jira credentials or a rules file to
+// run, and must not emit this daemon's own structured startup logging.
+if (process.argv[2] === "link") {
+  process.exit(await runLinkCli(process.argv.slice(3)));
 }
 
-// local/ui: `butchr link` and `butchr session` went with managed links and
-// managed sessions. They, and any other unknown subcommand, are refused here,
-// before any startup side effect: the daemon takes no arguments, so without
-// this `butchr link list` would start it (or collide with a running one's port).
-const REMOVED_SUBCOMMANDS: Readonly<Record<string, string>> = { link: "managed links", session: "managed sessions" };
-const unknownSubcommand = process.argv[2];
-if (unknownSubcommand !== undefined && !unknownSubcommand.startsWith("-")) {
-  const removedWith = REMOVED_SUBCOMMANDS[unknownSubcommand];
-  console.error(
-    removedWith
-      ? `butchr ${unknownSubcommand}: removed along with ${removedWith}.`
-      : `butchr: unknown command "${unknownSubcommand}". Run butchr with no arguments to start the daemon, or butchr rules check [file].`,
-  );
-  process.exit(2);
+// BUTCHR-454: `butchr session list|show|create|freeze|unfreeze`, same
+// precedent as `butchr link` immediately above — a managed-session
+// definition is local filesystem state (plus the drovr-events freeze
+// store), so this must run with no Jira credentials and no rules file.
+if (process.argv[2] === "session") {
+  process.exit(await runSessionCli(process.argv.slice(3)));
+}
+
+// FACTORY-621: `butchr rules check [file]` — validates a rules file and
+// dry-runs its jira-work/jira-idea queries, read-only. Same precedent as
+// `link`/`session` immediately above: intercepted before config/rules
+// loading so a syntactically-broken rules file can be diagnosed with this
+// command even though it would make the daemon itself refuse to start.
+if (process.argv[2] === "rules") {
+  process.exit(await runRulesCli(process.argv.slice(3)));
 }
 
 // BUTCHR-346: installed before anything else in this file ever logs — every
@@ -196,8 +218,9 @@ installLogSink();
 // (invalid JSON, wrong owner, a symlink, too-wide a mode, a non-
 // allowlisted key, an out-of-range value) is reported LOUDLY — one journal
 // line per problem, right here at startup, BEFORE `loadConfig` ever runs —
-// and, once `opsAlertRouter` exists further down this file, also raised
-// as an ops alert.
+// and, once `teamAdminNotify` exists further down this file, also raised
+// as an ops alert (see that section's own comment for why this can't post
+// immediately: the poster isn't built yet this early in the file).
 const settingsFileResult = loadSettingsFile(process.env);
 for (const problem of settingsFileResult.problems) console.error(`butchr: ${problem}`);
 const effectiveEnv = effectiveSettingsEnv(process.env as Record<string, string | undefined>, settingsFileResult.values);
@@ -220,9 +243,7 @@ const cachedUnitHint = createCachedUnitHint();
 // itself, which still throws for every OTHER kind of misconfiguration
 // exactly as before — this is not a general "never crash" change, only the
 // one case setup mode exists for.
-// local/ui: a GitHub token the Settings page wrote to secrets/github-token is filled in the same way (`resolveEffectiveGithubEnv`).
-// local/ui: and the Zendesk/Trello credential files the same way (`resolveEffectiveProviderSecretsEnv`).
-const effectiveJiraEnv = resolveEffectiveProviderSecretsEnv(resolveEffectiveGithubEnv(resolveEffectiveJiraEnv(effectiveEnv, { onWarn: (line) => console.error(`butchr: ${line}`) })));
+const effectiveJiraEnv = resolveEffectiveJiraEnv(effectiveEnv, { onWarn: (line) => console.error(`butchr: ${line}`) });
 // FACTORY-66: an explicit `BUTCHR_ATLASSIAN_ENABLED=false` (etc.) always
 // bypasses setup mode, even on an otherwise-fresh install with nothing else
 // set — the operator has said what they want, there is nothing to walk
@@ -301,47 +322,6 @@ if (config.githubTokenReadError) console.error(`butchr: ${config.githubTokenRead
 // see this ticket's own doc for why Zendesk config isn't centralized there).
 const resourceLookupDeps = { jiraHost: config.atlassian ? new URL(config.atlassian.site).hostname.toLowerCase() : undefined, zendeskSubdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || undefined };
 
-// FACTORY-137 (D9): Catamorbius push mode — off unless CATAMORBIUS_URL is
-// configured AND at least one provider is enabled via CATAMORBIUS_PROVIDERS
-// (see src/catamorbius/push-config.ts). A malformed value (bad URL, a
-// non-positive numeric knob, an unknown provider name) fails daemon startup
-// loudly, same as every other opted-in config block in this file already
-// does; an unreadable token file degrades to "push disabled, poll instead"
-// with one WARNING (see that module's own header for why that one case,
-// and only that one, does not throw). The client's own `start()` never
-// blocks or throws into daemon startup (task 1's own contract) — only this
-// SYNCHRONOUS config parse can fail startup, never the connection itself.
-let catamorbiusPush: CatamorbiusPushController | undefined;
-try {
-  const catamorbiusFullConfig = loadCatamorbiusFullConfig(
-    process.env as Record<string, string | undefined>,
-    (p) => readFileSync(p, "utf8"),
-    (line) => console.error(line),
-  );
-  if (catamorbiusFullConfig) {
-    catamorbiusPush = createCatamorbiusPushController(catamorbiusFullConfig, {
-      clientDeps: { fetch, now: Date.now, setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h as never), random: Math.random },
-      log: (line) => console.error(line),
-    });
-    catamorbiusPush.start();
-    console.error(`  [catamorbius] push mode enabled: providers=${catamorbiusFullConfig.push.providers.join(",")}, ttl=${catamorbiusFullConfig.push.ttlMs}ms, grace=${catamorbiusFullConfig.push.graceMs}ms, debounce=${catamorbiusFullConfig.push.debounceMs}ms`);
-  }
-} catch (e) {
-  console.error(`butchr: ${(e as Error).message}`);
-  console.error("See .env.example for the required CATAMORBIUS_* configuration.");
-  process.exit(1);
-}
-// D9: "the daemon stop path stops it" — this daemon had no existing
-// SIGTERM/SIGINT handler before this ticket, so the platform default
-// (terminate immediately) was the whole daemon's effective shutdown
-// contract. `attachProcessShutdown` stops the push client THEN exits,
-// preserving that default instead of silently replacing it — see its own
-// doc comment (src/catamorbius/push-controller.ts) for the regression this
-// fixes (readiness review on PR #805's current head: the original version
-// here only called `stop()` and never exited, leaving the whole daemon
-// running forever on SIGTERM/SIGINT once push mode was enabled).
-if (catamorbiusPush) attachProcessShutdown(catamorbiusPush);
-
 // Resource-agent rules (src/rules/rules.ts): the ONLY thing that decides what
 // gets staffed. A present rules file with zero enabled rules staffs nothing;
 // an absent file means zero rules (there are no built-in defaults), announced
@@ -352,11 +332,17 @@ let missingRulesPath: string | null = null;
 // before `loadRules` below ever runs for real, so a fresh install's
 // dashboard (FACTORY-663) has something to edit/enable with no hand-edited
 // JSON and no restart. Captured here rather than acted on immediately: the
-// ops-alert router this seed's own "seeded"/"vanished" outcomes are raised
+// ops-alert router this seed's own "seeded"/"vanished" outcomes need to post
 // through (agentsafety constraint 4) is constructed much later in this same
-// file's startup sequence — the raise happens there, right after that router
-// exists (search `firstRunSeedOutcome` below).
+// file's startup sequence, after the Rocket.Chat credential is resolved —
+// the raise happens there, right after that router exists (search
+// `firstRunSeedOutcome` below).
 const firstRunSeedOutcome: FirstRunSeedOutcome = seedFirstRunRules(process.env as Record<string, string | undefined>);
+// Connection-only integration: never attaches remote rule execution authority.
+const controlPanelDirectory=process.env.BUTCHR_CONTROL_PANEL_DIR??integrationJoin(process.env.XDG_CONFIG_HOME??integrationJoin(integrationHome(),".config"),"butchr");
+const controlPanel=createControlPanelClient(controlPanelDirectory);
+const workerRollout=configuredWorkerRollout(process.env.BUTCHR_RECONCILIATION_CANARY,controlPanelDirectory);
+if(workerRollout)console.error(`[worker-canary] ${JSON.stringify(workerRollout.summary())}`);
 if (firstRunSeedOutcome.kind === "seeded") {
   console.error(`butchr: first run — seeded ${firstRunSeedOutcome.path} with one disabled template rule (${FIRST_RULE_ID}); edit its query in the dashboard, then enable it (its brief is file-only — edit that in ${firstRunSeedOutcome.path} by hand if you want it)`);
   if (firstRunSeedOutcome.dirPermissionsWarning) console.error(`WARNING: butchr: ${firstRunSeedOutcome.dirPermissionsWarning}`);
@@ -398,7 +384,6 @@ const rulesHolder = (() => {
     const enabled = loaded.rules.filter((r) => r.enabled).map((r) => r.id);
     if (loaded.origin === "missing") console.error(`butchr: no rules file at ${loaded.path}: 0 rules — nothing will be staffed. See the README's "First run" section, and \`butchr rules check\` once you've written one.`);
     else console.error(`butchr: rules from ${loaded.path}: ${enabled.length} enabled${enabled.length ? ` (${enabled.join(", ")})` : " — nothing will be staffed"}`);
-    for (const w of loaded.warnings ?? []) console.error(`butchr: WARNING: ${w}`);
     return createRulesHolder(loaded.rules, sourceEtagOf(loaded.text));
   } catch (e) {
     console.error(`butchr: ${(e as Error).message}`);
@@ -412,7 +397,10 @@ const rulesHolder = (() => {
 // restart, and what still doesn't (a provider with
 // ZERO enabled rules — and so no client/loop at all — at startup still
 // needs one to ever begin staffing; see the SIGHUP handler below).
-const getRules = rulesHolder.getRules;
+const ruleAuthority=controlPanel.attachRuleRuntime({...(workerRollout?{rollout:workerRollout}:{}),holder:rulesHolder,readText:()=>{try{return readFileSync(rulesPath(),"utf8");}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return undefined;throw e;}},writeText:(text,ifMatch)=>writeRulesFile(text,process.env,undefined,{ifMatch}),reload:()=>reloadLocalRules(),census:()=>herd.ruleCensus(),reconcile:(change,isCurrent)=>herd.reconcilePreferences(change.spec,isCurrent,change)});
+const getRules=ruleAuthority.getRules;
+const initializationRules=ruleAuthority.getInitializationRules();
+const reloadLocalRules=()=>{const result=reloadRules(rulesHolder);if(result.ok)ruleAuthority.refreshLocal();return result;};
 // BUTCHR-398: log every sentinel rule at startup, one line each, so an
 // operator can see at a glance what is exempt from the fleet agent cap —
 // the epic decision's own ask ("log each sentinel rule at startup"). No
@@ -422,6 +410,63 @@ const getRules = rulesHolder.getRules;
 for (const r of getRules()) {
   if (r.enabled && r.role === "sentinel") console.error(`butchr: rule ${r.id} (${r.resourceProvider}) is a sentinel — excluded from the agent cap and admission withholding`);
 }
+// BUTCHR-408 review fix: `roleOfAgent` below is RULE-level only (one shared
+// `Rule` per provider) — the built-in managed-sessions rule (never in
+// `rules`, and even if it were, fixed to `role: "worker"`) cannot express a
+// per-FILE manifest's own `role`. This map is the seam: the managed-sessions
+// loop rebuilds it every poll from that poll's eligible definitions (see
+// `ManagedSessionResourceDeps.roles`, src/rules/session-definition-type.ts),
+// keyed by the SAME agent key `roleOfAgent` is called with, and `roleOfAgent`
+// consults it FIRST for any id `ownsManagedSessionAgent` recognizes. Before
+// this loop's first poll (e.g. right after a restart, for an
+// already-running managed-session agent), it has no entry yet and
+// `roleOfAgent` falls through to its own existing fail-safe `"worker"`
+// default below — documented here, not silently relied upon.
+const managedSessionRoles = new Map<string, AgentRole>();
+/**
+ * BUTCHR-460 — same seam as `managedSessionRoles` immediately above, one
+ * field over: `accountPolicyOf` below is RULE-level only, same reason
+ * `roleOfAgent` needed `managedSessionRoles` — the built-in managed-sessions
+ * rule is ONE shared `Rule` (fixed `account: "none"`) for every
+ * heterogeneous definition file. Rebuilt every poll by the managed-sessions
+ * loop itself (`ManagedSessionResourceDeps.accountPolicies`,
+ * src/rules/session-definition-type.ts) from that poll's eligible matches.
+ */
+const managedSessionAccountPolicies = new Map<string, AccountPolicy>();
+/**
+ * FACTORY-75 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` above, one field over: this poll's
+ * eligible definitions' resolved `(model, effort)` pair (`effectiveAgent`,
+ * src/resources/session-definition.ts), keyed identically. `resolvedAgentOf`
+ * below consults this map for a managed-session id before falling back to
+ * `rules`' own `agentPreferences` for a rule-engine id — see that
+ * function's own comment for the full shape.
+ */
+const managedSessionResolvedAgents = new Map<string, { model: string; effort?: AgentEffort }>();
+/**
+ * DROVR-42/FACTORY-67 — same rebuilt-every-poll seam as `managedSessionRoles`/
+ * `managedSessionAccountPolicies` immediately above, one field over: whether
+ * an eligible managed-session definition is lizard-mode eligible
+ * (`SessionDefinition.lizardMode` — since FACTORY-138, absent now resolves
+ * eligible for a `vendor: "claude"` definition; see that field's own doc
+ * comment and the fill site, `ManagedSessionResourceDeps.lizardModes`,
+ * src/rules/session-definition-type.ts, for the full default and its
+ * Codex carve-out). Consulted below by `ruleLizardModeOf`,
+ * which `lizardModeLabel` (the permission-answer timer's `eligiblePanes` hook)
+ * is built from — see `ManagedSessionResourceDeps.lizardModes`'s own doc
+ * comment (src/rules/session-definition-type.ts) for why this is
+ * deliberately LIVE rather than persisted-at-spawn the way
+ * `permissionMode`/`strictMcpConfig` are (FACTORY-43): this field never
+ * reaches the launched process's argv. FACTORY-87: a RULE-launched agent
+ * (jira-work/jira-project/github/filesystem, as opposed to a managed
+ * session) has no per-file manifest of its own to rebuild a map like this
+ * from every poll — its `lizardMode` lives on its own `Rule`
+ * (src/rules/rules.ts), which is loaded once at startup, so `ruleLizardModeOf`
+ * below reads it straight from the already-loaded `rules` list instead of a
+ * second map, the same "rule-level fallback" shape `ruleRoleOfAgent` already
+ * uses for `role`.
+ */
+const managedSessionLizardModes = new Map<string, boolean>();
 /**
  * BUTCHR-398 — the fleet capacity role classifier every rule loop's
  * admission wiring below shares: a running or candidate agent id's role,
@@ -429,11 +474,18 @@ for (const r of getRules()) {
  * against the loaded `rules`. Fails safe to `"worker"` for anything that
  * cannot be resolved — a legacy/bare-issue agent, or a rule since removed —
  * per `AdmissionControllerDeps.roleOf`'s own contract (src/agents/admission.ts).
+ * BUTCHR-408: a managed-session agent's role comes from `managedSessionRoles`
+ * (its OWN manifest field) instead, checked before the rule-level fallback —
+ * see that map's own comment just above.
  */
 const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  if (ownsManagedSessionAgent(id)) {
+    const manifestRole = managedSessionRoles.get(id);
+    if (manifestRole) return manifestRole;
+  }
+  const rule = ruleAuthority.ruleForAdmission(id);
   return rule?.role;
 };
 /**
@@ -445,10 +497,13 @@ const ruleRoleOfAgent = (id: string): AgentCapacityRole | undefined => {
  * has its own unit tests independent of this module, which has no exports
  * and cannot itself be imported by a test without running the whole
  * daemon's startup side effects. This is just the daemon's own binding of
- * that decision to its own live rules (`getRules()`) — see
- * `RuleLizardModeDeps`'s own doc comment.
+ * that decision to its own live state (`rules`, `managedSessionLizardModes`,
+ * `ownsManagedSessionAgent`) — see `RuleLizardModeDeps`'s own doc comment for
+ * what each input means and why a managed session needs the live map while
+ * every other rule-launched agent reads straight off its own `Rule`.
  */
-const ruleLizardModeOf = (id: string): boolean => sharedRuleLizardModeOf(id, { rules: getRules() });
+const ruleLizardModeOf = (id: string): boolean =>
+  !ruleAuthority.isUnresolvedAgent(id) && sharedRuleLizardModeOf(id, { rules: ruleAuthority.ruleForAgent(id) ? [ruleAuthority.ruleForAgent(id)!] : getRules(), isManagedSessionAgent: ownsManagedSessionAgent, managedSessionLizardModes });
 // FACTORY-757 (supersedes BUTCHR-422/FACTORY-39's issue-type hardcoding):
 // capacity is decided solely by each rule's own `role` field — see
 // src/agents/capacity-role.ts for the construction-level exceptions (bare
@@ -465,11 +520,16 @@ const roleOfAgent = (id: string): AgentCapacityRole => capacityRoleFor(id, ruleR
  * there is no fail-safe-to-limited default to get wrong here: an id this
  * cannot resolve simply keeps today's behaviour, same as a resolved rule
  * that never sets either field (see `RuleRateLimit`'s own doc comment).
+ * BUTCHR-408's managed-session agents have no rule-engine `Rule` of their
+ * own (see `managedSessionRoles`'s own comment above) and so are never
+ * rate-limited by this — out of this ticket's scope, which wires exactly
+ * the rule-engine providers `maxNewPerTick`/`minSecondsBetweenAdmissions`
+ * validate for.
  */
 const rateLimitOfAgent = (id: string): RuleRateLimit | undefined => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAdmission(id);
   if (!rule || (rule.maxNewPerTick === undefined && rule.minSecondsBetweenAdmissions === undefined)) return undefined;
   return {
     ruleId: rule.id,
@@ -498,7 +558,7 @@ for (const u of unresolvedRelationships(getRules())) console.error(`  ${formatUn
 const mcpBindingsOf = (id: string) => {
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAgent(id);
   return rule?.mcpServers;
 };
 
@@ -509,20 +569,80 @@ const mcpBindingsOf = (id: string) => {
  * the two-axis `modelPower`/`effort` mechanism (src/resources/power-scale.ts).
  * Same decode-then-look-up-by-ruleId shape as `mcpBindingsOf` immediately
  * above, for the SAME reason (HerdrHerd holds no rule state of its own) —
- * a rule-engine id resolves to that rule's own `agentPreferences` entry for
- * this provider — ALREADY resolved at `loadRules()` time (`AgentPreference`'s
- * own doc comment, src/rules/rules.ts), so this is a plain lookup, not a
- * second resolution. `undefined` for anything this lookup cannot answer —
- * the same "nothing to compare, so nothing reads stale" fail-safe
- * `mcpBindingsOf` already has.
+ * a managed-session id is checked FIRST against `managedSessionResolvedAgents`
+ * (rebuilt every managed-sessions poll from that poll's eligible
+ * definitions — see that map's own comment above), since a managed-session
+ * definition has no entry in `rules` at all; a rule-engine id then falls
+ * through to that rule's own `agentPreferences` entry for this provider —
+ * ALREADY resolved at `loadRules()` time (`AgentPreference`'s own doc
+ * comment, src/rules/rules.ts), so this is a plain lookup, not a second
+ * resolution. `undefined` for anything neither map/lookup can answer — the
+ * same "nothing to compare, so nothing reads stale" fail-safe `mcpBindingsOf`
+ * already has.
  */
 const resolvedAgentOf = (id: string, provider: string): { model?: string; effort?: AgentEffort } | undefined => {
+  if (ownsManagedSessionAgent(id)) return managedSessionResolvedAgents.get(id);
   const decoded = decodeAnyAgentKey(id);
   if (!decoded) return undefined;
-  const rule = getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider);
+  const rule = ruleAuthority.ruleForAgent(id);
   const preference = rule?.agentPreferences?.find((p) => p.harness === provider);
   return preference ? { ...(preference.model !== undefined ? { model: preference.model } : {}), ...(preference.effort !== undefined ? { effort: preference.effort } : {}) } : undefined;
 };
+
+/**
+ * BUTCHR-412 — same fail-safe classifier shape as `roleOfAgent` immediately
+ * above, one field over: this id's rule's Rocket.Chat account policy, or
+ * `"none"` for anything this daemon cannot resolve back to a rule (a legacy/
+ * bare-issue id, or a rule since removed) — an unrecognised agent must never
+ * provision an account for itself, mirroring `roleOfAgent`'s own "an
+ * unrecognised agent is always a worker" fail-safe.
+ * BUTCHR-460: a managed-session agent's OWN `account` (its manifest field)
+ * IS read here — via `managedSessionAccountPolicies`, checked before the
+ * rule-level fallback — same precedent as `ruleRoleOfAgent`'s own
+ * `managedSessionRoles` lookup just above, for the identical reason (the
+ * built-in managed-sessions rule cannot carry a per-file account policy
+ * itself).
+ */
+const accountPolicyOf = (id: string): AccountPolicy => {
+  const decoded = decodeAnyAgentKey(id);
+  if (!decoded) return "none";
+  if (ownsManagedSessionAgent(id)) {
+    const manifestPolicy = managedSessionAccountPolicies.get(id);
+    if (manifestPolicy) return manifestPolicy;
+  }
+  const rule = ruleAuthority.ruleForAgent(id);
+  return rule?.account ?? "none";
+};
+
+/**
+ * BUTCHR-413 — this id's own non-secret Rocket.Chat account name
+ * (`spec.rocketchatAccount`'s source, see that field's own doc comment,
+ * src/agents/workspace.ts), for the two callers that have no live,
+ * `ensure()`-populated `SpawnSpec` to read it from at all:
+ * `HerdrHerd.spawn`/`HerdrHerd.staleIssues`' own fallback (only when
+ * `account-lifecycle.ts`'s `ensure` never ran for a launch — no
+ * accountLifecycle wired at all) and `createCodexChannelRelayPool`'s own
+ * daemon-side connection (which reconciles against a bare issue id, never a
+ * spec). `undefined` for an id whose rule grants it none
+ * (`accountPolicyOf(id) === "none"`, the same fail-safe classifier
+ * `accountLifecycle` itself is gated on immediately below).
+ *
+ * REVIEW FINDING (BUTCHR-413 round 3): the first version of this called
+ * `rcUsernameFor(id)` with no prefix, silently assuming the DEFAULT managed
+ * prefix — wrong once BUTCHR-412's configurable `Config.rocketchat.managedPrefix`
+ * (`ROCKETCHAT_MANAGED_PREFIX`) is set to anything else, since
+ * `ensureAccount` (`src/accounts/manager.ts`) derives the REAL provisioned
+ * username with THAT prefix. Naming a different account than the one
+ * actually provisioned would have pointed Codex's own reply header and this
+ * relay's own connection at an account that doesn't exist, while
+ * `staleIssues()` (recomputing this same wrong value) would never agree
+ * with what `HerdrHerd.spawn` actually launched with whenever `ensure()`'s
+ * real value WAS used — a respawn loop. Fixed: pass THE SAME configured
+ * prefix `createAccountManager` below is given, so this can never name a
+ * different account than `ensureAccount` actually provisions.
+ */
+const accountNameOf = (id: string): string | undefined =>
+  accountPolicyOf(id) === "none" ? undefined : rcUsernameFor(id, config.rocketchat?.managedPrefix);
 
 // github-issue rules run only with GitHub auth and org scope configured and
 // every enabled rule's query scoped inside those orgs; otherwise none of them
@@ -530,7 +650,7 @@ const resolvedAgentOf = (id: string, provider: string): { model?: string; effort
 // FACTORY-66 review round 2: `applyProviderSwitch` applies this provider's
 // OWN independent switch on top of the credential-driven decision above —
 // see that function's own doc comment (src/rules/provider-enablement.ts).
-const githubStaffing = applyProviderSwitch("github-issue", githubIssueStaffing(getRules(), config.github), config.providerEnabled["github-issue"]);
+const githubStaffing = applyProviderSwitch("github-issue", githubIssueStaffing(initializationRules, config.github), config.providerEnabled["github-issue"]);
 const githubIssues = githubStaffing.run && config.github
   ? createGithubIssueClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -539,7 +659,7 @@ const githubIssues = githubStaffing.run && config.github
 // Config["github"]'s own doc comment) but are their own provider, staffing
 // gate, client and loop — a rules file with github-issue rules and no
 // github-pr rules stays unaffected, and vice versa.
-const githubPrStaffingResult = applyProviderSwitch("github-pr", githubPrStaffing(getRules(), config.github), config.providerEnabled["github-pr"]);
+const githubPrStaffingResult = applyProviderSwitch("github-pr", githubPrStaffing(initializationRules, config.github), config.providerEnabled["github-pr"]);
 const githubPrs = githubPrStaffingResult.run && config.github
   ? createGithubPrClient({ fetchImpl: fetch, token: config.github.token, orgs: config.github.orgs, log: (line) => console.error(`  ${line}`) })
   : undefined;
@@ -554,28 +674,13 @@ const githubPrs = githubPrStaffingResult.run && config.github
 // `zendeskTicketStaffingIfEnabled` (src/rules/zendesk-ticket-type.ts)
 // checks the switch FIRST and never calls the real staffing function (or
 // its credential read) when it's off.
-// local/ui: the effective env, so a subdomain/token saved from the Settings page applies after a restart.
-// The risk acknowledgement is still read from it unchanged: settings.json can never set that key.
 const zendeskStaffing = applyProviderSwitch(
   "zendesk-ticket",
-  zendeskTicketStaffingIfEnabled(getRules(), effectiveJiraEnv, config.providerEnabled["zendesk-ticket"]),
+  zendeskTicketStaffingIfEnabled(initializationRules, process.env as Record<string, string | undefined>, config.providerEnabled["zendesk-ticket"]),
   config.providerEnabled["zendesk-ticket"],
 );
 const zendeskTickets = zendeskStaffing.run
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskStaffing.subdomain, token: zendeskStaffing.token, log: (line) => console.error(`  ${line}`) })
-  : undefined;
-
-// local/ui: trello-card rules, gated the same way as zendesk-ticket: the
-// .env-only risk acknowledgement, TRELLO_BOARD_ID and owner-only key and
-// token files. Otherwise none of them runs (announced by startTrelloCardLoop).
-// FACTORY-66: and behind its own provider switch, checked before any credential read.
-const trelloStaffing = applyProviderSwitch(
-  "trello-card",
-  trelloCardStaffingIfEnabled(getRules(), effectiveJiraEnv, config.providerEnabled["trello-card"]),
-  config.providerEnabled["trello-card"],
-);
-const trelloCards = trelloStaffing.run
-  ? createTrelloCardClient({ fetchImpl: fetch, boardId: trelloStaffing.boardId, apiKey: trelloStaffing.apiKey, token: trelloStaffing.token, log: (line) => console.error(`  ${line}`) })
   : undefined;
 
 // filesystem rules need no external credential — every enabled one runs,
@@ -583,7 +688,7 @@ const trelloCards = trelloStaffing.run
 // this provider's own independent switch is off (FACTORY-66 review round
 // 2: see `FilesystemLoopDeps.enabled`'s own doc comment,
 // src/daemon/filesystem-loop.ts).
-const fsRules = filesystemRules(getRules());
+const fsRules = filesystemRules(initializationRules);
 const filesystemEnabled = config.providerEnabled.filesystem;
 const filesystemStaffing = applyProviderSwitch("filesystem", { run: fsRules.length > 0, rules: fsRules, reason: null }, filesystemEnabled);
 
@@ -592,7 +697,7 @@ const filesystemStaffing = applyProviderSwitch("filesystem", { run: fsRules.leng
 // this daemon CAN now reach here with Atlassian disabled; the old "always
 // runs" assumption is no longer true. See `confluencePageStaffing` below,
 // which `startConfluencePageLoop`'s own call site gates on.
-const confluencePageEnabledRules = confluencePageRules(getRules());
+const confluencePageEnabledRules = confluencePageRules(initializationRules);
 
 // FACTORY-66: see `atlassianProviderStaffing`'s own doc comment
 // (src/rules/atlassian-staffing.ts) for the shape and the "why one function
@@ -604,10 +709,10 @@ const confluencePageEnabledRules = confluencePageRules(getRules());
 // the whole credential; these four are the finer-grained complement a
 // reviewer asked for (one of the four can be off while the other three
 // and the credential itself stay fully active).
-const jiraWorkStaffing = applyProviderSwitch("jira-work", atlassianProviderStaffing("jira-work", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-work"]);
-const jiraIdeaStaffing = applyProviderSwitch("jira-idea", atlassianProviderStaffing("jira-idea", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-idea"]);
-const jiraProjectStaffing = applyProviderSwitch("jira-project", atlassianProviderStaffing("jira-project", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-project"]);
-const confluencePageStaffing = applyProviderSwitch("confluence-page", atlassianProviderStaffing("confluence-page", getRules(), Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["confluence-page"]);
+const jiraWorkStaffing = applyProviderSwitch("jira-work", atlassianProviderStaffing("jira-work", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-work"]);
+const jiraIdeaStaffing = applyProviderSwitch("jira-idea", atlassianProviderStaffing("jira-idea", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-idea"]);
+const jiraProjectStaffing = applyProviderSwitch("jira-project", atlassianProviderStaffing("jira-project", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["jira-project"]);
+const confluencePageStaffing = applyProviderSwitch("confluence-page", atlassianProviderStaffing("confluence-page", initializationRules, Boolean(config.atlassian), config.atlassianDisabledReason), config.providerEnabled["confluence-page"]);
 
 /**
  * FACTORY-66 — disabled stand-ins for the real Atlassian client/ops, used
@@ -645,7 +750,7 @@ const atlassian = config.atlassian
 // configured), not merely `ideaRules.length` — a rules file with jira-idea
 // rules but Atlassian disabled must not construct a client that would only
 // ever reject.
-const ideaRules = jiraIdeaRules(getRules());
+const ideaRules = jiraIdeaRules(initializationRules);
 const jiraIdeas = jiraIdeaStaffing.run ? createJiraIdeaClient(atlassian) : undefined;
 // Tool connections are independent of agent staffing (an agent may still
 // want `*_tools` available with zero enabled rules for that provider) but
@@ -669,13 +774,9 @@ const githubToolPrs = githubPrs ?? (config.github && config.providerEnabled["git
 // jira-idea's own switch said should not exist.
 const jiraToolIdeas = (config.atlassian && config.providerEnabled["jira-idea"]) ? (jiraIdeas ?? createJiraIdeaClient(atlassian)) : undefined;
 const zendeskToolAuth = !zendeskTickets && config.providerEnabled["zendesk-ticket"] && process.env[ZENDESK_RISK_ACK_ENV]?.trim() === ZENDESK_RISK_ACK_VALUE
-  ? loadZendeskAuth(effectiveJiraEnv) : undefined;
+  ? loadZendeskAuth(process.env) : undefined;
 const zendeskToolTickets = zendeskTickets ?? (zendeskToolAuth?.ok
   ? createZendeskTicketClient({ fetchImpl: fetch, subdomain: zendeskToolAuth.subdomain, token: zendeskToolAuth.token }) : undefined);
-const trelloToolAuth = !trelloCards && config.providerEnabled["trello-card"] && process.env[TRELLO_RISK_ACK_ENV]?.trim() === TRELLO_RISK_ACK_VALUE
-  ? loadTrelloAuth(effectiveJiraEnv) : undefined;
-const trelloToolCards = trelloCards ?? (trelloToolAuth?.ok
-  ? createTrelloCardClient({ fetchImpl: fetch, boardId: trelloToolAuth.boardId, apiKey: trelloToolAuth.apiKey, token: trelloToolAuth.token }) : undefined);
 
 // Label writes must never silently 403: Jira only honours notifyUsers=false
 // for an account holding Administer Jira/Projects on the ticket's project.
@@ -692,7 +793,7 @@ const labelWriter = createNotifyGate({ jira: atlassian, account: config.atlassia
 // extra: before this, a hung herdr socket left `herdr.agent.list()` and
 // `herdr.subscribe()` pending forever, wedging every caller that serializes
 // on one of them.
-const herdr = new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs });
+const herdr = daemonWorkerClient(new DrovrClient({ ...(config.herdrSocket ? { socketPath: config.herdrSocket } : {}), timeoutMs: config.herdrCallTimeoutMs }),workerRollout);
 // Before any listener or loop exists: live agents in legacy flat workspaces
 // count against the host cap but no rule loop owns them, so refuse to start
 // rather than oversubscribe or adopt them (src/daemon/legacy-preflight.ts).
@@ -715,7 +816,15 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, accountNameOf, resolvedAgentOf, workerRollout);
+herd.ruleRuntime=()=>ruleAuthority.policy;
+{const spec=workerRollout?.continuationSpec();if(spec){
+ if(!atlassian)throw Error('Configured issue policy client required for continuation');
+ workerRollout!.installContinuationPolicyReader(createContinuationPolicyReader(spec.policy,{
+ intent:()=>controlPanel.readContinuationIntent(spec.authority),issue:()=>atlassian.issue(spec.policy.issueKey),comments:()=>atlassian.allComments(spec.policy.issueKey)
+ }));
+}}
+{const census=await herd.ruleCensus();ruleAuthority.recordFullCensus(census.ids,census.complete);}
 // FACTORY-95 (implementing FACTORY-90, epic FACTORY-83): relabel every
 // currently-running, butchr-owned herdr workspace to its short display label
 // on every daemon startup — no agent restart. Idempotent (see
@@ -736,7 +845,7 @@ void herd.relabelOwnedWorkspaces();
 // throws (per-pane failures are swallowed and logged inside it).
 void reportPersistedAgentSessions({ herdr, log: (line) => console.error(`  ${line}`) });
 // BUTCHR-413 — the Codex stopgap wake path for a `channel: true` MCP server
-// binding (BUTCHR-411's `Rule.mcpServers`): a
+// binding (BUTCHR-411's `Rule.mcpServers`, e.g. Rocket.Chat's `rocketr`): a
 // Claude agent bound to one needs nothing here (its own CLI opens the
 // notification stream directly, per BUTCHR-411's launch wiring); a Codex
 // agent has no development-channel concept and would otherwise receive
@@ -750,6 +859,12 @@ const codexChannelRelays = createCodexChannelRelayPool({
   bindingsOf: mcpBindingsOf,
   runningIssues: () => herd.runningIssues(),
   log: (line) => console.error(`  ${line}`),
+  // BUTCHR-413 (review finding 2): the SAME per-agent, non-secret account
+  // name `herd` above uses for Codex's own bound-server headers — one
+  // identity, two consumers, so a message aimed at this agent's account
+  // reaches it however it is running, and the two paths can never disagree
+  // about who this agent is.
+  accountNameOf,
 });
 const codexChannelRelayTick = () => codexChannelRelays.reconcile().catch((e) => console.error(`  WARNING: [notify] codex channel relay reconcile failed: ${(e as Error)?.message ?? e}`));
 void codexChannelRelayTick();
@@ -787,19 +902,30 @@ const ADMISSION_SOURCE_JIRA_PROJECT = "jira-project";
 const jiraProjectEnabled = jiraProjectStaffing.run;
 const ADMISSION_SOURCE_FILESYSTEM = "filesystem";
 const ADMISSION_SOURCE_CONFLUENCE_PAGE = "confluence-page";
-const ADMISSION_SOURCE_TRELLO_CARD = "trello-card";
+// BUTCHR-408: unlike every rule above, the managed-sessions query is built
+// into the daemon, never a user rules.json rule — it always runs (no
+// staffing gate, same "every enabled filesystem rule always runs" reasoning
+// as ADMISSION_SOURCE_FILESYSTEM, minus the "enabled" part since there is no
+// rules.json entry to disable), so it is unconditionally in `sources` below.
+const ADMISSION_SOURCE_MANAGED_SESSIONS = "managed-sessions";
 const admissionController = createAdmissionController({
   cap: config.maxAgents,
-  residency: () => herd.runningIssues(),
+  residency: async()=>{const census=await herd.ruleCensus();ruleAuthority.recordFullCensus(census.ids,census.complete);if(!census.complete)throw Error("Ambiguous worker census");return census.ids;},
   // BUTCHR-398: shared across every rule provider's admission bucket —
   // `roleOfAgent` reads the FULL `rules` list (every provider), so it
   // correctly classifies a running id of ANY provider, not just jira-work.
+  // BUTCHR-408: a managed-session agent's OWN `role` (its manifest field) IS
+  // read here — via `managedSessionRoles` (see that map's own comment,
+  // above `roleOfAgent`'s definition), not the rule-level lookup every
+  // other provider uses (the built-in managed-sessions rule is one shared
+  // Rule for every heterogeneous definition file, so it cannot carry a
+  // per-file role itself).
   roleOf: roleOfAgent,
   // FACTORY-907: see `rateLimitOfAgent`'s own doc comment above.
   rateLimitOf: rateLimitOfAgent,
   log: (line) => console.error(`  ${line}`),
   now: () => Date.now(),
-  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(filesystemStaffing.run ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ...(trelloCards ? [ADMISSION_SOURCE_TRELLO_CARD] : [])],
+  sources: [ADMISSION_SOURCE_ISSUE, ...(githubIssues ? [ADMISSION_SOURCE_GITHUB_ISSUE] : []), ...(githubPrs ? [ADMISSION_SOURCE_GITHUB_PR] : []), ...(jiraIdeas ? [ADMISSION_SOURCE_JIRA_IDEA] : []), ...(zendeskTickets ? [ADMISSION_SOURCE_ZENDESK_TICKET] : []), ...(jiraProjectEnabled ? [ADMISSION_SOURCE_JIRA_PROJECT] : []), ...(filesystemStaffing.run ? [ADMISSION_SOURCE_FILESYSTEM] : []), ...(confluencePageEnabledRules.length ? [ADMISSION_SOURCE_CONFLUENCE_PAGE] : []), ADMISSION_SOURCE_MANAGED_SESSIONS],
 });
 const terminalPrefix = config.terminalPrefix ?? detectTerminalPrefix((c) => Bun.which(c) != null) ?? undefined;
 // BUTCHR-269: widened from a bare `Map<string, string>` of summaries alone —
@@ -858,9 +984,23 @@ const dashboardFeed = createDashboardFeed({
   withheldTracker: dashboardWithheldStatusFloor,
   admission: () => admissionController.census(),
 });
+const operationalAgentFeed=createOperationalAgentFeed(Date.now,key=>ruleAuthority.admittedRuleIdentity(key));
+controlPanel.setTelemetrySource(()=>operationalAgentFeed.snapshot("daemon",true));
 
 const ops: AtlassianOps = config.atlassian ? realAtlassian({ site: config.atlassian.site, email: config.atlassian.email, token: config.atlassian.token }) : createDisabledAtlassianOpsStub();
 
+// FACTORY-7/FACTORY-5: the local file store needs no credentials and works
+// for every ResourceRef kind; a `jira-project:` owner routes to the
+// project-property-backed store instead (this daemon already has Jira
+// credentials loaded, so the factory is cheap and side-effect-free rather
+// than genuinely lazy) — see `src/resources/link-store-router.ts` for the
+// routing decision itself. BUTCHR-469: hoisted out of the MCP tool wiring
+// below (its original, still-only-other, call site) so the SAME instance
+// (stateless per call, so a second handle would be equivalent anyway — see
+// `createLinkStore`'s own doc comment) can also be handed to the
+// `jira-project` resource type's own linked-eventing wiring further down,
+// without constructing a second routing store for no reason.
+const routingLinkStore = createRoutingLinkStore({ fileStore: createLinkStore(defaultLinksStorePath()), jiraProjectStore: () => createJiraProjectLinkStore(ops) });
 
 // The own-write ledger (src/jira-watch/own-writes.ts): every daemon-side
 // write (agent tool calls, and this daemon's own label sync) records the
@@ -952,13 +1092,6 @@ const zendeskTicketHealth = createResourceLoopHealth({
   thresholdMs: Math.max(config.pollStaleMs, 3 * ZENDESK_TICKET_POLL_MS),
   log: (line) => console.error(line),
 });
-const trelloCardHealth = createResourceLoopHealth({
-  name: "trello-card",
-  enabled: Boolean(trelloCards),
-  ...(trelloStaffing.run ? {} : { disabledReason: trelloStaffing.reason ?? "no enabled trello-card rules" }),
-  thresholdMs: Math.max(config.pollStaleMs, 3 * TRELLO_CARD_POLL_MS),
-  log: (line) => console.error(line),
-});
 const filesystemHealth = createResourceLoopHealth({
   name: "filesystem",
   enabled: filesystemStaffing.run,
@@ -971,6 +1104,13 @@ const confluencePageHealth = createResourceLoopHealth({
   enabled: confluencePageStaffing.run,
   ...(confluencePageStaffing.run ? {} : { disabledReason: confluencePageStaffing.reason ?? "no enabled confluence-page rules" }),
   thresholdMs: Math.max(config.pollStaleMs, 3 * CONFLUENCE_PAGE_POLL_MS),
+  log: (line) => console.error(line),
+});
+// BUTCHR-408: always enabled — the built-in query has no staffing gate and no rules.json entry to disable.
+const managedSessionsHealth = createResourceLoopHealth({
+  name: "managed-sessions",
+  enabled: true,
+  thresholdMs: Math.max(config.pollStaleMs, 3 * MANAGED_SESSIONS_POLL_MS),
   log: (line) => console.error(line),
 });
 // BUTCHR-179: per-detector "could not check" coverage, reported as a
@@ -1065,49 +1205,28 @@ installSetupCodeSigusr2Handler(jiraTokenRotateCodeManager, (line) => console.err
 // comments (`../web/view.ts`).
 const jiraTokenTestRateLimit = createWriteRateLimiter({ windowMs: 10 * 60_000, max: 5 });
 const jiraTokenWriteRateLimit = createWriteRateLimiter({ windowMs: 60 * 60_000, max: 3 });
-// local/ui: `POST /api/settings/github/test` — same 1-per-5s shape as the Jira test above.
-const githubTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
-const providerTestRateLimit = createWriteRateLimiter({ windowMs: 5_000, max: 1 });
-// local/ui: which supervisor runs this daemon, measured once (one
-// `systemctl`/`launchctl print` call) — the Settings page shows the matching
-// setup-code command and whether its Restart button works.
-const supervisorInfo: Promise<SupervisorInfo> = (async () => {
-  if (await isRunningUnderThisUnit()) return { kind: "systemd" } as const;
-  const job = await launchdJobForThisProcess();
-  return job ? ({ kind: "launchd", job } as const) : ({ kind: "none" } as const);
-})();
-// local/ui: the credential cards' data, re-reading settings.json each time so
-// a just-saved org list shows, next to what this daemon started with (it
-// keeps using that until a restart, and the page says so).
-const startupCardSettings = {
-  githubOrgs: (effectiveJiraEnv.BUTCHR_GITHUB_ORGS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
-  zendeskSubdomain: effectiveJiraEnv.ZENDESK_SUBDOMAIN?.trim() || null,
-  trelloBoardId: effectiveJiraEnv.TRELLO_BOARD_ID?.trim() || null,
-};
-const credentialsSummary = async () => buildCredentialsSummary({
-  rawEnv: process.env as Record<string, string | undefined>,
-  settingsFileValues: loadSettingsFile(process.env).values,
-  // FACTORY-66: Atlassian can be switched off or unconfigured now; the card then shows no site or email.
-  atlassian: { site: config.atlassian?.site ?? null, email: config.atlassian?.email ?? null },
-  githubActive: config.github !== undefined,
-  running: startupCardSettings,
-  startedAt: buildIdentity.startedAt,
-  supervisor: await supervisorInfo,
-  ownPid: process.pid,
-});
-// local/ui: the env the NEXT start would build (this process's env, then
-// settings.json and the managed secret files as they are now), for the
-// Settings page's connection tests: they check what the cards show, not what
-// this daemon started with. Jira's own test is upstream's and still tests the
-// running config.
-const nextStartEnv = () => resolveEffectiveProviderSecretsEnv(resolveEffectiveGithubEnv(effectiveSettingsEnv(process.env as Record<string, string | undefined>, loadSettingsFile(process.env).values)));
 
-// FACTORY-662 item 4: one JSON-lines audit file, next to the rules file
+// FACTORY-662 item 4/7: one JSON-lines audit file, next to the rules file
 // itself (same directory FACTORY-658's own backups live in) — every
-// accepted/rejected write appends one line here and to the journal.
+// accepted/rejected write appends one line here AND raises a non-deduped
+// alert through the SAME Rocket.Chat poster the managed-session escalator
+// and ops-alert router already share (`teamAdminNotify`, defined further
+// down this file) — referenced here only inside a closure not called until
+// an actual write happens, well after `teamAdminNotify` is initialized; see
+// `ptyAttach.read`'s own comment just below in this file for the identical,
+// already-established pattern.
 const auditLogPath = join(dirname(rulesPath()), WEB_WRITE_AUDIT_LOG_BASENAME);
+// B4 (agentsafety second pass): ONE logger instance, not rebuilt per call —
+// its rejected-write aggregation (`createAuditLogger`'s own header) only
+// works if the SAME instance sees every write.
 const auditWrite = createAuditLogger({
   append: fileAuditAppend(auditLogPath),
+  // Deferred to CALL time (not evaluated here) — `teamAdminNotify` is
+  // declared further down this file; this closure isn't invoked until an
+  // actual write happens, well after it's initialized. Same pattern as
+  // `ptyAttach.read`'s own comment elsewhere in this file.
+  postAlert: (text: string) => (teamAdminNotify ? teamAdminNotify(config.opsAlert.room, text) : Promise.resolve()),
+  host: hostname(),
   log: (line) => console.error(line),
 });
 
@@ -1131,14 +1250,14 @@ const auditWrite = createAuditLogger({
 // per-rule rate limit (which previously fell through to the
 // `Number.POSITIVE_INFINITY` fail-safe below, tripping the scope ceiling
 // on every back-to-back apply).
-const scopeOf = createScopeCache(async (id: string, queryOverride: string, provider?: ResourceProvider): Promise<number> => {
-  const result = await rulesPreviewer(id, queryOverride, provider);
+const scopeOf = createScopeCache(async (id: string, queryOverride: string): Promise<number> => {
+  const result = await rulesPreviewer(id, queryOverride);
   return result.ok ? result.total : Number.POSITIVE_INFINITY;
 });
 const rulesWriteDeps = {
   env: process.env,
   reload: () => {
-    const result = reloadRules(rulesHolder);
+    const result = reloadLocalRules();
     // FACTORY-685 (N4): every successful write already calls this via
     // `toOutcome` — clearing the scope cache here, unconditionally, means a
     // cached scope reading can never outlive the write (or SIGHUP, or the
@@ -1161,6 +1280,27 @@ const rulesWriteDeps = {
 // never a second type).
 const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
 
+// FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+// path's own deps — `dir`/`store` are the SAME `sessionDefinitionsPath()`/
+// `defaultSessionFreezeIo().store` `configInventory` above already reads,
+// never a second resolution. `lastUiWrite` is its OWN ref (undo scoped to
+// THIS write path only, never shared with `rulesWriteDeps.lastUiWrite`).
+const sessionDefinitionsWriteDeps = {
+  dir: () => sessionDefinitionsPath(),
+  store: defaultSessionFreezeIo().store,
+  lastUiWrite: { value: null } as SessionDefinitionLastUiWriteRef,
+};
+
+// FACTORY-962 (epic FACTORY-659, slice D1 follow-up): the links write
+// path's own deps — `path` is the SAME `defaultLinksStorePath()` the
+// `butchr link` CLI and `resourceLinkTools` already read/write, never a
+// second resolution. `lastUiWrite` is its OWN ref (undo scoped to THIS
+// write path only, never shared with `sessionDefinitionsWriteDeps.lastUiWrite`).
+const linksWriteDeps = {
+  path: () => defaultLinksStorePath(),
+  lastUiWrite: { value: null } as LastLinksUiWrite,
+};
+
 // FACTORY-668 (C2, write): `reloadRulesNow` (the in-process write-path
 // caller, FACTORY-663) and `daemonReload` (`POST /api/daemon/reload`'s new
 // HTTP exposure of the SAME trigger) are literally the same function —
@@ -1168,13 +1308,14 @@ const agentWriteDeps: AgentWriteDeps = { ops, herd, roles: config.assignees };
 // or from `SIGHUP`'s own handler below, which also calls `reloadRules`
 // directly against this one `rulesHolder`.
 const reloadRulesInProcess = () => {
-  const result = reloadRules(rulesHolder);
+  const result = reloadLocalRules();
   scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
   return result;
 };
 
 const { app, mcp } = buildApp({
-  getRules,
+  getRules:rulesHolder.getRules,
+  localRulesWritable:()=>ruleAuthority.summary().authority!=="remote",
   getRulesSourceEtag: () => rulesHolder.getSourceEtag(),
   reloadRulesNow: reloadRulesInProcess,
   daemonReload: reloadRulesInProcess,
@@ -1228,27 +1369,33 @@ const { app, mcp } = buildApp({
   // below, near `PERMISSION_ANSWER_INTERVAL_MS`) joins `loopHealth`/
   // `notifyHealth` IN `components[]` — not the `resourceLoops[]` list below —
   // see `createTickHealth`'s own doc comment (src/daemon/health.ts) for why.
-  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [jiraWorkHealth, githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, trelloCardHealth], unresolvedRelationships(getRules()), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
+  health: () => combineHealth([loopHealth, notifyHealth, permissionAnswerHealth], toBuildReport(buildIdentity), coverage.snapshot(), admissionController.snapshot(), currency.snapshot(), [jiraWorkHealth, githubIssueHealth, githubPrHealth, jiraIdeaHealth, zendeskTicketHealth, jiraProjectHealth, filesystemHealth, confluencePageHealth, managedSessionsHealth], unresolvedRelationships(getRules()), escalator.managedSessionEscalations(), credentialDeathTracker.current(), codexDialogSightings.sightings(), dashboardAppStatus(dashboardAppRoot), issueLoopWatchdog.reports(), commentChecksSkipped, stalledWakes, stalledWakesCapped),
   // BUTCHR-269: NO I/O here — reads the snapshot the `agentStatuses` tee
   // (below, inside `createLabelSync`'s deps) last stored, fed by the issue
   // loop's own 15s poll. See src/agents/dashboard.ts's header and BUTCHR-263
   // for why a request-time fetch is the wrong pattern here even though it's
   // what `state` above does.
   dashboard: async () => dashboardFeed.snapshot(),
-  // FACTORY-72: every configured rule, staffed or not — see src/agents/query-agent-inventory.ts's own top
+  controlPanel,
+  // FACTORY-72: every configured rule and managed-session definition,
+  // staffed or not — see src/agents/query-agent-inventory.ts's own top
   // comment for the reuse this is built from. `rulesFile`/`configReasonFor`
   // are this daemon's own already-computed values (loaded/decided once at
   // startup above), never a second load or a second staffing decision.
   configInventory: () =>
     buildQueryAgentInventory({
-      rulesFile: { path: rulesPath(), rules: getRules(), error: null },
+      rulesFile: { path: rulesPath(), rules: rulesHolder.getRules(), error: null },
       dashboard: dashboardFeed.snapshot(),
       configReasonFor: (rule) => {
         if (rule.resourceProvider === "github-issue" && !githubStaffing.run && githubStaffing.rules.some((r) => r.id === rule.id)) return githubStaffing.reason;
         if (rule.resourceProvider === "github-pr" && !githubPrStaffingResult.run && githubPrStaffingResult.rules.some((r) => r.id === rule.id)) return githubPrStaffingResult.reason;
         if (rule.resourceProvider === "zendesk-ticket" && !zendeskStaffing.run && zendeskStaffing.rules.some((r) => r.id === rule.id)) return zendeskStaffing.reason;
-        if (rule.resourceProvider === "trello-card" && !trelloStaffing.run && trelloStaffing.rules.some((r) => r.id === rule.id)) return trelloStaffing.reason;
         return null;
+      },
+      sessionDefinitions: {
+        activeDir: sessionDefinitionsPath(),
+        archiveDir: sessionArchiveDir(),
+        store: defaultSessionFreezeIo().store,
       },
     }),
   // BUTCHR-339: the dashboard page's header info — the SAME `build`/`currency`
@@ -1323,15 +1470,14 @@ const { app, mcp } = buildApp({
   // and `fileEtag` (review round 1, note (b); review round 2, G1:
   // `rulesEtag()`, FACTORY-658, FACTORY-662's F7 requirement) are the real
   // per-request I/O this route needs (the file's own current bytes/mtime),
-  // accepted because this is a distinct, infrequently-hit route, never on
-  // `/`'s or `/dashboard`'s own request path. `getRulesSourceEtag()`
+  // accepted for the same reason `configInventory` above accepts its own
+  // session-definition-listing I/O: a distinct, infrequently-hit route,
+  // never on `/`'s or `/dashboard`'s own request path. `getRulesSourceEtag()`
   // (passed to `buildApp` above) is read fresh too, by this route itself —
   // that gap between it and this call's own `fileEtag` is exactly what
   // `stale` reports.
   // FACTORY-729: `GET /api/rules/catalog`'s own data — pure constants, no I/O.
   rulesCatalog: () => RULE_FORM_CATALOG,
-  // local/ui: the shipped `@builtin:` briefs, resolved, for the dashboard's rule editor.
-  builtinBriefs: () => knownBriefTypes().map((name) => ({ name, text: briefFor(name) })),
   rulesFileState: async () => {
     let mtime: string | null = null;
     try {
@@ -1339,7 +1485,7 @@ const { app, mcp } = buildApp({
     } catch {
       mtime = null;
     }
-    return { path: rulesPath(), rules: getRules(), error: null, mtime, fileEtag: rulesEtag() };
+    return { path: rulesPath(), rules: rulesHolder.getRules(), error: null, mtime, fileEtag: rulesEtag() };
   },
   rulesPreview: (id, queryOverride) => rulesPreviewer(id, queryOverride),
   // FACTORY-662: the write path's own deps — see the comments just above
@@ -1351,7 +1497,7 @@ const { app, mcp } = buildApp({
     enabled: (id, enabled, ifMatch, confirm, planHash) => writeRuleEnabled(id, enabled, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     fields: (id, patch, ifMatch, confirm, planHash) => writeRuleFields(id, patch, ifMatch, confirm, planHash, scopeOf, rulesWriteDeps),
     undo: (backupId) => writeUndo(backupId, rulesWriteDeps),
-    plan: (id, patch, confirm, opts) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps, opts),
+    plan: (id, patch, confirm) => planRuleWrite(id, patch, confirm, scopeOf, rulesWriteDeps),
     // FACTORY-731: `hasLiveAgents` reads the SAME poll-fed
     // `dashboardFeed.snapshot().rows` every other "is this rule staffed"
     // check in this daemon already reads (`ruleHasLiveAgent`'s own doc
@@ -1363,6 +1509,28 @@ const { app, mcp } = buildApp({
     // stale-file refusal ride the identical wiring, never a second copy.
     create: (input, confirm, planHash) => createRule(input, confirm, planHash, scopeOf, rulesWriteDeps),
     planCreate: (input, confirm) => planRuleCreate(input, confirm, scopeOf, rulesWriteDeps),
+  },
+  // FACTORY-667 (epic FACTORY-659, slice D1): the session-definitions write
+  // orchestration (`../resources/session-definitions-write.ts`) — reuses
+  // this daemon's own already-constructed `sessionDefinitionsWriteDeps`
+  // above, never a second freeze store or directory resolution.
+  sessionDefinitionsWrite: {
+    fields: (name, patch, ifMatch, confirm) => writeSessionDefinitionFields(sessionDefinitionsWriteDeps, name, patch, ifMatch, confirm),
+    frozen: (name, frozen, ifMatch) => writeSessionDefinitionFrozen(sessionDefinitionsWriteDeps, name, frozen, ifMatch),
+    undo: (backupId) => writeSessionDefinitionUndo(sessionDefinitionsWriteDeps, backupId),
+  },
+  // FACTORY-962 (epic FACTORY-659, slice D1 follow-up): `GET /api/links`'s
+  // own read — the file-backed link store only (see `listAllFileLinks`'s
+  // own header for why a jira-project-owned link can't be enumerated this
+  // way), read fresh every request, same discipline as `configInventory`.
+  linksRead: () => listAllFileLinks(defaultLinksStorePath()),
+  // FACTORY-962: the links write orchestration (`../resources/links-write.ts`)
+  // — reuses this daemon's own already-constructed `linksWriteDeps` above,
+  // never a second path resolution.
+  linksWrite: {
+    add: (resource, target) => writeLinkAdd(linksWriteDeps, resource, target),
+    remove: (resource, target) => writeLinkRemove(linksWriteDeps, resource, target),
+    undo: (backupId) => writeLinkUndo(linksWriteDeps, backupId),
   },
   auditWrite,
   writeRateLimit,
@@ -1376,14 +1544,7 @@ const { app, mcp } = buildApp({
   // was built from are passed through too, so `buildSettingEntries` can
   // report `source: "environment" | "file" | "default"` correctly for
   // every allowlisted key — see that function's own doc comment.
-  // local/ui: read from settings.json as it is now, the same as the PUT reply
-  // below (`buildCurrentSettingsApiResponse`), so a value saved from the
-  // Settings page still reads back as saved after leaving the page or
-  // reloading, until the restart that applies it.
-  settings: async () => ({
-    ...(await buildCurrentSettingsApiResponse(process.env as Record<string, string | undefined>, () => loadSettingsFile(process.env), { unitHint: () => cachedUnitHint() })),
-    credentials: await credentialsSummary(),
-  }),
+  settings: () => buildSettingsApiResponse(effectiveEnv, { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: settingsFileResult.values }),
   // FACTORY-664: `POST /api/settings/jira/test` — calls Atlassian with THIS
   // daemon's own already-loaded credentials, never anything from the
   // request itself.
@@ -1404,10 +1565,8 @@ const { app, mcp } = buildApp({
   // needed" badge has an accurate current/pending value to show it against).
   settingsWrite: async (key, value, confirm) => {
     writeSetting(key, value, confirm);
-    return {
-      ...(await buildCurrentSettingsApiResponse(process.env as Record<string, string | undefined>, () => loadSettingsFile(process.env), { unitHint: () => cachedUnitHint() })),
-      credentials: await credentialsSummary(),
-    };
+    const fresh = loadSettingsFile(process.env);
+    return buildSettingsApiResponse(effectiveSettingsEnv(process.env as Record<string, string | undefined>, fresh.values), { unitHint: () => cachedUnitHint(), rawEnv: process.env as Record<string, string | undefined>, settingsFileValues: fresh.values });
   },
   // FACTORY-665: `POST /api/daemon/restart` — fixed-argv `systemctl --user
   // restart butchr.service`, ONLY when this daemon is actually running
@@ -1434,62 +1593,15 @@ const { app, mcp } = buildApp({
   // FACTORY-66: `config.atlassian` can now be `undefined` — rotation makes
   // no sense with no Atlassian credential to rotate, refused the same way
   // any other bad input to this route already is (400), never a crash.
-  // local/ui: the token is written where it actually lives — the file
-  // ATLASSIAN_TOKEN_FILE names (this install's case), else the managed
-  // secrets/atlassian-token — after `checkSecretDestination` passes. Only a
-  // literal ATLASSIAN_TOKEN still answers 409.
-  jiraTokenRotate: (input, rateGate) => {
-    if (!config.atlassian) return Promise.resolve({ ok: false as const, status: 400 as const, body: { error: disabledAtlassianReason() } });
-    const target = resolveCredentialTarget("atlassian", process.env as Record<string, string | undefined>);
-    return handleJiraTokenWrite(
-      { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
-      {
-        setupCode: jiraTokenRotateCodeManager,
-        path: target.path ?? jiraTokenFilePath(process.env as Record<string, string | undefined>),
-        env: process.env as Record<string, string | undefined>,
-        checkDestination: (path) => checkSecretDestination(path, { managed: target.managed }),
-      } satisfies JiraWriteDeps,
-      { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
-    );
-  },
+  jiraTokenRotate: (input, rateGate) => config.atlassian
+    ? handleJiraTokenWrite(
+        { site: config.atlassian.site, email: config.atlassian.email, token: input.token, setupCode: input.setupCode },
+        { setupCode: jiraTokenRotateCodeManager, path: jiraTokenFilePath(process.env as Record<string, string | undefined>), env: process.env as Record<string, string | undefined> } satisfies JiraWriteDeps,
+        { requireEnvCheck: true, ...(rateGate ? { rateGate } : {}) },
+      )
+    : Promise.resolve({ ok: false as const, status: 400 as const, body: { error: disabledAtlassianReason() } }),
   jiraTokenTestRateLimit,
   jiraTokenWriteRateLimit,
-  // local/ui: the GitHub token is set with the same setup code (one SIGUSR2
-  // code authorizes one secret write, whichever it is) and written where
-  // `resolveCredentialTarget` says it lives, resolved per request.
-  githubTokenWrite: (input, rateGate) => handleGithubTokenWrite(
-    input,
-    { setupCode: jiraTokenRotateCodeManager, target: resolveCredentialTarget("github", process.env as Record<string, string | undefined>) },
-    { ...(rateGate ? { rateGate } : {}) },
-  ),
-  githubTest: () => {
-    const { token, orgs } = githubTestInputs(nextStartEnv());
-    return testGithubConnection(token, orgs);
-  },
-  githubTestRateLimit,
-  // local/ui: Zendesk and Trello, the same way. The Zendesk subdomain the
-  // token is tested against is re-read per request, so one saved a moment
-  // earlier counts.
-  zendeskTokenWrite: (input, rateGate) => handleZendeskTokenWrite(
-    input,
-    {
-      setupCode: jiraTokenRotateCodeManager,
-      targets: [resolveCredentialTarget("zendesk", process.env as Record<string, string | undefined>)],
-      subdomain: process.env.ZENDESK_SUBDOMAIN?.trim() || loadSettingsFile(process.env).values.ZENDESK_SUBDOMAIN || null,
-    },
-    { ...(rateGate ? { rateGate } : {}) },
-  ),
-  trelloCredentialsWrite: (input, rateGate) => handleTrelloCredentialsWrite(
-    input,
-    {
-      setupCode: jiraTokenRotateCodeManager,
-      targets: [resolveCredentialTarget("trello-key", process.env as Record<string, string | undefined>), resolveCredentialTarget("trello-token", process.env as Record<string, string | undefined>)],
-    },
-    { ...(rateGate ? { rateGate } : {}) },
-  ),
-  zendeskTest: () => testZendeskConnection(nextStartEnv()),
-  trelloTest: () => testTrelloConnection(nextStartEnv()),
-  providerTestRateLimit,
 // check_in/stand_down are passed no registries: the rule engine has no
 // project tier to check in and no per-agent sleep yet, so both tools run in
 // their documented "declares nothing" mode instead of feeding state that no
@@ -1501,13 +1613,15 @@ const { app, mcp } = buildApp({
   // initialized, which here means its MCP tools are not even registered,
   // not merely registered-but-guaranteed-to-fail.
   ...(config.atlassian ? providerAtlassianTools(ops, undefined, recordOwnWrite) : {}),
+  ...resourceLinkTools(routingLinkStore, (line) => console.error(line)),
   ...(githubToolIssues ? githubIssueTools({ client: githubToolIssues, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(githubToolPrs ? githubPrTools({ client: githubToolPrs, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(zendeskToolTickets ? zendeskTicketTools({ client: zendeskToolTickets, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
-  ...(trelloToolCards ? trelloCardTools({ client: trelloToolCards, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   ...(config.atlassian && jiraToolIdeas ? jiraIdeaTools({ client: jiraToolIdeas, site: config.atlassian.site, onWrite: (resource, updated, writer) => ownWrites.record(resource, updated, writer, Date.now()) }) : {}),
   // Linking requires both configured provider clients; their account checks remain authoritative.
   ...(config.atlassian && githubToolIssues && jiraToolIdeas ? ideaGithubLinkTools({ ideas: jiraToolIdeas, github: githubToolIssues, ideaMatches: () => ideaMatches, githubMatches: () => githubMatches, site: config.atlassian.site }) : {}),
+  // Session control retains its explicit controller authorization and containment.
+  ...sessionFreezeTools({ dir: sessionDefinitionsPath(), list: listFilesystemResources, read: (p) => readFile(p, "utf8"), freeze: defaultSessionFreezeIo() }),
 });
 app.all("/resource-mcp/:agent/:name", ({ request, params }) => resourceConnections.handle(request, params.agent, params.name));
 app.listen(listenOptions(config.port));
@@ -1555,7 +1669,7 @@ console.error(`butchr daemon on http://${DAEMON_HOSTNAME}:${config.port}  (${des
 // once, at startup, and is unaffected either way.
 process.on("SIGHUP", () => {
   const before = rulesHolder.getRules().length;
-  const result = reloadRules(rulesHolder);
+  const result = reloadLocalRules();
   scopeOf.clear(); // FACTORY-685 (N4) — see `rulesWriteDeps.reload`'s own comment above.
   if (!result.ok) {
     console.error(`butchr: rules reload from ${result.path} failed; keeping the running rules:`);
@@ -1580,7 +1694,6 @@ process.on("SIGHUP", () => {
   if (result.removed.length) console.error(`  removed: ${result.removed.join(", ")}`);
   if (result.changed.length) console.error(`  changed: ${result.changed.join(", ")}`);
   if (!result.added.length && !result.removed.length && !result.changed.length) console.error(`  no change`);
-  for (const w of result.warnings ?? []) console.error(`  WARNING: ${w}`);
 });
 // BUTCHR-320 (C): reuses the exact same buildIdentity/toBuildReport this
 // daemon's own /health `build` field serves (see `health` above) — never a
@@ -1725,6 +1838,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
   try {
     agents = await dashboardFeed.poll(async () => {
       const { agents } = await herdr.agent.list();
+      operationalAgentFeed.record(agents.map(a=>({agentKey:agentIdOfWorkspacePath(a.cwd??null),status:a.agent_status})));
       // FACTORY-407: `agent_key` (full, undiscarded) feeds the dashboard row's
       // own correlation identifier (`buildDashboardRows`); `resource_key`
       // (bare, via the UNCHANGED `resourceOfCwd`) stays exactly what
@@ -1733,6 +1847,7 @@ const agentStatusesFeedingDashboard = async (): Promise<ReadonlyMap<string, stri
       return { agents: agents.map((a) => ({ ...a, resource_key: resourceOfCwd(a.cwd), agent_key: dashboardAgentOfCwd(a.cwd) })) };
     });
   } catch (e) {
+    operationalAgentFeed.decline();
     coverage.recordDeclined(DASHBOARD_DETECTOR);
     throw e;
   }
@@ -1810,10 +1925,9 @@ const stallRemediation = config.stallRemediationMode === "off" ? undefined : cre
 // deliberately discards rule identity), so this is the one place that
 // association is still available. A ticket matched by more than one
 // enabled rule resolves by the most conservative reading per field,
-// independently: ANY matching rule with `idlePokeEnabled` off disables the
-// poke outright (local/ui: off is the default, so only rules that turn it
-// on count as on; an opt-out from one rule should never be overridden by
-// another rule's opt-in); among rules that leave it
+// independently: ANY matching rule's explicit `idlePokeEnabled: false`
+// disables the poke outright (an opt-out from one rule should never be
+// overridden by another rule's silence); among rules that leave it
 // enabled, the SMALLEST explicit `idlePokeMinutes` wins (the more urgent
 // configured interval, never the global, never an unset rule's silence);
 // the first matching rule's explicit `idlePokeMessage` wins (arbitrary but
@@ -1823,17 +1937,19 @@ const stallRemediation = config.stallRemediationMode === "off" ? undefined : cre
 const idlePokeRuleConfigByIssue = new Map<string, IdlePokeRuleConfig>();
 function updateIdlePokeRuleConfig(units: readonly ExecutionUnit<RuleMatch>[]): void {
   idlePokeRuleConfigByIssue.clear();
-  for (const m of resourceMatches(units)) {
+  const policies=resourceMatches(admittedPolicyUnits(units,ruleAuthority)).map(m=>({issueKey:m.issue.key,rule:m.rule}));
+  for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-work'&&!isQueryLevelAgent(held.id))policies.push({issueKey:resourceKeyOf(held.id),rule:held.rule});
+  for (const m of policies) {
     if (!m.rule.enabled) continue;
-    const existing = idlePokeRuleConfigByIssue.get(m.issue.key);
+    const existing = idlePokeRuleConfigByIssue.get(m.issueKey);
     if (m.rule.idlePokeEnabled !== true) {
-      idlePokeRuleConfigByIssue.set(m.issue.key, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
+      idlePokeRuleConfigByIssue.set(m.issueKey, { idlePokeEnabled: false, ...(existing?.idlePokeMinutes !== undefined ? { idlePokeMinutes: existing.idlePokeMinutes } : {}), ...(existing?.idlePokeMessage !== undefined ? { idlePokeMessage: existing.idlePokeMessage } : {}) });
       continue;
     }
     if (existing?.idlePokeEnabled === false) continue; // an earlier rule's explicit opt-out already wins
     const idlePokeMinutes = m.rule.idlePokeMinutes !== undefined && (existing?.idlePokeMinutes === undefined || m.rule.idlePokeMinutes < existing.idlePokeMinutes) ? m.rule.idlePokeMinutes : existing?.idlePokeMinutes;
     const idlePokeMessage = existing?.idlePokeMessage ?? m.rule.idlePokeMessage;
-    idlePokeRuleConfigByIssue.set(m.issue.key, {
+    idlePokeRuleConfigByIssue.set(m.issueKey, {
       idlePokeEnabled: true,
       ...(idlePokeMinutes !== undefined ? { idlePokeMinutes } : {}),
       ...(idlePokeMessage !== undefined ? { idlePokeMessage } : {}),
@@ -1951,6 +2067,104 @@ const abandonedDetector = createAbandonedDetector({
 // silently swallowing it).
 const isQueryLevelAgent = (id: string): boolean => decodeQueryAgentKey(id) !== null;
 
+// BUTCHR-412 — the Rocket.Chat account lifecycle, wired into every rule loop
+// below as the SAME shared instance (one account manager/store for the whole
+// daemon, not one per tier — same reasoning as `admissionController` above):
+// see docs/rocketchat-accounts.md ("Wiring") for the full design and
+// docs/execution-modes.md's `account` section for what each policy means.
+//
+// ALWAYS BUILT (BUTCHR-460 review finding, round 1, blocking — superseding
+// this ticket's own first round, which gated this behind a `rcPolicyNeeded`
+// computed once at startup from `rules.json` PLUS a startup-time snapshot of
+// the session-definitions directory). That gate was correct for `rules.json`
+// alone (loaded once, fixed for the daemon's whole life — a real "nothing
+// will EVER want one" fact) but wrong for managed sessions: the built-in
+// managed-sessions rule ALWAYS runs (no staffing gate — BUTCHR-408), and
+// `butchr session create` can add a definition with `account: "temporary"`/
+// `"permanent"` at ANY time while the daemon is running, no restart involved
+// — so "nothing wants an account" is never a fact this daemon can know in
+// advance, only "nothing wants one YET". Gating `accountLifecycle` itself
+// behind that unknowable fact meant a definition created after a false
+// startup snapshot would spawn with NO account hooks wired at all — not a
+// visible refusal, a SILENT unaccounted spawn, exactly what BUTCHR-412's own
+// "withheld, not degraded" doctrine forbids. Fixed by always building it: the
+// RC HTTP client itself still stays `null` (and every `ensureAccount` call
+// for a policy other than `"none"` still visibly refuses, logged and
+// withheld — see `ensure`'s own doc comment) whenever `ROCKETCHAT_*` is
+// unconfigured — this reuses that EXISTING refusal path rather than adding a
+// second, managed-sessions-only one. `ensureAccount(id, "none")` still never
+// touches the store or client at all (the policy table's own first row), so
+// the ordinary, all-`"none"` daemon pays only for the (cheap: one keyed-lock
+// check, no I/O) synchronous no-op path, not the store/client machinery
+// itself — the one real, accepted cost of this fix is the orphan-sweep timer
+// (below) now always runs, a `.butchr-rc-accounts.json` read every 30
+// minutes, even on a daemon that will never provision anything.
+const rcAuth = loadRocketChatAuth(process.env as Record<string, string | undefined>);
+if (!rcAuth.ok && getRules().some((r) => r.enabled && r.account !== "none")) {
+  console.error(`  WARNING: [account] enabled rule(s) request a Rocket.Chat account policy but Rocket.Chat is not usable (${rcAuth.reason}) — every ensureAccount call will refuse until this is fixed`);
+}
+const rcClient = rcAuth.ok
+  ? createRocketChatClient({ fetchImpl: fetch, url: rcAuth.url, adminUserId: rcAuth.adminUserId, adminToken: rcAuth.adminToken, log: (line) => console.error(`  ${line}`) })
+  : null;
+const accountManager = createAccountManager({
+  client: rcClient,
+  store: createFileAccountStore(),
+  userCapThreshold: config.rocketchat?.userCapThreshold ?? 45,
+  tempAccountCapThreshold: config.rocketchat?.temporaryAccountCapThreshold ?? 8,
+  tokenDir: config.rocketchat?.tokenDir ?? join(workspaceRoot(), ".butchr-rc-tokens"),
+  ...(config.rocketchat?.managedPrefix ? { managedPrefix: config.rocketchat.managedPrefix } : {}),
+});
+const manifestPublisher = createFileNexusManifestPublisher(config.rocketchat?.nexusManifestFile ?? join(workspaceRoot(), ".butchr-rc-nexus-manifest.json"));
+const accountLifecycle = createAccountLifecycle({
+  manager: accountManager,
+  policyOf: accountPolicyOf,
+  manifestPublisher,
+  log: (line) => console.error(`  ${line}`),
+  // Best-effort audible refusal beyond the log line above, for the two
+  // Jira-backed providers only (jira-work, jira-idea) — github-issue and
+  // zendesk-ticket have no generic `ops.addComment`-shaped route wired at
+  // this layer (see docs/rocketchat-accounts.md's own residual-gap note);
+  // a refusal for either of those is still visible in the journal.
+  notify: async (id, text) => {
+    if (isQueryLevelAgent(id)) return; // no single ticket to comment on — same discipline as issueCrashLoopDetector/issueReconcileFailureDetector above
+    const decoded = decodeAnyAgentKey(id);
+    if (decoded?.resourceProvider !== "jira-work" && decoded?.resourceProvider !== "jira-idea") return;
+    await speakOnOwnChannel(ops, resourceKeyOf(id), text);
+  },
+});
+// BUTCHR-412 — the daemon-shutdown residual gap, named honestly rather than
+// closed: daemon shutdown has NO stop handler at all (src/agents/herd.ts's
+// callers never call herd.stop from a shutdown path; agents keep running
+// under herdr regardless of this process's own lifetime), so nothing here
+// needs to release an account on shutdown — an agent that is still running
+// still legitimately holds its account. The gap this DOES leave is an
+// account whose agent genuinely stopped existing with no reaper run in
+// between (this daemon crashing before a reap poll ever observed it, or an
+// account orphaned by an earlier bug) — `reconcileOrphans` is the read-only
+// backstop `docs/rocketchat-accounts.md` names for exactly this.
+// `createAccountOrphanSweep` (src/agents/account-orphan-sweep.ts) is the
+// SAFE wrapper around it — see that module's own top comment for why a
+// single `herd.runningIssues()` snapshot is NOT safe to act on directly
+// (review finding, round 1): it uses `herd.residentIssues()` (a real
+// per-pane liveness check) plus a minimum record age and a two-consecutive-
+// sweep grace before ever releasing anything. Run once at startup, then on
+// this interval — cheap enough (one file read, one herd read per sweep)
+// that a dedicated poll loop would be overkill. BUTCHR-460: this timer now
+// always runs (see "ALWAYS BUILT" above) — a `.butchr-rc-accounts.json` read
+// every 30 minutes even for a daemon that never provisions anything, the one
+// accepted cost of closing the silent-unaccounted-spawn gap.
+const orphanSweep = createAccountOrphanSweep({
+  now: () => Date.now(),
+  reconcileOrphans: (agentExists) => accountManager.reconcileOrphans(agentExists),
+  residentIssues: () => herd.residentIssues(),
+  release: (agentKey, reason) => accountLifecycle.release(agentKey, reason),
+  publishBatch: () => accountLifecycle.publishBatch(),
+  log: (line) => console.error(`  ${line}`),
+});
+const ACCOUNT_ORPHAN_SWEEP_MS = 30 * 60_000;
+void orphanSweep.sweep();
+setInterval(() => void orphanSweep.sweep(), ACCOUNT_ORPHAN_SWEEP_MS);
+
 const issueCrashLoopDetector = createCrashLoopDetector({
   now: () => Date.now(),
   count: config.crashLoopCount,
@@ -1962,17 +2176,68 @@ const issueCrashLoopDetector = createCrashLoopDetector({
   comments: (id) => (isQueryLevelAgent(id) ? Promise.resolve([]) : ownChannelComments(resourceKeyOf(id))),
   log: (line) => console.error(`  ${line}`),
 });
+// FACTORY-47: a managed-session agent (built-in `managed-sessions` rule,
+// BUTCHR-408) has NO Jira ticket to comment on at all — unlike
+// `issueCrashLoopDetector` above, every id this instance ever sees IS one of
+// these filesystem-provider ids (this is wired ONLY into
+// `startManagedSessionsLoop` below), never conditionally, so there is no
+// `isQueryLevelAgent`-style branch here: `addComment`/`comments` always
+// bypass Jira and log instead. Before this, a managed session whose agent
+// kept dying and being respawned (a startup crash, an MCP config that
+// failed to load, a session-limit refusal that never cleared, ...) had
+// NOTHING recording why — see `createCrashLoopDetector`'s own top comment
+// ("nothing to stop it and NOTHING TO SAY SO"), which this ticket found
+// applied to managed sessions exactly as much as to an ordinary rule agent,
+// just never wired up for them. Its own instance (never shared with
+// `issueCrashLoopDetector`), same reasoning as that detector's own doc
+// comment on why each `runResourceLoop` call needs its own tracker.
+const managedSessionCrashLoopDetector = createCrashLoopDetector({
+  now: () => Date.now(),
+  count: config.crashLoopCount,
+  windowMinutes: config.crashLoopWindowMinutes,
+  addComment: async (id, text) => { console.error(`  [managed-sessions:crash-loop] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
+  comments: () => Promise.resolve([]),
+  log: (line) => console.error(`  ${line}`),
+  // FACTORY-622: the two `addComment`/`comments` lines directly above are
+  // the whole defect this adds a channel for — they are correct, and they
+  // reach a journal on one host and nothing else. A managed session's crash
+  // loop was therefore invisible twice over: 2026-10-02 (director and
+  // genius, "nowhere to post") and 2026-10-03 (admin-brooswit-nexus, 26
+  // "refusing implicit replacement" refusals, "a crash-loop complaint that
+  // reached only the journal"). Wired ONLY here, never into
+  // `issueCrashLoopDetector` above, which already posts on the resource's
+  // own ticket — see `CrashLoopDetectorDeps.opsAlert`'s own doc comment for
+  // that reasoning and for why this is a thunk: `opsAlertRouter` is
+  // constructed several hundred lines below, after the Rocket.Chat
+  // credential it needs is loaded, so reading it by value here would be a
+  // temporal-dead-zone access.
+  opsAlert: () => opsAlertRouter,
+  refusalReason: (id) => herd.lastSpawnRefusal(id),
+});
 // FACTORY-501 (FACTORY-500 item 2, option b) — audible-only escalation for a
 // herdr-restored pane stuck "deferred"/"stuck" on `herd.resumeInPlace()`, so
 // a busy-forever restored agent is never silently degraded with no notice —
 // see `src/agents/restored-pane-escalation.ts`'s own top comment for the
-// full mechanism.
+// full mechanism. TWO SEPARATE INSTANCES, same reasoning as
+// issueCrashLoopDetector/managedSessionCrashLoopDetector above: an issue-tier
+// agent has a Jira ticket to comment on, a managed-session agent (buddy,
+// genius) does not.
 const issueRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
   now: () => Date.now(),
   addComment: async (id, text) => {
     if (isQueryLevelAgent(id)) { console.error(`  [restored-pane-escalation] ${id}: query-level agent — no single ticket to comment on, skipping`); return; }
     await speakOnOwnChannel(ops, resourceKeyOf(id), text);
   },
+  log: (line) => console.error(`  ${line}`),
+});
+// FACTORY-501: a managed-session agent has NO Jira ticket to comment on at
+// all — same reasoning as `managedSessionCrashLoopDetector` immediately
+// above, and every id this instance ever sees is one of these ids (wired
+// ONLY into `startManagedSessionsLoop` below), so `addComment` always logs
+// rather than branching on `isQueryLevelAgent`.
+const managedSessionRestoredPaneEscalationDetector = createRestoredPaneEscalationDetector({
+  now: () => Date.now(),
+  addComment: async (id, text) => { console.error(`  [managed-sessions:restored-pane-escalation] ${id}: no Jira ticket to comment on — logging instead:\n  ${text.replace(/\n/g, "\n  ")}`); },
   log: (line) => console.error(`  ${line}`),
 });
 // BUTCHR-147: audible isolated herd.spawn/stop/respawn failure detection —
@@ -2028,6 +2293,12 @@ const issueReaper = createReaper({
   now: () => Date.now(),
   candidates: () => herd.strandedCandidates(),
   close: (c) => herd.closeStranded(c),
+  // BUTCHR-412: the self-exit path's own account teardown — a reaped
+  // workspace's agent exited on its own (crash, `/exit`, quota) and never
+  // went through `HerdrHerd.stop()`/`reconcileNow`'s `plan.stop` at all, so
+  // nothing else in this daemon would otherwise release a temporary account
+  // for it. `"stop"` — a reap IS a genuine stop, not a respawn.
+  ...(accountLifecycle ? { release: (agentKey: string) => accountLifecycle!.release(agentKey, "stop") } : {}),
   onReaped: async (agentKey) => purgeStoppedAgentLabels([agentKey]),
   log: (line) => console.error(`  ${line}`),
 });
@@ -2135,7 +2406,7 @@ if (jiraWorkStaffing.run) void sweepStaleAgentLabels({
 const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined => {
   const decoded = decodeAnyAgentKey(agent);
   if (!decoded) return undefined;
-  return getRules().find((r) => r.id === decoded.ruleId && r.resourceProvider === decoded.resourceProvider)?.notifyDeliveryMode;
+  return ruleAuthority.ruleForAgent(agent)?.notifyDeliveryMode;
 };
 
 const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason): Promise<void> => {
@@ -2152,7 +2423,7 @@ const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReas
   const msg = reason && "linked" in reason ? linkedChangeNudge(issue, reason.linked.events)
     : reason && "pr" in reason ? prReviewStateNudge(issue, reason.pr.from, reason.pr.to)
     : changeNudge(issue, aboutIssue, reason);
-  const result = await deliverNotice({
+  const result = await deliverAdmittedNotice(ruleAuthority.policy,agent,{
     pushChannel: () => notifyAgent(mcp, agent, aboutIssue, msg),
     nudgePrompt: () => herd.nudge(agent, msg),
     mode: ruleNotifyDeliveryMode(agent),
@@ -2225,18 +2496,18 @@ const ruleResourceType = createRuleResourceType({
   // "error" (skipped, retried, never reported unreadable), not a crash.
   confluenceVersion: (id) => atlassian.confluencePageVersion(id),
   ...(config.github ? { github: { fetchImpl: fetch, token: config.github.token } } : {}),
-  // local/ui: a ticket's own open PR (branch `KEY` or `KEY-…`), read from
-  // the pr:* discovery cache — never a request of its own. Same
-  // `config.github` gate as `prTracker` itself.
-  ...(prTracker ? { ticketPullRequest: (key: string) => prTracker.pullRequestFor(key) } : {}),
   webpage: { fetchImpl: fetch },
   // FACTORY-9: `pollFilesystem`'s own dep — plain `node:fs/promises` `stat`,
   // no config gate (mirrors `webpage` immediately above: no credentials, no
   // per-daemon opt-in needed).
   filesystem: { stat },
+  // FACTORY-9: the SAME FACTORY-4 local link store `resourceLinkTools`
+  // above is registered with (a fresh `LinkStore` handle onto the same
+  // underlying file — this implementation is stateless per call, so a
+  // second handle is equivalent to sharing one instance; see
+  // `createLinkStore`'s own doc comment, src/resources/link-store.ts).
+  linkStore: createLinkStore(defaultLinksStorePath()),
   notify: notifyRuleAgent,
-  // FACTORY-137
-  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 
 // FACTORY-772: wrapped in a function, rather than called inline once, so
@@ -2252,6 +2523,8 @@ const ruleResourceType = createRuleResourceType({
 // `runResourceLoop`/`startLoop`) — never re-registers an agent, re-reads
 // config, or duplicates any of this daemon's other long-lived state.
 const startIssueLoop = () => runResourceLoop(ruleResourceType, {
+  onFencedPoll: async()=>{await agentStatusesFeedingDashboard();},
+  ruleProvider:"jira-work",
   herd,
   ownsId: ownsRuleAgent,
   notify: notifyRuleAgent,
@@ -2320,7 +2593,8 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
     // doc comment above for why this is the only place that association
     // is still available.
     if (idlePoke) updateIdlePokeRuleConfig(matches);
-    stalledMinutesByIssue = stalledMinutesForIssues(matches);
+    stalledMinutesByIssue = new Map(stalledMinutesForIssues(admittedPolicyUnits(matches,ruleAuthority)));
+    for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-work'&&held.rule.stalledMinutes!==undefined)(stalledMinutesByIssue as Map<string,number>).set(resourceKeyOf(held.id),held.rule.stalledMinutes);
     return syncLabels(uniqueIssues(matches));
   },
   checkAbandoned: (matches) => abandonedDetector.check(uniqueIssues(matches)),
@@ -2332,6 +2606,7 @@ const startIssueLoop = () => runResourceLoop(ruleResourceType, {
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ISSUE),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   intervalMs: 15_000,
   // FACTORY-66 review round 2 (P2, brooswit @ 46b4c7f): `jiraWorkHealth`
@@ -2411,6 +2686,7 @@ startGithubIssueLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_ISSUE),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => githubIssueHealth.recordSuccess(),
   onError: (e) => githubIssueHealth.recordError(e),
 });
@@ -2437,6 +2713,7 @@ startGithubPrLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_GITHUB_PR),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_GITHUB_PR),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => githubPrHealth.recordSuccess(),
   onError: (e) => githubPrHealth.recordError(e),
@@ -2483,6 +2760,7 @@ startJiraIdeaLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_JIRA_IDEA),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_JIRA_IDEA),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),  onPollSuccess: () => jiraIdeaHealth.recordSuccess(),
   onError: (e) => jiraIdeaHealth.recordError(e),
 });
@@ -2508,36 +2786,10 @@ startZendeskTicketLoop({
   onAdmitted: admissionController.recordSpawned,
   reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
   releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_ZENDESK_TICKET),
+  account: accountLifecycle,
   log: (line) => console.error(`  ${line}`),
   onPollSuccess: () => zendeskTicketHealth.recordSuccess(),
   onError: (e) => zendeskTicketHealth.recordError(e),
-});
-
-// local/ui: the trello-card rule loop, the twin of the zendesk-ticket one: its
-// own agents and admission bucket, and none of the detectors above. Its agents'
-// only write is their own card comment.
-if (trelloStaffing.run) console.error(`  trello-card rules: ${trelloStaffing.rules.map((r) => r.id).join(", ")} (board ${trelloStaffing.boardId})`);
-startTrelloCardLoop({
-  staffing: trelloStaffing,
-  rules: getRules(),
-  client: trelloCards ?? { searchAll: async () => [], lists: async () => [], comments: async () => [] },
-  herd,
-  deliver: async (agent, resource, msg) => {
-    const result = await deliverNotice({
-      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
-      nudgePrompt: () => herd.nudge(agent, msg),
-      mode: ruleNotifyDeliveryMode(agent),
-    });
-    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
-  },
-  suppress: (resource, updated, watcher) => ownWrites.shouldSuppress(resource, updated, watcher, Date.now()),
-  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_TRELLO_CARD),
-  onAdmitted: admissionController.recordSpawned,
-  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_TRELLO_CARD),
-  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_TRELLO_CARD),
-  log: (line) => console.error(`  ${line}`),
-  onPollSuccess: () => trelloCardHealth.recordSuccess(),
-  onError: (e) => trelloCardHealth.recordError(e),
 });
 
 // The filesystem rule loop: its own agents and admission bucket, no external
@@ -2610,6 +2862,71 @@ startConfluencePageLoop({
   onError: (e) => confluencePageHealth.recordError(e),
 });
 
+// BUTCHR-408: the built-in managed-sessions query — butchr's own rule, never
+// read from rules.json, over the well-known definitions directory. Same
+// admission/health wiring shape as every rule loop above, its own bucket.
+//
+// FACTORY-1010: deliberately OUT of this ticket's scope — its agents come
+// from `SessionDefinition` manifests (src/resources/session-definition.ts),
+// never a `Rule`, so there is no `notifyDeliveryMode` to read here, and
+// `ruleNotifyDeliveryMode` is not called below (it would resolve to
+// `undefined` for any key it was handed anyway, byte-identical to today).
+console.error(`  managed-session definitions: ${sessionDefinitionsPath()}`);
+startManagedSessionsLoop({
+  roles: managedSessionRoles,
+  accountPolicies: managedSessionAccountPolicies,
+  resolvedAgents: managedSessionResolvedAgents,
+  lizardModes: managedSessionLizardModes,
+  account: accountLifecycle,
+  herd,
+  deliver: async (agent, resource, msg) => {
+    const result = await deliverNotice({
+      pushChannel: () => notifyAgent(mcp, agent, resource, msg),
+      nudgePrompt: () => herd.nudge(agent, msg),
+    });
+    console.error(`  [notify] ${agent}: ${renderNotifyDelivery(result)}`);
+  },
+  admission: (candidates, stopping) => admissionController.admit(candidates, stopping, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  onAdmitted: admissionController.recordSpawned,
+  reserveAdmission: (ids) => admissionController.reserve(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  releaseAdmission: (ids) => admissionController.release(ids, ADMISSION_SOURCE_MANAGED_SESSIONS),
+  checkCrashLoop: managedSessionCrashLoopDetector.check,
+  // FACTORY-505: the gap FACTORY-500 found and this comment used to name —
+  // `onResumeWaiting`/`onResumePreserved` never reached `startManagedSessionsLoop`
+  // at all, so a managed session (buddy, genius) deferring a model/effort
+  // resume was silent however long it deferred, and a successful in-place
+  // resume never even logged. Same "no Jira ticket to comment on" reasoning
+  // as `managedSessionCrashLoopDetector`/`managedSessionRestoredPaneEscalationDetector`
+  // above — log only, never `ops.addComment`. See
+  // `ManagedSessionsLoopDeps.onResumeWaiting`/`.onResumePreserved`'s own doc
+  // comments (src/daemon/session-definitions-loop.ts).
+  onResumeWaiting: (agent, outcome, consecutivePolls) => {
+    console.error(`  [managed-sessions:resume-waiting] ${agent}: resume still waiting after ${consecutivePolls} polls (${outcome}) — no Jira ticket to comment on, logging instead`);
+  },
+  onResumePreserved: (agent) => {
+    console.error(`  [managed-sessions] ${agent} resumed in place (session preserved)`);
+  },
+  // FACTORY-501: REQUIRED wiring — without this, a restored-pane escalation
+  // would silently never fire for buddy/genius (the canary set), the exact
+  // gap FACTORY-500 found in `onResumeWaiting`/`onResumePreserved` above
+  // `startManagedSessionsLoop` never receiving them either. See
+  // `ManagedSessionsLoopDeps.checkRestoredPaneDeferred`'s own doc comment
+  // (src/daemon/session-definitions-loop.ts).
+  checkRestoredPaneDeferred: managedSessionRestoredPaneEscalationDetector.check,
+  log: (line) => console.error(`  ${line}`),
+  onPollSuccess: () => managedSessionsHealth.recordSuccess(),
+  onError: (e) => managedSessionsHealth.recordError(e),
+  // FACTORY-53/FACTORY-71: linked-change eventing for a managed session that
+  // opts in via `linkedEventingProjects` — the SAME `searchAll`/`comments`/
+  // `notifyRuleAgent`/routed link store/`herd.frozen` seams the `jira-project`
+  // rule loop's own linked-eventing wiring already uses above.
+  searchIssues: (jql) => atlassian.searchAll(jql),
+  comments: (key) => atlassian.comments(key),
+  linkStore: routingLinkStore,
+  notify: notifyRuleAgent,
+  isFrozen: async (id) => (await herd.frozen([id])).has(id),
+});
+
 // `ownChannelComments` (the read half symmetric to the `addComment` dep's
 // speakOnOwnChannel routing above) is built once, earlier in this file, from
 // the extracted `createOwnChannelComments` (src/tools/speak.ts, BUTCHR-141/
@@ -2631,6 +2948,41 @@ startConfluencePageLoop({
 // escalation dedupe and ANSWER directive are read from the resource its
 // speech actually lives on (a Confluence footer comment on its root doc),
 // not from a Jira issue endpoint that never resolves for it.
+// FACTORY-369: a SEPARATE Rocket.Chat identity from `rcAuth`/`rcClient`
+// above — that one is account-management only (see its own comment); a
+// managed-session escalation posting to #team-admin needs a different
+// Nexus grant that may not exist yet (see `Config.managedEscalationRocketChat`'s
+// own doc comment). Absent/invalid credential: `teamAdminNotify` stays
+// undefined and every escalation degrades to the loud journal line
+// `escalation-loop.ts` already writes unconditionally (AC 6) — never a
+// startup crash, exactly like `rcAuth`'s own "optional, refuse at point of
+// use" contract above.
+const managedEscalationAuth = config.managedEscalationRocketChat
+  ? loadRocketChatAuth({
+      ROCKETCHAT_URL: config.managedEscalationRocketChat.url,
+      ROCKETCHAT_ADMIN_USER_ID: config.managedEscalationRocketChat.adminUserId,
+      ROCKETCHAT_ADMIN_TOKEN_FILE: config.managedEscalationRocketChat.adminTokenFile,
+    })
+  : { ok: false as const, reason: "BUTCHR_TEAM_ADMIN_ROCKETCHAT_URL/_USER_ID/_TOKEN_FILE not set" };
+// FACTORY-609 (Part B): the same one credential now posts to EITHER room —
+// there is no second Nexus grant, only a second ROOM, and RocketChatPoster
+// already takes a channel per call (FACTORY-607 comment 28784 item 4). The
+// routing values themselves (which room/mention each tier uses) live in
+// `config.managedEscalationRouting`, always present regardless of whether
+// this credential is configured — see that field's own doc comment.
+const managedEscalationRooms = [...new Set([config.managedEscalationRouting.normalRoom, config.managedEscalationRouting.assemblyRoom, config.managedEscalationRouting.directorRoom])];
+if (!managedEscalationAuth.ok) {
+  console.error(`  managed-session escalation disabled (${managedEscalationAuth.reason}) — every managed-session escalation logs a complete [managed-escalation] journal line only`);
+} else {
+  console.error(`  managed-session escalation enabled → #${managedEscalationRooms.join(", #")} (Rocket.Chat)`);
+}
+const teamAdminNotify = managedEscalationAuth.ok
+  ? (() => {
+      const poster = createRocketChatPoster({ fetchImpl: fetch, url: managedEscalationAuth.url, adminUserId: managedEscalationAuth.adminUserId, adminToken: managedEscalationAuth.adminToken });
+      return async (room: string, text: string) => { await poster.postMessage(room, text); };
+    })()
+  : undefined;
+
 const escalator = createEscalator({
   read: readPane,
   send: sendPane,
@@ -2654,48 +3006,118 @@ const escalator = createEscalator({
   // dialog that opened this ticket. Shares config.captureDir with the
   // session-limit watcher's own captures (capture-store.ts); each recognizes
   // only its own filename shape, so neither ever evicts the other's files.
+  // FACTORY-50 (Part C): the SAME sink also lands a keyless managed-session
+  // pane's capture, under its own disjoint filename shape — no separate dep
+  // to wire, since `EscalatorDeps.captures` is already the one seam both
+  // paths funnel through inside escalation-loop.ts.
   captures: createCaptureStore(config.captureDir),
   coverage,
+  // FACTORY-45: called only when `issueForPane` already resolved null for
+  // this pane (see the wiring below) — a real managed-session identity
+  // widens the keyless path to a loud journal line + a `/health` stalled
+  // mark; anything else keeps today's log-only behavior.
+  managedSessionOf: managedSessionOfPane,
+  // FACTORY-369: absent (undefined) whenever `managedEscalationAuth` isn't
+  // ok — see that constant's own comment just above for the fallback.
+  ...(teamAdminNotify ? { teamAdminNotify } : {}),
+  managedEscalationRouting: config.managedEscalationRouting,
 });
 
 // Resolves a pane's issue key the same way for onExposed and onUnparseable —
 // both need it, and neither can assume the caller already has it.
-//
-// FACTORY-381: also returns `context` — `escalator.onBlocked`/`onNoPrompt`'s
-// optional `PaneContext`, whatever identifies this pane to a HUMAN on the
-// ticketless, non-managed-session capture path — derived from the SAME row,
-// never a second `herdr.agent.list()` call (the ticket's own requirement:
-// "don't add a new herdr call just for this; use what's already on the
-// row"). A row's `display_agent` (herdr's own display label for the pane) is
-// preferred over `agent_session.value` as the "session/account name": it's
-// the field herdr already means for a human to read, where `agent_session`
-// is an internal id/path.
-async function issueForPane(paneId: string): Promise<{ issue: string | null; context: PaneContext }> {
+async function issueForPane(paneId: string): Promise<string | null> {
   const { agents } = await herdr.agent.list();
-  const row = agents.find((a) => a.pane_id === paneId);
-  return {
-    issue: escalationTargetOfCwd(row?.cwd),
-    context: { cwd: row?.cwd ?? null, sessionName: row?.display_agent ?? row?.agent_session?.value ?? null },
-  };
+  return escalationTargetOfCwd(agents.find((a) => a.pane_id === paneId)?.cwd);
 }
+
+/**
+ * FACTORY-45: `escalator`'s own `managedSessionOf` dep — resolves a pane's
+ * managed-session identity, called ONLY when `issueForPane` already
+ * returned null for it (see the escalator wiring below). `agentIdOfWorkspacePath`
+ * decodes the pane's cwd back to its herd id regardless of provider;
+ * `ownsManagedSessionAgent` narrows that to exactly the filesystem-provider
+ * `managed-sessions` built-in rule (src/rules/session-definition-type.ts) —
+ * every OTHER keyless pane (an unowned/legacy workspace, a query-level
+ * agent, a plain `filesystem` agent under some OTHER rule, ...) resolves
+ * `null` here, which keeps today's log-only behavior for them exactly (see
+ * `EscalatorDeps.managedSessionOf`'s own doc comment). A second
+ * `herdr.agent.list()` call, separate from `issueForPane`'s own: only paid
+ * for a keyless pane, which is the uncommon case, and keeps this a small,
+ * independent seam rather than reshaping `issueForPane`'s existing contract.
+ */
+async function managedSessionOfPane(paneId: string): Promise<{ agentKey: string; definitionPath: string } | null> {
+  const { agents } = await herdr.agent.list();
+  const cwd = agents.find((a) => a.pane_id === paneId)?.cwd;
+  const id = agentIdOfWorkspacePath(cwd);
+  if (!id || !ownsManagedSessionAgent(id)) return null;
+  const decoded = decodeAnyAgentKey(id);
+  // The built-in managed-sessions rule always runs `swarm` execution (one
+  // agent per definition file — see builtinManagedSessionsRule's own doc
+  // comment, src/rules/session-definition-type.ts), so it never produces a
+  // query-level ("@query") agent key; this is defensive, not expected to be
+  // exercised.
+  if (!decoded || decoded.kind !== "resource") return null;
+  return { agentKey: id, definitionPath: decoded.resourceId };
+}
+
+// FACTORY-45 Part B: drovr's own host-neutral escalation hook
+// (`createManagedSessionEscalationWatcher`, src/agents/managed-session-escalation-watcher.ts,
+// wrapping `@brooswit/drovr` >= 0.15.0's `createBlockingEscalationWatcher`)
+// — deliberately a SEPARATE poll loop, own timer, own read of the fleet:
+// the watcher's own contract ("never call poll concurrently on the same
+// instance") is exactly the same "no overlapping polls" discipline
+// watchBlocked already gives its own caller, so this loop earns it the
+// same way rather than borrowing that one's cadence. Feeds ONLY the
+// managed-session minimal escalation (`escalator.onDrovrUnknownDialog`/
+// `onDrovrDialogResolved`) — a keyed pane, or a keyless pane that is not a
+// managed session, is a no-op there (see that method's own doc comment,
+// src/agents/escalation-loop.ts): Butchr's EXISTING `watchPrompts` pipeline
+// below stays the SOLE answerer and authoritative detector/escalator for
+// both, unchanged by this ticket — drovr's own `sendKeys` is a permanent
+// no-op here (see `createManagedSessionEscalationWatcher`'s own doc
+// comment for why: it detects and escalates, but never presses).
+const blockingEscalationWatcher = createManagedSessionEscalationWatcher(escalator);
+let blockingEscalationPollInFlight = false;
+const blockingEscalationTimer = setInterval(() => {
+  if (blockingEscalationPollInFlight) return;
+  blockingEscalationPollInFlight = true;
+  blockingEscalationWatcher.poll(herdr)
+    .catch((e) => console.error(`  [blocking-escalation] poll failed: ${(e as Error)?.message ?? e}`))
+    .finally(() => { blockingEscalationPollInFlight = false; });
+}, 5_000);
+blockingEscalationTimer.unref?.();
 
 // FACTORY-363/FACTORY-397: drovr's SEPARATE login-expired watcher
 // (`createLoginExpiredWatcher`, `@brooswit/drovr` >= 0.16.3,
 // src/agents/login-expired-alert.ts) — its OWN independent poll loop, own
-// timer, own read of the fleet: every pane drovr reports, keyed or not,
-// reaches the host-wide alert (both real incidents, FACTORY-314/w1T and
-// FACTORY-324/w1V, were keyed panes). See `src/agents/login-expired-alert.ts`'s own header for
+// timer, own read of the fleet, deliberately NOT sharing
+// `blockingEscalationTimer` above: that timer feeds ONLY
+// `escalator.onDrovrUnknownDialog`, whose managed-session-only routing is
+// exactly the trap this condition must not inherit (a keyed pane — both real
+// incidents, FACTORY-314/w1T and FACTORY-324/w1V — resolves `managedSessionOf`
+// to null there and would be silently dropped). This tracker has no
+// managed-session concept at all: every pane drovr reports reaches the
+// host-wide alert. See `src/agents/login-expired-alert.ts`'s own header for
 // the full design and why its delivery (a journal line + a `/health` sibling
 // field, both below) survives a dead Claude credential.
-// FACTORY-630: the ops-alert route — one deduplicated `[butchr:ops-alert]`
-// journal line per condition, for this alert and every later ops condition
-// that reuses it (see src/agents/ops-alert.ts).
+// FACTORY-630: the PUSH destination for this alert, and for every later ops
+// condition that reuses the route. Built on the SAME `teamAdminNotify`
+// closure the managed-session escalator is wired behind above — one poster,
+// one credential, a second room per call, no second Rocket.Chat client. When
+// that credential is absent, `post` is undefined and the router degrades to
+// its own journal line, leaving this alert exactly as it behaved before this
+// ticket (the journal line and `/health` below are untouched by it).
 const opsAlertRouter = createOpsAlertRouter({
+  ...(teamAdminNotify ? { post: teamAdminNotify } : {}),
+  room: config.opsAlert.room,
+  mention: config.opsAlert.mention,
   host: hostname(),
   now: () => Date.now(),
   log: (line) => console.log(line),
   dedupWindowMs: config.opsAlert.dedupMinutes * 60_000,
 });
+if (teamAdminNotify) console.error(`  ops alerts enabled → #${config.opsAlert.room} (Rocket.Chat), dedup ${config.opsAlert.dedupMinutes}m per condition`);
+else console.error(`  ops alerts disabled (no Rocket.Chat posting credential) — every ops alert logs a [butchr:ops-alert] journal line only`);
 
 // FACTORY-665: the settings.json problems already logged to the journal
 // above (before `opsAlertRouter` existed this early in the file) ALSO get
@@ -2763,9 +3185,9 @@ const loginExpiredTimer = setInterval(() => {
 loginExpiredTimer.unref?.();
 
 // FACTORY-425 (implements FACTORY-419): host-side counting of Codex
-// unrecognised-dialog sightings per fingerprint — an independent poll
+// unrecognised-dialog sightings per fingerprint — a FOURTH, independent poll
 // loop, own timer, own read of the fleet, same isolation reasoning as
-// `loginExpiredTimer` above. Deliberately calls
+// `loginExpiredTimer`/`blockingEscalationTimer` above. Deliberately calls
 // ONLY `scanPendingCodexApprovals` (a pure read — never
 // `approveCodexApproval`/`autoAnswerCodexApprovals`, either of which can
 // press keys for a RECOGNISED dialog): this loop observes and counts, never
@@ -2789,27 +3211,34 @@ codexDialogSightingsTimer.unref?.();
 // DROVR-42/FACTORY-67 (host-wiring decision carried over from DROVR-41,
 // under the DROVR-37 epic — narrowed to an explicit opt-in field by
 // FACTORY-67's director before merge; see that ticket if this looks
-// different from DROVR-41's original "sweep every pane" recommendation): an
-// independent pane-scanning timer — see
+// different from DROVR-41's original "sweep every pane" recommendation): a
+// THIRD, independent pane-scanning timer — see
 // src/agents/permission-answer-loop.ts's own header for the full reasoning
 // (why this is its own timer rather than folded into the Jira reconcile
-// loop above, and why it cannot collide with `chooseStartupAnswer`/
-// `watchPrompts` below). Presses keys (unlike the read-only timers above),
-// so it earns its own tighter isolation from every other poll loop's
-// failure modes.
+// loop above or `blockingEscalationTimer` immediately above, and why it
+// cannot collide with `chooseStartupAnswer`/`watchPrompts` below). Presses
+// keys (unlike `blockingEscalationTimer`, which never does — see that
+// timer's own comment) so it earns its own tighter isolation from every
+// other poll loop's failure modes, exactly like `blockingEscalationTimer`
+// already does for the same reason.
 //
 // `lizardModeLabel` is this timer's `eligiblePanes` hook (see
 // `PermissionAnswerLoopDeps.eligiblePanes`'s own doc comment): a pane counts
-// only when its cwd resolves to SOME rule-engine agent id AND
-// `ruleLizardModeOf` says that id is eligible (`Rule.lizardMode` —
-// FACTORY-87). FACTORY-138 (operator decision, FACTORY-67 director comment
-// 2026-09-26 22:24Z): upstream, a rule that never sets the field is
-// eligible BY DEFAULT; local/ui: only an explicit `lizardMode: true` is
-// eligible (the user asked for lizard mode to be off by default). A
-// legacy/bare-issue agent still resolves `false` and is never touched — see
-// `ruleLizardModeOf`'s own doc comment (src/agents/permission-answer-loop.ts)
-// for the full breakdown. The label itself (basename of the resource id,
-// e.g. the Jira/GitHub/filesystem resource) is what lets a log line name WHICH AGENT got a prompt answered
+// only when its cwd resolves to SOME rule-engine agent id (managed session or
+// rule-launched alike) AND `ruleLizardModeOf` says that id is eligible
+// (`managedSessionLizardModes`'s live poll for a managed session,
+// `Rule.lizardMode` for everything else — FACTORY-87). FACTORY-138 (operator
+// decision, FACTORY-67 director comment 2026-09-26 22:24Z): a managed
+// session (vendor "claude") or rule that never sets the field is now
+// eligible BY DEFAULT — only an explicit `lizardMode: false` resolves
+// `false`. A legacy/bare-issue agent, a managed session not yet observed
+// this daemon's lifetime, or a `vendor: "codex"` managed session (which
+// cannot set this field at all) still resolves `false` and is never
+// touched — see `ruleLizardModeOf`'s own doc comment
+// (src/agents/permission-answer-loop.ts) for the full breakdown of which
+// cases the new default does and does not reach. The label itself (basename of
+// the resource id, e.g. the definition file or the Jira/GitHub/filesystem
+// resource) is what lets a log line name WHICH AGENT got a prompt answered
 // (FACTORY-67's own requirement), not just an opaque pane id.
 function lizardModeLabel(cwd: string | null | undefined): string | undefined {
   const id = agentIdOfWorkspacePath(cwd);
@@ -2837,7 +3266,7 @@ const permissionAnswerEligiblePanes = (agents: readonly { pane_id: string; cwd: 
 // CADENCE, chosen and measured against this daemon's own load rather than
 // copied from DROVR-41's order-of-magnitude suggestion unread: 20s lands
 // inside DROVR-41's own 15-30s recommendation, slower than the 5s
-// `loginExpiredTimer`/`watchPrompts` timers (a pure-read status poll,
+// `blockingEscalationTimer`/`watchPrompts` timers (a pure-read status poll,
 // cheap to run often) but close to this daemon's own ~15s Jira reconcile
 // cadence under load (BUTCHR-117) — a bound already proven acceptable
 // elsewhere in this same daemon, without adding a fourth distinct polling
@@ -2963,6 +3392,12 @@ startPermissionAnswerWatch(
     readTimeoutMs: PERMISSION_ANSWER_READ_TIMEOUT_MS,
     log: (line) => console.error(`  ${line}`),
     onApproved: approvalSoundNotifier.notifyApproved,
+    // FACTORY-581 SAFETY GUARD 3: attributes a managed-session pane's "no
+    // longer blocked" line to THIS pass, tagged with drovr's own
+    // `recognizedVia` — see `Escalator.onPermissionAnswered`'s own doc
+    // comment (src/agents/escalation-loop.ts). A no-op for every
+    // non-managed-session pane.
+    onAnswered: (r) => escalator.onPermissionAnswered(r.paneId, r.recognizedVia),
     // FACTORY-752 (FACTORY-746 (c)): see `permissionAnswerHealth`'s own
     // declaration above and `createTickHealth`'s doc comment for the full
     // reasoning — never called together for the same tick.
@@ -3041,8 +3476,8 @@ watchPrompts({
   onExposed: ({ paneId, prompt, pollSeq }) => {
     void (async () => {
       try {
-        const { issue, context } = await issueForPane(paneId);
-        await escalator.onBlocked(paneId, issue, prompt, pollSeq, context);
+        const issue = await issueForPane(paneId);
+        await escalator.onBlocked(paneId, issue, prompt, pollSeq);
       } catch (e) {
         console.error(`  [prompts] onExposed error: ${(e as Error)?.message ?? e}`);
       }
@@ -3054,8 +3489,8 @@ watchPrompts({
   onUnparseable: ({ paneId, text, pollSeq }) => {
     void (async () => {
       try {
-        const { issue, context } = await issueForPane(paneId);
-        escalator.onNoPrompt(paneId, issue, text, pollSeq, context);
+        const issue = await issueForPane(paneId);
+        escalator.onNoPrompt(paneId, issue, text, pollSeq);
       } catch (e) {
         console.error(`  [prompts] onUnparseable error: ${(e as Error)?.message ?? e}`);
       }
@@ -3106,13 +3541,15 @@ const projectType = createJiraProjectResourceType({
   prepare: (spec) => resourceConnections.prepare(spec),
   // BUTCHR-469: linked-change eventing (member discovery + managed links) —
   // the SAME `searchAll`/`comments`/`notifyRuleAgent` seams the jira-work
-  // rule loop's own linked-eventing wiring already uses above.
+  // rule loop's own linked-eventing wiring already uses above, plus the
+  // SAME routed link store `resourceLinkTools` is wired with (a
+  // `jira-project:` owner key routes to the `brooswit.butchr.links`
+  // project-property store — see `routingLinkStore`'s own doc comment).
   searchIssues: (jql) => (jiraProjectStaffing.run ? atlassian.searchAll(jql) : Promise.resolve([])),
   comments: (key) => (jiraProjectStaffing.run ? atlassian.comments(key) : Promise.resolve([])),
+  linkStore: routingLinkStore,
   notify: notifyRuleAgent,
   log: (line) => console.error(`  [jira-project] ${line}`),
-  // FACTORY-137
-  ...(catamorbiusPush ? { push: catamorbiusPush.coverage, onLinkedEventingState: (s: LinkedEventingState) => catamorbiusPush!.registerConsumer(s) } : {}),
 });
 // FACTORY-941: refresh `pinnedActiveMinutesByProject` from this exact poll's
 // matches BEFORE `runResourceLoop` (src/daemon/loop.ts) ever reaches
@@ -3129,11 +3566,13 @@ const projectType = createJiraProjectResourceType({
 const projectDiscoverySearch = projectType.discovery.search;
 projectType.discovery.search = async () => {
   const matches = await projectDiscoverySearch();
-  pinnedActiveMinutesByProject = pinnedActiveMinutesFor(matches);
+  pinnedActiveMinutesByProject = new Map(pinnedActiveMinutesFor(matches.flatMap(m=>ruleAuthority.isUnresolvedAgent(m.agentKey)?[]:[{...m,rule:ruleAuthority.ruleForAgent(m.agentKey)??m.rule}])));
+  for(const held of ruleAuthority.retainedRules())if(held.rule.resourceProvider==='jira-project'&&held.rule.stalledMinutes!==undefined)(pinnedActiveMinutesByProject as Map<string,number>).set(held.id,held.rule.stalledMinutes);
   return matches;
 };
 if (!jiraProjectStaffing.run && jiraProjectStaffing.reason) console.error(`  WARNING: ${jiraProjectStaffing.reason}`);
 runResourceLoop(projectType, {
+  ruleProvider:"jira-project",
   herd,
   ownsId: ownsJiraProjectAgent,
   // Free-form: no notification concept (eventRules.poll always reports no

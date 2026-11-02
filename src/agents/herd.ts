@@ -1,11 +1,20 @@
+import {nativeSessionHash} from '../control-panel/worker-rollout.js';
+import {WORKER_CANARY_KICKOFF} from '../control-panel/worker-rollout.js';
+import type {WorkerRollout} from '../control-panel/worker-rollout.js';
+import type {WorkerChange,WorkerChangeResult} from "../control-panel/worker-reconciliation.js";
+import {createLifecycleFence} from '../control-panel/lifecycle-fence.js';
+import type {RuntimePolicy} from "../control-panel/rule-runtime.js";
 import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events';
 import { createHash } from "node:crypto";
+import {lstatSync} from "node:fs";
+import {join} from "node:path";
 import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
-import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
+import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decideRespawnResume } from "./respawn.js";
 import { clearStopCause, persistIntentionalStop, workspaceStopCause } from "./stop-cause.js";
 import { decodeAgentKey } from "../rules/agent-key.js";
+import { MANAGED_SESSIONS_RULE_ID, managedSessionShortDisplayId } from "../rules/session-definition-type.js";
 import { baseDisplayLabel, FULL_AGENT_KEY_METADATA_FIELD, METADATA_SOURCE, resolveDisplayLabels } from "../rules/display-label.js";
 import { agentLaunchConfig, agentStartParams, kickoffFor, spawnArgs, checkArgv, providerOrder, type AgentConfig, type AgentProvider, type RestoredResumePolicy } from "./argv.js";
 import type { AgentEffort, McpServerBinding } from "../rules/rules.js";
@@ -83,6 +92,8 @@ export interface StaleAgent {
 
 /** What the reconcile loop needs from herdr. Abstracted so it fakes cleanly in tests. */
 export interface Herd {
+  ruleRuntime?:()=>RuntimePolicy;
+  ruleCensus?():Promise<{ids:string[];complete:boolean}>;
   frozen?(ids: readonly string[]): Promise<ReadonlySet<string>>;
   /** Issues that currently have a butchr-managed agent running. */
   runningIssues(): Promise<string[]>;
@@ -103,11 +114,12 @@ export interface Herd {
    * BUTCHR-334, and the ordinary plan-spawn loop today), so no existing
    * caller needs to change.
    */
-  spawn(spec: SpawnSpec, origin?: SpawnOrigin): Promise<void>;
+  spawn(spec: SpawnSpec, origin?: SpawnOrigin, ruleLease?:number): Promise<void>;
   /** Observe a desired worker's quota state before reconciliation decides to spawn. */
   recoverQuota?(spec: SpawnSpec): Promise<"not-refused" | "recovered" | "waiting">;
+  reconcilePreferences?(spec:SpawnSpec,isCurrent:()=>boolean,change?:WorkerChange):Promise<WorkerChangeResult>;
   /** Shut off the agent for an issue (idempotent). */
-  stop(issue: string): Promise<void>;
+  stop(issue: string, ruleLease?:number): Promise<void>;
   /** The current pane id of an issue's agent, freshly resolved, or null if not running. */
   paneFor(issue: string): Promise<string | null>;
   /**
@@ -117,7 +129,7 @@ export interface Herd {
    * refused the send outright (blocked); `refusal` set if the send succeeded
    * but the pane shows a session-limit refusal rather than a started turn.
    */
-  nudge(issue: string, text: string): Promise<NudgeResult>;
+  nudge(issue: string, text: string, ruleLease?:number): Promise<NudgeResult>;
   /**
    * The provider actually running an issue's agent right now, resolved from
    * its pane's OWN foreground process (the same source `staleIssues()`
@@ -206,7 +218,7 @@ export interface Herd {
    * optional. A fake that has no use for real resume behaviour can implement
    * it as `async () => "unresumable"`.
    */
-  resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed">;
+  resumeInPlace(spec: SpawnSpec, ruleLease?:number): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed">;
 
   /**
    * FACTORY-525: the reason `resumeInPlace(spec)`'s most recent `"failed"`
@@ -511,10 +523,11 @@ export function isHerdrRestoredPane(observedArgv: readonly string[], persistedSe
  * behaviour, unconditionally); `"all"` enables it regardless of
  * `agentName`; a `ReadonlySet` (the parsed comma-separated list,
  * `loadConfig`, src/config/config.ts) enables it only when `agentName` is
- * both defined and a member. `agentName` is `undefined` for a rule-engine
- * agent (a task/story/epic worker has no stable name to gate on — see
- * `isHerdrRestoredPane`'s own callsite in `staleIssues()`), which this never
- * enables under `"off"`/a named list — only `"all"` ever widens to those.
+ * both defined and a member. `agentName` is `undefined` for a non-managed-
+ * session agent (an ordinary rule-engine task/story/epic worker has no
+ * stable name to gate on — see `isHerdrRestoredPane`'s own callsite in
+ * `staleIssues()` for how it's derived), which this never enables under
+ * `"off"`/a named list — only `"all"` ever widens to those.
  */
 export function restoredResumeEnabledFor(policy: RestoredResumePolicy, agentName: string | undefined): boolean {
   if (policy === "off") return false;
@@ -627,6 +640,8 @@ export type SpawnOrigin = "spawn" | "respawn";
 
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
+  ruleRuntime?:()=>RuntimePolicy;
+  private readonly lifecycleFence:ReturnType<typeof createLifecycleFence<DrovrClient>>;
   private readonly freezeWatches = new Map<string, ReturnType<typeof watchInstanceFreeze>>();
   /** Extracted out of `startProviders` (unchanged behaviour) so `tryClaudeResume` — which never calls `startProviders` at all — gets the SAME freeze gate/watch. */
   private async ensureFreezeWatch(key: string): Promise<void> {
@@ -737,25 +752,53 @@ export class HerdrHerd implements Herd {
      */
     private readonly mcpBindingsOf?: (issue: string) => readonly McpServerBinding[] | undefined,
     /**
+     * BUTCHR-413 — same shape and same reason as `mcpBindingsOf` immediately
+     * above, one field over: this issue's own non-secret account-identifying
+     * name for `McpServerBinding.accountHeader` (`spec.rocketchatAccount`, see
+     * that field's own doc comment, src/agents/workspace.ts), or `undefined`
+     * for none (an `account: "none"` rule, or no Rocket.Chat configured at
+     * all). Called from BOTH `spawnExclusive` (augments the real spec before
+     * `buildWorkspace`/`agentLaunchConfig`) and `staleIssues()` (augments the
+     * reconstructed comparison spec) — the SAME callback both times, so a
+     * value that is deterministic in its caller (as `rcUsernameFor(issue)`
+     * is, src/accounts/identity.ts) can never drift between what an agent
+     * was actually launched with and what a later poll expects, with no
+     * persistence required. Optional and defaulting to "no account name for
+     * anyone" keeps a daemon with no Rocket.Chat configured, or a rule with
+     * no `accountHeader` binding, at byte-identical expected argv to before
+     * this field existed.
+     */
+    private readonly accountNameOf?: (issue: string) => string | undefined,
+    /**
      * FACTORY-75 — this issue's CURRENTLY resolved `(model, effort)` pair
      * for the given provider, from the `modelPower`/`effort` two-axis
-     * mechanism (src/resources/power-scale.ts): a rule's `agentPreferences`
-     * entry (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
+     * mechanism (src/resources/power-scale.ts): a managed-session
+     * definition's own field, or a rule's `agentPreferences` entry
+     * (already pre-resolved at `loadRules()` time — see `AgentPreference`'s
      * own doc comment, src/rules/rules.ts, for why nothing downstream of
      * that needed to change). `undefined` for anything this daemon cannot
-     * resolve (a legacy/bare-issue id, a rule since removed, or
+     * resolve (a legacy/bare-issue id, a rule/definition since removed, or
      * one that sets neither `model`/`modelPower` nor `effort`/`effortPower`
      * for this provider) — `staleIssues()` below then skips the
      * comparison entirely, the same fail-safe "nothing to compare, so
      * nothing is stale" shape `mcpBindingsOf`'s own absence already has.
      * Called ONLY from `staleIssues()`, never from `spawn()` — a real
      * launch already gets its resolved agent straight from `spec.agents`
-     * (`rule.agentPreferences`), so this seam
-     * exists purely for the comparison side, unlike `mcpBindingsOf` above
-     * (which augments a real spawn too).
+     * (`specForSessionDefinition`/`rule.agentPreferences`), so this seam
+     * exists purely for the comparison side, unlike `mcpBindingsOf`/
+     * `accountNameOf` above (which augment a real spawn too).
      */
     private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
-  ) {}
+    private readonly rollout?:WorkerRollout,
+  ) {if(this.rollout)this.herdr=this.rollout.wrap(this.herdr);this.lifecycleFence=createLifecycleFence(this.herdr);this.herdr=this.lifecycleFence.client;}
+
+  private withRuleLease<T>(issue:string,kind:'spawn'|'stop'|'resume'|'notify',lease:number|undefined,action:()=>Promise<T>):Promise<T>{
+    const policy=this.ruleRuntime?.();
+    if(!policy||kind==='stop'&&lease===undefined)return this.lifecycleFence.run(()=>{},action); // explicit freeze/human stops retain their authority
+    const captured=lease??policy.generation();
+    return this.lifecycleFence.run(()=>{const current=this.ruleRuntime?.();if(current!==policy||(kind==='spawn'?!policy.canAdmit(issue,captured):kind==='stop'?policy.protectStop(issue,captured):kind==='notify'?!policy.canNotify(issue,captured,captured):policy.protectRespawn(issue,captured)))throw Error('Rule authority changed before worker action');},action);
+  }
+
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
     let lifecycle = this.lifecycles.get(issue);
@@ -775,6 +818,9 @@ export class HerdrHerd implements Herd {
       lifecycle = new ManagedHerdrLifecycle({
         client: this.herdr, cwd: ensureWorkspaceDir(issue),
         availability: this.availability, wait: this.wait,
+        ...(this.rollout?.workerKey===issue&&this.rollout.continuationSpec()?{current:{paneId:this.rollout.continuationSpec()!.source.paneId,provider:this.rollout.continuationSpec()!.source.provider as "codex"|"claude"|"agy",cwd:this.rollout.continuationSpec()!.source.cwd}}:{}),
+        // Temporary exact-worker recovery limit; every unfenced lifecycle keeps SDK defaults.
+        ...(this.rollout?.workerKey === issue ? { transcriptLimits: { maxBytes: 64 * 1024 * 1024, maxChars: 64 * 1024 * 1024 } } : {}),
         startOptions: {
           readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS,
           now: this.monotonicNow, wait: this.wait,
@@ -835,10 +881,35 @@ export class HerdrHerd implements Herd {
       // Replacement re-runs selection from the TOP of the priority list:
       // a Codex worker at its limit goes back to Claude when Claude is
       // available; a Claude worker at its limit goes on to Codex.
+      if(this.rollout)return 'waiting';
       const result = await this.startProviders(spec, current.pane_id);
       if (result.status === "success") this.log?.(`[provider-fallback] ${spec.key} recovered provider=${result.account.provider} pane=${result.value}`);
       return result.status === "success" ? "recovered" : "waiting";
     });
+  }
+
+  /** Desired preference changes use the same acknowledged transaction as quota handoff. */
+  async reconcilePreferences(specIn:SpawnSpec,isCurrent:()=>boolean,change?:WorkerChange):Promise<WorkerChangeResult>{
+    if(this.rollout&&specIn.key!==this.rollout.workerKey)return {status:'blocked',reason:'Worker is outside the explicit canary permit'};
+    const accountName=specIn.rocketchatAccount??this.accountNameOf?.(specIn.key);
+    const spec:SpawnSpec=accountName?{...specIn,rocketchatAccount:accountName}:specIn;
+    let lifecycle:ManagedHerdrLifecycle|undefined,previousPane:string|undefined;
+    const guard=()=>{if(!isCurrent())throw Error('Desired worker configuration was superseded or disabled');};
+    const physical=()=>{const current=lifecycle?.current;return current?{paneId:current.paneId,provider:current.provider}:undefined;};
+    const execute=()=>this.lifecycleFence.run(guard,()=>this.exclusive(spec.key,async():Promise<WorkerChangeResult>=>{
+      guard();lifecycle=this.lifecycle(spec.key);const current=await lifecycle.resolveCurrent();guard();
+      if(!current)return {status:'blocked',reason:'Current worker identity is unavailable'};
+      previousPane=current.pane_id;
+      if(current.agent_status!=='idle'&&current.agent_status!=='done')return {status:'blocked',reason:'Current worker is not idle or done',current:physical()};
+      const result=await this.startProviders(spec,current.pane_id,'Desired rule launch preferences changed');guard();const applied=physical();
+      if(result.status!=='success')return {status:'blocked',reason:result.status==='blocked'?result.reason:'No requested provider is available',current:applied,partial:!!applied&&applied.paneId!==previousPane};
+      if(!result.attempted.length||!applied||applied.paneId===previousPane||applied.paneId!==result.value)return {status:'blocked',reason:'Drovr did not acknowledge a replacement worker',current:applied};
+      return {status:'applied',current:applied};
+    }));
+    try{
+      if(this.rollout){if(!change)return {status:'blocked',reason:'Canary requires exact source/deployment/config authority'};return await this.rollout.run(this.herdr,change,isCurrent,async()=>{await instanceFreezeStore.assertRunnable(`butchr:${spec.key}`);let stopMarker=false;try{lstatSync(join(workspaceDirFor(spec.key),'.butchr-stop-cause.json'));stopMarker=true;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}if(this.refused.has(spec.key)||stopMarker)throw Error('Canary source has a known quota or intentional-stop hold');},execute,physical);}
+      return await execute();
+    }catch(error){const current=physical();return {status:'blocked',reason:error instanceof Error?error.message:'Worker handoff failed',current,partial:!!previousPane&&!!current&&current.paneId!==previousPane};}
   }
 
   private observeQuota(issue: string, current: results.AgentInfo, text: string): SessionLimitRefusal | null {
@@ -874,7 +945,7 @@ export class HerdrHerd implements Herd {
       const cwd = a.cwd ?? null;
       const issue = agentIdOfWorkspacePath(cwd);
       if (!cwd || !issue || !a.pane_id) continue;
-      const currentPane = this.lifecycles.get(issue)?.current?.paneId;
+      const currentPane = this.lifecycles.get(issue)?.current?.paneId ?? (this.rollout?.workerKey===issue?this.rollout.continuationSpec()?.source.paneId:undefined);
       if (currentPane && a.pane_id !== currentPane) continue;
       // More than one live pane at one owned path is ambiguous. Do not let
       // iteration order silently choose which process Butchr controls.
@@ -891,6 +962,19 @@ export class HerdrHerd implements Herd {
       }
     }
     return map;
+  }
+
+  async ruleCensus():Promise<{ids:string[];complete:boolean}>{
+    const {agents}=await this.herdr.agent.list();const counts=new Map<string,number>();let complete=true;
+    for(const agent of agents){const id=agentIdOfWorkspacePath(agent.cwd??null);if(!id){if(agent.name?.startsWith(AGENT_PREFIX))complete=false;continue;}counts.set(id,(counts.get(id)??0)+1);if(!agent.pane_id||agent.launch_pending)complete=false;}
+    for(const [id,count] of counts)if(count>1){
+      const continuation=this.rollout?.workerKey===id?this.rollout.continuationSpec():undefined;
+      const pair=agents.filter(a=>agentIdOfWorkspacePath(a.cwd??null)===id);
+      const source=continuation&&pair.find(a=>a.pane_id===continuation.source.paneId),target=continuation&&pair.find(a=>a.pane_id===continuation.target.paneId);
+      if(!continuation||count!==2||pair.length!==2||!source||!target||source.cwd!==continuation.source.cwd||source.agent!==continuation.source.provider||nativeSessionHash(source.agent_session)!==continuation.source.sessionHash||target.cwd!==continuation.target.cwd||target.agent!=='claude'||target.workspace_id!==continuation.target.workspaceId||target.terminal_id!==continuation.target.terminalId||nativeSessionHash(target.agent_session)!==continuation.target.sessionHash)complete=false;
+    }
+    for(const [id,lifecycle]of this.lifecycles)if(lifecycle.current?.paneId&&!counts.has(id)){counts.set(id,1);complete=false;}
+    return {ids:[...counts.keys()],complete};
   }
 
   async runningIssues(): Promise<string[]> {
@@ -952,20 +1036,36 @@ export class HerdrHerd implements Herd {
         continue;
       }
       const decoded = decodeAgentKey(issue);
-      // BUTCHR-411: a rule-engine agent's mcpServers must come from the
-      // RULE's CURRENT config, not a persisted file, or an admin removing a
-      // binding from rules.json would never read as stale — see the
-      // constructor's own doc comment on mcpBindingsOf for why this lookup
-      // exists instead of caching the original spawn's SpawnSpec.
-      const mcpServers = this.mcpBindingsOf?.(issue);
-      // FACTORY-43: `spec.permissionMode`/`spec.strictMcpConfig` are two
-      // OTHER fields a spawn can carry that this reconstruction used to drop
-      // entirely — leaving an agent launched with a non-default permission
-      // mode (or strictMcpConfig) permanently stale. Same
-      // read-the-workspace-back shape `externalMcpServers` (in `expected`
-      // below) uses: whatever buildWorkspace persisted at the real spawn is
-      // what "expected" means here, never a value recomputed independently
-      // of that spawn.
+      // BUTCHR-408/BUTCHR-411: two independent sources feed a spec's
+      // mcpServers, kept apart by POPULATION so neither shadows the other's
+      // staleness signal. A managed-session agent (filesystem provider,
+      // MANAGED_SESSIONS_RULE_ID, BUTCHR-408) has no entry in `rules` at
+      // all, so `mcpBindingsOf` could only ever answer "no bindings" for
+      // it — its real mcpServers is whatever buildWorkspace last persisted
+      // for this workspace (workspaceMcpServers, src/agents/workspace.ts,
+      // the SAME read-the-workspace-back shape externalMcpServers below
+      // already uses). A rule-engine agent's mcpServers (BUTCHR-411), by
+      // contrast, must come from the RULE's CURRENT config, not a persisted
+      // file, or an admin removing a binding from rules.json would never
+      // read as stale — see the constructor's own doc comment on
+      // mcpBindingsOf for why this lookup exists instead of caching the
+      // original spawn's SpawnSpec.
+      const isManagedSession = decoded?.resourceProvider === "filesystem" && decoded.ruleId === MANAGED_SESSIONS_RULE_ID;
+      const mcpServers = isManagedSession ? (workspaceMcpServers(cwd) ?? []) : this.mcpBindingsOf?.(issue);
+      // BUTCHR-413: same `accountNameOf` callback `spawn()` itself uses —
+      // see that constructor param's own doc comment for why recomputing it
+      // fresh here, rather than caching the original spawn's spec, is what
+      // keeps this comparison from drifting.
+      const accountName = this.accountNameOf?.(issue);
+      // FACTORY-43: `spec.permissionMode`/`spec.strictMcpConfig` are the two
+      // OTHER fields a managed-session spawn actually carries
+      // (specForSessionDefinition, src/rules/session-definition-type.ts)
+      // that this reconstruction used to drop entirely — leaving every
+      // managed session launched with a non-default permission mode (or
+      // strictMcpConfig) permanently stale. Same read-the-workspace-back
+      // shape as `mcpServers`/`externalMcpServers` above: whatever
+      // buildWorkspace persisted at the real spawn is what "expected" means
+      // here, never a value recomputed independently of that spawn.
       const permissionMode = workspacePermissionMode(cwd);
       const strictMcpConfig = workspaceStrictMcpConfig(cwd);
       // FACTORY-108: same read-the-workspace-back shape as permissionMode/
@@ -975,7 +1075,7 @@ export class HerdrHerd implements Herd {
       // would forever mismatch a naively-recomputed "expected" argv that
       // still assumes the bypass flag, respawn-looping it forever.
       const lizardMode = workspaceLizardMode(cwd);
-      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
+      const expected = spawnArgs({ key: issue, issuetype: "task", summary: "", parent: null, ...(decoded ? { resource: decoded.resourceId, externalMcpServers: workspaceExternalMcp(cwd) ?? [] } : {}), ...(mcpServers ? { mcpServers } : {}), ...(accountName ? { rocketchatAccount: accountName } : {}), ...(permissionMode !== undefined ? { permissionMode } : {}), ...(strictMcpConfig !== undefined ? { strictMcpConfig } : {}), ...(lizardMode !== undefined ? { lizardMode } : {}) }, cwd, { provider, ...(disabledMcpServers ? { disabledMcpServers } : {}) }, this.mcpUrl);
       const check = checkArgv(expected, proc.argv);
       if (!check.ok) {
         // FACTORY-470/472: a herdr-restored pane (this file's own
@@ -997,13 +1097,16 @@ export class HerdrHerd implements Herd {
         //
         // FACTORY-491 (director item 5): gated behind the
         // `BUTCHR_RESTORED_RESUME` canary/kill switch — `restoredResumeEnabledFor`'s
-        // own doc comment has the full policy. A rule-engine agent has no
-        // stable name to gate on (`undefined` below), so only an "all" policy
-        // ever reaches it.
+        // own doc comment has the full policy. `agentName` is this issue's
+        // managed-session bare definition name (`managedSessionShortDisplayId`)
+        // when it is one, `undefined` otherwise (an ordinary rule-engine
+        // agent has no stable name to gate on, so only an "all" policy ever
+        // reaches it).
+        const agentName = isManagedSession ? managedSessionShortDisplayId(decoded!.resourceId) : undefined;
         if (
           provider === "claude" &&
           !launchPending &&
-          restoredResumeEnabledFor(this.agent.restoredResume ?? new Set(), undefined) &&
+          restoredResumeEnabledFor(this.agent.restoredResume ?? new Set(), agentName) &&
           isHerdrRestoredPane(proc.argv, workspaceSessionId(cwd))
         ) {
           // FACTORY-491 (director item 1): log the observed argv on every
@@ -1158,8 +1261,23 @@ export class HerdrHerd implements Herd {
    * reach zero lines on a rejecting `agent.list()`, at this method's
    * pre-fix shape, before this fix landed.
    */
-  async spawn(spec: SpawnSpec, origin: SpawnOrigin = "spawn"): Promise<void> {
-    return this.exclusive(spec.key, () => this.spawnExclusive(spec, origin));
+  async spawn(specIn: SpawnSpec, origin: SpawnOrigin = "spawn",ruleLease?:number): Promise<void> {
+    this.rollout?.assertOrdinaryAllowed();
+    // BUTCHR-413: a fallback fill only, never an overwrite — BUTCHR-412's
+    // own `account-lifecycle.ts` `ensure()` already sets `rocketchatAccount`
+    // on `desired`/`toSpawn` BEFORE `herd.spawn` is ever called, from the
+    // REAL `ensureAccount` outcome for this launch (respecting a cap
+    // refusal, a not-managed collision, etc. — cases where `ensure` instead
+    // returns `null` and this method is never reached at all). Both
+    // producers derive the identical value from the same agent key
+    // (`rcUsernameFor`, src/accounts/identity.ts), so this is never a
+    // disagreement — only a fallback for a launch path that never went
+    // through `ensure` at all (no accountLifecycle wired, e.g. RC not
+    // configured for any rule). See `staleIssues()` below for the SAME
+    // callback used to keep its own reconstruction in sync.
+    const accountName = specIn.rocketchatAccount ?? this.accountNameOf?.(specIn.key);
+    const spec: SpawnSpec = accountName ? { ...specIn, rocketchatAccount: accountName } : specIn;
+    return this.withRuleLease(spec.key,'spawn',ruleLease,()=>this.exclusive(spec.key, () => this.spawnExclusive(spec, origin)));
   }
 
   private async spawnExclusive(spec: SpawnSpec, origin: SpawnOrigin): Promise<void> {
@@ -1179,6 +1297,7 @@ export class HerdrHerd implements Herd {
       // outcomes are unchanged; only a REJECTING `byIssue()` now falls
       // through to the same `failed` line every other failure gets.
       if ((await this.byIssue()).has(issue)) {
+        this.ruleRuntime?.().spawnObservedExisting(issue);
         this.spawnRefusal.delete(issue);
         this.log?.(`${SPAWN_TAG} ${issue} noop — already has a live agent origin=${origin}`);
         return;
@@ -1197,7 +1316,7 @@ export class HerdrHerd implements Herd {
       // `spec.ticketStatus` is present, i.e. this is a ticket-backed
       // jira-work-shaped spawn at all (`SpawnSpec.ticketStatus`'s own doc
       // comment, src/agents/workspace.ts, names this exact discriminator).
-      // Without this second half, a query-level agent —
+      // Without this second half, a managed-session or query-level agent —
       // every `spec` throughout this codebase's EXISTING test suite
       // included, none of which ever had a reason to set `ticketStatus` —
       // would pay `tryClaudeResume`'s own `decideRespawnResume` call and,
@@ -1529,8 +1648,8 @@ export class HerdrHerd implements Herd {
     if (preference?.effort) selected.effort = preference.effort;
     const dir = buildWorkspace(spec, this.mcpUrl, "claude", selected.disabledMcpServers);
     // FACTORY-916 review fix: `prepareWorkspace`/`home` MUST resolve before
-    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`
-    // (src/agents/workspace.ts) resolves
+    // `decideRespawnResume` runs, not after — `claudeTranscriptExists`/
+    // `estimateTranscriptTokens` (src/agents/workspace.ts) both resolve
     // Claude's per-cwd project folder under `home` (defaulting to
     // `homedir()` when absent), the SAME override `startProviders`'s own
     // `prepare()` already threads through for its own post-launch
@@ -1545,6 +1664,7 @@ export class HerdrHerd implements Herd {
     const decision = decideRespawnResume({
       dir,
       ...(spec.resumeOnRespawn !== undefined ? { resumeOnRespawn: spec.resumeOnRespawn } : {}),
+      ...(spec.resumeContextCutoff !== undefined ? { resumeContextCutoff: spec.resumeContextCutoff } : {}),
       ...(spec.ticketStatus !== undefined ? { ticketStatus: spec.ticketStatus } : {}),
       ...(spec.ticketLabels !== undefined ? { ticketLabels: spec.ticketLabels } : {}),
       ...(home !== undefined ? { home } : {}),
@@ -1613,7 +1733,7 @@ export class HerdrHerd implements Herd {
     return paneId;
   }
 
-  private async startProviders(spec: SpawnSpec, refusedPane?: string) {
+  private async startProviders(spec: SpawnSpec, refusedPane?: string,reason?:string) {
     await this.ensureFreezeWatch(spec.key);
     const label = await this.labelFor(spec.key);
     // FACTORY-314 (PR #513 review fix): captured by `prepare()` below, purely
@@ -1646,17 +1766,20 @@ export class HerdrHerd implements Herd {
     // itself (see its own doc comment, "MILLISECOND-GRANULARITY HAZARD")
     // carries the fix for the truncation this leaves behind.
     const launchStartedAt = Date.now();
+    const ownedContinuation=this.rollout?.continuationRequest();
     const result = await this.lifecycle(spec.key).start({
       priority: (spec.agents?.length ? [...new Set(spec.agents.map((p) => p.harness))] : providerOrder(this.agent, spec.issuetype)).map(provider => ({ provider, accountId: "default" })),
       label,
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
+      ...(reason ? {reason} : {}),
+      ...(ownedContinuation?{continuation:ownedContinuation}:{}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
       // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
       // its real working directory, then follow its definition's own
       // brief — the launched process itself still starts at the ordinary
       // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
-      kickoff: (provider) => kickoffFor(provider, spec),
+      kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, spec),
       prepare: async provider => {
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
@@ -1672,12 +1795,17 @@ export class HerdrHerd implements Herd {
         const home = prepared && typeof prepared === "object" && "HOME" in prepared && typeof prepared.HOME === "string"
           ? prepared.HOME : undefined;
         preparedHome = home;
+        if(reason&&refusedPane){
+          const source=await this.lifecycle(spec.key).resolveCurrent();
+          if(!source||source.pane_id!==refusedPane)throw Error('Source worker identity changed during handoff preparation');
+        }
         return { launch, ...(home ? { env: { HOME: home }, home } : {}) };
       },
     });
     if (result.status === "success") {
+      if(result.attempted.length===0)this.ruleRuntime?.().spawnObservedExisting(spec.key);
       this.refused.delete(spec.key);
-      await this.reportFullAgentKey(spec.key);
+      if(!ownedContinuation)await this.reportFullAgentKey(spec.key);
       // FACTORY-314 (PR #513 review fix): a fresh Claude launch runs under
       // Claude's OWN auto-generated session id — nothing butchr passes
       // reaches the real launch argv (`ManagedHerdrLifecycle.start()` builds
@@ -1701,7 +1829,11 @@ export class HerdrHerd implements Herd {
       // (slower under MCP-connection retries, model cold-start, etc.). A
       // bounded poll closes this gap cheaply: the common case still returns
       // on the FIRST check (the file is usually already there).
-      if (result.account.provider === "claude") {
+      if(ownedContinuation){
+        const {agent}=await this.herdr.agent.get(ownedContinuation.target.paneId);
+        if(agent.pane_id!==ownedContinuation.target.paneId||agent.agent_session?.kind!=='id'||agent.agent_session.agent!=='claude'||nativeSessionHash(agent.agent_session)!==ownedContinuation.targetSessionHash)throw Error('Committed continuation native target changed');
+        persistDiscoveredSessionId(workspaceDirFor(spec.key),agent.agent_session.value);
+      } else if (result.account.provider === "claude") {
         const dir = workspaceDirFor(spec.key);
         // FACTORY-418 (fixed here, inside FACTORY-411's PR — see that
         // ticket for why it's routed through this story instead of its
@@ -1877,12 +2009,13 @@ export class HerdrHerd implements Herd {
     return (r as { read: { text: string } }).read.text;
   }
 
-  async stop(issue: string): Promise<void> {
-    await this.exclusive(issue, async () => {
+  async stop(issue: string,ruleLease?:number): Promise<void> {
+    this.rollout?.assertOrdinaryAllowed();
+    await this.withRuleLease(issue,'stop',ruleLease,()=>this.exclusive(issue, async () => {
       await this.lifecycle(issue).stop();
       this.freezeWatches.get(issue)?.close();this.freezeWatches.delete(issue);
       this.refused.delete(issue);
-    });
+    }));
   }
 
   async paneFor(issue: string): Promise<string | null> {
@@ -1923,10 +2056,11 @@ export class HerdrHerd implements Herd {
    * through `resumeInPlaceExclusive`'s many return points) is where this
    * lives: one call site can't miss a branch the way N scattered ones could.
    */
-  async resumeInPlace(spec: SpawnSpec): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed"> {
+  async resumeInPlace(spec: SpawnSpec, ruleLease?:number): Promise<"resumed" | "deferred" | "stuck" | "unresumable" | "unresumable-transcript-gone" | "failed"> {
+    this.rollout?.assertOrdinaryAllowed();
     const issue = spec.key;
     try {
-      const outcome = await this.exclusive(issue, () => this.resumeInPlaceExclusive(spec));
+      const outcome = await this.withRuleLease(issue,'resume',ruleLease,()=>this.exclusive(issue, () => this.resumeInPlaceExclusive(spec)));
       // FACTORY-525: non-destructive read (`.get`, not `lastResumeFailureDetail`)
       // — the caller (loop.ts) still needs to read-and-clear this same detail
       // itself once `resumeInPlace()` returns, to build its own respawn
@@ -2338,8 +2472,8 @@ export class HerdrHerd implements Herd {
     return procs.some((p) => managedAgentProviderOfProcess(p)) ? "live" : "dead";
   }
 
-  async nudge(issue: string, text: string): Promise<NudgeResult> {
-    return this.exclusive(issue, async () => {
+  async nudge(issue: string, text: string, ruleLease?:number): Promise<NudgeResult> {
+    return this.withRuleLease(issue,'notify',ruleLease,()=>this.exclusive(issue, async () => {
       const lifecycle = this.lifecycle(issue);
       try {
         await instanceFreezeStore.assertRunnable(`butchr:${issue}`);
@@ -2358,7 +2492,7 @@ export class HerdrHerd implements Herd {
         await this.herdr.pane.sendKeys({ pane_id: current.pane_id, keys: ["enter"] }).catch(() => {});
       }
       return { delivered: true };
-    });
+    }));
   }
 }
 

@@ -26,13 +26,9 @@ import { describe, expect, test } from "bun:test";
  * is the intended, anticipated outcome of adding a seam — not evidence the
  * new seam is wrong.
  *
- * FACTORY-998: the count went to 9 — `startConfluencePageLoop` (the new
- * `confluence-page` rule loop) is a NINTH seam, same contract, same
- * reasoning: an anticipated, intended new seam, not a regression.
- *
- * local/ui: back to 8 — the managed-sessions loop (one seam) was removed
- * together with managed sessions themselves — then 9 again with our
- * `startTrelloCardLoop` (the `trello-card` rule loop), same contract.
+ * FACTORY-998: the count below is now 9, not 8 — `startConfluencePageLoop`
+ * (the new `confluence-page` rule loop) is a NINTH seam, same contract,
+ * same reasoning: an anticipated, intended new seam, not a regression.
  */
 
 const src = await Bun.file(new URL("../../src/daemon/index.ts", import.meta.url)).text();
@@ -54,7 +50,8 @@ describe("every delivery seam routes through the ONE shared gate (acceptance D)"
   });
 
   test("deliverNotice and renderNotifyDelivery are each invoked exactly 9 times — one per seam, no seam keeps its own copy", () => {
-    expect(src.split("deliverNotice({").length - 1).toBe(9);
+    expect(src.split("deliverNotice({").length - 1).toBe(8);
+    expect(src.split("deliverAdmittedNotice(ruleAuthority.policy,agent,{").length - 1).toBe(1);
     expect(src.split("renderNotifyDelivery(").length - 1).toBe(9);
   });
 
@@ -77,9 +74,11 @@ function sliceAfter(marker: string, length = 600): string {
 }
 
 describe("named per-seam checks", () => {
-  test("jira-work rule engine (notifyRuleAgent)", () => {
+  test("jira-work rule engine (notifyRuleAgent)", async () => {
     const block = sliceAfter("const notifyRuleAgent = async (agent: string, about: string, reason?: NotifyReason)", 1400);
-    expect(block).toContain("deliverNotice({");
+    expect(block).toContain("deliverAdmittedNotice(ruleAuthority.policy,agent,{");
+    const guarded=await Bun.file(new URL("../../src/control-panel/admitted-notice.ts",import.meta.url)).text();
+    expect(guarded).toContain("await deliverNotice(");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
   });
@@ -119,15 +118,15 @@ describe("named per-seam checks", () => {
     expect(block).not.toContain("void notifyAgent(");
   });
 
-  test("FACTORY-845: idle-poke engine (deliverIdlePoke)", () => {
-    const block = sliceAfter("const deliverIdlePoke = async (issue: string, text: string)", 500);
+  test("managed-sessions loop (startManagedSessionsLoop)", () => {
+    const block = sliceAfter("startManagedSessionsLoop({");
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
   });
 
-  test("local/ui: trello-card loop (startTrelloCardLoop)", () => {
-    const block = sliceAfter("startTrelloCardLoop({");
+  test("FACTORY-845: idle-poke engine (deliverIdlePoke)", () => {
+    const block = sliceAfter("const deliverIdlePoke = async (issue: string, text: string)", 500);
     expect(block).toContain("deliverNotice({");
     expect(block).toContain("renderNotifyDelivery(");
     expect(block).not.toContain("void notifyAgent(");
@@ -159,8 +158,8 @@ describe("FACTORY-1010: per-rule notifyDeliveryMode is threaded through every ru
     expect(src).toContain("const ruleNotifyDeliveryMode = (agent: string): NotifyDeliveryMode | undefined =>");
   });
 
-  test("mode: ruleNotifyDeliveryMode(agent) appears exactly 8 times — once per rule-owned seam (local/ui: trello-card's is the eighth), no seam keeps its own copy", () => {
-    expect(src.split("mode: ruleNotifyDeliveryMode(agent),").length - 1).toBe(8);
+  test("mode: ruleNotifyDeliveryMode(agent) appears exactly 7 times — once per rule-owned seam, no seam keeps its own copy", () => {
+    expect(src.split("mode: ruleNotifyDeliveryMode(agent),").length - 1).toBe(7);
   });
 
   for (const marker of [
@@ -171,7 +170,6 @@ describe("FACTORY-1010: per-rule notifyDeliveryMode is threaded through every ru
     "startZendeskTicketLoop({",
     "startFilesystemLoop({",
     "startConfluencePageLoop({",
-    "startTrelloCardLoop({",
   ]) {
     test(`rule-owned seam at ${JSON.stringify(marker)} passes mode: ruleNotifyDeliveryMode(agent)`, () => {
       const block = sliceAfter(marker, 1300);
@@ -183,5 +181,9 @@ describe("FACTORY-1010: per-rule notifyDeliveryMode is threaded through every ru
     const block = sliceAfter("const deliverIdlePoke = async (issue: string, text: string)", 500);
     expect(block).not.toContain("ruleNotifyDeliveryMode");
   });
-  // local/ui: upstream's managed-sessions seam case is gone with the loop itself (managed sessions dropped).
+
+  test("the managed-sessions seam deliberately does NOT read notifyDeliveryMode (documented out-of-scope: SessionDefinition, not a Rule)", () => {
+    const block = sliceAfter("startManagedSessionsLoop({");
+    expect(block).not.toContain("ruleNotifyDeliveryMode");
+  });
 });

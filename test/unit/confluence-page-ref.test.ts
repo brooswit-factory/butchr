@@ -7,11 +7,11 @@ describe("parseConfluencePageRef", () => {
   });
 
   test("extracts the page id from a full Confluence page URL — reuses pageIdFromUrl rather than a second regex", () => {
-    expect(parseConfluencePageRef("https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Some+Title")).toEqual({ pageId: "39518269" });
+    expect(parseConfluencePageRef("https://example.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Some+Title")).toEqual({ pageId: "39518269" });
   });
 
   test("a Confluence URL with no page id (e.g. a space overview) is not a confluence-page ref", () => {
-    expect(parseConfluencePageRef("https://wroosbit.atlassian.net/wiki/spaces/FACTORY/overview")).toBeNull();
+    expect(parseConfluencePageRef("https://example.atlassian.net/wiki/spaces/FACTORY/overview")).toBeNull();
   });
 
   test("malformed input is null, never thrown", () => {
@@ -37,7 +37,7 @@ describe("formatConfluencePageRef / isConfluencePageRef", () => {
 describe("canonicalization / dedup equivalence", () => {
   test("a bare id and the URL naming the same page are equivalent", () => {
     const byId = parseConfluencePageRef("39518269")!;
-    const byUrl = parseConfluencePageRef("https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title")!;
+    const byUrl = parseConfluencePageRef("https://example.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title")!;
     expect(formatConfluencePageRef(byId)).toBe(formatConfluencePageRef(byUrl));
   });
 

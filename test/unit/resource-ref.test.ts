@@ -97,7 +97,7 @@ describe("canonicalKey: dedup equivalence and non-equivalence, across the whole 
 
   test("a webpage ref and a confluence-page ref for the SAME real page are NOT equivalent — known, deliberately unresolved aliasing (docs/resource-links.md)", () => {
     const confluence = canonicalKey(parseResourceRef("confluence-page:39518269"));
-    const webpage = canonicalKey(parseResourceRef("webpage:https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title"));
+    const webpage = canonicalKey(parseResourceRef("webpage:https://example.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title"));
     expect(confluence).not.toBe(webpage);
   });
 

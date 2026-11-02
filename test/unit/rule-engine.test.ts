@@ -123,24 +123,25 @@ describe("rule discovery", () => {
     expect(querySpec.lizardMode).toBe(true);
   });
 
-  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): `resumeOnRespawn` is
-  // forwarded the same way, EXCEPT it is absent-means-ON (no tri-state), so
-  // an explicit `false` must still reach the spec — a truthy-only forward
-  // (the shape `lizardMode` above uses) would silently drop it.
-  // `ticketStatus`/`ticketLabels` are always present — this already-fetched
-  // issue's own fields, never conditional on the rule. FACTORY-1018 removed
-  // `resumeContextCutoff` entirely, so there is nothing of that shape left
-  // to forward.
-  test("FACTORY-916: resumeOnRespawn is forwarded (including an explicit false), and ticketStatus/ticketLabels always ride along", () => {
-    const [rule] = rules({ id: "resume", query: "q", resumeOnRespawn: false });
+  // FACTORY-916 (epic FACTORY-843, story FACTORY-850): `resumeOnRespawn`/
+  // `resumeContextCutoff` (FACTORY-851) are forwarded the same way, EXCEPT
+  // `resumeOnRespawn` is absent-means-ON (no tri-state), so an explicit
+  // `false` must still reach the spec — a truthy-only forward (the shape
+  // `lizardMode` above uses) would silently drop it. `ticketStatus`/
+  // `ticketLabels` are always present — this already-fetched issue's own
+  // fields, never conditional on the rule.
+  test("FACTORY-916: resumeOnRespawn/resumeContextCutoff are forwarded (including an explicit false), and ticketStatus/ticketLabels always ride along", () => {
+    const [rule] = rules({ id: "resume", query: "q", resumeOnRespawn: false, resumeContextCutoff: 5000 });
     const spec = specForMatch({ agentKey: "jira-work:resume:BUTCHR-7", rule: rule!, issue: issue("BUTCHR-7", { status: "In Review", labels: ["a", "b"] }) });
     expect(spec.resumeOnRespawn).toBe(false);
+    expect(spec.resumeContextCutoff).toBe(5000);
     expect(spec.ticketStatus).toBe("In Review");
     expect(spec.ticketLabels).toEqual(["a", "b"]);
 
     const [plainRule] = rules({ id: "plain2", query: "q" });
     const plainSpec = specForMatch({ agentKey: "jira-work:plain2:BUTCHR-7", rule: plainRule!, issue: issue("BUTCHR-7") });
     expect(plainSpec).not.toHaveProperty("resumeOnRespawn");
+    expect(plainSpec).not.toHaveProperty("resumeContextCutoff");
     expect(plainSpec.ticketStatus).toBe("In Progress"); // issue()'s own default
     expect(plainSpec.ticketLabels).toEqual([]);
   });
@@ -230,7 +231,7 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
     const lines: string[] = [];
     const withDescription = issue("BUTCHR-1", {
       description: [
-        "Design: https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
+        "Design: https://example.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design",
         "Issue: https://github.com/brooswit-factory/butchr/issues/42",
         "PR: https://github.com/brooswit-factory/butchr/pull/395",
         "Docs: https://example.com/some/docs",
@@ -240,7 +241,7 @@ describe("BUTCHR-429: linked-change discovery logging", () => {
     const type = createRuleResourceType({ rules: rules({ id: "task", query: "q" }), search: async () => [withDescription], log: (l) => lines.push(l) });
     await type.discovery.search();
     const linked = lines.filter((l) => l.startsWith("[linked-discovery]"));
-    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://wroosbit.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
+    expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=confluence target=https://example.atlassian.net/wiki/spaces/BUTCHR/pages/1/Design skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-issue target=brooswit-factory/butchr#42 skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=github-pr target=brooswit-factory/butchr#395 skipped=false");
     expect(linked).toContain("[linked-discovery] jira-work:task:BUTCHR-1 kind=webpage target=https://example.com/some/docs skipped=false");
@@ -1160,17 +1161,22 @@ describe("rule workspaces", () => {
 });
 
 // BUTCHR-411 / CNDLX-45: the ticket's own concrete case — the Candlestix MUD
-// players' shared `mud-mcp` HTTP bridge. Event-driven Claude delivery from
-// that MCP server must be preserved end to end: the rule's own binding,
-// through specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's
-// channel flag.
-describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind an MCP channel server", () => {
+// players' shared `mud-mcp` HTTP bridge, account policy `none` (no
+// Rocket.Chat account is provisioned for them; that's a sibling task, S4, on
+// a parallel branch). Event-driven Claude delivery from that non-RC MCP
+// server must be preserved end to end: the rule's own binding, through
+// specForMatch, buildWorkspace's mcp.json, and agentLaunchConfig's channel
+// flag.
+describe("mud-bridge worked example (BUTCHR-411 / CNDLX-45): bind a non-Rocket.Chat MCP channel server", () => {
   const mudBinding = { name: "mud-mcp", type: "http" as const, url: "https://mud.example/mcp", channel: true };
 
-  test("a rule still carrying the legacy account: none key gets full channel delivery", () => {
+  test("the binding path never reads Rule.account — account: none still gets full channel delivery", () => {
     const [rule] = rules({ id: "mud", query: "project = CNDLX", account: "none", mcpServers: [mudBinding] });
-    expect(rule).not.toHaveProperty("account"); // the legacy key is ignored by the loader
+    expect(rule!.account).toBe("none"); // the sibling RC-lifecycle task's own field — set, but untouched below
     const spec = specForMatch({ agentKey: "jira-work:mud:CNDLX-45", rule: rule!, issue: issue("CNDLX-45") });
+    // SpawnSpec has no `account` field at all: agentLaunchConfig's channel wiring
+    // (argv.ts) has no way to consult account policy even if it wanted to —
+    // structural independence, not just an untested code path.
     expect(spec).not.toHaveProperty("account");
     expect(spec.mcpServers).toEqual([mudBinding]);
     const launch = agentLaunchConfig(spec, "/d", "p", "n", { provider: "claude" });
@@ -1270,38 +1276,37 @@ describe("BUTCHR-436: linked-change eventing wiring", () => {
 
 // FACTORY-1: investigated a reported regression — "after linked eventing was
 // enabled, a cross-daemon Story→Epic submit_to_boss no longer wakes the
-// boss", hypothesised as the (then-existing) `linked:` rate cap
-// (`maxLinkedTurnsPerHour`) superseding or sharing a budget with the
-// pre-existing `related:` (Implements chain) boss-wake mechanism. NOT
-// REPRODUCIBLE: the two mechanisms are architecturally independent —
-// `discovery.related()`'s return value (which `related:` events are
-// computed from) is built from `relatedForRules` BEFORE
+// boss", hypothesised as the new `linked:` rate cap (`maxLinkedTurnsPerHour`)
+// superseding or sharing a budget with the pre-existing `related:` (Implements
+// chain) boss-wake mechanism. NOT REPRODUCIBLE: the two mechanisms are
+// architecturally independent — `discovery.related()`'s return value (which
+// `related:` events are computed from) is built from `relatedForRules` BEFORE
 // `linkedEventingState.runTick` ever runs, and `runTick` only ever performs
-// `deps.notify` side effects, keyed by the OWNING resource's agent key — it
-// never touches the related-resource array or any state
-// `createRuleEventRules`'s "related" space reads. This test pins that
-// independence for the epic/story case the ticket asked for: a cross-daemon
-// boss (whose OWN rule matches no local Story at all — the worker is
-// fetched only through the foreign-implementer path, exactly BUTCHR-388's
-// own documented live-fleet shape) whose OWN linked-eventing activity
-// (unrelated `linked:` churn landing in the SAME tick) still gets exactly
-// one `related:` notify the moment its real child moves to In Review.
-// FACTORY-252 removed the rate cap this test's own hypothesis named
-// entirely, which only strengthens the independence proof: there is no
-// cap left for the two mechanisms to even potentially share. (Investigation
-// record, incl. why the live incident actually happened — a missing
-// Implements issuelink, not this hypothesis — is on the FACTORY-1 ticket
-// and its linked doc.)
-describe("FACTORY-1: linked eventing never supersedes a boss/worker related: wake", () => {
-  test("cross-daemon epic hears its story's move to In Review via related:, alongside unrelated linked-eventing activity in the same tick", async () => {
+// `deps.notify` side effects under its own `turns` budget, keyed by the
+// OWNING resource's agent key — it never touches the related-resource array
+// or any state `createRuleEventRules`'s "related" space reads. This test
+// pins that independence for the epic/story case the ticket asked for: a
+// cross-daemon boss (whose OWN rule matches no local Story at all — the
+// worker is fetched only through the foreign-implementer path, exactly
+// BUTCHR-388's own documented live-fleet shape) whose OWN linked-eventing
+// budget is already exhausted by unrelated linked churn (reproducing the
+// live `[notify-suppressed] ... arm=rate-capped count=2 max=2` evidence)
+// still gets exactly one `related:` notify the moment its real child moves to
+// In Review. (Investigation record, incl. why the live incident actually
+// happened — a missing Implements issuelink, not this hypothesis — is on the
+// FACTORY-1 ticket and its linked doc.)
+describe("FACTORY-1: linked eventing's rate cap never supersedes a boss/worker related: wake", () => {
+  test("cross-daemon epic hears its story's move to In Review via related:, even with its own linkedEventing budget exhausted", async () => {
     const bossKey = "DROVR-37";
     const workerKey = "DROVR-38"; // fetched only via the foreign-implementer path — this daemon's own rules never match it
     // BUTCHR-472: these must NOT be Implements/outward targets of the boss —
     // that exact pair is now de-duplicated out of the linked path entirely
-    // (already covered by related:). A "Blocks" link is pure linked-path
-    // churn, untouched by BUTCHR-472's de-dup (which only ever excludes an
-    // Implements/outward target — see `watchedKeys`, src/jira-watch/routes.ts).
-    const siblingKeys = ["DROVR-30", "DROVR-31"]; // Blocks-type links on the boss, used as unrelated linked-path churn
+    // (already covered by related:), so it could never again exhaust
+    // `maxLinkedTurnsPerHour` the way this test needs. A "Blocks" link is
+    // pure linked-path churn, untouched by BUTCHR-472's de-dup (which only
+    // ever excludes an Implements/outward target — see `watchedKeys`,
+    // src/jira-watch/routes.ts) — so it still exhausts the budget genuinely.
+    const siblingKeys = ["DROVR-30", "DROVR-31"]; // Blocks-type links on the boss, used to genuinely exhaust its linked-eventing budget first
 
     let storyStatus = "In Progress";
     let siblingRound = 0;
@@ -1321,7 +1326,7 @@ describe("FACTORY-1: linked eventing never supersedes a boss/worker related: wak
     const logs: string[] = [];
     // This daemon's own rules match ONLY Epics — BUTCHR-388's own documented
     // live-fleet shape ("booswrit's ... rules are issuetype = Epic|Task|Bug").
-    const ruleSet = rules({ id: "epics", query: "issuetype = Epic", linkedEventing: true });
+    const ruleSet = rules({ id: "epics", query: "issuetype = Epic", linkedEventing: true, maxLinkedTurnsPerHour: 2 });
     const search = async (jql: string) => {
       if (jql === "issuetype = Epic") return [boss()];
       if (jql.startsWith("key in (")) {
@@ -1339,7 +1344,7 @@ describe("FACTORY-1: linked eventing never supersedes a boss/worker related: wak
 
     await type.discovery.search();
     let related = await type.discovery.related!(active);
-    // Two genuine sibling status flips — unrelated linked:-path churn for the same owner.
+    // Two genuine sibling status flips spend the epic's own maxLinkedTurnsPerHour: 2 budget.
     for (let i = 0; i < 2; i++) {
       siblingRound++;
       await type.discovery.search();
@@ -1348,17 +1353,22 @@ describe("FACTORY-1: linked eventing never supersedes a boss/worker related: wak
     logs.length = 0; // ignore the warm-up churn's own logging
 
     // BUTCHR-472: the workerKey Implements/outward pair is now de-duplicated
-    // out of the linked path entirely (already covered by related:). One
-    // more round of the SAME sibling (Blocks-type) churn used above,
-    // landing in the SAME tick as the story's move, keeps this test proving
-    // what it always proved: unrelated linked:-path activity never blocks
+    // out of the linked path entirely (already covered by related:), so its
+    // own status flip can no longer be what trips the rate cap. One more
+    // round of the SAME sibling (Blocks-type) churn used above, landing in
+    // the SAME tick as the story's move, keeps this test proving what it
+    // always proved: a genuinely exhausted linked-path cap never blocks
     // related:.
     siblingRound++;
-    // The real boss-wake event: the story moves to In Review in the same tick as unrelated linked: churn.
+    // The real boss-wake event: the story moves to In Review while the budget is exhausted.
     storyStatus = "In Review";
     await type.discovery.search();
     const relatedAfter = await type.discovery.related!(active);
-    expect(logs.some((l) => l.includes("rate-capped"))).toBe(false); // no cap exists any more
+
+    // Confirm the rate cap genuinely bit this tick (matching the live
+    // `arm=rate-capped count=2 max=2` evidence) — a vacuously-passing test
+    // that never actually exhausted the budget would prove nothing.
+    expect(logs.some((l) => l.includes("[notify-suppressed]") && l.includes("arm=rate-capped") && l.includes(bossKey))).toBe(true);
 
     // The SAME mechanism `runResourceLoop`'s own onChange stage (src/daemon/loop.ts)
     // uses: diff the two related snapshots, then decide+deliver per watcher.
@@ -1373,6 +1383,6 @@ describe("FACTORY-1: linked eventing never supersedes a boss/worker related: wak
         if ((await evPoll.decide(key, w, "related")).deliver) delivered.push(w);
       }
     }
-    expect(delivered).toEqual(["jira-work:epics:" + bossKey]); // exactly one related: notify to the boss, unaffected by unrelated linked-eventing activity
+    expect(delivered).toEqual(["jira-work:epics:" + bossKey]); // exactly one related: notify to the boss, never dropped by the exhausted linked-eventing cap
   });
 });

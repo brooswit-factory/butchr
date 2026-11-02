@@ -85,7 +85,7 @@ describe("isConfluencePageResourceId", () => {
   });
 
   test("rejects a full Confluence URL — x-issue is never a URL, only the resolved bare id (unlike parseConfluencePageRef, which also accepts one for the links/ResourceRef axis)", () => {
-    expect(isConfluencePageResourceId("https://wroosbit.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title")).toBe(false);
+    expect(isConfluencePageResourceId("https://example.atlassian.net/wiki/spaces/FACTORY/pages/39518269/Title")).toBe(false);
   });
 
   test("rejects anything malformed", () => {

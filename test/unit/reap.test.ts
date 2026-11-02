@@ -359,58 +359,75 @@ describe("createReaper", () => {
     expect(calls).toBe(0);
   });
 
-  // FACTORY-92: the reaped-agent hook must key off `agentKey`, never
-  // `label` — a human-readable/renamed label (FACTORY-83's eventual change)
-  // must never route the hook at the wrong agent.
-  test("FACTORY-92: onReaped is called with the REAL agent key even when the herdr label is a different, human-readable string", async () => {
-    const reaped: string[] = [];
+  // BUTCHR-412, re-grounded by FACTORY-92.
+  test("release is called with the candidate's REAL agentKey after a successful close", async () => {
+    const released: string[] = [];
+    const clock = tickingNow(0);
+    const reaper = createReaper({
+      now: clock.now,
+      candidates: async () => [{ workspaceId: "w1", label: "jira-work:triage:BUTCHR-9", agentKey: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
+      close: async () => true,
+      release: async (agentKey) => { released.push(agentKey); },
+    });
+    await reaper.check();
+    clock.advance(MIN);
+    await reaper.check();
+    expect(released).toEqual(["jira-work:triage:BUTCHR-9"]);
+  });
+
+  // FACTORY-92: this is the release call site's own regression test for the
+  // ticket's core fix — release must key off `agentKey`, never `label`, so a
+  // human-readable/renamed label (FACTORY-83's eventual change) never routes
+  // release at the wrong Rocket.Chat account.
+  test("FACTORY-92: release is called with the REAL agent key even when the herdr label is a different, human-readable string", async () => {
+    const released: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
       candidates: async () => [{ workspaceId: "w1", label: "admin-assembly", agentKey: "jira-work:triage:BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => true,
-      onReaped: async (agentKey) => { reaped.push(agentKey); },
+      release: async (agentKey) => { released.push(agentKey); },
     });
     await reaper.check();
     clock.advance(MIN);
     await reaper.check();
-    expect(reaped).toEqual(["jira-work:triage:BUTCHR-9"]);
-    expect(reaped).not.toContain("admin-assembly");
+    expect(released).toEqual(["jira-work:triage:BUTCHR-9"]);
+    expect(released).not.toContain("admin-assembly");
   });
 
-  test("onReaped is never called for a candidate that was NOT actually closed (verified live/unknown)", async () => {
-    const reaped: string[] = [];
+  test("release is never called for a candidate that was NOT actually closed (verified live/unknown)", async () => {
+    const released: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
       candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => false,
-      onReaped: async (agentKey) => { reaped.push(agentKey); },
+      release: async (agentKey) => { released.push(agentKey); },
     });
     await reaper.check();
     clock.advance(MIN * 10);
     await reaper.check();
-    expect(reaped).toEqual([]);
+    expect(released).toEqual([]);
   });
 
-  test("an onReaped failure is logged and swallowed — never fails the poll or the reclaim count", async () => {
+  test("a release failure is logged and swallowed — never fails the poll or the reclaim count", async () => {
     const logs: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({
       now: clock.now,
       candidates: async () => [{ workspaceId: "w1", label: "BUTCHR-9", agentKey: "BUTCHR-9", paneIds: ["w1:p1"] }],
       close: async () => true,
-      onReaped: async () => { throw new Error("herdr unreachable"); },
+      release: async () => { throw new Error("RC unreachable"); },
       log: (l) => logs.push(l),
     });
     await reaper.check();
     clock.advance(MIN);
     await expect(reaper.check()).resolves.toBeUndefined();
     expect(logs.some((l) => l.includes("reclaimed workspace w1"))).toBe(true);
-    expect(logs.some((l) => l.includes("WARNING") && l.includes("label purge failed"))).toBe(true);
+    expect(logs.some((l) => l.includes("WARNING") && l.includes("account release failed"))).toBe(true);
   });
 
-  test("onReaped omitted entirely: reaping still works", async () => {
+  test("release omitted entirely: reaping still works exactly as before this ticket", async () => {
     const closes: string[] = [];
     const clock = tickingNow(0);
     const reaper = createReaper({

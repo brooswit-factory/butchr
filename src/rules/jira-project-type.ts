@@ -71,15 +71,11 @@ export interface CreateJiraProjectResourceTypeDeps {
   notify?: (agentKey: string, about: string, reason: NotifyReason) => void | Promise<void>;
   /** BUTCHR-469: per-target comment-cursor support for member/managed-link Jira targets — the SAME `LinkedEventingDeps.comments` shape. Optional; omitted, no comment event is ever detected for a project owner (unchanged pre-BUTCHR-469 behaviour). */
   comments?: LinkedEventingDeps['comments'];
+  /** BUTCHR-469: the FACTORY-4/FACTORY-8 managed-link store, routed (`createRoutingLinkStore`, src/resources/link-store-router.ts) so a `jira-project:` owner reaches the `brooswit.butchr.links` project-property store. Optional; omitted, no managed link is ever reconciled into a project owner's watch. */
+  linkStore?: LinkedEventingDeps['linkStore'];
   log?: (line: string) => void;
   /** Injectable clock, for deterministic tests — threaded straight through to `LinkedEventingDeps.now`. */
   now?: () => number;
-  /** FACTORY-137: the daemon's Catamorbius push controller's read-only coverage query — passed straight through to `runTick`. Optional; omitted, push mode never activates for `jira-project` owners. */
-  push?: LinkedEventingDeps['push'];
-  setTimeout?: LinkedEventingDeps['setTimeout'];
-  clearTimeout?: LinkedEventingDeps['clearTimeout'];
-  /** FACTORY-137: called once with this call's own `LinkedEventingState`, so the daemon can register it with the push controller. Optional; omitted, this instance never receives push signals. */
-  onLinkedEventingState?: (state: ReturnType<typeof createLinkedEventingState>) => void;
 }
 
 export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTypeDeps): ResourceType<ProjectMatch> {
@@ -87,7 +83,6 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
  // `createRuleResourceType`'s own `let latest` (src/rules/resource-type.ts).
  let latest: ProjectMatch[] = [];
  const linkedEventingState = createLinkedEventingState();
- deps.onLinkedEventingState?.(linkedEventingState);
  return {
  discovery: {idOf:m=>m.agentKey,search:async()=>{
    const groups=await Promise.all(deps.rules.filter(r=>r.enabled&&r.resourceProvider==='jira-project').map(async rule=>{
@@ -131,10 +126,8 @@ export function createJiraProjectResourceType(deps: CreateJiraProjectResourceTyp
          notify,
          ...(deps.log ? { log: deps.log } : {}),
          ...(deps.now ? { now: deps.now } : {}),
+         ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
          ...(deps.comments ? { comments: deps.comments } : {}),
-         ...(deps.push ? { push: deps.push } : {}),
-         ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
-         ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
        }, projectMatches);
      } catch (e) {
        deps.log?.(`  WARNING: [linked-eventing] project tick threw: ${(e as Error)?.message ?? e}`);

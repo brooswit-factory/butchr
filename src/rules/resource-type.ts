@@ -87,8 +87,14 @@ export interface RuleResourceDeps {
   webpage?: LinkedEventingDeps["webpage"];
   /** FACTORY-9: `external-poll.ts`'s `pollFilesystem` needs. Passed straight through to `runTick`, same as the three deps immediately above — see `LinkedEventingDeps.filesystem`'s own doc comment for what an omitted dep resolves to. */
   filesystem?: LinkedEventingDeps["filesystem"];
-  /** local/ui — a ticket's own open PR from GitHub PR discovery; passed straight through to `runTick` — see `LinkedEventingDeps.ticketPullRequest`'s own doc comment. Omitted (no GitHub configured), no ticket PR is watched. */
-  ticketPullRequest?: LinkedEventingDeps["ticketPullRequest"];
+  /**
+   * FACTORY-9 (epic FACTORY-3, story 3/3): the FACTORY-4 butchr-managed link
+   * store — see `LinkedEventingDeps.linkStore`'s own doc comment
+   * (src/jira-watch/linked-eventing.ts) for the full contract. Passed
+   * straight through to `runTick`, same as every other linked-eventing dep
+   * above; omitted, no managed link is ever reconciled into a watcher.
+   */
+  linkStore?: LinkedEventingDeps["linkStore"];
   /** FACTORY-949: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.blockedWakeDebounceMinutes`'s own doc comment. */
   blockedWakeDebounceMinutes?: IssueResourceDeps["blockedWakeDebounceMinutes"];
   /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.stalledWakeDebounceMinutes`'s own doc comment. */
@@ -99,24 +105,6 @@ export interface RuleResourceDeps {
   onStalledWake?: IssueResourceDeps["onStalledWake"];
   /** FACTORY-972: threaded straight through to every `createIssueEventRules` instance below — see `IssueResourceDeps.onStalledWakeCapped`'s own doc comment. */
   onStalledWakeCapped?: IssueResourceDeps["onStalledWakeCapped"];
-  /**
-   * FACTORY-137 (D2): the daemon's Catamorbius push controller's read-only
-   * coverage query — passed straight through to `runTick`, same as every
-   * other linked-eventing dep above. Optional; omitted, push mode never
-   * activates for this rule type (every existing caller/test).
-   */
-  push?: LinkedEventingDeps["push"];
-  setTimeout?: LinkedEventingDeps["setTimeout"];
-  clearTimeout?: LinkedEventingDeps["clearTimeout"];
-  /**
-   * FACTORY-137: called ONCE, synchronously, right after this call's own
-   * `LinkedEventingState` is constructed — lets the daemon register it with
-   * the push controller (`registerConsumer`) so a Catamorbius event can
-   * reach it (`markDirty`/`requestResync`/`runDirtyPass`) and so its own
-   * `stats()` can be surfaced. Optional; omitted, this instance simply
-   * never receives push signals (byte-identical to pre-FACTORY-137).
-   */
-  onLinkedEventingState?: (state: LinkedEventingState) => void;
 }
 
 /**
@@ -287,7 +275,7 @@ export function relatedForRules(
     const provider = listener.rule.resourceProvider;
     return [{
       agentKey: `related:${provider}:${issue.key}`,
-      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", role: "worker" },
+      rule: { id: FOREIGN_RULE_ID, enabled: false, resourceProvider: provider, query: "", brief: "", execution: "swarm", account: "none", role: "worker" },
       issue,
     }];
   };
@@ -420,6 +408,7 @@ export function specForMatch({ agentKey, rule, issue }: RuleMatch): SpawnSpec {
     // this already-fetched `issue`'s own fields, carried through so the
     // spawn decision's `classifyStop` call needs no Jira fetch of its own.
     ...(rule.resumeOnRespawn !== undefined ? { resumeOnRespawn: rule.resumeOnRespawn } : {}),
+    ...(rule.resumeContextCutoff !== undefined ? { resumeContextCutoff: rule.resumeContextCutoff } : {}),
     ticketStatus: issue.status,
     ticketLabels: issue.labels,
   };
@@ -571,7 +560,6 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
   const excluded = onceExcluded("jira-work", "not a proven work item", deps.log);
   const linkedDiscoveryTracker = createLinkedDiscoveryTracker();
   const linkedEventingState: LinkedEventingState = createLinkedEventingState();
-  deps.onLinkedEventingState?.(linkedEventingState);
   return {
     discovery: {
       idOf: unitAgentKey,
@@ -652,12 +640,8 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
               ...(deps.webpage ? { webpage: deps.webpage } : {}),
               // FACTORY-9
               ...(deps.filesystem ? { filesystem: deps.filesystem } : {}),
+              ...(deps.linkStore ? { linkStore: deps.linkStore } : {}),
               ...(deps.comments ? { comments: deps.comments } : {}),
-              ...(deps.ticketPullRequest ? { ticketPullRequest: deps.ticketPullRequest } : {}),
-              // FACTORY-137
-              ...(deps.push ? { push: deps.push } : {}),
-              ...(deps.setTimeout ? { setTimeout: deps.setTimeout } : {}),
-              ...(deps.clearTimeout ? { clearTimeout: deps.clearTimeout } : {}),
             });
           } catch (e) {
             deps.log?.(`  WARNING: [linked-eventing] tick threw: ${(e as Error)?.message ?? e}`);

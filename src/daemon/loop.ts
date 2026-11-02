@@ -1,3 +1,5 @@
+import {createObservationJournal} from "../control-panel/observation-journal.js";
+import type {ResourceProvider} from "../rules/rules.js";
 import { watch, type Stop } from "@brooswit/sundry";
 import type { JiraIssue, JiraComment } from "../atlassian/types.js";
 import { planReconcile } from "../reconcile/plan.js";
@@ -7,6 +9,7 @@ import type { ResourceType, RelatedResource } from "../resources/types.js";
 import { createIssueEventRules, ISSUE_ACTIVATION, ISSUE_SPAWN_CONFIG, issueIdOf } from "../resources/issue.js";
 import type { SkippedCommentCheckReason } from "../jira-watch/skipped-comment-check-log.js";
 import type { ReconcileFailure } from "../agents/reconcile-failure.js";
+import type { AccountLifecycleHooks } from "../agents/account-lifecycle.js";
 export type { ReconcileFailure, ReconcileStage } from "../agents/reconcile-failure.js";
 export type { NotifyReason } from "../resources/types.js";
 import type { NotifyReason } from "../resources/types.js";
@@ -209,6 +212,7 @@ export class ResumeDeferGuard {
 export const RESUME_WAITING_NOTICE_AT_POLLS = 10;
 
 export interface ReconcileOptions {
+  ruleLease?: number|undefined;
   onRespawn?: (issue: string, reason: string, observedArgv: string[]) => void | Promise<void>;
   /** FACTORY-916 — see `LoopDeps.onRespawnResumed`'s own doc comment; threaded straight through. */
   onRespawnResumed?: (issue: string) => void | Promise<void>;
@@ -481,6 +485,18 @@ export interface ReconcileOptions {
    * report through).
    */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
+  /**
+   * BUTCHR-412: Rocket.Chat account lifecycle, independent of every hook
+   * above (residency/admission/crash-loop/etc. all still run exactly as
+   * before — this only decides what `ensureAccount`/`releaseAccount` see, and
+   * WITHHOLDS a spawn `admitted`/`plan.respawn` would otherwise have made,
+   * never adds one). See `../agents/account-lifecycle.ts` for the hook
+   * contract and why its two call sites below are exactly the boundary the
+   * account manager's own token-rotation contract needs. Optional; omitted,
+   * no account lifecycle runs (every caller before this ticket) — every
+   * `SpawnSpec` reaches `herd.spawn` exactly as `desired` provided it.
+   */
+  account?: AccountLifecycleHooks;
 }
 
 /**
@@ -527,9 +543,19 @@ export interface ReconcileOptions {
  * case is untouched by this reversal.
  */
 export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, SpawnSpec>, opts: ReconcileOptions = {}): Promise<void> {
+  const rulePolicy=herd.ruleRuntime?.();let ruleLease=opts.ruleLease??rulePolicy?.generation()??0;
+  let runtimeRunning:readonly string[]|undefined;
+  if(rulePolicy){const census=herd.ruleCensus?await herd.ruleCensus():{ids:await herd.runningIssues(),complete:false};rulePolicy.census(census);if(opts.ruleLease===undefined)ruleLease=rulePolicy.generation();runtimeRunning=census.ids;desired=rulePolicy.prepare(desired,runtimeRunning,ruleLease);}
   const frozen = new Set(herd.frozen ? await herd.frozen([...desired.keys()]) : []);
   desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
   const failures: ReconcileFailure[] = [];
+  // BUTCHR-412: drain any release `AccountLifecycleHooks.release` could not
+  // complete on an earlier poll (the manager call itself threw, after
+  // herd.stop had already succeeded) BEFORE anything else this poll — see
+  // that hook's own doc comment for why this is the only retry path such a
+  // failure ever gets (the id is no longer running, so it can never land in
+  // a future plan.stop on its own).
+  if (opts.account) await opts.account.retryPendingReleases();
   if (herd.recoverQuota) {
     await Promise.all([...desired.values()].map(async (spec) => {
       try {
@@ -544,7 +570,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   const poll = guard.nextPoll();
   const stale = await herd.staleIssues();
   const staleByIssue = new Map(stale.map((s) => [s.issue, s]));
-  const running = await herd.runningIssues();
+  const running = runtimeRunning??await herd.runningIssues();
   if(herd.frozen) for(const id of await herd.frozen(running)) frozen.add(id);
   desired = new Map([...desired].filter(([id])=>!frozen.has(id)));
   opts = {...opts, atRest:[...(opts.atRest ?? [])].filter(id=>!frozen.has(id))};
@@ -632,6 +658,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // below; this `finally` releases whatever is still held if anything
   // between here and there throws, so no reservation outlives this round.
   const held = new Set(admitted);
+  const skippedByRulePolicy=new Set<string>();
   const release = async (ids: readonly string[]) => {
     if (!opts.releaseAdmission || !ids.length) return;
     for (const id of ids) held.delete(id);
@@ -670,23 +697,45 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     // resource's spawn this same `Promise.all`.
     await Promise.all(admitted.map(async (issue) => {
       try {
-        await herd.spawn(desired.get(issue)!);
-        // FACTORY-916: THE primary case this story exists for — `issue`
-        // was `desired` but not `running` at all (this `admitted`/
-        // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
-        // below, which only ever sees an agent that WAS running) —
-        // i.e. exactly the "daemon respawns a worker after an
-        // unintended stop" shape FACTORY-843's outcome describes. Same
-        // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
-        // callback the stale-argv loop below also consults — see that
-        // loop's own comment for the full contract. Without this read
-        // HERE too, a genuine crash-respawn that resumed would get NO
-        // ticket notice at all: this loop never calls `opts.onRespawn`
-        // in the first place (a brand-new "first ever spawn" needs no
-        // "your session was X" notice), so there is no existing call
-        // this piggybacks on the way the stale-argv loop's does.
-        if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
+        const spec = desired.get(issue)!;
+        if(herd.frozen&&(await herd.frozen([issue])).has(issue)){skippedByRulePolicy.add(issue);return;}
+        if(rulePolicy&&!rulePolicy.canSpawn(spec,ruleLease)){skippedByRulePolicy.add(issue);return;}
+        // BUTCHR-412: `ensure` runs BEFORE herd.spawn, and only ever for an
+        // id `admitted` (never one already resident — BUTCHR-287's own
+        // residency filter already removed those from `live`/`admitted`
+        // upstream of this point) — see AccountLifecycleHooks' own doc
+        // comment for why that boundary is exactly what the account
+        // manager's token-rotation contract needs.
+        const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
+        if (toSpawn === null) {
+          // A real refusal, already logged (and, where wired, posted) by
+          // `ensure` itself — recorded here as an ordinary "spawn" failure so
+          // it shares checkReconcileFailure's existing audible-failure route
+          // and is excluded from `onAdmitted` below, same as any other failed
+          // spawn attempt.
+          failures.push({ id: issue, stage: "spawn", error: new Error("account policy refused this launch — see the [account] log line above; withheld rather than started without it") });
+        } else {
+          if(rulePolicy&&!rulePolicy.canAdmit(issue,ruleLease)){skippedByRulePolicy.add(issue);return;}
+          await herd.spawn(toSpawn,undefined,rulePolicy?ruleLease:undefined);
+          rulePolicy?.spawnSucceeded(issue);
+          // FACTORY-916: THE primary case this story exists for — `issue`
+          // was `desired` but not `running` at all (this `admitted`/
+          // `plan.spawn` loop, never `plan.respawn`'s stale-argv loop
+          // below, which only ever sees an agent that WAS running) —
+          // i.e. exactly the "daemon respawns a worker after an
+          // unintended stop" shape FACTORY-843's outcome describes. Same
+          // read-once `lastFreshSpawnResumed` signal and `onRespawnResumed`
+          // callback the stale-argv loop below also consults — see that
+          // loop's own comment for the full contract. Without this read
+          // HERE too, a genuine crash-respawn that resumed would get NO
+          // ticket notice at all: this loop never calls `opts.onRespawn`
+          // in the first place (a brand-new "first ever spawn" needs no
+          // "your session was X" notice), so there is no existing call
+          // this piggybacks on the way the stale-argv loop's does.
+          if (herd.lastFreshSpawnResumed?.(issue) && opts.onRespawnResumed) await opts.onRespawnResumed(issue);
+        }
       } catch (e) {
+        rulePolicy?.spawnFailed(issue);
         failures.push({ id: issue, stage: "spawn", error: e });
       }
       await release([issue]);
@@ -703,16 +752,30 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // there is no ledger anywhere to report to otherwise.
   if (opts.onAdmitted) {
     const failedSpawnIds = new Set(failures.filter((f) => f.stage === "spawn").map((f) => f.id));
-    opts.onAdmitted(admitted.filter((id) => !failedSpawnIds.has(id)));
+    opts.onAdmitted(admitted.filter((id) => !failedSpawnIds.has(id)&&!skippedByRulePolicy.has(id)));
   }
   // BUTCHR-147: sequential, same as before (stop has no documented wait to
   // parallelize against) — but each iteration's rejection is now caught so
   // one bad `herd.stop` no longer aborts the REST of this loop (every other
   // resource still gets stopped this poll) or the `respawn` loop below.
   for (const issue of plan.stop) {
+    if(!frozen.has(issue)&&rulePolicy?.protectStop(issue,ruleLease))continue;
     try {
-      await herd.stop(issue);
+      await herd.stop(issue,rulePolicy?ruleLease:undefined);
       await opts.onStopped?.(issue);
+      // BUTCHR-412: released only AFTER a successful stop — if herd.stop
+      // itself threw, the agent may still be running, and releasing its
+      // account out from under a still-live agent would be wrong; a
+      // throwing herd.stop instead falls to the catch below and is retried
+      // as an ordinary stop failure next poll (plan.stop recomputes every
+      // poll from scratch). `release` ITSELF never throws past this point —
+      // see AccountLifecycleHooks.release's own doc comment: once herd.stop
+      // has succeeded, the id is no longer running and so can never again
+      // land in plan.stop on its own, which is exactly why a release
+      // failure here is queued internally and drained every poll by
+      // `retryPendingReleases` (above, top of this function) instead of
+      // being left to a retry path that does not actually exist for it.
+      if (opts.account) await opts.account.release(issue, "stop");
     } catch (e) {
       failures.push({ id: issue, stage: "stop", error: e });
     }
@@ -725,6 +788,7 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // tracked state for free).
   const restoredPaneDeferredThisPoll: string[] = [];
   for (const issue of plan.respawn) {
+    if(rulePolicy?.protectRespawn(issue,ruleLease))continue;
     const info = staleByIssue.get(issue)!;
     let reason = info.reason;
     // FACTORY-314: a `resumable` staleness (Claude, model/effort-only) tries
@@ -749,7 +813,8 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
       const isRestoredPane = info.reason.startsWith(RESTORED_PANE_STALE_REASON_PREFIX);
       let outcome: Awaited<ReturnType<NonNullable<Herd["resumeInPlace"]>>>;
       try {
-        outcome = await herd.resumeInPlace(spec);
+        if(rulePolicy?.protectRespawn(issue,ruleLease))continue;
+        outcome = await herd.resumeInPlace(spec,rulePolicy?ruleLease:undefined);
       } catch (e) {
         failures.push({ id: issue, stage: "respawn", error: e });
         continue;
@@ -818,12 +883,30 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
     opts.reserveAdmission?.([issue]);
     try {
       const spec = desired.get(issue)!;
-      await herd.stop(issue);
+      // BUTCHR-412: `ensure` runs BEFORE the interim `herd.stop` below —
+      // deliberately: this is a "same agent identity coming back" launch
+      // (`docs/rocketchat-accounts.md`), so a refused account should leave
+      // the existing (stale-argv, but otherwise working) agent running
+      // rather than stop it with no replacement over an account hiccup.
+      // `release(issue, "respawn")` is a documented no-op for a temporary
+      // account either way — called for the same reason `ensureAccount`'s
+      // own "respawn never unprovisions" contract is exercised through real
+      // code here rather than assumed.
+      const toSpawn = opts.account ? await opts.account.ensure(spec) : spec;
+      if (toSpawn === null) {
+        failures.push({ id: issue, stage: "respawn", error: new Error("account policy refused this launch — see the [account] log line above; stale agent left running rather than stopped with no replacement") });
+        continue;
+      }
+      if(rulePolicy?.protectRespawn(issue,ruleLease))continue;
+      if (opts.account) await opts.account.release(issue, "respawn");
+      if(rulePolicy?.protectRespawn(issue,ruleLease))continue;
+      await herd.stop(issue,rulePolicy?ruleLease:undefined);
       // FACTORY-1001: a respawn is also a real lifecycle stop. Purge the
       // stopped pane's agent labels before the replacement is launched so a
       // failed/restarted pane cannot leave stale ownership behind.
       await opts.onStopped?.(issue);
-      await herd.spawn(spec, "respawn");
+      if(rulePolicy&&!rulePolicy.canAdmit(issue,ruleLease))continue;
+      await herd.spawn(toSpawn, "respawn",rulePolicy?ruleLease:undefined);
     } catch (e) {
       // BUTCHR-147 §7: isolated — every OTHER resource's respawn this poll
       // is unaffected. If `stop` succeeded but `spawn` then threw, `issue`
@@ -894,6 +977,15 @@ export async function reconcileNow(herd: Herd, desired: ReadonlyMap<string, Spaw
   // own try/catch here is ever removed or narrowed, this call site becomes
   // exactly that same hazard and should be wrapped too.
   if (opts.checkReconcileFailure) await opts.checkReconcileFailure(failures, [...desired.keys()], running);
+  // BUTCHR-412 (batch provisioning, BUTCHR-391 comment 24007): called ONCE,
+  // at the very end of this poll, after every `ensure`/`release` call above
+  // (spawn loop, stop loop, respawn loop) has run — never per-id. A poll
+  // that provisioned or released nothing this round is a no-op here (see
+  // `AccountLifecycleHooks.publishBatch`'s own doc comment, `../agents/account-lifecycle.ts`,
+  // for the dirty-tracking that makes that true); one that did publishes the
+  // Nexus hand-off manifest exactly once, regardless of how many ids this
+  // poll's spawn/respawn/stop loops touched.
+  if (opts.account) await opts.account.publishBatch();
 }
 
 /**
@@ -936,6 +1028,8 @@ export const atRestFrom = <T>(items: readonly T[], resourceType: Pick<ResourceTy
 };
 
 interface Snapshot<T> {
+  observed?:boolean;
+  ruleLease?: number|undefined;
   issues: T[];
   related: RelatedResource<T>[];
 }
@@ -989,6 +1083,8 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
   // caller — BUTCHR-413's Codex channel relay — does not go through
   // `scopedHerd`) but is forwarded here too, now that it's been audited.
   return {
+    ...(herd.ruleRuntime?{ruleRuntime:()=>herd.ruleRuntime!().scope(ownsId)}:{}),
+    ...(herd.ruleCensus?{ruleCensus:async()=>{const c=await herd.ruleCensus!();return {...c,ids:c.ids.filter(ownsId)};}}:{}),
     ...(herd.frozen ? {frozen:(ids:readonly string[])=>herd.frozen!(ids.filter(ownsId))} : {}),
     runningIssues: async () => (await herd.runningIssues()).filter(ownsId),
     staleIssues: async () => (await herd.staleIssues()).filter((s) => ownsId(s.issue)),
@@ -999,13 +1095,14 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
     // (`runResourceLoop` below calls `reconcileNow(scopedHerd(...), ...)`),
     // reintroducing finding 2 in production while every direct-`herd`-object
     // test (which bypasses this wrapper entirely) kept passing.
-    spawn: (spec, origin) => herd.spawn(spec, origin),
-    stop: (issue) => herd.stop(issue),
+    spawn: (spec, origin, lease) => herd.spawn(spec, origin, lease),
+    stop: (issue, lease) => herd.stop(issue, lease),
     paneFor: (issue) => herd.paneFor(issue),
-    nudge: (issue, text) => herd.nudge(issue, text),
+    nudge: (issue, text, lease) => herd.nudge(issue, text, lease),
     ...(herd.recoverQuota ? { recoverQuota: (spec: SpawnSpec) => herd.recoverQuota!(spec) } : {}),
+    ...(herd.reconcilePreferences ? {reconcilePreferences:(spec:SpawnSpec,current:()=>boolean,change?:import('../control-panel/worker-reconciliation.js').WorkerChange)=>ownsId(spec.key)?herd.reconcilePreferences!(spec,()=>ownsId(spec.key)&&current(),change):Promise.resolve({status:'blocked' as const,reason:'Worker belongs to another rule scope'})}:{}),
     ...(herd.providerOf ? { providerOf: (issue: string) => herd.providerOf!(issue) } : {}),
-    resumeInPlace: (spec: SpawnSpec) => herd.resumeInPlace(spec),
+    resumeInPlace: (spec: SpawnSpec, lease?:number) => herd.resumeInPlace(spec, lease),
     // FACTORY-525: forwarded explicitly for the SAME reason `providerOf` is,
     // just above — an optional member silently dropped here would still
     // compile, and this loop's own reason-string read (just above, in this
@@ -1020,6 +1117,7 @@ export function scopedHerd(herd: Herd, ownsId: (id: string) => boolean): Herd {
 
 /** What `runResourceLoop` needs beyond the resource type itself — every field here is already fully generic (no `T`-shaped logic anywhere). */
 export interface GenericLoopDeps<T> {
+  ruleProvider?: ResourceProvider;
   herd: Herd;
   /**
    * BUTCHR-91/BUTCHR-68: which opaque ids (as `herd.runningIssues()`/
@@ -1076,9 +1174,13 @@ export interface GenericLoopDeps<T> {
   releaseAdmission?: (ids: readonly string[]) => Promise<void>;
   /** BUTCHR-305/BUTCHR-238: see `ReconcileOptions.checkPinnedActive`'s doc comment — threaded straight through to `reconcileNow` below. Wired into the PROJECT loop ONLY (src/daemon/index.ts) — the issue tier already covers this same shape via `syncLabels`/`stallRemediation`; wiring both would double-post. Optional; omitted, no pinned-active detection runs. */
   checkPinnedActive?: (activeRunning: readonly string[]) => Promise<void>;
+  /** BUTCHR-412: see `ReconcileOptions.account`'s doc comment — threaded straight through to `reconcileNow` below. Wired into every rule loop (src/daemon/index.ts) as the SAME shared `AccountLifecycleHooks` instance (one account manager/store, not one per tier — mirrors `admission` above). Optional; omitted, no account lifecycle runs (every caller before this ticket). */
+  account?: AccountLifecycleHooks;
   log?: (line: string) => void;
   intervalMs: number;
   onError?: (error: unknown) => void;
+  /** Read-only operational inventory while rule observation is intentionally fenced. */
+  onFencedPoll?: () => Promise<void>;
   onPollSuccess?: () => void;
   /**
    * BUTCHR-57: called once per poll when the NOTIFY stage concludes without
@@ -1140,8 +1242,86 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
   // previous/current snapshots.
   let notifyTick = 0;
 
+  const processNotifications=async(next:Snapshot<T>,prev:Snapshot<T>):Promise<boolean>=>{
+      // BUTCHR-57: the whole notify stage is wrapped so its returned promise
+      // can never reject — `watch()` does not await `onChange` (mechanic A
+      // above), so a rejection here would otherwise be a silent unhandled
+      // promise rejection, invisible to both `deps.onError` (that seam only
+      // ever sees a rejection from the FETCH stage, the first `watch()`
+      // argument) and to `/health`. A failure is instead logged loudly on
+      // the house `deps.log`/`console.error` seam, in the neighbouring
+      // `WARNING: [tag] ... threw: ...` style, and `onNotifySuccess` is
+      // simply not called — leaving the notify health component to go stale
+      // rather than reporting a false success. Per mechanic C, a failed pass
+      // here has already lost this poll's diff forever (`watch()` advances
+      // its baseline before calling `onChange`), so there is nothing left to
+      // retry — the goal here is only to make that failure loud, not silent.
+      try {
+        const sent = new Set<string>();
+        const send=async(issue:string,about:string,reason?:NotifyReason)=>{const id=issue+'|'+about;if(sent.has(id))return;sent.add(id);await deps.notify(issue,about,reason);};
+
+        const evPoll = await resourceType.eventRules.poll(
+          { primary: prev.issues, related: prev.related },
+          { primary: next.issues, related: next.related },
+        );
+
+        // Primary (assigned) resources: notify the resource's own agent only.
+        // Parent/membership is not an event to listen for — a boss hears
+        // change only through the related (Implements) chain below.
+        for (const key of evPoll.changedPrimary) {
+          const verdict = await evPoll.decide(key, key, "primary");
+          if (verdict.deliver) await send(key, key, verdict.reason);
+        }
+        // Related work: notify every watcher of what changed.
+        const watchersOf = (k: string) =>
+          next.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? prev.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
+          ?? [];
+        for (const key of evPoll.changedRelated) {
+          for (const w of watchersOf(key)) {
+            const verdict = await evPoll.decide(key, w, "related");
+            if (verdict.deliver) await send(w, key, verdict.reason);
+          }
+        }
+        deps.onNotifySuccess?.();
+        return true;
+      } catch (e) {
+        deps.log?.(`  WARNING: [notify] stage threw: ${(e as Error)?.message ?? e}`);
+        return false;
+      }
+  };
+  type Intent={issue:string;about:string;context:string;decide?:()=>Promise<{deliver:boolean;reason?:NotifyReason}>;verdict?:{deliver:boolean;reason?:NotifyReason}};
+  const observations=createObservationJournal<Snapshot<T>,Intent>({
+    key:intent=>intent.issue,
+    valid:next=>next.observed!==false&&next.ruleLease===deps.herd.ruleRuntime?.().generation()&&!!deps.herd.ruleRuntime?.().canObserve(deps.ruleProvider),
+    prepare:async(previous,next)=>{
+      const poll=await resourceType.eventRules.poll({primary:previous.issues,related:previous.related},{primary:next.issues,related:next.related});
+      const pairs=new Map<string,{issue:string;about:string;space:'primary'|'related'}>();
+      for(const issue of poll.changedPrimary)pairs.set(issue+'|'+issue,{issue,about:issue,space:'primary'});
+      for(const about of poll.changedRelated){const watchers=next.related.find(v=>resourceType.discovery.idOf(v.issue)===about)?.watchers??previous.related.find(v=>resourceType.discovery.idOf(v.issue)===about)?.watchers??[];for(const issue of watchers)pairs.set(issue+'|'+about,{issue,about,space:'related'});}
+      if(pairs.size>10000)throw Error('Observation intent bound reached before deciding or delivering');
+      return [...pairs.values()].flatMap(({issue,about,space})=>{const context=deps.herd.ruleRuntime!().notificationContext(issue);return context?[{issue,about,context,decide:()=>poll.decide(issue,about,space)}]:[];});
+    },
+    capture:async intent=>{intent.verdict??=await intent.decide!();delete intent.decide;},
+    deliver:async intent=>{
+      const policy=deps.herd.ruleRuntime!();let state=policy.noticeDisposition(intent.issue,intent.context);if(state==='discard')return true;
+      if(!intent.verdict?.deliver)return true;
+      state=policy.noticeDisposition(intent.issue,intent.context);if(state==='discard')return true;if(state==='defer')return false;
+      if(deps.herd.frozen&&(await deps.herd.frozen([intent.issue])).has(intent.issue))return true;
+      state=policy.noticeDisposition(intent.issue,intent.context);if(state==='discard')return true;if(state==='defer')return false;
+      await deps.notify(intent.issue,intent.about,intent.verdict.reason);return true;
+    },
+    onError:()=>deps.log?.('WARNING: notification observation or delivery remains pending for retry'),
+    onSuccess:()=>deps.onNotifySuccess?.(),
+  });
+
+  let previousRulesSnapshot:Snapshot<T>={issues:[],related:[]};
   return watch<Snapshot<T>>(
     async () => {
+      const runtimePolicy=deps.herd.ruleRuntime?.();if(runtimePolicy&&deps.herd.ruleCensus)runtimePolicy.census(await deps.herd.ruleCensus());
+      const ruleLease=runtimePolicy?.generation();
+      // Intentional policy fencing completes the loop without observing or advancing its journal.
+      if(deps.herd.ruleRuntime&&!deps.herd.ruleRuntime().canObserve(deps.ruleProvider)){await deps.onFencedPoll?.();deps.onPollSuccess?.();deps.onNotifySuccess?.();return {...previousRulesSnapshot,ruleLease,observed:false};}
       const issues = await resourceType.discovery.search();
       const desired = desiredFrom(issues, resourceType);
       // Two separate passes over `issues`, each re-calling `verdictFor` per
@@ -1154,6 +1334,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
       // relaxing that constraint.
       const atRest = atRestFrom(issues, resourceType);
       await reconcileNow(scopedHerd(deps.herd, deps.ownsId), desired, {
+        ruleLease,
         ...(deps.onRespawn ? { onRespawn: deps.onRespawn } : {}),
         ...(deps.onRespawnResumed ? { onRespawnResumed: deps.onRespawnResumed } : {}),
         ...(deps.onResumePreserved ? { onResumePreserved: deps.onResumePreserved } : {}),
@@ -1175,6 +1356,7 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         ...(deps.reserveAdmission ? { reserveAdmission: deps.reserveAdmission } : {}),
         ...(deps.releaseAdmission ? { releaseAdmission: deps.releaseAdmission } : {}),
         ...(deps.checkPinnedActive ? { checkPinnedActive: deps.checkPinnedActive } : {}),
+        ...(deps.account ? { account: deps.account } : {}),
         atRest,
       });
       // BUTCHR-307 REVIEW FIX: `atRest` ids are unioned in here, not just
@@ -1212,58 +1394,13 @@ export function runResourceLoop<T>(resourceType: ResourceType<T>, deps: GenericL
         }
       }
       deps.onPollSuccess?.();
-      return { issues, related };
+      previousRulesSnapshot={issues,related,ruleLease,observed:true};
+      return previousRulesSnapshot;
     },
-    async (next, prev) => {
-      // BUTCHR-57: the whole notify stage is wrapped so its returned promise
-      // can never reject — `watch()` does not await `onChange` (mechanic A
-      // above), so a rejection here would otherwise be a silent unhandled
-      // promise rejection, invisible to both `deps.onError` (that seam only
-      // ever sees a rejection from the FETCH stage, the first `watch()`
-      // argument) and to `/health`. A failure is instead logged loudly on
-      // the house `deps.log`/`console.error` seam, in the neighbouring
-      // `WARNING: [tag] ... threw: ...` style, and `onNotifySuccess` is
-      // simply not called — leaving the notify health component to go stale
-      // rather than reporting a false success. Per mechanic C, a failed pass
-      // here has already lost this poll's diff forever (`watch()` advances
-      // its baseline before calling `onChange`), so there is nothing left to
-      // retry — the goal here is only to make that failure loud, not silent.
-      try {
-        const sent = new Set<string>();
-        const send = async (issue: string, about: string, reason?: NotifyReason) => {
-          const id = `${issue}|${about}`;
-          if (sent.has(id)) return;
-          sent.add(id);
-          await deps.notify(issue, about, reason);
-        };
-
-        const evPoll = await resourceType.eventRules.poll(
-          { primary: prev.issues, related: prev.related },
-          { primary: next.issues, related: next.related },
-        );
-
-        // Primary (assigned) resources: notify the resource's own agent only.
-        // Parent/membership is not an event to listen for — a boss hears
-        // change only through the related (Implements) chain below.
-        for (const key of evPoll.changedPrimary) {
-          const verdict = await evPoll.decide(key, key, "primary");
-          if (verdict.deliver) await send(key, key, verdict.reason);
-        }
-        // Related work: notify every watcher of what changed.
-        const watchersOf = (k: string) =>
-          next.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
-          ?? prev.related.find((r) => resourceType.discovery.idOf(r.issue) === k)?.watchers
-          ?? [];
-        for (const key of evPoll.changedRelated) {
-          for (const w of watchersOf(key)) {
-            const verdict = await evPoll.decide(key, w, "related");
-            if (verdict.deliver) await send(w, key, verdict.reason);
-          }
-        }
-        deps.onNotifySuccess?.();
-      } catch (e) {
-        deps.log?.(`  WARNING: [notify] stage threw: ${(e as Error)?.message ?? e}`);
-      }
+    async (next,prev)=>{
+      if(!deps.herd.ruleRuntime){await processNotifications(next,prev);return;}
+      if(next.observed===false)return;
+      await observations.submit(next,prev.observed===false?undefined:prev);
     },
     deps.intervalMs,
     {

@@ -93,7 +93,7 @@ function main(): void {
     dashboard: async () => ({ checked: true, confirmedAt: new Date().toISOString(), rows: [], admission: { cap: 0, residency: 0, sentinels: 0, sources: [] } }),
     header: () => ({ build: null }),
     resourceLink: notImplemented("resourceLink"),
-    configInventory: async () => ({ rules: [], errors: [] }),
+    configInventory: async () => ({ rules: [], sessionDefinitions: [], errors: [] }),
     resourcesForUrl: (url) => Promise.resolve(buildResourcesForUrlResponse(url, { jiraHost }, [])),
     extensionAuth,
     // ptyAttach deliberately omitted: `/agents/:agentKey/pty` is reachable

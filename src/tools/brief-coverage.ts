@@ -28,4 +28,7 @@ export const BRIEF_COVERAGE: Readonly<Record<string, BriefCoverageEntry>> = {
   confluence_read_document: { taught: true },
   jira_get_project_property: { taught: true },
   jira_get_remote_link: { taught: true },
+  list_links: { taught: true },
+  add_link: { taught: true },
+  remove_link: { taught: true },
 };

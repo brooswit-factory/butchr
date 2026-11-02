@@ -1,7 +1,7 @@
 
 ● Called butchr (ctrl+o to expand)
 
-  ⎿  === THE MEASURED DEFECT (operator, booswrit fleet, 2026-08-29T06:5xZ) ===
+  ⎿  === SYNTHETIC QUOTED EXAMPLE ===
      A freshly spawned agent's KICKOFF prompt landed while the Claude account
      was at its session limit. The pane printed:
 
