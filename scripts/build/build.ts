@@ -1,3 +1,4 @@
+import {buildContinuationHelper} from './continuation-helper.js';
 /**
  * BUTCHR-54: the real build step. Bakes the git sha (and a dirty-tree flag)
  * this build was made FROM into `dist/butchr.js` via `Bun.build`'s `define`
@@ -69,9 +70,5 @@ writeFileSync(bridgeFile, `#!/usr/bin/env bun\n${readFileSync(bridgeFile, "utf8"
 chmodSync(bridgeFile, 0o755);
 console.log(`built ${bridgeFile}`);
 
-// The recovery regression imports this pure helper from the local build.
-const helper = await Bun.build({
-  entrypoints: ["src/control-panel/worker-rollout.ts"], outdir: OUTDIR,
-  naming: "continuation-helper.js", target: "bun",
-});
-if (!helper.success) { for (const log of helper.logs) console.error(log); process.exit(1); }
+// Build the same pure helper exercised by the isolated packaged regression.
+await buildContinuationHelper(process.cwd(),OUTDIR);
