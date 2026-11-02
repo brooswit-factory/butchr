@@ -1,13 +1,16 @@
 import {execFile} from 'node:child_process';
+import {existsSync} from 'node:fs';
+import {homedir} from 'node:os';
+import {join} from 'node:path';
 import type {ManagedAgentProvider} from '@brooswit/drovr';
 import {parseIntegrationStatus} from '../operator/native-session.js';
 export interface ProviderReadiness {ready:boolean;reason?:string;}
 /** Read-only official status, never installation or credential inspection. Cache
  * unavailable/missing results too: repeated census retries cannot spawn or flood CLI. */
-export function createProviderReadiness(options:{inspect?:()=>Promise<string>;now?:()=>number;cacheMs?:number}={}){
+export function createProviderReadiness(options:{binary?:string;inspect?:()=>Promise<string>;now?:()=>number;cacheMs?:number}={}){
  const now=options.now??(()=>performance.now()),cacheMs=options.cacheMs??30_000;
  if(!Number.isFinite(cacheMs)||cacheMs<=0)throw Error('Readiness cache duration must be positive');
- const inspect=options.inspect??(()=>new Promise<string>((resolve,reject)=>execFile('herdr',['integration','status'],{encoding:'utf8',timeout:5000,maxBuffer:65536},(error,stdout)=>error?reject(error):resolve(stdout))));
+ const inspect=options.inspect??(()=>new Promise<string>((resolve,reject)=>execFile(options.binary??(existsSync(join(homedir(),'.local/bin',process.platform==='win32'?'herdr.exe':'herdr'))?join(homedir(),'.local/bin',process.platform==='win32'?'herdr.exe':'herdr'):'herdr'),['integration','status'],{encoding:'utf8',timeout:5000,maxBuffer:65536},(error,stdout)=>error?reject(error):resolve(stdout))));
  let cached:{until:number;text:string|null}|undefined,pending:Promise<void>|undefined;
  return async(provider:ManagedAgentProvider):Promise<ProviderReadiness>=>{
   if(provider!=='claude'&&provider!=='codex')return {ready:true};

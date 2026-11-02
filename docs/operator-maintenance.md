@@ -113,3 +113,15 @@ never renews a consumed attempt. Audit/plan files are private operational data
 and must not be committed or published.
 
 Protocol references: Herdr 0.8.2 [recognized native sources](https://github.com/herdrdev/herdr/blob/v0.8.2/src/agent_resume.rs) and [session ownership/replacement guards](https://github.com/herdrdev/herdr/blob/v0.8.2/src/terminal/state.rs).
+
+## Paid-launch readiness guard
+
+Daemon launches check official Claude/Codex integration status before workspace
+creation or a paid target start. Missing, outdated or unknown status blocks the
+launch; the read-only result is shared and cached for 30 seconds, including
+failures. The check uses the existing owner-local Herdr binary when present,
+then PATH, so a minimal service PATH does not mask an installed integration.
+No hook installation, rule changes, quota override or paid readiness probe occurs.
+After an authorized integration repair, status is rechecked automatically.
+Preserved uncommitted staging panes still require normal ownership recovery;
+this guard never closes a pane or fabricates a native session reference.
