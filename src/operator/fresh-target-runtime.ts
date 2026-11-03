@@ -28,18 +28,21 @@ function nativeFile(path:string,expected:{provider:'codex'|'claude';cwd:string;s
 }
 /** Only the adoption operator may attest a known suggestion. This normalizes a
  * read-only copy, never the terminal, and never changes the shared draft guard. */
-export function confirmedSuggestionView(raw:unknown,c:SuggestionConfirmation,expected:SuggestionConfirmation['target'],physical:{pid:number;generation:string},now=Date.now()){
- const result=raw as {read?:{pane_id?:string;workspace_id?:string;source?:string;format?:string;truncated?:boolean;text?:string}},view=result?.read;
+export function confirmedSuggestionView(raw:unknown,detection:unknown,c:SuggestionConfirmation,expected:SuggestionConfirmation['target'],physical:{pid:number;generation:string},now=Date.now()){
+ const result=raw as {read?:{pane_id?:string;workspace_id?:string;source?:string;format?:string;truncated?:boolean;text?:string;revision?:number;tab_id?:string}},view=result?.read;
+ const detected=(detection as typeof result)?.read;
  if(c?.kind!=='user-confirmed-suggestion'||typeof c.reference!=='string'||!c.reference.trim()||c.reference.length>256||!Number.isFinite(c.confirmedAt)||c.confirmedAt>now||now-c.confirmedAt>3600000||stable(c.target)!==stable(expected)||c.process?.pid!==physical.pid||c.process.generation!==physical.generation||typeof c.suggestion!=='string'||! /^[^\x00-\x1f\x7f]{1,200}$/.test(c.suggestion)||! /^[a-f0-9]{64}$/.test(c.ansiLineSHA256))throw Error('Exact fresh user-confirmed suggestion/target/process binding required');
- if(!view||view.pane_id!==expected.paneId||view.workspace_id!==expected.workspaceId||view.source!=='detection'||view.format!=='ansi'||view.truncated!==false||typeof view.text!=='string'||view.text.length>32768)throw Error('Exact complete ANSI suggestion view required');
+ if(!view||view.pane_id!==expected.paneId||view.workspace_id!==expected.workspaceId||view.source!=='visible'||view.format!=='ansi'||view.truncated!==false||typeof view.text!=='string'||view.text.length>32768)throw Error('Exact complete ANSI suggestion view required');
  const clean=(v:string)=>v.replace(/\x1b\[[0-9;]*m/g,'').replace(/\r/g,'');
+ const rendered=(v:string)=>clean(v).split('\n').filter((line,i,all)=>i<all.length-1||line!=='').join('\n');
+ if(!detected||detected.source!=='detection'||detected.pane_id!==view.pane_id||detected.workspace_id!==view.workspace_id||!view.tab_id||detected.tab_id!==view.tab_id||!Number.isSafeInteger(view.revision)||view.revision!<0||detected.revision!==view.revision||detected.truncated!==false||typeof detected.text!=='string'||rendered(detected.text)!==rendered(view.text))throw Error('Matching complete visible/detection frame required');
  const lines=view.text.split('\n'),index=lines.flatMap((v,i)=>/^\s*[❯›>]/.test(clean(v))?[i]:[]).at(-1)??-1,line=lines[index];
  if(index<0||!line||hash(line)!==c.ansiLineSHA256||!/^❯\u00a0\x1b\[0m\x1b\[2m[^\x1b]+\x1b\[0m\r?$/.test(line)||clean(line)!=='❯\u00a0'+c.suggestion)throw Error('Confirmed suggestion changed or input is not the attested dim placeholder');
  const normalized=lines.map(clean);if(normalized.some(v=>v.includes('\x1b')))throw Error('Unknown ANSI controls cannot prove readiness');normalized[index]='❯';
  // Known passive context hint in the right footer column; no dialog, mode,
  // authentication or quota text is removed. Other footer checks stay unchanged.
  for(let i=index+1;i<normalized.length;i++)normalized[i]=normalized[i]!.replace(/\s{2,}new task\? \/clear to save [0-9.,]+[km]? tokens\s*$/i,'');
- return {...result,read:{...view,format:'text',text:normalized.join('\n')}};
+ return {...result,read:{...detected,format:'text',text:normalized.join('\n')}};
 }
 export function freshTargetRuntime(r:AdoptionRequest,deps:{client?:DrovrClient;home?:string;show?:(unit:string)=>Record<string,string>;processIdentity?:typeof processProof}={}):AdoptionIO{
  const ownerHome=deps.home??homedir(),identify=deps.processIdentity??processProof;
@@ -64,7 +67,7 @@ export function freshTargetRuntime(r:AdoptionRequest,deps:{client?:DrovrClient;h
    if(rows.length!==1||rows[0]!.name!=='claude')throw Error('One exact foreground Claude process required');
    const argv=rows[0]!.argv??[],flag=(name:string)=>{const positions=argv.flatMap((v,i)=>v===name?[i]:[]);if(positions.length!==1||!argv[positions[0]!+1])throw Error('Explicit unique launch preference required');return argv[positions[0]!+1]!;};
    const preferences={model:flag('--model'),effort:flag('--effort')},physical=identify(rows[0]!.pid,workspace,r.targetExecutable);
-   const readPrompt=async(paneId:string)=>{if(!r.suggestionConfirmation)return client.pane.read({pane_id:paneId,source:'detection',strip_ansi:true});const raw=await client.pane.read({pane_id:paneId,source:'detection',format:'ansi',strip_ansi:false});return confirmedSuggestionView(raw,r.suggestionConfirmation,expected,physical);};
+   const readPrompt=async(paneId:string)=>{if(!r.suggestionConfirmation)return client.pane.read({pane_id:paneId,source:'detection',strip_ansi:true});const before=(await client.pane.get(paneId)).pane;const detection=await client.pane.read({pane_id:paneId,source:'detection',strip_ansi:true});const raw=await client.pane.read({pane_id:paneId,source:'visible',format:'ansi',strip_ansi:false});const after=(await client.pane.get(paneId)).pane;const binding=(p:typeof pane)=>({pane:p.pane_id,workspace:p.workspace_id,terminal:p.terminal_id,cwd:p.cwd,native:p.agent_session,revision:p.revision});if(stable(binding(before))!==stable(binding(after))||before.terminal_id!==expected.terminalId||nativeSessionHash(before.agent_session)!==expected.sessionHash||(raw as any).read?.revision!==before.revision||stable(physical)!==stable(identify(rows[0]!.pid,workspace,r.targetExecutable)))throw Error('Suggestion pane/native/process generation changed');return confirmedSuggestionView(raw,detection,r.suggestionConfirmation,expected,physical);};
    await assertClaudeTargetReady(expected,{getAgent,readPrompt});
    const source=nativeFile(r.sourceHistory,{provider:'codex',cwd:workspace,sessionHash:permit.source.sessionHash,max:64*1024*1024});
    if(source.bytes!==permit.continuation!.snapshot.bytes||source.sha256!==permit.continuation!.snapshot.sha256)throw Error('Preserved original source snapshot differs');
