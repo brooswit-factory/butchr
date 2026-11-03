@@ -4,7 +4,8 @@ import {parsePermit,type CanaryPermit} from '../control-panel/worker-rollout.js'
 import {privateText,hash,verifyValidationRetirement} from './validation-retirement.js';
 import {retirementWriterIdentity,claimRetirementWriter,type RetirementWriterIdentity} from './retirement-writer.js';
 import {stable} from './staged-bootstrap.js';
-export interface AdoptionRequest{state:string;permit:string;socket:string;runtime:string;unit:string;workspaces:string;freezeRoot:string;repository:string;sourceHistory:string;nativeRoot:string;targetExecutable:string;}
+export interface SuggestionConfirmation{kind:"user-confirmed-suggestion";reference:string;confirmedAt:number;target:Target;process:{pid:number;generation:string};suggestion:string;ansiLineSHA256:string;}
+export interface AdoptionRequest{suggestionConfirmation?:SuggestionConfirmation;state:string;permit:string;socket:string;runtime:string;unit:string;workspaces:string;freezeRoot:string;repository:string;sourceHistory:string;nativeRoot:string;targetExecutable:string;}
 type Target=NonNullable<CanaryPermit['continuation']>['target'];
 export interface AdoptionSnapshot{target:Target;sourceAbsent:true;workspaceKey:string;preferences:{model:string;effort:string};process:unknown;workspace:unknown;histories:unknown;inventory:unknown;independentHolds:unknown;holdsClear:true;}
 export interface AdoptionIO{assertStopped():Promise<void>;capture(permit:CanaryPermit):Promise<AdoptionSnapshot>;}
