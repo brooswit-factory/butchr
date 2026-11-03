@@ -16,14 +16,14 @@ import type {AdoptionRequest,AdoptionIO,SuggestionConfirmation} from './fresh-ta
 function canonical(path:string){if(!isAbsolute(path)||realpathSync(path)!==path)throw Error('Explicit canonical nonsymlink path required');return path;}
 function noHold(path:string){try{lstatSync(path);}catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return;throw e;}throw Error('Independent freeze/stop/quota hold exists');}
 /** Hash only; never copy saved conversations into a prompt, audit or output. */
-function nativeFile(path:string,expected:{provider:'codex'|'claude';cwd:string;sessionHash:string;max:number}){
+function nativeFile(path:string,expected:{provider:'codex'|'claude';cwd:string;sessionHash:string;max:number;immutableSHA256?:string}){
  canonical(path);const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
- try{const before=fstatSync(fd);if(!before.isFile()||before.uid!==process.getuid?.()||before.nlink!==1||(before.mode&0o022)||before.size<=0||before.size>expected.max)throw Error('Unsafe bounded native history');
+ try{const before=fstatSync(fd);if(!before.isFile()||before.uid!==process.getuid?.()||before.nlink!==1||(before.mode&0o002)||((before.mode&0o020)&&! /^[a-f0-9]{64}$/.test(expected.immutableSHA256??''))||before.size<=0||before.size>expected.max)throw Error('Unsafe bounded native history');
   const digest=createHash('sha256'),buffer=Buffer.alloc(1024*1024);let total=0,header='',identity=false;
   for(;;){const n=readSync(fd,buffer,0,buffer.length,null);if(!n)break;digest.update(buffer.subarray(0,n));total+=n;
    if(!identity){header+=buffer.subarray(0,n).toString('utf8');for(const line of header.split('\n').slice(0,-1)){const j=JSON.parse(line),id=expected.provider==='codex'?j.type==='session_meta'?j.payload?.id:undefined:j.sessionId,cwd=expected.provider==='codex'?j.payload?.cwd:j.cwd;if(id&&cwd===expected.cwd&&hash(JSON.stringify([expected.provider,'id',id]))===expected.sessionHash){identity=true;break;}}if(!identity)throw Error('Native identity not proven in bounded header');}
   }
-  if(statKey(before)!==statKey(fstatSync(fd)))throw Error('Native history changed while hashing');return {bytes:total,sha256:digest.digest('hex')};
+  if(statKey(before)!==statKey(fstatSync(fd)))throw Error('Native history changed while hashing');const sha256=digest.digest('hex');if(expected.immutableSHA256&&sha256!==expected.immutableSHA256)throw Error('Preserved immutable native snapshot differs');return {bytes:total,sha256};
  }finally{closeSync(fd);}
 }
 /** Only the adoption operator may attest a known suggestion. This normalizes a
@@ -69,7 +69,7 @@ export function freshTargetRuntime(r:AdoptionRequest,deps:{client?:DrovrClient;h
    const preferences={model:flag('--model'),effort:flag('--effort')},physical=identify(rows[0]!.pid,workspace,r.targetExecutable);
    const readPrompt=async(paneId:string)=>{if(!r.suggestionConfirmation)return client.pane.read({pane_id:paneId,source:'detection',strip_ansi:true});const before=(await client.pane.get(paneId)).pane;const detection=await client.pane.read({pane_id:paneId,source:'detection',strip_ansi:true});const raw=await client.pane.read({pane_id:paneId,source:'visible',format:'ansi',strip_ansi:false});const after=(await client.pane.get(paneId)).pane;const binding=(p:typeof pane)=>({pane:p.pane_id,workspace:p.workspace_id,terminal:p.terminal_id,cwd:p.cwd,native:p.agent_session,revision:p.revision});if(stable(binding(before))!==stable(binding(after))||before.terminal_id!==expected.terminalId||nativeSessionHash(before.agent_session)!==expected.sessionHash||stable(physical)!==stable(identify(rows[0]!.pid,workspace,r.targetExecutable)))throw Error('Suggestion pane/native/process generation changed');return confirmedSuggestionView(raw,detection,r.suggestionConfirmation,expected,physical);};
    await assertClaudeTargetReady(expected,{getAgent,readPrompt});
-   const source=nativeFile(r.sourceHistory,{provider:'codex',cwd:workspace,sessionHash:permit.source.sessionHash,max:64*1024*1024});
+   const source=nativeFile(r.sourceHistory,{provider:'codex',cwd:workspace,sessionHash:permit.source.sessionHash,max:64*1024*1024,immutableSHA256:permit.continuation!.snapshot.sha256});
    if(source.bytes!==permit.continuation!.snapshot.bytes||source.sha256!==permit.continuation!.snapshot.sha256)throw Error('Preserved original source snapshot differs');
    const ref=target.agent_session;if(!ref||ref.kind!=='id'||typeof ref.value!=='string'||! /^[a-f0-9-]{36}$/.test(ref.value))throw Error('Exact registered target native id required');
    const history=nativeFile(join(r.nativeRoot,ref.value+'.jsonl'),{provider:'claude',cwd:workspace,sessionHash:expected.sessionHash,max:64*1024*1024});
