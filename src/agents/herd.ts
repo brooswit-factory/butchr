@@ -1719,11 +1719,13 @@ export class HerdrHerd implements Herd {
       ...(ownedContinuation?{continuation:ownedContinuation}:{}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
-      // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
-      // its real working directory, then follow its definition's own
-      // brief — the launched process itself still starts at the ordinary
-      // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
-      kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, spec),
+      // for why a spec with `cwd` needs its OWN kickoff (told where to find
+      // its generated CLAUDE.md/brief.md by ABSOLUTE path, then to `cd` into
+      // its real working directory — the launched process itself still
+      // starts at the ordinary bookkeeping directory, `workspaceDirFor`
+      // below, independent of `provider`). Every other spec (no `cwd`) is
+      // unaffected.
+      kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, workspaceDirFor(spec.key), spec),
       prepare: async provider => {
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
@@ -2173,26 +2175,33 @@ export class HerdrHerd implements Herd {
     // reasoning covers the staleness-BOOKKEEPING files (model/effort/
     // permission-mode/strict-mcp-config, never read by Claude itself, only
     // compared against by a LATER `staleIssues()` poll) — it does NOT cover
-    // `mcp.json`, which Claude reads as real file CONTENT on its very first
-    // post-resume turn. The relaunched process's argv (built from `spec`
-    // just below) already carries the new channel flag correctly regardless
-    // of timing, but if `mcp.json` itself is still the OLD content, the
-    // relaunch would silently start with stale tool bindings. So this one
-    // file — and only this one — is written NOW, before the relaunch
-    // attempt, via the same writer `buildWorkspace()` itself calls
-    // (`writeClaudeMcpJson`, src/agents/workspace.ts) rather than the full
-    // function: it carries no anti-regression timing concern of its own
-    // (Claude re-reads it fresh every turn regardless of what `staleIssues()`
-    // believes), so writing it early costs nothing and fixes the gap: a
-    // FAILED resume leaves it pointing at the NEW bindings, same as it would
-    // once `buildWorkspace()` runs again on this workspace's next successful
+    // anything Claude reads as real file CONTENT on its very first
+    // post-resume turn: `mcp.json`, and (FACTORY-1036) CLAUDE.md/brief.md/
+    // ENVIRONMENT.md. The relaunched process's argv (built from `spec` just
+    // below) already carries the new channel flag correctly regardless of
+    // timing, but if `mcp.json`/CLAUDE.md/brief.md themselves are still OLD
+    // content, the relaunch would silently start with stale tool bindings OR
+    // stale instructions — the exact gap FACTORY-1036 closes (before it, only
+    // mcp.json was refreshed here; CLAUDE.md/brief.md/ENVIRONMENT.md waited
+    // for the full `buildWorkspace()` call below, AFTER the relaunch was
+    // already confirmed alive — a resumed agent's entire first turn could run
+    // against instructions as stale as its last successful launch). None of
+    // these carry an anti-regression timing concern of their own (Claude
+    // re-reads them fresh regardless of what `staleIssues()` believes), so
+    // writing them early costs nothing and fixes the gap: a FAILED resume
+    // leaves them pointing at the NEW content, same as it would once
+    // `buildWorkspace()` runs again on this workspace's next successful
     // spawn/resume anyway.
-    // FACTORY-625: the shared pre-launch step, not `writeClaudeMcpJson`
-    // alone. The veto hook must be installed BEFORE the relaunch for the same
-    // reason mcp.json is: Claude reads both as real file content on its first
-    // post-resume turn, and `buildWorkspace` does not run until after the
-    // relaunch is verified — so installing it there would leave every resumed
-    // session unhooked for its whole first turn.
+    // FACTORY-625/FACTORY-1036: `writePreLaunchClaudeFiles` is the shared
+    // pre-launch step for EVERYTHING in that previous paragraph, not
+    // `writeClaudeMcpJson` alone — see its own doc comment
+    // (src/agents/workspace.ts) for the full list and for what this does and
+    // does not guarantee about the runtime actually reloading it. The veto
+    // hook is installed here for the same reason: Claude reads it as real
+    // file content on its first post-resume turn, and `buildWorkspace` does
+    // not run until after the relaunch is verified — so installing any of
+    // this only there would leave every resumed session unhooked, and running
+    // on stale instructions, for its whole first turn.
     writePreLaunchClaudeFiles(cwd, spec, this.mcpUrl);
     const params = agentStartParams(spec, cwd, pane, nameFor(issue), selected, this.mcpUrl);
     try {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { briefFor, knownBriefTypes, BEFORE_YOU_STOP_INCLUDE_MARKER, RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER } from "../../src/agents/workspace.js";
+import { briefFor, knownBriefTypes, BEFORE_YOU_STOP_INCLUDE_MARKER, RECURSIVE_CHILD_CLOSURE_INCLUDE_MARKER, RESOLVED_CLAUDE_MD, RESOLVED_AGENTS_MD } from "../../src/agents/workspace.js";
 import { KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT } from "../../src/agents/argv.js";
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -134,17 +134,23 @@ const BLOCKED_TO_DO_PHRASES: Record<string, RegExp> = {
 const isSharedFragment = (f: string): boolean => f.startsWith("_");
 
 /**
- * Every template under `briefs/` that is actually a shipped brief — never a
- * hand-copied literal list (that is exactly how `briefs/project.md` went
- * uncovered, per `knownBriefTypes()`'s own doc comment). `AGENTS.md`/
- * `CLAUDE.md` are generic provider-pointer files with no tier-specific
- * content of their own, and any `_`-prefixed file is a shared fragment
- * itself (`_before-you-stop.md`, `_recursive-child-closure.md`) — the
- * DoD's own "a shared fragment must not be treated as a standalone
+ * Every template under `briefs/` that is actually a shipped TIER brief —
+ * never a hand-copied literal list (that is exactly how `briefs/project.md`
+ * went uncovered, per `knownBriefTypes()`'s own doc comment). `AGENTS.md`/
+ * `CLAUDE.md` are excluded from THIS list specifically because the
+ * recursive-child-closure sweep below (`parentTierFiles()`) has no meaning
+ * for them — they are generic provider-pointer files with no child-owning
+ * concept of their own, never a tier — and any `_`-prefixed file is a
+ * shared fragment itself (`_before-you-stop.md`, `_recursive-child-closure.md`)
+ * — the DoD's own "a shared fragment must not be treated as a standalone
  * template needing an include," checked generically so a FUTURE shared
  * fragment is excluded too without touching this list — so all are
  * excluded the same way `brief-tool-surface.test.ts` excludes them for its
- * own, adjacent claim.
+ * own, adjacent claim. FACTORY-1036: excluded from the recursive-closure
+ * sweep is NOT exempt from the before-you-stop marker requirement — see the
+ * dedicated "briefs/CLAUDE.md and briefs/AGENTS.md carry the shared-section
+ * include marker too" test below, which falsifies exactly that for these
+ * two files on their own.
  */
 function briefTemplateFiles(): string[] {
   return readdirSync(BRIEFS_DIR).filter((f) => f.endsWith(".md") && f !== "AGENTS.md" && f !== "CLAUDE.md" && !isSharedFragment(f));
@@ -213,17 +219,46 @@ describe("FACTORY-735/FACTORY-739: shared 'before you stop' section", () => {
     }
   });
 
-  // DoD item 4: the SAME text, in the worker's kickoff prompt — delivered
-  // (and so in context) from the agent's very first turn, not only inside
-  // brief.md.
-  test("the Claude kickoff prompt carries the same required text", () => {
-    for (const phrase of REQUIRED_PHRASES) expect(KICKOFF_PROMPT).toMatch(phrase);
+  // FACTORY-1036: the required text used to be duplicated into the kickoff
+  // prompt itself (DoD item 4's original rationale: in context from the
+  // agent's very first turn, not only inside brief.md) — that duplication is
+  // exactly what produced the 5,970-byte kickoff this ticket fixes. The
+  // kickoff prompt is now short and reminder-free; the SAME text instead
+  // reaches the agent's first turn via generated CLAUDE.md/AGENTS.md (see
+  // RESOLVED_CLAUDE_MD/RESOLVED_AGENTS_MD below), which `writePreLaunchClaudeFiles`
+  // writes before every fresh, respawned, AND resumed launch alike.
+  test("FACTORY-1036: the kickoff prompt no longer carries the shared text — it is short and fixed instead", () => {
+    for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      for (const phrase of REQUIRED_PHRASES) expect(prompt).not.toMatch(phrase);
+      expect(prompt.length).toBeLessThan(100);
+    }
     expect(KICKOFF_PROMPT).toContain("follow your CLAUDE.md");
+    expect(AGENTS_KICKOFF_PROMPT).toContain("follow your AGENTS.md");
   });
 
-  test("the non-Claude (AGENTS.md) kickoff prompt carries the same required text", () => {
-    for (const phrase of REQUIRED_PHRASES) expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
-    expect(AGENTS_KICKOFF_PROMPT).toContain("follow your AGENTS.md");
+  // FACTORY-1036: CLAUDE.md/AGENTS.md now carry the required text instead —
+  // resolved, never the literal include marker — so it reaches the agent
+  // from generated memory/system context rather than a one-time kickoff
+  // string. See also the dedicated marker-presence test below.
+  test("FACTORY-1036: resolved CLAUDE.md/AGENTS.md carry the same required text the kickoff prompt used to", () => {
+    for (const resolved of [RESOLVED_CLAUDE_MD, RESOLVED_AGENTS_MD]) {
+      for (const phrase of REQUIRED_PHRASES) expect(resolved).toMatch(phrase);
+      expect(resolved).not.toContain(BEFORE_YOU_STOP_INCLUDE_MARKER);
+    }
+  });
+
+  // FACTORY-1036: `briefTemplateFiles()` above deliberately excludes
+  // CLAUDE.md/AGENTS.md (they are not TIER briefs — see that function's own
+  // doc comment, and they must NOT be swept into the recursive-child-closure
+  // requirement, which has no meaning for a generic provider-pointer file).
+  // This is the separate, explicit falsifier for the one marker they DO now
+  // require, so a future edit to briefs/CLAUDE.md or briefs/AGENTS.md that
+  // drops the include is caught here instead of silently passing because the
+  // main sweep above never looks at these two files at all.
+  test("FACTORY-1036: briefs/CLAUDE.md and briefs/AGENTS.md carry the shared-section include marker too", () => {
+    for (const file of ["CLAUDE.md", "AGENTS.md"]) {
+      expect(readFileSync(join(BRIEFS_DIR, file), "utf8")).toContain(BEFORE_YOU_STOP_INCLUDE_MARKER);
+    }
   });
 });
 
@@ -264,13 +299,16 @@ describe("FACTORY-1020: worker briefs own verified In Review and Done transition
     }
   });
 
-  // Both supported kickoff reminders (DoD: "both supported kickoff
-  // reminders receiving the same text") carry the lifecycle rules too, not
-  // just the original before-you-stop phrasing.
-  test("both kickoff prompts carry the lifecycle rules and every named scenario", () => {
+  // DoD item 4's original "both supported kickoff reminders receiving the
+  // same text" now lives in resolved CLAUDE.md/AGENTS.md instead of the
+  // kickoff prompt itself — FACTORY-1036 moved it there precisely so the
+  // kickoff argv stays short. See the FACTORY-1036 tests above for the
+  // kickoff-prompt-is-now-short assertion; this is the lifecycle-rules
+  // equivalent of that move for CLAUDE.md/AGENTS.md.
+  test("FACTORY-1036: resolved CLAUDE.md/AGENTS.md carry the lifecycle rules and every named scenario — not the kickoff prompt", () => {
     for (const phrase of [...REQUIRED_LIFECYCLE_PHRASES, ...Object.values(SCENARIO_PHRASES)]) {
-      expect(KICKOFF_PROMPT).toMatch(phrase);
-      expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
+      expect(RESOLVED_CLAUDE_MD).toMatch(phrase);
+      expect(RESOLVED_AGENTS_MD).toMatch(phrase);
     }
   });
 
@@ -407,10 +445,13 @@ describe("FACTORY-1021: genuinely blocked work moves to To Do", () => {
     }
   });
 
-  test("both kickoff prompts carry the blocked-to-To Do rule", () => {
+  // FACTORY-1036: see the identical note on "resolved CLAUDE.md/AGENTS.md
+  // carry the lifecycle rules..." above — same move, same reason, for the
+  // blocked-to-To-Do rule specifically.
+  test("FACTORY-1036: resolved CLAUDE.md/AGENTS.md carry the blocked-to-To Do rule — not the kickoff prompt", () => {
     for (const phrase of Object.values(BLOCKED_TO_DO_PHRASES)) {
-      expect(KICKOFF_PROMPT).toMatch(phrase);
-      expect(AGENTS_KICKOFF_PROMPT).toMatch(phrase);
+      expect(RESOLVED_CLAUDE_MD).toMatch(phrase);
+      expect(RESOLVED_AGENTS_MD).toMatch(phrase);
     }
   });
 
@@ -430,5 +471,50 @@ describe("FACTORY-1021: genuinely blocked work moves to To Do", () => {
     const brief = briefFor("project");
     expect(brief).toMatch(/never call `jira_transition` with a project\s+key/i);
     expect(brief).toMatch(/skip them entirely for the\s+project resource itself/i);
+  });
+});
+
+/**
+ * FACTORY-1036 (Work item 4): the shared source distinguished a genuine
+ * non-question hold (-> To Do, FACTORY-1021 above, unconditionally
+ * preserved — a plain Jira workflow may not even HAVE a richer status) from
+ * nothing at all for a concrete, unresolved QUESTION blocking progress — a
+ * gap next to current rule-engine briefs, which already separate the two.
+ * This is purely ADDITIVE: it does not touch the FACTORY-1021 phrases above.
+ */
+const NEEDS_FEEDBACK_PHRASES: Record<string, RegExp> = {
+  "a question is distinguished from the non-question hold above": /is a different case from the hold above/i,
+  "Needs Feedback preferred when this issue's workflow offers it": /commonly\s*named something like needs feedback\), move there instead of to\s*do/i,
+  "the question, choices, and who can answer must be stated": /state\s*the exact question, the available choices and tradeoffs, what work it\s*prevents, and who can answer it/i,
+  "never invent an answer or repeat the same question": /never invent an answer, never repeat the\s*same unanswered question on every wake/i,
+  "falls back to keeping current status, never To Do by default": /where this issue's workflow offers no such status, keep its\s*current status/i,
+};
+
+describe("FACTORY-1036: a concrete question is distinguished from a non-question blocker", () => {
+  for (const [scenario, phrase] of Object.entries(NEEDS_FEEDBACK_PHRASES)) {
+    test(`the shared source falsifies: ${scenario}`, () => {
+      const text = readFileSync(join(BRIEFS_DIR, "_before-you-stop.md"), "utf8");
+      expect(text).toMatch(phrase);
+    });
+  }
+
+  test("briefFor() resolves the question/Needs-Feedback distinction into every known tier plus the DEFAULT fallback", () => {
+    for (const type of [...knownBriefTypes(), "Sub-task"]) {
+      const brief = briefFor(type);
+      for (const phrase of Object.values(NEEDS_FEEDBACK_PHRASES)) expect(brief).toMatch(phrase);
+    }
+  });
+
+  test("resolved CLAUDE.md/AGENTS.md also carry the question/Needs-Feedback distinction", () => {
+    for (const resolved of [RESOLVED_CLAUDE_MD, RESOLVED_AGENTS_MD]) {
+      for (const phrase of Object.values(NEEDS_FEEDBACK_PHRASES)) expect(resolved).toMatch(phrase);
+    }
+  });
+
+  // The FACTORY-1021 "genuinely cannot proceed -> To Do" sentence must
+  // survive byte-for-byte: this is an ADDITION, not a replacement.
+  test("the new question/Needs-Feedback paragraph did not touch the existing To Do rule", () => {
+    const text = readFileSync(join(BRIEFS_DIR, "_before-you-stop.md"), "utf8");
+    for (const phrase of Object.values(BLOCKED_TO_DO_PHRASES)) expect(text).toMatch(phrase);
   });
 });
