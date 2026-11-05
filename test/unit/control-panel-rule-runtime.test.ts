@@ -44,11 +44,39 @@ test('control invalidation mid-search retains the resource change until a fresh 
 test('incomplete census never prunes admitted policy or enables admission/lifecycle',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();f.runtime.recordFullCensus([],false);expect(f.runtime.summary().phase).toBe('inventory-uncertain');expect(f.runtime.ruleForAgent(key())!.role).toBe('worker');expect(f.runtime.policy.canAdmit(key('2'),f.runtime.policy.generation())).toBe(false);expect(f.runtime.policy.protectStop(key(),f.runtime.policy.generation())).toBe(true);f.runtime.recordFullCensus([key()],true);expect(f.runtime.summary().phase).toBe('active');}finally{f.close();}});
 test('directory fsync failure after authority rename fails closed and recovers only from durable state',()=>{const f=fixture();try{const runtime=createRuleRuntime(f.directory,f.local,()=>{throw Error('fixture sync failure')});runtime.update({connected:true,rules:rows(),revision:'a'.repeat(64),source,control:{enabled:true,disabledRules:[]}});runtime.recordFullCensus([],true);const p=runtime.plan();expect(()=>runtime.activate({localDigest:p.localDigest!,remoteDigest:p.remoteDigest!,confirm:true})).toThrow('sync failure');expect(runtime.summary().phase).toBe('blocked');expect(runtime.policy.canAdmit(key(),runtime.policy.generation())).toBe(false);const recovered=f.restart();f.update();recovered.recordFullCensus([],true);expect(recovered.summary().authority).toBe('remote');expect(recovered.summary().phase).toBe('active');}finally{f.close();}});
 test('failed local deactivation write preserves active authority and exact-byte recoverable baseline',()=>{const f=fixture();try{const runtime=createRuleRuntime(f.directory,{...f.local,writeText:()=>{throw Error('fixture local write');}});runtime.update({connected:true,rules:rows(),revision:'a'.repeat(64),source,control:{enabled:true,disabledRules:[]}});runtime.recordFullCensus([],true);let p=runtime.plan();runtime.activate({localDigest:p.localDigest!,remoteDigest:p.remoteDigest!,confirm:true});p=runtime.plan();expect(()=>runtime.deactivateLocal({localDigest:p.localDigest!,remoteDigest:p.remoteDigest!,confirm:true})).toThrow('local write');expect(readFileSync(f.path,'utf8')).toBe(f.original);runtime.rollback(true);expect(runtime.summary().authority).toBe('local');}finally{f.close();}});
-test('a newly eligible resource under a held rule admits at once, unrelated to the retained worker, and the frozen graph only converges once that worker naturally retires',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();f.remote=rows({rules:[{...doc.rules[0],query:'project = FUTURE'},doc.rules[1]]});f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(true);
- await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);expect(f.runtime.getRules()[0]!.query).toBe('project = FIXTURE');
+test('an additive query change admits a newly eligible resource at once, adopts the query immediately and leaves the retained worker untouched',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();
+ expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.getRules()[0]!.query).toBe('project = FIXTURE OR project = FUTURE');
  await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
- await reconcileNow(workers.h,new Map([[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2'),'stop:'+key()]);
- await reconcileNow(workers.h,new Map([[key('2'),spec(key('2'))]]));expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.getRules()[0]!.query).toBe('project = FUTURE');expect(workers.actions).toEqual(['spawn:'+key('2'),'stop:'+key()]);
+ expect(f.runtime.ruleForAgent(key())!.role).toBe('worker');
+ }finally{f.close();}});
+test('production discovery itself reads the live query every poll: a new-only match admits, an old-only match retires, and a replacement does both while an unrelated resident stays',async()=>{
+ const {runResourceLoop}=await import('../../src/daemon/loop.js');
+ const f=fixture(),workers=herd([key()]),universe=[{id:key(),project:'FIXTURE'},{id:key('2'),project:'FUTURE'},{id:key('3'),project:'UNRELATED'}];
+ const matches=(query:string,project:string)=>query.split(' OR ').some(clause=>clause.trim()===`project = ${project}`);
+ f.update();f.runtime.recordFullCensus([key()],true);const p=f.runtime.plan();f.runtime.activate({localDigest:p.localDigest!,remoteDigest:p.remoteDigest!,confirm:true});
+ workers.h.ruleRuntime=()=>f.runtime.policy;
+ const stop=runResourceLoop<{id:string;project:string}>({discovery:{idOf:r=>r.id,search:async()=>universe.filter(r=>matches(f.runtime.getRules().find(d=>d.id==='worker')!.query,r.project))},activation:{verdictFor:()=>'active'},spawnConfig:{specFor:r=>spec(r.id)},eventRules:{poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})}},{herd:workers.h,ownsId:()=>true,ruleProvider:'jira-work',intervalMs:10,notify:async()=>{}});
+ try{
+  await until(()=>workers.actions.length>=0,50);expect(workers.actions).toEqual([]);expect(workers.running.has(key())).toBe(true);
+  f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();
+  await until(()=>workers.running.has(key('2')));
+  expect(workers.running.has(key())).toBe(true);expect(workers.running.has(key('3'))).toBe(false);
+  f.remote=rows({rules:[{...doc.rules[0],query:'project = FUTURE OR project = UNRELATED'},doc.rules[1]]});f.update();
+  await until(()=>!workers.running.has(key())&&workers.running.has(key('3')));
+  expect(workers.running.has(key('2'))).toBe(true);
+ }finally{stop();await Bun.sleep(20);f.close();}
+});
+test('a narrowing query retires a resource that no longer matches through the normal safe lifecycle while an unrelated still-matching worker stays',async()=>{const f=fixture(),workers=herd([key(),key('2')]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = NARROWED'},doc.rules[1]]});f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);
+ await reconcileNow(workers.h,new Map([[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['stop:'+key()]);expect(workers.running.has(key('2'))).toBe(true);
+ }finally{f.close();}});
+test('a query replacement with both additions and removals adopts the latest graph and performs both in one reconcile, without a restart or an all-workers-empty prerequisite',async()=>{const f=fixture(),workers=herd([key(),key('2')]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = NARROWED OR project = FUTURE'},doc.rules[1]]});f.update();
+ await reconcileNow(workers.h,new Map([[key('2'),spec(key('2'))],[key('3'),spec(key('3'))]]));
+ expect(workers.actions).toEqual(['spawn:'+key('3'),'stop:'+key()]);expect(workers.running.has(key('2'))).toBe(true);
  }finally{f.close();}});
 test('a rule withdrawn entirely from remote admits no new resource while the retained worker under it stays protected',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();workers.setStale([key()]);
  f.remote=[];f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(true);
@@ -56,19 +84,20 @@ test('a rule withdrawn entirely from remote admits no new resource while the ret
  await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual([]);
  expect(f.runtime.policy.protectRespawn(key(),f.runtime.policy.generation())).toBe(true);
  }finally{f.close();}});
-test('a newly eligible resource under a held rule is not admitted while the census is incomplete',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();f.remote=rows({rules:[{...doc.rules[0],query:'project = FUTURE'},doc.rules[1]]});f.update();
+test('a newly eligible resource under a changed query is not admitted while the census is incomplete',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();
  f.runtime.recordFullCensus([key()],false);expect(f.runtime.summary().phase).toBe('inventory-uncertain');
  expect(f.runtime.policy.canAdmit(key('2'),f.runtime.policy.generation())).toBe(false);
  f.runtime.recordFullCensus([key()],true);expect(f.runtime.policy.canAdmit(key('2'),f.runtime.policy.generation())).toBe(true);
  }finally{f.close();}});
-test('a newly eligible resource admitted during a deferred graph transition survives restart and does not re-admit a duplicate',()=>{const f=fixture();try{f.update();f.runtime.recordFullCensus([key()],true);f.activate();
- f.remote=rows({rules:[{...doc.rules[0],query:'project = FUTURE'},doc.rules[1]]});f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(true);
- const lease=f.runtime.policy.generation();expect(f.runtime.policy.canSpawn(spec(key('2')),lease)).toBe(true);f.runtime.policy.spawnSucceeded(key('2'));
+test('repeated reconcile/census and a restart neither revert an adopted query nor duplicate an admitted resource',async()=>{const f=fixture(),workers=herd([key()]);try{workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
  expect(f.runtime.retainedRules().map(r=>r.id).sort()).toEqual([key(),key('2')].sort());
- f.restart();f.update();
- expect(f.runtime.summary().discoveryChangesDeferred).toBe(true);
+ f.restart();workers.h.ruleRuntime=()=>f.runtime.policy;f.update();
+ expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.getRules()[0]!.query).toBe('project = FIXTURE OR project = FUTURE');
  expect(f.runtime.retainedRules().map(r=>r.id).sort()).toEqual([key(),key('2')].sort());
- const lease2=f.runtime.policy.generation();expect(f.runtime.policy.canSpawn(spec(key('2')),lease2)).toBe(false);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
  }finally{f.close();}});
 test('an unseen worker whose rule was never delivered remains protected rather than inheriting or being stopped',async()=>{const f=fixture(),workers=herd(['jira-work:unknown:FIXTURE-99']);try{f.update();f.activate();workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map());expect(workers.actions).toEqual([]);expect(f.runtime.ruleForAgent('jira-work:unknown:FIXTURE-99')).toBeUndefined();expect(f.runtime.policy.protectStop('jira-work:unknown:FIXTURE-99',f.runtime.policy.generation())).toBe(true);}finally{f.close();}});
 test('remote rule authority does not capture existing bare agent notification or explicit admission policy',async()=>{const f=fixture();try{f.update();f.activate();const generation=f.runtime.policy.generation();expect(f.runtime.policy.canNotify('FIXTURE-BARE',generation,generation)).toBe(true);expect(f.runtime.policy.canAdmit('FIXTURE-BARE',generation)).toBe(true);expect(f.runtime.policy.canSpawn(spec('FIXTURE-BARE'),generation)).toBe(true);expect(f.runtime.policy.protectStop('FIXTURE-BARE',generation)).toBe(false);expect(f.runtime.isUnresolvedAgent('FIXTURE-BARE')).toBe(false);}finally{f.close();}});
