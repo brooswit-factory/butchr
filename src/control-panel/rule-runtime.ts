@@ -55,7 +55,18 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  // Fields a retained worker's own in-flight traversal depends on staying stable — never membership
  // (`query`/`id`/`resourceProvider`, see nextObservationGraph) — so that only THESE need to freeze.
  const OBSERVATION_BEHAVIOR_FIELDS=['execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'] as const;
- const observationBehaviorOf=(rule:Rule)=>{const out:Record<string,unknown>={};for(const k of OBSERVATION_BEHAVIOR_FIELDS)out[k]=(rule as unknown as Record<string,unknown>)[k];return out;};
+ // Pins a rule's behavior fields to `pin`'s own KEY PRESENCE, not just its values: naively doing
+ // `out[k]=pin[k]` for every field would create an explicit `undefined`-valued own property for any
+ // field `pin` never set at all, even though plain omission and an explicit `undefined` serialize
+ // identically through observationCompatible's array-based JSON.stringify — but NOT through
+ // fingerprint()/canonical()'s Object.entries-based walk (safeLifecycle), which treats a present
+ // key with value `undefined` as a REAL difference from an absent one. That spurious key would then
+ // make a worker's own (plainly-shaped) entry.rule fingerprint-mismatch against this exposed rule
+ // FOREVER, even when every actual value already matches — silently reintroducing exactly the
+ // "stranded resident" bug this file's nextObservationGraph comment above describes. Deleting (not
+ // defaulting to undefined) a field absent from `pin` keeps this rule's own shape bit-for-bit
+ // whatever `pin` itself has, so a worker pinned to its OWN entry.rule always matches it exactly.
+ const observationBehaviorOf=(rule:Rule,pin:Rule):Rule=>{const out=rule as unknown as Record<string,unknown>;for(const k of OBSERVATION_BEHAVIOR_FIELDS){if(Object.hasOwn(pin as object,k))out[k]=structuredClone((pin as unknown as Record<string,unknown>)[k]);else delete out[k];}return out as unknown as Rule;};
  function graphDeferred(){return !!manifest?.active&&graphFingerprint(manifest.observationGraph)!==graphFingerprint(manifest.remote.map(r=>r.definition));}
  function heldObservationKeys(graph:readonly Rule[]){
   const previous=new Map(graph.map(rule=>[keyOf(rule),rule]));
@@ -71,10 +82,21 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   // wire query: a retained worker elsewhere under the same rule has no bearing on whether some OTHER
   // resource is currently eligible. What that worker's own in-flight traversal DOES still need frozen
   // is the observation-BEHAVIOR shape (maxLinkedItems etc.) it is actively using — so only those
-  // fields, never membership, stay pinned to the old value until every resident under the key drains.
+  // fields, never membership, stay pinned until every resident under the key drains.
   const directRoots=new Set([...retained.values()].filter(entry=>entry.managed).map(entry=>keyOf(entry.rule)));
-  const next=parsed.map(rule=>{const old=previous.get(keyOf(rule));if(!old||!held.has(keyOf(rule)))return structuredClone(rule);
-   return directRoots.has(keyOf(rule))?{...structuredClone(rule),...observationBehaviorOf(old)}:{...structuredClone(old),enabled:rule.enabled};});
+  // Pinned to the OLDEST still-retained resident's OWN captured rule — never to a disconnected
+  // historical echo. retained preserves insertion order and residents are only ever removed, never
+  // reinserted ahead of an existing one, so the first managed match under a key is deterministically
+  // whichever resident has lived there longest. Once that resident drains, the pin immediately
+  // advances to whichever resident is next-longest-lived — a value some LIVE resident is actually
+  // using — rather than continuing to echo a prior resident's value nothing alive still depends on
+  // (the bug: a second, independent wire edit after the first resident drained could then match
+  // NEITHER that stale echo nor the new live definition, stranding the remaining resident's own
+  // notifications/respawn/retirement until it happened to exit too).
+  const pinFor=(key:string)=>{for(const entry of retained.values())if(entry.managed&&keyOf(entry.rule)===key)return entry.rule;return undefined;};
+  const next=parsed.map(rule=>{const key=keyOf(rule),old=previous.get(key);if(!old||!held.has(key))return structuredClone(rule);
+   if(!directRoots.has(key))return {...structuredClone(old),enabled:rule.enabled};
+   return observationBehaviorOf(structuredClone(rule),pinFor(key)??old);});
   // A dependency with no parsed counterpart at all (or a withdrawn direct root) has no live value to
   // take membership from either way — keep the entire prior entry, exactly as a dependency would.
   for(const [key,old]of previous)if(held.has(key)&&!parsed.some(rule=>keyOf(rule)===key))next.push(structuredClone(old));

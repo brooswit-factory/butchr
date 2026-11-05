@@ -86,3 +86,30 @@ bump: patch
   that caused the freeze, live wire for one admitted after — settles the
   comparison; a worker matching neither (a genuine further change) is
   still correctly flagged incompatible.
+- Two further defects in that same freeze mechanism, both only reachable
+  after the original resident eventually drains while a later resident
+  (admitted under the live wire, above) remains:
+  - `nextObservationGraph`'s exposed pin previously kept echoing
+    whichever value the ORIGINAL resident had captured, forever, by
+    copying forward the graph's own prior snapshot rather than any
+    currently-retained resident's actual rule. Once that resident
+    drained, nothing alive was using that echoed value any more, so a
+    SECOND, independent wire edit afterward could match neither the
+    stale echo nor the new live definition — stranding the remaining
+    resident's own notifications/respawn/retirement until it, too,
+    happened to exit. The pin is now derived from whichever currently-
+    retained resident under the key has lived there longest (`retained`
+    preserves insertion order), so it converges to a value some live
+    resident is actually using as soon as an older one drains.
+  - Separately, `observationBehaviorOf` always set all 7
+    `OBSERVATION_BEHAVIOR_FIELDS` as explicit (possibly `undefined`)
+    own properties on the exposed rule, even for a field the pin itself
+    never set at all. `observationCompatible`'s array-based comparison
+    doesn't care, but `safeLifecycle`'s full-rule `fingerprint()` does:
+    its `canonical()` walk treats a present key valued `undefined` as
+    different from an absent one, so a plainly-shaped `entry.rule`
+    (never touched by this merge) would permanently fingerprint-mismatch
+    the exposed rule even once every actual value matched. The merge now
+    deletes a field absent from the pin instead of defaulting it to
+    `undefined`, so the exposed rule's shape for these fields always
+    mirrors whichever resident it is pinned to, bit for bit.
