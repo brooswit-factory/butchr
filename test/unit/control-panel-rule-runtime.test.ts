@@ -123,6 +123,23 @@ test('a second independent behavior-field edit after the original resident drain
  expect(workers.actions).toEqual(['spawn:'+key('2'),'stop:'+key('2')]);
  expect(workers.running.has(key('2'))).toBe(false);
  }finally{f.close();}});
+test('a second independent behavior-field edit while the original resident is still ALIVE still leaves the intermediate resident notifiable, respawnable and retirable, because admission-time behavior is never re-validated against anything live',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE',maxLinkedItems:7},doc.rules[1]]});f.update();
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE',maxLinkedItems:9},doc.rules[1]]});f.update();
+ const gen=()=>f.runtime.policy.generation();
+ expect(f.runtime.policy.canNotify(key('2'),gen(),gen())).toBe(true);
+ expect(f.runtime.policy.protectStop(key('2'),gen())).toBe(false);
+ expect(f.runtime.policy.protectRespawn(key('2'),gen())).toBe(false);
+ expect(f.runtime.policy.canNotify(key(),gen(),gen())).toBe(true);
+ expect(f.runtime.policy.protectStop(key(),gen())).toBe(false);
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE',maxLinkedItems:9},doc.rules[1]]});f.update();
+ expect(f.runtime.policy.protectStop(key('2'),f.runtime.policy.generation())).toBe(false);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())]]));
+ expect(workers.actions).toEqual(['spawn:'+key('2'),'stop:'+key('2')]);
+ expect(workers.running.has(key())).toBe(true);expect(workers.running.has(key('2'))).toBe(false);
+ }finally{f.close();}});
 test('a rule with no live counterpart left on the wire at all still refuses new admission even though its own retained worker is a direct root',async()=>{const f=fixture(),workers=herd([key()]);try{
  workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
  f.remote=[];f.update();

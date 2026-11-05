@@ -57,15 +57,16 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  const OBSERVATION_BEHAVIOR_FIELDS=['execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'] as const;
  // Pins a rule's behavior fields to `pin`'s own KEY PRESENCE, not just its values: naively doing
  // `out[k]=pin[k]` for every field would create an explicit `undefined`-valued own property for any
- // field `pin` never set at all, even though plain omission and an explicit `undefined` serialize
- // identically through observationCompatible's array-based JSON.stringify — but NOT through
- // fingerprint()/canonical()'s Object.entries-based walk (safeLifecycle), which treats a present
- // key with value `undefined` as a REAL difference from an absent one. That spurious key would then
- // make a worker's own (plainly-shaped) entry.rule fingerprint-mismatch against this exposed rule
- // FOREVER, even when every actual value already matches — silently reintroducing exactly the
- // "stranded resident" bug this file's nextObservationGraph comment above describes. Deleting (not
- // defaulting to undefined) a field absent from `pin` keeps this rule's own shape bit-for-bit
- // whatever `pin` itself has, so a worker pinned to its OWN entry.rule always matches it exactly.
+ // field `pin` never set at all — a different shape from plain omission, even though the two
+ // serialize identically wherever a field is read positionally (an array of values, a direct
+ // property access). fingerprint()/canonical()'s Object.entries-based walk is NOT one of those
+ // places: it treats a present key valued `undefined` as a REAL difference from an absent one.
+ // Deleting (not defaulting to undefined) a field absent from `pin` keeps this exposed rule's shape
+ // bit-for-bit whatever `pin` itself has, so nothing comparing the two by canonical fingerprint ever
+ // sees a difference that doesn't actually exist. (safeLifecycle below now excludes these fields
+ // from its own fingerprint entirely, so it no longer depends on this; kept because `getRules()`
+ // exposes this same object, and a caller fingerprinting it should see a shape that is actually
+ // true, not an artifact of how this merge happens to be implemented.)
  const observationBehaviorOf=(rule:Rule,pin:Rule):Rule=>{const out=rule as unknown as Record<string,unknown>;for(const k of OBSERVATION_BEHAVIOR_FIELDS){if(Object.hasOwn(pin as object,k))out[k]=structuredClone((pin as unknown as Record<string,unknown>)[k]);else delete out[k];}return out as unknown as Rule;};
  function graphDeferred(){return !!manifest?.active&&graphFingerprint(manifest.observationGraph)!==graphFingerprint(manifest.remote.map(r=>r.definition));}
  function heldObservationKeys(graph:readonly Rule[]){
@@ -220,31 +221,34 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  async function prepareActivation(){if(!local.census)throw Error('Complete worker census unavailable');const before=generation,etag=sourceEtagOf(local.readText());const census=await local.census();if(before!==generation||etag!==sourceEtagOf(local.readText()))throw Error('Cutover state changed during census');recordFullCensus(census.ids,census.complete);if(!census.complete)throw Error('Worker inventory is incomplete or ambiguous');}
  function managed(id:string){if(ownsManagedSessionAgent(id))return false;return !!retained.get(id)?.managed||(!!manifest?.active||fault)&&!!decodeAnyAgentKey(id);}
  function current(id:string,lease:number){const r=ruleFor(id);return !fault&&lease===generation&&!!r&&allowed(r);}
- // Membership (query) is never part of this comparison: it now always tracks the live wire for a
- // directly retained rule (see nextObservationGraph) and drifting on its own is not a reason to treat
- // an otherwise-healthy, already-admitted worker as incompatible — only the observation-BEHAVIOR shape
- // it is actively relying on (maxLinkedItems etc.) does that.
- function observationCompatible(a:Rule,b:Rule){return JSON.stringify(OBSERVATION_BEHAVIOR_FIELDS.map(k=>(a as unknown as Record<string,unknown>)[k]))===JSON.stringify(OBSERVATION_BEHAVIOR_FIELDS.map(k=>(b as unknown as Record<string,unknown>)[k]));}
- // `ruleFor(id)` (the exposed graph entry) is, for a directly-held rule, the frozen-behavior
- // snapshot pinned to whichever resident's in-flight traversal caused the freeze — exactly what a
- // worker admitted under THAT freeze (its own entry.rule captured the same frozen values) should
- // keep comparing against. A worker admitted afterward under the live wire (canSpawn records the
- // current remote definition for a first-time admission, see above) has nothing frozen about its
- // own entry.rule, so comparing it against the OTHER resident's pinned snapshot would show
- // permanent, spurious drift for as long as that other resident lives — fencing its own
- // notifications/respawn/stop indefinitely. Accepting a match against EITHER reference lets each
- // resident's own admission-time truth settle the comparison, without weakening it: a worker that
- // matches neither (a genuine third change since either reference was captured) is still correctly
- // flagged incompatible.
- function behaviorCompatible(entryRule:Rule,exposed:Rule,id:string){if(observationCompatible(entryRule,exposed))return true;const desired=desiredRule(id);return !!desired&&observationCompatible(entryRule,desired);}
+ // Membership (query) was never part of this file's compatibility checks (it now always tracks the
+ // live wire for a directly retained rule, see nextObservationGraph, and drifting on its own was
+ // never a reason to treat an otherwise-healthy worker as incompatible). Observation-BEHAVIOR drift
+ // (maxLinkedItems etc.) is excluded here too, for a sharper reason: it is captured once, at
+ // admission, into entry.rule and NEVER resynced afterward — by design, so a resident's own in-flight
+ // traversal never changes mid-flight. Two or more residents under the same directly-held rule can
+ // therefore legitimately carry DIFFERENT admission-time behavior snapshots at once (one admitted
+ // before a wire edit, one after). There is exactly one shared "exposed" reference per rule
+ // (nextObservationGraph's pin), so comparing a resident's own snapshot against it (or against the
+ // live wire) can only ever correctly describe ONE of those residents at a time — a second,
+ // independent wire edit after the first one's admission reliably strands whichever resident isn't
+ // currently mirrored by that single shared reference: no notifications, no respawn, and — the
+ // actually harmful case — no retirement even once it stops matching its query, for as long as some
+ // OTHER resident under the same key keeps the behavior fields held. The invariant that replaces it:
+ // a resident's own admission-time behavior is ALWAYS considered compatible, full stop, for exactly
+ // the same reason entry.rule is never resynced — there is nothing live to safely validate it
+ // against, and admission/retirement are already governed correctly by query (`allowed`), independent
+ // of this. Role/brief/agentPreferences drift is a different, pre-existing axis (reconciled
+ // separately) and still gates safeLifecycle below unchanged.
  function lifecycleEnabled(rule:Rule){return observationAllowed(rule)&&(!manifest?.active||!control.disabledRules.includes(remoteIdentity(rule)));}
- // Same reasoning as observationCompatible above: normalize away a query that moved out from under
- // this worker on its own before comparing the rest (role/brief/preferences/behavior) for an exact
- // match — a query-only change must never block this worker's own respawn. The same either-reference
- // reasoning as behaviorCompatible above applies to the full fingerprint, not just the behavior
- // fields: a worker admitted under the live wire while another resident's freeze is still active
- // must match the LIVE definition safely, not only the other resident's frozen one.
- function safeLifecycle(id:string,lease:number){const entry=retained.get(id),r=ruleFor(id);if(!managed(id))return true;if(!(entry?.known&&r&&lease===generation&&allowed(r)))return false;const desired=desiredRule(id);const matches=(ref:Rule)=>fingerprint({...appliedRule(entry),query:ref.query})===fingerprint(ref);return matches(r)||(!!desired&&matches(desired));}
+ // Normalizes away query (synced immediately for a direct root, see nextObservationGraph — a
+ // query-only change must never block this worker's own respawn) AND observation-behavior fields
+ // (never resynced after admission, see above — a worker's own captured behavior staying exactly
+ // what it was admitted with is success, not drift) before comparing the rest — role, brief,
+ // agentPreferences — for an exact match.
+ function safeLifecycle(id:string,lease:number){const entry=retained.get(id),r=ruleFor(id);if(!managed(id))return true;if(!(entry?.known&&r&&lease===generation&&allowed(r)))return false;
+  const strip=(rule:Rule):Rule=>{const out={...rule} as Record<string,unknown>;for(const k of OBSERVATION_BEHAVIOR_FIELDS)delete out[k];return out as unknown as Rule;};
+  return fingerprint(strip({...appliedRule(entry),query:r.query}))===fingerprint(strip(r));}
  // OFF is an explicit configuration verdict, never inferred from a missing rule or failed discovery.
  function configuredOff(id:string,lease:number):boolean {
   if(!manifest?.active||fault||error||!connected||!control.enabled||!inventoryComplete||lease!==generation||ownsManagedSessionAgent(id))return false;
@@ -274,8 +278,8 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
    const rule=!retained.has(spec.key)&&manifest?.active?desiredRule(spec.key)??exposed:exposed;
    pendingSpawns.add(spec.key);pendingOrigins.set(spec.key,{id:rule.id,name:rule.id,...(manifest?.active?remoteAdmittedIdentity(manifest.source):{source:'local' as const})});retained.set(spec.key,{rule:structuredClone(rule),known:true,managed:!!manifest?.active});if(manifest)try{saveRetained();}catch{pendingSpawns.delete(spec.key);pendingOrigins.delete(spec.key);retained.delete(spec.key);error='Admission context could not be saved';connected=false;changed();return false;}return true;},
   spawnObservedExisting(id){if(pendingSpawns.has(id)){const entry=retained.get(id);if(entry){const {origin:_,...rest}=entry;retained.set(id,{...rest,...(manifest?.active?{known:false,managed:true}:{})});if(manifest)saveRetained();refresh();}pendingSpawns.delete(id);pendingOrigins.delete(id);}},spawnSucceeded:(id)=>{const origin=pendingOrigins.get(id),entry=retained.get(id);if(origin&&entry){retained.set(id,{...entry,origin:structuredClone(origin)});if(manifest)saveRetained();}pendingSpawns.delete(id);pendingOrigins.delete(id);},spawnFailed(id){pendingSpawns.delete(id);pendingOrigins.delete(id);/* A failed launch may already own a pane. Only a later reliable census may discard its policy. */},
-  protectStop:(id,lease)=>{if(ownsManagedSessionAgent(id))return true;if(configuredOff(id,lease))return false;const e=retained.get(id),r=ruleFor(id);return managed(id)&&!(e?.known&&r&&lease===generation&&lifecycleEnabled(r)&&behaviorCompatible(e.rule,r,id));},protectRespawn:(id,lease)=>ownsManagedSessionAgent(id)||managed(id)&&!safeLifecycle(id,lease),
-  canNotify:(id,_previous,next)=>{const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!workerPending(id)&&next===generation&&!!entry?.known&&!!r&&next===generation&&observationAllowed(r)&&!!manifest?.remote.some(v=>v.definition.id===r.id&&v.definition.enabled)&&!control.disabledRules.includes(remoteIdentity(r))&&behaviorCompatible(entry.rule,r,id);},ignoreNotification:(id)=>managed(id)&&!!manifest?.active&&!retained.has(id)&&!pendingSpawns.has(id),
+  protectStop:(id,lease)=>{if(ownsManagedSessionAgent(id))return true;if(configuredOff(id,lease))return false;const e=retained.get(id),r=ruleFor(id);return managed(id)&&!(e?.known&&r&&lease===generation&&lifecycleEnabled(r));},protectRespawn:(id,lease)=>ownsManagedSessionAgent(id)||managed(id)&&!safeLifecycle(id,lease),
+  canNotify:(id,_previous,next)=>{const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!workerPending(id)&&next===generation&&!!entry?.known&&!!r&&next===generation&&observationAllowed(r)&&!!manifest?.remote.some(v=>v.definition.id===r.id&&v.definition.enabled)&&!control.disabledRules.includes(remoteIdentity(r));},ignoreNotification:(id)=>managed(id)&&!!manifest?.active&&!retained.has(id)&&!pendingSpawns.has(id),
  };}
  function summary(){return {...(local.rollout?{canary:local.rollout.summary()}:{}),workerReconciliation:[...retained].flatMap(([id,entry])=>entry.reconciliation?[{id,...entry.reconciliation,...(workers.state(id)??{})}]:[]),authority:manifest?.active?'remote':'local',connected,revision:manifest?.revision??revision,inventoryComplete,phase:fault?'blocked':manifest?.active?!inventoryComplete?'inventory-uncertain':error?'blocked':!connected?'disconnected':!control.enabled?'master-off':graphDeferred()?'deferred':'active':'staged',error,generation,retainedAgents:[...retained.values()].filter(r=>r.managed).length,discoveryChangesDeferred:graphDeferred(),deferredRules:deferredRuleDetails(),unresolvedAgents:[...retained.values()].filter(r=>r.managed&&!r.known).length,localDeactivated:!!manifest?.deactivation&&sourceEtagOf(local.readText())===manifest.deactivation.emptyEtag};}
  return {settleReconciliation:()=>workers.idle(),retryReconciliation:()=>reconcileWorkers(true),admittedRuleIdentity,update,plan,activate,recordFullCensus,prepareActivation,ruleForAdmission,isUnresolvedAgent:(id:string)=>!ownsManagedSessionAgent(id)&&!!manifest?.active&&!!decodeAnyAgentKey(id)&&!retained.get(id)?.known,deactivateLocal,rollback,summary,getRules:()=>live,getInitializationRules:initializationRules,refreshLocal:()=>{if(!manifest?.active)changed();},ruleForAgent,observedWorkerIds:()=>[...retained.keys()],retainedRules:()=>[...retained].filter(([,r])=>r.managed&&r.known).map(([id,r])=>({id,rule:structuredClone(r.rule)})),policy:policy()};

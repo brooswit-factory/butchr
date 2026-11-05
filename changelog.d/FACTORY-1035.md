@@ -86,7 +86,26 @@ bump: patch
   that caused the freeze, live wire for one admitted after — settles the
   comparison; a worker matching neither (a genuine further change) is
   still correctly flagged incompatible.
-- Two further defects in that same freeze mechanism, both only reachable
+- `protectStop`/`canNotify`/`protectRespawn` no longer re-validate a
+  resident's observation-behavior fields against anything live at all.
+  Those fields are captured once at admission into `entry.rule` and
+  never resynced — by design, so a resident's in-flight traversal never
+  changes mid-flight — so two or more residents under one directly-held
+  rule can legitimately carry different admission-time snapshots at
+  once. Comparing any one of them against a single shared reference
+  (the exposed pin, or the live wire, or both) could only ever describe
+  one resident correctly; a second independent wire edit reliably
+  stranded whichever resident wasn't currently mirrored by that
+  reference — no notifications, no respawn, and, worst, no retirement
+  even once it stopped matching its own query, regardless of whether
+  the original resident had since drained or was still alive. The fix:
+  a resident's own admission-time behavior is now always compatible,
+  full stop — there is nothing live to safely validate it against, and
+  query-based admission/retirement already works independently of this
+  (see above). `safeLifecycle` still compares role/brief/agentPreferences
+  (a separate, pre-existing, reconciled axis) after stripping behavior
+  fields and normalizing query out of the comparison.
+- Two further defects in the pin mechanism itself, both only reachable
   after the original resident eventually drains while a later resident
   (admitted under the live wire, above) remains:
   - `nextObservationGraph`'s exposed pin previously kept echoing
