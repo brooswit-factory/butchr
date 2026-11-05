@@ -29,11 +29,33 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: butchr
     steps:
+      # FACTORY-1038: package.json depends on `file:../drovr` and `file:../drovr/legacy-events`, so a
+      # frozen install needs the same pinned, built sibling SDK checkout ci.yml uses. Without it every
+      # automatic release failed at `bun install` ("Could not find folder file:../drovr") and no tag or
+      # GitHub Release was ever created. Keep this ref, the Bun version and the build recipe identical
+      # to ci.yml and RECOVERY.md (test/unit/drovr-pin-consistency.test.ts enforces the pin).
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with: { path: butchr, fetch-depth: 0 }
+      - uses: actions/checkout@v4
+        with:
+          repository: brooswit-factory/drovr
+          ref: 52d0106898982cb4d411208dc687f9e20a4075eb
+          path: drovr
       - uses: oven-sh/setup-bun@v2
-        with: { bun-version: latest }
+        with: { bun-version: 1.3.11 }
+      - name: build pinned sibling SDK sources
+        working-directory: drovr
+        shell: bash
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+          cd legacy-events
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
       - run: bun install --frozen-lockfile
       - name: sync onto the current origin/main
         # cancel-in-progress:false serializes this workflow with itself — a second merge's run

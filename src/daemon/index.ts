@@ -1,3 +1,4 @@
+import {createProviderReadiness} from '../agents/provider-readiness.js';
 import {createContinuationPolicyReader} from '../control-panel/worker-continuation-policy.js';
 import {deliverAdmittedNotice} from '../control-panel/admitted-notice.js';
 import {admittedPolicyUnits} from '../control-panel/admitted-policy.js';
@@ -720,10 +721,11 @@ if (!preflight.ok) {
   console.error(`butchr: ${preflight.message}`);
   process.exit(1);
 }
-// No rules file + live rule agents: refuse, rather than stop the whole fleet
-// on the first poll over what is usually an accident (src/daemon/missing-rules-preflight.ts).
+// Under local authority, refuse missing rules with live rule agents. A validated
+// saved remote authority restores its own rules and keeps lifecycle actions fenced
+// until reconnection and complete inventory (src/daemon/missing-rules-preflight.ts).
 if (missingRulesPath !== null) {
-  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents);
+  const rulesPreflight = await missingRulesPreflight(missingRulesPath, async () => (await herdr.agent.list()).agents, undefined, ruleAuthority.summary().authority === "remote");
   if (!rulesPreflight.ok) {
     console.error(`butchr: ${rulesPreflight.message}`);
     process.exit(1);
@@ -733,7 +735,7 @@ if (missingRulesPath !== null) {
 // per spawn attempt (success/failure/noop) — see herd.ts's own `spawn()` doc
 // comment. `undefined` for `wait` keeps HerdrHerd's own default real-timer
 // wait; only `log` is being threaded through here.
-const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf, workerRollout);
+const herd = new HerdrHerd(herdr, `http://localhost:${config.port}/mcp`, undefined, (line) => console.error(`  ${line}`), config.agent, undefined, undefined, undefined, mcpBindingsOf, resolvedAgentOf, workerRollout, createProviderReadiness());
 herd.ruleRuntime=()=>ruleAuthority.policy;
 {const spec=workerRollout?.continuationSpec();if(spec){
  if(!atlassian)throw Error('Configured issue policy client required for continuation');

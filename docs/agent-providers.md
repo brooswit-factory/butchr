@@ -207,3 +207,29 @@ After review, configure `BUTCHR_AGENT_PROVIDER=codex` and optionally
 `BUTCHR_AGENT_MODEL` in the service environment; have the deployment owner
 install the reviewed build and schedule activation. Leave provider unset or
 `claude` to retain the default. Do not change either user's global MCP config.
+
+## Fresh-session vendor and model changes
+
+Ordinary Butchr replacements intentionally omit conversation-history import. They retain the workspace and saved native histories, verify the new provider’s native readiness acknowledgement, retire the idle source only after that proof, and then send the normal task brief. No historical transcript size limit is raised. Existing partial-handoff and security/quota holds remain blockers; a fresh-session policy does not adopt ambiguous workers or authorize clearing those holds. Explicit historical canary permits keep their original contract.
+
+### Recovering a source-absent historical target
+
+`butchr-operator fresh-target plan|apply|status` supports adopting an existing, verified Claude target after the original source pane disappeared during a retired historical partial handoff. It performs no launch, close, prompt or history import. It updates only the matching retained reconciliation record; saved rules, overrides, other workers' holds, spent permits and both native histories stay intact.
+
+Before planning, use the daemon's read-only `/api/operator-paths` and existing service binding to select the actual state, runtime, workspace and freeze roots. Stop only the existing Butchr service and its health watchdog/timer for maintenance, preserving their prior activation states. Planning requires those units already stopped and is read-only:
+
+```sh
+butchr-operator fresh-target plan \
+  --state "$STATE" --permit "$PERMIT" --socket "$SOCKET" \
+  --runtime "$RELEASE" --unit butchr.service --workspaces "$WORKSPACES" \
+  --freeze-root "$FREEZE_ROOT" --repository "$EXISTING_NESTED_REPOSITORY" \
+  --source-history "$EXACT_SOURCE_NATIVE_FILE" \
+  --native-root "$EXACT_CLAUDE_PROJECT_DIRECTORY" \
+  --target-executable "$EXACT_CLAUDE_IMAGE"
+```
+
+Save the inspected plan in an owner-private file inside the existing private state directory. Review its target, physical/native identity, desired preferences, preserved-history and dirty-work fingerprints, and zero-launch/close/import effects. With explicit recovery authority, apply that exact plan using `--plan-file`, `--confirm` and `--approval-reference`. The command takes the same kernel-backed writer lease as the daemon and the independent canary-control lock, rechecks the plan, writes a durable audit with the before/after state images, and atomically installs only the selected record change. Restore only previously active services, then verify current authority, the actual surviving target and normal reconciliation readback.
+
+`fresh-target status --state "$STATE" --confirm "$PLAN_HASH"` distinguishes recorded adoption, an unapplied intent and a state requiring inspection. Repeating a completed operation makes no additional changes. A precommit interruption can resume only the same intent after complete reinspection; an uncertain commit retains its control lock and requires inspection. Never hand-clear an uncertain lock or change a pane/session reference to make a plan pass. A current source, another target, edited workspace, changed native/process identity or preferences, quota/security prompt, independent freeze/stop hold or changed authority refuses recovery.
+
+If the operator cannot distinguish a gray suggested prompt from typed input, first obtain the user's explicit factual confirmation. `fresh-target plan` accepts optional `--suggestion-confirmation OWNER_PRIVATE_FILE` for that specific case. Its JSON records `kind: "user-confirmed-suggestion"`, an approval `reference`, `confirmedAt` (UTC milliseconds), the exact original permit `target` binding, `process` (`pid`, `generation`), the confirmed `suggestion` and the SHA-256 of its complete ANSI composer line (`ansiLineSHA256`). The evidence expires after one hour and must still match the same native session/process and the exact dim placeholder rendering at every inspection. The confirmation is included in the hashed plan and durable adoption audit. It neither sends nor clears terminal input, changes a user setting, nor weakens readiness for other operations. A changed/real draft, unknown controls, security/quota footer or any unrelated hold still refuses recovery.

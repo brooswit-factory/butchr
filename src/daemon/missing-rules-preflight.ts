@@ -1,5 +1,5 @@
 /**
- * Startup preflight: refuse to run with NO rules file while rule agents are
+ * Startup preflight: refuse local-authority startup with NO rules file while rule agents are
  * still live.
  *
  * A missing rules file means zero rules, and every rule loop still owns its
@@ -27,12 +27,17 @@ export async function missingRulesPreflight(
   rulesPath: string,
   list: () => Promise<readonly PreflightAgent[]>,
   root: string = workspaceRoot(),
+  hasRemoteAuthority = false,
 ): Promise<MissingRulesPreflight> {
   let agents: readonly PreflightAgent[];
   try { agents = await list(); }
   catch (e) {
     return { ok: false, message: `startup preflight could not list herdr agents to check for live rule agents: ${(e as Error)?.message ?? e}. Refusing to start with no rules file at ${rulesPath}: zero rules would stop any rule agent still running. Start herdr and retry.` };
   }
+  // Authority comes from the validated, restored runtime, whose saved rules
+  // remain authoritative when the local file is absent. Keep census failure
+  // above and all runtime lifecycle leases fail-closed.
+  if (hasRemoteAuthority) return { ok: true };
   const live = agents
     .map((a) => ({ id: ruleAgentIdOfWorkspacePath(a.cwd, root), pane: a.pane_id ?? null }))
     .filter((a): a is { id: string; pane: string | null } => a.id !== null);

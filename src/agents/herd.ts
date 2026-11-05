@@ -1,3 +1,4 @@
+import type {ProviderReadiness} from './provider-readiness.js';
 import {nativeSessionHash} from '../control-panel/worker-rollout.js';
 import {WORKER_CANARY_KICKOFF} from '../control-panel/worker-rollout.js';
 import type {WorkerRollout} from '../control-panel/worker-rollout.js';
@@ -769,6 +770,7 @@ export class HerdrHerd implements Herd {
      */
     private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
     private readonly rollout?:WorkerRollout,
+    private readonly providerReadiness?:(provider:ManagedAgentProvider)=>Promise<ProviderReadiness>,
   ) {if(this.rollout)this.herdr=this.rollout.wrap(this.herdr);this.lifecycleFence=createLifecycleFence(this.herdr);this.herdr=this.lifecycleFence.client;}
 
   private withRuleLease<T>(issue:string,kind:'spawn'|'stop'|'resume'|'notify',lease:number|undefined,action:()=>Promise<T>):Promise<T>{
@@ -778,6 +780,18 @@ export class HerdrHerd implements Herd {
     return this.lifecycleFence.run(()=>{const current=this.ruleRuntime?.();if(current!==policy||(kind==='spawn'?!policy.canAdmit(issue,captured):kind==='stop'?policy.protectStop(issue,captured):kind==='notify'?!policy.canNotify(issue,captured,captured):policy.protectRespawn(issue,captured)))throw Error('Rule authority changed before worker action');},action);
   }
 
+
+  /** Automatic cleanup must preserve every workspace of a held transaction,
+   * including an agentless source. Never use the explicit-human-stop exemption. */
+  private withCleanupLease<T>(issue:string,action:()=>Promise<T>):Promise<T>{
+    const policy=this.ruleRuntime?.(),lease=policy?.generation();
+    return this.lifecycleFence.extend(()=>{if(this.ruleRuntime&&!policy)throw Error('Cleanup authority unavailable');if(this.refused.has(issue))throw Error('Known quota hold preserves cleanup workspace');if(policy&&(this.ruleRuntime?.()!==policy||policy.protectCleanup?.(issue,lease!)!==false))throw Error('Worker cleanup is protected or ownership/authority is uncertain');},action);
+  }
+
+  private async assertCleanupHolds(issue:string):Promise<void>{
+    await instanceFreezeStore.assertRunnable(`butchr:${issue}`);
+    try{lstatSync(join(workspaceDirFor(issue),'.butchr-stop-cause.json'));throw Error('Intentional-stop marker preserves cleanup workspace');}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+  }
 
   private lifecycle(issue: string): ManagedHerdrLifecycle {
     let lifecycle = this.lifecycles.get(issue);
@@ -871,6 +885,7 @@ export class HerdrHerd implements Herd {
   async reconcilePreferences(specIn:SpawnSpec,isCurrent:()=>boolean,change?:WorkerChange):Promise<WorkerChangeResult>{
     if(this.rollout&&specIn.key!==this.rollout.workerKey)return {status:'blocked',reason:'Worker is outside the explicit canary permit'};
     const spec=specIn;
+    if(this.providerReadiness&&spec.agents?.length===1){const readiness=await this.providerReadiness(spec.agents[0]!.harness);if(!readiness.ready)return {status:'blocked',reason:readiness.reason??'Provider integration readiness unavailable; paid handoff blocked'};}
     let lifecycle:ManagedHerdrLifecycle|undefined,previousPane:string|undefined;
     const guard=()=>{if(!isCurrent())throw Error('Desired worker configuration was superseded or disabled');};
     const physical=()=>{const current=lifecycle?.current;return current?{paneId:current.paneId,provider:current.provider}:undefined;};
@@ -880,7 +895,7 @@ export class HerdrHerd implements Herd {
       previousPane=current.pane_id;
       if(current.agent_status!=='idle'&&current.agent_status!=='done')return {status:'blocked',reason:'Current worker is not idle or done',current:physical()};
       const result=await this.startProviders(spec,current.pane_id,'Desired rule launch preferences changed');guard();const applied=physical();
-      if(result.status!=='success')return {status:'blocked',reason:result.status==='blocked'?result.reason:'No requested provider is available',current:applied,partial:!!applied&&applied.paneId!==previousPane};
+      if(result.status!=='success')return {status:'blocked',reason:result.status==='blocked'?result.reason:'No requested provider is available',current:applied,partial:result.status==='blocked'&&!!result.requiresInspection||!!applied&&applied.paneId!==previousPane};
       if(!result.attempted.length||!applied||applied.paneId===previousPane||applied.paneId!==result.value)return {status:'blocked',reason:'Drovr did not acknowledge a replacement worker',current:applied};
       return {status:'applied',current:applied};
     }));
@@ -1433,7 +1448,10 @@ export class HerdrHerd implements Herd {
    * and it is why the tests assert on a SECOND `spawn()` call succeeding
    * rather than on this one.
    */
-  private async clearVanishedWorker(issue: string, pane: string | undefined): Promise<void> {
+  private async clearVanishedWorker(issue:string,pane:string|undefined):Promise<void>{
+    try{await this.withCleanupLease(issue,()=>this.clearVanishedWorkerOwned(issue,pane));}catch(e){this.log?.(`WARNING: [cleanup] ${issue} preserved held/uncertain worker: ${String(e)}`);}
+  }
+  private async clearVanishedWorkerOwned(issue: string, pane: string | undefined): Promise<void> {
     if (!pane) return; // nothing was being held — a blocked result with no `current` is not this ticket's wedge
     let panes: readonly results.PaneInfo[];
     try {
@@ -1452,10 +1470,10 @@ export class HerdrHerd implements Herd {
         return;
       }
       cause = `pane ${pane} is still listed but empty (its provider exited without butchr closing it)`;
-      await this.closePaneDefensively(pane);
+      await this.closePaneDefensively(pane,issue);
     }
     try {
-      await this.lifecycle(issue).stop();
+      await this.assertCleanupHolds(issue);await this.lifecycle(issue).stop();
     } catch (e) {
       this.log?.(`WARNING: ${SPAWN_TAG} ${issue} could not clear the worker state for vanished pane ${pane}; the next spawn may still be refused: ${(e as Error)?.message ?? e}`);
       return;
@@ -1647,7 +1665,7 @@ export class HerdrHerd implements Herd {
     try {
       await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
     } catch (e) {
-      await this.closePaneDefensively(paneId);
+      await this.closePaneDefensively(paneId,spec.key);
       this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — ${(e as Error)?.message ?? e}`);
       return undefined;
     }
@@ -1658,7 +1676,7 @@ export class HerdrHerd implements Herd {
     await this.wait(RESUME_LAUNCH_VERIFY_MS);
     const launched = await this.providerOfPane(paneId);
     if (!launched || launched.provider !== "claude") {
-      await this.closePaneDefensively(paneId);
+      await this.closePaneDefensively(paneId,spec.key);
       this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — no exit status captured`);
       return undefined;
     }
@@ -1717,6 +1735,8 @@ export class HerdrHerd implements Herd {
       ...(refusedPane ? { replacePaneId: refusedPane } : {}),
       ...(reason ? {reason} : {}),
       ...(ownedContinuation?{continuation:ownedContinuation}:{}),
+      // Ordinary replacements intentionally start fresh; explicit historical canary permits retain their own contract.
+      ...(!this.rollout&&refusedPane?{historyMode:"fresh" as const}:{}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
       // for why a spec with `cwd` needs its OWN kickoff (told where to find
@@ -1727,6 +1747,7 @@ export class HerdrHerd implements Herd {
       // unaffected.
       kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, workspaceDirFor(spec.key), spec),
       prepare: async provider => {
+        if(this.providerReadiness){const readiness=await this.providerReadiness(provider);if(!readiness.ready)throw new Error(readiness.reason??'Provider integration readiness unavailable; paid launch blocked');}
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;
         // A rule's own preference for this harness (its first entry naming it) overrides the global model.
@@ -1986,9 +2007,12 @@ export class HerdrHerd implements Herd {
    * to see (logged and swallowed, same fault-isolation shape as
    * `relabelRunningAgent`'s own catch, just above).
    */
-  private async closePaneDefensively(pane: string): Promise<void> {
+  private async closePaneDefensively(pane:string,issue:string):Promise<void>{
     try {
-      await this.herdr.pane.close(pane);
+      await this.withCleanupLease(issue,async()=>{
+        await this.assertCleanupHolds(issue);if(this.ruleRuntime){const {pane:current}=await this.herdr.pane.get(pane);if(current.pane_id!==pane||agentIdOfWorkspacePath(current.cwd)!==issue)throw Error('Cleanup pane ownership changed');}
+        await this.herdr.pane.close(pane);
+      });
     } catch (e) {
       this.log?.(`WARNING: [herdr-restore] failed to close pane ${pane} defensively after a failed resume: ${(e as Error)?.message ?? e}`);
     }
@@ -2146,7 +2170,7 @@ export class HerdrHerd implements Herd {
     // not a gap in this check.
     const postExitOutcome = async (causedBy?: unknown): Promise<"stuck" | "failed"> => {
       if (await this.providerOfPane(pane)) return "stuck";
-      await this.closePaneDefensively(pane);
+      await this.closePaneDefensively(pane,issue);
       this.resumeFailureDetail.set(issue, causedBy ? `herdr error: ${(causedBy as Error)?.message ?? causedBy}` : "no exit status captured");
       return "failed";
     };
@@ -2256,7 +2280,7 @@ export class HerdrHerd implements Herd {
     await this.wait(RESUME_LAUNCH_VERIFY_MS);
     const launched = await this.providerOfPane(pane);
     if (!launched || launched.provider !== "claude") {
-      await this.closePaneDefensively(pane);
+      await this.closePaneDefensively(pane,issue);
       // FACTORY-525: herdr accepted the launch and nothing threw — Claude
       // just didn't stay up. herdr exposes no exit code for a pane's
       // process, so there is no number to report here; say so explicitly
@@ -2290,7 +2314,7 @@ export class HerdrHerd implements Herd {
       this.herdr.pane.list(),
       this.herdr.agent.list(),
     ]);
-    return strandedCandidates(workspaces, panes, agents, workspaceRoot());
+    const policy=this.ruleRuntime?.(),lease=policy?.generation();return strandedCandidates(workspaces,panes,agents,workspaceRoot()).filter(c=>!this.ruleRuntime||policy?.protectCleanup?.(c.agentKey,lease!)===false);
   }
 
   /**
@@ -2382,12 +2406,19 @@ export class HerdrHerd implements Herd {
    * additionally wraps this call too — belt and suspenders, matching this
    * ticket's own "each close catches its own rejection" requirement).
    */
-  async closeStranded(candidate: StrandedCandidate): Promise<boolean> {
+  async closeStranded(candidate:StrandedCandidate):Promise<boolean>{
+    candidate={...candidate,paneIds:[...candidate.paneIds]};
     try {
-      const verdict = await this.workspaceVerdict(candidate.paneIds);
-      if (verdict !== "dead") return false;
-      await this.herdr.workspace.close({ workspace_id: candidate.workspaceId } as Parameters<DrovrClient["workspace"]["close"]>[0]);
-      return true;
+      return await this.withCleanupLease(candidate.agentKey,async()=>{
+        const ownership=async()=>{const {workspaces}=await this.herdr.workspace.list(),{panes}=await this.herdr.pane.list();
+          if(!workspaces.some(w=>w.workspace_id===candidate.workspaceId))return false;
+          const owned=panes.filter(p=>p.workspace_id===candidate.workspaceId);
+          return owned.length===candidate.paneIds.length&&new Set(candidate.paneIds).size===candidate.paneIds.length&&owned.every(p=>candidate.paneIds.includes(p.pane_id)&&agentIdOfWorkspacePath(p.cwd)===candidate.agentKey);
+        };
+        if(!await ownership())return false;
+        const verdict=await this.workspaceVerdict(candidate.paneIds);if(verdict!=="dead")return false;
+        await this.assertCleanupHolds(candidate.agentKey);if(!await ownership())return false;await this.herdr.workspace.close({workspace_id:candidate.workspaceId});return true;
+      });
     } catch {
       return false;
     }

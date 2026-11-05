@@ -21,7 +21,7 @@
 import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DrovrClient } from "@brooswit/drovr";
+import { DrovrClient, stagedTargetName, startManagedAgent } from "@brooswit/drovr";
 import { buildWorkspace, type SpawnSpec } from "../src/agents/workspace.js";
 import { spawnArgs, controlCharStartArgs } from "../src/agents/argv.js";
 
@@ -50,6 +50,7 @@ const herdr = new DrovrClient(socketPath ? { socketPath } : {});
 const scratchRoot = mkdtempSync(join(tmpdir(), "butchr-ci-spawn-smoke-"));
 let workspaceId: string | undefined;
 let paneId: string | undefined;
+let targetWorkspaceId:string|undefined,targetPaneId:string|undefined;
 
 /**
  * Polls for the sentinel file the stub touches before it sleeps (see
@@ -72,6 +73,8 @@ async function pollForStubToRun(pane: string, timeoutMs: number): Promise<boolea
 }
 
 async function cleanup(): Promise<void> {
+  if(targetPaneId)await herdr.pane.close(targetPaneId).catch(()=>{});
+  if(targetWorkspaceId)await herdr.workspace.close({workspace_id:targetWorkspaceId}).catch(()=>{});
   if (paneId) await herdr.pane.close(paneId).catch((e) => console.error("cleanup: pane.close failed:", e));
   // Closing the pane above already tears down a workspace left with no
   // panes, so a "workspace not found" here just means cleanup already
@@ -123,6 +126,23 @@ async function main(): Promise<void> {
     throw new Error(`agent.start accepted the argv, but the stub never touched its sentinel (${SENTINEL}) within 15s`);
   }
   console.log("OK: herdr accepted the real kickoff argv and actually ran the stub");
+  // Actual Herdr global-name contract: retain the running source while staging
+  // a distinct transaction target. Unit fakes also enforce this constraint.
+  const target=await herdr.workspace.create({label:'ci-staged-name-target',cwd:dir});
+  targetWorkspaceId=target.workspace.workspace_id;targetPaneId=target.root_pane.pane_id;
+  const sourceName=`ci-spawn-smoke-${THROWAWAY_KEY.toLowerCase()}`;
+  let collisionRejected=false;
+  try{await startManagedAgent(herdr,{pane_id:targetPaneId,name:sourceName,kind:'claude',args});}
+  catch(e){if((e as {code?:string}).code!=='agent_name_taken')throw e;collisionRejected=true;}
+  if(!collisionRejected)throw Error('Herdr failed to reject the live source name');
+  const occupied=new Set((await herdr.agent.list()).agents.map(a=>a.name).filter((n):n is string=>typeof n==='string'));
+  const targetName=stagedTargetName(sourceName,{paneId,provider:'claude',cwd:dir},targetPaneId,'claude',occupied);
+  if(existsSync(SENTINEL))unlinkSync(SENTINEL);
+  await startManagedAgent(herdr,{pane_id:targetPaneId,name:targetName,kind:'claude',args});
+  if(!await pollForStubToRun(targetPaneId,15_000))throw Error('Staged target did not run the stub');
+  const rows=(await herdr.agent.list()).agents;
+  if(!rows.some(a=>a.pane_id===paneId&&a.name===sourceName)||!rows.some(a=>a.pane_id===targetPaneId&&a.name===targetName))throw Error('Staged source/target identity readback failed');
+  console.log('OK: actual Herdr rejected the conflicting name, then retained source and distinct transaction target');
 }
 
 main()
