@@ -159,11 +159,11 @@ export function inventoryCodexMcp(
  * the directory the agent should actually WORK in — but (see
  * `SpawnSpec.cwd`'s own doc comment, src/agents/workspace.ts, for the full
  * story) the spawned PROCESS's own launch cwd stays the ordinary
- * bookkeeping directory; `cwd` is communicated to the agent through ITS
- * OWN kickoff instructions instead, explicitly telling it to `cd` there
- * before anything else — since with the process actually launched at
- * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
- * PROJECT's own file (if any), never butchr's generated one.
+ * bookkeeping directory (`dir` below); `cwd` is communicated to the agent
+ * through ITS OWN kickoff instructions instead, explicitly telling it to
+ * `cd` there before anything else — since with the process actually
+ * launched at `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to
+ * the PROJECT's own file (if any), never butchr's generated one.
  *
  * FACTORY-1036: this branch USED TO inline the definition's entire `brief`
  * (its whole prompt/role) into this one argv positional, flattened to a
@@ -172,25 +172,35 @@ export function inventoryCodexMcp(
  * here until a managed session with a long brief hit it. It no longer does:
  * `buildWorkspace` already writes that SAME `spec.brief` to this
  * workspace's own `brief.md` (via `ruleBrief`, src/agents/workspace.ts) for
- * EVERY spec that sets it, cwd or not, so pointing at CLAUDE.md here reaches
- * the exact same content on disk instead of duplicating it into argv. The
- * agent still learns its real working directory from this one short
- * sentence — the one thing that MUST be in the kickoff itself, since
- * `spec.cwd` is never the launched process's own OS cwd (see above) and so
- * cannot be discovered by reading a file in the directory Claude actually
- * started in.
+ * EVERY spec that sets it, cwd or not. An EARLIER version of this fix just
+ * said "cd there... then follow your CLAUDE.md" — PR #829 review (round 1,
+ * blocking) caught that this is broken: the agent is told to `cd` to
+ * `spec.cwd` BEFORE it has actually read brief.md, and CLAUDE.md's own text
+ * names brief.md with a bare RELATIVE reference ("in this directory") — so
+ * by the time the agent gets around to opening it, its shell/tool cwd is
+ * `spec.cwd` (the operator's own project directory), not `dir`, and a
+ * relative "brief.md" read there either 404s or — worse — silently opens an
+ * unrelated file the operator's own project happens to have at that name.
+ * `dir` is threaded in here explicitly so the kickoff can name ABSOLUTE
+ * paths to both generated files, correct regardless of the agent's current
+ * shell cwd or read/cd ordering — the one thing a bare "follow your
+ * CLAUDE.md" pointer cannot be, once the agent is told to leave `dir`.
  *
  * FACTORY-892: this is the ONE function every start path (the real spawn
  * path's `kickoff` callback into `ManagedHerdrLifecycle.start()`, and
  * `agentStartParams`/`spawnArgs` below) calls to get the prompt that becomes
  * `args[0]` of `agent.start` — `assertSafeStartArgv` below is still a
- * backstop even though `spec.cwd` (a butchr/operator-controlled filesystem
- * path, never raw operator prose) is far less likely to carry a control
- * character than the raw brief text this branch used to inline.
+ * backstop even though `dir`/`spec.cwd` (butchr/operator-controlled
+ * filesystem paths, never raw operator prose) are far less likely to carry a
+ * control character than the raw brief text this branch used to inline.
  */
-export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
+export const kickoffFor = (provider: AgentProvider, dir: string, spec?: SpawnSpec): string => {
   const base = provider === "claude" ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
-  const prompt = spec?.cwd && spec.brief ? `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then ${base}` : base;
+  const instructionFile = provider === "claude" ? "CLAUDE.md" : "AGENTS.md";
+  const prompt =
+    spec?.cwd && spec.brief
+      ? `Read ${dir}/${instructionFile} and ${dir}/brief.md for your butchr instructions, then cd to ${spec.cwd} — your real working directory for this task — before doing anything else.`
+      : base;
   assertSafeStartArgv([prompt]);
   return prompt;
 };
@@ -376,7 +386,7 @@ export function agentStartParams(
   spec: SpawnSpec, dir: string, paneId: string, name: string,
   agent: AgentConfig = { provider: "claude" }, mcpUrl = "http://localhost:7717/mcp",
 ): ParamsOf<"agent.start"> {
-  const params = buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, spec) });
+  const params = buildAgentStartParams({ ...agentLaunchConfig(spec, dir, paneId, name, agent, mcpUrl), prompt: kickoffFor(agent.provider, dir, spec) });
   if (agent.provider === "claude" && agent.resumeSessionId) {
     params.args = [...(params.args ?? []), "--resume", agent.resumeSessionId];
   }

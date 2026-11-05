@@ -196,7 +196,14 @@ describe("HerdrHerd", () => {
     });
     expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
     expect(f.started[0].args[0]).toContain(absPath("repo", "some-project"));
-    expect(f.started[0].args[0]).toContain("CLAUDE.md");
+    // PR #829 review (round 1, blocking): the kickoff must name the REAL
+    // bookkeeping dir by absolute path for both generated files — not just
+    // the bare word "CLAUDE.md" — since the agent is told to cd to
+    // spec.cwd and CLAUDE.md's own text points at brief.md with a bare
+    // relative path.
+    const bookkeepingDir = workspaceDirFor(key);
+    expect(f.started[0].args[0]).toContain(`${bookkeepingDir}/CLAUDE.md`);
+    expect(f.started[0].args[0]).toContain(`${bookkeepingDir}/brief.md`);
     expect(f.started[0].args[0]).not.toContain("Keep this repo's docs and dependency versions current.");
   });
   test("paneFor resolves the current pane, or null when not running", async () => {

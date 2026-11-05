@@ -1719,11 +1719,13 @@ export class HerdrHerd implements Herd {
       ...(ownedContinuation?{continuation:ownedContinuation}:{}),
       // BUTCHR-408 review fix: `spec`-aware, not the bare `kickoffFor`
       // reference — see `kickoffFor`'s own doc comment (src/agents/argv.ts)
-      // for why a spec with `cwd` needs its OWN kickoff (told to `cd` into
-      // its real working directory, then follow its definition's own
-      // brief — the launched process itself still starts at the ordinary
-      // bookkeeping directory). Every other spec (no `cwd`) is unaffected.
-      kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, spec),
+      // for why a spec with `cwd` needs its OWN kickoff (told where to find
+      // its generated CLAUDE.md/brief.md by ABSOLUTE path, then to `cd` into
+      // its real working directory — the launched process itself still
+      // starts at the ordinary bookkeeping directory, `workspaceDirFor`
+      // below, independent of `provider`). Every other spec (no `cwd`) is
+      // unaffected.
+      kickoff: (provider) => this.rollout?WORKER_CANARY_KICKOFF:kickoffFor(provider, workspaceDirFor(spec.key), spec),
       prepare: async provider => {
         const selected: AgentConfig = { ...this.agent, provider };
         if (provider !== this.agent.provider) delete selected.model;

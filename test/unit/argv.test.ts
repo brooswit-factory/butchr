@@ -277,10 +277,14 @@ describe("FACTORY-892: control-character pre-flight guard", () => {
   test("FACTORY-1036: kickoffFor stays short and brief-content-free even for a huge/multi-line/control-character-laden spec.brief — the previous 5,970-byte kickoff can no longer recur", () => {
     const hugeBrief = "Line one.\nLine two.\r\nThird line.\0with a NUL.\n".repeat(200); // ~6KB, same order of magnitude as the incident's 5,970 bytes
     expect(hugeBrief.length).toBeGreaterThan(5_970);
-    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: hugeBrief };
+    // Realistic-length absolute paths, not short fixtures — the byte-bound
+    // assertion below must hold against actual bookkeeping-dir/cwd lengths,
+    // not just trivially pass because the fixture paths happen to be short.
+    const dir = "/home/booswrit/butchr-workspaces/filesystem/repos/some-encoded-resource-identifier";
+    const cwdSpec = { ...spec, cwd: "/home/booswrit/code/some-operator-project/nested/working-directory", brief: hugeBrief };
     for (const provider of ["claude", "codex", "agy"] as const) {
-      const prompt = kickoffFor(provider, cwdSpec);
-      expect(prompt.length).toBeLessThan(300);
+      const prompt = kickoffFor(provider, dir, cwdSpec);
+      expect(prompt.length).toBeLessThan(500);
       expect(prompt).not.toContain("\n");
       expect(prompt).not.toContain("\r");
       expect(prompt).not.toContain("\0");
@@ -290,9 +294,27 @@ describe("FACTORY-892: control-character pre-flight guard", () => {
     }
   });
 
+  // PR #829 review (round 1, blocking): the managed-session kickoff must
+  // name the bookkeeping dir by ABSOLUTE path, for both generated files —
+  // the agent is told to `cd` to spec.cwd, and CLAUDE.md's own text refers
+  // to brief.md with a bare relative path ("in this directory"), so without
+  // an absolute path here the agent cannot reliably locate either file once
+  // it has moved to its real working directory.
+  test("FACTORY-1036 (PR #829 review): the managed-session kickoff names the bookkeeping dir by absolute path for both CLAUDE.md/AGENTS.md and brief.md", () => {
+    const dir = "/home/booswrit/butchr-workspaces/filesystem/repos/some-resource";
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
+    const claudePrompt = kickoffFor("claude", dir, cwdSpec);
+    expect(claudePrompt).toContain(`${dir}/CLAUDE.md`);
+    expect(claudePrompt).toContain(`${dir}/brief.md`);
+    expect(claudePrompt).toContain(cwdSpec.cwd);
+    const agentsPrompt = kickoffFor("codex", dir, cwdSpec);
+    expect(agentsPrompt).toContain(`${dir}/AGENTS.md`);
+    expect(agentsPrompt).toContain(`${dir}/brief.md`);
+  });
+
   test("kickoffFor without cwd/brief still returns the ordinary single-line kickoff for every provider", () => {
     for (const provider of ["claude", "codex", "agy"] as const) {
-      const prompt = kickoffFor(provider, spec);
+      const prompt = kickoffFor(provider, "/w/KAN-783", spec);
       expect(controlCharStartArgs([prompt])).toEqual([]);
     }
   });
