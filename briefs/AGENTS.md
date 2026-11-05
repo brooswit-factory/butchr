@@ -12,3 +12,5 @@ connection failure rather than assuming a Claude startup warning applies.
 {{GROUND_TRUTH}}
 
 The same block is also in `ENVIRONMENT.md` in this directory, unchanged.
+
+<!-- include: briefs/_before-you-stop.md -->

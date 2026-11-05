@@ -3,7 +3,7 @@ import { readFileSync, existsSync, rmSync, writeFileSync, statSync, chmodSync, m
 import { join, resolve } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, type SpawnSpec } from "../../src/agents/workspace.js";
+import { briefFor, interpolate, modelFor, effortFor, assertNoInheritedMcpConfig, buildWorkspace, writePreLaunchClaudeFiles, agentIdOfWorkspacePath, ensureWorkspaceDir, isValidLeaf, newLayoutDirFor, readBookkeptAgentKey, writeBookkeptAgentKey, FILESYSTEM_TOOLS_NOTE, mcpIdentityHeaders, resolveMcpServerHeaders, resourceKeyOf, ruleAgentIdOfWorkspacePath, singleResourceOf, workspaceDirFor, workspaceMcpServers, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, workspaceRoot, BEFORE_YOU_STOP_INCLUDE_MARKER, type SpawnSpec } from "../../src/agents/workspace.js";
 import { agentLaunchConfig } from "../../src/agents/argv.js";
 import { encodeAgentKey, encodeQueryAgentKey } from "../../src/rules/agent-key.js";
 import { MAX_ENCODED_SEGMENT_BYTES } from "../../src/resources/filesystem-ref.js";
@@ -396,6 +396,77 @@ describe("buildWorkspace", () => {
       if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
       else process.env.BUTCHR_WORKSPACES = previous;
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-1036: CLAUDE.md/AGENTS.md now also carry the shared
+  // before-you-stop section (previously only brief.md did, plus a SEPARATE
+  // copy duplicated into the launch kickoff argv — see argv.test.ts) —
+  // resolved, never the literal include marker leaking to the agent.
+  test("FACTORY-1036: CLAUDE.md and AGENTS.md carry the resolved before-you-stop section, not the literal include marker", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-stop-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const spec = { key: "KAN-11", issuetype: "Task", summary: "s", parent: null };
+      const claudeDir = buildWorkspace(spec, "http://x/mcp", "claude");
+      const claudeMd = readFileSync(join(claudeDir, "CLAUDE.md"), "utf8");
+      expect(claudeMd).toMatch(/before you stop or go idle/i);
+      expect(claudeMd).not.toContain(BEFORE_YOU_STOP_INCLUDE_MARKER);
+
+      const agyKey = "KAN-12";
+      const agentsDir = buildWorkspace({ ...spec, key: agyKey }, "http://x/mcp", "agy");
+      const agentsMd = readFileSync(join(agentsDir, "AGENTS.md"), "utf8");
+      expect(agentsMd).toMatch(/before you stop or go idle/i);
+      expect(agentsMd).not.toContain(BEFORE_YOU_STOP_INCLUDE_MARKER);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-1036: the freeform ("project resource agent") CLAUDE.md variant
+  // is a separate literal, not `interpolate(RESOLVED_CLAUDE_MD, ...)` — it
+  // must carry the same shared section too, resolved the same way.
+  test("FACTORY-1036: the freeform jira-project CLAUDE.md also carries the resolved before-you-stop section", () => {
+    const previous = process.env.BUTCHR_WORKSPACES;
+    const root = mkdtempSync(join(tmpdir(), "bw-stop-freeform-"));
+    process.env.BUTCHR_WORKSPACES = root;
+    try {
+      const key = encodeAgentKey({ resourceProvider: "jira-project", ruleId: "project-managers", resourceId: "GK" });
+      const spec: SpawnSpec = { key, issuetype: "Project", summary: "s", parent: null };
+      const dir = buildWorkspace(spec, "http://x/mcp", "claude");
+      const claudeMd = readFileSync(join(dir, "CLAUDE.md"), "utf8");
+      expect(claudeMd).toContain("free-form assistant for project");
+      expect(claudeMd).toMatch(/before you stop or go idle/i);
+      expect(claudeMd).not.toContain(BEFORE_YOU_STOP_INCLUDE_MARKER);
+    } finally {
+      if (previous === undefined) delete process.env.BUTCHR_WORKSPACES;
+      else process.env.BUTCHR_WORKSPACES = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // FACTORY-1036: writePreLaunchClaudeFiles is now the ONE pre-launch step
+  // for every file Claude reads as content on its first turn — not just
+  // mcp.json/the veto hook (see test/unit/claude-hooks.test.ts for that
+  // half). Exercised standalone (no buildWorkspace call at all), the same
+  // way `resumeInPlaceExclusive` (herd.ts) calls it directly before a
+  // `--resume` relaunch.
+  test("FACTORY-1036: writePreLaunchClaudeFiles writes CLAUDE.md, brief.md, and ENVIRONMENT.md too, standalone — the same files buildWorkspace writes, for the resume path that never calls buildWorkspace first", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wplcf-"));
+    try {
+      const spec: SpawnSpec = { key: "KAN-13", issuetype: "Task", summary: "preload before resume", parent: null };
+      writePreLaunchClaudeFiles(dir, spec, "http://x/mcp");
+      expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toMatch(/before you stop or go idle/i);
+      const brief = readFileSync(join(dir, "brief.md"), "utf8");
+      expect(brief).toContain("KAN-13");
+      expect(brief).toContain("preload before resume");
+      expect(existsSync(join(dir, "ENVIRONMENT.md"))).toBe(true);
+      expect(existsSync(join(dir, "mcp.json"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

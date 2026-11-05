@@ -57,16 +57,23 @@ describe("spawnArgs", () => {
     expect(codexArgs).not.toContain("--strict-mcp-config");
   });
 
-  test("PR #394 review fix (round 3): a spec with cwd set gets a kickoff that names its own working directory AND its own brief — both vendors — never the bare \"follow your CLAUDE.md/AGENTS.md\", which would be ambiguous about where the agent should actually work", () => {
+  // FACTORY-1036: this used to inline the ENTIRE brief text into args[0] —
+  // exactly the unbounded-argv shape that produced the 5,970-byte kickoff
+  // this ticket fixes. The brief itself still reaches the agent (buildWorkspace
+  // writes it to this workspace's own brief.md, see workspace.test.ts), so
+  // the kickoff only needs to name the real working directory and point at
+  // CLAUDE.md/AGENTS.md — never the bare "follow your CLAUDE.md/AGENTS.md"
+  // with no cd instruction, which would be ambiguous about where to work.
+  test("FACTORY-1036: a spec with cwd set gets a short kickoff naming its own working directory and pointing at CLAUDE.md/AGENTS.md — never the raw brief text inlined into argv", () => {
     const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
     const claudeArgs = spawnArgs(cwdSpec, "/w/KAN-783");
     expect(claudeArgs[0]).toContain("/repo/some-project");
-    expect(claudeArgs[0]).toContain("Keep this repo's docs current.");
-    expect(claudeArgs[0]).not.toContain("CLAUDE.md");
+    expect(claudeArgs[0]).toContain("CLAUDE.md");
+    expect(claudeArgs[0]).not.toContain("Keep this repo's docs current.");
     const codexArgs = spawnArgs(cwdSpec, "/w/KAN-783", { provider: "codex" });
     expect(codexArgs[0]).toContain("/repo/some-project");
-    expect(codexArgs[0]).toContain("Keep this repo's docs current.");
-    expect(codexArgs[0]).not.toContain("AGENTS.md");
+    expect(codexArgs[0]).toContain("AGENTS.md");
+    expect(codexArgs[0]).not.toContain("Keep this repo's docs current.");
   });
 
   test("PR #394 review fix (round 3): a spec with cwd set is STILL launched with its process cwd at the ordinary bookkeeping directory, never at spec.cwd — see SpawnSpec.cwd's own doc comment for why (Drovr's launch.cwd===workspace.cwd invariant, and runningIssues()'s agentIdOfWorkspacePath-based residency)", () => {
@@ -232,36 +239,54 @@ describe("FACTORY-892: control-character pre-flight guard", () => {
     for (const ok of [" ", "hello world", ""]) expect(controlCharStartArgs([ok])).toEqual([]);
   });
 
-  test("KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT are one line each, with the required reminder text, and pass the guard", () => {
+  // FACTORY-1036: the shared before-you-stop reminder no longer lives in
+  // these constants at all (it is generated into CLAUDE.md/AGENTS.md
+  // instead — see test/unit/before-you-stop-coverage.test.ts), so this test
+  // now pins the OPPOSITE of what its pre-FACTORY-1036 name claimed: short,
+  // fixed, reminder-free kickoff text.
+  test("FACTORY-1036: KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT are short, fixed strings with no shared-section reminder appended, and still pass the guard", () => {
+    expect(KICKOFF_PROMPT).toBe("follow your CLAUDE.md.");
+    expect(AGENTS_KICKOFF_PROMPT).toBe("follow your AGENTS.md.");
     for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
+      expect(prompt.length).toBeLessThan(100);
       expect(prompt).not.toContain("\n");
       expect(controlCharStartArgs([prompt])).toEqual([]);
       expect(() => assertSafeStartArgv([prompt])).not.toThrow();
     }
   });
 
-  // FACTORY-940: briefs/_before-you-stop.md starts with a Markdown `##`
-  // heading; flattening to one line must strip that marker rather than just
-  // collapsing the newlines around it, or the kickoff reads literally as
-  // "follow your CLAUDE.md. ## Before you stop or go idle Before you stop …".
-  test("FACTORY-940: KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT never carry a leading Markdown heading marker from the shared section", () => {
+  // FACTORY-940's own regression (a leaked Markdown "##" from the shared
+  // section) can no longer happen at all now that no shared-section text is
+  // appended — kept as a historical guard against ever re-introducing that
+  // append by accident.
+  test("FACTORY-940 (now trivially true post-FACTORY-1036): KICKOFF_PROMPT and AGENTS_KICKOFF_PROMPT never carry a leading Markdown heading marker", () => {
     for (const prompt of [KICKOFF_PROMPT, AGENTS_KICKOFF_PROMPT]) {
       expect(prompt).not.toContain("##");
       expect(prompt).not.toMatch(/(^|\s)#{1,6}\s/);
     }
   });
 
-  // The latent case FACTORY-891's review flagged: kickoffFor's second
-  // branch (spec.cwd + spec.brief) builds its own prompt string, independent
-  // of the two KICKOFF_PROMPT constants above, and must flatten/guard it too.
-  test("kickoffFor flattens a multi-line spec.brief to one line and the result passes the guard — table-driven over every provider", () => {
-    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Line one.\nLine two.\r\nLine three." };
+  // FACTORY-1036: kickoffFor's cwd+brief branch used to inline the ENTIRE
+  // brief (flattened to one line) into args[0] — unbounded by the brief's
+  // own size, exactly the shape of the 5,970-byte kickoff this ticket fixes
+  // (reconstructed here at roughly that scale, plus control characters a
+  // flatten step would have had to strip). It no longer does: the brief
+  // reaches the agent via its own brief.md (buildWorkspace/ruleBrief, see
+  // workspace.test.ts) instead, so the kickoff stays short regardless of
+  // brief size or content — table-driven over every provider.
+  test("FACTORY-1036: kickoffFor stays short and brief-content-free even for a huge/multi-line/control-character-laden spec.brief — the previous 5,970-byte kickoff can no longer recur", () => {
+    const hugeBrief = "Line one.\nLine two.\r\nThird line.\0with a NUL.\n".repeat(200); // ~6KB, same order of magnitude as the incident's 5,970 bytes
+    expect(hugeBrief.length).toBeGreaterThan(5_970);
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: hugeBrief };
     for (const provider of ["claude", "codex", "agy"] as const) {
       const prompt = kickoffFor(provider, cwdSpec);
+      expect(prompt.length).toBeLessThan(300);
       expect(prompt).not.toContain("\n");
       expect(prompt).not.toContain("\r");
-      expect(prompt).toContain("Line one. Line two. Line three.");
+      expect(prompt).not.toContain("\0");
+      expect(prompt).not.toContain("Line one");
       expect(controlCharStartArgs([prompt])).toEqual([]);
+      expect(() => assertSafeStartArgv([prompt])).not.toThrow();
     }
   });
 
@@ -270,15 +295,6 @@ describe("FACTORY-892: control-character pre-flight guard", () => {
       const prompt = kickoffFor(provider, spec);
       expect(controlCharStartArgs([prompt])).toEqual([]);
     }
-  });
-
-  // The guard is a BACKSTOP, not just a flattening exercise: a control
-  // character that flattening's \s+ collapse does not touch (a bare NUL is
-  // not whitespace) must still surface as a loud butchr-side error here,
-  // not an opaque herdr invalid_agent_argument 4xx three layers down.
-  test("kickoffFor throws butchr's own error for a spec.brief control character that flattening cannot remove", () => {
-    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "before\0after" };
-    expect(() => kickoffFor("claude", cwdSpec)).toThrow(/control character/);
   });
 
   // Table-driven over every provider AND both spec shapes the ticket names

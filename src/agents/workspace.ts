@@ -220,6 +220,39 @@ const BRIEF_BY_TYPE: Readonly<Record<string, string>> = {
 };
 
 /**
+ * FACTORY-1036: `briefs/CLAUDE.md`/`briefs/AGENTS.md` now carry the shared
+ * before-you-stop include too (not just the tier briefs above) — resolved
+ * ONCE here, the same discipline as `BRIEF_BY_TYPE`. This is what lets
+ * `src/agents/argv.ts` stop duplicating that text into the launch kickoff
+ * argv: the agent now sees it in CLAUDE.md/AGENTS.md on every (re)launch
+ * this file's own `writePreLaunchClaudeFiles`/`buildWorkspace` write it
+ * before — fresh spawn, crash/respawn, AND in-place `--resume` — never only
+ * on the first turn's own kickoff text. See `writePreLaunchClaudeFiles`'s
+ * own doc comment below for what this guarantees and what it does not.
+ */
+export const RESOLVED_CLAUDE_MD = resolveIncludes(CLAUDE_MD);
+export const RESOLVED_AGENTS_MD = resolveIncludes(AGENTS_MD);
+
+/**
+ * The freeform ("project resource agent") landing page `buildWorkspace`/
+ * `writePreLaunchClaudeFiles` write for a `jira-project`-keyed spec, for
+ * EITHER vendor (byte-identical today, same as before this ticket) — a
+ * template, not a literal, so `{{KEY}}` is filled per spec via `interpolate()`
+ * exactly like every other CLAUDE.md/AGENTS.md variant, and so it can carry
+ * the SAME before-you-stop include every other variant now does (FACTORY-1036)
+ * — safe here too: that shared section's own opening paragraph already
+ * tells a project-resource agent to skip the issue-transition rules entirely.
+ */
+const FREEFORM_INSTRUCTIONS_TEMPLATE = resolveIncludes(`# Project resource agent
+
+You are a free-form assistant for project {{KEY}}. Read brief.md for the operator's instructions.
+No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by this role.
+Await direction if your brief does not assign work. Preserve sandbox and approval review.
+
+${BEFORE_YOU_STOP_INCLUDE_MARKER}
+`);
+
+/**
  * BUTCHR-169: every placeholder `interpolate()` is capable of substituting
  * into a workspace file — the type-level door `src/workspace/registry.ts`
  * mirrors (see that file's header for the rule this joins, and why the
@@ -827,18 +860,74 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
 }
 
 /**
- * FACTORY-625: the ONE pre-launch step for a Claude workspace — everything
- * Claude reads as real file content on its first post-launch turn.
+ * FACTORY-1036: CLAUDE.md, brief.md, and ENVIRONMENT.md for a Claude
+ * workspace — pulled out of `buildWorkspace` so `writePreLaunchClaudeFiles`
+ * can write them BEFORE an in-place `--resume` relaunch too, not just on a
+ * fresh spawn (see that function's own doc comment for the full ordering
+ * story). Byte-identical content to what `buildWorkspace` always wrote for
+ * `provider === "claude"` — this only moves WHEN it is written and WHO can
+ * call it, never WHAT gets written. `buildWorkspace` itself now calls this
+ * (via `writePreLaunchClaudeFiles`) for Claude and writes the Codex/Agy
+ * equivalents (AGENTS.md) directly for every other provider, since those
+ * have no resume-in-place mechanism of their own to preload for (FACTORY-314:
+ * "this ticket's --resume mechanism covers Claude only").
+ */
+function writeClaudeInstructionFiles(dir: string, spec: SpawnSpec, mcpUrl: string): void {
+  const resource = resourceOfSpec(spec);
+  const view: SpawnSpec = { ...spec, key: resource };
+  const freeform = providerOf(spec) === "jira-project";
+  const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
+  writeFileSync(join(dir, "CLAUDE.md"), freeform ? interpolate(FREEFORM_INSTRUCTIONS_TEMPLATE, view) : interpolate(RESOLVED_CLAUDE_MD, view, groundTruth));
+  writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
+  writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
+}
+
+/**
+ * FACTORY-625/FACTORY-1036: the ONE pre-launch step for a Claude workspace —
+ * everything Claude reads as real file content on its first post-launch OR
+ * post-resume turn: `mcp.json`, the file-execution-veto hook, AND (as of
+ * FACTORY-1036) the instruction files themselves — CLAUDE.md, brief.md, and
+ * ENVIRONMENT.md.
  *
  * This exists because there are TWO launch paths and they had drifted. A fresh
- * spawn runs the whole of `buildWorkspace`; a RESUME (herd.ts) relaunches
- * `--resume` into an existing workspace, writes only `mcp.json` before the
- * relaunch, and calls `buildWorkspace` only AFTER the relaunch is verified. So
- * anything written solely by `buildWorkspace` is absent for the entire first
- * turn of every resumed session — which for a safety hook means a resumed
- * agent runs UNHOOKED, silently, exactly the direction that must never fail.
- * Both paths call this one function instead, so a file added here cannot be
- * added to one path and forgotten in the other.
+ * spawn runs the whole of `buildWorkspace`, which (for `provider === "claude"`)
+ * delegates its OWN instruction-file writes to this function rather than
+ * duplicating them — see `buildWorkspace`'s own doc comment. A RESUME
+ * (herd.ts's `resumeInPlaceExclusive`) relaunches `--resume` into an EXISTING
+ * workspace and calls `buildWorkspace` only AFTER the relaunch is verified
+ * (deliberately — see that call site's own doc comment on why the OTHER,
+ * staleness-bookkeeping files `buildWorkspace` also writes — model/effort/
+ * permission-mode/strict-mcp-config/lizard-mode/mcpServers — must stay gated
+ * on confirmed success). Before FACTORY-1036, this function wrote only
+ * `mcp.json` and the veto hook before that relaunch, so a resumed session's
+ * first turn could read STALE CLAUDE.md/brief.md/ENVIRONMENT.md content —
+ * whatever an earlier launch of this same workspace had written, not
+ * necessarily what the CURRENT spec/ground-truth/brief would produce today.
+ * Both paths now call this ONE function for every file Claude reads as
+ * content, so a file added here cannot be added to one path and forgotten in
+ * the other, and a resumed agent's first turn sees exactly what a fresh one
+ * would.
+ *
+ * What this guarantees, and what it does not (ticket AC: "do not claim
+ * instructions are enforced merely because a file exists"): this function
+ * guarantees the FILE CONTENT is current at the moment of every (re)launch
+ * this daemon performs — fresh spawn, crash/respawn, and in-place `--resume`
+ * alike — covered by this module's own tests and `herd.test.ts`'s resume
+ * fixtures. It does NOT guarantee Claude Code re-reads CLAUDE.md mid-session
+ * on its own: an already-running agent that never relaunches will not pick up
+ * a CLAUDE.md edit until its NEXT (re)launch. That is the documented
+ * (https://code.claude.com/docs/en/memory), not independently re-verified
+ * here, basis for moving the shared before-you-stop text out of the
+ * once-per-launch kickoff argv (`src/agents/argv.ts`'s `KICKOFF_PROMPT`) and
+ * into CLAUDE.md instead: CLAUDE.md is loaded as the agent's own memory/
+ * system context at process start — including a `--resume` relaunch, which
+ * is itself a fresh process — rather than as part of the compactable
+ * conversation transcript a long session's own context compaction can push
+ * out from under a kickoff-argv-only copy of this text. See
+ * `docs/claude-md-reload-contract.md` for the full statement of what is
+ * measured here versus relied on from the runtime, and the actual
+ * limitation (launch-boundary freshness only — never a live mid-session
+ * hot-reload).
  *
  * `vetoEnabled: false` still runs the installer: it is what REMOVES a
  * previously installed hook (see `installFileExecutionVeto`), so turning the
@@ -853,6 +942,7 @@ export function writeClaudeMcpJson(dir: string, spec: SpawnSpec, mcpUrl: string)
 let lastVetoUnavailableReason: string | undefined;
 export function writePreLaunchClaudeFiles(dir: string, spec: SpawnSpec, mcpUrl: string, opts: { auditPath?: string; root?: string; vetoEnabled?: boolean; python?: PythonCheck } = {}): void {
   writeClaudeMcpJson(dir, spec, mcpUrl);
+  writeClaudeInstructionFiles(dir, spec, mcpUrl);
   const root = opts.root ?? workspaceRoot();
   let vetoEnabled = opts.vetoEnabled ?? true;
   if (vetoEnabled) {
@@ -974,16 +1064,23 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
     const agyJson = isQuerySpec(spec) ? { agent: spec.key, mcpUrl } : isKeyOnly(spec) ? { agent: spec.key, resource, mcpUrl } : { issue: resource, ...(spec.resource ? { agent: spec.key } : {}), mcpUrl };
     writeFileSync(join(dir, ".butchr-agy.json"), JSON.stringify(agyJson, null, 2));
   }
-  const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
-  writeFileSync(join(dir, provider === "claude" ? "CLAUDE.md" : "AGENTS.md"), freeform ? `# Project resource agent
-
-You are a free-form assistant for project ${resource}. Read brief.md for the operator's instructions.
-No ticket, Confluence page, task hierarchy, or autonomous workflow is implied by this role.
-Await direction if your brief does not assign work. Preserve sandbox and approval review.
-` : interpolate(provider === "claude" ? CLAUDE_MD : AGENTS_MD, view, groundTruth));
-  writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
-  if (provider === "claude") writePreLaunchClaudeFiles(dir, spec, mcpUrl);
-  writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
+  // FACTORY-1036: for Claude, `writePreLaunchClaudeFiles` now writes
+  // CLAUDE.md/brief.md/ENVIRONMENT.md itself (via `writeClaudeInstructionFiles`)
+  // — the SAME writer `resumeInPlaceExclusive` (herd.ts) calls directly
+  // before an in-place `--resume` relaunch, so a fresh spawn and a resume
+  // produce byte-identical instruction files for the same spec. Codex/Agy
+  // have no resume-in-place mechanism of their own (FACTORY-314: "this
+  // ticket's --resume mechanism covers Claude only"), so they keep writing
+  // their AGENTS.md/brief.md/ENVIRONMENT.md directly here, unchanged from
+  // before this ticket.
+  if (provider === "claude") {
+    writePreLaunchClaudeFiles(dir, spec, mcpUrl);
+  } else {
+    const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));
+    writeFileSync(join(dir, "AGENTS.md"), freeform ? interpolate(FREEFORM_INSTRUCTIONS_TEMPLATE, view) : interpolate(RESOLVED_AGENTS_MD, view, groundTruth));
+    writeFileSync(join(dir, "brief.md"), spec.brief !== undefined ? ruleBrief(spec, view) : interpolate(briefFor(spec.issuetype), view));
+    writeFileSync(join(dir, "ENVIRONMENT.md"), groundTruth);
+  }
   return dir;
 }
 

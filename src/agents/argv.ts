@@ -9,8 +9,6 @@ import {
   type ManagedAgentLaunch,
   type ParamsOf,
 } from "@brooswit/drovr";
-// Bun embeds this at build time, so the built binary carries it — same discipline as workspace.ts's own briefs/*.md imports.
-import BEFORE_YOU_STOP from "../../briefs/_before-you-stop.md" with { type: "text" };
 
 /**
  * FACTORY-892: herdr's `agent.start` rejects any start argument containing a
@@ -46,40 +44,32 @@ export function assertSafeStartArgv(args: readonly string[]): void {
 }
 
 /**
- * FACTORY-940: `briefs/_before-you-stop.md` (and any other hand-written
- * Markdown source this feeds) opens with a `#`-style heading — stripped here
- * so it never survives flattening as a literal `##` sitting mid-sentence.
- * Only a LEADING marker is touched; the rest of the text is untouched.
+ * FACTORY-1036: the kickoff prompt is now this short, FIXED string — no
+ * shared-section text appended. Before this ticket, this constant was
+ * `` `follow your CLAUDE.md. ${flattened _before-you-stop.md text}` ``: a
+ * multi-hundred-to-several-thousand-byte string living in `args[0]` of every
+ * `agent.start` call (FACTORY-735/739's own design, hardened by FACTORY-892's
+ * control-character guard and FACTORY-940's heading-marker strip). That
+ * design is what produced the 5,970-byte kickoff command a canonical-PTY
+ * input path truncated at 4095 bytes (see FACTORY-1036's own incident
+ * evidence) — the reminder text was duplicated into argv SOLELY so it would
+ * survive a long session's own context compaction and still be visible at
+ * stop-or-idle time, reasoning that no longer applies now that the SAME
+ * text is also generated into CLAUDE.md/AGENTS.md before every (re)launch
+ * (`src/agents/workspace.ts`'s `writePreLaunchClaudeFiles`/`buildWorkspace`,
+ * via `BEFORE_YOU_STOP_INCLUDE_MARKER`) — loaded as the agent's own memory/
+ * system context at process start (including a `--resume` relaunch, itself a
+ * fresh process), not as part of the compactable conversation transcript a
+ * kickoff-argv-only copy was vulnerable to. See `writePreLaunchClaudeFiles`'s
+ * own doc comment for exactly what is guaranteed here and what is not (a
+ * documented runtime property, not independently re-verified in this repo).
+ * `kickoffFor` below (the managed-session branch) no longer inlines a rule's
+ * own `spec.brief` into argv either, for the identical reason — see its own
+ * doc comment.
  */
-const MARKDOWN_LEADING_LINE_MARKER = /^(?:#{1,6}|>+|[-*+]|\d+\.)\s+/;
-
-/** Collapses all whitespace (including newlines) to single spaces, so the result is always safe as ONE start argument. */
-const flattenToSingleLine = (text: string): string =>
-  text.trim().replace(MARKDOWN_LEADING_LINE_MARKER, "").replace(/\s+/g, " ");
-
-/**
- * FACTORY-735/FACTORY-739: the shared "before you stop" reminder appended to
- * every kickoff prompt below, so it is in context from the agent's very
- * first turn — not just inside `brief.md` (which a long session's own
- * context compaction can push out) — and so it is still there at the moment
- * the agent is deciding whether to stop or go idle. Same shared source
- * (`briefs/_before-you-stop.md`) `src/agents/workspace.ts`'s own
- * `BEFORE_YOU_STOP_INCLUDE_MARKER` resolves into every `briefs/*.md`
- * template — this is the SECOND of the two places FACTORY-735 requires the
- * text to land, not a competing copy of it.
- *
- * FACTORY-892: flattened to one line (`flattenToSingleLine`, not just
- * `.trim()`) — `briefs/_before-you-stop.md` is hand-wrapped Markdown with
- * real newlines mid-sentence, and a multi-line kickoff is exactly the
- * regression this ticket fixes. See `CONTROL_CHAR_PATTERN`'s own doc
- * comment above for why.
- */
-const KICKOFF_REMINDER = flattenToSingleLine(BEFORE_YOU_STOP);
-
-/** Claude Code's initial prompt, queued at startup and submitted once the startup dialogs are answered. ONE LINE — see FACTORY-892 above. */
-export const KICKOFF_PROMPT = `follow your CLAUDE.md. ${KICKOFF_REMINDER}`;
-/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above, same reminder appended. ONE LINE — see FACTORY-892 above. */
-export const AGENTS_KICKOFF_PROMPT = `follow your AGENTS.md. ${KICKOFF_REMINDER}`;
+export const KICKOFF_PROMPT = "follow your CLAUDE.md.";
+/** Codex/Agy's initial prompt — the non-Claude twin of `KICKOFF_PROMPT` above. See that constant's own doc comment for why this is short now. */
+export const AGENTS_KICKOFF_PROMPT = "follow your AGENTS.md.";
 /**
  * FACTORY-127/FACTORY-138 (operator decision, FACTORY-67 director comment
  * 2026-09-26 22:24Z): butchr's own default for a Claude launch whose spec
@@ -171,29 +161,36 @@ export function inventoryCodexMcp(
  * story) the spawned PROCESS's own launch cwd stays the ordinary
  * bookkeeping directory; `cwd` is communicated to the agent through ITS
  * OWN kickoff instructions instead, explicitly telling it to `cd` there
- * before anything else, followed by its definition's own `brief` (its
- * whole prompt/role) — since with the process actually launched at
+ * before anything else — since with the process actually launched at
  * `spec.cwd`, `"follow your CLAUDE.md"` there would resolve to the
- * PROJECT's own file (if any), never butchr's generated one, and the
- * definition's `brief` would never reach the agent at all.
+ * PROJECT's own file (if any), never butchr's generated one.
+ *
+ * FACTORY-1036: this branch USED TO inline the definition's entire `brief`
+ * (its whole prompt/role) into this one argv positional, flattened to a
+ * single line — operator/rule-authored text with no size bound of its own,
+ * exactly the shape of the 5,970-byte kickoff this ticket fixes, just latent
+ * here until a managed session with a long brief hit it. It no longer does:
+ * `buildWorkspace` already writes that SAME `spec.brief` to this
+ * workspace's own `brief.md` (via `ruleBrief`, src/agents/workspace.ts) for
+ * EVERY spec that sets it, cwd or not, so pointing at CLAUDE.md here reaches
+ * the exact same content on disk instead of duplicating it into argv. The
+ * agent still learns its real working directory from this one short
+ * sentence — the one thing that MUST be in the kickoff itself, since
+ * `spec.cwd` is never the launched process's own OS cwd (see above) and so
+ * cannot be discovered by reading a file in the directory Claude actually
+ * started in.
  *
  * FACTORY-892: this is the ONE function every start path (the real spawn
  * path's `kickoff` callback into `ManagedHerdrLifecycle.start()`, and
  * `agentStartParams`/`spawnArgs` below) calls to get the prompt that becomes
- * `args[0]` of `agent.start`. `spec.brief` is operator/rule-authored and can
- * be multi-line — the SAME class of break the two KICKOFF_PROMPT constants
- * had, just latent until a multi-line brief is used — so it is flattened
- * here too, and the result is asserted safe before it ever leaves this
- * function, as a backstop for any control character flattening doesn't
- * catch (e.g. a bare `\0`, which is not whitespace).
+ * `args[0]` of `agent.start` — `assertSafeStartArgv` below is still a
+ * backstop even though `spec.cwd` (a butchr/operator-controlled filesystem
+ * path, never raw operator prose) is far less likely to carry a control
+ * character than the raw brief text this branch used to inline.
  */
 export const kickoffFor = (provider: AgentProvider, spec?: SpawnSpec): string => {
-  const prompt =
-    spec?.cwd && spec.brief
-      ? `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then: ${flattenToSingleLine(spec.brief)}`
-      : provider === "claude"
-        ? KICKOFF_PROMPT
-        : AGENTS_KICKOFF_PROMPT;
+  const base = provider === "claude" ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
+  const prompt = spec?.cwd && spec.brief ? `Your working directory for this task is ${spec.cwd} — cd there before doing anything else. Then ${base}` : base;
   assertSafeStartArgv([prompt]);
   return prompt;
 };

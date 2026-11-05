@@ -175,7 +175,11 @@ describe("HerdrHerd", () => {
     expect(f2.started.length).toBe(0);
   });
 
-  test("PR #394 review fix (round 3): a spec with its own working directory (cwd set) spawns cleanly end-to-end through the REAL spawn path (HerdrHerd + Drovr's ManagedHerdrLifecycle, not a stub) — kickoff names both the working directory AND the brief, and the launched process itself stays at the ordinary bookkeeping workspace", async () => {
+  // FACTORY-1036: the kickoff used to inline the ENTIRE brief text — see
+  // this test's own name, pre-this-ticket. It no longer does (the brief
+  // reaches the agent via its own brief.md instead, see workspace.test.ts),
+  // so this now asserts the short cwd+CLAUDE.md-pointer kickoff instead.
+  test("PR #394 review fix (round 3) / FACTORY-1036: a spec with its own working directory (cwd set) spawns cleanly end-to-end through the REAL spawn path (HerdrHerd + Drovr's ManagedHerdrLifecycle, not a stub) — kickoff names the working directory and points at CLAUDE.md, never the raw brief text, and the launched process itself stays at the ordinary bookkeeping workspace", async () => {
     // Round 2 shipped a version where agentLaunchConfig's own `cwd` was `spec.cwd` directly. That
     // broke Drovr's ManagedHerdrLifecycle invariant (its `cwd` is FIXED to workspaceDirFor(issue) —
     // see herd.ts's own `lifecycle()` — and it throws "Launch does not match selected provider and
@@ -192,8 +196,8 @@ describe("HerdrHerd", () => {
     });
     expect(f.started.length).toBe(1); // did NOT throw — this is the regression this test exists to catch
     expect(f.started[0].args[0]).toContain(absPath("repo", "some-project"));
-    expect(f.started[0].args[0]).toContain("Keep this repo's docs and dependency versions current.");
-    expect(f.started[0].args[0]).not.toContain("CLAUDE.md");
+    expect(f.started[0].args[0]).toContain("CLAUDE.md");
+    expect(f.started[0].args[0]).not.toContain("Keep this repo's docs and dependency versions current.");
   });
   test("paneFor resolves the current pane, or null when not running", async () => {
     const f = fakeHerdr([{ name: "butchr-kan-5", pane_id: "w1:p5" }]);
@@ -3731,6 +3735,46 @@ describe("resumeInPlace", () => {
         expect(outcome).toBe("resumed");
         const mcpJson = JSON.parse(readFileSync(join(cwd, "mcp.json"), "utf8"));
         expect(mcpJson.mcpServers.chan1).toEqual({ type: "http", url: "http://example/mcp" });
+        expect(workspaceSessionId(cwd)).toBe("original-session");
+      });
+    });
+  });
+
+  // FACTORY-1036: before this ticket, `resumeInPlaceExclusive` wrote only
+  // mcp.json + the veto hook before a relaunch, and called the FULL
+  // `buildWorkspace()` (which also rewrites CLAUDE.md/brief.md/ENVIRONMENT.md)
+  // only AFTER the relaunch was confirmed alive — so a resumed session's
+  // ENTIRE first turn could read whatever CLAUDE.md/brief.md this workspace
+  // happened to have from an earlier launch, not necessarily what this
+  // spec/the current briefs would produce today. This proves the fix: the
+  // instruction files are already current the moment `resumeInPlace()`
+  // reports "resumed", the same way the FACTORY-411/424 test above proves it
+  // for mcp.json.
+  test("FACTORY-1036: resumeInPlace() rewrites CLAUDE.md, brief.md, and ENVIRONMENT.md BEFORE reporting resumed — a resumed session's first turn never reads stale instructions", async () => {
+    const { writeFileSync } = require("node:fs") as typeof import("node:fs");
+    await withTempWorkspaces(async () => {
+      const resource = absPath("etc", "defs", "factory-1036.json");
+      const key = encodeAgentKey({ resourceProvider: "filesystem", ruleId: "repos", resourceId: resource });
+      const cwd = ensureWorkspaceDir(key);
+      const spec = { key, issuetype: "Task" as const, summary: "FACTORY-1036 fresh summary", parent: null, resource };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const oldArgv = spawnArgs({ ...spec, summary: "" }, cwd);
+        await f.client.agent.start({ args: oldArgv });
+        f.started.length = 0;
+
+        // Simulate a workspace whose instruction files are stale — exactly
+        // what this workspace would look like on resume BEFORE this fix.
+        writeFileSync(join(cwd, "CLAUDE.md"), "STALE CLAUDE.md FROM AN EARLIER LAUNCH");
+        writeFileSync(join(cwd, "brief.md"), "STALE BRIEF FROM AN EARLIER LAUNCH");
+        writeFileSync(join(cwd, "ENVIRONMENT.md"), "STALE ENVIRONMENT FROM AN EARLIER LAUNCH");
+
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home));
+        const outcome = await herd.resumeInPlace(spec);
+        expect(outcome).toBe("resumed");
+        expect(readFileSync(join(cwd, "CLAUDE.md"), "utf8")).toMatch(/before you stop or go idle/i);
+        expect(readFileSync(join(cwd, "brief.md"), "utf8")).toContain("FACTORY-1036 fresh summary");
+        expect(readFileSync(join(cwd, "ENVIRONMENT.md"), "utf8")).not.toContain("STALE");
         expect(workspaceSessionId(cwd)).toBe("original-session");
       });
     });

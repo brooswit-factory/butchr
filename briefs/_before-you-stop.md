@@ -51,6 +51,18 @@ moving a blocked issue back to In Progress, confirm the blocker is actually
 resolved and authorized implementation has actually resumed; never infer
 resolution from elapsed time, a label change, or merely waking up.
 
+A concrete, unresolved question that blocks progress — one only a human or
+another owner can resolve — is a different case from the hold above, not a
+dependency/approval/quota/access condition you are merely waiting out. When
+this issue's own workflow offers a status built for exactly this (commonly
+named something like Needs Feedback), move there instead of To Do, and
+state the exact question, the available choices and tradeoffs, what work it
+prevents, and who can answer it. Never invent an answer, never repeat the
+same unanswered question on every wake, and never claim completion while it
+is still open. Where this issue's workflow offers no such status, keep its
+current status and make the open question and the blocked work it prevents
+equally clear in your comment instead.
+
 Move to In Review once all review-ready scoped work exists: a current-head
 PR or artifact, with its tests and acceptance evidence, linked on the
 issue. A draft PR, or a review that comes back CHANGES_REQUESTED, means
