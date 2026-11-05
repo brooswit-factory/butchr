@@ -53,26 +53,50 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  const definitions=()=>manifest?.active?manifest.observationGraph:[...local.holder.getRules()];
  const graphFingerprint=(rules:readonly Rule[])=>JSON.stringify([...rules].sort((a,b)=>a.id.localeCompare(b.id)).map(r=>{const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'];return fields.map(k=>(r as unknown as Record<string,unknown>)[k]);}));
  function graphDeferred(){return !!manifest?.active&&graphFingerprint(manifest.observationGraph)!==graphFingerprint(manifest.remote.map(r=>r.definition));}
- function heldObservationKeys(graph:readonly Rule[]){
+ // A key is genuinely held only while some retained, managed identity under it is still pinned to a
+ // shape `latest` (the authoritative desired definitions — manifest.remote once a wire update has
+ // actually landed, or the freshly parsed update still in flight) has since moved past — never merely
+ // because a (possibly freshly, currently admitted) resource exists under it. Otherwise a resource
+ // admitted straight onto the live definition (see canSpawn) would itself re-anchor the freeze below
+ // and the graph would never converge: every ongoing resident under an actively-used rule would
+ // permanently hold it.
+ function heldObservationKeys(graph:readonly Rule[],latest:readonly Rule[]){
   const previous=new Map(graph.map(rule=>[keyOf(rule),rule]));
-  const held=new Set([...retained.values()].filter(entry=>entry.managed).map(entry=>keyOf(entry.rule)));
-  const pending=[...held];for(let i=0;i<pending.length;i++){const old=previous.get(pending[i]!),rel=old?.relationships;for(const id of [rel?.childRule,...(rel?.inwardConnectionRules??[])]){const dependency=id?[...previous.values()].find(rule=>rule.id===id):undefined;if(dependency&&!held.has(keyOf(dependency))){held.add(keyOf(dependency));pending.push(keyOf(dependency));}}}
+  const desiredByKey=new Map(latest.map(rule=>[keyOf(rule),rule]));
+  const stale=(rule:Rule)=>{const desired=desiredByKey.get(keyOf(rule));return !desired||graphFingerprint([rule])!==graphFingerprint([desired]);};
+  // A rule's own key only freezes (see nextObservationGraph) while some retained identity under it is
+  // genuinely stale, so admission isn't fenced forever by an ongoing resident whose stored rule
+  // already matches the live wire (see canSpawn). A DEPENDENCY, reached below via childRule/
+  // inwardConnectionRules, is a different protection: it freezes as long as ANY retained identity
+  // still relies on its parent rule at all — regardless of whether the parent rule's own fields
+  // changed — since the retained worker may still be traversing linked items through that dependency's
+  // current shape. The walk below is seeded from every managed key for that reason, even one that is
+  // not itself stale; only the seed's OWN membership in `held` (not what it reaches) is staleness-gated.
+  const managedKeys=new Set([...retained.values()].filter(entry=>entry.managed).map(entry=>keyOf(entry.rule)));
+  const held=new Set([...retained.values()].filter(entry=>entry.managed&&stale(entry.rule)).map(entry=>keyOf(entry.rule)));
+  const pending=[...managedKeys];for(let i=0;i<pending.length;i++){const old=previous.get(pending[i]!),rel=old?.relationships;for(const id of [rel?.childRule,...(rel?.inwardConnectionRules??[])]){const dependency=id?[...previous.values()].find(rule=>rule.id===id):undefined;if(dependency&&!held.has(keyOf(dependency))){held.add(keyOf(dependency));pending.push(keyOf(dependency));}}}
   return held;
  }
  function nextObservationGraph(parsed:readonly Rule[]):Rule[]{
   const previous=new Map((manifest?.observationGraph??[]).map(rule=>[keyOf(rule),rule]));
   // Retained observers keep dependency queries/edges; unrelated rules advance.
-  const held=heldObservationKeys([...previous.values()]);
+  const held=heldObservationKeys([...previous.values()],parsed);
   const next=parsed.map(rule=>{const old=previous.get(keyOf(rule));return old&&held.has(keyOf(rule))&&graphFingerprint([old])!==graphFingerprint([rule])?{...structuredClone(old),enabled:rule.enabled}:structuredClone(rule);});
   for(const [key,old]of previous)if(held.has(key)&&!parsed.some(rule=>keyOf(rule)===key))next.push(structuredClone(old));
   return next;
  }
  function ruleGraphDeferred(rule:Rule){const desired=manifest?.remote.find(row=>keyOf(row.definition)===keyOf(rule))?.definition;return !!manifest?.active&&(!desired||graphFingerprint([rule])!==graphFingerprint([desired]));}
  function observers(rule:Rule){return [...retained.values()].some(r=>r.managed&&r.known&&keyOf(r.rule)===keyOf(rule));}
- function observationHeld(rule:Rule){return !!manifest&&heldObservationKeys(manifest.observationGraph).has(keyOf(rule));}
+ function observationHeld(rule:Rule){return !!manifest&&heldObservationKeys(manifest.observationGraph,manifest.remote.map(r=>r.definition)).has(keyOf(rule));}
  function observationAllowed(rule:Rule){return !fault&&(!manifest?.active||inventoryComplete&&connected&&!error&&control.enabled&&rule.enabled&&initialized.has(rule.resourceProvider));}
  function remoteIdentity(rule:Rule){return `remote:${manifest!.source.serverId}:${manifest!.source.authorizationId}:${rule.id}`;}
- function allowed(rule:Rule){return !fault&&(!manifest?.active||inventoryComplete&&connected&&!error&&!ruleGraphDeferred(rule)&&control.enabled&&rule.enabled&&!control.disabledRules.includes(remoteIdentity(rule))&&initialized.has(rule.resourceProvider));}
+ // Admission-readiness of a rule, independent of whether ITS OWN observationGraph entry has
+ // converged with the wire yet. Used both by `allowed` (which additionally requires convergence,
+ // for anything with an existing identity to protect) and, via `current`, as the basis for admitting
+ // a resource that has never been retained before: it has no existing identity that graph drift could
+ // put at risk, so it is safe to admit on the live, current definition rather than wait on it.
+ function admissionReady(rule:Rule){return !fault&&(!manifest?.active||inventoryComplete&&connected&&!error&&control.enabled&&rule.enabled&&!control.disabledRules.includes(remoteIdentity(rule))&&initialized.has(rule.resourceProvider));}
+ function allowed(rule:Rule){return admissionReady(rule)&&!ruleGraphDeferred(rule);}
  function refresh(){const defs=definitions();live.splice(0,live.length,...defs.map(r=>({...structuredClone(r),enabled:r.enabled&&(allowed(r)||observationHeld(r)&&observationAllowed(r))})));}
  function changed(){generation++;refresh();}
  refresh();
@@ -147,7 +171,17 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  function recordFullCensus(running:readonly string[],complete=false){captureCensus(running,complete,()=>true,true);}
  async function prepareActivation(){if(!local.census)throw Error('Complete worker census unavailable');const before=generation,etag=sourceEtagOf(local.readText());const census=await local.census();if(before!==generation||etag!==sourceEtagOf(local.readText()))throw Error('Cutover state changed during census');recordFullCensus(census.ids,census.complete);if(!census.complete)throw Error('Worker inventory is incomplete or ambiguous');}
  function managed(id:string){if(ownsManagedSessionAgent(id))return false;return !!retained.get(id)?.managed||(!!manifest?.active||fault)&&!!decodeAnyAgentKey(id);}
- function current(id:string,lease:number){const r=ruleFor(id);return !fault&&lease===generation&&!!r&&allowed(r);}
+ // A resource with no existing retained identity (never admitted before) cannot be put at risk by
+ // graph drift the way an already-known retained worker could, so — PROVIDED some other resource is
+ // already an established, directly-admitted resident of the exact same rule — it is evaluated against
+ // the live desired definition instead of waiting on the held observationGraph entry's own convergence:
+ // a held/deferred key must never silently fence every OTHER resource matching that same rule behind
+ // one unrelated retained worker. The established-resident requirement excludes a key that is held only
+ // as someone ELSE's dependency (childRule/inwardConnectionRules in heldObservationKeys) with no
+ // resident of its own — that hold protects a different rule's in-flight linked-item traversal, not an
+ // admission backlog, and must keep fencing fresh admission under it. An already-known id keeps the
+ // stricter, convergence-gated path throughout.
+ function current(id:string,lease:number){const r=ruleFor(id);if(fault||lease!==generation)return false;if(r&&allowed(r))return true;const entry=retained.get(id);if(entry?.known&&!pendingSpawns.has(id))return false;const desired=desiredRule(id);if(!desired)return false;const key=keyOf(desired);const hasEstablishedResident=[...retained.values()].some(e=>e.managed&&keyOf(e.rule)===key);return hasEstablishedResident&&admissionReady(desired);}
  function observationCompatible(a:Rule,b:Rule){const fields=['id','resourceProvider','query','execution','relationships','linkedEventing','linkedPollIntervalMs','maxLinkedItems','linkedRemoteLinks','linkedDescriptionLinks'];return JSON.stringify(fields.map(k=>(a as unknown as Record<string,unknown>)[k]))===JSON.stringify(fields.map(k=>(b as unknown as Record<string,unknown>)[k]));}
  function lifecycleEnabled(rule:Rule){return observationAllowed(rule)&&(!manifest?.active||!control.disabledRules.includes(remoteIdentity(rule)));}
  function safeLifecycle(id:string,lease:number){const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!!entry?.known&&!!r&&lease===generation&&allowed(r)&&fingerprint(appliedRule(entry))===fingerprint(r);}
@@ -169,7 +203,11 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
    return new Map([...desired].filter(([id])=>!fault&&(manifest?.active?(have.has(id)||!managed(id)||current(id,lease)):!manifest||lease===generation)));
   },
   canAdmit:(id,lease)=>ownsManagedSessionAgent(id)||!fault&&(manifest?.active?(!managed(id)||current(id,lease)):!manifest||lease===generation),
-  canSpawn(spec,lease){if(local.rollout)return false;if(ownsManagedSessionAgent(spec.key))return true;if(fault||manifest&&lease!==generation)return false;if(manifest?.active&&managed(spec.key)&&!current(spec.key,lease))return false;const rule=ruleFor(spec.key);if(!rule)return !managed(spec.key);if(retained.size>=MAX_AGENTS&&!retained.has(spec.key))return false;pendingSpawns.add(spec.key);pendingOrigins.set(spec.key,{id:rule.id,name:rule.id,...(manifest?.active?remoteAdmittedIdentity(manifest.source):{source:'local' as const})});retained.set(spec.key,{rule:structuredClone(rule),known:true,managed:!!manifest?.active});if(manifest)try{saveRetained();}catch{pendingSpawns.delete(spec.key);pendingOrigins.delete(spec.key);retained.delete(spec.key);error='Admission context could not be saved';connected=false;changed();return false;}return true;},
+  canSpawn(spec,lease){if(local.rollout)return false;if(ownsManagedSessionAgent(spec.key))return true;if(fault||manifest&&lease!==generation)return false;if(manifest?.active&&managed(spec.key)&&!current(spec.key,lease))return false;
+   // A fresh admission has no prior identity the held/frozen graph entry is protecting, so it is
+   // admitted straight onto the live desired definition rather than the (possibly stale) frozen one —
+   // otherwise it would itself keep anchoring heldObservationKeys to the old shape forever (see there).
+   const rule=(manifest?.active?desiredRule(spec.key):undefined)??ruleFor(spec.key);if(!rule)return !managed(spec.key);if(retained.size>=MAX_AGENTS&&!retained.has(spec.key))return false;pendingSpawns.add(spec.key);pendingOrigins.set(spec.key,{id:rule.id,name:rule.id,...(manifest?.active?remoteAdmittedIdentity(manifest.source):{source:'local' as const})});retained.set(spec.key,{rule:structuredClone(rule),known:true,managed:!!manifest?.active});if(manifest)try{saveRetained();}catch{pendingSpawns.delete(spec.key);pendingOrigins.delete(spec.key);retained.delete(spec.key);error='Admission context could not be saved';connected=false;changed();return false;}return true;},
   spawnObservedExisting(id){if(pendingSpawns.has(id)){const entry=retained.get(id);if(entry){const {origin:_,...rest}=entry;retained.set(id,{...rest,...(manifest?.active?{known:false,managed:true}:{})});if(manifest)saveRetained();refresh();}pendingSpawns.delete(id);pendingOrigins.delete(id);}},spawnSucceeded:(id)=>{const origin=pendingOrigins.get(id),entry=retained.get(id);if(origin&&entry){retained.set(id,{...entry,origin:structuredClone(origin)});if(manifest)saveRetained();}pendingSpawns.delete(id);pendingOrigins.delete(id);},spawnFailed(id){pendingSpawns.delete(id);pendingOrigins.delete(id);/* A failed launch may already own a pane. Only a later reliable census may discard its policy. */},
   protectStop:(id,lease)=>{if(ownsManagedSessionAgent(id))return true;if(configuredOff(id,lease))return false;const e=retained.get(id),r=ruleFor(id);return managed(id)&&!(e?.known&&r&&lease===generation&&lifecycleEnabled(r)&&observationCompatible(e.rule,r));},protectRespawn:(id,lease)=>ownsManagedSessionAgent(id)||managed(id)&&!safeLifecycle(id,lease),
   canNotify:(id,_previous,next)=>{const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!workerPending(id)&&next===generation&&!!entry?.known&&!!r&&next===generation&&observationAllowed(r)&&!!manifest?.remote.some(v=>v.definition.id===r.id&&v.definition.enabled)&&!control.disabledRules.includes(remoteIdentity(r))&&observationCompatible(entry.rule,r);},ignoreNotification:(id)=>managed(id)&&!!manifest?.active&&!retained.has(id)&&!pendingSpawns.has(id),
