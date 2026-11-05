@@ -1,0 +1,4 @@
+import {test,expect} from 'bun:test';
+import {mkdtempSync,rmSync,readFileSync} from 'node:fs';import {tmpdir} from 'node:os';import {join,resolve} from 'node:path';
+import {buildOperatorCommand} from '../../scripts/build/operator-command.js';
+test('production operator artifact launches with a single shebang and inert help',async()=>{const directory=mkdtempSync(join(tmpdir(),'operator-command-build-'));try{const file=await buildOperatorCommand(resolve(import.meta.dir,'../..'),directory);const result=Bun.spawnSync([process.execPath,file,'--help'],{timeout:10000});expect(result.exitCode).toBe(0);expect(result.stderr.toString()).toBe('');expect(result.stdout.toString()).toContain('retire-validation');expect(result.stdout.toString()).toContain('EXACT_PLAN_HASH');expect(readFileSync(file,'utf8').split('\n').filter(l=>l.startsWith('#!'))).toHaveLength(1);}finally{rmSync(directory,{recursive:true,force:true});}});

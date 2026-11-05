@@ -1,3 +1,4 @@
+import {effectiveMaintenancePaths} from '../operator/maintenance-paths.js';
 import type {ControlPanelClient} from "../control-panel/client.js";
 import { Elysia } from "elysia";
 import type { McpHandle } from "@brooswit/thatch";
@@ -834,6 +835,10 @@ export function liveView(mcp: McpHandle, deps: ViewDeps) {
       const guard=await checkWriteGuard(buildWriteGuardRequest(request,server),deps.writeGuard);if(!guard.ok){set.status=guard.status;return guard.body;}
       const limited=checkWriteRateLimit(deps,server?.requestIP(request)??undefined,{route:"/api/remote-config",action:"remote-config-override",ids:[],origin:request.headers.get("origin")});if(limited){set.status=429;return limited.body;}
       try{return deps.controlPanel.setRemoteConfig(body);}catch{set.status=400;return {error:"Could not save local remote configuration override"};}
+    })
+    .get("/api/operator-paths", async ({request,server,set})=>{
+      const guard=await controlPanelReadGuard(request,server);if(guard){set.status=guard.status;return {error:guard.error};}
+      set.headers["cache-control"]="no-store";return effectiveMaintenancePaths();
     })
     .get("/api/control-panel", async ({ request, server, set }) => {
       const guard = await controlPanelReadGuard(request, server);

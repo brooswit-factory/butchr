@@ -1,3 +1,4 @@
+import {buildOperatorCommand} from './operator-command.js';
 import {buildContinuationHelper} from './continuation-helper.js';
 /**
  * BUTCHR-54: the real build step. Bakes the git sha (and a dirty-tree flag)
@@ -72,3 +73,6 @@ console.log(`built ${bridgeFile}`);
 
 // Build the same pure helper exercised by the isolated packaged regression.
 await buildContinuationHelper(process.cwd(),OUTDIR);
+
+// Supported explicit operator workflow; build/import never applies maintenance.
+await buildOperatorCommand(process.cwd(),OUTDIR);

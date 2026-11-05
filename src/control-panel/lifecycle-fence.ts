@@ -5,5 +5,8 @@ export function createLifecycleFence<T extends object>(client:T){
  const effects:Record<string,ReadonlySet<string>>={agent:new Set(['start','stop','prompt']),workspace:new Set(['create','close','rename','reportMetadata']),pane:new Set(['close','sendText','sendKeys','reportAgentSession'])};
  const wrapped=new Map<PropertyKey,unknown>();
  const proxy=new Proxy(client,{get(target,group,receiver){const value=Reflect.get(target,group,receiver);if(typeof group!=='string'||!effects[group]||!value||typeof value!=='object')return value;if(!wrapped.has(group))wrapped.set(group,new Proxy(value,{get(surface,method){const fn=Reflect.get(surface,method);if(typeof fn!=='function')return fn;return (...args:unknown[])=>{if(typeof method==='string'&&effects[group]!.has(method))context.getStore()?.();return Reflect.apply(fn,surface,args);};}}));return wrapped.get(group);}});
- return {client:proxy,run:<R>(guard:()=>void,action:()=>Promise<R>)=>context.run(guard,async()=>{guard();return action();})};
+ const run=<R>(guard:()=>void,action:()=>Promise<R>)=>context.run(guard,async()=>{guard();return action();});
+ // Cleanup adds a veto; it must never erase its caller's authority fence.
+ const extend=<R>(guard:()=>void,action:()=>Promise<R>)=>{const parent=context.getStore();return run(()=>{parent?.();guard();},action);};
+ return {client:proxy,run,extend};
 }
