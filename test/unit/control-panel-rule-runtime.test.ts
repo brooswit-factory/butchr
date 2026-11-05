@@ -56,9 +56,10 @@ test('production discovery itself reads the live query every poll: a new-only ma
  const matches=(query:string,project:string)=>query.split(' OR ').some(clause=>clause.trim()===`project = ${project}`);
  f.update();f.runtime.recordFullCensus([key()],true);const p=f.runtime.plan();f.runtime.activate({localDigest:p.localDigest!,remoteDigest:p.remoteDigest!,confirm:true});
  workers.h.ruleRuntime=()=>f.runtime.policy;
- const stop=runResourceLoop<{id:string;project:string}>({discovery:{idOf:r=>r.id,search:async()=>universe.filter(r=>matches(f.runtime.getRules().find(d=>d.id==='worker')!.query,r.project))},activation:{verdictFor:()=>'active'},spawnConfig:{specFor:r=>spec(r.id)},eventRules:{poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})}},{herd:workers.h,ownsId:()=>true,ruleProvider:'jira-work',intervalMs:10,notify:async()=>{}});
+ let searches=0;
+ const stop=runResourceLoop<{id:string;project:string}>({discovery:{idOf:r=>r.id,search:async()=>{searches++;return universe.filter(r=>matches(f.runtime.getRules().find(d=>d.id==='worker')!.query,r.project));}},activation:{verdictFor:()=>'active'},spawnConfig:{specFor:r=>spec(r.id)},eventRules:{poll:async()=>({changedPrimary:[],changedRelated:[],decide:async()=>({deliver:false})})}},{herd:workers.h,ownsId:()=>true,ruleProvider:'jira-work',intervalMs:10,notify:async()=>{}});
  try{
-  await until(()=>workers.actions.length>=0,50);expect(workers.actions).toEqual([]);expect(workers.running.has(key())).toBe(true);
+  await until(()=>searches>=2);expect(workers.actions).toEqual([]);expect(workers.running.has(key())).toBe(true);
   f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();
   await until(()=>workers.running.has(key('2')));
   expect(workers.running.has(key())).toBe(true);expect(workers.running.has(key('3'))).toBe(false);
@@ -67,6 +68,42 @@ test('production discovery itself reads the live query every poll: a new-only ma
   expect(workers.running.has(key('2'))).toBe(true);
  }finally{stop();await Bun.sleep(20);f.close();}
 });
+test('a retained worker whose rule also picks up a behavior-field edit, not just query, does not fence an otherwise newly eligible resource under the same rule',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE',maxLinkedItems:7},doc.rules[1]]});f.update();
+ expect(f.runtime.summary().discoveryChangesDeferred).toBe(true);expect(f.runtime.getRules()[0]!.maxLinkedItems).not.toBe(7);
+ expect(f.runtime.policy.canAdmit(key('2'),f.runtime.policy.generation())).toBe(true);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
+ expect(workers.running.has(key())).toBe(true);
+ const deferred=f.runtime.summary().deferredRules.find(d=>d.id==='worker')!;expect(deferred.admissionBlocked).toBe(false);expect(deferred.differingFields).toContain('maxLinkedItems');expect(deferred.differingFields).not.toContain('query');expect(deferred.holdingWorkers).toContain(key());
+ }finally{f.close();}});
+test('a rule with no live counterpart left on the wire at all still refuses new admission even though its own retained worker is a direct root',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=[];f.update();
+ const deferred=f.runtime.summary().deferredRules.find(d=>d.id==='worker')!;expect(deferred.admissionBlocked).toBe(true);expect(deferred.holdingWorkers).toContain(key());
+ expect(f.runtime.policy.canAdmit(key('2'),f.runtime.policy.generation())).toBe(false);
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual([]);expect(workers.running.has(key())).toBe(true);
+ }finally{f.close();}});
+test('a query change arriving mid-admission still fences the late spawn and releases the reservation, exactly like any other in-flight rule change',async()=>{const f=fixture(),workers=herd();try{f.update();f.activate();workers.h.ruleRuntime=()=>f.runtime.policy;const released:string[]=[];let admitted:string[]=[];await reconcileNow(workers.h,new Map([[key(),spec(key())]]),{admission:async ids=>{f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE'},doc.rules[1]]});f.update();return [...ids]},releaseAdmission:async ids=>{released.push(...ids)},onAdmitted:ids=>{admitted=[...ids]}});expect(workers.actions).toEqual([]);expect(released).toContain(key());expect(admitted).toEqual([]);}finally{f.close();}});
+for(const scenario of ['invalid query','unauthorized source'] as const)test('a remote update that is '+scenario+' fails safe with a clear error, leaving the retained worker and prior admission untouched',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ if(scenario==='invalid query'){const base=f.remote[0]!,broken:RemoteRule[]=[{...base,definition:{...base.definition,query:''}},f.remote[1]!];f.update({rules:broken});}
+ else f.update({source:{serverId:source.serverId,authorizationId:'00000000-0000-4000-8000-000000000099'}});
+ expect(f.runtime.summary().phase).toBe('blocked');expect(typeof f.runtime.summary().error).toBe('string');
+ expect(f.runtime.getRules().find(r=>r.id==='worker')!.query).toBe('project = FIXTURE');
+ expect(f.runtime.retainedRules().map(r=>r.id)).toContain(key());
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual([]);expect(workers.running.has(key())).toBe(true);
+ }finally{f.close();}});
+test('a failed spawn for a resource newly admitted under a changed query still retries and converges on the live definition',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE',role:'sentinel'},doc.rules[1]]});f.update();
+ workers.h.spawn=async s=>{if(s.key===key('2'))throw Error('fixture transient spawn failure');workers.running.add(s.key)};
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));
+ expect(workers.running.has(key('2'))).toBe(false);expect(f.runtime.ruleForAdmission(key('2'))).toBeTruthy();
+ workers.h.spawn=async s=>{workers.running.add(s.key)};
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));
+ expect(workers.running.has(key('2'))).toBe(true);expect(f.runtime.ruleForAgent(key('2'))!.role).toBe('sentinel');
+ }finally{f.close();}});
 test('a narrowing query retires a resource that no longer matches through the normal safe lifecycle while an unrelated still-matching worker stays',async()=>{const f=fixture(),workers=herd([key(),key('2')]);try{
  workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));f.update();f.activate();
  f.remote=rows({rules:[{...doc.rules[0],query:'project = NARROWED'},doc.rules[1]]});f.update();expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);

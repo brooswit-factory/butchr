@@ -80,12 +80,49 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   for(const [key,old]of previous)if(held.has(key)&&!parsed.some(rule=>keyOf(rule)===key))next.push(structuredClone(old));
   return next;
  }
- function ruleGraphDeferred(rule:Rule){const desired=manifest?.remote.find(row=>keyOf(row.definition)===keyOf(rule))?.definition;return !!manifest?.active&&(!desired||graphFingerprint([rule])!==graphFingerprint([desired]));}
  function observers(rule:Rule){return [...retained.values()].some(r=>r.managed&&r.known&&keyOf(r.rule)===keyOf(rule));}
  function observationHeld(rule:Rule){return !!manifest&&heldObservationKeys(manifest.observationGraph).has(keyOf(rule));}
  function observationAllowed(rule:Rule){return !fault&&(!manifest?.active||inventoryComplete&&connected&&!error&&control.enabled&&rule.enabled&&initialized.has(rule.resourceProvider));}
  function remoteIdentity(rule:Rule){return `remote:${manifest!.source.serverId}:${manifest!.source.authorizationId}:${rule.id}`;}
+ // Scoped to admission, NOT to the dependency-freeze `nextObservationGraph` already applies: a rule
+ // with no live counterpart on the wire at all can never admit a new resource (withdrawal, direct
+ // root or not — its existing retained worker stays protected regardless, since protectStop/
+ // protectRespawn never consult `allowed`/`ruleGraphDeferred`). Short of outright withdrawal, a
+ // DIRECTLY retained rule's exposed `rule.query` already tracks the live wire (nextObservationGraph),
+ // so the rest of its definition drifting (OBSERVATION_BEHAVIOR_FIELDS — maxLinkedItems etc, still
+ // pinned for that worker's own in-flight traversal) must never fence any OTHER resource's admission
+ // under the SAME rule — that reintroduces the incident. A rule only reached as another rule's
+ // dependency (never a direct root itself) has no such exemption: its exposed definition, query
+ // included, stays frozen in full and unconditionally (protecting a DIFFERENT rule's in-flight
+ // traversal, not an admission backlog), so any drift there still defers it exactly as before this
+ // fix — existing dependency-freeze coverage asserts this unchanged. deferredRuleDetails() below
+ // reports all of this for operators without it ever gating admission on its own.
+ function ruleGraphDeferred(rule:Rule){
+  if(!manifest?.active)return false;
+  const desired=manifest.remote.find(row=>keyOf(row.definition)===keyOf(rule))?.definition;
+  if(!desired)return true;
+  if([...retained.values()].some(entry=>entry.managed&&keyOf(entry.rule)===keyOf(rule)))return false;
+  return graphFingerprint([rule])!==graphFingerprint([desired]);
+ }
  function allowed(rule:Rule){return !fault&&(!manifest?.active||inventoryComplete&&connected&&!error&&!ruleGraphDeferred(rule)&&control.enabled&&rule.enabled&&!control.disabledRules.includes(remoteIdentity(rule))&&initialized.has(rule.resourceProvider));}
+ const DEFERRABLE_FIELDS=['query',...OBSERVATION_BEHAVIOR_FIELDS] as const;
+ function deferredRuleDetails(){
+  if(!manifest?.active)return [] as {id:string;resourceProvider:string;admissionBlocked:boolean;differingFields:string[];holdingWorkers:string[];unblockCondition:string}[];
+  const graph=manifest.observationGraph,exposed=new Map(graph.map(rule=>[keyOf(rule),rule]));
+  const held=heldObservationKeys(graph);
+  const directRoots=new Set([...retained.values()].filter(entry=>entry.managed).map(entry=>keyOf(entry.rule)));
+  const out:{id:string;resourceProvider:string;admissionBlocked:boolean;differingFields:string[];holdingWorkers:string[];unblockCondition:string}[]=[];
+  for(const key of held){
+   const current=exposed.get(key);if(!current)continue;
+   const desired=manifest.remote.find(r=>keyOf(r.definition)===key)?.definition;
+   const differingFields=desired?DEFERRABLE_FIELDS.filter(field=>JSON.stringify((current as unknown as Record<string,unknown>)[field])!==JSON.stringify((desired as unknown as Record<string,unknown>)[field])):['rule withdrawn from the live remote definition'];
+   if(differingFields.length===0)continue;
+   const holdingWorkers=[...retained].filter(([,entry])=>entry.managed&&keyOf(entry.rule)===key).map(([id])=>id);
+   const direct=directRoots.has(key),admissionBlocked=!direct||!desired;
+   out.push({id:current.id,resourceProvider:current.resourceProvider,admissionBlocked,differingFields:[...differingFields],holdingWorkers,unblockCondition:!desired?'This rule has no live counterpart on the remote definition at all, so no new resource can be admitted under it; the holding worker(s) above stay protected and running until they retire naturally.':direct?'Admission already follows the live query; only this rule\'s observation-behavior fields stay pinned to the holding worker(s) above until they drain naturally.':'This rule is only held as another rule\'s dependency, so its own definition (including its query) stays pinned in full until every worker retained under it drains naturally.'});
+  }
+  return out;
+ }
  function refresh(){const defs=definitions();live.splice(0,live.length,...defs.map(r=>({...structuredClone(r),enabled:r.enabled&&(allowed(r)||observationHeld(r)&&observationAllowed(r))})));}
  function changed(){generation++;refresh();}
  refresh();
@@ -194,7 +231,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   protectStop:(id,lease)=>{if(ownsManagedSessionAgent(id))return true;if(configuredOff(id,lease))return false;const e=retained.get(id),r=ruleFor(id);return managed(id)&&!(e?.known&&r&&lease===generation&&lifecycleEnabled(r)&&observationCompatible(e.rule,r));},protectRespawn:(id,lease)=>ownsManagedSessionAgent(id)||managed(id)&&!safeLifecycle(id,lease),
   canNotify:(id,_previous,next)=>{const entry=retained.get(id),r=ruleFor(id);return !managed(id)||!workerPending(id)&&next===generation&&!!entry?.known&&!!r&&next===generation&&observationAllowed(r)&&!!manifest?.remote.some(v=>v.definition.id===r.id&&v.definition.enabled)&&!control.disabledRules.includes(remoteIdentity(r))&&observationCompatible(entry.rule,r);},ignoreNotification:(id)=>managed(id)&&!!manifest?.active&&!retained.has(id)&&!pendingSpawns.has(id),
  };}
- function summary(){return {...(local.rollout?{canary:local.rollout.summary()}:{}),workerReconciliation:[...retained].flatMap(([id,entry])=>entry.reconciliation?[{id,...entry.reconciliation,...(workers.state(id)??{})}]:[]),authority:manifest?.active?'remote':'local',connected,revision:manifest?.revision??revision,inventoryComplete,phase:fault?'blocked':manifest?.active?!inventoryComplete?'inventory-uncertain':error?'blocked':!connected?'disconnected':!control.enabled?'master-off':graphDeferred()?'deferred':'active':'staged',error,generation,retainedAgents:[...retained.values()].filter(r=>r.managed).length,discoveryChangesDeferred:graphDeferred(),unresolvedAgents:[...retained.values()].filter(r=>r.managed&&!r.known).length,localDeactivated:!!manifest?.deactivation&&sourceEtagOf(local.readText())===manifest.deactivation.emptyEtag};}
+ function summary(){return {...(local.rollout?{canary:local.rollout.summary()}:{}),workerReconciliation:[...retained].flatMap(([id,entry])=>entry.reconciliation?[{id,...entry.reconciliation,...(workers.state(id)??{})}]:[]),authority:manifest?.active?'remote':'local',connected,revision:manifest?.revision??revision,inventoryComplete,phase:fault?'blocked':manifest?.active?!inventoryComplete?'inventory-uncertain':error?'blocked':!connected?'disconnected':!control.enabled?'master-off':graphDeferred()?'deferred':'active':'staged',error,generation,retainedAgents:[...retained.values()].filter(r=>r.managed).length,discoveryChangesDeferred:graphDeferred(),deferredRules:deferredRuleDetails(),unresolvedAgents:[...retained.values()].filter(r=>r.managed&&!r.known).length,localDeactivated:!!manifest?.deactivation&&sourceEtagOf(local.readText())===manifest.deactivation.emptyEtag};}
  return {settleReconciliation:()=>workers.idle(),retryReconciliation:()=>reconcileWorkers(true),admittedRuleIdentity,update,plan,activate,recordFullCensus,prepareActivation,ruleForAdmission,isUnresolvedAgent:(id:string)=>!ownsManagedSessionAgent(id)&&!!manifest?.active&&!!decodeAnyAgentKey(id)&&!retained.get(id)?.known,deactivateLocal,rollback,summary,getRules:()=>live,getInitializationRules:initializationRules,refreshLocal:()=>{if(!manifest?.active)changed();},ruleForAgent,observedWorkerIds:()=>[...retained.keys()],retainedRules:()=>[...retained].filter(([,r])=>r.managed&&r.known).map(([id,r])=>({id,rule:structuredClone(r.rule)})),policy:policy()};
 }
 export type RuleRuntime=ReturnType<typeof createRuleRuntime>;
