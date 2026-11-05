@@ -70,3 +70,19 @@ bump: patch
   held rule now records the current remote definition instead; an
   existing identity's own respawn is unaffected and keeps using its
   pinned snapshot exactly as before.
+- Recording the live definition on a new resident (above) was not enough
+  on its own: `protectStop`/`canNotify` (via `observationCompatible`) and
+  `protectRespawn`/`safeLifecycle` (via a full-rule fingerprint) still
+  compared that worker's own `entry.rule` against `ruleFor(id)` — the
+  SAME frozen-exposed snapshot pinned for the OTHER, pre-existing
+  resident. A new resident's live `entry.rule` can never match that
+  frozen snapshot's behavior fields, so it was permanently treated as
+  "incompatible": undeliverable notifications, blocked respawn, and
+  immune to being stopped even once it stopped matching a narrowed
+  query — one retained worker degrading every later admission under the
+  same rule, for as long as it lived. Both comparisons now also accept a
+  match against the current remote definition (`desiredRule(id)`), so a
+  resident's own admission-time truth — frozen snapshot for the resident
+  that caused the freeze, live wire for one admitted after — settles the
+  comparison; a worker matching neither (a genuine further change) is
+  still correctly flagged incompatible.
