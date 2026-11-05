@@ -77,6 +77,19 @@ test('a retained worker whose rule also picks up a behavior-field edit, not just
  expect(workers.running.has(key())).toBe(true);
  const deferred=f.runtime.summary().deferredRules.find(d=>d.id==='worker')!;expect(deferred.admissionBlocked).toBe(false);expect(deferred.differingFields).toContain('maxLinkedItems');expect(deferred.differingFields).not.toContain('query');expect(deferred.holdingWorkers).toContain(key());
  }finally{f.close();}});
+test('a new admission under a direct root with frozen behavior fields records the live definition, not the frozen snapshot, and the graph converges once every resident drains',async()=>{const f=fixture(),workers=herd([key()]);try{
+ workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
+ f.remote=rows({rules:[{...doc.rules[0],query:'project = FIXTURE OR project = FUTURE',maxLinkedItems:7},doc.rules[1]]});f.update();
+ await reconcileNow(workers.h,new Map([[key(),spec(key())],[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
+ expect(f.runtime.ruleForAgent(key('2'))!.maxLinkedItems).toBe(7);
+ expect(f.runtime.ruleForAgent(key())!.maxLinkedItems).not.toBe(7);
+ expect(f.runtime.getRules()[0]!.maxLinkedItems).not.toBe(7);
+ f.runtime.recordFullCensus([key('2')],true);
+ expect(f.runtime.ruleForAgent(key('2'))!.maxLinkedItems).toBe(7);
+ await reconcileNow(workers.h,new Map([[key('2'),spec(key('2'))]]));expect(workers.actions).toEqual(['spawn:'+key('2')]);
+ f.runtime.recordFullCensus([],true);
+ expect(f.runtime.summary().discoveryChangesDeferred).toBe(false);expect(f.runtime.getRules()[0]!.maxLinkedItems).toBe(7);
+ }finally{f.close();}});
 test('a rule with no live counterpart left on the wire at all still refuses new admission even though its own retained worker is a direct root',async()=>{const f=fixture(),workers=herd([key()]);try{
  workers.h.ruleRuntime=()=>f.runtime.policy;await reconcileNow(workers.h,new Map([[key(),spec(key())]]));f.update();f.activate();
  f.remote=[];f.update();

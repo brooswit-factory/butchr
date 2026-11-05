@@ -30,11 +30,10 @@ bump: patch
   parent — that protection is about a different rule's own in-flight
   linked-item traversal, never an admission backlog, and must keep fencing
   fresh admission under the dependency's key.
-- `current()`/`canSpawn()` are otherwise unchanged: once a directly-held
-  rule's own `query`/`enabled` are no longer frozen, the existing
-  convergence-gated admission path already does the right thing for every
-  resource under it, new or retained, without any special casing by
-  resource identity.
+- `current()` is otherwise unchanged: once a directly-held rule's own
+  `query`/`enabled` are no longer frozen, the existing convergence-gated
+  admission path already does the right thing for every resource under
+  it, new or retained, without any special casing by resource identity.
 - `allowed()`'s own admission gate (`ruleGraphDeferred`) no longer
   fingerprints a directly-held rule's *entire* definition against the
   live wire before admitting anything under it. That full-definition
@@ -60,3 +59,14 @@ bump: patch
   an operator or caller can now tell apart "this rule's query already
   admits, only its behavior fields are still catching up" from "this
   rule (or its dependency) is genuinely fenced until its worker drains."
+- `canSpawn()` no longer hands a genuinely NEW resident (no retained entry
+  of its own yet) the frozen-behavior snapshot that `nextObservationGraph`
+  pins for a directly-held rule's PRE-EXISTING resident(s). That snapshot
+  exists to protect an already-running worker's own in-flight traversal,
+  not to seed a new one — `entry.rule` is never resynced after admission,
+  so a new resident that captured it at admission time would carry the
+  old behavior forever, even after the original resident drains and the
+  rule itself converges. A first-time admission under an active, directly
+  held rule now records the current remote definition instead; an
+  existing identity's own respawn is unaffected and keeps using its
+  pinned snapshot exactly as before.
