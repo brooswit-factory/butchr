@@ -332,3 +332,42 @@ test('restart of an interrupted staged handoff never launches a second replaceme
   expect(launches).toBe(0);expect(runtime.summary().workerReconciliation[0]).toMatchObject({status:'blocked',partial:true,cleanupProtected:true});
  }finally{f.close();}
 });
+
+// FACTORY-1038: the integrated tree must keep a53c374's transaction protection effective once the
+// runtime is otherwise healthy. A restarted runtime that has not yet taken a complete census is in
+// 'inventory-uncertain' and already refuses stop/respawn/spawn for EVERY worker, so assertions made
+// in that window cannot tell these guards from their absence (mutation-checked: removing the
+// canSpawn, protectStop or protectRespawn guard in rule-runtime.ts fails the tests below).
+function restartedWithCompleteCensus(handoff?:'pending'|'partial'){
+  const f=fixture();
+  f.update();f.runtime.recordFullCensus([key()],true);f.activate();
+  if(handoff){
+    const path=join(f.directory,'remote-rule-authority.json'),m=JSON.parse(readFileSync(path,'utf8')),entry=m.retained.find((v:any)=>v[0]===key())[1];
+    entry.lastHandoff={status:handoff==='partial'?'blocked':'pending',partial:handoff==='partial',token:'b'.repeat(64),current:{paneId:'source:p1',provider:'codex'}};
+    entry.reconciliation={...entry.lastHandoff};
+    if(handoff==='partial')entry.needsReconciliation=true;
+    writeFileSync(path,JSON.stringify(m),{mode:0o600});
+  }
+  f.restart();f.update();f.runtime.recordFullCensus([key()],true);
+  return f;
+}
+for(const handoff of ['pending','partial'] as const)test('a '+handoff+' handoff worker stays unstoppable, unrespawnable and unspawnable after restart even with a complete census',()=>{
+  const f=restartedWithCompleteCensus(handoff);
+  try{
+    expect(f.runtime.summary().phase).toBe('active');
+    const p=f.runtime.policy,g=p.generation();
+    expect(p.protectStop(key(),g)).toBe(true);
+    expect(p.protectRespawn(key(),g)).toBe(true);
+    expect(p.canSpawn(spec(key()),g)).toBe(false);
+  }finally{f.close();}
+});
+test('control: a healthy restarted worker with a complete census stays lifecycle-eligible, so the handoff guards above are not vacuous',()=>{
+  const f=restartedWithCompleteCensus();
+  try{
+    expect(f.runtime.summary().phase).toBe('active');
+    const p=f.runtime.policy,g=p.generation();
+    expect(p.protectStop(key(),g)).toBe(false);
+    expect(p.protectRespawn(key(),g)).toBe(false);
+    expect(p.canSpawn(spec(key()),g)).toBe(true);
+  }finally{f.close();}
+});
