@@ -2250,6 +2250,12 @@ const ruleResourceType = createRuleResourceType({
   // that leaves it absent/false never calls this (see
   // src/jira-watch/linked-eventing.ts's own contract).
   remoteLinks: (key) => atlassian.remoteLinks(key),
+  // FACTORY-1039: gated INSIDE linked-eventing.ts to Epic/Task owners only
+  // (`NATIVE_CHILD_OWNER_ISSUETYPES`) — never called for a Story or
+  // `jira-project` owner. Same `jiraWorkStaffing.run` short-circuit and
+  // `searchAll` (full pagination, never a first-page-only `search`) as the
+  // `search` dep just above, for the same reasons given there.
+  nativeChildren: async (key) => (jiraWorkStaffing.run ? atlassian.searchAll(`parent = "${key}"`) : []),
   // BUTCHR-437: the three external-link pollers' own deps — every one
   // gated by a match's own `linkedDescriptionLinks` opt-in inside
   // linked-eventing.ts, never called otherwise. `webpage` needs no
