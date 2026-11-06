@@ -492,7 +492,13 @@ export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: rea
  * pointer is; see `"native-child"`'s own doc comment, src/resources/
  * linked-discovery.ts, and FACTORY-909(A)'s `parentOnlyOpenWorkers`,
  * src/tools/relationship.ts, which documents the SAME asymmetry for the
- * staffing tier), so finding them needs a real JQL query: `parent = "<ownKey>"`.
+ * staffing tier), so finding them needs a real JQL query: `parent = "<ownKey>"`
+ * — ORDER BY-ed deterministically (the real wiring, `src/daemon/index.ts`,
+ * sorts `ORDER BY key ASC`) so WHICH children a `maxLinkedItems` cap
+ * truncates away stays stable tick-to-tick for the same underlying set,
+ * never an arbitrary rotating subset. See `LinkedEventingDeps.nativeChildren`'s
+ * own doc comment for why this is part of the DEP's contract, not merely
+ * an implementation detail of the one real caller.
  *
  * DELIBERATELY ITS OWN DEP (`LinkedEventingDeps.nativeChildren`), NOT the
  * shared `deps.search` batched seam every OTHER Jira-kind fetch in this
@@ -748,6 +754,16 @@ export interface LinkedEventingDeps {
    * watched (byte-identical to pre-FACTORY-1039 behaviour) — the same
    * "omitted dep ⇒ feature silently never runs" contract `remoteLinks`
    * above already has.
+   *
+   * CONTRACT (review fix, PR #831): the returned array's ORDER matters —
+   * `capLinkedItems` keeps a strict PREFIX of it under `maxLinkedItems`, so
+   * an implementation that doesn't return a stable order (e.g. a raw,
+   * unsorted Jira search) lets which children get a slot rotate between
+   * ticks for the exact same underlying set. `cappedAwayThisTick`
+   * (this module's own `runTick`) already stops that rotation from ever
+   * being misreported as a removal, but a stable order (the real wiring's
+   * `ORDER BY key ASC`, `src/daemon/index.ts`) is still what keeps WHICH
+   * children are actually covered predictable rather than arbitrary.
    */
   nativeChildren?: (key: string) => Promise<JiraIssue[]>;
   /** Own-write echo suppression — `createOwnWriteLedger#shouldSuppress` (src/jira-watch/own-writes.ts), called with the LINKED item's own key and the OWNING agent as watcher, so an agent's edit to something it links suppresses only for that agent, exactly as `LoopDeps.suppress` already documents for owned resources. Optional; omitted, nothing is ever suppressed as an echo. Jira-kind only — an external target has no own-write concept here (BUTCHR-437 does not extend echo suppression to Confluence/GitHub/webpage). */
@@ -1055,6 +1071,17 @@ export function createLinkedEventingState(): LinkedEventingState {
     // replays the SAME last-known fetch-failure set instead of assuming
     // everything succeeded.
     linkFetchFailedOwners: ReadonlySet<string>;
+    // FACTORY-1039: the targets `capLinkedItems` skipped THIS discovery for
+    // one issue owner (`capLinkedItems`'s own `skipped`, keyed by target) —
+    // see the removal-detection skip in `runOwnerPass` for why. A cap-
+    // skipped target is simply not FETCHED/diffed this tick (same shape as
+    // `linkFetchFailedOwners` above: "not checked" must never look like
+    // "unlinked"), so excluding it from `gone` is the exact same discipline
+    // applied for a different cause. Unlike `linkFetchFailedOwners`, this
+    // does NOT suppress every OTHER per-item check for the owner — only
+    // this ONE target's removal comparison — since every other kept item
+    // is unaffected by one sibling target losing its cap slot.
+    cappedAwayThisTick: ReadonlyMap<string, ReadonlySet<string>>;
     // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
     // discovery's own native-issuelink membership per issue owner, keyed by
     // the Jira issueLink's OWN id — see `issuelinkMembership`'s own doc
@@ -1335,8 +1362,20 @@ export function createLinkedEventingState(): LinkedEventingState {
       const kept = perOwnerItems.get(entry.agentKey) ?? [];
       if (!prevSet) continue;
       const keptTargets = new Set(trackedKept(entry.agentKey, kept).map((i) => i.target));
+      // FACTORY-1039 (review fix): a target this discovery still found but
+      // `capLinkedItems` dropped for lack of a slot is NOT a removal — see
+      // `cappedAwayThisTick`'s own doc comment above. Its baseline is
+      // therefore also left untouched below (never added to `gone`, so
+      // never reaches the baseline-delete sweep either) — it resumes
+      // diffing against its old snapshot the moment it wins a slot back,
+      // rather than restarting as a silent "first sighting" that could mask
+      // whatever changed on it while it was capped away.
+      const cappedAway = ctx.cappedAwayThisTick.get(entry.agentKey);
       const gone: LinkedChangeEvent[] = [];
-      for (const [target, info] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
+      for (const [target, info] of prevSet) {
+        if (keptTargets.has(target) || cappedAway?.has(target)) continue;
+        gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
+      }
       if (gone.length) removedByOwner.set(entry.agentKey, gone);
     }
 
@@ -1722,6 +1761,11 @@ export function createLinkedEventingState(): LinkedEventingState {
         // is missing from it) reports a false "no longer linked" for
         // something that never actually changed.
         const linkFetchFailedOwners = new Set<string>();
+        // FACTORY-1039 (review fix): one issue owner's own `capLinkedItems`
+        // `skipped` targets THIS tick, by agentKey — see `PassContext.cappedAwayThisTick`'s
+        // own doc comment for why this exists and how `runOwnerPass`'s
+        // removal detection consumes it.
+        const cappedAwayThisTick = new Map<string, Set<string>>();
         // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
         // tick's own native-issuelink membership, per issue owner — keyed
         // by the Jira issueLink's OWN id, not by target, so two DISTINCT
@@ -1794,6 +1838,11 @@ export function createLinkedEventingState(): LinkedEventingState {
           // the cap is the reason some weren't even fetched.
           if (skipped.length) {
             deps.log?.(`  WARNING: [linked-eventing] item cap: ${m.agentKey} (${m.issue.key}) has more linked items than maxLinkedItems (${effectiveMaxLinkedItems(m.rule)}) allows this tick; ${skipped.length} skipped (not watched) this tick — coverage is incomplete while this persists`);
+            // FACTORY-1039 (review fix): record WHICH targets lost their
+            // slot this tick so the removal-detection pass below can tell
+            // "capped away" apart from "genuinely no longer linked" — see
+            // `PassContext.cappedAwayThisTick`'s own doc comment.
+            cappedAwayThisTick.set(m.agentKey, new Set(skipped.map((i) => i.target)));
           }
           perOwnerItems.set(m.agentKey, kept);
         }
@@ -1895,7 +1944,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey, notifyAgentKey: m.notifyAgentKey ?? m.agentKey })),
         ];
 
-        const ctx: PassContext = { ownerEntries, perOwnerItems, projectOwnerKeys, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, issuelinkIdsThisTick, deps };
+        const ctx: PassContext = { ownerEntries, perOwnerItems, projectOwnerKeys, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, cappedAwayThisTick, issuelinkIdsThisTick, deps };
         lastPassContext = ctx;
         await runOwnerPass(ctx, undefined);
       });

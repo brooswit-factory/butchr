@@ -177,7 +177,7 @@ describe("FACTORY-1039: native Jira child discovery for Epic/Task owners", () =>
     ]);
   });
 
-  test("more native children than maxLinkedItems: the cap is enforced, the overflow is logged, never silently claimed as complete coverage", async () => {
+  test("more native children than maxLinkedItems: the cap is enforced, the overflow is logged, never silently claimed as complete coverage, and the cap-skipped child is never reported removed", async () => {
     const epic = issue("FACTORY-770", { issuetype: "Epic" });
     const world: Record<string, JiraIssue> = {
       "FACTORY-1": issue("FACTORY-1", { parent: "FACTORY-770" }),
@@ -185,10 +185,55 @@ describe("FACTORY-1039: native Jira child discovery for Epic/Task owners", () =>
       "FACTORY-3": issue("FACTORY-3", { parent: "FACTORY-770" }),
     };
     const state = createLinkedEventingState();
-    const { deps, logs } = fakeDeps(world, { childrenByParent: { "FACTORY-770": ["FACTORY-1", "FACTORY-2", "FACTORY-3"] } });
+    const { deps, notified, logs } = fakeDeps(world, { childrenByParent: { "FACTORY-770": ["FACTORY-1", "FACTORY-2", "FACTORY-3"] } });
+    const m = match("jira-work:epic:FACTORY-770", rule({ maxLinkedItems: 2 }), epic);
 
-    await state.runTick([match("jira-work:epic:FACTORY-770", rule({ maxLinkedItems: 2 }), epic)], deps);
+    await state.runTick([m], deps); // seed: FACTORY-1/FACTORY-2 kept, FACTORY-3 capped away
     expect(logs.some((l) => l.includes("item cap") && l.includes("FACTORY-770") && l.includes("1 skipped"))).toBe(true);
+    expect(notified).toHaveLength(0);
+
+    // Review fix (PR #831): the SAME, genuinely-unchanged set, capped the
+    // SAME way a second tick in a row — FACTORY-3 is still a real native
+    // child, just never fetched under this cap. It must never be reported
+    // "no longer linked" merely for persistently losing a scarce slot.
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(0);
+  });
+
+  test("FACTORY-1039 (review fix, PR #831): cap-truncated native children do not flap — reordering the SAME underlying set under a cap produces no removal event, and a still-linked overflow child resumes from its OLD baseline once it wins a slot back", async () => {
+    const epic = issue("FACTORY-770", { issuetype: "Epic" });
+    const world: Record<string, JiraIssue> = {
+      "FACTORY-1": issue("FACTORY-1", { parent: "FACTORY-770" }),
+      "FACTORY-2": issue("FACTORY-2", { parent: "FACTORY-770" }),
+      "FACTORY-3": issue("FACTORY-3", { parent: "FACTORY-770" }),
+    };
+    const childrenByParent: Record<string, string[]> = { "FACTORY-770": ["FACTORY-1", "FACTORY-2", "FACTORY-3"] };
+    const state = createLinkedEventingState();
+    const { deps, notified } = fakeDeps(world, { childrenByParent });
+    const m = match("jira-work:epic:FACTORY-770", rule({ maxLinkedItems: 2 }), epic);
+
+    await state.runTick([m], deps); // seed: FACTORY-1/FACTORY-2 kept, FACTORY-3 capped away
+    expect(notified).toHaveLength(0);
+
+    // Exactly the same three children, just a different order — reproduces
+    // wroosbit's review finding: without a deterministic `ORDER BY` on the
+    // real `parent = ...` search, Jira's own unspecified order could do
+    // this for no structural reason at all. Nothing was actually unlinked;
+    // this must never surface as "no longer linked" for FACTORY-1.
+    childrenByParent["FACTORY-770"] = ["FACTORY-3", "FACTORY-2", "FACTORY-1"];
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(0);
+
+    // Reordered back, AND a genuine change on the child that just won its
+    // slot back — it must diff against its ORIGINAL (tick-1) baseline, not
+    // restart as a silent "first sighting" that would swallow this change.
+    childrenByParent["FACTORY-770"] = ["FACTORY-1", "FACTORY-2", "FACTORY-3"];
+    world["FACTORY-1"] = issue("FACTORY-1", { parent: "FACTORY-770", status: "In Progress" });
+    await state.runTick([m], deps);
+    expect(notified).toHaveLength(1);
+    expect(linkedEvents(notified[0]!.reason)).toEqual([
+      { target: "FACTORY-1", kind: "native-child", detail: 'status changed from "To Do" to "In Progress" (as of 2026-09-16T00:00:00.000+0000)' },
+    ]);
   });
 
   test("a failed native-child search fails open: logs a WARNING, that owner's native children are simply skipped this tick, without blocking any other owner", async () => {
