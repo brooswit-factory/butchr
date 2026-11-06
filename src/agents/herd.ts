@@ -166,9 +166,14 @@ export interface Herd {
    *   it — OR (MEASURED live) the pane DID return to a shell but herdr
    *   rejects the relaunch with `agent_name_taken`: the old process can
    *   still hold the pane's agent name for a moment even after it stops
-   *   being the reported foreground process. Same non-destructive retry as
-   *   `"deferred"` either way, distinguished only in the eventual notice's
-   *   wording (a human likely needs to look, not just wait).
+   *   being the reported foreground process — OR (FACTORY-1037) `launchPending`
+   *   has persisted for the SAME pane past `LAUNCH_PENDING_STUCK_TIMEOUT_MS`:
+   *   a launch that never actually started (a native shell-readiness race
+   *   truncating the injected command is the measured incident cause) and
+   *   that herdr itself gives no bounded deadline for once its Blocked phase
+   *   is reached. Same non-destructive retry as `"deferred"` in every case,
+   *   distinguished only in the eventual notice's wording (a human likely
+   *   needs to look, not just wait).
    * - `"unresumable"`: resuming isn't possible because no id could ever be
    *   pinned down — no persisted session id at all (a pre-FACTORY-314
    *   workspace), or the running provider isn't Claude, or the agent
@@ -299,6 +304,27 @@ export const PANE_BUSY_MAX_RETRIES = 4;
  */
 export const RESUME_EXIT_TIMEOUT_MS = 10_000;
 export const RESUME_EXIT_POLL_MS = 250;
+
+/**
+ * FACTORY-1037 — how long `resumeInPlaceExclusive`'s own `launchPending`
+ * deferral (below) may persist for the SAME issue/pane before it is
+ * reported `"stuck"` instead of `"deferred"` forever. That method's own
+ * existing comment on this already named the gap this closes: herdr's
+ * Pending launch phase is itself deadline-bounded (source-read, not
+ * measured: 30s default/300s cap at the pinned version), but its Blocked
+ * phase has none, so a launch-pending deferral hit while Blocked "does not
+ * resolve 'in practice'; it can persist." 300_000ms is deliberately well
+ * above herdr's own documented worst-case Pending bound, so a launch that
+ * is still progressing through herdr's OWN bounded phase is never
+ * misclassified — only a deferral that outlives even that generous margin
+ * (necessarily either stuck in herdr's unbounded Blocked phase, or
+ * otherwise never settling) is reclassified. "stuck", not a new outcome:
+ * same non-destructive contract as every other `"stuck"` return here (no
+ * stop, no spawn, no touching the pane) — see `Herd.resumeInPlace`'s own
+ * doc comment for why that, not `"unresumable"` or a fresh outcome, is the
+ * correct shape for "needs a human, but nothing here is safe to automate."
+ */
+export const LAUNCH_PENDING_STUCK_TIMEOUT_MS = 300_000;
 
 /**
  * FACTORY-314 (FACTORY-312 review, 26137 point 2) — how long `resumeInPlace()`
@@ -660,6 +686,14 @@ export class HerdrHerd implements Herd {
   private readonly resumeFailureDetail = new Map<string, string>();
   /** FACTORY-622: the reason the LAST `spawn()` attempt for this issue did not produce a running agent, or absent when the last attempt succeeded (or no-opped on an already-live agent). See `lastSpawnRefusal` for the contract. */
   private readonly spawnRefusal = new Map<string, string>();
+  /**
+   * FACTORY-1037 — when `resumeInPlaceExclusive` FIRST observed THIS pane
+   * (keyed by `issue:pane`, so a genuinely new pane for the same issue never
+   * inherits a stale clock) continuously `launchPending`, monotonic time.
+   * Cleared the moment a poll finds it no longer pending (ready, gone, or a
+   * different pane entirely) — see that method's own use for the full bound.
+   */
+  private readonly launchPendingSince = new Map<string, { pane: string; since: number }>();
 
   /** See the `Herd.lastResumeFailureDetail` interface doc for the full contract. Read-once: cleared on read, same shape as `resumeInPlace`'s own outcome. */
   lastResumeFailureDetail(issue: string): string | undefined {
@@ -2101,7 +2135,26 @@ export class HerdrHerd implements Herd {
     // instead, so a launch-pending deferral hit while the pane is Blocked
     // is not bounded by anything herdr guarantees. This does not resolve
     // "in practice"; it can persist.
-    if (launchPending) return "deferred";
+    //
+    // FACTORY-1037: bounded here instead, since herdr will not do it for us.
+    // Keyed by pane, not just issue — a genuinely NEW pane for this same
+    // issue (a respawn elsewhere between polls) must start its own clock,
+    // never inherit a stale one from a pane that is no longer even this
+    // entry's pane. Past LAUNCH_PENDING_STUCK_TIMEOUT_MS, "stuck" — the
+    // existing non-destructive outcome ("do NOT relaunch onto it, do NOT
+    // kill it ... a human likely needs to look, not just wait") is exactly
+    // the right shape for a launch that never actually started and that no
+    // safe automated recovery exists for: this was never a running Claude
+    // process to begin with, only an upgrade from "wait forever" to "wait
+    // generously, then say so."
+    if (launchPending) {
+      const tracked = this.launchPendingSince.get(issue);
+      const since = tracked?.pane === pane ? tracked.since : this.monotonicNow();
+      this.launchPendingSince.set(issue, { pane, since });
+      if (this.monotonicNow() - since >= LAUNCH_PENDING_STUCK_TIMEOUT_MS) return "stuck";
+      return "deferred";
+    }
+    this.launchPendingSince.delete(issue);
     // FACTORY-314 (PR #513 review fix): verify the id we are ABOUT TO RESUME
     // still has a real transcript before doing anything else — a stale or
     // corrupted persisted id must fail safe (an honest fresh restart) rather
