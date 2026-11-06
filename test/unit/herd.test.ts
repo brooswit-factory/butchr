@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, LAUNCH_PENDING_STUCK_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -2314,6 +2314,78 @@ describe("resumeInPlace", () => {
         expect(outcome).toBe("unresumable");
         expect(f.sent).toEqual([]);
         expect(f.started).toHaveLength(0);
+      });
+    });
+  });
+
+  // FACTORY-1037: the launchPending guard above never resolved on its own —
+  // this pins the NEW bound on it (review finding: "resumeInPlaceExclusive's
+  // own launchPending deferral has an identical unbounded-wait shape").
+  // statefulHerdr's launchPending:true holds INDEFINITELY (see the
+  // processGone test's own note above), so without the fix every one of
+  // these polls would return "deferred" forever.
+  test("FACTORY-1037: a launch-pending pane that persists past the stuck ceiling (SAME pane, across polls) is reported stuck, not deferred forever", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-904" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true });
+        let now = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home), () => now);
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // first observation — the clock starts here
+        now += LAUNCH_PENDING_STUCK_TIMEOUT_MS - 1;
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // still inside the bound
+        now += 2; // now past LAUNCH_PENDING_STUCK_TIMEOUT_MS since the FIRST observation
+        expect(await herd.resumeInPlace(spec)).toBe("stuck");
+        // Non-destructive throughout, exactly like every other "stuck" path: never touched, never relaunched.
+        expect(f.sent).toEqual([]);
+        expect(f.started).toHaveLength(0);
+      });
+    });
+  });
+
+  test("FACTORY-1037: a launch_pending pane that clears before the ceiling keeps reporting deferred, never stuck", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-905" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd, "idle", { launchPending: true });
+        let now = 0;
+        const herd = new HerdrHerd(f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home), () => now);
+        expect(await herd.resumeInPlace(spec)).toBe("deferred");
+        now += LAUNCH_PENDING_STUCK_TIMEOUT_MS - 1;
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // still inside the bound, unlike the sibling test above
+      });
+    });
+  });
+
+  // A genuinely NEW pane for the same issue (a respawn elsewhere between
+  // polls) must start its own clock — it was never actually stuck for
+  // anywhere near as long as the issue's (not the pane's) clock would
+  // otherwise claim if keyed on the issue alone.
+  test("FACTORY-1037: a different pane for the same issue resets the stuck clock, even after the OLD pane had already accumulated most of the bound", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-906" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        let now = 0;
+        let pane = "w1:p1";
+        const client = {
+          agent: { list: async () => ({ agents: [{ agent: "claude", agent_status: "idle", cwd, pane_id: pane, workspace_id: "w1", launch_pending: true }] }) },
+          pane: { processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: [CLAUDE_PROC] } }) },
+        } as any;
+        const herd = new HerdrHerd(client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home), () => now);
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // pane "w1:p1"'s clock starts here
+        now += LAUNCH_PENDING_STUCK_TIMEOUT_MS - 1; // "w1:p1"'s own clock is now nearly exhausted
+        pane = "w2:p1"; // the issue now resolves to a genuinely different pane (a respawn elsewhere between polls)
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // NOT stuck — "w2:p1" has its own, freshly-started clock
+        now += LAUNCH_PENDING_STUCK_TIMEOUT_MS - 1;
+        expect(await herd.resumeInPlace(spec)).toBe("deferred"); // still inside "w2:p1"'s own bound
+        now += 2;
+        expect(await herd.resumeInPlace(spec)).toBe("stuck"); // "w2:p1" itself has now genuinely run out its own bound
       });
     });
   });
