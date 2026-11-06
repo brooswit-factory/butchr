@@ -66,6 +66,14 @@ export interface RuleResourceDeps {
    */
   remoteLinks?: (key: string) => Promise<JiraRemoteLink[]>;
   /**
+   * FACTORY-1039: a match's native Jira children (an Epic's attached
+   * Story/Task, a Task's own subtask), called ONLY for an Epic/Task owner —
+   * see `LinkedEventingDeps.nativeChildren` (src/jira-watch/linked-eventing.ts)
+   * for the exact contract. Optional; omitted, no Epic/Task owner's native
+   * children are ever watched (every existing caller/test).
+   */
+  nativeChildren?: LinkedEventingDeps["nativeChildren"];
+  /**
    * BUTCHR-436: delivers one poll tick's coalesced linked-change nudge to an
    * owning resource's own agent — the SAME notify seam `GenericLoopDeps.notify`
    * (src/daemon/loop.ts) already is in production (src/daemon/index.ts wires
@@ -643,6 +651,7 @@ export function createRuleResourceType(deps: RuleResourceDeps): ResourceType<Exe
             await linkedEventingState.runTick(latest, {
               search: deps.search,
               ...(deps.remoteLinks ? { remoteLinks: deps.remoteLinks } : {}),
+              ...(deps.nativeChildren ? { nativeChildren: deps.nativeChildren } : {}),
               ...(deps.suppress ? { suppress: deps.suppress } : {}),
               notify: deps.notify,
               ...(deps.log ? { log: deps.log } : {}),

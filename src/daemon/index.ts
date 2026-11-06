@@ -2250,6 +2250,22 @@ const ruleResourceType = createRuleResourceType({
   // that leaves it absent/false never calls this (see
   // src/jira-watch/linked-eventing.ts's own contract).
   remoteLinks: (key) => atlassian.remoteLinks(key),
+  // FACTORY-1039: gated INSIDE linked-eventing.ts to Epic/Task owners only
+  // (`NATIVE_CHILD_OWNER_ISSUETYPES`) — never called for a Story or
+  // `jira-project` owner. Same `jiraWorkStaffing.run` short-circuit and
+  // `searchAll` (full pagination, never a first-page-only `search`) as the
+  // `search` dep just above, for the same reasons given there.
+  // ORDER BY key ASC (review fix, PR #831): without it Jira's result order
+  // for an unordered `parent = ...` query is unspecified, so WHICH children
+  // a `maxLinkedItems` cap truncates away could shuffle tick-to-tick for
+  // the exact same underlying set — never safe, never actually unlinked,
+  // just an arbitrary different subset each time. A stable sort keeps the
+  // cap's victim(s) consistent, so coverage of an over-cap Epic/Task's own
+  // children is at least PREDICTABLE even though it is already,
+  // independently, never silently reported as a removal — see
+  // `cappedAwayThisTick` (src/jira-watch/linked-eventing.ts) for that half
+  // of the fix.
+  nativeChildren: async (key) => (jiraWorkStaffing.run ? atlassian.searchAll(`parent = "${key}" ORDER BY key ASC`) : []),
   // BUTCHR-437: the three external-link pollers' own deps — every one
   // gated by a match's own `linkedDescriptionLinks` opt-in inside
   // linked-eventing.ts, never called otherwise. `webpage` needs no

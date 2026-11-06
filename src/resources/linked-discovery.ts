@@ -37,7 +37,7 @@
  * of these is wired at runtime today, and where it is exposed-but-unwired
  * pending a future story.
  */
-import type { IssueLink, JiraRemoteLink } from "../atlassian/types.js";
+import type { IssueLink, JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
 import { isIssueKey } from "./id.js";
 import { formatGithubIssueRef, githubIssueRefFromUrl, githubPrRefFromUrl } from "./github-issue-ref.js";
 
@@ -58,7 +58,23 @@ export type LinkedItemKind =
    * so this kind is only ever produced by `src/resources/link-reconcile.ts`,
    * never by anything in this module.
    */
-  | "filesystem";
+  | "filesystem"
+  /**
+   * FACTORY-1039 (epic FACTORY-770, implementing story FACTORY-251): the
+   * INVERSE of `parent` above — a Jira issue whose own native `parent`
+   * field points AT this resource (an Epic's attached Story/Task, or a
+   * Task's native subtask), found by a caller's own `parent = "<ownKey>"`
+   * JQL search. Unlike every other kind above, this one is NOT found by
+   * parsing already-fetched data: a resource's DOWNWARD children are never
+   * on its own fetched payload (only its UPWARD `parent` pointer is), so
+   * this kind is only ever produced by `nativeChildItems` below from an
+   * array the CALLER already fetched via that search — see
+   * `nativeChildLinkedItems` (src/jira-watch/linked-eventing.ts) for the
+   * one caller that runs it, gated to Epic/Task owners only. No `linkId`,
+   * same reason `parent` has none: Jira's native hierarchy is a scalar
+   * field, not an identified link object.
+   */
+  | "native-child";
 
 /**
  * One discovered link. `target` is the stable identity `discoverLinkedItems`
@@ -110,6 +126,21 @@ export function parentItems(parent: string | null | undefined): LinkedItem[] {
 /** Every Jira remote issue link, as a target URL — see this module's own top comment for where the input array comes from at runtime. `JiraRemoteLink.id` is always present (required on that type), so every item here always carries a `linkId`. */
 export function remoteLinkItems(links: readonly JiraRemoteLink[]): LinkedItem[] {
   return links.map((l) => ({ kind: "remote-link" as const, target: l.url, linkId: l.id }));
+}
+
+/**
+ * FACTORY-1039: `children` is whatever a caller's own `parent = "<ownKey>"`
+ * JQL search already returned (never fetched here — see `"native-child"`'s
+ * own doc comment on `LinkedItemKind` above) — a pure map to `LinkedItem[]`,
+ * same shape `remoteLinkItems` above already has for its own
+ * already-fetched `JiraRemoteLink[]`. De-duplication and self-reference
+ * exclusion are the CALLER's job (`nativeChildLinkedItems`,
+ * src/jira-watch/linked-eventing.ts), same division of labour
+ * `discoverLinkedItems` itself uses for `ownKey` — this function stays a
+ * total, unconditional map with no filtering of its own.
+ */
+export function nativeChildItems(children: readonly JiraIssue[]): LinkedItem[] {
+  return children.map((c) => ({ kind: "native-child" as const, target: c.key }));
 }
 
 /** A bare Jira issue key, anywhere in text (not only inside a URL) — reuses `isIssueKey` (src/resources/id.ts), the same charset `src/tools/docs.ts`'s doc-binding path already treats as "shaped like an issue key", rather than a third regex disagreeing with the two that module's own doc comment already warns about. */

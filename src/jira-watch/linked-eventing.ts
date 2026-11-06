@@ -245,7 +245,7 @@
 import type { JiraComment, JiraIssue, JiraRemoteLink } from "../atlassian/types.js";
 import type { Rule } from "../rules/rules.js";
 import type { LinkedChangeEvent, NotifyReason } from "../resources/types.js";
-import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
+import { capLinkedItems, descriptionItems, discoverLinkedItems, jiraBrowseKey, nativeChildItems, type LinkedItem, type LinkedItemKind } from "../resources/linked-discovery.js";
 import { watchKeyForResource, type WatchKey } from "../catamorbius/mapping.js";
 import { isDaemonLabelOnlyDiff, excludeBookkeepingComments } from "./diff.js";
 import { watchedKeys } from "./routes.js";
@@ -373,8 +373,11 @@ export interface ProjectLinkedEventingMatch {
   notifyAgentKey?: string;
 }
 
-/** Of every kind `discoverLinkedItems` can produce, only these are Jira-kind for THIS module's Jira-diffing path (Confluence/GitHub/webpage are BUTCHR-437's, driven by the external-poll.ts path below). */
-const JIRA_DISCOVERY_KINDS = new Set<LinkedItemKind>(["issuelink", "parent", "jira-key"]);
+/** Of every kind `discoverLinkedItems` can produce, only these are Jira-kind for THIS module's Jira-diffing path (Confluence/GitHub/webpage are BUTCHR-437's, driven by the external-poll.ts path below). FACTORY-1039: `"native-child"` is included too — it never comes from `discoverLinkedItems` (see that kind's own doc comment, src/resources/linked-discovery.ts), but it is still a Jira issue key and rides this exact same batched-fetch/comment-cursor/push machinery. */
+const JIRA_DISCOVERY_KINDS = new Set<LinkedItemKind>(["issuelink", "parent", "jira-key", "native-child"]);
+
+/** FACTORY-1039: the owning-resource issue types `nativeChildLinkedItems` runs its `parent = "<ownKey>"` search for — this ticket's own bounded scope ("the owning Task/Epic side"), never a Story or any other type. */
+const NATIVE_CHILD_OWNER_ISSUETYPES = new Set(["Epic", "Task"]);
 
 /**
  * BUTCHR-437: the kinds `external-poll.ts` knows how to poll via a per-item
@@ -430,9 +433,10 @@ function pushWatchKeyFor(item: LinkedItem): { key: WatchKey; provider: "jira" | 
  * the pre-existing `related:` notify path — an Implements link with the
  * other end on the IMPLEMENTER side (`otherEnd === "outward"`), i.e. a boss
  * hearing what implements it — is excluded here, of whatever `LinkedItem`
- * kind it happens to surface as (issuelink/parent/jira-key/remote-link),
- * so this module never re-derives and re-notifies the SAME (owner, target)
- * pair `related:` already delivers independently. Both paths read off the
+ * kind it happens to surface as (issuelink/parent/jira-key/remote-link/
+ * FACTORY-1039's native-child), so this module never re-derives and
+ * re-notifies the SAME (owner, target) pair `related:` already delivers
+ * independently. Both paths read off the
  * SAME `watchedKeys` function (never a second, possibly-drifting
  * definition of "already routed"). This is deliberately NOT symmetric:
  * `watchedKeys` only ever returns the outward/implementer side, so a
@@ -440,8 +444,17 @@ function pushWatchKeyFor(item: LinkedItem): { key: WatchKey; provider: "jira" | 
  * reverse direction `routes.ts` itself documents as excluded from
  * `related:`) is never in this set and is therefore untouched — see this
  * ticket's PR for why that direction is left exactly as it was.
+ *
+ * FACTORY-1039: `nativeChildren`, when given (`nativeChildLinkedItems`
+ * below ran its own `parent = "<ownKey>"` search for an Epic/Task owner),
+ * is folded in LAST — behind `discovered` and `remoteKeyItems` in dedup
+ * order, so a child ALSO reachable via an explicit `issuelink` (or already
+ * routed via `related:`) keeps that structured kind/`linkId` and is never
+ * double-reported as a second, free-text-equivalent `native-child` item.
+ * This is the exact "explicit beats native-child, same target collapses to
+ * one item" rule this ticket's own acceptance criteria name.
  */
-export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: readonly JiraRemoteLink[] | undefined): LinkedItem[] {
+export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: readonly JiraRemoteLink[] | undefined, nativeChildren?: readonly JiraIssue[]): LinkedItem[] {
   const routedByRelated = new Set(watchedKeys(match.issue.issuelinks ?? []));
   const discovered = discoverLinkedItems({
     issuelinks: match.issue.issuelinks,
@@ -456,14 +469,97 @@ export function jiraKindLinkedItems(match: LinkedEventingMatch, remoteLinks: rea
       if (key && key !== match.issue.key) remoteKeyItems.push({ kind: "remote-link", target: key, linkId: l.id });
     }
   }
+  // FACTORY-1039: `!== match.issue.key` is a defensive self-reference guard
+  // (same shape the remote-link branch just above already has) against a
+  // corrupt/cyclic Jira parent graph — a `parent = "<ownKey>"` search
+  // returning the owner's own key back as its own "child" would otherwise
+  // self-loop this owner's own baseline.
+  const childItems = nativeChildren ? nativeChildItems(nativeChildren).filter((i) => i.target !== match.issue.key) : [];
   const seen = new Set<string>();
   const out: LinkedItem[] = [];
-  for (const item of [...discovered, ...remoteKeyItems]) {
+  for (const item of [...discovered, ...remoteKeyItems, ...childItems]) {
     if (seen.has(item.target) || routedByRelated.has(item.target)) continue;
     seen.add(item.target);
     out.push(item);
   }
   return out;
+}
+
+/**
+ * FACTORY-1039 (epic FACTORY-770, implementing story FACTORY-251): the
+ * native-child side of `jiraKindLinkedItems` above — a resource's DOWNWARD
+ * children are never on its own fetched payload (only its UPWARD `parent`
+ * pointer is; see `"native-child"`'s own doc comment, src/resources/
+ * linked-discovery.ts, and FACTORY-909(A)'s `parentOnlyOpenWorkers`,
+ * src/tools/relationship.ts, which documents the SAME asymmetry for the
+ * staffing tier), so finding them needs a real JQL query: `parent = "<ownKey>"`
+ * — ORDER BY-ed deterministically (the real wiring, `src/daemon/index.ts`,
+ * sorts `ORDER BY key ASC`) so WHICH children a `maxLinkedItems` cap
+ * truncates away stays stable tick-to-tick for the same underlying set,
+ * never an arbitrary rotating subset. See `LinkedEventingDeps.nativeChildren`'s
+ * own doc comment for why this is part of the DEP's contract, not merely
+ * an implementation detail of the one real caller.
+ *
+ * DELIBERATELY ITS OWN DEP (`LinkedEventingDeps.nativeChildren`), NOT the
+ * shared `deps.search` batched seam every OTHER Jira-kind fetch in this
+ * module already uses: `deps.search`'s own call COUNT is a load-bearing
+ * assertion across this module's existing test suite (BUTCHR-471's cap
+ * tests, every FACTORY-137 push/TTL/coverage-skip test) — those tests
+ * fake exactly one search shape (`key in (...)`) and assert how many times
+ * it fires. Routing this brand-new per-Epic/Task-owner call through that
+ * SAME function would silently double those counts for every Task/Epic
+ * owner in every one of those unrelated tests. A dedicated optional dep —
+ * same shape `remoteLinks`/`ticketPullRequest`/`confluenceVersion` already
+ * have — keeps this feature's marginal cost fully isolated and opt-in: a
+ * caller that never wires `nativeChildren` (every existing caller/test)
+ * gets byte-identical behaviour, never a new search call. See
+ * `src/rules/resource-type.ts`'s `RuleResourceDeps.nativeChildren` and
+ * `src/daemon/index.ts` for the one real wiring (`atlassian.searchAll`,
+ * which already paginates fully, so a child set larger than one page is
+ * never silently truncated here; `maxLinkedItems`, applied where
+ * `jiraKindLinkedItems`'s result is capped in `runTick` below, is what
+ * actually bounds how many are watched).
+ *
+ * SCOPED to `NATIVE_CHILD_OWNER_ISSUETYPES` (Epic/Task) only — this
+ * ticket's own bounded acceptance criterion ("the owning Task/Epic side");
+ * every other owner type (a Story, a `jira-project`, …), or an owner of
+ * either type when `deps.nativeChildren` is simply omitted, returns
+ * `{ items: [], failed: false }` with NO call at all, never a wasted one.
+ *
+ * FAILS OPEN, gated the same way `remoteLinks` already is: a failed fetch
+ * logs one WARNING and resolves `{ items: [], failed: true }` for just this
+ * owner, never throwing the whole tick away. `failed: true` additionally
+ * tells the caller to add this owner to `linkFetchFailedOwners` — unlike
+ * `remoteLinks`'s own failure (which only ever risks losing REMOTE-link
+ * targets), a native-child item IS ordinary removal-tracked `kept`
+ * membership, so a transient failure here could otherwise read as "no
+ * longer linked" for a child that never actually left; see
+ * `linkFetchFailedOwners`'s own doc comment in `runTick` below for the
+ * matching half of this safety.
+ *
+ * KNOWN, UNDETECTABLE COVERAGE GAP (named here, not fixed — there is
+ * nothing to fix): Jira's search silently OMITS an issue the querying
+ * account cannot read, the SAME documented contract the batched
+ * `key in (...)` fetch already has. For an EXPLICITLY-linked target that
+ * omission is at least detectable (the target's key was already known, so
+ * a missing row is reported `unreadable`). A native child has no such
+ * prior key — if one is permission-restricted from the very first tick, it
+ * never appears in `children` at all and this function has no way to know
+ * it exists, let alone report it. So "zero native children found" is never
+ * provable as "this Epic/Task genuinely has none" — only as "none were
+ * found that this account could read this tick." Document this limitation
+ * in the PR; there is no code-level fix for a search that cannot see what
+ * it cannot see.
+ */
+async function nativeChildLinkedItems(match: LinkedEventingMatch, deps: LinkedEventingDeps): Promise<{ items: readonly JiraIssue[]; failed: boolean }> {
+  if (!NATIVE_CHILD_OWNER_ISSUETYPES.has(match.issue.issuetype) || !deps.nativeChildren) return { items: [], failed: false };
+  try {
+    const children = await deps.nativeChildren(match.issue.key);
+    return { items: children, failed: false };
+  } catch (e) {
+    deps.log?.(`  WARNING: [linked-eventing] native-child fetch failed for ${match.agentKey} (${match.issue.key}): ${(e as Error)?.message ?? e}`);
+    return { items: [], failed: true };
+  }
 }
 
 /**
@@ -647,6 +743,29 @@ export interface LinkedEventingDeps {
   search: (jql: string) => Promise<JiraIssue[]>;
   /** `AtlassianClient#remoteLinks` — called ONLY for a match whose rule has `linkedRemoteLinks: true`, never otherwise (BUTCHR-436's own knob contract: zero remote-link calls for a non-opted-in resource). Optional; omitted, no rule can ever opt into remote links (treated the same as a rule that doesn't). */
   remoteLinks?: (key: string) => Promise<JiraRemoteLink[]>;
+  /**
+   * FACTORY-1039: a Jira `parent = "<key>"` search — called ONLY for an
+   * Epic/Task owner (`NATIVE_CHILD_OWNER_ISSUETYPES`), never for a Story or
+   * a `jira-project` owner. Deliberately a dependency OF ITS OWN, never the
+   * shared `search` above — see `nativeChildLinkedItems`'s own doc comment
+   * for why reusing `search` would have silently doubled that function's
+   * call count for every existing test of every OTHER feature built on it.
+   * Optional; omitted, no Epic/Task owner's native children are ever
+   * watched (byte-identical to pre-FACTORY-1039 behaviour) — the same
+   * "omitted dep ⇒ feature silently never runs" contract `remoteLinks`
+   * above already has.
+   *
+   * CONTRACT (review fix, PR #831): the returned array's ORDER matters —
+   * `capLinkedItems` keeps a strict PREFIX of it under `maxLinkedItems`, so
+   * an implementation that doesn't return a stable order (e.g. a raw,
+   * unsorted Jira search) lets which children get a slot rotate between
+   * ticks for the exact same underlying set. `cappedAwayThisTick`
+   * (this module's own `runTick`) already stops that rotation from ever
+   * being misreported as a removal, but a stable order (the real wiring's
+   * `ORDER BY key ASC`, `src/daemon/index.ts`) is still what keeps WHICH
+   * children are actually covered predictable rather than arbitrary.
+   */
+  nativeChildren?: (key: string) => Promise<JiraIssue[]>;
   /** Own-write echo suppression — `createOwnWriteLedger#shouldSuppress` (src/jira-watch/own-writes.ts), called with the LINKED item's own key and the OWNING agent as watcher, so an agent's edit to something it links suppresses only for that agent, exactly as `LoopDeps.suppress` already documents for owned resources. Optional; omitted, nothing is ever suppressed as an echo. Jira-kind only — an external target has no own-write concept here (BUTCHR-437 does not extend echo suppression to Confluence/GitHub/webpage). */
   suppress?: (key: string, updated: string, watcher: string) => boolean;
   /** The exact delivery seam every other notify in this codebase already uses — see this module's own top comment for why this is "UNCHANGED IN SHAPE". */
@@ -952,6 +1071,17 @@ export function createLinkedEventingState(): LinkedEventingState {
     // replays the SAME last-known fetch-failure set instead of assuming
     // everything succeeded.
     linkFetchFailedOwners: ReadonlySet<string>;
+    // FACTORY-1039: the targets `capLinkedItems` skipped THIS discovery for
+    // one issue owner (`capLinkedItems`'s own `skipped`, keyed by target) —
+    // see the removal-detection skip in `runOwnerPass` for why. A cap-
+    // skipped target is simply not FETCHED/diffed this tick (same shape as
+    // `linkFetchFailedOwners` above: "not checked" must never look like
+    // "unlinked"), so excluding it from `gone` is the exact same discipline
+    // applied for a different cause. Unlike `linkFetchFailedOwners`, this
+    // does NOT suppress every OTHER per-item check for the owner — only
+    // this ONE target's removal comparison — since every other kept item
+    // is unaffected by one sibling target losing its cap slot.
+    cappedAwayThisTick: ReadonlyMap<string, ReadonlySet<string>>;
     // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
     // discovery's own native-issuelink membership per issue owner, keyed by
     // the Jira issueLink's OWN id — see `issuelinkMembership`'s own doc
@@ -1232,8 +1362,20 @@ export function createLinkedEventingState(): LinkedEventingState {
       const kept = perOwnerItems.get(entry.agentKey) ?? [];
       if (!prevSet) continue;
       const keptTargets = new Set(trackedKept(entry.agentKey, kept).map((i) => i.target));
+      // FACTORY-1039 (review fix): a target this discovery still found but
+      // `capLinkedItems` dropped for lack of a slot is NOT a removal — see
+      // `cappedAwayThisTick`'s own doc comment above. Its baseline is
+      // therefore also left untouched below (never added to `gone`, so
+      // never reaches the baseline-delete sweep either) — it resumes
+      // diffing against its old snapshot the moment it wins a slot back,
+      // rather than restarting as a silent "first sighting" that could mask
+      // whatever changed on it while it was capped away.
+      const cappedAway = ctx.cappedAwayThisTick.get(entry.agentKey);
       const gone: LinkedChangeEvent[] = [];
-      for (const [target, info] of prevSet) if (!keptTargets.has(target)) gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
+      for (const [target, info] of prevSet) {
+        if (keptTargets.has(target) || cappedAway?.has(target)) continue;
+        gone.push({ target, kind: info.kind, detail: "no longer linked", ...(info.linkId ? { linkId: info.linkId } : {}) });
+      }
       if (gone.length) removedByOwner.set(entry.agentKey, gone);
     }
 
@@ -1619,6 +1761,11 @@ export function createLinkedEventingState(): LinkedEventingState {
         // is missing from it) reports a false "no longer linked" for
         // something that never actually changed.
         const linkFetchFailedOwners = new Set<string>();
+        // FACTORY-1039 (review fix): one issue owner's own `capLinkedItems`
+        // `skipped` targets THIS tick, by agentKey — see `PassContext.cappedAwayThisTick`'s
+        // own doc comment for why this exists and how `runOwnerPass`'s
+        // removal detection consumes it.
+        const cappedAwayThisTick = new Map<string, Set<string>>();
         // FACTORY-833 (review round 2, PR #800, replayed onto main): THIS
         // tick's own native-issuelink membership, per issue owner — keyed
         // by the Jira issueLink's OWN id, not by target, so two DISTINCT
@@ -1661,17 +1808,42 @@ export function createLinkedEventingState(): LinkedEventingState {
               linkFetchFailedOwners.add(m.agentKey);
             }
           }
+          // FACTORY-1039: native Jira children (an Epic's attached
+          // Story/Task, a Task's own subtask) — see `nativeChildLinkedItems`'s
+          // own doc comment for the search, its scope (Epic/Task owners
+          // only) and its fail-open/coverage-gap contract. A failure here
+          // joins the SAME `linkFetchFailedOwners` set the remote-links
+          // failure above does, for the same reason — see that set's own
+          // doc comment in `runTick` below.
+          const { items: nativeChildren, failed: nativeChildFailed } = await nativeChildLinkedItems(m, deps);
+          if (nativeChildFailed) linkFetchFailedOwners.add(m.agentKey);
           // BUTCHR-437: description-derived Confluence/GitHub/webpage items
           // are combined with Jira-kind items BEFORE `maxLinkedItems` caps,
           // so the cap applies uniformly across every kind for this
           // resource — never a separate per-kind budget.
-          const jiraItems = jiraKindLinkedItems(m, remoteLinks);
+          const jiraItems = jiraKindLinkedItems(m, remoteLinks, nativeChildren);
           const externalItems = m.rule.linkedDescriptionLinks === true ? descriptionLinkedItems(m) : [];
           // local/ui: the ticket's own PR first, so the item cap never drops
           // it, and deduped so the same PR named in the description isn't
           // watched twice.
           const prItems = ticketPullRequestItems(m.issue.key, deps.ticketPullRequest);
-          const { kept } = capLinkedItems(dedupeByTarget([...prItems, ...jiraItems, ...externalItems]), effectiveMaxLinkedItems(m.rule));
+          const { kept, skipped } = capLinkedItems(dedupeByTarget([...prItems, ...jiraItems, ...externalItems]), effectiveMaxLinkedItems(m.rule));
+          // FACTORY-1039: unlike the project-member cap warning below (which
+          // holds that owner's watermark too), an issue owner's item cap has
+          // no watermark to hold — a skipped item is simply not watched this
+          // tick, retried fresh next tick exactly like it always was pre-this
+          // ticket. This warning only makes that non-coverage VISIBLE instead
+          // of silent, so "zero native-child events this tick" is never
+          // misread as "this Epic/Task's children are fully covered" when
+          // the cap is the reason some weren't even fetched.
+          if (skipped.length) {
+            deps.log?.(`  WARNING: [linked-eventing] item cap: ${m.agentKey} (${m.issue.key}) has more linked items than maxLinkedItems (${effectiveMaxLinkedItems(m.rule)}) allows this tick; ${skipped.length} skipped (not watched) this tick — coverage is incomplete while this persists`);
+            // FACTORY-1039 (review fix): record WHICH targets lost their
+            // slot this tick so the removal-detection pass below can tell
+            // "capped away" apart from "genuinely no longer linked" — see
+            // `PassContext.cappedAwayThisTick`'s own doc comment.
+            cappedAwayThisTick.set(m.agentKey, new Set(skipped.map((i) => i.target)));
+          }
           perOwnerItems.set(m.agentKey, kept);
         }
 
@@ -1772,7 +1944,7 @@ export function createLinkedEventingState(): LinkedEventingState {
           ...projectOpted.map((m) => ({ agentKey: m.agentKey, rule: m.rule, label: m.projectKey, notifyAgentKey: m.notifyAgentKey ?? m.agentKey })),
         ];
 
-        const ctx: PassContext = { ownerEntries, perOwnerItems, projectOwnerKeys, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, issuelinkIdsThisTick, deps };
+        const ctx: PassContext = { ownerEntries, perOwnerItems, projectOwnerKeys, memberTargetsByOwner, usedWatermarkByOwner, nextProjectWatermark, memberFetchedByKey, linkFetchFailedOwners, cappedAwayThisTick, issuelinkIdsThisTick, deps };
         lastPassContext = ctx;
         await runOwnerPass(ctx, undefined);
       });

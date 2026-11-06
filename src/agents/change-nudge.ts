@@ -260,8 +260,8 @@ export function jiraIdeaNudge(resource: string, reason: NotifyReason | undefined
  * anyone else). Never empty: `events` is guaranteed non-empty by the
  * coalescer (a tick with nothing to report never calls this at all).
  */
-/** The linked-item kinds that name a Jira issue (`JIRA_DISCOVERY_KINDS`, src/jira-watch/linked-eventing.ts) — restated, not imported, to keep this module free of that one's imports. */
-const JIRA_LINKED_KINDS = new Set(["issuelink", "parent", "jira-key", "remote-link"]);
+/** The linked-item kinds that name a Jira issue (`JIRA_DISCOVERY_KINDS`, src/jira-watch/linked-eventing.ts) — restated, not imported, to keep this module free of that one's imports. FACTORY-1039: `"native-child"` added alongside that set's own addition. */
+const JIRA_LINKED_KINDS = new Set(["issuelink", "parent", "jira-key", "remote-link", "native-child"]);
 
 export function linkedChangeNudge(issue: string, events: readonly LinkedChangeEvent[]): string {
   const n = events.length;
