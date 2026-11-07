@@ -72,6 +72,26 @@ async function pollForStubToRun(pane: string, timeoutMs: number): Promise<boolea
   return false;
 }
 
+/**
+ * `workspace.create` resolves once Herdr has allocated the pane, which can
+ * precede the shell becoming ready to receive the agent-start command. Two
+ * successive foreground-process observations provide a small readiness
+ * fence without treating the shell itself as proof that the stub ran (the
+ * sentinel below remains the only success condition).
+ */
+async function waitForPaneShell(pane: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let readyObservations = 0;
+  while (Date.now() < deadline) {
+    const r = await herdr.pane.processInfo({ pane_id: pane }).catch(() => undefined);
+    const processes = (r as { process_info?: { foreground_processes?: unknown[] } } | undefined)?.process_info?.foreground_processes;
+    readyObservations = Array.isArray(processes) && processes.length > 0 ? readyObservations + 1 : 0;
+    if (readyObservations >= 2) return;
+    await new Promise((res) => setTimeout(res, 250));
+  }
+  throw new Error(`new Herdr pane ${pane} never reported a stable shell before agent.start`);
+}
+
 async function cleanup(): Promise<void> {
   if(targetPaneId)await herdr.pane.close(targetPaneId).catch(()=>{});
   if(targetWorkspaceId)await herdr.workspace.close({workspace_id:targetWorkspaceId}).catch(()=>{});
@@ -112,6 +132,7 @@ async function main(): Promise<void> {
   workspaceId = created.workspace.workspace_id;
   paneId = created.root_pane.pane_id;
   console.log(`herdr workspace ${workspaceId}, pane ${paneId}`);
+  await waitForPaneShell(paneId, 5_000);
 
   // This call is the actual regression surface: FACTORY-735/739 made this
   // reject with invalid_agent_argument for EVERY spawn in production. If it

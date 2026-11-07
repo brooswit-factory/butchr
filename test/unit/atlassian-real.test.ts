@@ -54,6 +54,26 @@ afterEach(() => {
 });
 
 describe("realAtlassian confluence page ops", () => {
+  test("getChildPages rejects incomplete pagination responses instead of mapping them to a measured empty page", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({ children: { getChildPages: () => Promise.resolve({ _links: { next: "/wiki/api/v2/pages/1/children?limit=50" } }) } }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getChildPages("1")).rejects.toThrow("omitted results");
+  });
+
+  test("getChildPages rejects a next link without a usable cursor rather than silently ending pagination", async () => {
+    mock.module("confluence.js", () => ({
+      createV2Client: () => ({ children: { getChildPages: () => Promise.resolve({ results: [], _links: { next: "/wiki/api/v2/pages/1/children?limit=50" } }) } }),
+      createV1Client: () => ({ search: { searchByCQL: () => Promise.resolve({ results: [] }) } }),
+    }));
+    const { realAtlassian } = await import("../../src/tools/atlassian-real.js");
+    const ops = realAtlassian({ site: "https://x.atlassian.net", email: "e@x.com", token: "t" });
+    await expect(ops.getChildPages("1")).rejects.toThrow("omitted cursor");
+  });
+
   test("createPage nests spaceId/status/title/body (+ optional parentId) under `body`, the only key confluence.js 3.2.0 forwards; getPage sends bodyFormat, the key the library actually reads, and adds bodyRequested/bodyLength", async () => {
     const createPageCalls: unknown[] = [];
     const getPageByIdCalls: unknown[] = [];

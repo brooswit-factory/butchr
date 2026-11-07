@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertOnlyChanged, createRulesFileExclusive, defaultIo, restoreBackup, rulesEtag, setRuleEnabled, setRuleRole, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
+import { assertOnlyChanged, createRulesFileExclusive, defaultIo, isUnsupportedDirectoryFsync, restoreBackup, rulesEtag, setRuleEnabled, setRuleRole, updateRulesFile, writeRulesFile, type WriteRulesIo, type WriteRulesResult } from "../../src/rules/write-rules.js";
 import type { RulesEnv } from "../../src/rules/rules.js";
 
 let dir: string;
@@ -590,9 +590,15 @@ describe("assertOnlyChanged (round 3, finding F2)", () => {
   });
 });
 
-describe("fsyncDir error handling (round 3, finding F5: swallow only EINVAL/ENOTSUP)", () => {
+describe("fsyncDir error handling (round 3, finding F5: swallow only unsupported-directory errors)", () => {
   test("the default io's fsyncDir propagates a non-whitelisted error (e.g. ENOENT) rather than swallowing it", () => {
     expect(() => defaultIo().fsyncDir(join(dir, "this-directory-does-not-exist"))).toThrow();
+  });
+
+  test("Windows EPERM is only treated as an unsupported directory fsync on Windows", () => {
+    expect(isUnsupportedDirectoryFsync("EPERM", "win32")).toBe(true);
+    expect(isUnsupportedDirectoryFsync("EPERM", "linux")).toBe(false);
+    expect(isUnsupportedDirectoryFsync("EIO", "win32")).toBe(false);
   });
 });
 

@@ -237,9 +237,17 @@ export function realAtlassian(cfg: { site: string; email: string; token: string 
     // following its `cursor` reached the rest.
     getChildPages: async (parentId, cursor) => {
       const r: any = await wiki.children.getChildPages({ id: parentId, limit: 50, ...(cursor ? { cursor } : {}) });
-      const nextUrl: string | undefined = r?._links?.next;
-      const nextCursor = nextUrl ? new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor") : null;
-      return { results: (r?.results ?? []).map((c: any) => ({ id: c.id, title: c.title })), ...(nextCursor ? { nextCursor } : {}) };
+      if (!Array.isArray(r?.results)) throw new Error("Confluence child-pages response omitted results");
+      const results = r.results.map((c: any) => {
+        if (typeof c?.id !== "string" || c.id.length === 0) throw new Error("Confluence child-pages response contained an invalid child id");
+        return { id: c.id, ...(typeof c.title === "string" ? { title: c.title } : {}) };
+      });
+      const nextUrl = r?._links?.next;
+      if (nextUrl === undefined || nextUrl === null) return { results };
+      if (typeof nextUrl !== "string" || nextUrl.length === 0) throw new Error("Confluence child-pages response contained an invalid next link");
+      const nextCursor = new URL(nextUrl, "https://placeholder.invalid").searchParams.get("cursor");
+      if (!nextCursor) throw new Error("Confluence child-pages response next link omitted cursor");
+      return { results, nextCursor };
     },
 
     // Read-modify-write: `fields.labels` on editIssue takes the FULL desired
