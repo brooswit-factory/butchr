@@ -17,7 +17,6 @@ import { loadTrelloAuth } from "../../src/resources/trello-card.js";
 import { githubTokenFilePath, testCandidateGithubToken, writeGithubToken } from "../../src/setup/github-token-write.js";
 import type { FetchLike } from "../../src/setup/jira-token-write.js";
 import { handleJiraTokenWrite, isTokenLiteralFromEnvironment } from "../../src/web/setup-api.js";
-import { createSetupCodeManager } from "../../src/setup/setup-code.js";
 
 let dir: string;
 beforeEach(() => {
@@ -186,11 +185,9 @@ describe("Atlassian rotation (relaxed env check)", () => {
   test("an env-named token file is rotated in place", async () => {
     const path = join(dir, "atlassian-token");
     writeFileSync(path, "old", { mode: 0o600 });
-    const setupCode = createSetupCodeManager();
-    const code = setupCode.mint();
     const r = await handleJiraTokenWrite(
-      { site: "https://x.atlassian.net", email: "a@b.c", token: "new-atl-token", setupCode: code },
-      { setupCode, fetchFn: okFetch, path, env: { ATLASSIAN_TOKEN_FILE: path }, checkDestination: (p) => checkSecretDestination(p, { managed: false }) },
+      { site: "https://x.atlassian.net", email: "a@b.c", token: "new-atl-token" },
+      { fetchFn: okFetch, path, env: { ATLASSIAN_TOKEN_FILE: path }, checkDestination: (p) => checkSecretDestination(p, { managed: false }) },
       { requireEnvCheck: true },
     );
     expect(r).toMatchObject({ ok: true, status: 200, body: { rotated: true, restartNeeded: true } });
@@ -198,18 +195,15 @@ describe("Atlassian rotation (relaxed env check)", () => {
     expect(modeOf(path)).toBe(0o600);
   });
 
-  test("a bad destination answers 400 before the setup code is spent", async () => {
+  test("a bad destination answers 400", async () => {
     writeFileSync(join(dir, "target"), "x");
     symlinkSync(join(dir, "target"), join(dir, "link"));
-    const setupCode = createSetupCodeManager();
-    const code = setupCode.mint();
     const r = await handleJiraTokenWrite(
-      { site: "https://x.atlassian.net", email: "a@b.c", token: "new", setupCode: code },
-      { setupCode, fetchFn: okFetch, path: join(dir, "link"), env: { ATLASSIAN_TOKEN_FILE: join(dir, "link") }, checkDestination: (p) => checkSecretDestination(p, { managed: false }) },
+      { site: "https://x.atlassian.net", email: "a@b.c", token: "new" },
+      { fetchFn: okFetch, path: join(dir, "link"), env: { ATLASSIAN_TOKEN_FILE: join(dir, "link") }, checkDestination: (p) => checkSecretDestination(p, { managed: false }) },
       { requireEnvCheck: true },
     );
     expect(r).toMatchObject({ ok: false, status: 400, body: { error: expect.stringContaining("symlink") } });
-    expect(setupCode.check(code)).toEqual({ ok: true });
   });
 });
 

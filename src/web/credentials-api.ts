@@ -2,12 +2,11 @@
  * local/ui — the orchestration behind `PUT /api/settings/github/token`, held
  * to the same order and rules as `./setup-api.ts`'s `handleJiraTokenWrite`:
  * configuration refusals first (a read-only target, an unsafe destination),
- * then the one-time setup code, then the shared secret-write rate limit,
- * then the token test and the write (`../setup/github-token-write.ts`).
- * Nothing here ever logs, audits, or returns the token or the code. Also
- * builds the credentials summary `GET /api/settings` carries (below).
+ * then the shared secret-write rate limit, then the token test and the
+ * write (`../setup/github-token-write.ts`). Nothing here ever logs, audits,
+ * or returns the token. Also builds the credentials summary `GET
+ * /api/settings` carries (below).
  */
-import type { SetupCodeManager } from "../setup/setup-code.js";
 import type { FetchLike, JiraTokenWriteIo } from "../setup/jira-token-write.js";
 import { writeGithubToken, type GithubTokenWriteOutcome } from "../setup/github-token-write.js";
 import { providerTestError, testTrelloBoard, testTrelloCredentials, testZendeskToken, writeVerifiedSecrets, type IdentityTest, type ProviderName, type VerifiedWriteOutcome } from "../setup/provider-secrets.js";
@@ -27,7 +26,6 @@ export type GithubTokenWriteRequestOutcome =
   | { ok: false; status: 429; body: { error: string }; retryAfterSeconds: number };
 
 export interface GithubWriteDeps {
-  setupCode: SetupCodeManager;
   /** Where the token goes (`resolveCredentialTarget("github", process.env)`), resolved per request so an env change is never cached. */
   target: CredentialTarget;
   io?: JiraTokenWriteIo;
@@ -49,14 +47,12 @@ function outcomeToResponse(outcome: GithubTokenWriteOutcome): GithubTokenWriteRe
   }
 }
 
-export async function handleGithubTokenWrite(input: { token: string; setupCode: string }, deps: GithubWriteDeps, opts: { rateGate?: RateGate } = {}): Promise<GithubTokenWriteRequestOutcome> {
+export async function handleGithubTokenWrite(input: { token: string }, deps: GithubWriteDeps, opts: { rateGate?: RateGate } = {}): Promise<GithubTokenWriteRequestOutcome> {
   const { target } = deps;
   if (target.readOnlyReason !== null || target.path === null) return { ok: false, status: 400, body: { error: target.readOnlyReason ?? "this token can't be set from here" } };
   const destination = checkSecretDestination(target.path, { managed: target.managed }, deps.destinationIo);
   if (!destination.ok) return { ok: false, status: 400, body: { error: destination.error } };
 
-  const codeCheck = deps.setupCode.check(input.setupCode);
-  if (!codeCheck.ok) return { ok: false, status: 400, body: { error: `setup code: ${codeCheck.reason}` } };
   const gate = opts.rateGate?.();
   if (gate && !gate.ok) return { ok: false, status: 429, body: { error: gate.error }, retryAfterSeconds: gate.retryAfterSeconds };
 
@@ -70,8 +66,8 @@ export async function handleGithubTokenWrite(input: { token: string; setupCode: 
 // ---------------------------------------------------------------------------
 // local/ui — `PUT /api/settings/zendesk/token` and `PUT
 // /api/settings/trello/credentials`: the GitHub route's order exactly
-// (configuration refusals, then the setup code, then the rate limit, then
-// the shape check, then test + write via `../setup/provider-secrets.ts`).
+// (configuration refusals, then the rate limit, then the shape check,
+// then test + write via `../setup/provider-secrets.ts`).
 // ---------------------------------------------------------------------------
 
 export type ProviderSecretWriteRequestOutcome =
@@ -80,7 +76,6 @@ export type ProviderSecretWriteRequestOutcome =
   | { ok: false; status: 429; body: { error: string }; retryAfterSeconds: number };
 
 export interface ProviderSecretWriteDeps {
-  setupCode: SetupCodeManager;
   /** Where each value goes, in the order the handler receives them, resolved per request. */
   targets: readonly CredentialTarget[];
   io?: JiraTokenWriteIo;
@@ -102,7 +97,6 @@ function verifiedOutcomeToResponse(outcome: VerifiedWriteOutcome, provider: Prov
 async function handleProviderSecretWrite(
   provider: ProviderName,
   values: readonly string[],
-  setupCode: string,
   test: (values: readonly string[]) => Promise<IdentityTest>,
   deps: ProviderSecretWriteDeps,
   opts: { rateGate?: RateGate; preflightError?: string | null },
@@ -114,8 +108,6 @@ async function handleProviderSecretWrite(
   }
   if (opts.preflightError) return { ok: false, status: 400, body: { error: opts.preflightError } };
 
-  const codeCheck = deps.setupCode.check(setupCode);
-  if (!codeCheck.ok) return { ok: false, status: 400, body: { error: `setup code: ${codeCheck.reason}` } };
   const gate = opts.rateGate?.();
   if (gate && !gate.ok) return { ok: false, status: 429, body: { error: gate.error }, retryAfterSeconds: gate.retryAfterSeconds };
 
@@ -128,17 +120,17 @@ async function handleProviderSecretWrite(
 }
 
 /** `subdomain` is what the token is tested against: the env's `ZENDESK_SUBDOMAIN`, else settings.json's. It's validated before anything is sent, since it becomes the request's host. */
-export async function handleZendeskTokenWrite(input: { token: string; setupCode: string }, deps: ProviderSecretWriteDeps & { subdomain: string | null }, opts: { rateGate?: RateGate } = {}): Promise<ProviderSecretWriteRequestOutcome> {
+export async function handleZendeskTokenWrite(input: { token: string }, deps: ProviderSecretWriteDeps & { subdomain: string | null }, opts: { rateGate?: RateGate } = {}): Promise<ProviderSecretWriteRequestOutcome> {
   const subdomain = deps.subdomain?.trim() ?? "";
   const preflightError = !subdomain
     ? "set and save the Zendesk subdomain first, then set the token"
     : !isZendeskSubdomain(subdomain) ? `ZENDESK_SUBDOMAIN ${JSON.stringify(subdomain)} isn't a valid subdomain` : null;
-  return handleProviderSecretWrite("Zendesk", [input.token], input.setupCode, ([token]) => testZendeskToken(subdomain, token!, deps.fetchFn), deps, { ...opts, preflightError });
+  return handleProviderSecretWrite("Zendesk", [input.token], ([token]) => testZendeskToken(subdomain, token!, deps.fetchFn), deps, { ...opts, preflightError });
 }
 
 /** Both values are tested together (Trello takes the key and token as a pair) and written together. */
-export async function handleTrelloCredentialsWrite(input: { apiKey: string; token: string; setupCode: string }, deps: ProviderSecretWriteDeps, opts: { rateGate?: RateGate } = {}): Promise<ProviderSecretWriteRequestOutcome> {
-  return handleProviderSecretWrite("Trello", [input.apiKey, input.token], input.setupCode, ([apiKey, token]) => testTrelloCredentials(apiKey!, token!, deps.fetchFn), deps, opts);
+export async function handleTrelloCredentialsWrite(input: { apiKey: string; token: string }, deps: ProviderSecretWriteDeps, opts: { rateGate?: RateGate } = {}): Promise<ProviderSecretWriteRequestOutcome> {
+  return handleProviderSecretWrite("Trello", [input.apiKey, input.token], ([apiKey, token]) => testTrelloCredentials(apiKey!, token!, deps.fetchFn), deps, opts);
 }
 
 export type ProviderConnectionTestResult = { ok: true; account: string; board?: string } | { ok: false; error: string };
@@ -208,8 +200,6 @@ export interface CredentialsSummary {
     /** `BUTCHR_TRELLO_ACCEPT_SHELL_CREDENTIAL_RISK` holds the opt-in value trello-card rules need. Set in the environment only, never from the page. */
     riskAccepted: boolean;
   };
-  /** How to mint the one-time setup code every token write needs, for this daemon's supervisor. */
-  setupCode: { command: string; findCommand: string | null; where: string };
   /** `startedAt`: when this daemon started (`/health`'s), so the page can tell a restarted daemon's answers from this one's. */
   restart: { supported: boolean; supervisor: "launchd" | "systemd" | "none"; startedAt: string };
 }
@@ -244,33 +234,6 @@ export interface CredentialsSummaryInput {
   running: { githubOrgs: readonly string[]; zendeskSubdomain: string | null; trelloBoardId: string | null };
   startedAt: string;
   supervisor: SupervisorInfo;
-  ownPid: number;
-}
-
-/** Single-quotes a path for a copy-paste command unless it's plainly safe. */
-function shellPath(path: string): string {
-  return /^[A-Za-z0-9_./~-]+$/.test(path) ? path : `'${path.replace(/'/g, `'\\''`)}'`;
-}
-
-export function setupCodeInstructions(supervisor: SupervisorInfo, ownPid: number): CredentialsSummary["setupCode"] {
-  switch (supervisor.kind) {
-    case "launchd": {
-      const log = supervisor.job.stderrPath;
-      return {
-        command: `launchctl kill SIGUSR2 gui/$(id -u)/${supervisor.job.label}`,
-        findCommand: log ? `grep 'setup code' ${shellPath(log)} | tail -1` : null,
-        where: log ? `butchr's log (${log})` : "butchr's log",
-      };
-    }
-    case "systemd":
-      return {
-        command: "systemctl --user kill -s SIGUSR2 butchr.service",
-        findCommand: "journalctl --user -u butchr.service -n 100 | grep 'setup code' | tail -1",
-        where: "butchr's journal",
-      };
-    default:
-      return { command: `kill -USR2 ${ownPid}`, findCommand: null, where: "butchr's own output (stderr)" };
-  }
 }
 
 async function tokenStatus(target: CredentialTarget, statFn: (path: string) => Promise<StatResult>): Promise<TokenStatus> {
@@ -307,7 +270,6 @@ export async function buildCredentialsSummary(input: CredentialsSummaryInput, st
       token: trelloToken,
       riskAccepted: env[TRELLO_RISK_ACK_ENV]?.trim() === TRELLO_RISK_ACK_VALUE,
     },
-    setupCode: setupCodeInstructions(input.supervisor, input.ownPid),
     restart: { supported: input.supervisor.kind !== "none", supervisor: input.supervisor.kind, startedAt: input.startedAt },
   };
 }

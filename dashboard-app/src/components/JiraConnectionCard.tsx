@@ -10,8 +10,7 @@
  * control below the existing Test button — `PUT /api/settings/jira/token`,
  * never `/api/setup/jira` (that route is setup-mode only; this card is
  * rendered only once configured). Site/email are NEVER resubmitted here
- * (the ticket's own "shell-only after setup" rule) — only a new token and
- * the one-time setup code the server requires on every secret write.
+ * (the ticket's own "shell-only after setup" rule) — only a new token.
  * Same password-field discipline as the Setup page: `type="password"`,
  * `autoComplete="off"`, cleared on submit, never in localStorage.
  */
@@ -44,13 +43,12 @@ type RotateState =
 
 function JiraTokenRotationControl({ setupApi }: { setupApi: SetupApi }) {
   const [token, setToken] = useState("");
-  const [setupCode, setSetupCode] = useState("");
   const [state, setState] = useState<RotateState>({ kind: "idle" });
 
   async function confirmRotate() {
     setState({ kind: "pending" });
     try {
-      const result = await setupApi.rotateToken({ token, setupCode });
+      const result = await setupApi.rotateToken({ token });
       setState({ kind: "done", accountId: result.accountId, displayName: result.displayName });
     } catch (e) {
       const message = e instanceof SetupRateLimitError
@@ -60,7 +58,6 @@ function JiraTokenRotationControl({ setupApi }: { setupApi: SetupApi }) {
       setState({ kind: "error", message });
     } finally {
       setToken("");
-      setSetupCode("");
     }
   }
 
@@ -82,8 +79,6 @@ function JiraTokenRotationControl({ setupApi }: { setupApi: SetupApi }) {
         <div className="settings-jira-card__rotate-form">
           <label htmlFor="rotate-token">New API token</label>
           <input id="rotate-token" type="password" autoComplete="off" value={token} onChange={(e) => setToken(e.target.value)} disabled={pending} data-testid="jira-rotate-token-input" />
-          <label htmlFor="rotate-setup-code">Setup code</label>
-          <input id="rotate-setup-code" type="text" autoComplete="off" value={setupCode} onChange={(e) => setSetupCode(e.target.value)} disabled={pending} data-testid="jira-rotate-code-input" />
           <div>
             <Button onPress={() => setState({ kind: "idle" })} isDisabled={pending} data-testid="jira-rotate-cancel-button">
               Cancel

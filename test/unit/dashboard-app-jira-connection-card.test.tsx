@@ -16,13 +16,12 @@ describe("JiraConnectionCard — rotation control (FACTORY-665, PR-2)", () => {
     expect(queryByTestId("jira-rotate-control")).toBeNull();
   });
 
-  test("with setupApi: a Rotate token button is rendered; clicking it reveals token/code fields with the right input types", () => {
+  test("with setupApi: a Rotate token button is rendered; clicking it reveals the token field with the right input types", () => {
     const { getByTestId } = render(<JiraConnectionCard api={createFixturesSettingsApi()} site="s" email="e" tokenFile={tokenFile} setupApi={createFixturesSetupApi()} />);
     fireEvent.click(getByTestId("jira-rotate-start-button"));
     const token = getByTestId("jira-rotate-token-input") as HTMLInputElement;
     expect(token.type).toBe("password");
     expect(token.autocomplete).toBe("off");
-    expect(getByTestId("jira-rotate-code-input")).toBeTruthy();
   });
 
   test("Cancel returns to the idle state without calling the API", () => {

@@ -13,7 +13,6 @@ import { liveView, type ViewDeps } from "../../src/web/view.js";
 import { createCsrfTokenIssuer } from "../../src/web/csrf.js";
 import { handleGithubTokenWrite, type GithubTokenWriteRequestOutcome } from "../../src/web/credentials-api.js";
 import { githubTestInputs, testGithubConnection } from "../../src/web/github-connection-test.js";
-import { createSetupCodeManager } from "../../src/setup/setup-code.js";
 import { resolveCredentialTarget } from "../../src/setup/secret-target.js";
 import type { FetchLike } from "../../src/setup/jira-token-write.js";
 
@@ -64,7 +63,7 @@ describe("PUT /api/settings/github/token", () => {
     const deps = writeDeps({ githubTokenWrite: async () => { called = true; return OK; }, auditWrite: (e) => { audited.push(e); } });
     await withApp(deps, async (port, headers) => {
       const { "x-butchr-csrf": _csrf, ...noCsrf } = headers;
-      const res = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers: noCsrf, body: JSON.stringify({ token: CANARY, setupCode: CODE }) });
+      const res = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers: noCsrf, body: JSON.stringify({ token: CANARY }) });
       expect(res.status).toBe(403);
     });
     expect(called).toBe(false);
@@ -73,17 +72,17 @@ describe("PUT /api/settings/github/token", () => {
     expect(JSON.stringify(audited)).not.toContain(CODE);
   });
 
-  test("happy path: passes exactly { token, setupCode } and a rate gate, returns the body, audits with no secret", async () => {
+  test("happy path: passes exactly { token } and a rate gate, returns the body, audits with no secret", async () => {
     let received: unknown;
     let gate: unknown;
     const audited: Array<{ outcome: string; diffSummary: string; ids: string[] }> = [];
     const deps = writeDeps({ githubTokenWrite: async (input, rateGate) => { received = input; gate = rateGate; return OK; }, auditWrite: (e) => { audited.push(e); } });
     await withApp(deps, async (port, headers) => {
-      const res = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers, body: JSON.stringify({ token: CANARY, setupCode: CODE }) });
+      const res = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers, body: JSON.stringify({ token: CANARY }) });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual(OK.body);
     });
-    expect(received).toEqual({ token: CANARY, setupCode: CODE });
+    expect(received).toEqual({ token: CANARY });
     expect(typeof gate).toBe("function");
     expect(audited.map((a) => [a.outcome, a.diffSummary])).toEqual([["accepted", "set github token"]]);
     expect(JSON.stringify(audited)).not.toContain(CANARY);
@@ -95,7 +94,7 @@ describe("PUT /api/settings/github/token", () => {
     await withApp(deps, async (port, headers) => {
       const bad = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers, body: JSON.stringify({ token: 7 }) });
       expect(bad.status).toBe(400);
-      const limited = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers, body: JSON.stringify({ token: CANARY, setupCode: CODE }) });
+      const limited = await fetch(`http://127.0.0.1:${port}/api/settings/github/token`, { method: "PUT", headers, body: JSON.stringify({ token: CANARY }) });
       expect(limited.status).toBe(429);
       expect(limited.headers.get("retry-after")).toBe("42");
     });
@@ -131,31 +130,17 @@ describe("handleGithubTokenWrite", () => {
 
   const okGithub: FetchLike = async () => new Response(JSON.stringify({ login: "octocat" }), { status: 200 });
 
-  test("a read-only target answers 400 before the code is spent", async () => {
-    const setupCode = createSetupCodeManager();
-    const code = setupCode.mint();
+  test("a read-only target answers 400", async () => {
     const target = resolveCredentialTarget("github", { GITHUB_TOKEN_FILE: "relative-token" });
-    const r = await handleGithubTokenWrite({ token: CANARY, setupCode: code }, { setupCode, target, fetchFn: okGithub });
+    const r = await handleGithubTokenWrite({ token: CANARY }, { target, fetchFn: okGithub });
     expect(r).toMatchObject({ ok: false, status: 400, body: { error: expect.stringContaining("absolute") } });
-    expect(setupCode.check(code)).toEqual({ ok: true });
   });
 
-  test("checks the code before the rate gate, so a wrong code never spends the budget", async () => {
-    const setupCode = createSetupCodeManager();
-    setupCode.mint();
-    let gateCalls = 0;
+  test("writes the managed secrets file; a multi-line token is refused", async () => {
     const target = resolveCredentialTarget("github", { BUTCHR_SECRETS_DIR: join(dir, "secrets") });
-    const r = await handleGithubTokenWrite({ token: CANARY, setupCode: "WRONGCODE1234" }, { setupCode, target, fetchFn: okGithub }, { rateGate: () => { gateCalls++; return { ok: true }; } });
-    expect(r).toEqual({ ok: false, status: 400, body: { error: "setup code: mismatch" } });
-    expect(gateCalls).toBe(0);
-  });
-
-  test("a valid code writes the managed secrets file; a multi-line token is refused", async () => {
-    const setupCode = createSetupCodeManager();
-    const target = resolveCredentialTarget("github", { BUTCHR_SECRETS_DIR: join(dir, "secrets") });
-    const bad = await handleGithubTokenWrite({ token: "two\nlines", setupCode: setupCode.mint() }, { setupCode, target, fetchFn: okGithub });
+    const bad = await handleGithubTokenWrite({ token: "two\nlines" }, { target, fetchFn: okGithub });
     expect(bad).toMatchObject({ ok: false, status: 400 });
-    const r = await handleGithubTokenWrite({ token: ` ${CANARY} `, setupCode: setupCode.mint() }, { setupCode, target, fetchFn: okGithub });
+    const r = await handleGithubTokenWrite({ token: ` ${CANARY} ` }, { target, fetchFn: okGithub });
     expect(r).toEqual({ ok: true, status: 200, body: { ok: true, login: "octocat", rotated: false, restartNeeded: true } });
     expect(readFileSync(join(dir, "secrets", "github-token"), "utf8")).toBe(CANARY);
     expect(JSON.stringify([bad, r])).not.toContain(CANARY);

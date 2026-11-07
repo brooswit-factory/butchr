@@ -5,9 +5,8 @@
  * behind one interface" pattern every other API module here follows
  * (`api/settings.ts`, `api/rules.ts`): `realSetupApi` hits the real
  * endpoints; `createFixturesSetupApi` lets tests/dev rehearse every state
- * (unconfigured, setup-code wrong/expired/locked, site-shape-invalid,
- * test ok/failed, account-mismatch, env-provided-409, rate-limited) with
- * no network at all.
+ * (unconfigured, site-shape-invalid, test ok/failed, account-mismatch,
+ * env-provided-409, rate-limited) with no network at all.
  */
 
 export interface SetupStatusResponse {
@@ -47,9 +46,9 @@ export class ProvidedByEnvironmentError extends Error {
 export interface SetupApi {
   getStatus(signal?: AbortSignal): Promise<SetupStatusResponse>;
   /** `POST /api/setup/jira` — setup mode only. */
-  submitSetup(input: { site: string; email: string; token: string; setupCode: string }, signal?: AbortSignal): Promise<JiraWriteOk>;
+  submitSetup(input: { site: string; email: string; token: string }, signal?: AbortSignal): Promise<JiraWriteOk>;
   /** `PUT /api/settings/jira/token` — configured mode, rotation (site/email are NOT resubmitted; the server reuses its own already-loaded values). */
-  rotateToken(input: { token: string; setupCode: string }, signal?: AbortSignal): Promise<JiraWriteOk>;
+  rotateToken(input: { token: string }, signal?: AbortSignal): Promise<JiraWriteOk>;
 }
 
 const CSRF_HEADER = "x-butchr-csrf";

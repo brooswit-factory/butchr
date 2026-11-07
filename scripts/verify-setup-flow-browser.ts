@@ -70,27 +70,11 @@ const fetchFn = (async (url: string, init: RequestInit) => {
   return fetch(url, init);
 }) as typeof fetch;
 
-// The "captured journal" — exactly what `runSetupModeDaemon` would hand
-// `console.error` under systemd, captured here instead so this script can
-// read the setup code the same way an operator reads it off `journalctl`.
 const journal: string[] = [];
 const log = (line: string) => { journal.push(line); console.log("[journal]", line); };
 
 const env = { XDG_CONFIG_HOME: CONFIG_DIR, BUTCHR_PORT: "0" };
-const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(0, env, log, fetchFn);
-const setupCode = setupCodeManager.mint();
-log(`butchr: setup code (10 min, single-use, 5 attempts): ${setupCode}`);
-
-// The journal-capture mechanism itself, proven: the code pulled out of
-// `journal` below must be the SAME one `setupCodeManager.mint()` just
-// returned — this script never reads the plaintext code directly off
-// `setupCodeManager`, only off the (simulated) journal, same as a real
-// operator would.
-const codeFromJournal = (() => {
-  const line = journal.find((l) => l.includes("setup code"));
-  const m = line ? /:\s*([A-Z0-9]{13})$/.exec(line.trim()) : null;
-  return m?.[1] ?? null;
-})();
+const { viewDeps } = buildSetupModeViewDeps(0, env, log, fetchFn);
 
 const dashboardAppRoot = join(import.meta.dir, "..", "dist", "web");
 const app = liveView({ connections: { list: () => [] } } as unknown as McpHandle, { ...viewDeps, dashboardAppRoot });
@@ -140,23 +124,20 @@ await send("Page.navigate", { url: `http://127.0.0.1:${port}/dashboard-app/` });
 await Bun.sleep(500);
 check("A1 the Setup page renders (unconfigured gate)", await until("setup-page", `!!document.querySelector('[data-testid=setup-page]')`));
 check("A2 no normal nav (Dashboard/Rules/Settings) is rendered while unconfigured", await ev(`!document.querySelector('a[href*="/rules"]')`) === true);
-check("A3 the setup code was correctly extracted from the captured journal line", codeFromJournal !== null && codeFromJournal === setupCode);
 await shot("1-unconfigured");
 
 // B: submit the setup form
 await setInput("setup-site-input", fakeSite);
 await setInput("setup-email-input", "butchr@example.com");
 await setInput("setup-token-input", CANARY_TOKEN);
-await setInput("setup-code-input", codeFromJournal ?? "");
 check("B1 click Configure", await clickBtn("setup-submit-button"));
 check("B2 the result shows the stub account/displayName", await until("configured", `(document.querySelector('[data-testid=setup-result]')?.textContent ?? '').includes('Stub Operator')`));
 check("B3 the result says butchr is restarting", await ev(`(document.querySelector('[data-testid=setup-result]')?.textContent ?? '').toLowerCase().includes('restarting into normal mode')`) === true);
 check("B4 the candidate token never appears anywhere in the rendered DOM", !((await ev(`document.documentElement.outerHTML`) as string).includes(CANARY_TOKEN)));
 await shot("2-configured");
 
-// C: the token/setup-code fields were cleared after submit (never left sitting in the DOM's own input value)
+// C: the token field was cleared after submit (never left sitting in the DOM's own input value)
 check("C1 the token field is cleared after submit", await ev(`document.querySelector('[data-testid=setup-token-input]').value`) === "");
-check("C2 the setup-code field is cleared after submit", await ev(`document.querySelector('[data-testid=setup-code-input]').value`) === "");
 
 console.log("   page errors:", JSON.stringify(await ev("window.__errs")).slice(0, 1500));
 

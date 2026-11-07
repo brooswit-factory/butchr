@@ -84,8 +84,7 @@ describe("FACTORY-716: real setup-then-restart seeds the starter rule", () => {
     }) as typeof fetch;
 
     const env = { XDG_CONFIG_HOME: configDir, BUTCHR_PORT: "0" };
-    const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(0, env, () => {}, fetchFn);
-    const setupCode = setupCodeManager.mint();
+    const { viewDeps } = buildSetupModeViewDeps(0, env, () => {}, fetchFn);
 
     // Same precedent as `test/unit/setup-mode.test.ts`: `isSameUidPeer`'s
     // real `/proc/net/tcp` lookup is exercised by its own dedicated test
@@ -107,16 +106,16 @@ describe("FACTORY-716: real setup-then-restart seeds the starter rule", () => {
       expect(sessionRes.status).toBe(200);
       const { csrfToken } = (await sessionRes.json()) as { csrfToken: string };
 
-      // Real `POST /api/setup/jira` — site/email/token/setupCode, through the
-      // full write-guard chain (origin/host/peer-uid/content-type/CSRF),
-      // exactly as the real UI submits it. This is what persists the
-      // identity file + managed token into `configDir/butchr/` AND appends
-      // the write-audit log (`web-write-audit.jsonl`) there — all three of
-      // which are now on `seedFirstRunRules`'s `setupWriteAllowlist`.
+      // Real `POST /api/setup/jira` — site/email/token, through the full
+      // write-guard chain (origin/host/peer-uid/content-type/CSRF), exactly
+      // as the real UI submits it. This is what persists the identity file
+      // + managed token into `configDir/butchr/` AND appends the write-audit
+      // log (`web-write-audit.jsonl`) there — all three of which are now on
+      // `seedFirstRunRules`'s `setupWriteAllowlist`.
       const setupRes = await fetch(`${origin}/api/setup/jira`, {
         method: "POST",
         headers: { ...headers, "content-type": "application/json", [CSRF_HEADER]: csrfToken },
-        body: JSON.stringify({ site: fakeSite, email: "seed-e2e@example.com", token: candidateToken, setupCode }),
+        body: JSON.stringify({ site: fakeSite, email: "seed-e2e@example.com", token: candidateToken }),
       });
       expect(setupRes.status).toBe(200);
       const setupBody = (await setupRes.json()) as { ok: boolean; identityPersisted: boolean; restarting?: boolean };

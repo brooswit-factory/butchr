@@ -46,7 +46,7 @@ const saveButton = (github: Scope) => github.getByTestId("cr-github-orgs-save") 
 const orgValues = (github: Scope) => github.queryAllByTestId(/^cr-github-org-\d+$/).map((el: HTMLElement) => (el as HTMLInputElement).value);
 
 describe("Settings: Providers section", () => {
-  test("shows both cards and the setup-code commands; the table and the old Jira card don't repeat them", async () => {
+  test("shows both cards; the table and the old Jira card don't repeat them", async () => {
     const view = mount(recordingApi().api);
     const atlassian = within(await view.findByTestId("cr-atlassian"));
     expect(atlassian.getByText("https://example.atlassian.net")).toBeTruthy();
@@ -55,8 +55,6 @@ describe("Settings: Providers section", () => {
     expect(github.getByTestId("cr-github-status").textContent).toContain("Off");
     expect(github.getByTestId("cr-github-token-status").textContent).toContain("Not set. Saving one writes /Users/you/.config/butchr/secrets/github-token.");
     expect(github.getByTestId("cr-github-open").textContent).toBe("Set token");
-    expect(view.getByTestId("cr-setup-code-command").textContent).toBe("launchctl kill SIGUSR2 gui/$(id -u)/com.example.butchr");
-    expect(view.getByTestId("cr-setup-code-find").textContent).toBe("grep 'setup code' /Users/you/Library/Logs/butchr.log | tail -1");
     expect(view.queryByTestId("jira-connection-card")).toBeNull();
     expect(view.queryByText("ATLASSIAN_SITE")).toBeNull();
     expect(view.queryByTestId("cr-restart-banner")).toBeNull();
@@ -74,7 +72,7 @@ describe("Settings: Providers section", () => {
     }
   });
 
-  test("setting the GitHub token sends exactly the token and code, clears the fields, and offers a restart", async () => {
+  test("setting the GitHub token sends exactly the token, clears the fields, and offers a restart", async () => {
     const { api, calls } = recordingApi();
     const view = mount(api);
     const github = within(await view.findByTestId("cr-github"));
@@ -82,10 +80,9 @@ describe("Settings: Providers section", () => {
     const tokenInput = github.getByTestId("cr-github-token") as HTMLInputElement;
     expect([tokenInput.type, tokenInput.autocomplete]).toEqual(["password", "off"]);
     setText(tokenInput, "ghp_secret");
-    setText(github.getByTestId("cr-github-code"), "ABCDEFGHJKMNP");
     fireEvent.click(github.getByTestId("cr-github-save"));
     await waitFor(() => expect(github.getByTestId("cr-github-result").textContent).toBe("Saved. It belongs to octocat. Restart butchr to use it."));
-    expect(calls.githubToken).toEqual([{ token: "ghp_secret", setupCode: "ABCDEFGHJKMNP" }]);
+    expect(calls.githubToken).toEqual([{ token: "ghp_secret" }]);
     expect(github.queryByTestId("cr-github-token")).toBeNull();
     expect(view.getByTestId("cr-restart-banner").textContent).toContain("You changed the GitHub token.");
     expect(view.container.innerHTML).not.toContain("ghp_secret");
@@ -194,10 +191,9 @@ describe("Settings: Providers section", () => {
     const atlassian = within(await view.findByTestId("cr-atlassian"));
     fireEvent.click(atlassian.getByTestId("cr-atlassian-open"));
     setText(atlassian.getByTestId("cr-atlassian-token"), "atl-new");
-    setText(atlassian.getByTestId("cr-atlassian-code"), "ABCDEFGHJKMNP");
     fireEvent.click(atlassian.getByTestId("cr-atlassian-save"));
     await waitFor(() => expect(atlassian.getByTestId("cr-atlassian-result").textContent).toBe("Saved. It belongs to JW. Restart butchr to use it."));
-    expect(received).toEqual({ token: "atl-new", setupCode: "ABCDEFGHJKMNP" });
+    expect(received).toEqual({ token: "atl-new" });
   });
 
   test("a literal Atlassian token and env-set orgs are shown read-only", async () => {
@@ -251,7 +247,7 @@ describe("Settings: Zendesk and Trello cards", () => {
     expect(view.queryByText("TRELLO_TOKEN_FILE")).toBeNull();
   });
 
-  test("saving the Zendesk subdomain writes ZENDESK_SUBDOMAIN, then the token form sends exactly the token and code", async () => {
+  test("saving the Zendesk subdomain writes ZENDESK_SUBDOMAIN, then the token form sends exactly the token", async () => {
     const { api, calls } = providerApi();
     const view = mount(api);
     const zendesk = within(await view.findByTestId("cr-zendesk"));
@@ -263,10 +259,9 @@ describe("Settings: Zendesk and Trello cards", () => {
 
     fireEvent.click(zendesk.getByTestId("cr-zendesk-open"));
     setText(zendesk.getByTestId("cr-zendesk-token"), "zd-secret");
-    setText(zendesk.getByTestId("cr-zendesk-code"), "ABCDEFGHJKMNP");
     fireEvent.click(zendesk.getByTestId("cr-zendesk-save"));
     await waitFor(() => expect(zendesk.getByTestId("cr-zendesk-result").textContent).toBe("Saved. It belongs to agent@example.com. Restart butchr to use it."));
-    expect(calls.zendesk).toEqual([{ token: "zd-secret", setupCode: "ABCDEFGHJKMNP" }]);
+    expect(calls.zendesk).toEqual([{ token: "zd-secret" }]);
     expect(view.getByTestId("cr-restart-banner").textContent).toContain("the Zendesk subdomain and the Zendesk token");
     expect(view.container.innerHTML).not.toContain("zd-secret");
   });
@@ -279,13 +274,12 @@ describe("Settings: Zendesk and Trello cards", () => {
     const key = trello.getByTestId("cr-trello-key") as HTMLInputElement;
     expect(key.type).toBe("password");
     setText(key, "tr-key");
-    setText(trello.getByTestId("cr-trello-code"), "ABCDEFGHJKMNP");
     expect((trello.getByTestId("cr-trello-save") as HTMLButtonElement).disabled).toBe(true);
     setText(trello.getByTestId("cr-trello-token"), "tr-token");
     await waitFor(() => expect((trello.getByTestId("cr-trello-save") as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(trello.getByTestId("cr-trello-save"));
     await waitFor(() => expect(trello.getByTestId("cr-trello-result").textContent).toBe("Saved. They belong to butchr-bot. Restart butchr to use them."));
-    expect(calls.trello).toEqual([{ apiKey: "tr-key", token: "tr-token", setupCode: "ABCDEFGHJKMNP" }]);
+    expect(calls.trello).toEqual([{ apiKey: "tr-key", token: "tr-token" }]);
     expect(trello.queryByTestId("cr-trello-key")).toBeNull();
     expect(view.container.innerHTML).not.toContain("tr-token");
   });

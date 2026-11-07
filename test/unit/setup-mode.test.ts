@@ -27,7 +27,7 @@ describe("buildSetupModeViewDeps", () => {
     const dir = mkdtempSync(join(tmpdir(), "setup-mode-test-"));
     try {
       const logs: string[] = [];
-      const { viewDeps, setupCodeManager } = buildSetupModeViewDeps(0, scratchEnv(dir), (l) => logs.push(l));
+      const { viewDeps } = buildSetupModeViewDeps(0, scratchEnv(dir), (l) => logs.push(l));
       // `isSameUidPeer`'s real `/proc/net/tcp` lookup is exercised directly
       // by `test/unit/peer-uid.test.ts`; this test is about ROUTE WIRING
       // (does setup mode serve the right routes with the right deps),
@@ -50,11 +50,10 @@ describe("buildSetupModeViewDeps", () => {
         const session = await fetch(`http://127.0.0.1:${port}/api/session`, { headers: { ...headers, "sec-fetch-site": "same-origin" } });
         const { csrfToken } = (await session.json()) as { csrfToken: string };
 
-        const code = setupCodeManager.mint();
         const setupRes = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, {
           method: "POST",
           headers: { ...headers, "content-type": "application/json", "x-butchr-csrf": csrfToken },
-          body: JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.c", token: "t", setupCode: code }),
+          body: JSON.stringify({ site: "https://x.atlassian.net", email: "a@b.c", token: "t" }),
         });
         // No real network reaches Jira from this test — the candidate test
         // fails (no stub server), which is expected; the point is the route
@@ -73,7 +72,7 @@ describe("buildSetupModeViewDeps", () => {
 });
 
 describe("runSetupModeDaemon", () => {
-  test("starts listening on the configured port, logs the setup code exactly once, and SIGUSR2 mints a fresh one", async () => {
+  test("starts listening on the configured port and logs the SETUP MODE line", async () => {
     const dir = mkdtempSync(join(tmpdir(), "setup-mode-test-"));
     try {
       const logs: string[] = [];
@@ -84,12 +83,7 @@ describe("runSetupModeDaemon", () => {
       // test file controls directly.
       await runSetupModeDaemon({ env: { ...scratchEnv(dir), BUTCHR_PORT: "0" }, log: (l) => logs.push(l) });
       expect(logs.some((l) => l.includes("SETUP MODE"))).toBe(true);
-      expect(logs.filter((l) => l.includes("setup code")).length).toBe(1);
       expect(logs.some((l) => l.includes("listening on"))).toBe(true);
-
-      logs.length = 0;
-      process.emit("SIGUSR2");
-      expect(logs.filter((l) => l.includes("setup code")).length).toBe(1);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

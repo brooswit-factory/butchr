@@ -134,7 +134,7 @@ describe("POST /api/setup/jira", () => {
     try {
       const token = await csrfToken(port);
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const payload = { site: "https://x.atlassian.net", email: "a@b.c", token: "canary-token-value", setupCode: "ABCDEFGHJKMN" };
+      const payload = { site: "https://x.atlassian.net", email: "a@b.c", token: "canary-token-value" };
       const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify(payload) });
       expect(res.status).toBe(200);
       expect(await res.json()).toEqual(OK_RESULT.body);
@@ -149,7 +149,7 @@ describe("POST /api/setup/jira", () => {
 
   test("a refusal from setupJiraWrite is returned verbatim (status + body) and audited as rejected", async () => {
     const audited: Array<{ outcome: string }> = [];
-    const refusal: JiraWriteRequestOutcome = { ok: false, status: 400, body: { error: "setup code: mismatch" } };
+    const refusal: JiraWriteRequestOutcome = { ok: false, status: 400, body: { error: "refused" } };
     const deps = writeDeps({ setupJiraWrite: async () => refusal, auditWrite: (e) => { audited.push(e); } });
     const app = liveView(fakeMcp, baseDeps(deps));
     app.listen(0);
@@ -158,14 +158,14 @@ describe("POST /api/setup/jira", () => {
     try {
       const token = await csrfToken(port);
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "c" }) });
+      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t" }) });
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual(refusal.body);
       expect(audited[0]!.outcome).toBe("rejected");
     } finally { await app.stop(true); }
   });
 
-  // Director 2026-10-06 item 5: the limiters are consulted through a gate the write handler calls only AFTER the setup code verified.
+  // The limiters are consulted through a gate the write handler can defer calling.
   const gatedWrite = (log: string[]) => async (_input: unknown, rateGate?: () => { ok: true } | { ok: false; error: string; retryAfterSeconds: number }) => {
     log.push("handler");
     const g = rateGate?.();
@@ -177,7 +177,7 @@ describe("POST /api/setup/jira", () => {
     let spent = 0;
     const log: string[] = [];
     const deps = writeDeps({
-      setupJiraWrite: async () => { log.push("handler"); return { ok: false as const, status: 400 as const, body: { error: "setup code: mismatch" } }; },
+      setupJiraWrite: async () => { log.push("handler"); return { ok: false as const, status: 400 as const, body: { error: "refused" } }; },
       jiraTokenTestRateLimit: () => { spent++; return { ok: true }; },
       jiraTokenWriteRateLimit: () => { spent++; return { ok: true }; },
     });
@@ -189,7 +189,7 @@ describe("POST /api/setup/jira", () => {
       const token = await csrfToken(port);
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
       for (let i = 0; i < 4; i++) {
-        const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "bad" }) });
+        const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t" }) });
         expect(res.status).toBe(400);
       }
       expect(spent).toBe(0);
@@ -209,7 +209,7 @@ describe("POST /api/setup/jira", () => {
     try {
       const token = await csrfToken(port);
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "c" }) });
+      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t" }) });
       expect(res.status).toBe(429);
       expect(res.headers.get("retry-after")).toBe("42");
     } finally { await app.stop(true); }
@@ -229,7 +229,7 @@ describe("POST /api/setup/jira", () => {
     try {
       const token = await csrfToken(port);
       const headers = { origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}`, "content-type": "application/json", "x-butchr-csrf": token };
-      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t", setupCode: "c" }) });
+      const res = await fetch(`http://127.0.0.1:${port}/api/setup/jira`, { method: "POST", headers, body: JSON.stringify({ site: "s", email: "e", token: "t" }) });
       expect(res.status).toBe(429);
       expect(res.headers.get("retry-after")).toBe("3600");
     } finally { await app.stop(true); }

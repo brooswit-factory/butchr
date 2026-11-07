@@ -70,7 +70,6 @@ export interface CredentialsSummary {
   github: { token: TokenStatus; orgs: string[]; orgsSource: "environment" | "file" | "default"; orgsEditable: boolean; active: boolean; runningOrgs: string[] };
   zendesk: { subdomain: LayeredValue; token: TokenStatus; riskAccepted: boolean };
   trello: { boardId: LayeredValue; apiKey: TokenStatus; token: TokenStatus; riskAccepted: boolean };
-  setupCode: { command: string; findCommand: string | null; where: string };
   /** `startedAt`: when the running butchr started, so a restart's new process can be told apart. */
   restart: { supported: boolean; supervisor: "launchd" | "systemd" | "none"; startedAt: string };
 }
@@ -154,14 +153,14 @@ export interface SettingsApi {
   restartDaemon(signal?: AbortSignal): Promise<void>;
   /** local/ui — tests the daemon's loaded GitHub token. Throws `RateLimitError` (429). */
   testGithubConnection(signal?: AbortSignal): Promise<GithubTestResult>;
-  /** local/ui — sets the GitHub token (one-time setup code required). Throws `RateLimitError` (429) or an `Error` carrying the server's own message. */
-  writeGithubToken(input: { token: string; setupCode: string }, signal?: AbortSignal): Promise<GithubTokenWriteOk>;
+  /** local/ui — sets the GitHub token. Throws `RateLimitError` (429) or an `Error` carrying the server's own message. */
+  writeGithubToken(input: { token: string }, signal?: AbortSignal): Promise<GithubTokenWriteOk>;
   /** local/ui — tests the running butchr's Zendesk or Trello credentials. Throws `RateLimitError` (429). */
   testProviderConnection(provider: "zendesk" | "trello", signal?: AbortSignal): Promise<ProviderTestResult>;
-  /** local/ui — sets the Zendesk OAuth token (setup code required). Same errors as `writeGithubToken`. */
-  writeZendeskToken(input: { token: string; setupCode: string }, signal?: AbortSignal): Promise<ProviderSecretWriteOk>;
-  /** local/ui — sets the Trello API key and token together (setup code required). Same errors as `writeGithubToken`. */
-  writeTrelloCredentials(input: { apiKey: string; token: string; setupCode: string }, signal?: AbortSignal): Promise<ProviderSecretWriteOk>;
+  /** local/ui — sets the Zendesk OAuth token. Same errors as `writeGithubToken`. */
+  writeZendeskToken(input: { token: string }, signal?: AbortSignal): Promise<ProviderSecretWriteOk>;
+  /** local/ui — sets the Trello API key and token together. Same errors as `writeGithubToken`. */
+  writeTrelloCredentials(input: { apiKey: string; token: string }, signal?: AbortSignal): Promise<ProviderSecretWriteOk>;
 }
 
 export const CSRF_HEADER = "x-butchr-csrf";
@@ -524,11 +523,6 @@ export function localUiSettingsFixture(): SettingsResponse {
         apiKey: { source: "unset", fileEnvKey: "TRELLO_API_KEY_FILE", path: "/Users/you/.config/butchr/secrets/trello-api-key", exists: false, readable: false, mode: null, tooOpen: null, readOnlyReason: null },
         token: { source: "unset", fileEnvKey: "TRELLO_TOKEN_FILE", path: "/Users/you/.config/butchr/secrets/trello-token", exists: false, readable: false, mode: null, tooOpen: null, readOnlyReason: null },
         riskAccepted: false,
-      },
-      setupCode: {
-        command: "launchctl kill SIGUSR2 gui/$(id -u)/com.example.butchr",
-        findCommand: "grep 'setup code' /Users/you/Library/Logs/butchr.log | tail -1",
-        where: "butchr's log (/Users/you/Library/Logs/butchr.log)",
       },
       restart: { supported: true, supervisor: "launchd", startedAt: "2026-10-16T00:00:00.000Z" },
     },
