@@ -285,7 +285,7 @@ describe("GET / (BUTCHR-344): a non-empty fixture exercises the route's own age/
       if (!terminalHrefMatch) throw new Error("expected a terminal link in the issue row's own HTML");
       const terminalRes = await fetch(`${b}${terminalHrefMatch[1]}`);
       expect(terminalRes.status).toBe(200);
-      expect(await terminalRes.text()).toContain("launched a terminal for w1:p3");
+      expect(await terminalRes.text()).toContain("Launched a terminal for");
 
       const issueResourceHrefMatch = issueRow.match(/href="([^"]+)">resource</);
       const projectResourceHrefMatch = projectRow.match(/href="([^"]+)">resource</);
@@ -633,23 +633,27 @@ describe("GET /configurations (FACTORY-136): the admission-source-unavailable tr
 // on the specific human-readable text (criterion 5) rather than just the
 // status code.
 describe("GET /agents/pane/:pane/attach — the dashboard link target (BUTCHR-267)", () => {
-  test("a live pane launches and reports what actually happened, in plain text", async () => {
-    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("w1:p3")}/attach`);
+  test("a live pane launches and reports what actually happened, in HTML that steps back to the dashboard", async () => {
+    const r = await fetch(`${base}/agents/pane/${encodeURIComponent("w1:p3")}/attach`, { redirect: "manual" });
     expect(r.status).toBe(200);
-    expect(r.headers.get("content-type")).toContain("text/plain");
+    expect(r.headers.get("content-type")).toContain("text/html");
     const body = await r.text();
+    expect(body).toContain("w1:p3");
     // Criterion 6: never claims a window appeared — only that launching it
     // was attempted, since the spawn is fire-and-forget.
-    expect(body).toContain("w1:p3");
     expect(body).not.toMatch(/window (appeared|opened)/);
-    // BUTCHR-344 (L1): pin the fire-and-forget WORDING itself, not just the
-    // absence of "window (appeared|opened)" — "opened a terminal window for
-    // w1:p3" matches neither alternative in that regex, so it would still
-    // pass the check above while quietly turning a launch into a
-    // confirmation. This exact phrase is what the route actually promises.
-    expect(body).toContain("launched a terminal for w1:p3");
+    // BUTCHR-344 (L1): pin the fire-and-forget WORDING itself. The success
+    // path moved from a plain-text dead-end to an HTML page that calls
+    // history.back(); the honesty hedge stays verbatim ("fire-and-forget")
+    // so a JS-off/direct-navigation browser still reads the real status
+    // rather than an actually blank page.
+    expect(body).toContain("Launched a terminal for");
     expect(body).toContain("fire-and-forget");
     expect(body).not.toMatch(/opened a terminal window/i);
+    // The step-back mechanism: history.back() first; location.replace("/")
+    // only when there is no prior page in history (direct-navigation case).
+    expect(body).toContain("history.back()");
+    expect(body).toContain('location.replace("/")');
     expect(openedPanes).toContain("w1:p3");
   });
   test("a colon-bearing pane id survives the route unmangled — criterion 1", async () => {
