@@ -9,7 +9,7 @@ import { instanceFreezeStore, watchInstanceFreeze } from '@brooswit/drovr-events
 import { createHash } from "node:crypto";
 import {lstatSync} from "node:fs";
 import {join} from "node:path";
-import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results } from "@brooswit/drovr";
+import { ManagedHerdrLifecycle, classifyProviderQuotaText, managedAgentProviderOfProcess, ProviderAvailabilityRegistry, processProviderAvailability, startManagedAgent, HerdrError, type ManagedAgentProvider, type DrovrClient, type results, type AgentStartOptions } from "@brooswit/drovr";
 import { prepareFactoryWorkspace } from "../mcp/registration.js";
 import { buildWorkspace, writePreLaunchClaudeFiles, workspaceExternalMcp, workspacePermissionMode, workspaceStrictMcpConfig, workspaceLizardMode, workspaceModel, workspaceEffort, workspaceSessionId, discoverClaudeSessionId, persistDiscoveredSessionId, invalidatePersistedSessionId, claudeTranscriptExists, agentIdOfWorkspacePath, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceIsolation, type SpawnSpec } from "./workspace.js";
 import { decideRespawnResume } from "./respawn.js";
@@ -663,6 +663,60 @@ const argvFlagValue = (argv: readonly string[], flag: string): string | undefine
  */
 export type SpawnOrigin = "spawn" | "respawn";
 
+/**
+ * FACTORY-1041: mirrors `@brooswit/drovr`'s own `CanonicalModeState`
+ * (`terminal-readiness.ts`, drovr PR #100, `5d3d85e3ef8781f700d399ca0de6f09ef438ee11`)
+ * — not re-exported by the pinned drovr commit (see RECOVERY.md), which
+ * predates that PR entirely, so it cannot be imported yet. Duplicated here
+ * rather than inlined as a bare string union so `HerdrHerd`'s own
+ * `checkCanonicalMode` seam (below) and `claudeLaunchOptions` share one
+ * name; re-verify this against drovr's own type the next time the pin
+ * advances, the same discipline `resumableArgvReason`'s own doc comment
+ * already applies to its literal flag strings.
+ */
+type CanonicalModeState = "canonical" | "raw" | "unsupported" | "unknown";
+
+/**
+ * FACTORY-1041: the options object shared by `HerdrHerd`'s two direct
+ * `startManagedAgent` call sites (`tryClaudeResume`, `resumeInPlaceExclusive`
+ * — both bypass `ManagedHerdrLifecycle` for the reasons each method's own
+ * doc comment gives). Pulled out into its own named, directly testable
+ * function, the same reasoning `resumableArgvReason`/`staleArgvOutcome`'s
+ * own doc comments give for doing so, rather than duplicating this object
+ * literal at both call sites.
+ *
+ * `checkCanonicalMode` is drovr's own pre-launch TTY-readiness gate
+ * (`AgentStartOptions.checkCanonicalMode`, drovr PR #100 above) — NOT YET a
+ * field the pinned drovr commit's `AgentStartOptions` type declares, so it
+ * is added to the return type explicitly (an intersection, below) rather
+ * than inlined into a plain `AgentStartOptions`-typed literal: TypeScript's
+ * excess-property check would reject an unknown key on a literal checked
+ * directly against that narrower, pinned-version type. A VARIABLE of this
+ * wider intersection type remains assignable to a parameter typed
+ * `AgentStartOptions` (structural subtyping, no excess-property check on a
+ * non-literal), so today's pinned `startManagedAgent` accepts the call and
+ * silently ignores the extra field (it predates the gate and never reads
+ * it); once the pin advances past the commit that adds the real field, this
+ * lines up by name with no further change required here.
+ *
+ * `checkCanonicalMode` undefined (the default — see `HerdrHerd`'s own
+ * constructor field) omits the key entirely, deferring to drovr's own
+ * default real implementation, never a safe-to-proceed override of its own.
+ */
+export function claudeLaunchOptions(
+  now: () => number,
+  wait: (ms: number) => Promise<void>,
+  checkCanonicalMode?: (shellPid: number) => Promise<CanonicalModeState>,
+): AgentStartOptions & { checkCanonicalMode?: (shellPid: number) => Promise<CanonicalModeState> } {
+  return {
+    readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS,
+    retryIntervalMs: PANE_READY_WAIT_MS,
+    now,
+    wait,
+    ...(checkCanonicalMode ? { checkCanonicalMode } : {}),
+  };
+}
+
 /** Herd backed by a live herdr, over the typed SDK. */
 export class HerdrHerd implements Herd {
   ruleRuntime?:()=>RuntimePolicy;
@@ -805,6 +859,19 @@ export class HerdrHerd implements Herd {
     private readonly resolvedAgentOf?: (issue: string, provider: ManagedAgentProvider) => { model?: string; effort?: AgentEffort } | undefined,
     private readonly rollout?:WorkerRollout,
     private readonly providerReadiness?:(provider:ManagedAgentProvider)=>Promise<ProviderReadiness>,
+    /**
+     * FACTORY-1041: test-injection seam for drovr's pre-launch TTY-readiness
+     * gate — mirrors the `monotonicNow`/`wait` injection above. The pinned
+     * `@brooswit/drovr` commit predates the gate entirely (see RECOVERY.md),
+     * so neither direct `startManagedAgent` call site reads this today; it
+     * exists so a unit test's fake pane never drives a real OS-level
+     * canonical-TTY check once the pin advances past drovr PR #100
+     * (`5d3d85e3ef8781f700d399ca0de6f09ef438ee11`) — see `claudeLaunchOptions`,
+     * above, for how this reaches `startManagedAgent`. `undefined` (the
+     * default) defers to drovr's own default real implementation, never a
+     * safe-to-proceed override of its own.
+     */
+    private readonly checkCanonicalMode?: (shellPid: number) => Promise<CanonicalModeState>,
   ) {if(this.rollout)this.herdr=this.rollout.wrap(this.herdr);this.lifecycleFence=createLifecycleFence(this.herdr);this.herdr=this.lifecycleFence.client;}
 
   private withRuleLease<T>(issue:string,kind:'spawn'|'stop'|'resume'|'notify',lease:number|undefined,action:()=>Promise<T>):Promise<T>{
@@ -1697,7 +1764,7 @@ export class HerdrHerd implements Herd {
     }
     const params = agentStartParams(spec, dir, paneId, nameFor(spec.key), selected, this.mcpUrl);
     try {
-      await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
+      await startManagedAgent(this.herdr, params, claudeLaunchOptions(this.monotonicNow, this.wait, this.checkCanonicalMode));
     } catch (e) {
       await this.closePaneDefensively(paneId,spec.key);
       this.log?.(`${RESUME_TAG} ${spec.key} respawn-resume-failed — ${(e as Error)?.message ?? e}`);
@@ -2282,7 +2349,7 @@ export class HerdrHerd implements Herd {
     writePreLaunchClaudeFiles(cwd, spec, this.mcpUrl);
     const params = agentStartParams(spec, cwd, pane, nameFor(issue), selected, this.mcpUrl);
     try {
-      await startManagedAgent(this.herdr, params, { readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now: this.monotonicNow, wait: this.wait });
+      await startManagedAgent(this.herdr, params, claudeLaunchOptions(this.monotonicNow, this.wait, this.checkCanonicalMode));
     } catch (e) {
       // FACTORY-314 (PR #513 review fix, live-tested against a real herdr):
       // MEASURED — the OLD claude process can still hold this pane's agent

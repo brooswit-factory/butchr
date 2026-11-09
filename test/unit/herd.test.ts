@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HerdrError, processProviderAvailability } from "@brooswit/drovr";
-import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, LAUNCH_PENDING_STUCK_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
+import { HerdrHerd, agentNameFor, resumableArgvReason, staleArgvOutcome, isHerdrRestoredPane, restoredResumeEnabledFor, claudeLaunchOptions, PANE_READY_WAIT_MS, PANE_READINESS_TIMEOUT_MS, LAUNCH_PENDING_STUCK_TIMEOUT_MS, SPAWN_TAG, RESUME_TAG } from "../../src/agents/herd.js";
 import type { Herd } from "../../src/agents/herd.js";
 import { reconcileNow, RespawnGuard } from "../../src/daemon/loop.js";
 import { buildWorkspace, ensureWorkspaceDir, workspaceDirFor, workspaceRoot, workspaceSessionId, workspaceModel, workspaceEffort, persistDiscoveredSessionId } from "../../src/agents/workspace.js";
@@ -2092,6 +2092,33 @@ describe("restoredResumeEnabledFor", () => {
   });
 });
 
+describe("claudeLaunchOptions (FACTORY-1041: checkCanonicalMode test-injection seam)", () => {
+  const now = () => 123;
+  const wait = async () => {};
+
+  test("omits checkCanonicalMode entirely when not provided, leaving today's pinned startManagedAgent behaviour untouched", () => {
+    const options = claudeLaunchOptions(now, wait);
+    expect(options).toEqual({ readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS, now, wait });
+    expect("checkCanonicalMode" in options).toBe(false);
+  });
+
+  test("threads a provided checkCanonicalMode through unchanged, for the gate to call once the pin advances past it", async () => {
+    const check = async (shellPid: number) => (shellPid === 42 ? "raw" as const : "unknown" as const);
+    const options = claudeLaunchOptions(now, wait, check);
+    expect(options.checkCanonicalMode).toBe(check);
+    expect(await options.checkCanonicalMode!(42)).toBe("raw");
+  });
+
+  test("still carries the existing now/wait/readiness fields alongside an injected checkCanonicalMode", () => {
+    const check = async () => "raw" as const;
+    const options = claudeLaunchOptions(now, wait, check);
+    expect(options.readinessTimeoutMs).toBe(PANE_READINESS_TIMEOUT_MS);
+    expect(options.retryIntervalMs).toBe(PANE_READY_WAIT_MS);
+    expect(options.now).toBe(now);
+    expect(options.wait).toBe(wait);
+  });
+});
+
 describe("resumeInPlace", () => {
   const instant = () => Promise.resolve();
   const CLAUDE_PROC = { pid: 1, argv: ["claude"], name: "claude" };
@@ -2147,7 +2174,13 @@ describe("resumeInPlace", () => {
         // launch-pending claude for a moment after its actual OS process has
         // already died; this simulates exactly that lag, independent of
         // whatever `list()` above still reports.
-        processInfo: async () => ({ process_info: { pane_id: pane, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
+        // FACTORY-1041: `shell_pid` is the pane's shell, not whichever
+        // process is currently in the foreground — present regardless of
+        // `foreground`/`processGone`, mirroring a real pane (herdr reports
+        // it from the moment the pane exists). Needed once drovr's own
+        // `startManagedAgent` gate (awaitNonCanonical, drovr PR #100) reads
+        // it before every `agent.start` this fixture drives.
+        processInfo: async () => ({ process_info: { pane_id: pane, shell_pid: SHELL_PROC.pid, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
         // FACTORY-491 (director item 3): records every defensive close so
@@ -2239,6 +2272,34 @@ describe("resumeInPlace", () => {
         expect(workspaceSessionId(cwd)).toBe("original-session"); // a --resume relaunch keeps the SAME id, never rediscovered
         expect(workspaceModel(cwd)).toBe("claude-opus-5"); // re-persisted, confirmed only AFTER the relaunch succeeded
         expect(workspaceEffort(cwd)).toBe("medium");
+      });
+    });
+  });
+
+  // FACTORY-1041: the same "resumed" happy path as immediately above, but
+  // with a `checkCanonicalMode` fake wired in at the HerdrHerd constructor's
+  // seam (13th positional arg) — proves resumeInPlaceExclusive's own
+  // `startManagedAgent` call accepts the extra option today without
+  // breaking (the pinned drovr silently ignores it, predating the gate —
+  // see `claudeLaunchOptions`'s own doc comment, src/agents/herd.ts), AND
+  // that it is never actually invoked pre-bump: this call site paying any
+  // attention to it yet would be a different, wrong claim about the pinned
+  // version's own behaviour.
+  test("FACTORY-1041: a checkCanonicalMode fake wired into the constructor is accepted but never called against the pinned (pre-gate) drovr", async () => {
+    await withTempWorkspaces(async () => {
+      const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-1041" });
+      const cwd = workspaceDirFor(key);
+      const spec = { key, issuetype: "Task", summary: "s", parent: null, agents: [{ harness: "claude" as const, model: "claude-opus-5", effort: "medium" as const }] };
+      await withResumableSession(cwd, "original-session", async (home) => {
+        const f = statefulHerdr("w1:p1", cwd);
+        const calls: number[] = [];
+        const checkCanonicalMode = async (shellPid: number) => { calls.push(shellPid); return "raw" as const; };
+        const herd = new HerdrHerd(
+          f.client, "http://x/mcp", instant, undefined, undefined, undefined, homeOf(home),
+          undefined, undefined, undefined, undefined, undefined, checkCanonicalMode,
+        );
+        expect(await herd.resumeInPlace(spec)).toBe("resumed");
+        expect(calls).toEqual([]); // pinned drovr predates the gate and never reads this option
       });
     });
   });
@@ -2892,7 +2953,10 @@ describe("resumeInPlace", () => {
           },
           pane: {
             close: async (id: string) => { closed.push(id); agents = agents.filter((a) => a.pane_id !== id); },
-            processInfo: async () => ({ process_info: { pane_id: "x", foreground_processes: [{ pid: 1, argv: ["claude"], name: "claude" }] } }),
+            // FACTORY-1041: `shell_pid` — see `statefulHerdr`'s own comment
+            // on this same field, above, for why it's needed here too (this
+            // fixture also drives a real `tryClaudeResume` -> `startManagedAgent`).
+            processInfo: async () => ({ process_info: { pane_id: "x", shell_pid: 99, foreground_processes: [{ pid: 1, argv: ["claude"], name: "claude" }] } }),
           },
           workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: `w9:p${++nextPane}` } }; } },
         };
@@ -3205,7 +3269,10 @@ describe("resumeInPlace", () => {
       },
       pane: {
         list: async () => ({ panes: state.panes.map((pane_id) => ({ pane_id, cwd })) }),
-        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
+        // FACTORY-1041: `shell_pid` — see `statefulHerdr`'s own comment on
+        // this same field, above; `fakeHerdrFullCycle` drives both
+        // `resumeInPlaceExclusive` and `tryClaudeResume`'s real `startManagedAgent` calls.
+        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, shell_pid: 99, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); if (!keepForegroundAfterExit) state.foreground = "shell"; },
         close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); state.panes = state.panes.filter((p) => p !== id); },
