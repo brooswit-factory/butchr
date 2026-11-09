@@ -6,9 +6,25 @@ import {lockDownAcl,unsafeWindowsAcl} from './windows-acl.js';
 export function acquireRuntimeWriter(directory:string){
  const path=join(directory,'.control-panel-writer.sqlite');
  const existed=existsSync(path);
- if(existed){const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(path))throw Error('Unsafe control-panel runtime lock');}
+ // The Windows ACL check is deliberately NOT here: this file carries Windows' own
+ // default DACL (which includes an unrelated logon-session SID — the same inheritance
+ // exposure fixed elsewhere in FACTORY-1043) from the moment it's created until this
+ // same function's own lockDownAcl call below actually secures it. A competitor racing
+ // a fresh creation sees existed=true for the winner's just-created, not-yet-locked-down
+ // file; checking unsafeWindowsAcl here would make it observe that transient ambient
+ // DACL and wrongly classify the file as permanently unsafe instead of reaching the
+ // normal contention path below (native finding, FACTORY-1043). Only the structural
+ // checks that don't depend on lockdown timing run here; the ACL check itself moves to
+ // after BEGIN EXCLUSIVE succeeds, where it's safe (see below).
+ if(existed){const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode))throw Error('Unsafe control-panel runtime lock');}
  const db=new Database(path,{create:true});chmodSync(path,0o600);
  try{db.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');}catch{db.close();throw Error('Another control-panel client owns this runtime directory');}
+ if(existed){
+  // Reaching here means no one else held this file exclusively, so it isn't a fresh
+  // winner's transient pre-lockdown window — it's either already secured from a prior
+  // run, or genuinely compromised. Safe (and still fail-closed) to check now.
+  if(unsafeWindowsAcl(path)){db.exec('ROLLBACK');db.close();throw Error('Unsafe control-panel runtime lock');}
+ }
  // Only now, once BEGIN EXCLUSIVE has actually succeeded, are we guaranteed the sole
  // owner of this directory — locking the ACL down any earlier (e.g. right after creating
  // the file, before this exclusivity gate) let two racing processes both attempt it on
