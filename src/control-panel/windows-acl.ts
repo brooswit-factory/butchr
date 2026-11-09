@@ -115,10 +115,13 @@ try {
   $path = $env:BUTCHR_ACL_PATH
   $acl = Get-Acl -LiteralPath $path
   $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-  $ownerSid = $acl.Owner.Translate([System.Security.Principal.SecurityIdentifier]).Value
-  $rules = @($acl.Access | ForEach-Object {
-    $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
-    [PSCustomObject]@{ sid = $sid; accessControlType = $_.AccessControlType.ToString() }
+  # The typed GetOwner/GetAccessRules overloads, not the .Owner/.Access properties: on
+  # native Windows (FACTORY-1043 round 3, confirmed), .Owner returns a plain
+  # System.String with no .Translate method — asking for SecurityIdentifier explicitly
+  # here returns the SID directly, with no ambiguity about what shape came back.
+  $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+  $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object {
+    [PSCustomObject]@{ sid = $_.IdentityReference.Value; accessControlType = $_.AccessControlType.ToString() }
   })
   $result = [PSCustomObject]@{ ok = $true; currentUserSid = $currentUserSid; ownerSid = $ownerSid; rules = $rules }
   Write-Output ($result | ConvertTo-Json -Compress -Depth 5)

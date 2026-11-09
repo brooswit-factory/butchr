@@ -21,13 +21,15 @@ export {validateServerUrl} from "./server-origin.js";
 export function createControlPanelClient(directory: string, fetchFn: typeof fetch = fetch) {
   mkdirSync(directory,{recursive:true,mode:0o700});
   const deploymentPath=join(directory,"deployment-id"), configurationPath=join(directory,"control-panel.json");
-  // An already-PROVISIONED directory's ACL (one that already has a deployment identity —
-  // e.g. from an older, less-secure install) is verified, never silently overwritten: an
-  // unsafe one is a refusal to start, for the operator to fix, exactly like every other
-  // "Unsafe ... file" refusal in this codebase. A directory that merely already existed
-  // but was never provisioned (nothing sensitive in it yet — a freshly made temp/parent
-  // directory, say) is just as safe to lock down fresh as a brand-new one.
-  if(!existsSync(deploymentPath))lockDownAcl(directory);
+  // An already-PROVISIONED directory's ACL (one that already holds ANY control-panel
+  // state — not just deployment-id specifically; a review finding noted that file alone
+  // is not proof the directory holds nothing else sensitive) is verified, never silently
+  // overwritten: an unsafe one is a refusal to start, for the operator to fix, exactly
+  // like every other "Unsafe ... file" refusal in this codebase. A directory that merely
+  // already existed but was never provisioned (nothing sensitive in it yet — a freshly
+  // made temp/parent directory, say) is just as safe to lock down fresh as a brand-new one.
+  const alreadyProvisioned=["deployment-id","control-panel.json",".control-panel-writer.sqlite","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  if(!alreadyProvisioned)lockDownAcl(directory);
   else if(unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
   const releaseWriter=acquireRuntimeWriter(directory);try{
   if(!existsSync(deploymentPath)){
