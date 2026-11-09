@@ -53,11 +53,20 @@ test('a losing candidate from a concurrent creation race is cleaned up and every
    }
   `;
   const children=Array.from({length:4},()=>Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'}));
-  const outputs=await Promise.all(children.map(async child=>{
+  // allSettled, not all: a fail-fast Promise.all would let `finally` remove the shared
+  // fixture directory while a sibling racer process was STILL RUNNING (still holding a
+  // file open inside it) the instant any ONE racer rejected — `rmSync` then throws EBUSY
+  // on Windows, masking the actual racer failure (confirmed natively, FACTORY-1043).
+  // Every child's own `child.exited` is awaited here regardless of outcome, so by the
+  // time we inspect results every process has actually exited before cleanup runs.
+  const settled=await Promise.allSettled(children.map(async child=>{
    const [out,code]=await Promise.all([new Response(child.stdout).text(),child.exited]);
    if(code!==0)throw Error('Synthetic racer failed: '+await new Response(child.stderr).text());
    return out.trim();
   }));
+  const failure=settled.find((r):r is PromiseRejectedResult=>r.status==='rejected');
+  if(failure)throw failure.reason;
+  const outputs=settled.map(r=>(r as PromiseFulfilledResult<string>).value);
   const identities=new Set(outputs);
   expect(identities.size).toBe(1);
   for(const id of identities)expect(id).toMatch(/^[0-9a-f-]{36}$/);
