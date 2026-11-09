@@ -36,7 +36,11 @@ export interface AclIo {
 export function defaultAclIo(): AclIo {
   return {
     run(script: string, path: string): string {
-      const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      // pwsh (PowerShell 7+), not the legacy Windows PowerShell 5.1 `powershell.exe`: the
+      // latter failed to autoload the module providing Get-Acl/Set-Acl on native Windows
+      // CI (FACTORY-1043) — "CouldNotAutoloadMatchingModule" — while pwsh is already what
+      // this repo's own CI steps run on the exact same runner image.
+      const result = spawnSync("pwsh", ["-NoProfile", "-NonInteractive", "-Command", script], {
         encoding: "utf8",
         windowsHide: true,
         env: { ...process.env, BUTCHR_ACL_PATH: path },
