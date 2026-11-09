@@ -72,4 +72,7 @@ test('a losing candidate from a concurrent creation race is cleaned up and every
   for(const id of identities)expect(id).toMatch(/^[0-9a-f-]{36}$/);
   expect(readdirSync(dir).filter(f=>f.startsWith('.deployment-'))).toEqual([]);
  }finally{rmSync(dir,{recursive:true,force:true});}
-},15000);
+// Explicit per-write Windows ACL lockdown (restored, FACTORY-1043: a real inheritance
+// exposure found natively) adds a real PowerShell invocation per racer attempt; native
+// Windows timing for this exact test was observed at ~29s even before that restoration.
+},60000);

@@ -38,10 +38,14 @@ import { spawnSync } from "node:child_process";
  *   An EXISTING path (a pre-existing directory from an older install, in particular) is
  *   only ever VERIFIED, never silently relocked; an unsafe existing ACL is a refusal
  *   (`unsafeWindowsAcl`/`verifyPrivateAcl` throwing), for the caller to act on, exactly
- *   like every other "Unsafe ... file" refusal in this codebase. A brand-new file written
- *   under an already-locked-down directory inherits that directory's ACL automatically at
- *   creation — before any content is written — so most writes need no extra PowerShell
- *   call at all.
+ *   like every other "Unsafe ... file" refusal in this codebase.
+ *
+ * (An earlier version of this comment claimed a brand-new file written under an
+ * already-locked-down directory inherits that directory's ACL automatically — DISPROVEN
+ * natively: a directory locked down exactly as intended can still report
+ * `InheritanceFlags=None` on its own ACEs, so nothing propagates; see `writeDurableFile`'s
+ * own doc comment in writer.ts for the confirmed exposure and why every write now locks
+ * its own file down explicitly instead of trusting inheritance.)
  * - `verifyPrivateAcl` validates the FULL expected shape strictly (SID syntax via regex,
  *   `accessControlType` exactly `Allow`/`Deny`) and fails closed (`ok:false`) the moment
  *   anything doesn't match, rather than treating a missing/malformed field as absent.
