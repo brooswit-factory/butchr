@@ -1,5 +1,5 @@
-import {syncDirectory} from "./writer.js";
-import {lstatSync,readFileSync,writeFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync} from 'node:fs';
+import {syncDirectory,writeDurableFile} from "./writer.js";
+import {lstatSync,readFileSync,renameSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 const identityPattern=/^remote:[0-9a-f-]{36}:[0-9a-f-]{36}:[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -16,7 +16,7 @@ export function createRemoteOverrides(directory:string,sync:typeof syncDirectory
   else throw Error('Invalid remote override');
   if(nextRules.length>10000)throw Error('Override limit reached');
   const temp=join(directory,`.remote-overrides-${randomUUID()}.tmp`);
-  try{writeFileSync(temp,JSON.stringify({enabled:nextEnabled,disabledRules:nextRules}),{flag:'wx',mode:0o600});const fd=openSync(temp,'r');try{fsyncSync(fd);}finally{closeSync(fd);}renameSync(temp,path);enabled=nextEnabled;disabledRules=nextRules;sync(directory);}finally{try{unlinkSync(temp);}catch{}}
+  try{writeDurableFile(temp,JSON.stringify({enabled:nextEnabled,disabledRules:nextRules}),'wx',0o600);renameSync(temp,path);enabled=nextEnabled;disabledRules=nextRules;sync(directory);}finally{try{unlinkSync(temp);}catch{}}
   enabled=nextEnabled;disabledRules=nextRules;return snapshot();
  }
  return {snapshot,update,isDisabled:(id:string)=>disabledRules.includes(id)};

@@ -1,6 +1,6 @@
 import {readRegisteredRuleIntent} from './registered-rule-readback.js';
 import {createRuleRuntime,type RuntimeLocal,type RuleRuntime} from "./rule-runtime.js";
-import {acquireRuntimeWriter,syncDirectory} from "./writer.js";
+import {acquireRuntimeWriter,syncDirectory,writeDurableFile} from "./writer.js";
 import {createTelemetryOutbox,type OperationalSnapshot,type TelemetrySource} from "./telemetry.js";
 import {createRemoteOverrides} from "./overrides.js";
 import { type RemoteRule } from "./remote-rules.js";
@@ -9,7 +9,7 @@ import {boundEventStream} from "./bounded-event-stream.js";
 import {EventSource} from "eventsource";
 import {createStreamState,MAX_EVENT_BYTES} from "./stream-state.js";
 /** Sprint one: only identity registration and remote brief delivery. No commands. */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, lstatSync, linkSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, lstatSync, linkSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Brief } from "./brief.js";
@@ -21,9 +21,11 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
   mkdirSync(directory,{recursive:true,mode:0o700});
   const releaseWriter=acquireRuntimeWriter(directory);try{
   const deploymentPath=join(directory,"deployment-id"), configurationPath=join(directory,"control-panel.json");
-  const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
-  writeFileSync(candidateIdentity,randomUUID()+"\n",{flag:"wx",mode:0o600});
-  try{const fd=openSync(candidateIdentity,"r");try{fsyncSync(fd);}finally{closeSync(fd);}linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}finally{unlinkSync(candidateIdentity);}
+  if(!existsSync(deploymentPath)){
+    const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
+    writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);
+    try{linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}finally{unlinkSync(candidateIdentity);}
+  }
   if(!lstatSync(deploymentPath).isFile() || lstatSync(deploymentPath).isSymbolicLink())throw new Error("Unsafe deployment identity file");
   const deploymentId=readFileSync(deploymentPath,"utf8").trim();
   if(!/^[0-9a-f-]{36}$/.test(deploymentId))throw new Error("Invalid deployment identity; repair it explicitly");
@@ -48,7 +50,7 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
     if(candidate && b.key==="" && config && candidate.serverUrl!==config.serverUrl)throw new Error("Enter a key when changing servers");
     const temp=join(directory,`.control-panel-${randomUUID()}.tmp`);
     let installed=false;
-    try{writeFileSync(temp,JSON.stringify(candidate),{flag:"wx",mode:0o600});const fd=openSync(temp,"r");try{fsyncSync(fd);}finally{closeSync(fd);}renameSync(temp,configurationPath);installed=true;syncDirectory(directory);}catch(error){if(installed)activateConfiguration(candidate);throw error;}finally{try{unlinkSync(temp);}catch{}}
+    try{writeDurableFile(temp,JSON.stringify(candidate),"wx",0o600);renameSync(temp,configurationPath);installed=true;syncDirectory(directory);}catch(error){if(installed)activateConfiguration(candidate);throw error;}finally{try{unlinkSync(temp);}catch{}}
     activateConfiguration(candidate);return summary();
   }
   const requests=new Set<AbortController>();

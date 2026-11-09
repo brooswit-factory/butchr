@@ -1,5 +1,5 @@
 import {Database} from 'bun:sqlite';
-import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,closeSync} from 'node:fs';
+import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,writeSync,closeSync} from 'node:fs';
 import {join} from 'node:path';
 /** Kernel-backed SQLite lock: exclusive ownership, automatically released on process death. */
 export function acquireRuntimeWriter(directory:string){
@@ -10,3 +10,8 @@ export function acquireRuntimeWriter(directory:string){
  let released=false;return ()=>{if(released)return;released=true;try{db.exec('ROLLBACK');}finally{db.close();}};
 }
 export function syncDirectory(directory:string){const fd=openSync(directory,'r');try{fsyncSync(fd);}finally{closeSync(fd);}}
+/** fsync requires a handle opened for writing; reopening a just-written file read-only to fsync it fails EPERM on Windows. */
+export function writeDurableFile(path:string,text:string,flags:string,mode:number){
+ const fd=openSync(path,flags,mode);
+ try{writeSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
+}
