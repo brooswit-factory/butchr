@@ -1,4 +1,5 @@
 import {test,expect} from 'bun:test';
+import {resolve} from 'node:path';
 import {unsafeGroupOtherBits} from '../../src/control-panel/writer.js';
 
 /**
@@ -16,7 +17,7 @@ test('flags world/group-accessible modes on this (POSIX) platform',()=>{
 });
 
 test('never flags anything on win32, where chmod cannot restrict group/other access anyway',async()=>{
- const module=new URL('../../src/control-panel/writer.ts',import.meta.url).pathname;
+ const module=resolve(import.meta.dir,'../../src/control-panel/writer.ts');
  const script=`
   Object.defineProperty(process,'platform',{value:'win32'});
   import {unsafeGroupOtherBits} from ${JSON.stringify(module)};

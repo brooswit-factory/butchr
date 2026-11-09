@@ -35,6 +35,8 @@ test('writeDurableFile honors exclusive-create flags and the requested mode',()=
   const path=join(dir,'identity.tmp');
   writeDurableFile(path,'fixture\n','wx',0o600);
   expect(()=>writeDurableFile(path,'fixture\n','wx',0o600)).toThrow();
-  expect(statSync(path).mode&0o777).toBe(0o600);
+  // NTFS has no POSIX group/other bits (see unsafeGroupOtherBits), so this mode
+  // round-trip only means something on POSIX.
+  if(process.platform!=='win32')expect(statSync(path).mode&0o777).toBe(0o600);
  }finally{rmSync(dir,{recursive:true,force:true});}
 });

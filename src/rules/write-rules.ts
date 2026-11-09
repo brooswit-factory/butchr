@@ -140,11 +140,13 @@ export interface WriteRulesIo {
   /**
    * fsyncs the directory itself (durability for the rename/backup entries
    * just created in it). A platform that genuinely cannot fsync a directory
-   * handle at all (`EINVAL`/`ENOTSUP`) degrades to best-effort silently;
-   * every OTHER error (notably `EIO` — a real, surfaced disk failure) is
-   * rethrown rather than swallowed (round-3 finding F5: a host with flaky
-   * power/disk must learn about a failed fsync, not silently proceed as if
-   * durable).
+   * handle at all (`EINVAL`/`ENOTSUP`, or `EPERM` — confirmed on native
+   * Windows, FACTORY-1043: FlushFileBuffers refuses a directory handle
+   * opened without backup-semantics access) degrades to best-effort
+   * silently; every OTHER error (notably `EIO` — a real, surfaced disk
+   * failure) is rethrown rather than swallowed (round-3 finding F5: a host
+   * with flaky power/disk must learn about a failed fsync, not silently
+   * proceed as if durable).
    */
   fsyncDir: (dir: string) => void;
   /** Acquires the cross-process write lock for `dir`, throwing (never sleeping/retrying, never reclaiming) if a lock file already exists; returns a release function. See `acquireRulesLock`'s own doc comment: a live holder, a dead holder, and corrupt content each refuse with their own message. */
@@ -284,7 +286,7 @@ export function defaultIo(): WriteRulesIo {
         // configurations) — not a real durability failure, degrade to best-effort silently.
         // Anything else (notably EIO — an actual disk failure) must propagate: see this
         // interface's own doc comment (round-3 finding F5).
-        if (code === "EINVAL" || code === "ENOTSUP") return;
+        if (code === "EINVAL" || code === "ENOTSUP" || code === "EPERM") return;
         throw e;
       }
     },
