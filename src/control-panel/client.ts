@@ -1,6 +1,6 @@
 import {readRegisteredRuleIntent} from './registered-rule-readback.js';
 import {createRuleRuntime,type RuntimeLocal,type RuleRuntime} from "./rule-runtime.js";
-import {acquireRuntimeWriter,syncDirectory,writeDurableFile,unsafeGroupOtherBits} from "./writer.js";
+import {acquireRuntimeWriter,syncDirectory,writeDurableFile,unsafeGroupOtherBits,createCandidateAndLink} from "./writer.js";
 import {lockDownAcl,unsafeWindowsAcl} from "./windows-acl.js";
 import {createTelemetryOutbox,type OperationalSnapshot,type TelemetrySource} from "./telemetry.js";
 import {createRemoteOverrides} from "./overrides.js";
@@ -10,7 +10,7 @@ import {boundEventStream} from "./bounded-event-stream.js";
 import {EventSource} from "eventsource";
 import {createStreamState,MAX_EVENT_BYTES} from "./stream-state.js";
 /** Sprint one: only identity registration and remote brief delivery. No commands. */
-import { mkdirSync, readFileSync, renameSync, lstatSync, linkSync, unlinkSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, lstatSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Brief } from "./brief.js";
@@ -67,18 +67,12 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
     lockDownAcl(directory);
   }
   if(!existsSync(deploymentPath)){
-    // candidateIdentity's name is a fresh randomUUID() every attempt, so this process is
-    // always its sole owner — never a preexisting file some other attempt created. The
-    // cleanup below must cover writeDurableFile itself, not just the link step after it:
-    // a lockdown/write/fsync failure inside writeDurableFile can leave a partially- or
-    // fully-written candidate on disk with nothing to remove it (native review finding,
-    // FACTORY-1043). catch-and-ignore on the unlink itself handles the case where
-    // writeDurableFile never got far enough to create anything at all.
+    // Ownership tracking (not deleting a candidate this call didn't create — review
+    // finding, FACTORY-1043: a fresh randomUUID() in the name makes collision unlikely,
+    // but unlikely is not ownership evidence) lives in createCandidateAndLink itself —
+    // see its own doc comment.
     const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
-    try{
-      writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);
-      try{linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}
-    }finally{try{unlinkSync(candidateIdentity);}catch{}}
+    createCandidateAndLink(candidateIdentity,randomUUID()+"\n",deploymentPath);
   }
   if(!lstatSync(deploymentPath).isFile() || lstatSync(deploymentPath).isSymbolicLink())throw new Error("Unsafe deployment identity file");
   const deploymentId=readFileSync(deploymentPath,"utf8").trim();

@@ -1,5 +1,5 @@
 import {Database} from 'bun:sqlite';
-import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,writeFileSync,closeSync,unlinkSync} from 'node:fs';
+import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,writeFileSync,closeSync,unlinkSync,linkSync} from 'node:fs';
 import {join} from 'node:path';
 import {lockDownAcl,unsafeWindowsAcl} from './windows-acl.js';
 /** Kernel-backed SQLite lock: exclusive ownership, automatically released on process death. */
@@ -96,6 +96,29 @@ export function syncDirectory(directory:string){
 export function writeDurableFile(path:string,text:string,flags:string,mode:number){
  const fd=openSync(path,flags,mode);
  try{lockDownAcl(path,undefined,false);writeFileSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
+}
+/**
+ * Writes `content` to a fresh, exclusively-created `candidatePath`, hard-links it to
+ * `targetPath` (tolerating a concurrent winner having already landed one), and always
+ * cleans up the candidate — EXCEPT when this call never actually created it.
+ *
+ * `owned` tracks that explicitly rather than assuming it from the candidate path being
+ * "probably unique" (e.g. a fresh randomUUID() in it): writeDurableFile's "wx" (exclusive
+ * create) flag has exactly one possible EEXIST source — its own initial open — so an
+ * EEXIST thrown from it means this call did NOT create anything at that path, and cleanup
+ * must leave whatever is already there alone (native review finding, FACTORY-1043: a
+ * cleanup that assumes ownership from name uniqueness alone isn't ownership evidence, and
+ * could delete a real, unrelated file that happens to share the name). Any other outcome
+ * — success, or a non-EEXIST failure from lockdown/write/fsync/link, which can only happen
+ * once the file actually exists — means this call DID create it, and cleanup must run.
+ */
+export function createCandidateAndLink(candidatePath:string,content:string,targetPath:string){
+ let owned=true;
+ try{
+  try{writeDurableFile(candidatePath,content,'wx',0o600);}
+  catch(e){if((e as NodeJS.ErrnoException).code==='EEXIST')owned=false;throw e;}
+  try{linkSync(candidatePath,targetPath);}catch(e){if((e as NodeJS.ErrnoException).code!=='EEXIST')throw e;}
+ }finally{if(owned)try{unlinkSync(candidatePath);}catch{}}
 }
 /**
  * NTFS has no POSIX group/other permission bits: chmodSync can only toggle the read-only
