@@ -7,11 +7,16 @@ export function acquireRuntimeWriter(directory:string){
  const path=join(directory,'.control-panel-writer.sqlite');
  const existed=existsSync(path);
  if(existed){const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(path))throw Error('Unsafe control-panel runtime lock');}
- // Lock the ACL down BEFORE sqlite ever writes its header, not after — the Database
- // constructor below is the first write for a brand-new lock file.
- else{const fd=openSync(path,'wx',0o600);closeSync(fd);lockDownAcl(path);}
  const db=new Database(path,{create:true});chmodSync(path,0o600);
  try{db.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');}catch{db.close();throw Error('Another control-panel client owns this runtime directory');}
+ // Only now, once BEGIN EXCLUSIVE has actually succeeded, are we guaranteed the sole
+ // owner of this directory — locking the ACL down any earlier (e.g. right after creating
+ // the file, before this exclusivity gate) let two racing processes both attempt it on
+ // the SAME brand-new file/directory at once, which native testing found could spuriously
+ // fail with "SeSecurityPrivilege". This file holds no credentials (just an empty lock
+ // marker), so the brief window where it exists under the directory's ambient ACL before
+ // this runs is an acceptable, deliberate tradeoff against reintroducing that race.
+ if(!existed)lockDownAcl(path);
  let released=false;return ()=>{if(released)return;released=true;try{db.exec('ROLLBACK');}finally{db.close();}};
 }
 /**
