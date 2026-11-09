@@ -16,7 +16,7 @@ function fakeIo(output: string): AclIo & {calls: {script: string; path: string}[
   return {calls, run(script, path) { calls.push({script, path}); return output; }};
 }
 
-test('every exported function is a no-op (never invokes PowerShell) on every platform but win32', () => {
+test.skipIf(process.platform === 'win32')('every exported function is a no-op (never invokes PowerShell) on every platform but win32', () => {
   const io = fakeIo('irrelevant');
   lockDownAcl('/posix/path', io);
   verifyPrivateAcl('/posix/path', io);
