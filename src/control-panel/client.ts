@@ -51,7 +51,21 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
   // against the SAME directory (before any exclusivity mechanism serialized them) could
   // spuriously hit "SeSecurityPrivilege"; doing it here, after the real exclusivity gate,
   // removes the race entirely rather than chasing that error's exact cause.
-  if(!alreadyProvisioned)lockDownAcl(directory);
+  //
+  // alreadyProvisioned above was read BEFORE acquiring that exclusivity, and native
+  // testing found it can be stale by the time we reach here: a competitor can observe
+  // `false`, then only actually win acquireRuntimeWriter once the real winner has
+  // already provisioned the directory and released it. Acting on the stale `false`
+  // would call lockDownAcl against a directory that's already provisioned — re-derive
+  // it now, under our own held exclusivity, and apply the SAME unsafe-ACL refusal an
+  // already-provisioned caller hit above instead of silently trusting a directory we
+  // didn't originally observe as provisioned.
+  const provisionedNow=alreadyProvisioned||["deployment-id","control-panel.json","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  if(provisionedNow){
+    if(unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
+  }else{
+    lockDownAcl(directory);
+  }
   if(!existsSync(deploymentPath)){
     const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
     writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);
