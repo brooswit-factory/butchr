@@ -27,13 +27,20 @@ export function syncDirectory(directory:string){
 }
 /**
  * fsync requires a handle opened for writing; reopening a just-written file read-only to
- * fsync it fails EPERM on Windows. The ACL is locked down right after creation but BEFORE
- * the (possibly sensitive — an authorization key, a lock, a manifest) content is written,
- * never after: no window where the content sits on disk under a wider ACL than intended.
+ * fsync it fails EPERM on Windows.
+ *
+ * No per-write ACL lockdown here: every caller creates this file inside a control-panel
+ * directory whose OWN ACL was already locked down (with inheritance enabled for new
+ * children) before any file was ever written into it, so a brand-new file inherits the
+ * correct restricted ACL automatically, before any content is written — re-locking each
+ * individual file on every write added a real PowerShell invocation per write, which was
+ * both much too slow (confirmed natively, FACTORY-1043 round 2/3) and unnecessary. Each
+ * call site that reads such a file back still verifies its ACL (`unsafeWindowsAcl`) rather
+ * than trusting inheritance blindly.
  */
 export function writeDurableFile(path:string,text:string,flags:string,mode:number){
  const fd=openSync(path,flags,mode);
- try{lockDownAcl(path);writeFileSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
+ try{writeFileSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
 }
 /**
  * NTFS has no POSIX group/other permission bits: chmodSync can only toggle the read-only
