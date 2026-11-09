@@ -12,6 +12,7 @@ import {prepareRuleCutover,ruleFingerprint} from './rule-cutover.js';
 import {type AdmittedRuleIdentity} from './telemetry-wire.js';
 import {restoreRetainedProvenance,remoteAdmittedIdentity} from './retained-origin.js';
 import {syncDirectory,writeDurableFile,unsafeGroupOtherBits} from './writer.js';
+import {unsafeWindowsAcl} from './windows-acl.js';
 const MAX=8_000_000,MAX_AGENTS=10000;
 const fingerprint=ruleFingerprint;
 const keyOf=(rule:Rule)=>rule.resourceProvider+':'+rule.id;
@@ -38,7 +39,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   for(const [id,entry]of m.retained){if(typeof id!=='string'||typeof entry.known!=='boolean'||typeof entry.managed!=='boolean')throw Error('Invalid retained rule');const decoded=decodeAnyAgentKey(id);if(!decoded||decoded.ruleId!==entry.rule.id||decoded.resourceProvider!==entry.rule.resourceProvider)throw Error('Invalid retained identity');if(entry.origin)entry.origin=restoreRetainedProvenance({provider:decoded.resourceProvider,kind:decoded.kind,ruleId:decoded.ruleId,...(decoded.kind==='resource'&&decoded.resourceProvider!=='filesystem'?{resourceId:decoded.resourceId}:{}),admittedRule:entry.origin},m.source).admittedRule!;parseRules({rules:[...m.history.filter(r=>r.id!==entry.rule.id),entry.rule]});if(Object.hasOwn(entry,'appliedPreferences'))parseRules({rules:[appliedRule(entry)]});if(entry.reconciliation&&(!/^[a-f0-9]{64}$/.test(entry.reconciliation.token)||!['pending','applied','blocked','superseded','disabled'].includes(entry.reconciliation.status)))throw Error('Invalid worker reconciliation record');}
   if(m.deactivation&&(typeof m.deactivation.originalText!=='string'||typeof m.deactivation.emptyEtag!=='string'))throw Error('Invalid deactivation record');return m;
  }
- try{const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||stat.size>MAX)throw Error('Unsafe remote authority manifest');manifest=validate(JSON.parse(readFileSync(path,'utf8')));retained=new Map(manifest.retained);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+ try{const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(path)||stat.size>MAX)throw Error('Unsafe remote authority manifest');manifest=validate(JSON.parse(readFileSync(path,'utf8')));retained=new Map(manifest.retained);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
  // A previous process may have staged a target before dying. Never convert
  // an interrupted durable request into another paid launch after restart.
  for(const entry of retained.values())if(entry.lastHandoff?.status==='pending'||entry.reconciliation?.status==='pending'){

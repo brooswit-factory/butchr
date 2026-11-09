@@ -135,6 +135,43 @@ jobs:
       - name: unit + load tests, coverage ≥ 90%
         continue-on-error: true
         run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+  windows-deployment-identity:
+    name: windows deployment identity (FACTORY-1043 required gate)
+    # The `windows` job above is whole-suite and continue-on-error (it tracks the full
+    # cross-platform gap, not a pass/fail release gate) and never starts the real daemon,
+    # so it cannot fail the check on a regression in the ONE thing FACTORY-1043 is about:
+    # the real daemon reaching app.listen() on Windows, and a restart reusing the existing
+    # deployment identity. This job is neither whole-suite nor continue-on-error — it is
+    # REQUIRED, and scoped to exactly that path. See scripts/verify-ci-windows-deployment-identity.ts
+    # for what it actually proves and why it never touches a real herdr/Jira/GitHub account.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: butchr
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: butchr }
+      - uses: actions/checkout@v4
+        with:
+          repository: brooswit-factory/drovr
+          ref: 52d0106898982cb4d411208dc687f9e20a4075eb
+          path: drovr
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.11 }
+      - name: build pinned sibling SDK sources
+        working-directory: drovr
+        shell: bash
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+          cd legacy-events
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+      - run: bun install --frozen-lockfile
+      - name: focused unit coverage for the deployment-identity/control-panel durability fix (FACTORY-1043)
+        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-windows-acl.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts test/unit/write-rules.test.ts
+      - name: real daemon fresh startup reaches HTTP listen, then restart reuses the SAME deployment identity (and a separate install gets a DISTINCT one)
+        run: bun run scripts/verify-ci-windows-deployment-identity.ts
   release-gate:
     name: release gate
     # Runs on pull requests AND branch pushes: with a pull_request-only `if`, a branch pushed
