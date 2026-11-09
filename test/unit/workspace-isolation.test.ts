@@ -19,7 +19,12 @@ describe("test workspace isolation", () => {
   const loadTimeRoot = workspaceRoot();
 
   test("the preload is wired into bunfig.toml", () => {
-    expect(readFileSync(join(import.meta.dir, "../../bunfig.toml"), "utf8")).toContain('preload = ["./test/setup/isolated-workspaces.ts"]');
+    const bunfig = readFileSync(join(import.meta.dir, "../../bunfig.toml"), "utf8");
+    const preloadLine = bunfig.split("\n").find((line) => line.startsWith("preload = ["));
+    expect(preloadLine, "bunfig.toml must declare a preload array").toBeDefined();
+    // FACTORY-1041: the array also carries test/setup/drovr-canonical-mode-gate.ts
+    // now — this assertion only cares that isolated-workspaces.ts is still in it.
+    expect(JSON.parse(preloadLine!.slice("preload = ".length))).toContain("./test/setup/isolated-workspaces.ts");
   });
 
   test("workspaceRoot() is the test temp root, at load time and in a test, never the real default", () => {

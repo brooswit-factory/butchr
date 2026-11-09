@@ -918,6 +918,7 @@ export class HerdrHerd implements Herd {
         startOptions: {
           readinessTimeoutMs: PANE_READINESS_TIMEOUT_MS, retryIntervalMs: PANE_READY_WAIT_MS,
           now: this.monotonicNow, wait: this.wait,
+          ...(this.checkCanonicalMode ? { checkCanonicalMode: this.checkCanonicalMode } : {}),
         },
       });
       this.lifecycles.set(issue, lifecycle);

@@ -572,17 +572,29 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
     const started: any[] = [];
     const closed: string[] = [];
     let calls = 0;
+    let launched = false;
+    let createdCwd: string | undefined;
     const client = {
       agent: {
-        list: async () => ({ agents: [] }),
+        // FACTORY-1041: once `start` actually succeeds, `list()` must report
+        // it (idle, not launch_pending) — `ManagedHerdrLifecycle`'s own
+        // post-launch `awaitLaunchSettled` (FACTORY-1037, newly reachable
+        // here now that this fixture's pin carries that work too) calls
+        // `resolveCurrent()` first, which throws `HandoffBlocked` on an
+        // empty `agent.list()` rather than treating "no entry yet" as still
+        // pending. Before this ticket's pin bump, this fixture's `list()`
+        // returning `[]` forever never mattered — `awaitLaunchSettled` did
+        // not exist on the previously-pinned commit.
+        list: async () => ({ agents: launched ? [{ pane_id: "w9:p1", cwd: createdCwd!, agent: "claude", agent_status: "idle" }] : [] }),
         start: async (p: any) => {
           calls++;
           if (calls <= rejectCount) throw busyError();
           started.push(p);
+          launched = true;
         },
       },
       pane: { close: async (id: string) => { closed.push(id); }, read: async () => ({ read: { text: "" } }) },
-      workspace: { create: async () => ({ root_pane: { pane_id: "w9:p1" } }) },
+      workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: "w9:p1" } }; } },
     };
     return { client: client as any, started, closed, callCount: () => calls };
   }
@@ -596,7 +608,14 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
     expect(f.started.length).toBe(1);
     expect(f.closed.length).toBe(0); // it eventually started — the pane it created must not be closed
     expect(f.callCount()).toBe(8);
-    expect(waits).toEqual([...Array(7).fill(PANE_READY_WAIT_MS), 12_000]);
+    // FACTORY-1041: the trailing 14 waits of 1000ms are `startProviders`'s own
+    // post-launch `discoverClaudeSessionId` retry loop (SESSION_DISCOVERY_POLL_MS,
+    // this file's own SESSION_DISCOVERY_ATTEMPTS doc comment) — newly REACHED
+    // by this fixture now that `agent.list()` reports the launched pane
+    // (above), so `awaitLaunchSettled` actually succeeds instead of throwing
+    // `HandoffBlocked` before session discovery ever ran. This fixture never
+    // writes a real transcript file, so discovery exhausts every attempt.
+    expect(waits).toEqual([...Array(7).fill(PANE_READY_WAIT_MS), 12_000, ...Array(14).fill(1_000)]);
   });
 
   test("deadline exhaustion closes the pane and never falls back to another provider", async () => {
@@ -604,7 +623,12 @@ describe("spawn: pane readiness retry (BUTCHR-268)", () => {
     let now = 0;
     const herd = new HerdrHerd(f.client, "u", async (ms) => { now += ms; }, undefined, { provider: "claude", providers: ["claude", "codex", "agy"] }, undefined, undefined, () => now);
     await expect(herd.spawn({ key: "KAN-7", issuetype: "Task", summary: "s", parent: null })).rejects.toMatchObject({
-      code: "agent_shell_readiness_timeout", diagnostics: { elapsedMs: PANE_READINESS_TIMEOUT_MS, processInfo: "unavailable" },
+      // FACTORY-1041: `processInfo`/`shellPid` reflect the universal test-time
+      // `pane.processInfo` fallback the whole suite now relies on (see
+      // test/setup/drovr-canonical-mode-gate.ts) — this fixture never
+      // implemented `processInfo` itself, so before that fallback existed
+      // this read genuinely failed ("unavailable").
+      code: "agent_shell_readiness_timeout", diagnostics: { elapsedMs: PANE_READINESS_TIMEOUT_MS, processInfo: "available", shellPid: 1 },
     });
     expect(f.closed).toEqual(["w9:p1"]);
     expect(f.started.length).toBe(0);
@@ -2180,7 +2204,7 @@ describe("resumeInPlace", () => {
         // it from the moment the pane exists). Needed once drovr's own
         // `startManagedAgent` gate (awaitNonCanonical, drovr PR #100) reads
         // it before every `agent.start` this fixture drives.
-        processInfo: async () => ({ process_info: { pane_id: pane, shell_pid: SHELL_PROC.pid, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
+        processInfo: async () => ({ type: "pane_process_info" as const, process_info: { pane_id: pane, shell_pid: SHELL_PROC.pid, foreground_processes: options.processGone ? [] : [foreground === "claude" ? { ...CLAUDE_PROC, argv: lastArgv } : SHELL_PROC] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); foreground = "shell"; },
         // FACTORY-491 (director item 3): records every defensive close so
@@ -2279,13 +2303,13 @@ describe("resumeInPlace", () => {
   // FACTORY-1041: the same "resumed" happy path as immediately above, but
   // with a `checkCanonicalMode` fake wired in at the HerdrHerd constructor's
   // seam (13th positional arg) — proves resumeInPlaceExclusive's own
-  // `startManagedAgent` call accepts the extra option today without
-  // breaking (the pinned drovr silently ignores it, predating the gate —
-  // see `claudeLaunchOptions`'s own doc comment, src/agents/herd.ts), AND
-  // that it is never actually invoked pre-bump: this call site paying any
-  // attention to it yet would be a different, wrong claim about the pinned
-  // version's own behaviour.
-  test("FACTORY-1041: a checkCanonicalMode fake wired into the constructor is accepted but never called against the pinned (pre-gate) drovr", async () => {
+  // `startManagedAgent` call actually threads this option through to drovr's
+  // real pre-launch TTY-readiness gate (drovr PR #100, live on the pin as of
+  // this ticket's own reconciliation) and that drovr genuinely calls it with
+  // the pane's real reported `shell_pid` (`statefulHerdr`'s `SHELL_PROC.pid`,
+  // 2) rather than silently ignoring it — see `claudeLaunchOptions`'s own
+  // doc comment, src/agents/herd.ts, for the seam this exercises.
+  test("FACTORY-1041: a checkCanonicalMode fake wired into the constructor is actually called by drovr's real pre-launch TTY-readiness gate", async () => {
     await withTempWorkspaces(async () => {
       const key = encodeAgentKey({ resourceProvider: "jira-work", ruleId: "jira-work", resourceId: "FACTORY-1041" });
       const cwd = workspaceDirFor(key);
@@ -2299,7 +2323,7 @@ describe("resumeInPlace", () => {
           undefined, undefined, undefined, undefined, undefined, checkCanonicalMode,
         );
         expect(await herd.resumeInPlace(spec)).toBe("resumed");
-        expect(calls).toEqual([]); // pinned drovr predates the gate and never reads this option
+        expect(calls).toEqual([2]); // SHELL_PROC.pid — the gate is live and reads this option
       });
     });
   });
@@ -2956,7 +2980,7 @@ describe("resumeInPlace", () => {
             // FACTORY-1041: `shell_pid` — see `statefulHerdr`'s own comment
             // on this same field, above, for why it's needed here too (this
             // fixture also drives a real `tryClaudeResume` -> `startManagedAgent`).
-            processInfo: async () => ({ process_info: { pane_id: "x", shell_pid: 99, foreground_processes: [{ pid: 1, argv: ["claude"], name: "claude" }] } }),
+            processInfo: async () => ({ type: "pane_process_info" as const, process_info: { pane_id: "x", shell_pid: 99, foreground_processes: [{ pid: 1, argv: ["claude"], name: "claude" }] } }),
           },
           workspace: { create: async (p: any) => { createdCwd = p.cwd; return { root_pane: { pane_id: `w9:p${++nextPane}` } }; } },
         };
@@ -3272,7 +3296,7 @@ describe("resumeInPlace", () => {
         // FACTORY-1041: `shell_pid` — see `statefulHerdr`'s own comment on
         // this same field, above; `fakeHerdrFullCycle` drives both
         // `resumeInPlaceExclusive` and `tryClaudeResume`'s real `startManagedAgent` calls.
-        processInfo: async (q: { pane_id: string }) => ({ process_info: { pane_id: q.pane_id, shell_pid: 99, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
+        processInfo: async (q: { pane_id: string }) => ({ type: "pane_process_info" as const, process_info: { pane_id: q.pane_id, shell_pid: 99, foreground_processes: state.foreground === "claude" ? [{ pid: 1, argv: lastArgv, name: "claude" }] : [] } }),
         sendText: async (p: any) => { sent.push({ text: p.text }); },
         sendKeys: async (p: any) => { sent.push({ keys: p.keys }); if (!keepForegroundAfterExit) state.foreground = "shell"; },
         close: async (id: string) => { closed.push(id); state.agents = state.agents.filter((a) => a.pane_id !== id); state.panes = state.panes.filter((p) => p !== id); },

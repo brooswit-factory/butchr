@@ -1,5 +1,5 @@
 [test]
-preload = ["./test/setup/isolated-workspaces.ts"]
+preload = ["./test/setup/isolated-workspaces.ts", "./test/setup/drovr-canonical-mode-gate.ts"]
 coverage = true
 coverageSkipTestFiles = true
 coverageReporter = ["text", "lcov"]
