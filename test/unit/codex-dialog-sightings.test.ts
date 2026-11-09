@@ -89,6 +89,28 @@ describe("createCodexDialogSightingsTracker (FACTORY-425/FACTORY-419)", () => {
     expect(tracker.sightings()).toEqual([expect.objectContaining({ fingerprint: "fpA", count: 2 })]);
   });
 
+  // FACTORY-1044: the live incident this ticket is about — a reviewer pane
+  // (MINECRAFT-494) sat stuck ~13h on two GitHub tool-consent dialogs while
+  // `/health` kept reporting "codex: 0 answered, 0 skipped, 2 unrecognised,
+  // 0 failed". This module's own counting/escalation surface (FACTORY-425)
+  // already turns repeated sightings of exactly this shape into a
+  // persistent, non-zero `/health` field — this test pins that against the
+  // real incident excerpt text rather than only an opaque placeholder.
+  test("the incident's stuck-reviewer dialog, sighted repeatedly, accumulates a non-zero /health-surfaced count instead of looking healthy forever", () => {
+    const { deps } = fakeDeps();
+    const tracker = createCodexDialogSightingsTracker(deps);
+    const excerpt = 'Allow GitHub to submit a pull request review?\n\naction: REQUEST_CHANGES\npull request: #4\ncommit: 36160c (obsolete head)';
+
+    // The daemon's own poll loop calls onScan every 5s (src/daemon/index.ts);
+    // simulate several polls while the pane sits stuck on the SAME dialog.
+    for (let i = 0; i < 5; i++) tracker.onScan([{ paneId: "reviewer-pane", fingerprint: "fp-stale-pr-review", excerpt }]);
+
+    const sightings = tracker.sightings();
+    expect(sightings).toHaveLength(1);
+    // Exactly the shape health.ts exposes as `codexUnrecognisedDialogSightings`.
+    expect(sightings[0]).toMatchObject({ fingerprint: "fp-stale-pr-review", count: 1, excerpt });
+  });
+
   test("lastSeen advances on a later episode but firstSeen and the representative excerpt never change", () => {
     const { deps, advance } = fakeDeps();
     const tracker = createCodexDialogSightingsTracker(deps);

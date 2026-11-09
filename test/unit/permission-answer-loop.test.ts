@@ -424,6 +424,65 @@ describe("FACTORY-108: Codex lizard mode wired alongside Claude in the same tick
     rmSync(dir, { recursive: true, force: true });
   });
 
+  // FACTORY-1044: the two exact GitHub tool-consent dialogs from the live
+  // incident (MINECRAFT-494 reviewer pane stuck ~13h) — regardless of which
+  // outcome shape `@brooswit/drovr`'s Codex classifier happens to return
+  // these as (today: `unrecognised`, since neither wording matched its
+  // pre-FACTORY-1044 MCP-tool pattern; once `@brooswit/drovr`'s own fix
+  // lands: a recognised-but-gated `skipped`, per that module's own test
+  // suite), this module's own job — never answer, log loudly, never drop
+  // silently — holds for both shapes without this file needing to know
+  // which one it's getting. Dialog recognition is drovr's job, not
+  // butchr's (see this file's own header); this test only pins butchr's
+  // OWN integration behavior against the exact incident text.
+  test("the incident's two GitHub tool-consent dialogs are never silently dropped, under either outcome shape drovr's classifier may report them as", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client } = fakeClient({ p1: "irrelevant, autoAnswerCodex is faked below" });
+
+    const staleReviewExcerpt = 'Allow GitHub to submit a pull request review?\n\naction: REQUEST_CHANGES\npull request: #4\ncommit: 36160c (obsolete — this PR\'s head has since moved)';
+    const convertDraftExcerpt = 'Allow GitHub to run tool "github.convert_pull_request_to_draft"?';
+
+    // Shape 1: today's pinned `@brooswit/drovr` — neither wording matches
+    // its MCP-tool pattern, so both land as `unrecognised`.
+    const lines: string[] = [];
+    const unrecognisedResults = [
+      { paneId: "reviewer-pane", label: "reviewer-pane", outcome: "unrecognised" as const, excerpt: staleReviewExcerpt, fingerprint: "fp-stale-review" },
+      { paneId: "reviewer-pane-2", label: "reviewer-pane-2", outcome: "unrecognised" as const, excerpt: convertDraftExcerpt, fingerprint: "fp-convert-draft" },
+    ];
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, log: (l) => lines.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (async () => unrecognisedResults) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    expect(lines.some((l) => l.includes("reviewer-pane") && l.includes("UNRECOGNISED (codex)") && l.includes("REQUEST_CHANGES") && l.includes("36160c"))).toBe(true);
+    expect(lines.some((l) => l.includes("reviewer-pane-2") && l.includes("UNRECOGNISED (codex)") && l.includes("convert_pull_request_to_draft"))).toBe(true);
+    // Never counted as "answered" or folded into the Claude summary line.
+    expect(lines.some((l) => l.includes("codex: 0 answered, 0 skipped, 2 unrecognised, 0 failed"))).toBe(true);
+
+    // Shape 2: a drovr that recognises the GitHub dialog family but gates it
+    // (the fix proposed against `@brooswit/drovr` for this ticket) reports
+    // these as `skipped`, with the parsed detail — not `unrecognised` and
+    // never `answered`. This file's own skip-logging path already handles
+    // that shape unconditionally; asserted here so a future drovr pin bump
+    // is not the first time this exact wiring is exercised.
+    const lines2: string[] = [];
+    const gatedResults = [
+      { paneId: "reviewer-pane", label: "reviewer-pane", outcome: "skipped" as const, reason: 'no plain approve-once option on this mcp-tool prompt (detail: GitHub.submit a pull request review; options: ["Allow","Allow for this session","Always allow","Cancel"])' },
+      { paneId: "reviewer-pane-2", label: "reviewer-pane-2", outcome: "skipped" as const, reason: 'no plain approve-once option on this mcp-tool prompt (detail: GitHub.github.convert_pull_request_to_draft; options: ["Allow","Allow for this session","Always allow","Cancel"])' },
+    ];
+    await runPermissionAnswerTick({
+      client, eligiblePanes: allEligible, auditPath, log: (l) => lines2.push(l),
+      autoAnswer: (async () => []) as unknown as typeof import("@brooswit/drovr").autoAnswerPermissions,
+      autoAnswerCodex: (async () => gatedResults) as unknown as typeof import("@brooswit/drovr").autoAnswerCodexApprovals,
+    });
+    expect(lines2.some((l) => l.includes("reviewer-pane") && l.includes("SKIPPED (codex)") && l.includes("GitHub.submit a pull request review"))).toBe(true);
+    expect(lines2.some((l) => l.includes("reviewer-pane-2") && l.includes("SKIPPED (codex)") && l.includes("convert_pull_request_to_draft"))).toBe(true);
+    expect(lines2.some((l) => l.includes("answered (codex)"))).toBe(false);
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("an unrecognised codex pane is logged once per distinct excerpt, not once per pane — a repeat of the SAME excerpt is suppressed, but a DIFFERENT excerpt on the same pane logs again", async () => {
     const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
     const auditPath = join(dir, "audit.jsonl");
