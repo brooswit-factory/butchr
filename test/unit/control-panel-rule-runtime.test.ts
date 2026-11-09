@@ -13,6 +13,8 @@ const source={serverId:'00000000-0000-4000-8000-000000000001',authorizationId:'0
 const doc={rules:[{id:'worker',resourceProvider:'jira-work',query:'project = FIXTURE',brief:'Original instructions\n',enabled:true,execution:'swarm',role:'worker',relationships:{childRule:'parked'}},{id:'parked',resourceProvider:'jira-work',query:'project = PARKED',brief:'Never start',enabled:false,role:'worker'}]};
 const key=(suffix='1')=>'jira-work:worker:FIXTURE-'+suffix;
 const spec=(id:string):SpawnSpec=>({key:id,issuetype:'Task',summary:'Disposable fake worker',parent:null});
+/** A real filesystem resource id must have a platform-correct absolute shape (FACTORY-1043: a hardcoded POSIX path is invalid on win32). */
+const fsPath=(...segments:string[])=>process.platform==='win32'?'C:\\'+segments.join('\\'):'/'+segments.join('/');
 function rows(document:unknown=doc):RemoteRule[]{return parseRules(document).map(definition=>({id:`remote:${source.serverId}:${source.authorizationId}:${definition.id}`,source:'remote',...source,sourceRuleId:definition.id,definition,executionState:'staged'}));}
 function fixture(){const directory=mkdtempSync(join(tmpdir(),'butchr-rule-runtime-')),path=join(directory,'rules.json'),env={BUTCHR_RULES_FILE:path};const original=JSON.stringify(doc,null,2)+'\n';writeFileSync(path,original,{mode:0o600});const holder=createRulesHolder(parseRules(doc),sourceEtagOf(original));
  const local={holder,readText:()=>readFileSync(path,'utf8'),writeText:(text:string,ifMatch:string)=>writeRulesFile(text,env,undefined,{ifMatch}),reload:()=>{const next=loadRules(env);holder.setRules(next.rules);holder.setSourceEtag(sourceEtagOf(next.text));return {ok:true};}};
@@ -211,7 +213,7 @@ test('disabled-only provider never becomes initialized just because remote autho
 
 test('built-in managed-session identity keeps its independent lifecycle under centralized rule authority',async()=>{const f=fixture();try{
  const {encodeAgentKey}=await import('../../src/rules/agent-key.js');
- const id=encodeAgentKey({resourceProvider:'filesystem',ruleId:'managed-sessions',resourceId:'/disposable/session.json'});f.update();f.activate();const p=f.runtime.policy,g=p.generation();expect(f.runtime.isUnresolvedAgent(id)).toBe(false);expect(p.canAdmit(id,g)).toBe(true);expect(p.canSpawn(spec(id),g)).toBe(true);expect(p.canNotify(id,g,g)).toBe(true);expect(p.protectRespawn(id,g)).toBe(true);expect(p.protectStop(id,g)).toBe(true);expect(p.ignoreNotification(id)).toBe(false);expect(p.noticeDisposition(id,p.notificationContext(id)!)).toBe('deliver');expect(p.prepare(new Map([[id,spec(id)]]),[],g).has(id)).toBe(true);f.update({connected:false,control:{enabled:false,disabledRules:[]}});expect(p.canSpawn(spec(id),g)).toBe(true);expect(p.canAdmit(id,g)).toBe(true);
+ const id=encodeAgentKey({resourceProvider:'filesystem',ruleId:'managed-sessions',resourceId:fsPath('disposable','session.json')});f.update();f.activate();const p=f.runtime.policy,g=p.generation();expect(f.runtime.isUnresolvedAgent(id)).toBe(false);expect(p.canAdmit(id,g)).toBe(true);expect(p.canSpawn(spec(id),g)).toBe(true);expect(p.canNotify(id,g,g)).toBe(true);expect(p.protectRespawn(id,g)).toBe(true);expect(p.protectStop(id,g)).toBe(true);expect(p.ignoreNotification(id)).toBe(false);expect(p.noticeDisposition(id,p.notificationContext(id)!)).toBe('deliver');expect(p.prepare(new Map([[id,spec(id)]]),[],g).has(id)).toBe(true);f.update({connected:false,control:{enabled:false,disabledRules:[]}});expect(p.canSpawn(spec(id),g)).toBe(true);expect(p.canAdmit(id,g)).toBe(true);
  const workers=herd();workers.h.ruleRuntime=()=>p;await reconcileNow(workers.h,new Map([[id,spec(id)]]));expect(workers.actions).toEqual(['spawn:'+id]);
  }finally{f.close();}});
 test('admitted linked-item observation limit remains on admitted observation graph until workers drain',()=>{const f=fixture();try{
@@ -221,7 +223,7 @@ test('admitted linked-item observation limit remains on admitted observation gra
 test('retired local managed-session namespace is never swept into remote OFF reconciliation',async()=>{const f=fixture();try{
  const {encodeAgentKey}=await import('../../src/rules/agent-key.js');
  const {reconcileDisabledRules}=await import('../../src/control-panel/reconcile-disabled-rules.js');
- const id=encodeAgentKey({resourceProvider:'filesystem',ruleId:'managed-sessions',resourceId:'/defs/disposable.json'});
+ const id=encodeAgentKey({resourceProvider:'filesystem',ruleId:'managed-sessions',resourceId:fsPath('defs','disposable.json')});
  f.update();f.activate();const workers=herd([id]);workers.h.ruleRuntime=()=>f.runtime.policy;
  f.runtime.recordFullCensus([id],true);f.remote=rows({rules:[{...doc.rules[0],enabled:false},doc.rules[1]]});f.update();
  await reconcileDisabledRules(workers.h,()=>true);

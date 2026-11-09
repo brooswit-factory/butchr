@@ -8,6 +8,8 @@ import {encodeQueryAgentKey,encodeAgentKey} from '../../src/rules/agent-key.js';
 import {cwdAgentResolvers} from '../../src/agents/dashboard.js';
 import {validateEvent} from '../../src/control-panel/telemetry-wire.js';
 const key=encodeAgentKey({resourceProvider:'confluence-page',ruleId:'servy-codex-agents',resourceId:'60588033'}),hash=(s:string)=>createHash('sha256').update(s).digest('hex');
+/** A real filesystem resource id must have a platform-correct absolute shape (FACTORY-1043: a hardcoded POSIX path is invalid on win32). */
+const fsPath=process.platform==='win32'?'C:\\private\\fixture\\path':'/private/fixture/path';
 test('existing Confluence agent omitted by the legacy dashboard is observed without widening dashboard/PTY ownership',()=>{
  const legacy=cwdAgentResolvers(()=>key);expect(legacy.dashboardAgentOfCwd('/synthetic-managed-workspace')).toBeNull();const feed=createOperationalAgentFeed(()=>Date.parse('2026-10-26T12:00:00.000Z'));expect(feed.snapshot('daemon',true).agentsChecked).toBe(false);
  expect(feed.record([{agentKey:key,status:'idle'}])).toBe(true);expect(feed.snapshot('daemon',true)).toEqual({mode:'daemon',controllersEnabled:true,agentsChecked:true,agentsTruncated:false,agents:[{id:hash(key),status:'idle',confirmedAt:'2026-10-26T12:00:00.000Z',provenance:{provider:'confluence-page',kind:'resource',ruleId:'servy-codex-agents',resourceId:'60588033'}}]});expect(JSON.stringify(feed.snapshot('daemon',true))).not.toContain('ancestor');expect(legacy.dashboardAgentOfCwd('/synthetic-managed-workspace')).toBeNull();
@@ -23,7 +25,7 @@ test('bounded projection has explicit truncation, normalizes unknown status and 
 });
 
 test('provider-native string IDs, query identity and filesystem privacy remain distinct',()=>{
- const feed=createOperationalAgentFeed();const fixtures=[['jira-work','FIXTURE-1'],['jira-idea','IDEA-2'],['jira-project','FIXTURE'],['github-issue','fixture/repo#1'],['github-pr','fixture/repo#2'],['zendesk-ticket','fixture#3'],['confluence-page','90071992547409931234'],['filesystem','/private/fixture/path']] as const;
+ const feed=createOperationalAgentFeed();const fixtures=[['jira-work','FIXTURE-1'],['jira-idea','IDEA-2'],['jira-project','FIXTURE'],['github-issue','fixture/repo#1'],['github-pr','fixture/repo#2'],['zendesk-ticket','fixture#3'],['confluence-page','90071992547409931234'],['filesystem',fsPath]] as const;
  for(const [resourceProvider,resourceId] of fixtures){const agentKey=encodeAgentKey({resourceProvider,ruleId:'fixture-rule',resourceId});feed.record([{agentKey,status:'idle'}]);const a=feed.snapshot('daemon',true).agents[0]!;expect(a.id).toBe(hash(agentKey));expect(a.provenance).toEqual({provider:resourceProvider,kind:'resource',ruleId:'fixture-rule',...(resourceProvider==='filesystem'?{}:{resourceId})});}
  const query=encodeQueryAgentKey({resourceProvider:'confluence-page',ruleId:'fixture-rule'});feed.record([{agentKey:query}]);expect(feed.snapshot('daemon',true).agents[0]!.provenance).toEqual({provider:'confluence-page',kind:'query',ruleId:'fixture-rule'});
  const snapshot=feed.snapshot('daemon',true);snapshot.agents[0]!.provenance!.ruleId='mutated';expect(feed.snapshot('daemon',true).agents[0]!.provenance!.ruleId).toBe('fixture-rule');
