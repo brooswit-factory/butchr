@@ -1,7 +1,6 @@
 import {readRegisteredRuleIntent} from './registered-rule-readback.js';
 import {createRuleRuntime,type RuntimeLocal,type RuleRuntime} from "./rule-runtime.js";
 import {acquireRuntimeWriter,syncDirectory,writeDurableFile,unsafeGroupOtherBits} from "./writer.js";
-import {lockDownAcl,unsafeWindowsAcl} from "./windows-acl.js";
 import {createTelemetryOutbox,type OperationalSnapshot,type TelemetrySource} from "./telemetry.js";
 import {createRemoteOverrides} from "./overrides.js";
 import { type RemoteRule } from "./remote-rules.js";
@@ -19,7 +18,7 @@ import {validateServerUrl} from "./server-origin.js";
 export {validateServerUrl} from "./server-origin.js";
 
 export function createControlPanelClient(directory: string, fetchFn: typeof fetch = fetch) {
-  mkdirSync(directory,{recursive:true,mode:0o700});lockDownAcl(directory);
+  mkdirSync(directory,{recursive:true,mode:0o700});
   const releaseWriter=acquireRuntimeWriter(directory);try{
   const deploymentPath=join(directory,"deployment-id"), configurationPath=join(directory,"control-panel.json");
   if(!existsSync(deploymentPath)){
@@ -40,7 +39,7 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
   function closeStream(){settleConnection();settleConnection=()=>{};streamGeneration++;source?.close();source=null;clearTimeout(retry);clearTimeout(watchdog);}
   function disconnected(){clearRemote();status=config?'Disconnected — check server and authorization':'Not configured';notifyRuntime();}
 
-  try{const stat=lstatSync(configurationPath);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(configurationPath))throw new Error("Control-panel configuration must be a private regular file");const value=JSON.parse(readFileSync(configurationPath,"utf8"));config=value===null?null:{serverUrl:validateServerUrl(value.serverUrl),key:validKey(value.key)};}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;}
+  try{const stat=lstatSync(configurationPath);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode))throw new Error("Control-panel configuration must be a private regular file");const value=JSON.parse(readFileSync(configurationPath,"utf8"));config=value===null?null:{serverUrl:validateServerUrl(value.serverUrl),key:validKey(value.key)};}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;}
   function validKey(value:unknown):string {if(typeof value!=="string"||!/^bsv1_[A-Za-z0-9_-]{43}$/.test(value))throw new Error("Invalid authorization key format");return value;}
   function notifyRuntime(){runtime?.update({connected:status==='Connected',rules:remoteRules,revision:rulesRevision,control:overrides.snapshot(),source:telemetrySource??undefined});}
   function summary(){return {serverUrl:config?.serverUrl??"",configured:!!config,deploymentId,sessionId,status,lastSeen,remoteBriefCount:remote.length,remoteRuleCount:remoteRules.length,remoteConfigsEnabled:overrides.snapshot().enabled,telemetry:telemetry.summary(),transport:"eventsource-json-patch",streamRevision,snapshotEvents,patchEvents,ruleRuntime:runtime?.summary()??null};}

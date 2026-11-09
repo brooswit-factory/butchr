@@ -169,7 +169,7 @@ jobs:
           bun run build
       - run: bun install --frozen-lockfile
       - name: focused unit coverage for the deployment-identity/control-panel durability fix (FACTORY-1043)
-        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-windows-acl.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts test/unit/write-rules.test.ts
+        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts test/unit/write-rules.test.ts
       - name: real daemon fresh startup reaches HTTP listen, then restart reuses the SAME deployment identity (and a separate install gets a DISTINCT one)
         run: bun run scripts/verify-ci-windows-deployment-identity.ts
   release-gate:
