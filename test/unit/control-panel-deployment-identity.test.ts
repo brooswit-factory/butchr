@@ -1,5 +1,5 @@
 import {test,expect} from 'bun:test';
-import {mkdtempSync,rmSync,readdirSync,existsSync} from 'node:fs';
+import {mkdtempSync,rmSync,readdirSync,existsSync,writeFileSync} from 'node:fs';
 import {join,resolve} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createControlPanelClient} from '../../src/control-panel/client.js';
@@ -19,13 +19,44 @@ import {createControlPanelClient} from '../../src/control-panel/client.js';
 test('distinct installations (separate directories) get distinct, well-formed deployment identities',()=>{
  const dirA=mkdtempSync(join(tmpdir(),'butchr-deploy-a-')),dirB=mkdtempSync(join(tmpdir(),'butchr-deploy-b-'));
  try{
-  const a=createControlPanelClient(dirA),b=createControlPanelClient(dirB);
+  // Each construction is protected by its own try/finally (source-review lead, FACTORY-
+  // 1043): constructing both before a single shared try would leave `a` unstopped if
+  // constructing `b` throws — its runtime-writer lock/timers would still be live when
+  // the outer finally below tries to remove dirA.
+  const a=createControlPanelClient(dirA);
   try{
-   expect(a.deploymentId).not.toBe(b.deploymentId);
-   for(const id of [a.deploymentId,b.deploymentId])expect(id).toMatch(/^[0-9a-f-]{36}$/);
-  }finally{a.stop();b.stop();}
+   const b=createControlPanelClient(dirB);
+   try{
+    expect(a.deploymentId).not.toBe(b.deploymentId);
+    for(const id of [a.deploymentId,b.deploymentId])expect(id).toMatch(/^[0-9a-f-]{36}$/);
+   }finally{b.stop();}
+  }finally{a.stop();}
  }finally{rmSync(dirA,{recursive:true,force:true});rmSync(dirB,{recursive:true,force:true});}
 },90000);
+
+/**
+ * FACTORY-1043 (PR review finding): a failure constructing a second client must not
+ * leak an already-successfully-constructed first one. dirB's control-panel.json is
+ * pre-seeded with invalid JSON so createControlPanelClient(dirB) throws predictably
+ * (after acquireRuntimeWriter/ACL lockdown/deployment-id creation have already
+ * succeeded for B — the config-parse step is the last thing that can fail), proving
+ * both that the original error still propagates (not masked by any later cleanup
+ * failure) and that `a` was actually released, not merely "not yet garbage collected":
+ * a fresh construction on the SAME directory immediately afterward must succeed
+ * without hitting the normal "Another control-panel client" contention error.
+ */
+test('a failure constructing a second client does not leak the first: it is still stopped, and the original error propagates',()=>{
+ const dirA=mkdtempSync(join(tmpdir(),'butchr-deploy-leak-a-')),dirB=mkdtempSync(join(tmpdir(),'butchr-deploy-leak-b-'));
+ try{
+  writeFileSync(join(dirB,'control-panel.json'),'not valid json{');
+  const a=createControlPanelClient(dirA);
+  try{
+   expect(()=>createControlPanelClient(dirB)).toThrow();
+  }finally{a.stop();}
+  const again=createControlPanelClient(dirA);
+  again.stop();
+ }finally{rmSync(dirA,{recursive:true,force:true});rmSync(dirB,{recursive:true,force:true});}
+},30000);
 
 // Same reasoning as above: the first createControlPanelClient call here is a full fresh
 // install (several real PowerShell ACL calls); give this test the same generous margin.
