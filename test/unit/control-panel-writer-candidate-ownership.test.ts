@@ -53,3 +53,20 @@ test('a concurrent winner having already landed the target is tolerated (EEXIST 
   expect(readFileSync(targetPath,'utf8')).toBe('winner-value\n');
  }finally{rmSync(dir,{recursive:true,force:true});}
 });
+
+/**
+ * FACTORY-1043 (source-review hypothesis, comment 52455): ownership must be an explicit
+ * success signal from the open itself, not inferred by elimination from a later error's
+ * code. A non-EEXIST open failure (here: the candidate's own parent directory doesn't
+ * exist, so openSync itself throws ENOENT) means nothing was ever created — proving this
+ * never even attempts an unlink (which, if it ran against a real unrelated file sharing
+ * that exact path for some other reason, would wrongly delete it).
+ */
+test('a non-EEXIST failure in the open itself (nothing created) never attempts cleanup',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'butchr-candidate-open-fail-'));
+ try{
+  const candidatePath=join(dir,'missing-subdir','candidate.tmp'),targetPath=join(dir,'target');
+  expect(()=>createCandidateAndLink(candidatePath,'value\n',targetPath)).toThrow();
+  expect(existsSync(join(dir,'missing-subdir'))).toBe(false);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});

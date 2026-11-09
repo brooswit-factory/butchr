@@ -102,21 +102,23 @@ export function writeDurableFile(path:string,text:string,flags:string,mode:numbe
  * `targetPath` (tolerating a concurrent winner having already landed one), and always
  * cleans up the candidate — EXCEPT when this call never actually created it.
  *
- * `owned` tracks that explicitly rather than assuming it from the candidate path being
- * "probably unique" (e.g. a fresh randomUUID() in it): writeDurableFile's "wx" (exclusive
- * create) flag has exactly one possible EEXIST source — its own initial open — so an
- * EEXIST thrown from it means this call did NOT create anything at that path, and cleanup
- * must leave whatever is already there alone (native review finding, FACTORY-1043: a
- * cleanup that assumes ownership from name uniqueness alone isn't ownership evidence, and
- * could delete a real, unrelated file that happens to share the name). Any other outcome
- * — success, or a non-EEXIST failure from lockdown/write/fsync/link, which can only happen
- * once the file actually exists — means this call DID create it, and cleanup must run.
+ * `owned` is an explicit success signal, set true only once openSync itself has actually
+ * returned a live fd — not inferred by elimination from the error code of a later
+ * failure. An earlier version of this function set `owned` false only for a specifically-
+ * EEXIST open failure, defaulting it true otherwise; that's wrong for any OTHER open
+ * failure (EACCES, ENOENT, …) that also never created anything, which would still have
+ * triggered cleanup against whatever happens to already be at that path (native review
+ * finding, FACTORY-1043). Opening the file directly here, instead of delegating the whole
+ * sequence to writeDurableFile, is what makes that explicit true-on-success signal
+ * possible: everything after a successful open — lockdown, write, fsync, link — can still
+ * fail, but by then this call unambiguously owns the path regardless of which step failed.
  */
 export function createCandidateAndLink(candidatePath:string,content:string,targetPath:string){
- let owned=true;
+ let owned=false;
  try{
-  try{writeDurableFile(candidatePath,content,'wx',0o600);}
-  catch(e){if((e as NodeJS.ErrnoException).code==='EEXIST')owned=false;throw e;}
+  const fd=openSync(candidatePath,'wx',0o600);
+  owned=true;
+  try{lockDownAcl(candidatePath,undefined,false);writeFileSync(fd,content);fsyncSync(fd);}finally{closeSync(fd);}
   try{linkSync(candidatePath,targetPath);}catch(e){if((e as NodeJS.ErrnoException).code!=='EEXIST')throw e;}
  }finally{if(owned)try{unlinkSync(candidatePath);}catch{}}
 }
