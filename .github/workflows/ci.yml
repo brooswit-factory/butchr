@@ -182,19 +182,28 @@ jobs:
       - name: start herdr server
         run: |
           & "$env:RUNNER_TEMP\herdr\herdr.exe" --version
-          Start-Process -FilePath "$env:RUNNER_TEMP\herdr\herdr.exe" -ArgumentList "server" -RedirectStandardOutput "herdr-server.log" -RedirectStandardError "herdr-server-err.log"
+          $proc = Start-Process -FilePath "$env:RUNNER_TEMP\herdr\herdr.exe" -ArgumentList "server" -RedirectStandardOutput "herdr-server.log" -RedirectStandardError "herdr-server-err.log" -PassThru
+          # herdr's own default socket location (confirmed from a prior run's own error text);
+          # waiting on the socket FILE existing is more reliable than shelling out to the CLI
+          # again, which can report an unrelated success/failure independent of whether the
+          # server it would talk to is actually up yet.
+          $socketPath = "$env:APPDATA\herdr\herdr.sock"
           $deadline = (Get-Date).AddSeconds(30)
           $ready = $false
           while ((Get-Date) -lt $deadline) {
-            & "$env:RUNNER_TEMP\herdr\herdr.exe" api snapshot *> $null
-            if ($LASTEXITCODE -eq 0) { $ready = $true; break }
-            Start-Sleep -Seconds 1
+            if ($proc.HasExited) { break }
+            if (Test-Path $socketPath) { $ready = $true; break }
+            Start-Sleep -Milliseconds 500
           }
+          Write-Host "---- herdr-server.log ----"
+          Get-Content "herdr-server.log" -ErrorAction SilentlyContinue
+          Write-Host "---- herdr-server-err.log ----"
+          Get-Content "herdr-server-err.log" -ErrorAction SilentlyContinue
           if (-not $ready) {
-            Write-Host "herdr server never became ready:"
-            Get-Content "herdr-server.log","herdr-server-err.log" -ErrorAction SilentlyContinue
+            Write-Host "herdr server never became ready. Process exited: $($proc.HasExited); exit code: $($proc.ExitCode)"
             exit 1
           }
+          Write-Host "herdr server ready at $socketPath"
       - name: real daemon fresh startup reaches HTTP listen, then restart reuses the SAME deployment identity (and a separate install gets a DISTINCT one)
         run: bun run scripts/verify-ci-windows-deployment-identity.ts
       - name: stop herdr server
