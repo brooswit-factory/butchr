@@ -9,6 +9,13 @@ import {createControlPanelClient} from '../../src/control-panel/client.js';
  * control-panel-https.test.ts) and distinct across installations, with race handling
  * and temp-file cleanup during creation. These cover the remaining invariants.
  */
+// Native evidence (Jira comment 52481): this test's own default timeout (whatever the
+// `bun test` global --timeout happens to be, since this test had no explicit override)
+// was too tight on real Windows — TWO full fresh installs each do several real
+// synchronous PowerShell ACL calls (the runtime-writer lock file, the directory, and the
+// deployment-id candidate file all get locked down), timing out at ~61.76s even with an
+// explicit `--timeout=60000`. Not a product defect — a test timeout bound too tight for
+// the real work this test legitimately does.
 test('distinct installations (separate directories) get distinct, well-formed deployment identities',()=>{
  const dirA=mkdtempSync(join(tmpdir(),'butchr-deploy-a-')),dirB=mkdtempSync(join(tmpdir(),'butchr-deploy-b-'));
  try{
@@ -18,8 +25,10 @@ test('distinct installations (separate directories) get distinct, well-formed de
    for(const id of [a.deploymentId,b.deploymentId])expect(id).toMatch(/^[0-9a-f-]{36}$/);
   }finally{a.stop();b.stop();}
  }finally{rmSync(dirA,{recursive:true,force:true});rmSync(dirB,{recursive:true,force:true});}
-});
+},90000);
 
+// Same reasoning as above: the first createControlPanelClient call here is a full fresh
+// install (several real PowerShell ACL calls); give this test the same generous margin.
 test('creating the deployment identity leaves no .deployment-*.tmp candidate behind, on both a fresh directory and one that already has an identity',()=>{
  const dir=mkdtempSync(join(tmpdir(),'butchr-deploy-cleanup-'));
  try{
@@ -33,7 +42,7 @@ test('creating the deployment identity leaves no .deployment-*.tmp candidate beh
   try{expect(second.deploymentId).toBe(deploymentId);}finally{second.stop();}
   expect(readdirSync(dir).filter(f=>f.startsWith('.deployment-'))).toEqual([]);
  }finally{rmSync(dir,{recursive:true,force:true});}
-});
+},90000);
 
 test('a losing candidate from a concurrent creation race is cleaned up and every racer converges on the SAME identity',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'butchr-deploy-race-'));
