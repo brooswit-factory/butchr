@@ -134,7 +134,11 @@ jobs:
         run: bun run typecheck
       - name: unit + load tests, coverage ≥ 90%
         continue-on-error: true
-        run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+        # --timeout: real per-write Windows ACL lockdown (restored, FACTORY-1043 — directory
+        # ACL inheritance to new children doesn't actually happen on real Windows, confirmed
+        # natively) spawns a real pwsh process on every control-panel write; bun test's
+        # default 5000ms per-test timeout is too tight for that on this job's runner.
+        run: bun test test/unit test/load --timeout=30000 && bun run scripts/coverage/gate.ts
   windows-deployment-identity:
     name: windows deployment identity (FACTORY-1043 required gate)
     # The `windows` job above is whole-suite and continue-on-error (it tracks the full
@@ -173,7 +177,12 @@ jobs:
         # lock race test fails to even start its worker on this runner (a separate, pre-existing
         # Bun.spawn("bun", ...) PATH/resolution issue on Windows, unrelated to FACTORY-1043) —
         # it still runs, non-blocking, in the generic `windows` job above.
-        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-windows-acl.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts
+        # --timeout=30000: real per-write Windows ACL lockdown (restored, FACTORY-1043 —
+        # directory ACL inheritance to new children doesn't actually happen on real Windows,
+        # confirmed natively) spawns a real pwsh process on every control-panel write; the
+        # default 5000ms per-test timeout was observed failing dozens of these tests at
+        # ~5015-5016ms on this exact gate.
+        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-windows-acl.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts --timeout=30000
       - name: install herdr (Windows release asset — the same pinned CLI the Linux spawn-smoke job installs, see docs/agent-providers.md)
         run: |
           Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-windows-x86_64.zip" -OutFile "$env:RUNNER_TEMP\herdr.zip"

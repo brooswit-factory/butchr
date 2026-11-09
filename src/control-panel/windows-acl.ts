@@ -181,15 +181,24 @@ function parseVerifyResult(output: string): VerifyResultOk | VerifyResultErr {
 
 /**
  * Resets `path`'s ACL to exactly {current user, SYSTEM, Administrators} full control, with
- * inheritance from the parent disabled, then reads the result back and throws if it isn't
- * actually safe (a silent partial failure must never be mistaken for success). Call this
- * ONLY for a path being created for the first time — never against a pre-existing path
- * (verify it instead; see this module's own header comment for why).
+ * inheritance from the parent disabled. Call this ONLY for a path being created for the
+ * first time — never against a pre-existing path (verify it instead; see this module's
+ * own header comment for why).
+ *
+ * `readback`, true by default, re-reads the result and throws if it isn't actually safe (a
+ * silent partial failure must never be mistaken for success) — doubling the PowerShell
+ * invocations for this call, which is fine for the low-frequency callers (the
+ * control-panel directory itself, the sqlite writer lock's first creation) this defaults
+ * for. `writeDurableFile`'s own per-write lockdown passes `false`: it runs on every
+ * ordinary write, confirmed natively to make the readback's extra PowerShell process a
+ * real, broad latency problem there — a lockdown that silently failed to apply still gets
+ * caught at the next READ of that file via `unsafeWindowsAcl`, so skipping the immediate
+ * double-check on the hot write path is a deliberate, bounded tradeoff, not a silent gap.
  */
-export function lockDownAcl(path: string, io: AclIo = defaultAclIo()): void {
+export function lockDownAcl(path: string, io: AclIo = defaultAclIo(), readback: boolean = true): void {
   if (process.platform !== "win32") return;
   io.run(LOCKDOWN_SCRIPT, path);
-  verifyPrivateAcl(path, io);
+  if (readback) verifyPrivateAcl(path, io);
 }
 
 /**

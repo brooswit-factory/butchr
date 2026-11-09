@@ -56,11 +56,14 @@ export function syncDirectory(directory:string){
  * includes an unrelated logon-session SID with read/execute access — confirmed by writing
  * real (test-only) content into exactly such a file and inspecting its resulting ACL.
  * Correctness/security here matters more than the write-path latency this adds; slower
- * than hoped, but inheritance cannot be trusted to have actually taken effect.
+ * than hoped, but inheritance cannot be trusted to have actually taken effect. Skips
+ * lockDownAcl's own extra readback (its `readback` param) on this hot per-write path —
+ * see that function's own doc comment for why that's a deliberate, bounded tradeoff
+ * rather than a silent gap.
  */
 export function writeDurableFile(path:string,text:string,flags:string,mode:number){
  const fd=openSync(path,flags,mode);
- try{lockDownAcl(path);writeFileSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
+ try{lockDownAcl(path,undefined,false);writeFileSync(fd,text);fsyncSync(fd);}finally{closeSync(fd);}
 }
 /**
  * NTFS has no POSIX group/other permission bits: chmodSync can only toggle the read-only
