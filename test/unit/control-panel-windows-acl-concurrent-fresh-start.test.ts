@@ -52,7 +52,14 @@ test('a competitor against a fresh directory whose writer lock is already held (
     const holdScript = `
      Object.defineProperty(process,'platform',{value:'win32'});
      import {acquireRuntimeWriter} from ${JSON.stringify(writerModule)};
-     acquireRuntimeWriter(${JSON.stringify(dir)}); // never released: holds the exclusive lock, directory never locked down
+     // The returned closure is the only live reference keeping the underlying sqlite
+     // Database handle (and its held exclusive transaction) from being released —
+     // discarding it let GC close the db early even while this process stayed alive,
+     // so the competitor saw no contention at all (confirmed natively AND in hosted CI:
+     // the race window silently never held). Kept alive here, referenced by the SIGTERM
+     // handler too, for the whole lifetime of this held process.
+     const release = acquireRuntimeWriter(${JSON.stringify(dir)});
+     process.on('SIGTERM', () => { release(); process.exit(0); });
      process.stdout.write('locked\\n');
      await new Promise(()=>{});
     `;
