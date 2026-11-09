@@ -59,7 +59,9 @@ describe("writeRulesFile: first write (no existing file)", () => {
     expect(result.backupId).toBeNull();
     expect(result.changedIds.sort()).toEqual(["stories", "triage"]);
     expect(readFileSync(result.path, "utf8")).toBe(doc([RULE_A, RULE_B]));
-    expect(statSync(result.path).mode & 0o777).toBe(0o600);
+    // NTFS has no POSIX group/other bits: chmod only toggles the read-only attribute, so a
+    // writable file's mode is always wide-open there regardless of what it was created with.
+    if (process.platform !== "win32") expect(statSync(result.path).mode & 0o777).toBe(0o600);
   });
 });
 
@@ -299,7 +301,9 @@ describe("writeRulesFile: preserves an existing file's mode", () => {
     writeRulesFile(doc([RULE_A]), env());
     chmodSync(rulesFilePath(), 0o640);
     writeRulesFile(doc([RULE_A, RULE_B]), env());
-    expect(statSync(rulesFilePath()).mode & 0o777).toBe(0o640);
+    // NTFS has no POSIX group/other bits: chmod only toggles the read-only attribute, so a
+    // writable file's mode is always wide-open there regardless of what it was created with.
+    if (process.platform !== "win32") expect(statSync(rulesFilePath()).mode & 0o777).toBe(0o640);
   });
 });
 
