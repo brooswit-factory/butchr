@@ -134,7 +134,80 @@ jobs:
         run: bun run typecheck
       - name: unit + load tests, coverage ≥ 90%
         continue-on-error: true
-        run: bun test test/unit test/load && bun run scripts/coverage/gate.ts
+        # --timeout: real per-write Windows ACL lockdown (restored, FACTORY-1043 — directory
+        # ACL inheritance to new children doesn't actually happen on real Windows, confirmed
+        # natively) spawns a real pwsh process on every control-panel write; bun test's
+        # default 5000ms per-test timeout is too tight for that on this job's runner.
+        run: bun test test/unit test/load --timeout=30000 && bun run scripts/coverage/gate.ts
+  windows-deployment-identity:
+    name: windows deployment identity (FACTORY-1043 required gate)
+    # The `windows` job above is whole-suite and continue-on-error (it tracks the full
+    # cross-platform gap, not a pass/fail release gate) and never starts the real daemon,
+    # so it cannot fail the check on a regression in the ONE thing FACTORY-1043 is about:
+    # the real daemon reaching app.listen() on Windows, and a restart reusing the existing
+    # deployment identity. This job is neither whole-suite nor continue-on-error — it is
+    # REQUIRED, and scoped to exactly that path. See scripts/verify-ci-windows-deployment-identity.ts
+    # for what it actually proves and why it never touches a real herdr/Jira/GitHub account.
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: butchr
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: butchr }
+      - uses: actions/checkout@v4
+        with:
+          repository: brooswit-factory/drovr
+          ref: 52d0106898982cb4d411208dc687f9e20a4075eb
+          path: drovr
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: 1.3.11 }
+      - name: build pinned sibling SDK sources
+        working-directory: drovr
+        shell: bash
+        run: |
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+          cd legacy-events
+          bun install --frozen-lockfile --ignore-scripts
+          bun run build
+      - run: bun install --frozen-lockfile
+      - name: focused unit coverage for the deployment-identity/control-panel durability fix (FACTORY-1043)
+        # write-rules.test.ts is deliberately excluded here: its FACTORY-673 two-real-process
+        # lock race test fails to even start its worker on this runner (a separate, pre-existing
+        # Bun.spawn("bun", ...) PATH/resolution issue on Windows, unrelated to FACTORY-1043) —
+        # it still runs, non-blocking, in the generic `windows` job above.
+        # --timeout=30000: real per-write Windows ACL lockdown (restored, FACTORY-1043 —
+        # directory ACL inheritance to new children doesn't actually happen on real Windows,
+        # confirmed natively) spawns a real pwsh process on every control-panel write; the
+        # default 5000ms per-test timeout was observed failing dozens of these tests at
+        # ~5015-5016ms on this exact gate.
+        run: bun test test/unit/control-panel-https.test.ts test/unit/control-panel-https-telemetry.test.ts test/unit/control-panel-deployment-identity.test.ts test/unit/control-panel-writer-durable-write.test.ts test/unit/control-panel-writer-sync-directory.test.ts test/unit/control-panel-writer-group-other-bits.test.ts test/unit/control-panel-windows-acl.test.ts test/unit/control-panel-rule-runtime.test.ts test/unit/control-panel-operational-inventory.test.ts test/unit/deployment-preflight.test.ts --timeout=30000
+      - name: install herdr (Windows release asset — the same pinned CLI the Linux spawn-smoke job installs, see docs/agent-providers.md)
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/herdrdev/herdr/releases/download/v0.8.2/herdr-windows-x86_64.zip" -OutFile "$env:RUNNER_TEMP\herdr.zip"
+          Expand-Archive -Path "$env:RUNNER_TEMP\herdr.zip" -DestinationPath "$env:RUNNER_TEMP\herdr"
+          echo "$env:RUNNER_TEMP\herdr" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: start herdr server
+        # bash, not PowerShell: a PowerShell `Start-Process`-launched background process was
+        # observed NOT to survive past this step on this runner (the socket existed right
+        # after starting it, but was gone again by the next step) — bash's own `&`
+        # backgrounding is the exact same mechanism the proven Linux spawn-smoke job already
+        # uses for this (see that job's own "start herdr server" step), just against the
+        # Windows release asset.
+        shell: bash
+        run: |
+          herdr.exe --version
+          herdr.exe server > herdr-server.log 2>&1 &
+          for i in $(seq 1 30); do herdr.exe api snapshot >/dev/null 2>&1 && exit 0; sleep 1; done
+          echo "herdr server never became ready:"; cat herdr-server.log; exit 1
+      - name: real daemon fresh startup reaches HTTP listen, then restart reuses the SAME deployment identity (and a separate install gets a DISTINCT one)
+        run: bun run scripts/verify-ci-windows-deployment-identity.ts
+      - name: stop herdr server
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: herdr.exe server stop
   release-gate:
     name: release gate
     # Runs on pull requests AND branch pushes: with a pull_request-only `if`, a branch pushed

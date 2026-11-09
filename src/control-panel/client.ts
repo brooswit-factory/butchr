@@ -1,6 +1,7 @@
 import {readRegisteredRuleIntent} from './registered-rule-readback.js';
 import {createRuleRuntime,type RuntimeLocal,type RuleRuntime} from "./rule-runtime.js";
-import {acquireRuntimeWriter,syncDirectory} from "./writer.js";
+import {acquireRuntimeWriter,syncDirectory,writeDurableFile,unsafeGroupOtherBits,createCandidateAndLink} from "./writer.js";
+import {lockDownAcl,unsafeWindowsAcl} from "./windows-acl.js";
 import {createTelemetryOutbox,type OperationalSnapshot,type TelemetrySource} from "./telemetry.js";
 import {createRemoteOverrides} from "./overrides.js";
 import { type RemoteRule } from "./remote-rules.js";
@@ -9,7 +10,7 @@ import {boundEventStream} from "./bounded-event-stream.js";
 import {EventSource} from "eventsource";
 import {createStreamState,MAX_EVENT_BYTES} from "./stream-state.js";
 /** Sprint one: only identity registration and remote brief delivery. No commands. */
-import { mkdirSync, readFileSync, writeFileSync, renameSync, lstatSync, linkSync, unlinkSync, openSync, fsyncSync, closeSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, lstatSync, unlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { Brief } from "./brief.js";
@@ -19,11 +20,60 @@ export {validateServerUrl} from "./server-origin.js";
 
 export function createControlPanelClient(directory: string, fetchFn: typeof fetch = fetch) {
   mkdirSync(directory,{recursive:true,mode:0o700});
-  const releaseWriter=acquireRuntimeWriter(directory);try{
   const deploymentPath=join(directory,"deployment-id"), configurationPath=join(directory,"control-panel.json");
-  const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
-  writeFileSync(candidateIdentity,randomUUID()+"\n",{flag:"wx",mode:0o600});
-  try{const fd=openSync(candidateIdentity,"r");try{fsyncSync(fd);}finally{closeSync(fd);}linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}finally{unlinkSync(candidateIdentity);}
+  // Determining whether this directory already holds ANY control-panel state (not just
+  // deployment-id — a review finding noted that file alone is not proof the directory
+  // holds nothing else sensitive) is a pure read, and so is VERIFYING an already-
+  // provisioned directory's ACL — both safe to do before any locking, and done here,
+  // BEFORE acquireRuntimeWriter ever creates or touches anything inside this directory.
+  // A review finding: mutating (creating the sqlite lock file, chmod, beginning a
+  // transaction) inside an unsafe, already-provisioned directory before refusing it
+  // violates verify-without-mutation — refusing happens here, first, unconditionally.
+  //
+  // .control-panel-writer.sqlite is deliberately EXCLUDED from this list (a second
+  // review finding, native-reproduced): it is the locking mechanism's OWN marker, created
+  // as the very FIRST step of ANY attempt at this directory — fresh or not — strictly
+  // before the directory is ever locked down (that happens only after acquireRuntimeWriter
+  // below succeeds). Treating its mere existence as "provisioned" means a losing racer in
+  // a concurrent FRESH startup could observe the winner's just-created lock file, see the
+  // directory's still-ambient ACL, and wrongly refuse it as unsafe instead of reaching the
+  // normal "Another control-panel client owns this runtime directory" contention path.
+  // Only deployment-id/control-panel.json/overrides/outbox/manifest — written AFTER a
+  // startup has actually completed at least once — indicate real provisioned, sensitive
+  // state worth refusing-without-mutation over.
+  const alreadyProvisioned=["deployment-id","control-panel.json","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  if(alreadyProvisioned&&unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
+  const releaseWriter=acquireRuntimeWriter(directory);try{
+  // Only an actual LOCKDOWN (a write) of a genuinely fresh (not-yet-provisioned)
+  // directory needs serializing — reached only by the single process that just won
+  // acquireRuntimeWriter's exclusive lock, never concurrently with another process
+  // trying the same directory. Native testing found that two racing lockDownAcl calls
+  // against the SAME directory (before any exclusivity mechanism serialized them) could
+  // spuriously hit "SeSecurityPrivilege"; doing it here, after the real exclusivity gate,
+  // removes the race entirely rather than chasing that error's exact cause.
+  //
+  // alreadyProvisioned above was read BEFORE acquiring that exclusivity, and native
+  // testing found it can be stale by the time we reach here: a competitor can observe
+  // `false`, then only actually win acquireRuntimeWriter once the real winner has
+  // already provisioned the directory and released it. Acting on the stale `false`
+  // would call lockDownAcl against a directory that's already provisioned — re-derive
+  // it now, under our own held exclusivity, and apply the SAME unsafe-ACL refusal an
+  // already-provisioned caller hit above instead of silently trusting a directory we
+  // didn't originally observe as provisioned.
+  const provisionedNow=alreadyProvisioned||["deployment-id","control-panel.json","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  if(provisionedNow){
+    if(unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
+  }else{
+    lockDownAcl(directory);
+  }
+  if(!existsSync(deploymentPath)){
+    // Ownership tracking (not deleting a candidate this call didn't create — review
+    // finding, FACTORY-1043: a fresh randomUUID() in the name makes collision unlikely,
+    // but unlikely is not ownership evidence) lives in createCandidateAndLink itself —
+    // see its own doc comment.
+    const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
+    createCandidateAndLink(candidateIdentity,randomUUID()+"\n",deploymentPath);
+  }
   if(!lstatSync(deploymentPath).isFile() || lstatSync(deploymentPath).isSymbolicLink())throw new Error("Unsafe deployment identity file");
   const deploymentId=readFileSync(deploymentPath,"utf8").trim();
   if(!/^[0-9a-f-]{36}$/.test(deploymentId))throw new Error("Invalid deployment identity; repair it explicitly");
@@ -37,7 +87,7 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
   function closeStream(){settleConnection();settleConnection=()=>{};streamGeneration++;source?.close();source=null;clearTimeout(retry);clearTimeout(watchdog);}
   function disconnected(){clearRemote();status=config?'Disconnected — check server and authorization':'Not configured';notifyRuntime();}
 
-  try{const stat=lstatSync(configurationPath);if(!stat.isFile()||stat.isSymbolicLink()||(stat.mode&0o077))throw new Error("Control-panel configuration must be a private regular file");const value=JSON.parse(readFileSync(configurationPath,"utf8"));config=value===null?null:{serverUrl:validateServerUrl(value.serverUrl),key:validKey(value.key)};}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;}
+  try{const stat=lstatSync(configurationPath);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(configurationPath))throw new Error("Control-panel configuration must be a private regular file");const value=JSON.parse(readFileSync(configurationPath,"utf8"));config=value===null?null:{serverUrl:validateServerUrl(value.serverUrl),key:validKey(value.key)};}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;}
   function validKey(value:unknown):string {if(typeof value!=="string"||!/^bsv1_[A-Za-z0-9_-]{43}$/.test(value))throw new Error("Invalid authorization key format");return value;}
   function notifyRuntime(){runtime?.update({connected:status==='Connected',rules:remoteRules,revision:rulesRevision,control:overrides.snapshot(),source:telemetrySource??undefined});}
   function summary(){return {serverUrl:config?.serverUrl??"",configured:!!config,deploymentId,sessionId,status,lastSeen,remoteBriefCount:remote.length,remoteRuleCount:remoteRules.length,remoteConfigsEnabled:overrides.snapshot().enabled,telemetry:telemetry.summary(),transport:"eventsource-json-patch",streamRevision,snapshotEvents,patchEvents,ruleRuntime:runtime?.summary()??null};}
@@ -48,7 +98,7 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
     if(candidate && b.key==="" && config && candidate.serverUrl!==config.serverUrl)throw new Error("Enter a key when changing servers");
     const temp=join(directory,`.control-panel-${randomUUID()}.tmp`);
     let installed=false;
-    try{writeFileSync(temp,JSON.stringify(candidate),{flag:"wx",mode:0o600});const fd=openSync(temp,"r");try{fsyncSync(fd);}finally{closeSync(fd);}renameSync(temp,configurationPath);installed=true;syncDirectory(directory);}catch(error){if(installed)activateConfiguration(candidate);throw error;}finally{try{unlinkSync(temp);}catch{}}
+    try{writeDurableFile(temp,JSON.stringify(candidate),"wx",0o600);renameSync(temp,configurationPath);installed=true;syncDirectory(directory);}catch(error){if(installed)activateConfiguration(candidate);throw error;}finally{try{unlinkSync(temp);}catch{}}
     activateConfiguration(candidate);return summary();
   }
   const requests=new Set<AbortController>();

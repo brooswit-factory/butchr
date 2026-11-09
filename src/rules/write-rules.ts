@@ -140,11 +140,14 @@ export interface WriteRulesIo {
   /**
    * fsyncs the directory itself (durability for the rename/backup entries
    * just created in it). A platform that genuinely cannot fsync a directory
-   * handle at all (`EINVAL`/`ENOTSUP`) degrades to best-effort silently;
-   * every OTHER error (notably `EIO` — a real, surfaced disk failure) is
-   * rethrown rather than swallowed (round-3 finding F5: a host with flaky
-   * power/disk must learn about a failed fsync, not silently proceed as if
-   * durable).
+   * handle at all (`EINVAL`/`ENOTSUP` on any platform, or `EPERM` on win32
+   * specifically — confirmed on native Windows, FACTORY-1043:
+   * FlushFileBuffers refuses a directory handle opened without
+   * backup-semantics access) degrades to best-effort silently; every OTHER
+   * error (notably `EIO` — a real, surfaced disk failure, and `EPERM` on
+   * POSIX, where it can mean a real permission problem) is rethrown rather
+   * than swallowed (round-3 finding F5: a host with flaky power/disk must
+   * learn about a failed fsync, not silently proceed as if durable).
    */
   fsyncDir: (dir: string) => void;
   /** Acquires the cross-process write lock for `dir`, throwing (never sleeping/retrying, never reclaiming) if a lock file already exists; returns a release function. See `acquireRulesLock`'s own doc comment: a live holder, a dead holder, and corrupt content each refuse with their own message. */
@@ -233,6 +236,21 @@ export function acquireRulesLock(dir: string): () => void {
   return acquireNamedLock(dir, ".rules.lock");
 }
 
+/**
+ * `fsyncDir`'s own error-degradation decision (round-3 finding F5), pulled out so it can
+ * be tested directly: `EINVAL`/`ENOTSUP` degrade on every platform (the kernel genuinely
+ * has no directory-fsync concept there); `EPERM` degrades ONLY on win32 (confirmed on
+ * native Windows, FACTORY-1043: FlushFileBuffers refuses a directory handle opened
+ * without backup-semantics access) — on POSIX, EPERM can mean a real permission problem
+ * and must still surface. Every other code (notably `EIO` — an actual disk failure)
+ * always propagates.
+ */
+export function degradesFsyncDirError(code: string | undefined, platform: NodeJS.Platform): boolean {
+  if (code === "EINVAL" || code === "ENOTSUP") return true;
+  if (code === "EPERM" && platform === "win32") return true;
+  return false;
+}
+
 /** The real filesystem implementation `writeRulesFile`/`updateRulesFile`/`restoreBackup`/`rulesEtag` default to. Exported for tests that need to override a single seam (e.g. `now`) while keeping every other operation real. */
 export function defaultIo(): WriteRulesIo {
   return {
@@ -280,11 +298,7 @@ export function defaultIo(): WriteRulesIo {
         try { fsyncSync(fd); } finally { closeSync(fd); }
       } catch (e) {
         const code = (e as NodeJS.ErrnoException).code;
-        // The platform genuinely cannot fsync a directory handle at all (e.g. some Windows
-        // configurations) — not a real durability failure, degrade to best-effort silently.
-        // Anything else (notably EIO — an actual disk failure) must propagate: see this
-        // interface's own doc comment (round-3 finding F5).
-        if (code === "EINVAL" || code === "ENOTSUP") return;
+        if (degradesFsyncDirError(code, process.platform)) return;
         throw e;
       }
     },

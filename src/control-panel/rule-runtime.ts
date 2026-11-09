@@ -1,7 +1,7 @@
 import type {WorkerRollout} from './worker-rollout.js';
 import {createWorkerReconciler,type WorkerChange,type WorkerChangeResult,type WorkerChangeState} from './worker-reconciliation.js';
 import {ownsManagedSessionAgent} from './reserved-worker.js';
-import {readFileSync,lstatSync,writeFileSync,renameSync,unlinkSync,openSync,fsyncSync,closeSync} from 'node:fs';
+import {readFileSync,lstatSync,renameSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 import {randomUUID,createHash} from 'node:crypto';
 import {parseRules,sourceEtagOf,type Rule,type RulesHolder,type ResourceProvider,type AgentPreference} from '../rules/rules.js';
@@ -11,7 +11,8 @@ import type {RemoteRule} from './remote-rules.js';
 import {prepareRuleCutover,ruleFingerprint} from './rule-cutover.js';
 import {type AdmittedRuleIdentity} from './telemetry-wire.js';
 import {restoreRetainedProvenance,remoteAdmittedIdentity} from './retained-origin.js';
-import {syncDirectory} from './writer.js';
+import {syncDirectory,writeDurableFile,unsafeGroupOtherBits} from './writer.js';
+import {unsafeWindowsAcl} from './windows-acl.js';
 const MAX=8_000_000,MAX_AGENTS=10000;
 const fingerprint=ruleFingerprint;
 const keyOf=(rule:Rule)=>rule.resourceProvider+':'+rule.id;
@@ -38,7 +39,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
   for(const [id,entry]of m.retained){if(typeof id!=='string'||typeof entry.known!=='boolean'||typeof entry.managed!=='boolean')throw Error('Invalid retained rule');const decoded=decodeAnyAgentKey(id);if(!decoded||decoded.ruleId!==entry.rule.id||decoded.resourceProvider!==entry.rule.resourceProvider)throw Error('Invalid retained identity');if(entry.origin)entry.origin=restoreRetainedProvenance({provider:decoded.resourceProvider,kind:decoded.kind,ruleId:decoded.ruleId,...(decoded.kind==='resource'&&decoded.resourceProvider!=='filesystem'?{resourceId:decoded.resourceId}:{}),admittedRule:entry.origin},m.source).admittedRule!;parseRules({rules:[...m.history.filter(r=>r.id!==entry.rule.id),entry.rule]});if(Object.hasOwn(entry,'appliedPreferences'))parseRules({rules:[appliedRule(entry)]});if(entry.reconciliation&&(!/^[a-f0-9]{64}$/.test(entry.reconciliation.token)||!['pending','applied','blocked','superseded','disabled'].includes(entry.reconciliation.status)))throw Error('Invalid worker reconciliation record');}
   if(m.deactivation&&(typeof m.deactivation.originalText!=='string'||typeof m.deactivation.emptyEtag!=='string'))throw Error('Invalid deactivation record');return m;
  }
- try{const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||(stat.mode&0o077)||stat.size>MAX)throw Error('Unsafe remote authority manifest');manifest=validate(JSON.parse(readFileSync(path,'utf8')));retained=new Map(manifest.retained);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
+ try{const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink()||unsafeGroupOtherBits(stat.mode)||unsafeWindowsAcl(path)||stat.size>MAX)throw Error('Unsafe remote authority manifest');manifest=validate(JSON.parse(readFileSync(path,'utf8')));retained=new Map(manifest.retained);}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}
  // A previous process may have staged a target before dying. Never convert
  // an interrupted durable request into another paid launch after restart.
  for(const entry of retained.values())if(entry.lastHandoff?.status==='pending'||entry.reconciliation?.status==='pending'){
@@ -54,7 +55,7 @@ export function createRuleRuntime(directory:string,local:RuntimeLocal,sync:typeo
  }
  const initial=initializationRules();initialized=new Set(initial.filter(r=>r.enabled).map(r=>r.resourceProvider));
  function persist(next:Manifest){const text=JSON.stringify(next);if(Buffer.byteLength(text)>MAX)throw Error('Remote authority snapshot exceeds local storage bound');const temp=join(directory,`.remote-authority-${randomUUID()}.tmp`);let installed=false;
-  try{writeFileSync(temp,text,{flag:'wx',mode:0o600});const fd=openSync(temp,'r');try{fsyncSync(fd);}finally{closeSync(fd);}renameSync(temp,path);installed=true;manifest=next;sync(directory);}catch(e){if(installed)manifest=next;fault=true;error='Remote authority persistence requires recovery';generation++;refresh();throw e;}finally{try{unlinkSync(temp);}catch{}}
+  try{writeDurableFile(temp,text,'wx',0o600);renameSync(temp,path);installed=true;manifest=next;sync(directory);}catch(e){if(installed)manifest=next;fault=true;error='Remote authority persistence requires recovery';generation++;refresh();throw e;}finally{try{unlinkSync(temp);}catch{}}
  }
  function saveRetained(){if(manifest)persist({...manifest,retained:[...retained]});}
  const definitions=()=>manifest?.active?manifest.observationGraph:[...local.holder.getRules()];
