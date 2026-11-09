@@ -29,7 +29,19 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
   // A review finding: mutating (creating the sqlite lock file, chmod, beginning a
   // transaction) inside an unsafe, already-provisioned directory before refusing it
   // violates verify-without-mutation — refusing happens here, first, unconditionally.
-  const alreadyProvisioned=["deployment-id","control-panel.json",".control-panel-writer.sqlite","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  //
+  // .control-panel-writer.sqlite is deliberately EXCLUDED from this list (a second
+  // review finding, native-reproduced): it is the locking mechanism's OWN marker, created
+  // as the very FIRST step of ANY attempt at this directory — fresh or not — strictly
+  // before the directory is ever locked down (that happens only after acquireRuntimeWriter
+  // below succeeds). Treating its mere existence as "provisioned" means a losing racer in
+  // a concurrent FRESH startup could observe the winner's just-created lock file, see the
+  // directory's still-ambient ACL, and wrongly refuse it as unsafe instead of reaching the
+  // normal "Another control-panel client owns this runtime directory" contention path.
+  // Only deployment-id/control-panel.json/overrides/outbox/manifest — written AFTER a
+  // startup has actually completed at least once — indicate real provisioned, sensitive
+  // state worth refusing-without-mutation over.
+  const alreadyProvisioned=["deployment-id","control-panel.json","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
   if(alreadyProvisioned&&unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
   const releaseWriter=acquireRuntimeWriter(directory);try{
   // Only an actual LOCKDOWN (a write) of a genuinely fresh (not-yet-provisioned)
