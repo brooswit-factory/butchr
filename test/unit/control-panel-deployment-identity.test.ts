@@ -45,12 +45,20 @@ test('a losing candidate from a concurrent creation race is cleaned up and every
   // others must observe either a clean "Another control-panel client owns this runtime
   // directory" refusal or, once the holder releases, the SAME identity the holder wrote
   // — never a distinct identity, a corrupt file, or a leaked temp candidate.
+  // Exhausting all 200 contention attempts without ever acquiring the lock must be a
+  // hard, explicit failure (nonzero exit, real error text) — not a silent exit(0) with
+  // empty stdout. An exhausted racer's empty output is otherwise indistinguishable from
+  // a genuine distinct-identity failure once collected into the identities Set below
+  // (native finding, FACTORY-1043: real pwsh-per-write timing made exhaustion possible).
   const script=`
    import {createControlPanelClient} from ${JSON.stringify(module)};
+   let identity;
    for(let attempt=0;attempt<200;attempt++){
-    try{const client=createControlPanelClient(${JSON.stringify(dir)});console.log(client.deploymentId);client.stop();break;}
+    try{const client=createControlPanelClient(${JSON.stringify(dir)});identity=client.deploymentId;client.stop();break;}
     catch(e){if(!String((e as Error).message).includes('Another control-panel client'))throw e;}
    }
+   if(identity===undefined)throw Error('exhausted 200 contention attempts without ever acquiring the runtime writer lock');
+   console.log(identity);
   `;
   const children=Array.from({length:4},()=>Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'}));
   // allSettled, not all: a fail-fast Promise.all would let `finally` remove the shared
