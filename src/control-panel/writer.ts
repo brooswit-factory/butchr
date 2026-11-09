@@ -18,14 +18,28 @@ export function acquireRuntimeWriter(directory:string){
  // between Database(create:true)'s default mode and this function's own chmodSync).
  // Only the structural checks that don't depend on that timing — regular file, not a
  // symlink — run here; the permission checks move to after BEGIN EXCLUSIVE succeeds.
- if(existed){const stat=lstatSync(path);if(!stat.isFile()||stat.isSymbolicLink())throw Error('Unsafe control-panel runtime lock');}
- const db=new Database(path,{create:true});chmodSync(path,0o600);
+ // priorMode is captured here, BEFORE anything below ever mutates this file's
+ // permissions — chmodSync (for a reused file) must not run until after the safety
+ // check below has looked at this exact, untouched value. Running chmodSync first
+ // would silently force any preexisting unsafe mode to 0600 before it's ever checked,
+ // turning a real compromised-lock refusal into a silent, unreported repair instead
+ // (native finding, FACTORY-1043).
+ let priorMode:number|undefined;
+ if(existed){
+  const stat=lstatSync(path);
+  if(!stat.isFile()||stat.isSymbolicLink())throw Error('Unsafe control-panel runtime lock');
+  priorMode=stat.mode;
+ }
+ const db=new Database(path,{create:true});
+ if(!existed)chmodSync(path,0o600);
  try{db.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');}catch{db.close();throw Error('Another control-panel client owns this runtime directory');}
  if(existed){
   // Reaching here means no one else held this file exclusively, so it isn't a fresh
   // winner's transient pre-lockdown window — it's either already secured from a prior
-  // run, or genuinely compromised. Safe (and still fail-closed) to check now.
-  if(unsafeGroupOtherBits(lstatSync(path).mode)||unsafeWindowsAcl(path)){db.exec('ROLLBACK');db.close();throw Error('Unsafe control-panel runtime lock');}
+  // run, or genuinely compromised. Safe (and still fail-closed) to check now, against
+  // the mode captured above before any mutation.
+  if(unsafeGroupOtherBits(priorMode!)||unsafeWindowsAcl(path)){db.exec('ROLLBACK');db.close();throw Error('Unsafe control-panel runtime lock');}
+  chmodSync(path,0o600);
  }
  // Only now, once BEGIN EXCLUSIVE has actually succeeded, are we guaranteed the sole
  // owner of this directory — locking the ACL down any earlier (e.g. right after creating
