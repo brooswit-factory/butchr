@@ -45,19 +45,30 @@ test('a losing candidate from a concurrent creation race is cleaned up and every
   // others must observe either a clean "Another control-panel client owns this runtime
   // directory" refusal or, once the holder releases, the SAME identity the holder wrote
   // — never a distinct identity, a corrupt file, or a leaked temp candidate.
-  // Exhausting all 200 contention attempts without ever acquiring the lock must be a
-  // hard, explicit failure (nonzero exit, real error text) — not a silent exit(0) with
-  // empty stdout. An exhausted racer's empty output is otherwise indistinguishable from
-  // a genuine distinct-identity failure once collected into the identities Set below
-  // (native finding, FACTORY-1043: real pwsh-per-write timing made exhaustion possible).
+  // A tight, uncapped-elapsed-time retry count is not a realistic wait bound against a
+  // real competing Windows process spending tens of seconds in synchronous per-write ACL
+  // PowerShell calls (native finding, FACTORY-1043: a 200-attempt tight loop exhausted
+  // and correctly reported itself after ~31s, well before the real holder had finished —
+  // the test's own retry budget was too short, not a product bug). Retry against an
+  // elapsed-time deadline instead, yielding (not spinning) between attempts so the OS can
+  // actually schedule the real holder process during the wait.
+  //
+  // Exhausting the deadline without ever acquiring the lock must be a hard, explicit
+  // failure (nonzero exit, real error text) — not a silent exit(0) with empty stdout. An
+  // exhausted racer's empty output is otherwise indistinguishable from a genuine
+  // distinct-identity failure once collected into the identities Set below.
   const script=`
    import {createControlPanelClient} from ${JSON.stringify(module)};
+   const deadline=Date.now()+90000;
    let identity;
-   for(let attempt=0;attempt<200;attempt++){
+   while(Date.now()<deadline){
     try{const client=createControlPanelClient(${JSON.stringify(dir)});identity=client.deploymentId;client.stop();break;}
-    catch(e){if(!String((e as Error).message).includes('Another control-panel client'))throw e;}
+    catch(e){
+     if(!String((e as Error).message).includes('Another control-panel client'))throw e;
+     await new Promise(r=>setTimeout(r,150));
+    }
    }
-   if(identity===undefined)throw Error('exhausted 200 contention attempts without ever acquiring the runtime writer lock');
+   if(identity===undefined)throw Error('exhausted the contention retry deadline without ever acquiring the runtime writer lock');
    console.log(identity);
   `;
   const children=Array.from({length:4},()=>Bun.spawn([process.execPath,'--eval',script],{stdout:'pipe',stderr:'pipe'}));
@@ -82,5 +93,7 @@ test('a losing candidate from a concurrent creation race is cleaned up and every
  }finally{rmSync(dir,{recursive:true,force:true});}
 // Explicit per-write Windows ACL lockdown (restored, FACTORY-1043: a real inheritance
 // exposure found natively) adds a real PowerShell invocation per racer attempt; native
-// Windows timing for this exact test was observed at ~29s even before that restoration.
-},60000);
+// Windows timing for this exact test was observed at ~31s for a losing racer alone, and
+// the retry script's own elapsed-time deadline above is 90s — this outer timeout must
+// exceed that deadline with room to spare.
+},120000);
