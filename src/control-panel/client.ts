@@ -67,9 +67,18 @@ export function createControlPanelClient(directory: string, fetchFn: typeof fetc
     lockDownAcl(directory);
   }
   if(!existsSync(deploymentPath)){
+    // candidateIdentity's name is a fresh randomUUID() every attempt, so this process is
+    // always its sole owner — never a preexisting file some other attempt created. The
+    // cleanup below must cover writeDurableFile itself, not just the link step after it:
+    // a lockdown/write/fsync failure inside writeDurableFile can leave a partially- or
+    // fully-written candidate on disk with nothing to remove it (native review finding,
+    // FACTORY-1043). catch-and-ignore on the unlink itself handles the case where
+    // writeDurableFile never got far enough to create anything at all.
     const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
-    writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);
-    try{linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}finally{unlinkSync(candidateIdentity);}
+    try{
+      writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);
+      try{linkSync(candidateIdentity,deploymentPath);}catch(e){if((e as NodeJS.ErrnoException).code!=="EEXIST")throw e;}
+    }finally{try{unlinkSync(candidateIdentity);}catch{}}
   }
   if(!lstatSync(deploymentPath).isFile() || lstatSync(deploymentPath).isSymbolicLink())throw new Error("Unsafe deployment identity file");
   const deploymentId=readFileSync(deploymentPath,"utf8").trim();
