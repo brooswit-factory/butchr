@@ -21,24 +21,25 @@ export {validateServerUrl} from "./server-origin.js";
 export function createControlPanelClient(directory: string, fetchFn: typeof fetch = fetch) {
   mkdirSync(directory,{recursive:true,mode:0o700});
   const deploymentPath=join(directory,"deployment-id"), configurationPath=join(directory,"control-panel.json");
+  // Determining whether this directory already holds ANY control-panel state (not just
+  // deployment-id — a review finding noted that file alone is not proof the directory
+  // holds nothing else sensitive) is a pure read, and so is VERIFYING an already-
+  // provisioned directory's ACL — both safe to do before any locking, and done here,
+  // BEFORE acquireRuntimeWriter ever creates or touches anything inside this directory.
+  // A review finding: mutating (creating the sqlite lock file, chmod, beginning a
+  // transaction) inside an unsafe, already-provisioned directory before refusing it
+  // violates verify-without-mutation — refusing happens here, first, unconditionally.
+  const alreadyProvisioned=["deployment-id","control-panel.json",".control-panel-writer.sqlite","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
+  if(alreadyProvisioned&&unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
   const releaseWriter=acquireRuntimeWriter(directory);try{
-  // Only ever reached by the single process that just won acquireRuntimeWriter's
-  // exclusive lock on this directory — never concurrently with another process trying
-  // the same directory. Native testing found that two racing lockDownAcl calls against
-  // the SAME directory (before any exclusivity mechanism serialized them) could spuriously
-  // hit "SeSecurityPrivilege"; moving the decision here, after the real exclusivity gate,
+  // Only an actual LOCKDOWN (a write) of a genuinely fresh (not-yet-provisioned)
+  // directory needs serializing — reached only by the single process that just won
+  // acquireRuntimeWriter's exclusive lock, never concurrently with another process
+  // trying the same directory. Native testing found that two racing lockDownAcl calls
+  // against the SAME directory (before any exclusivity mechanism serialized them) could
+  // spuriously hit "SeSecurityPrivilege"; doing it here, after the real exclusivity gate,
   // removes the race entirely rather than chasing that error's exact cause.
-  //
-  // An already-PROVISIONED directory's ACL (one that already holds ANY control-panel
-  // state — not just deployment-id specifically; a review finding noted that file alone
-  // is not proof the directory holds nothing else sensitive) is verified, never silently
-  // overwritten: an unsafe one is a refusal to start, for the operator to fix, exactly
-  // like every other "Unsafe ... file" refusal in this codebase. A directory that merely
-  // already existed but was never provisioned (nothing sensitive in it yet — a freshly
-  // made temp/parent directory, say) is just as safe to lock down fresh as a brand-new one.
-  const alreadyProvisioned=["deployment-id","control-panel.json","remote-overrides.json","event-outbox.json","remote-rule-authority.json"].some(name=>existsSync(join(directory,name)));
   if(!alreadyProvisioned)lockDownAcl(directory);
-  else if(unsafeWindowsAcl(directory))throw new Error("Unsafe Windows ACL on the control-panel directory; fix its ACL (or remove the directory and let it be recreated) before starting");
   if(!existsSync(deploymentPath)){
     const candidateIdentity=join(directory,`.deployment-${randomUUID()}.tmp`);
     writeDurableFile(candidateIdentity,randomUUID()+"\n","wx",0o600);

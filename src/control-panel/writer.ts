@@ -1,5 +1,5 @@
 import {Database} from 'bun:sqlite';
-import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,writeFileSync,closeSync} from 'node:fs';
+import {chmodSync,existsSync,lstatSync,openSync,fsyncSync,writeFileSync,closeSync,unlinkSync} from 'node:fs';
 import {join} from 'node:path';
 import {lockDownAcl,unsafeWindowsAcl} from './windows-acl.js';
 /** Kernel-backed SQLite lock: exclusive ownership, automatically released on process death. */
@@ -16,7 +16,19 @@ export function acquireRuntimeWriter(directory:string){
  // fail with "SeSecurityPrivilege". This file holds no credentials (just an empty lock
  // marker), so the brief window where it exists under the directory's ambient ACL before
  // this runs is an acceptable, deliberate tradeoff against reintroducing that race.
- if(!existed)lockDownAcl(path);
+ if(!existed){
+  // A lockdown failure here (PowerShell/Set-Acl itself, or its own readback) must not
+  // leave the exclusive transaction and db handle open with no way to release them — a
+  // review finding: throwing before the release closure below is ever constructed leaks
+  // both. Roll back, close, and remove the lock file this call just created (so the next
+  // attempt starts clean and retries the lockdown) before propagating the real error.
+  try{lockDownAcl(path);}
+  catch(e){
+   try{db.exec('ROLLBACK');}finally{db.close();}
+   try{unlinkSync(path);}catch{}
+   throw e;
+  }
+ }
  let released=false;return ()=>{if(released)return;released=true;try{db.exec('ROLLBACK');}finally{db.close();}};
 }
 /**
