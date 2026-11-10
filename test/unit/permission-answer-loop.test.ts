@@ -46,6 +46,43 @@ const NO_ALWAYS_SCREEN = `──────────────────
 
  Esc to cancel · Tab to amend`;
 
+// FACTORY-1045/FACTORY-682: a session already running `--permission-mode
+// acceptEdits`, editing a file outside its trusted root — option 2 drops the
+// "switch to accept edits" lead-in entirely (nothing left to switch to) and
+// is bare: "Yes, and always allow access to <dir> for this session
+// (shift+tab)". Text verified verbatim against drovr's own fixture
+// (test/fixtures/file-edit-approval/pane-acceptedits-dir-only-edit-header-visible.txt
+// in the now-pinned @brooswit/drovr 0.16.15) — see that fixture's README for
+// this shape's two-independent-source provenance (no live pane on this host
+// could be driven into acceptEdits mode to capture it directly). Before the
+// FACTORY-682 fix this shape was the Servy 45-minute stall: unrecognized by
+// `FILE_EDIT_OPTION_2`, so `path` stayed `undefined` and the dialog was
+// never answered by lizard mode at all.
+const ACCEPTEDITS_DIR_ONLY_SCREEN = `❯ Edit the file /home/booswrit/work/smooth-slopes/.github/workflows/ci.yml: add a build job.
+  Use the Edit tool directly with the full absolute path, do not ask me anything first.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(/home/booswrit/work/smooth-slopes/.github/workflows/ci.yml)
+
+──────────────────────────────────────────────────────────────────────────────────────────────────
+ Edit file
+ ../../../../smooth-slopes/.github/workflows/ci.yml
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ 1  name: ci
+ 2
+ 3  jobs:
+ 4 +
+ 5 +  build:
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to make this edit to ci.yml?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /home/booswrit/work/smooth-slopes/.github/workflows for this
+      session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend`;
+
 const AGENT_BASE = { agent: "claude" as const, focused: true, revision: 1, tab_id: "t1", terminal_id: "term1", workspace_id: "w1" };
 
 // Measured live against the REAL installed @brooswit/drovr `classifyCodexApprovalScreen`
@@ -172,6 +209,36 @@ describe("runPermissionAnswerTick", () => {
     // FACTORY-145's own trailing latency record appended right after it.
     expect(audit.at(-2)).toMatchObject({ outcome: "approved", scope: "once", option: "Yes" });
     expect(audit.at(-1)).toMatchObject({ paneId: "p1", trigger: "sweep" });
+    expect(audit.at(-1)).not.toHaveProperty("latencyMs");
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("FACTORY-1045/FACTORY-682: the acceptEdits dir-only Edit-file dialog is recognized, path-derived and answered once — never the persistent directory grant", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perm-audit-"));
+    const auditPath = join(dir, "audit.jsonl");
+    const { client, sendKeysCalls } = fakeClient({ p1: ACCEPTEDITS_DIR_ONLY_SCREEN });
+
+    const results = await runPermissionAnswerTick({ client, eligiblePanes: allEligible, auditPath });
+
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ paneId: "p1", outcome: "answered", tool: "Edit file" });
+    // Exactly one sendKeys call, and it is "enter" at the dialog's default
+    // cursor (option 1, "Yes") — never a second call and never the keys that
+    // would be needed to move onto/select option 2's persistent directory
+    // grant. This is the Servy 45-minute-stall shape: before FACTORY-682,
+    // `FILE_EDIT_OPTION_2` did not match this bare "Yes, and always allow
+    // access to <dir> for this session (shift+tab)" text at all, `path`
+    // stayed `undefined`, and lizard mode skipped the dialog outright.
+    expect(sendKeysCalls).toEqual([{ target: "p1", keys: ["enter"] }]);
+    const audit = readFileSync(auditPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    // scope "once" / option "Yes" on drovr's own "approved" record is the
+    // directly-verifiable claim that the directory was never auto-granted —
+    // GUARD 1(b)/GUARD 4 in drovr's permission-approval.ts refuse scope
+    // "always" unconditionally for Edit/Create file on every shape of this
+    // dialog, dir-only included.
+    expect(audit.at(-2)).toMatchObject({ outcome: "approved", scope: "once", option: "Yes", tool: "Edit file" });
+    expect(audit.at(-1)).toMatchObject({ paneId: "p1", tool: "Edit file", trigger: "sweep" });
     expect(audit.at(-1)).not.toHaveProperty("latencyMs");
 
     rmSync(dir, { recursive: true, force: true });
