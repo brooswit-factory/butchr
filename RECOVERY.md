@@ -2,11 +2,11 @@ This branch integrates the recovered authority source with current main and fixe
 
 The original 342 inputs (299 application, 43 SDK) were recovered and hash-verified locally. The public payload excludes private Git history, credentials, native conversations, runtime state, permits, receipts, host-specific operational records and opaque dependency archives. Terminal parser specimens use synthetic replacements; parser assertions remain intact. Private service links use an example domain.
 
-Use Bun 1.3.11 and Node 20.20.2. Clone the approved Drovr recovery next to this checkout as `../drovr`, pinned to `e9c1b3644a5a056584069cd29abbe1ea0a57c0bf`:
+Use Bun 1.3.11 and Node 20.20.2. Clone the approved Drovr recovery next to this checkout as `../drovr`, pinned to `76920cd0a64cf6d7cc1ea895f23a7fad9ee2fc87`:
 
 ```sh
 git clone https://github.com/brooswit-factory/drovr.git ../drovr
-git -C ../drovr checkout e9c1b3644a5a056584069cd29abbe1ea0a57c0bf
+git -C ../drovr checkout 76920cd0a64cf6d7cc1ea895f23a7fad9ee2fc87
 (cd ../drovr && bun install --frozen-lockfile --ignore-scripts && bun run build)
 (cd ../drovr/legacy-events && bun install --frozen-lockfile --ignore-scripts && bun run build)
 bun install --frozen-lockfile --ignore-scripts
@@ -21,7 +21,7 @@ Two integration tests requiring an external private server checkout and one host
 
 Continue development from these public branches on the destination development machine. No original-host workspace, cache path or original archive is needed by the documented build.
 
-Integration repairs preserve current-main provider/credential/dashboard APIs and full lifecycle/readback briefs. CI checks out both repositories as siblings and builds SDK commit `e9c1b3644a5a056584069cd29abbe1ea0a57c0bf` before installing Butchr. Registry dependencies were already outside the application's coverage scope; the sibling SDK is excluded on that same basis, with the application source/operator coverage gate and 90% threshold unchanged.
+Integration repairs preserve current-main provider/credential/dashboard APIs and full lifecycle/readback briefs. CI checks out both repositories as siblings and builds SDK commit `76920cd0a64cf6d7cc1ea895f23a7fad9ee2fc87` before installing Butchr. Registry dependencies were already outside the application's coverage scope; the sibling SDK is excluded on that same basis, with the application source/operator coverage gate and 90% threshold unchanged.
 
 Rule OFF reconciliation runs before discovery fencing. It requires current authenticated authority, an explicit disabled rule, known exact rule ownership and a fresh complete worker census. Every destructive RPC retains the numeric generation lease. Missing/invalid configuration, disconnects, uncertain inventory, stale leases and partial handoffs preserve workers. Master pause remains a pause. Human and legacy local session workers are outside this sweep.
 
