@@ -662,10 +662,10 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
 });
 
 describe("FACTORY-1050: ollama launch", () => {
-  test("builds the literal `ollama launch claude --model <model>` argv, reusing Claude's own CLAUDE.md kickoff, effort, permission-mode and MCP flags", () => {
+  test("builds the documented `ollama launch claude --model <model> --yes -- ...` argv (docs.ollama.com/integrations/claude-code), reusing Claude's own CLAUDE.md kickoff, effort, permission-mode and MCP flags after the -- delimiter", () => {
     const args = spawnArgs(spec, "/w/KAN-783", { provider: "ollama", model: "qwen3.5:4b" });
     expect(args).toEqual([
-      "launch", "claude", "--model", "qwen3.5:4b",
+      "launch", "claude", "--model", "qwen3.5:4b", "--yes", "--",
       KICKOFF_PROMPT,
       "--effort", "high",
       "--permission-mode", DEFAULT_PERMISSION_MODE,
@@ -679,11 +679,12 @@ describe("FACTORY-1050: ollama launch", () => {
     const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
     const ollamaArgs = spawnArgs(cwdSpec, "/w/KAN-783", { provider: "ollama", model: "qwen3.5:4b" });
     // The kickoff prompt is NOT args[0] for ollama — "launch", "claude",
-    // "--model", <model> sit in front of it (see the next test for the
-    // full, exact shape); it is still the one and only positional argument
-    // after that literal prefix.
+    // "--model", <model>, "--yes", "--" sit in front of it (see the next
+    // test for the full, exact shape); it is still the one and only
+    // positional argument after that literal prefix.
     expect(ollamaArgs[0]).toBe("launch");
-    const prompt = ollamaArgs[4];
+    expect(ollamaArgs.slice(4, 6)).toEqual(["--yes", "--"]);
+    const prompt = ollamaArgs[6];
     expect(prompt).toContain("/repo/some-project");
     expect(prompt).toContain("CLAUDE.md");
     expect(prompt).not.toContain("AGENTS.md");
@@ -697,7 +698,7 @@ describe("FACTORY-1050: ollama launch", () => {
   test("an explicit permissionMode/strictMcpConfig forward exactly like a direct Claude launch", () => {
     const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions", strictMcpConfig: true }, "/w/KAN-783", { provider: "ollama", model: "qwen3.8:27b" });
     expect(args).toEqual([
-      "launch", "claude", "--model", "qwen3.8:27b",
+      "launch", "claude", "--model", "qwen3.8:27b", "--yes", "--",
       KICKOFF_PROMPT,
       "--effort", "high",
       "--permission-mode", "bypassPermissions",
