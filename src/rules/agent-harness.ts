@@ -23,9 +23,32 @@
  * looking `ENOENT` from `vite.config.ts`'s third-party-notices plugin).
  */
 
-/** Agent harnesses Drovr can launch. */
-export const AGENT_HARNESSES = ["claude", "codex", "agy"] as const;
+/**
+ * FACTORY-1050: `"ollama"` added as the fourth harness — Drovr's
+ * `ManagedAgentProvider` (`@brooswit/drovr`) union gained the identical
+ * fourth member for the SAME "ollama launch claude --model <model>"
+ * launcher. Never imported from `@brooswit/drovr` here even though it
+ * duplicates that type's literal value: this file is the SAME dependency-
+ * free leaf module described in the top-of-file comment above (no
+ * `node:*`, browser-bundle-safe), and `@brooswit/drovr` pulls in Bun/
+ * `node:*` APIs of its own — importing even a type-only value from it would
+ * reintroduce exactly the bundle breakage this file exists to avoid. Keep
+ * this list and Drovr's `ManagedAgentProvider` in sync by hand.
+ */
+export const AGENT_HARNESSES = ["claude", "codex", "agy", "ollama"] as const;
 export type AgentHarness = (typeof AGENT_HARNESSES)[number];
+
+/**
+ * FACTORY-1050: the EXACT three model choices John authorized for the
+ * `"ollama"` harness (jira comment 54276 — confirmed, superseding an
+ * earlier `"qwen.3.8:27b"` a registry check had flagged as a likely typo,
+ * jira comment 54275). Preserve byte-for-byte; never normalize or
+ * substitute. Duplicated from `@brooswit/drovr`'s own
+ * `OLLAMA_CLAUDE_MODELS` for the identical leaf-module reason as
+ * `AGENT_HARNESSES` above — keep the two lists in sync by hand.
+ */
+export const OLLAMA_CLAUDE_MODELS = ["qwen3.5:4b", "gemma4:12b", "qwen3.8:27b"] as const;
+export type OllamaClaudeModel = (typeof OLLAMA_CLAUDE_MODELS)[number];
 
 /**
  * FACTORY-87 (FACTORY-76, rule-side companion to DROVR-42) — the same

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { AGENT_HARNESSES, RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
+import { AGENT_HARNESSES, OLLAMA_CLAUDE_MODELS, RULE_PERMISSION_MODES } from "../../src/rules/rules.js";
 import { AGENT_EFFORTS } from "../../src/resources/power-scale.js";
 import {
   CUSTOM_MODEL_PATTERN, RULE_FORM_CATALOG, customModelProblems, ruleFormCatalogEntry,
@@ -10,9 +10,9 @@ describe("RULE_FORM_CATALOG", () => {
     expect(RULE_FORM_CATALOG.map((e) => e.harness)).toEqual([...AGENT_HARNESSES]);
   });
 
-  test("every entry allows a custom model and offers the full permission-mode list", () => {
+  test("every entry except ollama allows a custom model; every entry offers the full permission-mode list", () => {
     for (const entry of RULE_FORM_CATALOG) {
-      expect(entry.allowsCustomModel).toBe(true);
+      expect(entry.allowsCustomModel).toBe(entry.harness !== "ollama");
       expect(entry.permissionModes).toEqual(RULE_PERMISSION_MODES);
     }
   });
@@ -29,6 +29,13 @@ describe("RULE_FORM_CATALOG", () => {
     expect(codex.efforts).toEqual(AGENT_EFFORTS);
     expect(agy.models).toEqual([]);
     expect(agy.efforts).toEqual([]);
+  });
+
+  test("FACTORY-1050: ollama carries exactly the three authorized models, no custom model, and Claude's own effort table", () => {
+    const ollama = ruleFormCatalogEntry("ollama");
+    expect(ollama.models).toEqual(OLLAMA_CLAUDE_MODELS);
+    expect(ollama.allowsCustomModel).toBe(false);
+    expect(ollama.efforts).toEqual(AGENT_EFFORTS);
   });
 
   test("every shipped model alias already satisfies CUSTOM_MODEL_PATTERN", () => {
@@ -72,5 +79,9 @@ describe("customModelProblems", () => {
   test("error text names the field (`at`)", () => {
     const [problem] = customModelProblems("", "agentPreferences[0].model");
     expect(problem).toContain("agentPreferences[0].model");
+  });
+
+  test("FACTORY-1050: every OLLAMA_CLAUDE_MODELS literal is shape-valid even though ollama itself disallows a custom model", () => {
+    for (const model of OLLAMA_CLAUDE_MODELS) expect(customModelProblems(model, "at")).toEqual([]);
   });
 });
