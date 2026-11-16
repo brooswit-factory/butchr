@@ -68,7 +68,7 @@ export const MAX_AGENTS_HARD_MAX = 100;
 /** Sub-second poll-staleness tolerances are almost certainly a typo, not an intent — refused outright, no confirm escape hatch (unlike the ceiling above, there is no legitimate reason to go lower, only a float/unit mistake). */
 export const POLL_STALE_MS_FLOOR = 1000;
 
-const PROVIDERS = new Set(["claude", "codex", "agy"]);
+const PROVIDERS = new Set(["claude", "codex", "agy", "ollama"]);
 
 /**
  * THE strict allowlist — every key `settings.json`/`PUT /api/settings/:key`
@@ -114,7 +114,7 @@ export type ValidateResult = { ok: true; normalized: string } | { ok: false; err
 function validateProviderOrder(value: string, name: string): ValidateResult {
   const entries = value.split(",").map((e) => e.trim());
   if (entries.some((e) => !PROVIDERS.has(e)) || new Set(entries).size !== entries.length || entries.some((e) => e === "")) {
-    return { ok: false, error: `${name} must be an ordered, comma-separated list of distinct providers (claude, codex, agy)` };
+    return { ok: false, error: `${name} must be an ordered, comma-separated list of distinct providers (claude, codex, agy, ollama)` };
   }
   return { ok: true, normalized: entries.join(",") };
 }
@@ -137,7 +137,7 @@ export function validateSettingValue(key: string, rawValue: string, confirm = fa
   if (value === "") return { ok: false, error: `${key} must not be empty` };
   switch (def.kind) {
     case "provider":
-      if (!PROVIDERS.has(value)) return { ok: false, error: `${key} must be claude, codex, or agy` };
+      if (!PROVIDERS.has(value)) return { ok: false, error: `${key} must be claude, codex, agy, or ollama` };
       return { ok: true, normalized: value };
     case "providerOrder":
       return validateProviderOrder(value, key);

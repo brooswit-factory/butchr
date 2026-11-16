@@ -1981,6 +1981,18 @@ describe("resumableArgvReason", () => {
     expect(resumableArgvReason("argv lacks --permission-mode bypassPermissions", "codex")).toBe(false);
     expect(resumableArgvReason("argv lacks --strict-mcp-config", "agy")).toBe(false);
   });
+  // FACTORY-1050: "ollama" joins "codex"/"agy" here deliberately, NOT
+  // "claude" — it IS the real Claude harness underneath, but this ticket's
+  // own exclusions (no live Ollama testing) forbid verifying that
+  // `ollama launch claude ... --resume <id>` actually behaves the way a
+  // direct `claude --resume <id>` does, so it gets NO resume-in-place
+  // eligibility — same fail-closed treatment as every other non-"claude"
+  // provider, never a guess that "it's really Claude" makes it safe.
+  test("never true for ollama either, even though it launches the real Claude harness underneath — unverified, so fails closed like codex/agy", () => {
+    expect(resumableArgvReason("argv lacks --permission-mode bypassPermissions", "ollama")).toBe(false);
+    expect(resumableArgvReason("argv lacks --strict-mcp-config", "ollama")).toBe(false);
+    expect(resumableArgvReason("argv lacks --dangerously-load-development-channels server:x", "ollama")).toBe(false);
+  });
 });
 
 // FACTORY-411/FACTORY-424 (PR #541 review, item 4): `staleArgvOutcome` is
@@ -2028,6 +2040,20 @@ describe("staleArgvOutcome", () => {
     expect(reason).toContain("session lost");
     expect(reason).toContain("--permission-mode bypassPermissions");
     expect(reason).toContain("--dangerously-load-development-channels server:x");
+  });
+  // FACTORY-1050: an ollama-launched agent that drifts gets the exact same
+  // explicit "stated limitation" treatment as codex/agy — a plain English
+  // reason naming the real provider, fed straight into an ordinary
+  // stop+respawn (never a silent resume attempt, never an unverified
+  // --resume call, never a wrong/stale provider identity reported).
+  test("ollama drift gets the same explicit stated-limitation rewrite, naming \"ollama\" (not a generic \"not Claude\"), resumable: false", () => {
+    const { reason, resumable } = staleArgvOutcome("argv lacks --strict-mcp-config", "ollama");
+    expect(resumable).toBe(false);
+    expect(reason).not.toContain("argv lacks");
+    expect(reason).toContain("session lost");
+    expect(reason).toContain("--strict-mcp-config");
+    expect(reason).toContain("Claude-only");
+    expect(reason).toContain("ollama");
   });
 });
 

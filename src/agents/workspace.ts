@@ -1073,7 +1073,21 @@ export function buildWorkspace(spec: SpawnSpec, mcpUrl: string, provider: AgentP
   // ticket's --resume mechanism covers Claude only"), so they keep writing
   // their AGENTS.md/brief.md/ENVIRONMENT.md directly here, unchanged from
   // before this ticket.
-  if (provider === "claude") {
+  //
+  // FACTORY-1050: `ollama` joins `claude` here, NOT the `else` branch —
+  // `ollama launch claude --model <model>` launches the real Claude
+  // harness, which reads CLAUDE.md/mcp.json exactly like a direct `claude`
+  // launch and needs the SAME file-execution-veto hook install
+  // (`writePreLaunchClaudeFiles` does all three). Writing it AGENTS.md
+  // instead would leave the running process reading instructions meant for
+  // a different harness entirely, and mcp.json would never be written at
+  // all — silently breaking MCP tool access for every `ollama` agent. This
+  // provider is still excluded from resume-in-place (see
+  // `OllamaAgentLaunch`'s own doc comment, `@brooswit/drovr`), so the
+  // byte-identical-with-resume property this comment describes for Claude
+  // does not apply here — `ollama` has no resume path to stay identical
+  // with, only an ordinary fresh spawn.
+  if (provider === "claude" || provider === "ollama") {
     writePreLaunchClaudeFiles(dir, spec, mcpUrl);
   } else {
     const groundTruth = groundTruthText(deriveGroundTruth(mcpUrl), buildIdentity, computeBuildCurrency(buildIdentity));

@@ -173,6 +173,28 @@ describe("parseRules", () => {
       expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "agy", effortPower: 50 }] }] }))
         .toThrow('effortPower is not supported for harness "agy"');
     });
+
+    // FACTORY-1050: "ollama" has a model concept (unlike "agy") but no
+    // sliding power-table resolution for it — exactly three fixed named
+    // models, so modelPower is rejected the same way agy's is, for a
+    // different reason; effortPower is still accepted (ollama forwards
+    // --effort to the real Claude harness it wraps).
+    test("modelPower is rejected for harness ollama — exactly three fixed models, not a power table; effortPower is still accepted", () => {
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "ollama", modelPower: 50 }] }] }))
+        .toThrow('modelPower is not supported for harness "ollama"');
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "ollama", effortPower: 70 }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "ollama", effort: "xhigh" }]);
+    });
+
+    test("FACTORY-1050: ollama's model must be one of the three exact literal choices", () => {
+      const [r] = parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "ollama", model: "qwen3.8:27b" }] }] });
+      expect(r!.agentPreferences).toEqual([{ harness: "ollama", model: "qwen3.8:27b" }]);
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "ollama", model: "llama3:8b" }] }] }))
+        .toThrow('model must be one of qwen3.5:4b, gemma4:12b, qwen3.8:27b for harness "ollama"');
+      // The SAME model string is perfectly valid for a different harness —
+      // this is a harness-specific restriction, not a global model ban.
+      expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", model: "llama3:8b" }] }] })).not.toThrow();
+    });
     test("out-of-range/non-integer modelPower/effortPower are rejected, same message shape as session-definition.ts's own fields", () => {
       expect(() => parseRules({ rules: [{ ...minimal, agentPreferences: [{ harness: "claude", modelPower: 101 }] }] }))
         .toThrow("modelPower must be between 0 and 100");

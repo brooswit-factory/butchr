@@ -25,17 +25,23 @@
  * accepts (`"sonnet"`, `"gpt-5.6-sol"`, …), in ascending power order,
  * de-duplicated (no table repeats a model today, but this stays correct if
  * the bands narrow further later). `agy` has no power table (`POWER_VENDORS`
- * is `claude`/`codex` only) and so ships `models: []` — `allowsCustomModel`
- * stays `true` for every harness regardless (the underlying
+ * is `claude`/`codex` only) and so ships `models: []`; `allowsCustomModel`
+ * stays `true` for every harness EXCEPT `ollama` (the underlying
  * `AgentPreference.model` field is, and remains, a free string validated
- * only by `CUSTOM_MODEL_PATTERN` below), so a caller may always type a
- * custom id via "Other…".
+ * only by `CUSTOM_MODEL_PATTERN` below for every OTHER harness), so a
+ * caller may type a custom id via "Other…" everywhere but there. FACTORY-
+ * 1050: `ollama` ships `models: OLLAMA_CLAUDE_MODELS` (exactly three fixed
+ * literal choices, no power table at all) and `allowsCustomModel: false` —
+ * see `RuleFormCatalogEntry.allowsCustomModel`'s own doc comment for the
+ * full reasoning and where the model is actually enforced.
  *
- * `efforts` is `AGENT_EFFORTS` for `claude`/`codex` (the same 0-100 axis
- * `effortPower` resolves through, `resolveEffortPower`) and `[]` for `agy`
- * (no effort concept at all — `agentLaunchConfig`'s Agy branch never reads
- * one, and `./rules.ts`'s own `parsePreferences` already rejects
- * `effort`/`effortPower` set for that harness).
+ * `efforts` is `AGENT_EFFORTS` for `claude`/`codex`/`ollama` (the same
+ * 0-100 axis `effortPower` resolves through, `resolveEffortPower` — `ollama`
+ * forwards `--effort` to the real Claude harness it wraps, so it shares the
+ * table rather than inventing its own) and `[]` for `agy` (no effort
+ * concept at all — `agentLaunchConfig`'s Agy branch never reads one, and
+ * `./rules.ts`'s own `parsePreferences` already rejects `effort`/
+ * `effortPower` set for that harness).
  *
  * `permissionModes` is `RULE_PERMISSION_MODES` for every harness: the rule
  * validator itself accepts every value for every provider (`RulePermissionMode`'s
@@ -46,7 +52,7 @@
  * and-sandbox` (`agentLaunchConfig`'s Codex branch, `../agents/argv.ts`) —
  * that mapping is a launch-time concern, not a catalog-time restriction.
  */
-import { AGENT_HARNESSES, AGENT_ROLES, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./agent-harness.js";
+import { AGENT_HARNESSES, AGENT_ROLES, OLLAMA_CLAUDE_MODELS, RULE_PERMISSION_MODES, type AgentHarness, type AgentRole, type RulePermissionMode } from "./agent-harness.js";
 import { AGENT_EFFORTS, CLAUDE_MODEL_POWER_TABLE, CODEX_MODEL_POWER_TABLE, type AgentEffort, type ModelPowerBand } from "../resources/power-scale.js";
 
 /**
@@ -67,11 +73,23 @@ export { AGENT_ROLES, type AgentRole };
 
 export interface RuleFormCatalogEntry {
   harness: AgentHarness;
-  /** Shipped model aliases, ascending power order, de-duplicated. `[]` for a harness with no power table (`agy`). */
+  /** Shipped model aliases, ascending power order, de-duplicated. `[]` for a harness with no power table (`agy`). `ollama`'s three fixed literal choices (`OLLAMA_CLAUDE_MODELS`), in order — not a power table (no sliding scale of alternatives, just exactly three named models). */
   models: readonly string[];
-  /** Always `true` today — `AgentPreference.model` is a free string for every harness; kept as its own field (rather than implied) so a future harness that truly cannot take a custom model id has somewhere to say so without breaking every existing reader of this shape. */
+  /**
+   * `true` for every harness except `ollama`: `AgentPreference.model` is a
+   * free string everywhere else, validated only by `CUSTOM_MODEL_PATTERN`
+   * below, so a caller may always type a custom id via "Other…". FACTORY-
+   * 1050: `ollama`'s dropdown offers EXACTLY its three authorized models,
+   * nothing else — "the smallest coherent fourth launcher option", per the
+   * ticket, not a general local-model picker. The write path's own
+   * `customModelProblems` below is still shape-only (it has no `harness` to
+   * check against here — see its own doc comment); the authoritative,
+   * harness-aware rejection of a non-matching `ollama` model lives in
+   * `rules.ts`'s `parsePreferences`, the one place `harness` and `model`
+   * are already validated together for every write path.
+   */
   allowsCustomModel: boolean;
-  /** `AGENT_EFFORTS` for a harness with an effort concept, `[]` otherwise (`agy`). */
+  /** `AGENT_EFFORTS` for a harness with an effort concept, `[]` otherwise (`agy`). `ollama` forwards `--effort` to the real Claude harness it wraps, so it shares Claude/Codex's table. */
   efforts: readonly AgentEffort[];
   /** `RULE_PERMISSION_MODES`, unconditionally — see this module's own header for why this is never narrowed per harness. */
   permissionModes: readonly RulePermissionMode[];
@@ -85,9 +103,11 @@ const MODEL_TABLES: Readonly<Partial<Record<AgentHarness, readonly ModelPowerBan
 const EFFORTS_BY_HARNESS: Readonly<Partial<Record<AgentHarness, readonly AgentEffort[]>>> = {
   claude: AGENT_EFFORTS,
   codex: AGENT_EFFORTS,
+  ollama: AGENT_EFFORTS,
 };
 
 function modelsFor(harness: AgentHarness): readonly string[] {
+  if (harness === "ollama") return OLLAMA_CLAUDE_MODELS;
   const table = MODEL_TABLES[harness];
   if (!table) return [];
   const seen = new Set<string>();
@@ -105,7 +125,7 @@ function modelsFor(harness: AgentHarness): readonly string[] {
 export const RULE_FORM_CATALOG: readonly RuleFormCatalogEntry[] = AGENT_HARNESSES.map((harness) => ({
   harness,
   models: modelsFor(harness),
-  allowsCustomModel: true,
+  allowsCustomModel: harness !== "ollama",
   efforts: EFFORTS_BY_HARNESS[harness] ?? [],
   permissionModes: RULE_PERMISSION_MODES,
 }));

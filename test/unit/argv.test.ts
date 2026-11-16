@@ -660,3 +660,63 @@ describe("agentStartParams — FACTORY-314 session id / resume", () => {
     expect(args[args.indexOf("--effort") + 1]).toBe("low");
   });
 });
+
+describe("FACTORY-1050: ollama launch", () => {
+  test("builds the documented `ollama launch claude --model <model> --yes -- ...` argv (docs.ollama.com/integrations/claude-code), reusing Claude's own CLAUDE.md kickoff, effort, permission-mode and MCP flags after the -- delimiter", () => {
+    const args = spawnArgs(spec, "/w/KAN-783", { provider: "ollama", model: "qwen3.5:4b" });
+    expect(args).toEqual([
+      "launch", "claude", "--model", "qwen3.5:4b", "--yes", "--",
+      KICKOFF_PROMPT,
+      "--effort", "high",
+      "--permission-mode", DEFAULT_PERMISSION_MODE,
+      "--mcp-config", "/w/KAN-783/mcp.json",
+      "--dangerously-load-development-channels=server:butchr",
+    ]);
+  });
+
+  test("kickoffFor treats ollama exactly like claude: CLAUDE.md, never AGENTS.md", () => {
+    expect(kickoffFor("ollama", "/w/KAN-783")).toBe(KICKOFF_PROMPT);
+    const cwdSpec = { ...spec, cwd: "/repo/some-project", brief: "Keep this repo's docs current." };
+    const ollamaArgs = spawnArgs(cwdSpec, "/w/KAN-783", { provider: "ollama", model: "qwen3.5:4b" });
+    // The kickoff prompt is NOT args[0] for ollama — "launch", "claude",
+    // "--model", <model>, "--yes", "--" sit in front of it (see the next
+    // test for the full, exact shape); it is still the one and only
+    // positional argument after that literal prefix.
+    expect(ollamaArgs[0]).toBe("launch");
+    expect(ollamaArgs.slice(4, 6)).toEqual(["--yes", "--"]);
+    const prompt = ollamaArgs[6];
+    expect(prompt).toContain("/repo/some-project");
+    expect(prompt).toContain("CLAUDE.md");
+    expect(prompt).not.toContain("AGENTS.md");
+  });
+
+  test("the process cwd stays the ordinary bookkeeping directory, same invariant as claude/codex", () => {
+    const launch = agentLaunchConfig(spec, "/w/KAN-783", "pane", "worker", { provider: "ollama", model: "gemma4:12b" });
+    expect(launch.cwd).toBe("/w/KAN-783");
+  });
+
+  test("an explicit permissionMode/strictMcpConfig forward exactly like a direct Claude launch", () => {
+    const args = spawnArgs({ ...spec, permissionMode: "bypassPermissions", strictMcpConfig: true }, "/w/KAN-783", { provider: "ollama", model: "qwen3.8:27b" });
+    expect(args).toEqual([
+      "launch", "claude", "--model", "qwen3.8:27b", "--yes", "--",
+      KICKOFF_PROMPT,
+      "--effort", "high",
+      "--permission-mode", "bypassPermissions",
+      "--mcp-config", "/w/KAN-783/mcp.json",
+      "--strict-mcp-config",
+      "--dangerously-load-development-channels=server:butchr",
+    ]);
+  });
+
+  test("agent.model is required for harness \"ollama\" — a missing model throws loudly rather than silently picking one", () => {
+    expect(() => agentLaunchConfig(spec, "/w/KAN-783", "pane", "worker", { provider: "ollama" })).toThrow(/agent\.model is required for harness "ollama"/);
+  });
+
+  test("no control characters, control-char guard passes for every authorized model", () => {
+    for (const model of ["qwen3.5:4b", "gemma4:12b", "qwen3.8:27b"] as const) {
+      const args = spawnArgs(spec, "/w/KAN-783", { provider: "ollama", model });
+      expect(controlCharStartArgs(args)).toEqual([]);
+      expect(() => assertSafeStartArgv(args)).not.toThrow();
+    }
+  });
+});

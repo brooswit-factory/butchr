@@ -43,7 +43,7 @@ import { zendeskTicketQueryProblems } from "../resources/zendesk-ticket.js";
 import { trelloRuleQueryProblems } from "./trello-card-type.js";
 import { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider } from "./agent-key.js";
 import { powerValueProblems, resolveModelPower, resolveEffortPower, AGENT_EFFORTS, type AgentEffort } from "../resources/power-scale.js";
-import { AGENT_HARNESSES, type AgentHarness, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
+import { AGENT_HARNESSES, type AgentHarness, OLLAMA_CLAUDE_MODELS, type OllamaClaudeModel, RULE_PERMISSION_MODES, type RulePermissionMode, AGENT_ROLES, type AgentRole } from "./agent-harness.js";
 
 export { isRuleId, RESOURCE_PROVIDERS, RULE_ID_MAX, type ResourceProvider };
 /**
@@ -66,7 +66,7 @@ export const PLACEHOLDER_QUERY = "PLACEHOLDER_QUERY";
  * `node:crypto`) and re-exported here unchanged for every existing
  * importer of `rules.js`.
  */
-export { AGENT_HARNESSES, type AgentHarness };
+export { AGENT_HARNESSES, type AgentHarness, OLLAMA_CLAUDE_MODELS, type OllamaClaudeModel };
 /**
  * FACTORY-75: moved to src/resources/power-scale.ts (that module's own top
  * comment explains why — it needs this type for its shared effort table,
@@ -674,6 +674,21 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     unknownFields(p, PREFERENCE_FIELDS, pat, errors);
     if (!oneOf(AGENT_HARNESSES, p.harness)) errors.push(`${pat}.harness must be one of ${AGENT_HARNESSES.join(", ")}`);
     if (p.model !== undefined && !nonEmpty(p.model)) errors.push(`${pat}.model must be a non-empty string`);
+    // FACTORY-1050: the ONE harness/model cross-check in this function —
+    // every other field here validates independently of `p.harness`'s own
+    // value, but `ollama`'s model is restricted to exactly three literal
+    // strings (no "Other…" custom id, unlike every other harness —
+    // `RuleFormCatalogEntry.allowsCustomModel`, `./rule-form-catalog.ts`),
+    // and `p.harness`/`p.model` are already both in hand on the SAME
+    // preference object here, so there is no cross-field plumbing to add —
+    // this is the authoritative enforcement; the web write path's own
+    // per-field validators are shape-only front doors that funnel back to
+    // THIS parser before anything is ever persisted (`write-rules.ts`'s own
+    // final `loadRules` call, "throws on invalid input; nothing below
+    // runs").
+    if (p.harness === "ollama" && p.model !== undefined && !(OLLAMA_CLAUDE_MODELS as readonly string[]).includes(p.model as string)) {
+      errors.push(`${pat}.model must be one of ${OLLAMA_CLAUDE_MODELS.join(", ")} for harness "ollama"`);
+    }
     if (p.effort !== undefined && !oneOf(AGENT_EFFORTS, p.effort)) errors.push(`${pat}.effort must be one of ${AGENT_EFFORTS.join(", ")}`);
     // FACTORY-75: modelPower/effortPower are the new 0-100 two-axis
     // mechanism (src/resources/power-scale.ts) — reject combining either
@@ -690,6 +705,10 @@ function parsePreferences(raw: unknown, at: string, errors: string[]): AgentPref
     if (p.modelPower !== undefined) {
       if (p.model !== undefined) errors.push(`${pat} must not set both "model" and "modelPower"`);
       else if (p.harness === "agy") errors.push(`${pat}.modelPower is not supported for harness "agy" — agy has no model-power table`);
+      // FACTORY-1050: `ollama` HAS a model concept (unlike `agy`) but no
+      // sliding power-table resolution for it — exactly three fixed named
+      // models, chosen directly, not via a 0-100 range.
+      else if (p.harness === "ollama") errors.push(`${pat}.modelPower is not supported for harness "ollama" — ollama has exactly three fixed model choices (${OLLAMA_CLAUDE_MODELS.join(", ")}), not a power table`);
       else {
         const problems = powerValueProblems(p.modelPower, `${pat}.modelPower`);
         errors.push(...problems);

@@ -7,6 +7,7 @@ import {
   parseCodexMcpInventory,
   type ManagedAgentProvider,
   type ManagedAgentLaunch,
+  type OllamaClaudeModel,
   type ParamsOf,
 } from "@brooswit/drovr";
 
@@ -195,8 +196,12 @@ export function inventoryCodexMcp(
  * control character than the raw brief text this branch used to inline.
  */
 export const kickoffFor = (provider: AgentProvider, dir: string, spec?: SpawnSpec): string => {
-  const base = provider === "claude" ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
-  const instructionFile = provider === "claude" ? "CLAUDE.md" : "AGENTS.md";
+  // FACTORY-1050: `ollama` IS the real Claude harness (launched through
+  // `ollama launch claude --model <model>`), so it reads CLAUDE.md exactly
+  // like a direct `claude` launch, never AGENTS.md.
+  const isClaudeHarness = provider === "claude" || provider === "ollama";
+  const base = isClaudeHarness ? KICKOFF_PROMPT : AGENTS_KICKOFF_PROMPT;
+  const instructionFile = isClaudeHarness ? "CLAUDE.md" : "AGENTS.md";
   const prompt =
     spec?.cwd && spec.brief
       ? `Read ${dir}/${instructionFile} and ${dir}/brief.md for your butchr instructions, then cd to ${spec.cwd} — your real working directory for this task — before doing anything else.`
@@ -259,6 +264,35 @@ export function agentLaunchConfig(
   agent: AgentConfig = { provider: "claude" },
   mcpUrl = "http://localhost:7717/mcp",
 ): ManagedAgentLaunch {
+  if (agent.provider === "ollama") {
+    // FACTORY-1050: unlike every other provider, `ollama` has no sensible
+    // default model to fall back to (three unrelated local models, nothing
+    // like Claude's own default) — a rule/definition that selects this
+    // harness without an explicit model is a config error, refused LOUDLY
+    // here rather than silently picking one of the three for the caller
+    // (this codebase's own stated philosophy — see e.g.
+    // `settings-file.ts`'s own top comment, "LOUD REFUSAL, NEVER A SILENT
+    // DEFAULT").
+    if (!agent.model) throw new Error('agent.model is required for harness "ollama" — one of the three authorized models must be explicitly selected');
+    return {
+      provider: "ollama",
+      model: agent.model as OllamaClaudeModel,
+      name,
+      paneId,
+      cwd: dir,
+      prompt: "",
+      // Same default/forwarding as the Claude branch below — `ollama` IS
+      // the real Claude harness, just launched through `ollama launch
+      // claude --model <model>` (see `@brooswit/drovr`'s `OllamaAgentLaunch`
+      // doc comment).
+      permissionMode: DEFAULT_PERMISSION_MODE,
+      effort: agent.effort ?? effortFor(spec.issuetype),
+      mcpConfigPath: dir + "/mcp.json",
+      developmentChannels: ["server:butchr", ...boundChannels(spec)],
+      ...(spec.permissionMode ? { permissionMode: spec.permissionMode } : {}),
+      ...(spec.strictMcpConfig ? { strictMcpConfig: true } : {}),
+    };
+  }
   if (agent.provider === "agy") {
     return {
       provider: "agy",
